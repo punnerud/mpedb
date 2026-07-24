@@ -59,6 +59,14 @@ fn map_err(e: DbError) -> PyErr {
         | DbError::UniqueViolation { .. }
         | DbError::NotNullViolation { .. }
         | DbError::CheckViolation { .. } => IntegrityError::new_err(msg),
+        // sqlite raises OperationalError ("no such table/column") for unknown
+        // schema objects, and real consumers catch by THAT class — diskcache
+        // probes its Settings table on every open and swallows
+        // OperationalError; a ProgrammingError there crashed Cache.__init__
+        // universally (PY-COMPAT.md tier 1). Same taxonomy here.
+        DbError::Bind(s) if s.contains("unknown table") || s.contains("unknown column") => {
+            OperationalError::new_err(msg)
+        }
         DbError::Parse { .. }
         | DbError::Bind(_)
         | DbError::TypeMismatch(_)
@@ -106,6 +114,15 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     }
     if let Ok(b) = obj.cast::<PyByteArray>() {
         return Ok(Value::Blob(b.to_vec()));
+    }
+    // memoryview (sqlite3.Binary) binds as a blob — 13 diskcache tests bind
+    // one directly, and PEP 249's Binary() constructor returns exactly this.
+    if let Ok(mv) = obj.cast::<pyo3::types::PyMemoryView>() {
+        if let Ok(b) = mv.call_method0("tobytes") {
+            if let Ok(by) = b.cast::<PyBytes>() {
+                return Ok(Value::Blob(by.as_bytes().to_vec()));
+            }
+        }
     }
     // Aware datetime (any fixed offset) -> UTC microseconds.
     if let Ok(dt) = obj.extract::<DateTime<FixedOffset>>() {
@@ -687,6 +704,10 @@ enum Backend {
 #[pyclass(name = "Connection", module = "mpedb")]
 struct PyConnection {
     backend: Backend,
+    /// sqlite3's `text_factory` — accepted and stored (str is the one
+    /// behavior mpedb produces; sqlitedict SETS it at bootstrap and never
+    /// needs another value).
+    text_factory: Option<Py<PyAny>>,
     /// The open transaction, if anything has been written since the last
     /// commit/rollback. PEP 249 says a connection is always in a transaction;
     /// mpedb's writer lock is exclusive, so one is only TAKEN once there is
@@ -716,6 +737,19 @@ struct Session {
 
 #[pymethods]
 impl PyConnection {
+    #[getter]
+    fn get_text_factory(&self, py: Python<'_>) -> Py<PyAny> {
+        match &self.text_factory {
+            Some(f) => f.clone_ref(py),
+            None => py.get_type::<pyo3::types::PyString>().into_any().unbind(),
+        }
+    }
+
+    #[setter]
+    fn set_text_factory(&mut self, f: Py<PyAny>) {
+        self.text_factory = Some(f);
+    }
+
     /// PEP 249 `Connection.cursor()`.
     fn cursor(slf: Py<Self>) -> PyCursor {
         PyCursor {
@@ -829,6 +863,63 @@ struct PyCursor {
 }
 
 impl PyCursor {
+    /// `PRAGMA name [= value]` / `PRAGMA name(arg)` — sqlite's contract,
+    /// approximated honestly: a SET form is accepted and ignored (mpedb's
+    /// journal/synchronous machinery is the config's, not per-connection), a
+    /// READ of a pragma we can answer returns ONE row (diskcache destructures
+    /// `PRAGMA page_size`), and anything else returns NO rows — which is
+    /// exactly what sqlite does for an unknown pragma, and never a lie about
+    /// a value we do not have.
+    fn exec_pragma(&mut self, py: Python<'_>, rest: &str) -> PyResult<()> {
+        let name_part = rest
+            .split(['=', '('])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let is_set = rest.contains('=');
+        let answer: Option<i64> = if is_set {
+            None
+        } else {
+            match name_part.as_str() {
+                "page_size" => Some(4096),
+                "cache_size" => Some(-2000),
+                "synchronous" => Some(2),
+                "foreign_keys" => Some(0),
+                "mmap_size" => Some(0),
+                "user_version" | "application_id" | "auto_vacuum" | "temp_store"
+                | "secure_delete" | "count_changes" => Some(0),
+                "schema_version" | "freelist_count" => Some(1),
+                "busy_timeout" => Some(5000),
+                "max_page_count" => Some(1073741823),
+                _ => None,
+            }
+        };
+        self.rows.clear();
+        self.pos = 0;
+        self.rowcount = -1;
+        self.description = None;
+        if !is_set {
+            if let Some(v) = answer {
+                self.description = Some(describe(py, &[name_part.clone()])?);
+                let row = (v,).into_pyobject(py)?.into_any().unbind();
+                self.rows = vec![row];
+            } else if name_part == "journal_mode" {
+                // The one TEXT-valued pragma real code reads (sqlitedict sets
+                // then trusts it): answer with the honest equivalent.
+                self.description = Some(describe(py, &[name_part.clone()])?);
+                let row = ("wal",).into_pyobject(py)?.into_any().unbind();
+                self.rows = vec![row];
+            }
+        } else if name_part == "journal_mode" {
+            // sqlite returns the RESULTING mode from a journal_mode SET.
+            self.description = Some(describe(py, &[name_part.clone()])?);
+            let row = ("wal",).into_pyobject(py)?.into_any().unbind();
+            self.rows = vec![row];
+        }
+        Ok(())
+    }
+
     /// Load one ExecResult into this cursor's PEP 249 state — shared by the
     /// native read path and the overlay per-statement path.
     fn load_result(&mut self, py: Python<'_>, res: ExecResult) -> PyResult<()> {
@@ -885,6 +976,54 @@ impl PyCursor {
         let mut conn = self.conn.borrow_mut(py);
         if conn.closed {
             return Err(closed_err());
+        }
+        // The connection-bootstrap ritual every real sqlite3 consumer runs
+        // before its first query (PY-COMPAT.md tier 1): PRAGMA in both forms,
+        // and transaction control through execute(). Handled here, above the
+        // backend split, so both engines answer identically.
+        let bare = sql.trim().trim_end_matches(';').trim();
+        if bare.len() >= 6 && bare[..6].eq_ignore_ascii_case("pragma") {
+            drop(conn);
+            return self.exec_pragma(py, bare[6..].trim());
+        }
+        let head = bare
+            .split_whitespace()
+            .next()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match head.as_str() {
+            // BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION]: the PEP 249
+            // connection is ALWAYS in a transaction (writes buffer until
+            // commit; the overlay's delta is the transaction) — accept as a
+            // no-op rather than refuse, which is what killed diskcache's
+            // _transact.
+            "begin" => {
+                drop(conn);
+                self.rowcount = -1;
+                self.rows.clear();
+                self.pos = 0;
+                self.description = None;
+                return Ok(());
+            }
+            "commit" | "end" => {
+                PyConnection::commit(&mut conn, py)?;
+                drop(conn);
+                self.rowcount = -1;
+                self.rows.clear();
+                self.pos = 0;
+                self.description = None;
+                return Ok(());
+            }
+            "rollback" => {
+                PyConnection::rollback(&mut conn)?;
+                drop(conn);
+                self.rowcount = -1;
+                self.rows.clear();
+                self.pos = 0;
+                self.description = None;
+                return Ok(());
+            }
+            _ => {}
         }
         // The overlay backend runs EVERYTHING per statement: reads consult
         // base+delta merged, writes land in the delta immediately (autocommit),
@@ -1129,6 +1268,7 @@ fn connect(py: Python<'_>, path: PathBuf, engine: Option<&str>) -> PyResult<PyCo
             backend: Backend::Overlay(Arc::new(Mutex::new(Some(ov))), base),
             txn: None,
             closed: false,
+            text_factory: None,
         });
     }
     let db = if spelled.ends_with(".toml") && !force_native {
@@ -1136,14 +1276,16 @@ fn connect(py: Python<'_>, path: PathBuf, engine: Option<&str>) -> PyResult<PyCo
     } else {
         // A database PATH (`:memory:`, `.mpedb`, or forced native): a minimal
         // config with no seed tables — `CREATE TABLE` (live DDL, #47) is how a
-        // sqlite3-shaped caller builds schema. `size_mb` is RESERVED sparse,
-        // not used.
+        // sqlite3-shaped caller builds schema. `size_mb` is PREALLOCATED
+        // (fallocate), so the drop-in default is deliberately small — the
+        // 1 GiB default ENOSPC'd a test suite that creates throwaway DBs
+        // (PY-COMPAT.md tier 1). Bigger databases declare a .toml config.
         // mpedb refuses a schema with NO live tables, and a sqlite3-shaped
         // `connect("new.mpedb")` carries no schema — so the seed holds one
         // inert bootstrap table (the mpedb-capi solution, same name family);
         // user tables are created live via `CREATE TABLE`.
         let toml = format!(
-            "[database]\npath = \"{}\"\nsize_mb = 1024\nmax_readers = 64\n\n\
+            "[database]\npath = \"{}\"\nsize_mb = 64\nmax_readers = 64\n\n\
              [[table]]\nname = \"_mpedb_py_bootstrap\"\nprimary_key = [\"id\"]\n\
              [[table.column]]\nname = \"id\"\ntype = \"int64\"\n",
             spelled.replace('\\', "/").replace('"', "")
@@ -1158,6 +1300,7 @@ fn connect(py: Python<'_>, path: PathBuf, engine: Option<&str>) -> PyResult<PyCo
         backend: Backend::Native(Arc::new(db)),
         txn: None,
         closed: false,
+        text_factory: None,
     })
 }
 

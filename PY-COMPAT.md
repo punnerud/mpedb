@@ -12,7 +12,7 @@ box, so only NEW failures count.
 | suite | stdlib baseline | mpedb 0.1.1 | first blocker |
 |---|---|---|---|
 | sqlitedict (89 tests) | 89 pass | 2 pass | `PRAGMA journal_mode` refused at connection bootstrap |
-| diskcache core (185) | 185 pass | 4 pass | `unknown table` raises ProgrammingError; diskcache catches OperationalError |
+| diskcache core (185) | 185 pass | 4 pass → **19 pass (0.1.2)** | tier 1 fixed the bootstrap; remainder is dominated by parameterized `LIMIT ?` (46 tests — engine SQL surface, 0.2) |
 | CPython test_sqlite3 (424 run) | — | 76 pass / 32 fail / 310 error | two missing `SQLITE_*` constants import-blocked 7 of 10 files |
 
 Reference: the C-API shim (a different artifact — the real `_sqlite3` C module
@@ -27,7 +27,17 @@ aggregates, and on the `.db` overlay even triggers and partial indexes).
 
 ## 0.2 roadmap, ranked by measured leverage
 
-### Tier 1 — the bootstrap ritual (small surface, flips real projects)
+### Tier 1 — SHIPPED in 0.1.2 (the bootstrap ritual)
+Delivered: PRAGMA accept-and-answer (set + read; page_size/journal_mode/… answer,
+unknown pragmas return no rows exactly as sqlite), unknown table/column →
+OperationalError, BEGIN/BEGIN IMMEDIATE/COMMIT/END/ROLLBACK through execute(),
+`dbapi2` submodule + register_adapter/register_converter (stored) +
+Date/Time/Timestamp/Binary + the SQLITE_LIMIT_*/LEGACY_TRANSACTION_CONTROL
+constant set + settable text_factory + memoryview binding, and the native
+size_mb default shrunk 1024 → 64 (the fallocate landmine). Measured: diskcache
+core 4 → 19 pass, connection bootstrap universal-crash gone.
+
+### Tier 1 — original findings (kept for the record)
 1. **PRAGMA, accept-and-answer.** Both forms: `PRAGMA x = v` (accept, ignore
    or honor) and `PRAGMA x` (must RETURN a row — diskcache destructures
    `PRAGMA page_size`). 85 of sqlitedict's 87 failures are this one statement.

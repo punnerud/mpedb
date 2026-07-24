@@ -54,14 +54,88 @@ NotSupportedError = ProgrammingError
 Warning = Error
 
 # Constants sqlite3-shaped code passes around; accepted and ignored where
-# they configure machinery mpedb does not have.
+# they configure machinery mpedb does not have. The SQLITE_LIMIT_* /
+# LEGACY_TRANSACTION_CONTROL set matters beyond its face value: two missing
+# constants import-blocked 7 of CPython's 10 test_sqlite3 files.
 PARSE_DECLTYPES = 1
 PARSE_COLNAMES = 2
+LEGACY_TRANSACTION_CONTROL = -1
+SQLITE_OK = 0
+SQLITE_DENY = 1
+SQLITE_IGNORE = 2
+SQLITE_LIMIT_LENGTH = 0
+SQLITE_LIMIT_SQL_LENGTH = 1
+SQLITE_LIMIT_COLUMN = 2
+SQLITE_LIMIT_EXPR_DEPTH = 3
+SQLITE_LIMIT_COMPOUND_SELECT = 4
+SQLITE_LIMIT_VDBE_OP = 5
+SQLITE_LIMIT_FUNCTION_ARG = 6
+SQLITE_LIMIT_ATTACHED = 7
+SQLITE_LIMIT_LIKE_PATTERN_LENGTH = 8
+SQLITE_LIMIT_VARIABLE_NUMBER = 9
+SQLITE_LIMIT_TRIGGER_DEPTH = 10
+SQLITE_LIMIT_WORKER_THREADS = 11
 
 sqlite_version = "3.45.0-mpedb"
 sqlite_version_info = (3, 45, 0)
-version = "0.1.1"
-version_info = (0, 1, 1)
+version = "0.1.2"
+version_info = (0, 1, 2)
+
+# ---------------------------------------------------------------------------
+# The PEP 249 type layer, as sqlite3 defines it. Adapters/converters are
+# REGISTERED faithfully (Django's sqlite backend registers a set at import
+# time) — application is part of the 0.2 detect_types work; registration must
+# not crash the import.
+import datetime as _dt
+
+Date = _dt.date
+Time = _dt.time
+Timestamp = _dt.datetime
+
+
+def DateFromTicks(ticks):
+    return Date.fromtimestamp(ticks)
+
+
+def TimeFromTicks(ticks):
+    return Time(*_dt.datetime.fromtimestamp(ticks).timetuple()[3:6])
+
+
+def TimestampFromTicks(ticks):
+    return Timestamp.fromtimestamp(ticks)
+
+
+Binary = memoryview
+
+adapters = {}
+converters = {}
+
+
+def register_adapter(type_, adapter):
+    """Store the adapter (applied in 0.2's detect_types work)."""
+    adapters[(type_, PrepareProtocol)] = adapter
+
+
+def register_converter(name, converter):
+    """Store the converter (applied in 0.2's detect_types work)."""
+    converters[name.upper()] = converter
+
+
+class PrepareProtocol:
+    """sqlite3's adapter-protocol marker type."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def enable_callback_tracebacks(flag):
+    """Accepted and ignored — mpedb has no C callbacks to swallow tracebacks in."""
+
+
+def complete_statement(statement):
+    """sqlite3's heuristic: does the string end a complete SQL statement?"""
+    s = statement.strip()
+    return s.endswith(";")
 
 __all__ = [
     "Connection",
@@ -89,6 +163,23 @@ __all__ = [
     "threadsafety",
     "version",
     "version_info",
+    "Binary",
+    "Date",
+    "DateFromTicks",
+    "LEGACY_TRANSACTION_CONTROL",
+    "PrepareProtocol",
+    "SQLITE_LIMIT_SQL_LENGTH",
+    "SQLITE_OK",
+    "Time",
+    "TimeFromTicks",
+    "Timestamp",
+    "TimestampFromTicks",
+    "adapters",
+    "complete_statement",
+    "converters",
+    "enable_callback_tracebacks",
+    "register_adapter",
+    "register_converter",
 ]
 
 
@@ -119,3 +210,8 @@ def connect(
     if uri and path.startswith("file:"):
         path = path[5:].split("?", 1)[0]
     return _connect(path, engine=engine)
+
+
+# `from sqlite3 import dbapi2` must resolve as an attribute after a
+# sys.modules swap — the submodule import binds it.
+from mpedb import dbapi2  # noqa: E402,F401
