@@ -1,0 +1,37 @@
+# pip install mpedb — the sqlite3 drop-in backed by the mpedb engine.
+#
+# Built with maturin: the Rust cdylib becomes `mpedb/_native` inside the
+# pure-Python package under python/ (the routing + compat shims live there).
+# abi3-py312: one wheel per platform covers CPython 3.12+.
+
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mpedb"
+version = "0.1.0"
+description = "Drop-in sqlite3 replacement: multi-process embedded database with MVCC snapshots, content-hashed plans, and a sqlite-backed sync mode for .db files"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Morten Punnerud-Engelstad" }]
+keywords = ["database", "sqlite3", "embedded", "mvcc", "sql"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Rust",
+  "Topic :: Database",
+  "Topic :: Database :: Database Engines/Servers",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+
+[project.urls]
+Repository = "https://github.com/punnerud/mpedb"
+
+[tool.maturin]
+python-source = "python"
+module-name = "mpedb._native"
+strip = true

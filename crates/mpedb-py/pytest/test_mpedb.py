@@ -734,14 +734,14 @@ def test_dbapi(cfg_path, base):
         pass
     ok("dbapi: IntegrityError at execute()")
 
-    # The honest boundary: mpedb has no DDL, and a sqlite3 program that runs
-    # some fails HERE rather than being told it is "100% compatible".
-    try:
-        conn.execute("CREATE TABLE nope (id INTEGER)")
-        raise AssertionError("DDL must be refused")
-    except mpedb.ProgrammingError:
-        pass
-    ok("dbapi: DDL is refused, loudly")
+    # Live DDL (#47) through the DB-API — the sqlite3 drop-in contract:
+    # `CREATE TABLE` is how a sqlite3-shaped program builds schema, so it must
+    # work here, immediately queryable on the same connection.
+    conn.execute("CREATE TABLE ddl_ok (id INTEGER PRIMARY KEY, s TEXT)")
+    conn.execute("INSERT INTO ddl_ok (id, s) VALUES (?, ?)", [1, "x"])
+    conn.commit()
+    assert conn.execute("SELECT s FROM ddl_ok WHERE id = 1").fetchone() == ("x",)
+    ok("dbapi: live DDL (CREATE TABLE) works through the DB-API")
 
     conn.close()
     try:

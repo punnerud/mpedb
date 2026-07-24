@@ -13,7 +13,10 @@ name = "mpedb_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-mpedb = { workspace = true }
+# `sqlite-checkpoint`: the `.db` routing (a sqlite file as base, mpedb as the
+# delta) needs the overlay's checkpoint push — `Connection.commit()` on a `.db`
+# path IS that checkpoint, which is what keeps the base in sync.
+mpedb = { workspace = true, features = ["sqlite-checkpoint"] }
 chrono = "0.4"
 # pyo3 is deliberately NOT a workspace dependency: only this crate binds Python.
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py312", "chrono"] }

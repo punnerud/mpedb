@@ -1,0 +1,91 @@
+# PyPI publish: when the tests are green on main, the `mpedb` package updates.
+#
+# Self-contained gate: this workflow runs the full workspace + capi suites
+# itself and only builds/publishes wheels if they pass — "green on GitHub"
+# IS the publish condition, not a parallel hope. `--skip-existing` makes a
+# push that does not bump the version in crates/mpedb-py/pyproject.toml a
+# no-op at the upload step, so ordinary pushes stay cheap and releasing is
+# exactly "bump the version, push, watch it go green".
+
+name: pypi
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: workspace tests
+        run: cargo test --workspace
+      - name: capi tests (own workspace)
+        run: cargo test --manifest-path crates/mpedb-capi/Cargo.toml
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  wheel-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          path: dist
+
+  wheel-macos:
+    needs: test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos
+          path: dist
+
+  sdist:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: -o dist --manifest-path crates/mpedb-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    needs: [wheel-linux, wheel-macos, sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          pip install --quiet twine
+          twine upload --skip-existing dist/*

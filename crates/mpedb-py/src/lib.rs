@@ -674,9 +674,19 @@ impl PySession {
 
 /// A DB-API 2.0 connection: a [`PyDatabase`] plus the transaction state PEP
 /// 249 requires (it has no autocommit — a connection is always in one).
+/// Which engine answers this connection — the `pip install mpedb` routing
+/// surface. `Native` is mpedb proper (`.mpedb` / `:memory:` / explicit
+/// `mpedb.mpedb`); `Overlay` is the sqlite-backed mode (#69): a `.db` path is
+/// READ as sqlite and every write lands in an mpedb delta pushed back into the
+/// base by `checkpoint()` — `commit()` here — so the `.db` stays in sync.
+enum Backend {
+    Native(Arc<Db>),
+    Overlay(Arc<Mutex<mpedb::SqliteOverlay>>),
+}
+
 #[pyclass(name = "Connection", module = "mpedb")]
 struct PyConnection {
-    db: Arc<Db>,
+    backend: Backend,
     /// The open transaction, if anything has been written since the last
     /// commit/rollback. PEP 249 says a connection is always in a transaction;
     /// mpedb's writer lock is exclusive, so one is only TAKEN once there is
@@ -722,18 +732,33 @@ impl PyConnection {
         if self.closed {
             return Err(closed_err());
         }
-        let Some(session) = self.txn.take() else {
-            return Ok(()); // nothing written; a no-op, as in sqlite3
-        };
-        let db = self.db.clone();
-        py.detach(move || -> Result<(), DbError> {
-            let mut w = db.begin()?;
-            for (sql, params) in &session.pending {
-                w.query(sql, params)?;
+        match &self.backend {
+            Backend::Native(db) => {
+                let Some(session) = self.txn.take() else {
+                    return Ok(()); // nothing written; a no-op, as in sqlite3
+                };
+                let db = db.clone();
+                py.detach(move || -> Result<(), DbError> {
+                    let mut w = db.begin()?;
+                    for (sql, params) in &session.pending {
+                        w.query(sql, params)?;
+                    }
+                    w.commit()
+                })
+                .map_err(map_err)
             }
-            w.commit()
-        })
-        .map_err(map_err)
+            // Overlay writes are per-statement (autocommit into the delta);
+            // `commit()` is the SYNC point: checkpoint pushes the delta into
+            // the `.db` base, which is what keeps sqlite and mpedb one store.
+            Backend::Overlay(ov) => {
+                let ov = ov.clone();
+                py.detach(move || -> Result<(), DbError> {
+                    let mut g = ov.lock().expect("overlay poisoned");
+                    g.checkpoint().map(|_| ())
+                })
+                .map_err(map_err)
+            }
+        }
     }
 
     /// PEP 249 `Connection.rollback()` — drop what was buffered.
@@ -801,6 +826,34 @@ struct PyCursor {
 }
 
 impl PyCursor {
+    /// Load one ExecResult into this cursor's PEP 249 state — shared by the
+    /// native read path and the overlay per-statement path.
+    fn load_result(&mut self, py: Python<'_>, res: ExecResult) -> PyResult<()> {
+        match res {
+            ExecResult::Rows { columns, rows } => {
+                let list = rows_to_py(py, rows)?;
+                self.rowcount = -1; // PEP 249: undefined for SELECT
+                self.description = Some(describe(py, &columns)?);
+                self.rows = list.iter().map(|r| r.unbind()).collect();
+                self.pos = 0;
+            }
+            ExecResult::Affected(n) => {
+                self.rowcount = n as i64;
+                self.rows.clear();
+                self.pos = 0;
+                self.description = None;
+            }
+            ExecResult::Explain(text) => {
+                self.description = Some(describe(py, &["plan".to_string()])?);
+                let row = (text,).into_pyobject(py)?.into_any().unbind();
+                self.rows = vec![row];
+                self.pos = 0;
+                self.rowcount = -1;
+            }
+        }
+        Ok(())
+    }
+
     fn is_write(sql: &str) -> bool {
         let t = sql.trim_start();
         ["insert", "update", "delete"]
@@ -830,7 +883,25 @@ impl PyCursor {
         if conn.closed {
             return Err(closed_err());
         }
-        let db = conn.db.clone();
+        // The overlay backend runs EVERYTHING per statement: reads consult
+        // base+delta merged, writes land in the delta immediately (autocommit),
+        // and `commit()` checkpoints into the base. Read-your-writes therefore
+        // HOLDS on this backend — the delta is already durable.
+        if let Backend::Overlay(ov) = &conn.backend {
+            let ov = ov.clone();
+            let sql2 = sql.clone();
+            let res = py
+                .detach(move || {
+                    run_coercing(vals, |p| {
+                        ov.lock().expect("overlay poisoned").query(&sql2, p)
+                    })
+                })
+                .map_err(map_err)?;
+            drop(conn);
+            return self.load_result(py, res);
+        }
+        let Backend::Native(db) = &conn.backend else { unreachable!() };
+        let db = db.clone();
 
         if !PyCursor::is_write(&sql) {
             // A read runs against the committed snapshot. It does NOT see this
@@ -841,29 +912,8 @@ impl PyCursor {
             let res = py
                 .detach(move || run_coercing(vals2, |p| db.query(&sql2, p)))
                 .map_err(map_err)?;
-            match res {
-                ExecResult::Rows { columns, rows } => {
-                    let list = rows_to_py(py, rows)?;
-                    self.rowcount = -1; // PEP 249: undefined for SELECT
-                    self.description = Some(describe(py, &columns)?);
-                    self.rows = list.iter().map(|r| r.unbind()).collect();
-                    self.pos = 0;
-                }
-                ExecResult::Affected(n) => {
-                    self.rowcount = n as i64;
-                    self.rows.clear();
-                    self.pos = 0;
-                    self.description = None;
-                }
-                ExecResult::Explain(text) => {
-                    self.description = Some(describe(py, &["plan".to_string()])?);
-                    let row = (text,).into_pyobject(py)?.into_any().unbind();
-                    self.rows = vec![row];
-                    self.pos = 0;
-                    self.rowcount = -1;
-                }
-            }
-            return Ok(());
+            drop(conn);
+            return self.load_result(py, res);
         }
 
         // A write. Validate it NOW against a throwaway session so the error
@@ -983,12 +1033,60 @@ fn describe(py: Python<'_>, columns: &[String]) -> PyResult<Py<PyAny>> {
     Ok(out.into_any().unbind())
 }
 
-/// PEP 249 `connect()`.
+/// PEP 249 `connect()` — sqlite3-shaped: takes a DATABASE path, not a config.
+///
+/// Routing (the `pip install mpedb` contract):
+/// - `":memory:"`            → native mpedb, process-private memory
+/// - `*.db`                  → sqlite-backed overlay (#69): reads the sqlite
+///   file, writes land in an mpedb delta, `commit()` checkpoints back into the
+///   `.db` — one store, kept in sync
+/// - `*.toml`                → an explicit mpedb config file (the pre-package
+///   behaviour, kept for callers that configure schema/durability up front)
+/// - anything else (`.mpedb`)→ native mpedb file; tables are created with
+///   ordinary `CREATE TABLE` (live DDL)
+///
+/// `engine="mpedb"` forces the native engine for ANY path — the
+/// `mpedb.mpedb` submodule; `engine="sqlite3"` is the default routing above.
 #[pyfunction]
-fn connect(py: Python<'_>, config_path: PathBuf) -> PyResult<PyConnection> {
-    let db = py.detach(move || Db::open(&config_path)).map_err(map_err)?;
+#[pyo3(signature = (path, engine=None))]
+fn connect(py: Python<'_>, path: PathBuf, engine: Option<&str>) -> PyResult<PyConnection> {
+    let spelled = path.to_string_lossy().into_owned();
+    let force_native = matches!(engine, Some("mpedb"));
+    if !force_native && spelled.ends_with(".db") {
+        let ov = py
+            .detach(move || mpedb::SqliteOverlay::open(&path))
+            .map_err(map_err)?;
+        return Ok(PyConnection {
+            backend: Backend::Overlay(Arc::new(Mutex::new(ov))),
+            txn: None,
+            closed: false,
+        });
+    }
+    let db = if spelled.ends_with(".toml") && !force_native {
+        py.detach(move || Db::open(&path)).map_err(map_err)?
+    } else {
+        // A database PATH (`:memory:`, `.mpedb`, or forced native): a minimal
+        // config with no seed tables — `CREATE TABLE` (live DDL, #47) is how a
+        // sqlite3-shaped caller builds schema. `size_mb` is RESERVED sparse,
+        // not used.
+        // mpedb refuses a schema with NO live tables, and a sqlite3-shaped
+        // `connect("new.mpedb")` carries no schema — so the seed holds one
+        // inert bootstrap table (the mpedb-capi solution, same name family);
+        // user tables are created live via `CREATE TABLE`.
+        let toml = format!(
+            "[database]\npath = \"{}\"\nsize_mb = 1024\nmax_readers = 64\n\n\
+             [[table]]\nname = \"_mpedb_py_bootstrap\"\nprimary_key = [\"id\"]\n\
+             [[table.column]]\nname = \"id\"\ntype = \"int64\"\n",
+            spelled.replace('\\', "/").replace('"', "")
+        );
+        py.detach(move || {
+            let cfg = mpedb::Config::from_toml_str(&toml)?;
+            Db::open_with_config(cfg)
+        })
+        .map_err(map_err)?
+    };
     Ok(PyConnection {
-        db: Arc::new(db),
+        backend: Backend::Native(Arc::new(db)),
         txn: None,
         closed: false,
     })
@@ -1004,7 +1102,7 @@ fn assert_thread_safe() {
     ok::<PySession>();
 }
 
-#[pymodule(name = "mpedb", gil_used = false)]
+#[pymodule(name = "_native", gil_used = false)]
 fn mpedb_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDatabase>()?;
     m.add_class::<PyTransaction>()?;
