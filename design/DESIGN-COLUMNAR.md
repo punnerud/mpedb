@@ -285,23 +285,37 @@ verification-calibration rule reserves for commit-path/wire-format changes. It
 also hands the derived-table machinery (DESIGN-TRIGGERS `[[model.derived]]`) a
 precise staleness signal it currently lacks — worth building once, used twice.
 
-## 7. MPEE prices column-scan vs row-scan
+## 7. Where "automatic via MPEE" actually landed (stage 4, SHIPPED)
 
-The access-path choice becomes a real cost decision the solver makes, extending
-the CostSource seam (DESIGN-MPEE-GENERAL §9.3):
+The first draft of this section imagined the planner PRICING a column scan
+against a row scan and choosing between them. Building it revealed that the
+choice does not live in the planner at all, and the reason is the better
+design:
 
-- **Row scan** cost ≈ `rows × row_width` bytes touched.
-- **Column scan** cost ≈ `Σ blocks (not pruned by the zone map) × block_bytes`
-  for the referenced columns only — and under a range predicate the pruned
-  fraction is estimable from the NDV/zone-map statistics the analyze pass
-  already gathers.
+**Segments are chosen at EXECUTION, transparently.** A scan-aggregate
+(`try_fused_fold`, the group-by fast path) tries its segments and uses them iff
+they are fresh and cover the table (§6), falling back to the row scan
+otherwise. There is no "column scan" plan node and no plan-time decision — the
+plan is identical whether segments exist or not, and execution picks the
+cheaper source with no cost estimate to get wrong. This is what makes the whole
+feature fail-safe: a mis-priced access path could pick the wrong plan, but a
+transparent execution-time source cannot.
 
-So a `sum(amount)` over a fact table prices the column scan far below the row
-scan and takes it; a `SELECT *` prices the row scan below (a column store would
-have to stitch every column back into a row) and keeps it. The solver picks per
-query from measured widths, not a hardcoded rule — which is the whole "automatic
-via MPEE" ask, and the reason column-vs-row belongs in the cost layer rather
-than in a per-table flag.
+So "automatic via MPEE" is the model deciding WHICH segments exist, not the
+planner deciding whether to read them. `Database::sync_columnar` (`mpedb model
+sync-columnar`) reads the workload model and builds segments for the scan-heavy
+tables (role `fact`, or a `star-olap` archetype unless the table is a
+`dimension`), dropping them for point-oriented tables. That IS the pricing —
+the model's roles are the cost input, and a dimension read by keys is priced
+out of a segment because it would never be read from one. Sparse and dynamic:
+only scanned fact tables get segments, and the set is regenerable, so the
+advisor can move it as the workload does.
+
+A future planner-side cost (a `SELECT *` that stitches every column back into a
+row is cheaper off the row tree; a fifty-column scan of two columns is cheaper
+off segments) would extend the CostSource seam (DESIGN-MPEE-GENERAL §9.3), but
+it is a refinement, not a prerequisite: today's transparent execution already
+takes the cheaper source per query without it.
 
 ## 8. Staged plan (each stage ships, measurable, fail-safe)
 
@@ -321,13 +335,17 @@ Differential-tested against the row scan, bit-for-bit, on every corpus shape.
 for range and equality predicates (the larger DuckDB-shaped win, `scan-range`
 and `scan-filter`). Composes with the filtered fold.
 
-**Stage 3 — dictionary + sparse + group-by.** Dictionary encoding, run-of-
-default, and `GROUP BY` on dictionary codes — where the group cells already ahead
-of SQLite widen further.
+**Stage 3 — dictionary + sparse + group-by.** SHIPPED. Dictionary encoding
+(text/blob segmentable, low-cardinality numerics shrunk), run-of-default sparse,
+a null-free flag, and `GROUP BY` served from segments — integer keys (3a) and
+text keys via the dictionary (3b). Measured: category 0.76 B/row, sparse
+discount 0.50 B/row; text group 512 → 417 ms.
 
-**Stage 4 — MPEE pricing + model-driven build.** The cost decision (§7) and
-`mpedb model sync-columnar` building the segments the model+advisor call for
-(§2). This is where "automatic + sparse + dynamic via MPEE" lands in full.
+**Stage 4 — model-driven build.** SHIPPED as `Database::sync_columnar` /
+`mpedb model sync-columnar` (§7): the model's roles decide which tables get
+segments (fact/star-olap → columnar, dimension → row), regenerable so the set
+moves with the workload. The planner-side column-vs-row cost (§7) is a deferred
+refinement — execution already picks the cheaper source transparently.
 
 **Stage 5 — the moving boundary.** The `colseg_watermark` and the split
 delta/main scan (§5.1): appends above the watermark keep the segments valid,

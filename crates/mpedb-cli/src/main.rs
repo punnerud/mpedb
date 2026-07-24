@@ -65,6 +65,10 @@ usage: mpedb <command> [args]
                                            workload model — DESIGN-MODEL-LANG.md)
   model set <target> <model.toml>          store the workload model
   model show <target>                      print the stored model
+  model sync-columnar <target>             build column segments for the tables
+                                           the model marks scan-heavy (fact /
+                                           star-olap); drop them for row-oriented
+                                           ones — automatic + sparse via MPEE
   fn define <target> <file.py|file.rs>     store a PySpell SQL function
   fn drop <target> <name>                  drop a stored function
   fn list <target>                         list stored functions
@@ -284,8 +288,23 @@ fn cmd_model(args: &[String]) -> CliResult {
             }
             Ok(())
         }
+        [sub, config] if sub == "sync-columnar" => {
+            let db = crate::util::open_target(config)?;
+            let r = db.sync_columnar()?;
+            for (t, n) in &r.columnarized {
+                println!("columnarized {t} ({n} columns)");
+            }
+            for t in &r.dropped {
+                println!("dropped segments for {t} (row-oriented in the model)");
+            }
+            if r.columnarized.is_empty() && r.dropped.is_empty() {
+                println!("the model marks no scan-heavy tables");
+            }
+            Ok(())
+        }
         _ => usage(
-            "model needs: set <target> <model.toml> | show <target> | sync-derived <target>",
+            "model needs: set <target> <model.toml> | show <target> | \
+             sync-derived <target> | sync-columnar <target>",
         ),
     }
 }
