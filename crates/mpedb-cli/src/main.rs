@@ -164,6 +164,11 @@ fn dispatch(argv: &[String]) -> CliResult {
     };
     let rest = &argv[1..];
     match cmd.as_str() {
+        // What a packaged binary is expected to answer (`brew test` runs it).
+        "--version" | "-V" | "version" => {
+            println!("mpedb {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "exec" => cmd_exec(rest),
         "prepare" => cmd_prepare(rest),
         "advise" => cmd_advise(rest),
