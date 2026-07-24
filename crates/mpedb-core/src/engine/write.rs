@@ -1820,6 +1820,50 @@ impl<'e> WriteTxn<'e> {
         btree::get(self, self.catalog_root, &sys_key(subkey))
     }
 
+    /// Store `bytes` as a CONTIGUOUS extent under sys key `subkey`, as a genuine
+    /// [`ExtentRef`](btree::Payload::ExtentRef) catalog cell — the columnar-
+    /// segment storage of DESIGN-COLUMNAR §7.3. It is the EXACT allocate →
+    /// payload → map-edit → insert sequence a spilling row value takes, so the
+    /// run inherits that path's crash safety (the commit fixpoint / extent map)
+    /// and MVCC pinning unchanged, AND two properties fall out for free:
+    ///
+    /// * the page-accounting verifier accounts for the run generically — it
+    ///   already walks every tree's [`collect_extents`](btree::collect_extents),
+    ///   and the catalog tree is one of them, so a colseg extent is neither
+    ///   "leaked" nor an unreferenced map entry (which a raw extent with its ref
+    ///   hidden in a `Flat` value WOULD have been);
+    /// * an [`Upsert`](InsertMode::Upsert) that replaces this key, and a
+    ///   [`sys_delete`](Self::sys_delete) that removes it, free the old run
+    ///   through the ONE `free_old_val` path the btree uses for row extents — so
+    ///   colseg needs NO manual free bookkeeping (no double-free surface).
+    ///
+    /// Because the bytes land contiguous in the file, a reader borrows them
+    /// ZERO-COPY straight from the mapping ([`ReadTxn::extent_slice`], via
+    /// [`ReadTxn::sys_extent_ref`]) instead of copying a 512 KiB overflow chain
+    /// out per block — the measured OLAP scan bottleneck, not the aggregation.
+    pub fn sys_put_extent(&mut self, subkey: &[u8], bytes: &[u8]) -> Result<()> {
+        let total_len = bytes.len() as u64;
+        if total_len == 0 {
+            return Err(Error::Internal("sys_put_extent of an empty payload".into()));
+        }
+        let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
+            .map_err(|_| Error::Unsupported("segment block too large for one extent".into()))?;
+        // Allocate + write the payload + record the map edit BEFORE inserting the
+        // cell, exactly as `insert_row_streaming` does. A failure past the alloc
+        // aborts the whole txn (map edits and the alloc are discarded on
+        // rollback), so a half-written run never survives to leak.
+        let start_page = self.alloc_run(npages)?;
+        leakstat::add(&leakstat::EXTENT_ALLOC_PAGES, u64::from(npages));
+        self.write_extent_payload(start_page, npages, &[bytes], total_len)?;
+        self.pending_map_edits
+            .push(super::extent::MapEdit::Insert(start_page, npages));
+        let mut payload = btree::Payload::ExtentRef { start_page, total_len, npages };
+        let root = self.catalog_root;
+        let out = btree::insert(self, root, &sys_key(subkey), &mut payload, InsertMode::Upsert)?;
+        self.catalog_root = out.new_root;
+        Ok(())
+    }
+
     pub fn sys_put(&mut self, subkey: &[u8], value: &[u8]) -> Result<()> {
         let root = self.catalog_root;
         let out = btree::insert(self, root, &sys_key(subkey), &mut btree::Payload::Flat(value), InsertMode::Upsert)?;
@@ -1857,6 +1901,22 @@ impl<'e> WriteTxn<'e> {
         let mut out = Vec::new();
         while let Some((k, v)) = c.next(self)? {
             out.push((k[1..].to_vec(), v));
+        }
+        Ok(out)
+    }
+
+    /// [`sys_scan_range`](Self::sys_scan_range) yielding only KEYS, values never
+    /// resolved (see [`ReadTxn::sys_scan_range_keys`]). The columnar
+    /// re-compaction deletes the old blocks of one column by key without pulling
+    /// each 512 KiB extent back in.
+    pub fn sys_scan_range_keys(&mut self, lo: &[u8], hi: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let klo = sys_key(lo);
+        let khi = sys_key(hi);
+        let root = self.catalog_root;
+        let mut c = btree::cursor(self, root, Some((&klo, true)), Some((&khi, false)))?;
+        let mut out = Vec::new();
+        while let Some(k) = c.next_key(self)? {
+            out.push(k[1..].to_vec());
         }
         Ok(out)
     }

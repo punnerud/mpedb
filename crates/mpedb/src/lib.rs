@@ -1956,6 +1956,26 @@ impl Database {
             .collect())
     }
 
+    /// The KEYS of namespace `ns`, prefix-stripped, without resolving the
+    /// values — the drop path for a family whose values are extents (columnar
+    /// segment blocks), where resolving would materialize every block.
+    pub(crate) fn sys_record_scan_keys(&self, ns: &str) -> Result<Vec<Vec<u8>>> {
+        check_sys_ns(ns)?;
+        let mut prefix = Vec::with_capacity(ns.len() + 1);
+        prefix.extend_from_slice(ns.as_bytes());
+        prefix.push(0);
+        let mut end = prefix.clone();
+        *end.last_mut().expect("non-empty") = 1;
+        let r = self.engine.begin_read()?;
+        let all = r.sys_scan_range_keys(&prefix, &end);
+        r.finish()?;
+        Ok(all?
+            .into_iter()
+            .filter(|k| k.starts_with(&prefix))
+            .map(|k| k[prefix.len()..].to_vec())
+            .collect())
+    }
+
     // ---------------- internal: plan registry protocol ----------------
 
     /// Local-cache/registry publication for a freshly compiled plan.
@@ -2702,6 +2722,20 @@ impl WriteSession<'_> {
         self.txn.clear_columnar_watermark(table_id)
     }
 
+    /// Store a column-segment block as a contiguous extent under its namespaced
+    /// sys-record key (DESIGN-COLUMNAR §7.3). Unlike [`sys_record_put`], the
+    /// value is NOT size-capped — the bytes live in an extent, and the catalog
+    /// cell is a tiny reference the verifier and the extent-free path both know.
+    /// A re-`put` or [`sys_record_delete`] of the same key frees the old run
+    /// automatically. See [`mpedb_core::engine::WriteTxn::sys_put_extent`].
+    ///
+    /// [`sys_record_put`]: Self::sys_record_put
+    /// [`sys_record_delete`]: Self::sys_record_delete
+    pub(crate) fn sys_record_put_extent(&mut self, ns: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
+        let subkey = sys_record_subkey(ns, key)?;
+        self.txn.sys_put_extent(&subkey, bytes)
+    }
+
     /// Scan namespaced system records whose key is in `[lo, hi)`, prefix-bounded
     /// (the mirror's dirty-set / park scans). Keys returned with the namespace
     /// prefix stripped.
@@ -2747,6 +2781,46 @@ impl WriteSession<'_> {
             .sys_scan_range(&klo, &khi)?
             .into_iter()
             .map(|(k, v)| (k[strip..].to_vec(), v))
+            .collect())
+    }
+
+    /// [`sys_record_scan_range`](Self::sys_record_scan_range) yielding only
+    /// KEYS (namespace-stripped), values never resolved. `lo`/`hi` bound one
+    /// column's block records; the re-compaction deletes them without pulling
+    /// each 512 KiB extent back in. Whole-namespace `lo = []`, `hi = [0xff]`.
+    pub(crate) fn sys_record_scan_range_keys(
+        &mut self,
+        ns: &str,
+        lo: &[u8],
+        hi: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        check_sys_ns(ns)?;
+        if lo.len() > SYS_RECORD_MAX_KEY || hi.len() > SYS_RECORD_MAX_KEY {
+            return Err(Error::Unsupported(format!(
+                "system record key must be ≤{SYS_RECORD_MAX_KEY} bytes"
+            )));
+        }
+        let mut klo = Vec::with_capacity(ns.len() + 1 + lo.len());
+        klo.extend_from_slice(ns.as_bytes());
+        klo.push(0);
+        klo.extend_from_slice(lo);
+        let khi = if lo.is_empty() && hi == [0xff] {
+            let mut e = ns.as_bytes().to_vec();
+            e.push(1);
+            e
+        } else {
+            let mut k = Vec::with_capacity(ns.len() + 1 + hi.len());
+            k.extend_from_slice(ns.as_bytes());
+            k.push(0);
+            k.extend_from_slice(hi);
+            k
+        };
+        let strip = ns.len() + 1;
+        Ok(self
+            .txn
+            .sys_scan_range_keys(&klo, &khi)?
+            .into_iter()
+            .map(|k| k[strip..].to_vec())
             .collect())
     }
 

@@ -1177,6 +1177,11 @@ impl Engine {
                 for r in roots2 {
                     btree::collect_extents(&txn, r, &mut refs)?;
                 }
+                // Sys-keyspace extents (columnar segment blocks, DESIGN-COLUMNAR
+                // §7.3) live as ExtentRef cells in the catalog tree itself, not
+                // in a table root — walk it too, or every live segment's run
+                // reads as an unreferenced map entry (`refs != mapped`).
+                btree::collect_extents(&txn, txn.catalog_root, &mut refs)?;
             }
             refs.sort_unstable();
             if refs.windows(2).any(|w| w[0].0 == w[1].0) {

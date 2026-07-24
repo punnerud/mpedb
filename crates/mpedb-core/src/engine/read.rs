@@ -239,6 +239,27 @@ impl ReadTxn<'_> {
         btree::max_key(self, root)
     }
 
+    /// Borrow an extent's `len` bytes ZERO-COPY from the mapping (DESIGN-COLUMNAR
+    /// §7.3) — the columnar segment read path. The slice points straight into
+    /// the mmap; no overflow chain is walked and nothing is copied, which is what
+    /// makes a segment scan run at memory speed.
+    ///
+    /// **Validity is bounded by the pin.** An extent freed by a commit AFTER
+    /// this snapshot is not reused while this reader stays pinned (the freed
+    /// pages carry that commit's txn id, reusable only once no reader pins an
+    /// older snapshot). But the pin can still be evicted under reader-table
+    /// pressure, after which a writer may reuse the pages — so a caller that
+    /// consumes the slice MUST revalidate [`still_pinned`](Self::still_pinned)
+    /// afterwards and discard the result on `false`, exactly as `blob_read` does
+    /// per chunk. The pages are committed and immutable within the pin, so there
+    /// is no torn read to guard against, only reuse-after-eviction.
+    pub fn extent_slice(&self, start_page: u64, len: u64) -> Result<&[u8]> {
+        let off = (start_page as usize)
+            .checked_mul(PAGE_SIZE)
+            .ok_or_else(|| Error::Corrupt("extent offset overflow".into()))?;
+        self.eng.shm.bytes(off, len as usize)
+    }
+
     /// Open one `text`/`blob` column of one row for CHUNKED reading — the
     /// eviction valve of DESIGN-BLOBEXTENT §5. `range` clamps to the value
     /// (`None` = the whole value); `Ok(None)` when the row is absent or the
@@ -1013,6 +1034,28 @@ impl ReadTxn<'_> {
         btree::get(self, self.meta.catalog_root, &sys_key(subkey))
     }
 
+    /// The `(start_page, total_len)` of the CONTIGUOUS extent stored under sys
+    /// key `subkey` by [`WriteTxn::sys_put_extent`], or `None` — the columnar-
+    /// segment read path (DESIGN-COLUMNAR §7.3). It DESCENDS to the cell WITHOUT
+    /// resolving the payload ([`btree::value_loc`]), so the caller can borrow the
+    /// block ZERO-COPY via [`extent_slice`](Self::extent_slice) instead of the
+    /// copy [`sys_get`](Self::sys_get) would force.
+    ///
+    /// `None` covers both an ABSENT record and a present NON-extent value (a
+    /// block written by a pre-extent-storage build as a `Flat`/overflow record).
+    /// The columnar reader treats either as "no segment here" and declines to
+    /// the row scan — colseg's universal fail-safe, and a ~free fallback that
+    /// keeps an old file's queries answering (segments are regenerable) rather
+    /// than hard-failing on a stale layout.
+    pub fn sys_extent_ref(&self, subkey: &[u8]) -> Result<Option<(u64, u64)>> {
+        match btree::value_loc(self, self.meta.catalog_root, &sys_key(subkey))? {
+            Some(btree::ValueLoc::Extent { start_page, total_len }) => {
+                Ok(Some((start_page, total_len)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// All system records, subkeys with the reserved prefix stripped.
     pub fn sys_scan(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let lo = [SYS_PREFIX];
@@ -1041,6 +1084,26 @@ impl ReadTxn<'_> {
         let mut out = Vec::new();
         while let Some((k, v)) = c.next(self)? {
             out.push((k[1..].to_vec(), v));
+        }
+        Ok(out)
+    }
+
+    /// [`sys_scan_range`](Self::sys_scan_range) yielding only KEYS — the values
+    /// are never resolved. For a family whose values are extents (columnar
+    /// segment blocks): a keyed delete must not materialize every 512 KiB block
+    /// just to learn its key.
+    pub fn sys_scan_range_keys(&self, lo: &[u8], hi: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let klo = sys_key(lo);
+        let khi = sys_key(hi);
+        let mut c = btree::cursor(
+            self,
+            self.meta.catalog_root,
+            Some((&klo, true)),
+            Some((&khi, false)),
+        )?;
+        let mut out = Vec::new();
+        while let Some(k) = c.next_key(self)? {
+            out.push(k[1..].to_vec());
         }
         Ok(out)
     }
