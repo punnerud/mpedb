@@ -137,89 +137,144 @@ fn budget_fits_in_memory(cells: u64) -> bool {
 ///
 /// `outer` lands at slot 0 and `inner` at `inner_at`, with NULL padding in
 /// between and after. Both sides may be SHORTER than the region they occupy:
-/// #125 narrows a held tuple to the slots a later stage can observe, and the
-/// dropped tail then reads as the NULL padding it already was for a LEFT
-/// join's unmatched inner side. Positions are therefore fixed by `inner_at`
-/// and `cap` — the plan's column indices are absolute in this tuple and
-/// nothing may shift them — which is also why the LEFT extension
-/// (`inner = &[]`) and the FULL sweep (`outer = &[]`) are this same call.
-///
-/// Two regimes, chosen by the caller from the cell budget:
-///
-/// - **finite budget** (the default): the deterministic cell cap is the
-///   guard, so the build is the plain `with_capacity` + `extend_from_slice`
-///   it always was — the O(n·m) candidate loop pays nothing for the budget
-///   machinery beyond one predicted branch.
-/// - **`fallible` (budget `0` = unlimited)**: every allocation the row makes
-///   is fallible — the spine via `try_reserve_exact`, and each text/blob
-///   payload via [`try_clone_value`] (at the memory wall those per-value
-///   clones are exactly what an infallible `extend_from_slice` aborts on;
-///   observed: a 26-byte `String` clone). Scalars are cloned inline (their
-///   `Clone` cannot allocate); only heap-carrying values take the outlined
-///   fallible path, which never inlines (`List` makes it recursive).
-// inline(always): this is the body of the O(n·m) candidate loop — as a mere
-// hint the call stayed outlined and cost ~1-2 ns per candidate (measurable
-// on a 400M-candidate join).
-#[inline(always)]
-fn build_joined_row(
-    fallible: bool,
-    cap: usize,
-    outer: &[Value],
-    inner: &[Value],
-    inner_at: usize,
-) -> Result<Vec<Value>> {
-    let mut joined;
-    if fallible {
-        joined = Vec::new();
-        joined.try_reserve_exact(cap).map_err(|_| join_oom())?;
-        push_clones(&mut joined, outer)?;
-        joined.resize(inner_at, Value::Null);
-        push_clones(&mut joined, inner)?;
-    } else {
-        joined = Vec::with_capacity(cap);
-        joined.extend_from_slice(outer);
-        joined.resize(inner_at, Value::Null);
-        joined.extend_from_slice(inner);
-    }
-    joined.resize(cap, Value::Null);
-    Ok(joined)
+/// The join accumulator as ONE flat, width-strided `Vec<Value>` instead of a
+/// `Vec` per row — the §9.4 residual made structural. The per-row spine was
+/// "3 allocations to carry 2 integers": every KEPT candidate paid a fresh heap
+/// `Vec` (the `mem::take`d buffer), `narrow_row` paid another, and the stage's
+/// `Vec<Vec<Value>>` dropped them all one by one. In the arena a candidate is
+/// built IN PLACE at the tail, the `ON` is evaluated against that slice, and a
+/// reject is a `truncate` — so a kept row costs ZERO extra allocations and a
+/// rejected one exactly the clone+drop it already cost. Row order, widths and
+/// the cell accounting are untouched: this changes how rows are CARRIED, never
+/// which rows exist.
+pub(super) struct RowArena {
+    vals: Vec<Value>,
+    width: usize,
+    /// EXPLICIT row count, never derived from `vals.len() / width`: a stage
+    /// whose #125 mask observes NOTHING downstream (`count(*)` over a join)
+    /// carries ZERO-width rows, which exist as rows while occupying no cells —
+    /// exactly what a length division cannot represent. The old `Vec<Vec<_>>`
+    /// got this for free (an empty `Vec` is still an element); the arena must
+    /// count deliberately.
+    rows: usize,
 }
 
-/// [`build_joined_row`] into an EXISTING buffer, reusing its allocation.
-///
-/// The inner candidate loop evaluates the ON over `[outer ‖ inner]` and, for a
-/// selective join, DISCARDS most candidates. Building a fresh `Vec` per
-/// candidate — the pre-`4471128` join path — allocated and freed one heap
-/// buffer per considered pair, the dominant cost in the `gather_joined`
-/// profile (malloc/free + drop chains). Filling a reused buffer instead pays
-/// one allocation across a run of rejected candidates; a KEPT candidate
-/// `mem::take`s the buffer (moved, never cloned — exactly the old cost), so
-/// this is strictly ≤ the old allocation count in every case: a cross join
-/// where every candidate is kept reallocates each time as before, a selective
-/// join shares one buffer across its rejects.
-#[inline]
-fn fill_joined_row(
-    buf: &mut Vec<Value>,
-    fallible: bool,
-    cap: usize,
-    outer: &[Value],
-    inner: &[Value],
-    inner_at: usize,
-) -> Result<()> {
-    buf.clear();
-    if fallible {
-        buf.try_reserve(cap).map_err(|_| join_oom())?;
-        push_clones(buf, outer)?;
-        buf.resize(inner_at, Value::Null);
-        push_clones(buf, inner)?;
-    } else {
-        buf.reserve(cap);
-        buf.extend_from_slice(outer);
-        buf.resize(inner_at, Value::Null);
-        buf.extend_from_slice(inner);
+impl RowArena {
+    fn new(width: usize) -> RowArena {
+        RowArena { vals: Vec::new(), width, rows: 0 }
     }
-    buf.resize(cap, Value::Null);
-    Ok(())
+
+    /// Adopt a `Vec<Vec<Value>>` stage (the initial outer gather). Values are
+    /// MOVED, not cloned; the per-row spines are freed here once instead of at
+    /// every later stage.
+    fn from_rows(rows: Vec<Vec<Value>>, width: usize) -> RowArena {
+        let mut a = RowArena::new(width);
+        a.vals.reserve(rows.len().saturating_mul(a.width));
+        for r in rows {
+            debug_assert_eq!(r.len(), a.width);
+            a.vals.extend(r);
+            a.rows += 1;
+        }
+        a
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.rows
+    }
+
+    /// Commit the row appended since the last committed tail — the KEEP half
+    /// of the append → evaluate → keep/reject protocol. A reject truncates
+    /// instead and commits nothing.
+    fn commit_row(&mut self) {
+        self.rows += 1;
+    }
+
+    pub(super) fn row(&self, i: usize) -> &[Value] {
+        &self.vals[i * self.width..(i + 1) * self.width]
+    }
+
+    /// Append `[outer ‖ pad-to-inner_at ‖ inner ‖ pad-to-cap]` at the tail and
+    /// return the row's start offset — [`build_joined_row`]'s layout, built in
+    /// place. On a reject the caller truncates back to `start`.
+    fn append_candidate(
+        &mut self,
+        fallible: bool,
+        cap: usize,
+        outer: &[Value],
+        inner: &[Value],
+        inner_at: usize,
+    ) -> Result<usize> {
+        let start = self.vals.len();
+        if fallible {
+            self.vals.try_reserve(cap).map_err(|_| join_oom())?;
+            push_clones(&mut self.vals, outer)?;
+            self.vals.resize(start + inner_at, Value::Null);
+            push_clones(&mut self.vals, inner)?;
+        } else {
+            self.vals.reserve(cap);
+            self.vals.extend_from_slice(outer);
+            self.vals.resize(start + inner_at, Value::Null);
+            self.vals.extend_from_slice(inner);
+        }
+        self.vals.resize(start + cap, Value::Null);
+        Ok(start)
+    }
+
+    /// Narrow the just-appended row (at `start`, full width `cap`) to `mask`/
+    /// `trim` IN PLACE — [`narrow_row`]'s semantics (holes below `trim` become
+    /// NULL, slots at or above it are dropped) by swapping survivors down and
+    /// truncating, so no fresh `Vec` and no value clones.
+    fn narrow_tail(&mut self, start: usize, cap: usize, mask: &Mask, trim: usize) {
+        for k in 0..trim.min(cap) {
+            if !mask.observes(k) {
+                self.vals[start + k] = Value::Null;
+            }
+        }
+        self.vals.truncate(start + trim.min(cap));
+    }
+
+    /// Keep only the rows `keep` says survive — the joined-`WHERE` pass, done
+    /// by swapping survivors down (three pointer-size copies per value, no
+    /// clone, no drop until the truncate).
+    fn retain_rows(&mut self, keep: &[bool]) {
+        let w = self.width;
+        let mut write = 0usize;
+        for (read, &k) in keep.iter().enumerate() {
+            if k {
+                if write != read {
+                    for c in 0..w {
+                        self.vals.swap(write * w + c, read * w + c);
+                    }
+                }
+                write += 1;
+            }
+        }
+        self.vals.truncate(write * w);
+        self.rows = write;
+    }
+
+    /// The compatibility exit for callers that need owned rows (sorting,
+    /// correlated scratch): one spine per FINAL row, values moved. Every
+    /// intermediate stage's spines are already gone — that is the point.
+    pub(super) fn into_rows(mut self) -> Vec<Vec<Value>> {
+        let w = self.width;
+        let n = self.rows;
+        let mut out: Vec<Vec<Value>> = Vec::with_capacity(n);
+        // Drain rows off the TAIL, returning the arena's cells as the rows take
+        // ownership: without this the whole buffer stays resident until the
+        // last row is built, and the conversion's peak double-holds every slot
+        // (the #125 byte meter caught exactly that). The shrink fires each time
+        // utilization quarters — a geometric series, O(n) copies total.
+        for _ in 0..n {
+            let tail = self.vals.len().saturating_sub(w);
+            out.push(self.vals.drain(tail..).collect());
+            if self.vals.len() * 4 <= self.vals.capacity() && self.vals.capacity() > 64 {
+                self.vals.shrink_to_fit();
+            }
+        }
+        out.reverse();
+        out
+    }
 }
 
 /// `extend_from_slice`, made fallible per value: only heap-carrying values take
@@ -526,32 +581,70 @@ pub(super) fn gather_joined(
     outer_policy: Option<&ExprProgram>,
     joins: &[Join],
     joined_filter: Option<&ExprProgram>,
+    prune: Option<&RowPrune>,
+) -> Result<Vec<Vec<Value>>> {
+    // The compatibility form: one owned spine per FINAL row. Callers that only
+    // read the rows (the joined aggregate) use the arena directly instead.
+    Ok(gather_joined_arena(
+        ctx, plan, params, schema, outer_table, outer_access, outer_policy, joins, joined_filter,
+        prune,
+    )?
+    .into_rows())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gather_joined_arena(
+    ctx: &mut dyn TxnCtx,
+    plan: &CompiledPlan,
+    params: &[Value],
+    schema: &Schema,
+    outer_table: u32,
+    outer_access: &AccessPath,
+    outer_policy: Option<&ExprProgram>,
+    joins: &[Join],
+    joined_filter: Option<&ExprProgram>,
     // #125: which slots of the accumulated tuple a later stage can observe.
     // `None` = carry everything, which is what every path did before.
     prune: Option<&RowPrune>,
-) -> Result<Vec<Vec<Value>>> {
+) -> Result<RowArena> {
     // Left-deep nested loop. Start with the outer's rows (its policy applies
     // through the access path), then fold in each join: gather that table's
     // rows — its policy runs over its OWN row, BEFORE any ON can raise on
     // it — and keep the pairs its ON accepts. Join `k`'s ON sees the row
     // accumulated so far, `[table0 ‖ … ‖ table_k]`, which is exactly the tuple
     // the planner bound and width-checked it against.
+    //
+    // Rows are carried in a [`RowArena`] — one flat width-strided allocation
+    // per stage instead of a `Vec` spine per row (the §9.4 residual). The
+    // PHYSICAL width per stage is the narrowed width when #125 prunes; the
+    // LOGICAL width (`acc_width`) keeps pricing the cell budget, whose trip
+    // points are a tested contract.
     let outer_def = table_def(schema, plan, outer_table)?;
-    let mut acc = match prune {
-        // The outer relation is held for the whole nested loop, so it is
-        // narrowed AS IT IS READ rather than after — see `gather_narrowed`.
-        Some(p) => gather_narrowed(
-            ctx,
-            outer_table,
-            outer_access,
-            outer_policy,
-            plan,
-            params,
-            &outer_def,
-            p.stage(0),
-        )?,
-        None => gather_rows(ctx, outer_table, outer_access, outer_policy, plan, params, None)?,
+    let phys0 = match prune {
+        Some(p) => {
+            let m = p.stage(0);
+            if m.prunes() { m.trim().min(outer_def.columns.len()) } else { outer_def.columns.len() }
+        }
+        None => outer_def.columns.len(),
     };
+    let mut acc = RowArena::from_rows(
+        match prune {
+            // The outer relation is held for the whole nested loop, so it is
+            // narrowed AS IT IS READ rather than after — see `gather_narrowed`.
+            Some(p) => gather_narrowed(
+                ctx,
+                outer_table,
+                outer_access,
+                outer_policy,
+                plan,
+                params,
+                &outer_def,
+                p.stage(0),
+            )?,
+            None => gather_rows(ctx, outer_table, outer_access, outer_policy, plan, params, None)?,
+        },
+        phys0,
+    );
     let mut stack = Vec::new();
     // The width of the tuple accumulated BEFORE each join — what a FULL
     // join's unmatched-inner sweep NULL-extends on the left. Tracked from the
@@ -722,14 +815,16 @@ pub(super) fn gather_joined(
             }
             _ => None,
         };
-        let mut next = Vec::new();
-        // One candidate buffer reused across the whole nested loop: a rejected
-        // pair leaves it filled for the next `fill_joined_row`; a kept pair
-        // `mem::take`s it (moved into `next`, no clone) and the next fill
-        // reallocates. See `fill_joined_row`.
-        let mut cand: Vec<Value> = Vec::new();
+        // The next stage's arena, at the NARROWED physical width. A candidate
+        // is appended at FULL width (the ON was bound against the whole
+        // `[outer ‖ inner]` tuple and may read any slot), evaluated in place,
+        // then truncated away on a reject or narrowed in place on a keep — a
+        // kept row costs ZERO extra allocations and a rejected one exactly the
+        // clone+drop it always cost.
+        let mut next = RowArena::new(next_trim);
         let mut probe_key: Vec<u8> = Vec::with_capacity(16);
-        for a in &acc {
+        for ai in 0..acc.len() {
+            let a = acc.row(ai);
             let fetched;
             let candidates: &[Vec<Value>] = match &held {
                 Some(rows) => rows,
@@ -762,12 +857,13 @@ pub(super) fn gather_joined(
                 ctx.charge_work(1, &|| {
                     format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                 })?;
-                // The candidate is built at FULL width: the ON was bound
-                // against the whole tuple `[outer ‖ inner]` and may read any
-                // slot of it. Only what SURVIVES is narrowed — the candidate
-                // itself is transient and never counted as held.
-                fill_joined_row(&mut cand, fallible, next_width, a, i, acc_width)?;
-                if join.on.eval_filter_host(&mut stack, &cand, params, ctx.host_fns())? {
+                let start = next.append_candidate(fallible, next_width, a, i, acc_width)?;
+                if join.on.eval_filter_host(
+                    &mut stack,
+                    &next.vals[start..start + next_width],
+                    params,
+                    ctx.host_fns(),
+                )? {
                     matched = true;
                     if let Some(m) = &mut inner_matched {
                         m[ci] = true;
@@ -777,15 +873,12 @@ pub(super) fn gather_joined(
                     cells.charge(next_width as u64, || {
                         format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                     })?;
-                    next.try_reserve(1).map_err(|_| join_oom())?;
-                    // Kept: MOVE the buffer out (no clone); `cand` is empty for
-                    // the next fill, which reallocates — exactly the old
-                    // per-kept-row allocation.
-                    let joined = std::mem::take(&mut cand);
-                    next.push(match narrow {
-                        None => joined,
-                        Some(m) => narrow_row(joined, m, next_trim, fallible)?,
-                    });
+                    if let Some(m) = narrow {
+                        next.narrow_tail(start, next_width, m, next_trim);
+                    }
+                    next.commit_row();
+                } else {
+                    next.vals.truncate(start);
                 }
             }
             // LEFT/FULL: no match → ONE row with the inner side NULL-extended.
@@ -794,15 +887,14 @@ pub(super) fn gather_joined(
             // inner row reads as ABSENT (the outer row survives,
             // NULL-extended, never carrying the hidden row's values).
             if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
-                let joined = build_joined_row(fallible, next_width, a, &[], acc_width)?;
+                let start = next.append_candidate(fallible, next_width, a, &[], acc_width)?;
                 cells.charge(next_width as u64, || {
                     format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                 })?;
-                next.try_reserve(1).map_err(|_| join_oom())?;
-                next.push(match narrow {
-                    None => joined,
-                    Some(m) => narrow_row(joined, m, next_trim, fallible)?,
-                });
+                if let Some(m) = narrow {
+                    next.narrow_tail(start, next_width, m, next_trim);
+                }
+                next.commit_row();
             }
         }
         // FULL's other half: inner rows NO outer row matched, NULL-extended
@@ -811,15 +903,14 @@ pub(super) fn gather_joined(
         if let (Some(m), Some(h)) = (&inner_matched, &held) {
             for (ci, i) in h.iter().enumerate() {
                 if !m[ci] {
-                    let joined = build_joined_row(fallible, next_width, &[], i, acc_width)?;
+                    let start = next.append_candidate(fallible, next_width, &[], i, acc_width)?;
                     cells.charge(next_width as u64, || {
                         format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                     })?;
-                    next.try_reserve(1).map_err(|_| join_oom())?;
-                    next.push(match narrow {
-                        None => joined,
-                        Some(m) => narrow_row(joined, m, next_trim, fallible)?,
-                    });
+                    if let Some(m) = narrow {
+                        next.narrow_tail(start, next_width, m, next_trim);
+                    }
+                    next.commit_row();
                 }
             }
         }
@@ -829,22 +920,23 @@ pub(super) fn gather_joined(
         let dropped = (acc.len() * acc_width) as u64
             + held.as_ref().map_or(0, |h| (h.len() * inner_width) as u64);
         acc_width += inner_width;
+        // The arena grew by doubling; what it HOLDS between stages is the rows,
+        // not the growth headroom. One bounded memcpy returns the overshoot —
+        // the #125 byte meter (`prune_width_mem`) is the tested contract.
+        next.vals.shrink_to_fit();
         acc = next;
         cells.release(dropped);
     }
     // WHERE runs once, over the full joined row — after every ON and every
     // per-table policy, because it can raise and a raise is observable.
-    // Survivors are MOVED, not cloned, so no new cells are charged; the
-    // survivor vec's own spine is the one bulk allocation, made fallible.
+    // Survivors are swapped down in place — no clone, no new cells.
     if let Some(f) = joined_filter {
-        let mut kept = Vec::new();
-        kept.try_reserve_exact(acc.len()).map_err(|_| join_oom())?;
-        for row in acc {
-            if f.eval_filter_host(&mut stack, &row, params, ctx.host_fns())? {
-                kept.push(row);
-            }
+        let mut keep = Vec::new();
+        keep.try_reserve_exact(acc.len()).map_err(|_| join_oom())?;
+        for i in 0..acc.len() {
+            keep.push(f.eval_filter_host(&mut stack, acc.row(i), params, ctx.host_fns())?);
         }
-        acc = kept;
+        acc.retain_rows(&keep);
     }
     Ok(acc)
 }

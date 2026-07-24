@@ -1483,7 +1483,19 @@ pub(super) fn exec_aggregate(
         false
     };
 
-    if !streamed {
+    if !streamed && !joins.is_empty() && correlated.is_empty() && post_filter.is_none() {
+        // Over a join with no correlated machinery and no post-filter, the
+        // joined rows are folded STRAIGHT OFF the arena — no per-row `Vec`
+        // spine is ever built (DESIGN-MPEE-GENERAL §9.4's measured residual):
+        // `Folder::push` reads a `&[Value]` and clones only what the group
+        // keeps, so the arena slice is exactly enough.
+        let arena = gather::gather_joined_arena(
+            ctx, plan, params, schema, table, access, filter, joins, joined_filter, prune,
+        )?;
+        for i in 0..arena.len() {
+            folder.push(&*ctx, arena.row(i), params)?;
+        }
+    } else if !streamed {
         // Unbounded on purpose: see the LIMIT note above. Over a join the row
         // being aggregated is the JOINED row — same rule, wider row.
         let rows = match joins.is_empty() {
