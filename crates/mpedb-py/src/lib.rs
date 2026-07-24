@@ -681,7 +681,7 @@ impl PySession {
 /// base by `checkpoint()` — `commit()` here — so the `.db` stays in sync.
 enum Backend {
     Native(Arc<Db>),
-    Overlay(Arc<Mutex<mpedb::SqliteOverlay>>),
+    Overlay(Arc<Mutex<Option<mpedb::SqliteOverlay>>>, PathBuf),
 }
 
 #[pyclass(name = "Connection", module = "mpedb")]
@@ -750,11 +750,14 @@ impl PyConnection {
             // Overlay writes are per-statement (autocommit into the delta);
             // `commit()` is the SYNC point: checkpoint pushes the delta into
             // the `.db` base, which is what keeps sqlite and mpedb one store.
-            Backend::Overlay(ov) => {
+            Backend::Overlay(ov, _) => {
                 let ov = ov.clone();
                 py.detach(move || -> Result<(), DbError> {
                     let mut g = ov.lock().expect("overlay poisoned");
-                    g.checkpoint().map(|_| ())
+                    g.as_mut()
+                        .ok_or_else(|| DbError::Internal("overlay gone".into()))?
+                        .checkpoint()
+                        .map(|_| ())
                 })
                 .map_err(map_err)
             }
@@ -887,13 +890,59 @@ impl PyCursor {
         // base+delta merged, writes land in the delta immediately (autocommit),
         // and `commit()` checkpoints into the base. Read-your-writes therefore
         // HOLDS on this backend — the delta is already durable.
-        if let Backend::Overlay(ov) = &conn.backend {
+        if let Backend::Overlay(ov, base) = &conn.backend {
             let ov = ov.clone();
+            let base = base.clone();
             let sql2 = sql.clone();
+            // DDL through the overlay: the overlay reads the BASE's schema and
+            // has no DDL of its own, so the statement is applied TO THE BASE —
+            // checkpoint first (push our deltas; an unpushed delta across a
+            // schema change is exactly what the overlay refuses by name), run
+            // the DDL via sqlite itself, reopen to re-derive the schema. The
+            // forced sync point is a documented divergence from sqlite3's
+            // transactional DDL.
+            let t = sql2.trim_start();
+            let is_ddl = ["create", "drop", "alter"]
+                .iter()
+                .any(|k| t.len() >= k.len() && t[..k.len()].eq_ignore_ascii_case(k));
+            if is_ddl {
+                py.detach(move || -> Result<(), DbError> {
+                    let mut g = ov.lock().expect("overlay poisoned");
+                    if let Some(o) = g.as_mut() {
+                        o.checkpoint()?;
+                    }
+                    *g = None; // release the base (the overlay holds SHARED)
+                    let c = rusqlite::Connection::open(&base)
+                        .map_err(|e| DbError::Unsupported(format!("open base: {e}")))?;
+                    c.execute_batch(&sql2)
+                        .map_err(|e| DbError::Unsupported(format!("ddl: {e}")))?;
+                    drop(c);
+                    // The old overlay sidecar was seeded from the PRE-DDL
+                    // schema; the checkpoint above emptied it, so dropping it
+                    // is lossless and lets the reopen seed from the new
+                    // schema (the overlay refuses a seed-hash mismatch).
+                    let mut side = base.as_os_str().to_owned();
+                    side.push(".overlay.mpedb");
+                    let _ = std::fs::remove_file(std::path::Path::new(&side));
+                    *g = Some(mpedb::SqliteOverlay::open(&base)?);
+                    Ok(())
+                })
+                .map_err(map_err)?;
+                drop(conn);
+                self.rowcount = 0;
+                self.rows.clear();
+                self.pos = 0;
+                self.description = None;
+                return Ok(());
+            }
             let res = py
                 .detach(move || {
                     run_coercing(vals, |p| {
-                        ov.lock().expect("overlay poisoned").query(&sql2, p)
+                        ov.lock()
+                            .expect("overlay poisoned")
+                            .as_mut()
+                            .ok_or_else(|| DbError::Internal("overlay gone".into()))?
+                            .query(&sql2, p)
                     })
                 })
                 .map_err(map_err)?;
@@ -1053,11 +1102,31 @@ fn connect(py: Python<'_>, path: PathBuf, engine: Option<&str>) -> PyResult<PyCo
     let spelled = path.to_string_lossy().into_owned();
     let force_native = matches!(engine, Some("mpedb"));
     if !force_native && spelled.ends_with(".db") {
+        let base = path.clone();
         let ov = py
-            .detach(move || mpedb::SqliteOverlay::open(&path))
+            .detach(move || {
+                // sqlite3.connect CREATES a missing database, and the overlay
+                // refuses a base with NO tables — so a fresh/empty base is
+                // seeded with one inert bootstrap table, IN THE BASE, by
+                // sqlite itself (visible to sqlite tools, clearly named).
+                // User tables arrive via CREATE TABLE (the DDL path above).
+                let c = rusqlite::Connection::open(&path)
+                    .map_err(|e| DbError::Unsupported(format!("create {}: {e}", path.display())))?;
+                let n: i64 = c
+                    .query_row("SELECT count(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0))
+                    .map_err(|e| DbError::Unsupported(format!("probe {}: {e}", path.display())))?;
+                if n == 0 {
+                    c.execute_batch(
+                        "CREATE TABLE mpedb_bootstrap (id INTEGER PRIMARY KEY)",
+                    )
+                    .map_err(|e| DbError::Unsupported(format!("init {}: {e}", path.display())))?;
+                }
+                drop(c);
+                mpedb::SqliteOverlay::open(&path)
+            })
             .map_err(map_err)?;
         return Ok(PyConnection {
-            backend: Backend::Overlay(Arc::new(Mutex::new(ov))),
+            backend: Backend::Overlay(Arc::new(Mutex::new(Some(ov))), base),
             txn: None,
             closed: false,
         });

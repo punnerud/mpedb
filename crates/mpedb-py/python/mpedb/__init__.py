@@ -60,8 +60,8 @@ PARSE_COLNAMES = 2
 
 sqlite_version = "3.45.0-mpedb"
 sqlite_version_info = (3, 45, 0)
-version = "0.1.0"
-version_info = (0, 1, 0)
+version = "0.1.1"
+version_info = (0, 1, 1)
 
 __all__ = [
     "Connection",

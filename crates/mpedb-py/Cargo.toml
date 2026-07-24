@@ -17,6 +17,9 @@ crate-type = ["cdylib"]
 # delta) needs the overlay's checkpoint push — `Connection.commit()` on a `.db`
 # path IS that checkpoint, which is what keeps the base in sync.
 mpedb = { workspace = true, features = ["sqlite-checkpoint"] }
+# Same rusqlite the overlay's checkpoint already compiles (shared build): used
+# ONLY to create a missing `.db` base properly (sqlite3.connect's semantics).
+rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = "0.4"
 # pyo3 is deliberately NOT a workspace dependency: only this crate binds Python.
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py312", "chrono"] }
