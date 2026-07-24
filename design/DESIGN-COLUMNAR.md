@@ -200,27 +200,44 @@ table and the delta is empty. That is exactly the bulk-load → compact → quer
 shape OLAP actually has, it needs no write-path change at all, and it is the
 honest starting point because it makes the first measurement clean.
 
-**Stage 5 moves the boundary continuously** — the gradual switch. A per-table
-`colseg_watermark` (the highest PK covered by segments) plus a second counter
-that distinguishes the two kinds of write:
+**Stage 5 moves the boundary continuously** — the gradual switch, SHIPPED. A
+per-table WATERMARK record (`\0w<table>` in the engine's reserved sys-keyspace)
+holds the build generation, the covered-row count `W`, and `wm_pk` — the highest
+PK the segments cover. **The record's PRESENCE is the coherence signal**, so
+there is no second counter:
 
-- an **append above the watermark** leaves every segment valid — the new rows
-  are simply delta;
-- a **mutation at or below the watermark** invalidates (that block, once blocks
-  are tracked individually; the table, before then).
+- an **append above the watermark** (a row with PK > `wm_pk`) leaves the record —
+  and so every segment — valid; the new rows are simply delta;
+- a **write at or below the watermark** (`note_columnar_mutation`, called from
+  every row mutator with the key it just wrote: insert/update/delete, typed and
+  blind, streaming) DELETES the record the instant `key <= wm_pk`, so the split
+  scan declines to the row scan. Column-layout DDL (ADD/DROP COLUMN) clears it
+  too, since it rewrites rows outside the mutators.
 
-A scan is then `segments over [min, watermark]` + `row fold over (watermark,
-max]`, and the machinery for that union **already exists**: the fused fold
-already splits a range and folds the remainder into the SAME accumulators on
-`FoldStop::Stopped(resume_key)` (`aggregate.rs:1083-1099`), and `btree::cursor`
-takes an arbitrary `pk >= watermark` lower bound as a first-class operation
-(`btree.rs:1573-1585`). The accumulators are commutative over concatenated
-ranges — the parallel fold already relies on that.
+A scan is then `segments over [min, wm_pk]` + `row fold over (wm_pk, max]`. The
+machinery for that union already existed: `fold_range_column`/`fold_range_columns`
+take an arbitrary `pk > wm_pk` exclusive lower bound as a first-class operation
+and fold straight into the SAME accumulators the segments fed, and those
+accumulators are commutative over concatenated PK-ordered ranges — the parallel
+fold already relies on that, so `sum(float)` stays bit-identical.
 
-The write-path cost is one PK memcmp per written row against a resident
-watermark. That is not free, which is why it is staged AFTER v1 is measured:
-then the cost of append-invalidation is a number rather than a guess, and the
-watermark can be justified against it instead of assumed.
+Two things make it exact rather than merely plausible. The **build race** is
+closed by a compare-and-set: compaction publishes the watermark only if the
+table's `mod_gen` is STILL the build snapshot's `g0`
+(`set_columnar_watermark_if_gen`, under the writer lock), so a covered write that
+raced the build has already bumped `mod_gen` and the watermark is never born
+stale. **Savepoints** are handled by re-issuing the delete idempotently on every
+covered write rather than caching "already deleted": a rollback that restores a
+deleted record is re-invalidated by the next covered write, and a rollback that
+restores the record restores the row with it.
+
+The write-path cost is one point `sys_get` per mutated table per txn (cached;
+`None` for the overwhelming majority of tables, which have no watermark) plus one
+PK memcmp per covered write. It was staged AFTER stages 1–2 were measured: a 1 %
+append to a 2 M-row fact table dropped the scan from 53 ms to 95 ms (full row
+scan) under the all-or-nothing rule, and cost 418 ms to re-compact; the split
+scan holds it at **53 ms with no maintenance**, which is the number that
+justifies the write-path touch.
 
 ## 6. Coherence — the one thing that must be exact
 
@@ -347,12 +364,16 @@ segments (fact/star-olap → columnar, dimension → row), regenerable so the se
 moves with the workload. The planner-side column-vs-row cost (§7) is a deferred
 refinement — execution already picks the cheaper source transparently.
 
-**Stage 5 — the moving boundary.** The `colseg_watermark` and the split
-delta/main scan (§5.1): appends above the watermark keep the segments valid,
-mutations below invalidate, and a scan unions segments with a row tail. Staged
-last on purpose — it is the only part that touches the write path (one PK
-memcmp per written row), so it is justified against a measured
-append-invalidation cost from stages 1–2 rather than against a guess.
+**Stage 5 — the moving boundary.** SHIPPED (§5.1): a per-table watermark record
+whose presence is the coherence signal, deleted on any write at or below it and
+by column DDL, published under a mod_gen CAS that closes the build race. All
+three scan feeds (`sum`, filtered `sum`, `GROUP BY`) union the segments with a
+row-tail fold over `(wm_pk, max]`. Staged last on purpose — it is the only part
+that touches the write path (one cached `sys_get` per mutated table per txn plus
+a PK memcmp on covered writes) — and justified by the measurement in §5.1: a
+1 % append that cost 418 ms to re-compact, or degraded the scan 53 → 95 ms under
+the all-or-nothing rule, is held at 53 ms with no maintenance. Adversarially
+reviewed as a commit-path change; all seven attack surfaces clean.
 
 **Stage 1's honest wrinkle, recorded up front.** Summing a float column from
 per-block partials changes the ORDER of additions, and float addition is not
