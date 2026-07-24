@@ -17,6 +17,10 @@ mpedb = { path = "../mpedb" }
 mpedb-types = { path = "../mpedb-types" }
 duckdb = { version = "1", features = ["bundled"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+postgres = "0.19"
+# Unix-socket connection only — no TLS, so drop the default native-tls/openssl
+# dependency (no OpenSSL dev headers on the bench box, and no need over a socket).
+mysql = { version = "25", default-features = false, features = ["minimal"] }
 
 [profile.release]
 opt-level = 3
