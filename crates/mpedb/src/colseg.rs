@@ -718,6 +718,87 @@ pub(crate) fn feed_from_segments(
 }
 
 
+/// Feed a GROUP BY aggregate from column segments (DESIGN-COLUMNAR stage 3):
+/// stream ONLY the group-key and aggregate-argument columns as synthetic rows
+/// into the ordinary [`Folder`](crate::exec) — same values, same PK order, so
+/// the grouping, HAVING, projection and ordering are the identical code and the
+/// answer is bit-identical to the row scan. A `GROUP BY store_id, sum(amount)`
+/// over a six-column fact table then touches two columns' packed segments
+/// instead of pulling every whole row out of the PK tree.
+///
+/// `needed` lists the `(ordinal, type)` of every column the aggregate reads —
+/// the group keys and the aggregate arguments, deduplicated by the caller. A
+/// synthetic row is table-width with exactly those ordinals filled (rest NULL);
+/// the caller has already verified nothing else is read (no bare columns, no
+/// per-aggregate FILTER over another column, no residual filter).
+///
+/// Returns `false` — decline to the row scan — unless every needed column has
+/// fresh segments (`mod_gen`) that cover the table and are blocked identically.
+pub(crate) fn feed_group_from_segments(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    width: usize,
+    needed: &[(u16, ColumnType)],
+    push: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<bool> {
+    if needed.is_empty() || needed.iter().any(|&(_, ty)| !segmentable(ty)) {
+        return Ok(false);
+    }
+    let (Ok(want_gen), Ok(want_rows)) = (snap.mod_gen(table), snap.row_count(table)) else {
+        return Ok(false);
+    };
+    // Load and validate every column up front: a decline discovered on column
+    // 2 must not have fed the folder from column 1.
+    let mut recs: Vec<Vec<Vec<u8>>> = Vec::with_capacity(needed.len());
+    for &(col, ty) in needed {
+        match load_column(snap, table, col, ty, want_gen, want_rows)? {
+            Some(r) => recs.push(r),
+            None => return Ok(false),
+        }
+    }
+    let n_blocks = recs[0].len();
+    if recs.iter().any(|r| r.len() != n_blocks) {
+        return Ok(false); // columns blocked differently: do not pair them
+    }
+
+    // One reused synthetic row; only the needed ordinals are ever written, and
+    // the folder clones what it keeps, so overwriting per row is sound.
+    let mut synth = vec![Value::Null; width];
+    // Per-column decoded block, reused across blocks (bounded by one block, not
+    // the table).
+    let mut cols: Vec<Vec<Value>> = vec![Vec::new(); needed.len()];
+    for bi in 0..n_blocks {
+        let mut n_rows: Option<usize> = None;
+        for (k, ((_, ty), rec)) in needed.iter().zip(&recs).enumerate() {
+            let blk = decode_block(&rec[bi], want_gen, *ty)?
+                .ok_or_else(|| Error::Corrupt("column segment changed mid-scan".into()))?;
+            match n_rows {
+                None => n_rows = Some(blk.n_rows as usize),
+                Some(n) if n != blk.n_rows as usize => return Ok(false),
+                _ => {}
+            }
+            cols[k].clear();
+            blk.for_each(&mut |v: &Value| {
+                cols[k].push(v.clone());
+                Ok(())
+            })?;
+        }
+        // Row-major emission across the columns decoded above. `r` indexes
+        // every column at once (a lockstep read), so the range loop is the
+        // natural shape — not an iterator over any single one.
+        let n = n_rows.unwrap_or(0);
+        #[allow(clippy::needless_range_loop)]
+        for r in 0..n {
+            for (k, &(ord, _)) in needed.iter().enumerate() {
+                synth[ord as usize] = cols[k][r].clone();
+            }
+            push(&synth)?;
+        }
+    }
+    Ok(true)
+}
+
+/// Load and validate every block of one column, returning the raw records so
 /// Load and validate every block of one column, returning the raw records so
 /// the caller can decode them a second time without another round of checks.
 /// `None` = not usable (missing, stale, unknown format, or the blocks do not

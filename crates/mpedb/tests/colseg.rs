@@ -61,6 +61,20 @@ primary_key = ["id"]
     )
 }
 
+fn all_rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
+    match db.query(sql, &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows from `{sql}`, got {other:?}"),
+    }
+}
+
+fn assert_rows_same(a: &[Vec<Value>], b: &[Vec<Value>], what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}: row count");
+    for (r1, r2) in a.iter().zip(b) {
+        assert_same(r1, r2, what);
+    }
+}
+
 fn one(db: &Database, sql: &str) -> Vec<Value> {
     match db.query(sql, &[]).unwrap() {
         ExecResult::Rows { rows, .. } => rows.into_iter().next().unwrap_or_default(),
@@ -266,5 +280,63 @@ fn predicates_the_zone_map_cannot_decide_still_answer_correctly() {
     db.compact_columns().unwrap();
     for (q, want) in qs.iter().zip(&before) {
         assert_same(&one(&db, q), want, q);
+    }
+}
+
+const GROUPED: &[&str] = &[
+    // Low and high cardinality group keys.
+    "SELECT qty, sum(amount) FROM fact GROUP BY qty ORDER BY qty",
+    "SELECT qty, count(*), min(amount), max(amount) FROM fact GROUP BY qty ORDER BY qty",
+    // A NULLABLE group key: NULL is its own group.
+    "SELECT qty, count(qty) FROM fact GROUP BY qty ORDER BY qty",
+    // Two keys.
+    "SELECT qty, count(*) FROM fact GROUP BY qty, id ORDER BY qty, id LIMIT 20",
+    // count(DISTINCT) inside a group.
+    "SELECT qty, count(DISTINCT amount) FROM fact GROUP BY qty ORDER BY qty",
+    // HAVING over the grouped tuple.
+    "SELECT qty, sum(amount) FROM fact GROUP BY qty HAVING sum(amount) > 1000 ORDER BY qty",
+    // avg (a partial-sum-and-count aggregate).
+    "SELECT qty, avg(amount) FROM fact GROUP BY qty ORDER BY qty",
+];
+
+#[test]
+fn segment_fed_group_by_is_bit_identical_to_the_row_scan() {
+    let (db, _g) = open("grouped");
+    seed(&db, 70_000);
+
+    let before: Vec<Vec<Vec<Value>>> = GROUPED.iter().map(|q| all_rows(&db, q)).collect();
+    db.compact_columns().unwrap();
+    for (q, want) in GROUPED.iter().zip(&before) {
+        assert_rows_same(&all_rows(&db, q), want, q);
+    }
+
+    // A write invalidates; answers stay right from the row scan.
+    db.query("INSERT INTO fact (id, qty, amount) VALUES (900001, 3, 2.5)", &[]).unwrap();
+    db.query("DELETE FROM fact WHERE id = 900001", &[]).unwrap();
+    for (q, want) in GROUPED.iter().zip(&before) {
+        assert_rows_same(&all_rows(&db, q), want, q);
+    }
+}
+
+/// Group shapes the fast path must DECLINE (bare columns, a computed key, a
+/// FILTER over the base row, a text key with no segment) still answer right.
+#[test]
+fn group_shapes_that_decline_still_answer_correctly() {
+    let (db, _g) = open("group-decline");
+    seed(&db, 5_000);
+    let qs = [
+        // sqlite bare column: the group carries a witness row's other column.
+        "SELECT qty, id, max(amount) FROM fact GROUP BY qty ORDER BY qty",
+        // A computed group key.
+        "SELECT qty + 1, count(*) FROM fact GROUP BY qty + 1 ORDER BY qty + 1",
+        // A per-aggregate FILTER (reads the base row).
+        "SELECT qty, count(*) FILTER (WHERE amount > 50) FROM fact GROUP BY qty ORDER BY qty",
+        // A text group key — no segment for it.
+        "SELECT label, count(*) FROM fact GROUP BY label ORDER BY label LIMIT 5",
+    ];
+    let before: Vec<Vec<Vec<Value>>> = qs.iter().map(|q| all_rows(&db, q)).collect();
+    db.compact_columns().unwrap();
+    for (q, want) in qs.iter().zip(&before) {
+        assert_rows_same(&all_rows(&db, q), want, q);
     }
 }

@@ -1204,6 +1204,49 @@ fn try_fused_fold(
 /// group), and the grouped output. `count(DISTINCT x)` therefore still holds
 /// its dedup set — but it no longer holds the ROWS as well, which was the
 /// larger half.
+///
+/// The columns a GROUP BY aggregate reads, IF it is a shape segments can feed:
+/// group keys that are plain columns and aggregate arguments that are a single
+/// column reference (or `count(*)`). `None` — meaning "not this shape, run the
+/// row scan" — for a computed key, a computed or multi-instruction argument, a
+/// per-aggregate FILTER (it reads the base row), or a non-native aggregate
+/// whose accumulator this fast path has no reason to trust.
+///
+/// The returned list is deduplicated and every column is checked segmentable,
+/// so a synthetic row filling exactly these ordinals evaluates the aggregate
+/// identically to the real row.
+fn segment_group_columns(t: &TableDef, agg: &Aggregation) -> Option<Vec<(u16, mpedb_types::ColumnType)>> {
+    use mpedb_sql::GroupKey;
+    let mut need: Vec<u16> = Vec::new();
+    for k in &agg.group_by {
+        match k {
+            GroupKey::Col(c) => need.push(*c),
+            GroupKey::Expr(_) => return None,
+        }
+    }
+    for call in &agg.aggs {
+        if call.filter.is_some() || !call.extra_args.is_empty() || call.func.native().is_none() {
+            return None;
+        }
+        match call.arg.as_ref().map(|p| p.instrs.as_slice()) {
+            None => {} // count(*)
+            Some([mpedb_types::Instr::PushCol(i)]) => need.push(*i),
+            Some(_) => return None,
+        }
+    }
+    need.sort_unstable();
+    need.dedup();
+    let mut out = Vec::with_capacity(need.len());
+    for c in need {
+        let col = t.columns.get(c as usize)?;
+        if !crate::colseg::segmentable(col.ty) {
+            return None;
+        }
+        out.push((c, col.ty));
+    }
+    Some(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn exec_aggregate(
     ctx: &mut dyn TxnCtx,
@@ -1255,7 +1298,58 @@ pub(super) fn exec_aggregate(
     // doc comment's list. `BatchScan::open` answers `None` for everything else,
     // and the materializing path below is then EXACTLY the code that ran
     // before, feeding the same `Folder::push`.
-    let streamed = if joins.is_empty() && correlated.is_empty() && post_filter.is_none() {
+    // GROUP-BY FROM SEGMENTS (design/DESIGN-COLUMNAR.md stage 3). A grouped
+    // aggregate can read only its group-key and argument columns off their
+    // packed segments and feed synthetic rows through THIS folder — same
+    // values, same PK order, so grouping/HAVING/projection/ordering are the
+    // identical code and the answer is bit-identical.
+    //
+    // Every guard here is a correctness one: the synthetic row fills only the
+    // columns the aggregate reads, so anything that reads another column of the
+    // base row must disqualify the path — bare columns (they carry a witness
+    // row's other columns), a per-aggregate FILTER (it evaluates over the base
+    // row), a residual filter, or any group key / argument that is not a plain
+    // segmentable column.
+    let segment_grouped = if !agg.group_by.is_empty()
+        && filter.is_none()
+        && joins.is_empty()
+        && correlated.is_empty()
+        && post_filter.is_none()
+        && agg.over_index.is_none()
+        && agg.bare_cols.is_empty()
+    {
+        match (ctx.snapshot_txn().is_some(), segment_group_columns(t, agg)) {
+            (true, Some(needed)) => {
+                // The snapshot borrow and the folder's push both borrow `ctx`
+                // SHARED (`snapshot_txn(&self)` / `folder.push(&dyn TxnCtx)`),
+                // which coexist; `folder` is a separate binding, mutated in the
+                // closure. Errors propagate — a host-aggregate mint can fail,
+                // and the guards above do not exclude one.
+                let snap = ctx.snapshot_txn().expect("checked");
+                crate::colseg::feed_group_from_segments(
+                    snap,
+                    table,
+                    width,
+                    &needed,
+                    &mut |row: &[Value]| folder.push(&*ctx, row, params),
+                )?
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    if segment_grouped {
+        // The folder was fed from segments; a partial feed is impossible
+        // (`feed_group_from_segments` pushes nothing unless every column
+        // checked out), so the shared render below runs on a complete fold.
+    } else {
+        // A declined attempt pushed nothing, so the folder is still empty —
+        // no rebuild needed. The materializing path runs as before.
+    }
+
+    let streamed = segment_grouped
+        || if joins.is_empty() && correlated.is_empty() && post_filter.is_none() {
         if let Some(accs) = try_agg_index(ctx, table, agg, filter)? {
             // Aggregate-over-index-tree (format 59): the tree answered and no
             // base row was ever materialized. Inject the one group the fold
