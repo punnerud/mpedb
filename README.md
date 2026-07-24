@@ -35,12 +35,17 @@ import mpedb as sqlite3   # existing sqlite3 code runs unchanged
 [crates/mpedb-py](crates/mpedb-py/README.md).
 
 **CLI** — the `mpedb` binary (REPL, dump, stress/crash harnesses, benchmarks,
-sqlite mirror/checkpoint) installs straight from this repo with a Rust
-toolchain:
+sqlite mirror/checkpoint). On macOS and Linux, from the tap:
+
+```sh
+brew install punnerud/mpedb/mpedb
+mpedb data.db     # opens an existing sqlite .db directly
+```
+
+Or from source anywhere a Rust toolchain runs:
 
 ```sh
 cargo install --git https://github.com/punnerud/mpedb mpedb-cli
-mpedb data.db     # opens an existing sqlite .db directly
 ```
 
 Linux and macOS run the whole engine and its multi-process crash tests; Windows
