@@ -866,9 +866,14 @@ fn tier_crash_injection() {
 #[test]
 fn crash_injection() {
     let td = TestDir::new("crash");
+    // Explicit size: the CLI default is sized for a 20-wave run on the
+    // fastest machine in the fleet, and several of these tests run in
+    // parallel on a small disk. The floor is pin-duration x free-rate
+    // (design/DESIGN.md §4.5, #135) — for THIS workload (2 waves, 4
+    // children) 96 MB measured 8/8 clean on the M3, so 128 is margin.
     let o = run(&[
         "crash", "--dir", td.path().to_str().unwrap(),
-        "--waves", "2", "--children", "4",
+        "--waves", "2", "--children", "4", "--size_mb", "128",
     ]);
     assert_ok(&o);
     let s = out_str(&o);

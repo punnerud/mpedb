@@ -209,15 +209,31 @@ pub fn run_parent(argv: &[String]) -> CliResult {
     // Fast machines (e.g. M3) can churn enough COW pages inside one 5-60ms kill
     // window to exhaust a small DB before SIGKILL lands (DbFull, not a lock bug).
     // Allow --size_mb to grow the file so recovery is observed, not masked.
-    // Blob mode raises the default: every blob write COWs kb/4 fresh pages, so
-    // blob churn eats a 64 MB file fast, and DbFull capacity-exits (reported
-    // apart, per #38) must not drown the correctness signal.
+    //
+    // The floor is set by MVCC, not by the live set (#135). A page freed by
+    // commit T is reusable only once T <= oldest_pinned, so the file must
+    // hold every page freed while the oldest live reader keeps its snapshot:
+    //
+    //     pages needed  ~=  pin duration  x  pages freed per second
+    //
+    // Concurrent writers make that product large on fast hardware even
+    // though the live set is ~100 tiny rows. Measured with `--children 4
+    // --waves 20`: this box (~140k commits/s) fills 16 MB and survives 64;
+    // the M3 (~270k commits/s, 1.94x) fills 64 MB and survives 256. The
+    // ordinary pin is ~4 ms — nothing is held open, nothing leaks (the page
+    // census at a DbFull showed 7 pages of data trees and 3932 pages listed
+    // free, all of them freed too recently to reuse).
+    //
+    // So the default is sized for the fastest machine in the fleet, not the
+    // slowest: a capacity exit here is indistinguishable from a correctness
+    // failure at a glance (#38), and that is the signal worth protecting.
+    // Blob mode wants the same headroom for a different reason: every blob
+    // write COWs kb/4 fresh pages.
     let size_mb = match p.value("size_mb") {
         Some(s) => s
             .parse::<u64>()
             .map_err(|_| Failure::Usage("--size_mb must be an integer".into()))?,
-        None if blob_kb > 0 => 256,
-        None => 64,
+        None => 256,
     };
     let tables = if blob_kb > 0 { CRASH_BLOB_TOML } else { CRASH_TOML };
     write_config_concurrency(&cfg, &dbf, size_mb, tables, &durability, &concurrency, extent_kb)?;
@@ -379,7 +395,8 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         );
         return runtime(format!(
             "{total_capacity} child(ren) ran out of space (exit {EXIT_CAPACITY}); \
-             raise --size_mb (now {size_mb})"
+             raise --size_mb (now {size_mb}) — the floor is \
+             pin-duration x free-rate, not the live set (#135)"
         ));
     }
     println!(

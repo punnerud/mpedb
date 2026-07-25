@@ -437,6 +437,25 @@ struct ReaderSlot {
 - **Page accounting invariant** (tested by the crash suite): pages reachable from the
   committed meta ⊎ pages listed in the freelist ⊎ [high_water, page_count) partition the
   data region after every commit.
+- **Space floor is a RATE, not a live-set size** (#135, measured 2026-07-24). A page
+  freed by commit `T` is reusable only once `T ≤ oldest_pinned`, so the file must hold
+  every page freed while the oldest live reader keeps its snapshot:
+
+      pages needed  ≈  pin duration  ×  pages freed per second
+
+  Both factors are ordinary: an unremarkable ~4 ms read pin, and a write rate high
+  enough that 4 ms is thousands of pages. The product is what sizes the file — the live
+  set does not enter into it. `crash --children 4 --waves 20` on a ~100-row workload
+  fills 16 MB on a 140k-commit/s box and 64 MB on a 270k-commit/s one (the M3, 1.94×),
+  while `--children 1` (no concurrent reader, no lag) runs 30 waves in 16 MB untouched.
+  At such a DbFull the page census reads: 7 pages of data trees, 3932 pages listed
+  free — all freed too recently to reuse. Nothing leaks, and `high_water` never falling
+  is not the cause either: reclaiming the file's tail was implemented and measured to
+  find zero eligible pages, because eligibility is exactly what is missing.
+
+  Consequences for anyone sizing a database: headroom scales with writer concurrency and
+  with hardware speed, not with how much data is kept. A reader that holds a snapshot
+  across a long operation raises the floor in direct proportion to how long it holds it.
 
 ## 5. Transactions
 
