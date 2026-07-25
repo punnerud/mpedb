@@ -25,11 +25,7 @@ mod sqlite_oracle;
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir() -> String {
-    if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm".into()
-    } else {
-        std::env::temp_dir().to_string_lossy().into_owned()
-    }
+    mpedb_testkit::scratch_base_str()
 }
 
 /// The whole fixture: one main mpedb + two attachable member files, plus the

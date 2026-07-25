@@ -148,7 +148,7 @@ fn statements() -> Vec<String> {
 }
 
 fn db() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-prune-{}-{}.mpedb",
         std::process::id(),
@@ -545,7 +545,7 @@ fn pruned_paths_agree_in_a_write_session() {
 /// invisible one.
 #[test]
 fn the_join_budget_still_prices_the_logical_product() {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-prune-budget-{}-{}.mpedb",
         std::process::id(),

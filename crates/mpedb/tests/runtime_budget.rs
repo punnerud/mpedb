@@ -56,11 +56,7 @@ primary_key = ["id"]
 
 /// Open a fresh database with an explicit `[runtime] max_work_rows` budget.
 fn open(max_work_rows: u64) -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-rtbudget-{}-{}.mpedb",
         std::process::id(),
@@ -232,11 +228,7 @@ fn unlimited_budget_never_trips() {
 /// the LAST table, so every earlier step is a cross join and the intermediate
 /// product multiplies by 30 per step (30^6 = 729M full-product rows).
 fn open_sixway(max_join_cells: u64) -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-joincells-{}-{}.mpedb",
         std::process::id(),

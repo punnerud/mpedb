@@ -22,18 +22,14 @@
 //! — so in every scenario below the successful members dirty the leaf first.
 
 use mpedb::{params, Config, Database, Error, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Pre-inserted row every doomed INSERT collides with on its LAST value.
 const POISON: i64 = -1;
 
 fn test_config(name: &str, extra_col: &str) -> (Config, PathBuf) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-ring-atomicity-{name}-{}.mpedb",
         std::process::id()

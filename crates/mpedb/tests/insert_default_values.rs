@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn db() -> (Database, String) {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!("{dir}/mpedb-defvals-{}-{}.mpedb", std::process::id(),
         UNIQ.fetch_add(1, Ordering::Relaxed));
     let _ = std::fs::remove_file(&path);

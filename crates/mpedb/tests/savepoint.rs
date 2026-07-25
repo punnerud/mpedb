@@ -58,11 +58,7 @@ primary_key = ["x"]
 const SQLITE_DDL: &str = "CREATE TABLE t(x INTEGER PRIMARY KEY, y INTEGER);\n";
 
 fn dbt() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-savepoint-{}-{}.mpedb",
         std::process::id(),

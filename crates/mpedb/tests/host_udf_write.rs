@@ -8,7 +8,7 @@
 //! `plan/<hash>` registry.
 
 use mpedb::{Config, Database, Error, ExecResult, HostAggState, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
@@ -21,11 +21,7 @@ impl Drop for FileGuard {
 }
 
 fn test_db(name: &str) -> (Database, FileGuard) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-udfw-{name}-{}-{}.mpedb",
         std::process::id(),
@@ -510,11 +506,7 @@ fn insert_values_carries_an_expression_host_udf_included() {
 /// where a host-call plan deliberately never appears.
 #[test]
 fn write_path_udf_under_durability_commit() {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-udfw-durable-{}-{}.mpedb",
         std::process::id(),

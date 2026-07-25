@@ -17,11 +17,7 @@ impl Drop for Tmp { fn drop(&mut self) { let _ = std::fs::remove_file(&self.path
 /// emp(eid, x, did?) joined against dept(did, val) — dept row 200 has
 /// `val = 0`, the divide-by-zero landmine a policy is about to hide.
 fn db(tag: &str) -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir
         .join(format!("mpedb-rlsjoin-{tag}-{}.mpedb", std::process::id()))
         .to_string_lossy()

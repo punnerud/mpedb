@@ -15,11 +15,7 @@ mod sqlite_oracle;
 /// temp dir — keeps the scratch path portable to macOS, where `/dev/shm` does
 /// not exist (#66).
 fn scratch_path(name: String) -> String {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     dir.join(name).to_string_lossy().into_owned()
 }
 

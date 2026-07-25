@@ -5,11 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn open() -> (Database, String) {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm".into()
-    } else {
-        std::env::temp_dir().display().to_string()
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-vt-{}-{}.mpedb",
         std::process::id(),

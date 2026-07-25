@@ -13,7 +13,7 @@
 //! this file also pins what mpedb promises not to guess.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "sqlite_oracle/mod.rs"]
@@ -24,11 +24,7 @@ static UNIQ: AtomicU64 = AtomicU64::new(0);
 const NULL_SENTINEL: &str = "<NULL>";
 
 fn mpedb_db() -> (Database, PathBuf) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-json-{}-{}.mpedb",
         std::process::id(),
@@ -869,11 +865,7 @@ fn out_of_scope_json_functions_name_themselves() {
 /// failure, not a skip.
 #[test]
 fn django_jsonfield_check_compiles_and_enforces() {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-json-django-{}-{}.mpedb",
         std::process::id(),

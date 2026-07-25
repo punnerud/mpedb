@@ -25,11 +25,7 @@ use std::time::{Duration, Instant};
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn db_path(name: &str) -> PathBuf {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     dir.join(format!(
         "mpedb-busy-{name}-{}-{}.mpedb",
         std::process::id(),

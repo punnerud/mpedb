@@ -3310,11 +3310,7 @@ mod tests {
     static UNIQ: AtomicU64 = AtomicU64::new(0);
 
     fn test_paths(name: &str) -> PathBuf {
-        let dir = if Path::new("/dev/shm").is_dir() {
-            PathBuf::from("/dev/shm")
-        } else {
-            std::env::temp_dir()
-        };
+        let dir = mpedb_testkit::scratch_base();
         dir.join(format!(
             "mpedb-facade-unit-{name}-{}-{}.mpedb",
             std::process::id(),
@@ -3354,11 +3350,7 @@ primary_key = ["id"]
     /// Two independent tables in one file — the shape every other write test
     /// here lacks.
     fn two_table_config(name: &str) -> (Config, PathBuf) {
-        let dir = if Path::new("/dev/shm").is_dir() {
-            PathBuf::from("/dev/shm")
-        } else {
-            std::env::temp_dir()
-        };
+        let dir = mpedb_testkit::scratch_base();
         let path = dir.join(format!("mpedb-{name}-{}.mpedb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let toml = format!(

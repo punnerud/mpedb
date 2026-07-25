@@ -6,17 +6,13 @@
 //! refused (never answered wrongly).
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn open(name: &str) -> (Database, PathBuf) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-view-{name}-{}-{}.mpedb",
         std::process::id(),
@@ -154,11 +150,7 @@ fn drop_view_and_refusals() {
 #[test]
 fn view_persists_and_second_process_sees_it() {
     let (cfg, path) = {
-        let dir = if Path::new("/dev/shm").is_dir() {
-            PathBuf::from("/dev/shm")
-        } else {
-            std::env::temp_dir()
-        };
+        let dir = mpedb_testkit::scratch_base();
         let path = dir.join(format!(
             "mpedb-view-mp-{}-{}.mpedb",
             std::process::id(),

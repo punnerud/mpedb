@@ -131,11 +131,7 @@ mod tests {
     static UNIQ: AtomicU64 = AtomicU64::new(0);
 
     fn shm_dir() -> PathBuf {
-        if Path::new("/dev/shm").is_dir() {
-            PathBuf::from("/dev/shm")
-        } else {
-            std::env::temp_dir()
-        }
+        mpedb_testkit::scratch_base()
     }
 
     fn db_path(name: &str) -> PathBuf {

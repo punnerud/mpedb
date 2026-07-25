@@ -44,7 +44,7 @@ const ROWS: &[&str] = &[
 ];
 
 fn open() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-numparam-{}-{}.mpedb",
         std::process::id(),
@@ -307,7 +307,7 @@ fn integral_float_constant_assigns_like_sqlite_strict() {
 /// A TOML-config table with the same shape as `DDL`, for the provenance half:
 /// `type = "int64"` never converts, whatever `INTEGER` does.
 fn config_int_db() -> (Database, String) {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-numparams-cfg-{}-{}.mpedb",
         std::process::id(),

@@ -113,17 +113,10 @@ impl Drop for Tmp {
     }
 }
 
-fn scratch_dir() -> &'static str {
-    for d in ["/mnt/xfs/mpedb-scratch", "/mnt/ext4/mpedb-scratch"] {
-        if std::fs::create_dir_all(d).is_ok() {
-            return d;
-        }
-    }
-    if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    }
+fn scratch_dir() -> String {
+    // Real filesystem, not tmpfs: this test asserts a MEMORY bound, and a
+    // database file on /dev/shm is itself resident memory.
+    mpedb_testkit::scratch_base_real_disk().display().to_string()
 }
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);

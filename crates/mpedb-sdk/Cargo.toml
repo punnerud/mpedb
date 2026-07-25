@@ -7,3 +7,6 @@ description = "Thin caching client session for mpedb: send SQL, the SDK compiles
 
 [dependencies]
 mpedb = { workspace = true }
+
+[dev-dependencies]
+mpedb-testkit = { path = "../mpedb-testkit" }

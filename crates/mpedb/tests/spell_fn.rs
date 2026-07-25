@@ -11,7 +11,7 @@ use mpedb::{Config, Database, ExecResult, Value};
 fn db(tag: &str) -> (Database, String) {
     let path = format!(
         "{}/spellfn-{tag}-{}.mpedb",
-        if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" },
+        mpedb_testkit::scratch_base_str(),
         std::process::id()
     );
     let _ = std::fs::remove_file(&path);

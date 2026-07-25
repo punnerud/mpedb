@@ -38,11 +38,7 @@ const SQLITE_SEED: &str = "CREATE TABLE t(pk INTEGER PRIMARY KEY, i INT, f REAL,
      (3, 7, NULL, NULL), (4, NULL, NULL, 'd'), (5, 1, 1.0, 'e');";
 
 fn open(name: &str) -> (Database, String) {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir
         .join(format!("mpedb-mixedarms-{name}-{}.mpedb", std::process::id()))
         .to_string_lossy()

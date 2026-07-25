@@ -53,11 +53,7 @@ impl Drop for Tmp {
 /// a config must declare at least one) and an optional work budget; every test
 /// table is then created at RUNTIME with the same DDL the oracle runs.
 fn open(tag: &str, max_work_rows: u64) -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-aggidx-{tag}-{}-{}.mpedb",
         std::process::id(),

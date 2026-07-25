@@ -15,6 +15,7 @@ mpedb-spell = { workspace = true }
 blake3 = { workspace = true }
 
 [dev-dependencies]
+mpedb-testkit = { path = "../mpedb-testkit" }
 # Tests forge hostile/stale registry records through a second engine
 # attachment (the facade exposes no raw registry writes, by design).
 mpedb-core = { workspace = true }

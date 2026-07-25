@@ -14,7 +14,7 @@
 //! an untyped bare parameter in a data slot is refused) are asserted directly.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "sqlite_oracle/mod.rs"]
@@ -25,11 +25,7 @@ static UNIQ: AtomicU64 = AtomicU64::new(0);
 const NULL_SENTINEL: &str = "<NULL>";
 
 fn mpedb_db() -> (Database, PathBuf) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-printf-{}-{}.mpedb",
         std::process::id(),

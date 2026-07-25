@@ -8,7 +8,7 @@
 //! invisible to other handles until commit.
 
 use mpedb::{Config, Database, Error, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
@@ -23,11 +23,7 @@ impl Drop for FileGuard {
 /// Seed with ONE table (`base`, id 0) — mpedb refuses a schema with no live
 /// tables. Everything else is created live inside the tests.
 fn config(name: &str) -> (Config, FileGuard) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-ddltxn-{name}-{}-{}.mpedb",
         std::process::id(),

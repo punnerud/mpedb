@@ -36,11 +36,7 @@ impl Drop for Tmp {
 }
 
 fn fresh_path() -> String {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     format!(
         "{dir}/mpedb-fts-{}-{}.mpedb",
         std::process::id(),

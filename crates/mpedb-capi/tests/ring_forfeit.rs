@@ -47,6 +47,8 @@
 //!    by batch latency, so no budget threshold bounds it. `design/DESIGN-CAPI.md`
 //!    §7 has the full argument and the protocol change that would close it.
 
+mod common;
+
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -63,11 +65,7 @@ fn bench_dir() -> PathBuf {
 }
 
 fn scratch_dir() -> PathBuf {
-    if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    }
+    common::scratch_base()
 }
 
 /// A `durability = commit` seed — the one configuration in which the ring is

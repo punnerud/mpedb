@@ -47,11 +47,7 @@ impl Drop for Tmp {
 }
 
 fn db(tag: &str) -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-anykey-{tag}-{}-{}.mpedb",
         std::process::id(),
@@ -560,7 +556,7 @@ fn a_correlated_memo_over_a_typeless_column_matches_sqlite() {
 fn a_typeless_key_survives_reopen() {
     let path = format!(
         "{}/mpedb-anykey-reopen-{}-{}.mpedb",
-        if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" },
+        mpedb_testkit::scratch_base_str(),
         std::process::id(),
         UNIQ.fetch_add(1, Ordering::Relaxed)
     );

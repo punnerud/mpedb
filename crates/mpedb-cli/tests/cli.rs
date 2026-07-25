@@ -11,12 +11,7 @@ fn bin() -> &'static str {
 }
 
 fn base_dir() -> PathBuf {
-    let shm = Path::new("/dev/shm");
-    if shm.is_dir() {
-        shm.to_path_buf()
-    } else {
-        std::env::temp_dir()
-    }
+    mpedb_testkit::scratch_base()
 }
 
 struct TestDir(PathBuf);

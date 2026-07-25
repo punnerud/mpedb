@@ -39,11 +39,7 @@ impl Drop for Tmp {
 /// A fresh mpedb with only a throwaway `seed` table (the config schema); the real
 /// tables under test are CREATEd at runtime via live DDL.
 fn db() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-rowvalue-{}-{}.mpedb",
         std::process::id(),

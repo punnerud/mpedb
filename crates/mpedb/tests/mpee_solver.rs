@@ -32,7 +32,7 @@ impl Drop for Tmp {
 
 /// `n` tables `tK(a int64 PK, b int64)`, 10 rows each — the `select5` shape.
 fn open_chain(n: usize, max_join_cells: u64) -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-mpee-{}-{}.mpedb",
         std::process::id(),
@@ -296,7 +296,7 @@ const J17_SQL: &str = "SELECT x24,x6,x53,x1,x54,x61,x58,x63,x56,x47,x27,x38,x4,x
      AND a63=b58 AND a61=b24 AND b47=a56 AND a38=9 AND b56=a4";
 
 fn open_j17() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-j17-{}-{}.mpedb",
         std::process::id(),
@@ -396,7 +396,7 @@ fn v2_inserts() -> Vec<String> {
 }
 
 fn v2_db() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-mpee-v2-{}-{}.mpedb",
         std::process::id(),

@@ -92,11 +92,7 @@ fn insert_statements() -> Vec<&'static str> {
 }
 
 fn db() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-nestcorr-{}-{}.mpedb",
         std::process::id(),

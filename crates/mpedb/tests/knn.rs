@@ -15,7 +15,7 @@ fn db(tag: &str) -> (Database, String) {
     // process, concurrently, and a shared path is a shared database.
     let path = format!(
         "{}/knn-{tag}-{}.mpedb",
-        if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" },
+        mpedb_testkit::scratch_base_str(),
         std::process::id()
     );
     let _ = std::fs::remove_file(&path);

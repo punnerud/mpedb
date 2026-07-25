@@ -23,3 +23,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # repl line editing + Tab completion. default-features off: no history file,
 # no fuzzy/skim, no derive — the completer is hand-written in `src/line.rs`.
 rustyline = { version = "18", default-features = false }
+
+[dev-dependencies]
+mpedb-testkit = { path = "../mpedb-testkit" }

@@ -12,11 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn scratch(tag: &str) -> String {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm".to_string()
-    } else {
-        std::env::temp_dir().to_string_lossy().into_owned()
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     format!(
         "{dir}/mpedb-tier-{tag}-{}-{}",
         std::process::id(),

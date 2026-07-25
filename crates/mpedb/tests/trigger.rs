@@ -45,11 +45,7 @@ primary_key = ["id"]
 }
 
 fn fresh_path(name: &str) -> PathBuf {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-trg-{name}-{}-{}.mpedb",
         std::process::id(),

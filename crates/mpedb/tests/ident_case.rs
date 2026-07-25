@@ -48,11 +48,7 @@ mod sqlite_oracle;
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn open() -> (Database, std::path::PathBuf) {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-identcase-{}-{}.mpedb",
         std::process::id(),

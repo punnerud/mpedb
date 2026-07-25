@@ -2,17 +2,13 @@
 
 use mpedb::{params, Config, Database, Error, ExecResult, Value};
 use mpedb_proc::{Lang, ProcEngine, ProcValue};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn test_config(name: &str) -> (Config, FileGuard) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-proc-{name}-{}-{}.mpedb",
         std::process::id(),

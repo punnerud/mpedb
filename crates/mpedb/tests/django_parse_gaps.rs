@@ -45,7 +45,7 @@ impl Drop for Tmp {
 }
 
 fn open() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-djgaps-{}-{}.mpedb",
         std::process::id(),
@@ -638,7 +638,7 @@ fn a_rigid_column_refuses_what_sqlite_would_coerce() {
 
     // The PROVENANCE half: the identical types declared in a TOML config keep
     // the rigid refusal, because that is what a rigid schema is for.
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-djgaps-cfg-{}-{}.mpedb",
         std::process::id(),

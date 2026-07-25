@@ -100,11 +100,7 @@ fn rows() -> Vec<String> {
 }
 
 fn db() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-agg-stream-{}-{}.mpedb",
         std::process::id(),
@@ -347,11 +343,7 @@ fn c_invariance() {
 /// — the tripwire's own behaviour is [`group_map_is_governed_by_the_budget`].
 #[test]
 fn budget_does_not_change_answers() {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let mut baseline: Option<Vec<Vec<Vec<Value>>>> = None;
     for (i, cells) in [0u64, 512, 4096, 268_435_456].into_iter().enumerate() {
         let path = format!(
@@ -383,11 +375,7 @@ fn budget_does_not_change_answers() {
 /// *less* governed by streaming, which is the wrong direction.
 #[test]
 fn group_map_is_governed_by_the_budget() {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-agg-groupcap-{}-{}.mpedb",
         std::process::id(),
@@ -433,11 +421,7 @@ fn integer_overflow_in_sum_matches_the_oracle() {
                   SELECT sum(v), typeof(sum(v)) FROM o;\n";
     let oracle = sqlite_oracle::try_script_stdout(script, "NULL");
 
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-agg-ovf-{}-{}.mpedb",
         std::process::id(),

@@ -10,18 +10,13 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::os::raw::c_int;
 use std::ptr;
 
-/// A writable scratch directory: `/dev/shm` where it exists (mpedb's natural
-/// habitat on Linux), the platform temp dir otherwise (macOS has no `/dev/shm`).
-/// Same fallback `attach_ffi.rs` and the shim itself already use.
+mod common;
+
+/// A writable scratch directory, from the shared rule in
+/// `tests/common` — honors `MPEDB_TEST_DIR`, else `/dev/shm`, else the
+/// platform temp dir (macOS has no `/dev/shm`).
 fn scratch_dir() -> String {
-    if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm".to_string()
-    } else {
-        std::env::temp_dir()
-            .to_string_lossy()
-            .trim_end_matches('/')
-            .to_string()
-    }
+    common::scratch_base_str().trim_end_matches('/').to_string()
 }
 
 fn cs(s: &str) -> CString {

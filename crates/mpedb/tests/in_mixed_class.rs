@@ -2,19 +2,13 @@
 //! `name IN (num_chairs + 0)` is a clean FALSE for text vs int, never a bind error.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn open() -> (Database, PathBuf) {
-    let dir = if Path::new("/mnt/ext4").is_dir() {
-        PathBuf::from("/mnt/ext4")
-    } else if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-inmix-{}-{}.mpedb",
         std::process::id(),

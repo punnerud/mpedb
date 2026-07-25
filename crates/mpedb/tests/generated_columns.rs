@@ -43,11 +43,7 @@ impl Drop for Tmp {
 }
 
 fn open() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-generated-{}-{}.mpedb",
         std::process::id(),
@@ -556,11 +552,7 @@ fn a_generated_expression_may_not_call_a_host_udf() {
 /// by the REOPENED handle computes the same column.
 #[test]
 fn generated_columns_survive_a_reopen() {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-gen-reopen-{}-{}.mpedb",
         std::process::id(),

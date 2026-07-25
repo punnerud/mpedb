@@ -4,6 +4,8 @@
 //! `PRAGMA database_list`, and the v1 refusals surfacing as clean SQLITE
 //! errors (never a differing answer).
 
+mod common;
+
 use mpedb_sqlite3::*;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::os::raw::c_int;
@@ -46,11 +48,7 @@ impl Drop for Files {
 }
 
 fn paths(tag: &str) -> (Files, String, String) {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = common::scratch_base_str();
     let main = format!("{dir}/mpedb-capi-att-{tag}-{}-main.db", std::process::id());
     let other = format!("{dir}/mpedb-capi-att-{tag}-{}-other.db", std::process::id());
     let _ = std::fs::remove_file(&main);

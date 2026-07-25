@@ -71,7 +71,7 @@ const ROWS: &[&str] = &[
 ];
 
 fn open() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-joinscope-{}-{}.mpedb",
         std::process::id(),

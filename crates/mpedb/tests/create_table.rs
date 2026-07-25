@@ -5,17 +5,13 @@
 //! process sees the new table on its next statement (schema-gen reload).
 
 use mpedb::{params, Config, Database, Error, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn config(name: &str) -> (Config, PathBuf) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-createtable-{name}-{}-{}.mpedb",
         std::process::id(),

@@ -55,11 +55,7 @@ const VALUES: &[&str] = &[
 ];
 
 fn open(tag: &str) -> (Database, String) {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir
         .join(format!("mpedb-bool-{tag}-{}.mpedb", std::process::id()))
         .to_string_lossy()

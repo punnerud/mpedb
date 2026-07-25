@@ -63,11 +63,7 @@ CREATE TABLE b (bid INTEGER PRIMARY KEY, k INT, w INT) STRICT;
 const SQLITE_INDEXES: &str = "CREATE INDEX a_g ON a(g); CREATE INDEX b_k ON b(k);\n";
 
 fn mpedb_open(indexed: bool) -> (Database, String) {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm".into()
-    } else {
-        std::env::temp_dir().display().to_string()
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-aggcorrpr-{}-{}.mpedb",
         std::process::id(),

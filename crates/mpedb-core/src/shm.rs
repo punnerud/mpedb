@@ -3259,12 +3259,7 @@ mod tests {
     /// wal tests run on /dev/shm when available: the torn-tail sweep calls
     /// wal_recover (a full-mapping msync) thousands of times.
     fn wal_tmp_path(name: &str) -> std::path::PathBuf {
-        let base = std::path::Path::new("/dev/shm");
-        let dir = if base.is_dir() {
-            base.join("mpedb-wal-tests")
-        } else {
-            std::env::temp_dir().join("mpedb-wal-tests")
-        };
+        let dir = mpedb_testkit::scratch_base().join("mpedb-wal-tests");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(format!("{}-{}", name, std::process::id()))
     }

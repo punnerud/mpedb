@@ -16,3 +16,6 @@ leakstat = []
 mpedb-types = { workspace = true }
 libc = { workspace = true }
 xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+mpedb-testkit = { path = "../mpedb-testkit" }

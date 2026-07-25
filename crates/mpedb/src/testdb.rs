@@ -10,11 +10,7 @@ use crate::Database;
 /// is what keeps these tests portable to macOS, where `/dev/shm` does not exist
 /// (#66). On Linux the choice is unchanged.
 pub(crate) fn scratch_dir() -> PathBuf {
-    if std::path::Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    }
+    mpedb_testkit::scratch_base()
 }
 
 /// Full scratch path for `name` under [`scratch_dir`], as a `String` — these

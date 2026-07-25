@@ -14,6 +14,7 @@ leakstat = ["mpedb-core/leakstat"]
 sqlite-checkpoint = ["dep:rusqlite"]
 
 [dev-dependencies]
+mpedb-testkit = { path = "../mpedb-testkit" }
 # "functions" lets the differential oracle register a Rust closure as the
 # consumer's `regexp()` UDF — the contract behind sqlite's REGEXP operator
 # (tests/regexp.rs; the bare library has no regexp() of its own).

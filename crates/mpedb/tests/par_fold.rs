@@ -31,11 +31,7 @@ mod sqlite_oracle;
 /// failed the entire file there with `Io(NotFound)` the first time CI ran on
 /// macOS.
 fn scratch_dir() -> String {
-    if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm".to_string()
-    } else {
-        std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string()
-    }
+    mpedb_testkit::scratch_base_str()
 }
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);

@@ -10,7 +10,7 @@ use mpedb::{Config, Database};
 fn db() -> (Database, String) {
     let path = format!(
         "{}/riskdg-{}.mpedb",
-        if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" },
+        mpedb_testkit::scratch_base_str(),
         std::process::id()
     );
     let _ = std::fs::remove_file(&path);

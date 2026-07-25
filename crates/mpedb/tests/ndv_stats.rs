@@ -7,11 +7,7 @@
 use mpedb::{Config, Database, ExecResult, Value};
 
 fn scratch_dir() -> String {
-    if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm".into()
-    } else {
-        std::env::temp_dir().to_string_lossy().into_owned()
-    }
+    mpedb_testkit::scratch_base_str()
 }
 
 fn db() -> (Database, String) {

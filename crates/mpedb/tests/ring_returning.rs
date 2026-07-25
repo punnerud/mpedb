@@ -10,16 +10,12 @@
 //! keeps such plans off the ring, like host-call and deadline-carrying ones.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 fn test_config() -> (Config, PathBuf) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!("mpedb-ring-returning-{}.mpedb", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let toml = format!(

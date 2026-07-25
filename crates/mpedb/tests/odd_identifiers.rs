@@ -14,7 +14,7 @@
 use mpedb::{Config, Database, ExecResult, Value};
 
 fn config(tag: &str) -> (Config, std::path::PathBuf) {
-    let path = if std::path::Path::new("/dev/shm").is_dir() { std::path::PathBuf::from("/dev/shm") } else { std::env::temp_dir() }
+    let path = mpedb_testkit::scratch_base()
         .join(format!("mpedb-oddident-{tag}.mpedb"));
     let _ = std::fs::remove_file(&path);
     let toml = format!(

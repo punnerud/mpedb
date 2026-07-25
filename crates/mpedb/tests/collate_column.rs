@@ -89,11 +89,7 @@ fn insert_statements() -> Vec<String> {
 }
 
 fn db() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-collate-col-{}-{}.mpedb",
         std::process::id(),
@@ -230,7 +226,7 @@ fn column_collation_matches_sqlite_3_45() {
 /// the default for comparisons on it, verified against sqlite.
 #[test]
 fn alter_add_column_collate_matches_sqlite() {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-collate-alter-{}-{}.mpedb",
         std::process::id(),
@@ -285,7 +281,7 @@ fn alter_add_column_collate_matches_sqlite() {
 /// rows of the LAST statement — or the first error as `Err`, so a constraint
 /// violation is observable and comparable to sqlite's.
 fn run_mpedb(stmts: &[&str]) -> Result<Vec<Vec<String>>, String> {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-collate-idx-{}-{}.mpedb",
         std::process::id(),

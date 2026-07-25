@@ -216,11 +216,7 @@ fn kind_seqs(n_joins: usize) -> Vec<Vec<K>> {
 #[test]
 fn full_join_chains_match_sqlite() {
     let pid = std::process::id();
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let mpath = format!("{dir}/mpedb-fjc-{pid}.mpedb");
 
     let db = open_mpedb(&mpath);

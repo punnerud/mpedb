@@ -44,11 +44,7 @@ impl Drop for Tmp {
 }
 
 fn shm_path(tag: &str) -> String {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let p = format!(
         "{dir}/mpedb-wframe-{tag}-{}-{}.mpedb",
         std::process::id(),

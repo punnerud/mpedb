@@ -74,11 +74,7 @@ fn insert_statements() -> Vec<String> {
 }
 
 fn db() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-glob-{}-{}.mpedb",
         std::process::id(),

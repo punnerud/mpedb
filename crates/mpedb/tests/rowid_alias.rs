@@ -46,11 +46,7 @@ impl Drop for Tmp {
 /// are created live via `CREATE TABLE`, exactly as they are in the sqlite3
 /// script, so the two engines run byte-identical DDL.
 fn open() -> Tmp {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        "/dev/shm"
-    } else {
-        "/tmp"
-    };
+    let dir = mpedb_testkit::scratch_base_str();
     let path = format!(
         "{dir}/mpedb-rowid-{}-{}.mpedb",
         std::process::id(),

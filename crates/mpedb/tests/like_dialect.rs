@@ -11,7 +11,7 @@
 //! text plus a numeric column, and pins the four behaviors from the spec.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
@@ -38,11 +38,7 @@ const DATA: &[(i64, &str)] = &[
 ];
 
 fn open(name: &str, compat: Option<&str>) -> (Database, PathBuf) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-like-{name}-{}-{}.mpedb",
         std::process::id(),

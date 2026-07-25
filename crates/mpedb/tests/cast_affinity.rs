@@ -26,11 +26,7 @@ mod sqlite_oracle;
 /// One throwaway database (FROM-less SELECT needs no user tables, but a config
 /// needs at least one, so we declare a trivial one and never touch it).
 fn open() -> (Database, String) {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = mpedb_testkit::scratch_base();
     let path = dir
         .join(format!("mpedb-cast-{}.mpedb", std::process::id()))
         .to_string_lossy()

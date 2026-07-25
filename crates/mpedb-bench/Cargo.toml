@@ -26,3 +26,6 @@ postgres = "0.19"
 [[bin]]
 name = "mpedb-bench"
 path = "src/main.rs"
+
+[dev-dependencies]
+mpedb-testkit = { path = "../mpedb-testkit" }
