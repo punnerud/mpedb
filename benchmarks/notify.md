@@ -170,58 +170,59 @@ deployment pays one per statement, and those round trips sit *inside* the
 transaction where they extend how long its row lock is held. The RTT is a knob
 (`MPEDB_E_RTT_MS`) so a reader who disagrees with 1 ms can pick another.
 
-### actions/s — local profile (20 ms think, 1 read/write pair)
+### actions/s — local profile (20 ms think, **1** read/write pair)
 
-| workers | Linux mpedb *unguarded (ctl)* | Linux mpedb guarded | Linux pg | M3 mpedb *unguarded (ctl)* | M3 mpedb guarded | M3 pg |
+| workers | Linux *unguarded (ctl)* | Linux guarded | Linux pg | M3 *unguarded (ctl)* | M3 guarded | M3 pg |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2 | 81 | 67 | 77 | 63 | 54 | 61 |
-| 4 | 162 | 121 | **156** | 123 | 94 | **118** |
-| 8 | 298 | 167 | **301** | 231 | 134 | **231** |
+| 2 | 81 | 69 | **78** | 63 | 61 | 61 |
+| 4 | 164 | 120 | **155** | 120 | 95 | **116** |
+| 8 | 304 | 183 | **296** | 235 | 136 | **226** |
 
-### actions/s — networked profile (40 ms think, 5 pairs, 1 ms RTT to pg)
+### actions/s — networked profile (40 ms think, **5** pairs, 1 ms RTT to pg)
 
-| workers | Linux mpedb *unguarded (ctl)* | Linux mpedb guarded | Linux pg | M3 mpedb *unguarded (ctl)* | M3 mpedb guarded | M3 pg |
+| workers | Linux *unguarded (ctl)* | Linux guarded | Linux pg | M3 *unguarded (ctl)* | M3 guarded | M3 pg |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2 | 44 | 44 | 43 | 38 | 39 | 37 |
-| 4 | 89 | 66 | **85** | 75 | 58 | **72** |
-| 8 | 174 | 88 | **165** | 149 | 78 | **143** |
-
-### E-hot (deliberate collision), 8 workers
-
-| | Linux | M3 |
-|---|---:|---:|
-| mpedb guarded | 69 | 96 |
-| postgres | **83** | **112** |
+| 2 | 44 | 26 | **29** | 40 | 23 | **26** |
+| 4 | 87 | 36 | **57** | 76 | 35 | **52** |
+| 8 | 175 | 44 | **115** | 148 | 40 | **93** |
 
 ### What this says
 
-**#143 turned a flat line into a scaling one.** Before key regions the guarded
-column was 42, 42, 42 on Linux and 34, 34, 34 on the M3 — every worker
-conflicted with every other because the guard compared *tables*. Recording
-which keys a commit landed on, and checking against the keys an action touched,
-takes it to 67 → 121 → 167. Retries fell from 2492 to 324 at 8 workers.
+**#143 works, and it works only for small actions.**
 
-**It does not close the gap.** Guarded mpedb reaches roughly **half** the
-unguarded ceiling at 8 workers, on both machines and both profiles, while
-PostgreSQL reaches all of it. The cause is the summary's width: the ring entry
-has 8 bytes, so the region set is a 64-bit Bloom filter with one bit per key.
-Two keys collide with probability 1/64, and a guard's window contains every
-commit since its snapshot — so the retry rate grows with **think time × commit
-rate**, which is why the networked profile (40 ms think) is worse than the
-local one (20 ms). That is the same rate-law shape as #135, and closing it is a
-format question, not an algorithmic one.
+With **one** read/write pair the guarded column went from a flat 42, 42, 42 to
+69, 120, 183 on Linux and 61, 95, 136 on the M3 — from "does not scale at all"
+to within reach of PostgreSQL. Recording *which keys* a commit landed on,
+rather than only which tables, is what did that.
 
-**Under real contention, waiting still beats retrying.** In E-hot PostgreSQL
-leads on both machines. The reason is not subtle: a waiter is handed the row
-and does its work once, while a retry throws away everything it already did —
-here a full think time — and starts over. Optimistic concurrency is the wrong
-tool when conflicts are common *and* the work between read and commit is
-expensive. That is exactly the case a lease (#142 G2) exists for, and this
-table is the argument for building it.
+With **five** pairs it collapses: 26, 36, 44 against an unguarded control of
+44, 87, 175. The arithmetic is not subtle. The ring entry has 8 bytes, so the
+region set is a 64-bit Bloom filter with one bit per key. An action touching
+six keys sets six bits; two such actions share a bit with probability roughly
+6 × 6 / 64 ≈ **56 %**. The filter stops filtering exactly when actions become
+realistic, and the retry counts show it — 785 refusals for 320 actions at 8
+workers.
 
-**Where the guard is unambiguously right:** two workers, either profile, both
-engines at the think-time floor. Nothing waits, nothing retries, and mpedb
-holds nothing across the work at all.
+**So this is a width problem, not an algorithm problem.** The mechanism is
+right and is now proven by the single-pair column; 64 bits is simply too narrow
+to summarise a multi-statement action. Widening it is a shared-memory format
+change and therefore a deliberate decision, not a tweak.
+
+**Under real contention, waiting still beats retrying.** PostgreSQL leads E-hot
+on both machines and both profiles. A waiter is handed the row and does its
+work once; a retry throws away everything it already did — here a whole think
+time — and starts over. Optimistic concurrency is the wrong tool when conflicts
+are common *and* the work between read and commit is expensive, which is
+precisely the case a lease (#142 G2) exists for.
+
+**Where the guard is unambiguously right:** two workers, local profile, both
+engines at the think-time floor with a handful of retries. Nothing waits,
+nothing is held across the work, and a killed worker costs nothing.
+
+**Note on the networked profile.** PostgreSQL's p50 rises to 67–80 ms there
+because it pays 15 modelled round trips inside each transaction. It still wins
+on throughput, which is the honest result: the network cost we modelled in its
+favour is real, and it is not what decides this arm.
 
 ## What this does not measure
 
