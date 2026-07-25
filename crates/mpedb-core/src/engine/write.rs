@@ -87,6 +87,11 @@ pub struct Guard {
     /// shard. Two statements under different tenants are not one shard, and
     /// letting the last one win would be exactly the wrong-answer direction.
     pub shard: Option<u64>,
+    /// Columns this action touched, folded `& 63` (#146 K1). Starts at 0 and
+    /// only ever grows; 0 at commit means "nothing named a column" and is
+    /// widened to [`COLS_ANY`] there rather than here, so the growing-only rule
+    /// stays simple.
+    pub cols: u64,
     /// Has any statement run yet? Distinguishes "no shard proven" from "no
     /// statement has spoken", which would otherwise both read as `None`.
     pub shard_seen: bool,
@@ -216,6 +221,8 @@ pub struct WriteTxn<'e> {
     pub(super) written_regions: u64,
     /// The shard this txn's writes all belong to (#144), or `None` if they do
     /// not all belong to one provable shard.
+    /// Columns this txn WROTE, same folding and same widening rule.
+    pub(super) written_cols: u64,
     pub(super) written_shard: Option<u64>,
     pub(super) written_shard_seen: bool,
     /// Per-table key REGION for change notification (#139 S2, widened by
@@ -418,6 +425,25 @@ impl<'e> WriteTxn<'e> {
     /// Narrow the guard's shard to what this statement proved (#144). The
     /// first statement sets it; every later one must agree or the shard is
     /// lost.
+    /// Widen the guarded surface by one column (#146 K1), or by ALL columns
+    /// when the statement cannot name them.
+    pub fn guard_touch_col(&mut self, col: Option<u16>) {
+        if let Some(g) = self.guard.as_mut() {
+            g.cols |= match col {
+                Some(c) => 1u64 << (c & 63),
+                None => crate::shm::COLS_ANY,
+            };
+        }
+    }
+
+    /// Same, for what this txn records as written.
+    pub fn record_written_col(&mut self, col: Option<u16>) {
+        self.written_cols |= match col {
+            Some(c) => 1u64 << (c & 63),
+            None => crate::shm::COLS_ANY,
+        };
+    }
+
     pub fn guard_shard(&mut self, shard: Option<u64>) {
         if let Some(g) = self.guard.as_mut() {
             if !g.shard_seen {
@@ -458,8 +484,8 @@ impl<'e> WriteTxn<'e> {
     }
 
     /// The guard's snapshot and accumulated surface, for the commit path.
-    pub fn guard_state(&self) -> Option<(u64, u64, u64, Option<u64>)> {
-        self.guard.as_ref().map(|g| (g.snap_txn, g.surface, g.regions, g.shard))
+    pub fn guard_state(&self) -> Option<(u64, u64, u64, Option<u64>, u64)> {
+        self.guard.as_ref().map(|g| (g.snap_txn, g.surface, g.regions, g.shard, g.cols))
     }
 
     pub fn hint_notify_key(&mut self, table_id: u32, region: Option<&[u8]>) {

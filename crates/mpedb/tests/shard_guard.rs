@@ -51,6 +51,22 @@ primary_key = ["id"]
   type = "int64"
 
 [[table]]
+name = "blocks"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "ord"
+  type = "int64"
+
+  [[table.column]]
+  name = "body"
+  type = "int64"
+
+[[table]]
 name = "other"
 primary_key = ["id"]
 
@@ -395,6 +411,130 @@ fn a_guard_that_scanned_conflicts_with_any_write() {
         other => panic!(
             "an action that decided from a full scan committed after the scanned \
              table changed ({other:?})"
+        ),
+    }
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **#146 K1, and the reason it exists.** One worker MOVES a block (writes
+/// `ord`) while another EDITS the same block's text (`body`) — the SAME ROW,
+/// different columns, both from the same snapshot. Both must commit.
+///
+/// This is the hard case in collaborative editing, and it is hard only when a
+/// move is expressed as delete-plus-insert: then it tears the text out from
+/// under everyone editing inside it. As a column write it is independent of
+/// the text, so the edit **follows the move** structurally rather than by any
+/// merge logic.
+///
+/// Row granularity (#143) passes every other test in this file and fails this
+/// one, which is what makes it load-bearing rather than decorative. Verified
+/// to fail with the column check removed.
+#[test]
+fn a_move_and_an_edit_on_one_row_both_commit() {
+    let (d, path) = db("cols");
+    d.query("INSERT INTO blocks (id, ord, body) VALUES (1, 10, 100)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+
+    let mv = ["UPDATE blocks SET ord = $1 WHERE id = $2"];
+    let ed = ["UPDATE blocks SET body = $1 WHERE id = $2"];
+
+    let mut a = d.begin_guarded_for(snap, &mv).unwrap();
+    a.query(mv[0], &[Value::Int(20), Value::Int(1)]).unwrap();
+    a.commit().expect("the move should commit");
+
+    let mut b = d.begin_guarded_for(snap, &ed).unwrap();
+    b.query(ed[0], &[Value::Int(200), Value::Int(1)]).unwrap();
+    b.commit().expect(
+        "the edit was refused because the block moved — a concurrent edit must \
+         FOLLOW a move, and column granularity is what makes that structural",
+    );
+
+    // Both landed: the block is at its new position WITH the new text.
+    let got = d.query("SELECT ord, body FROM blocks WHERE id = 1", &[]).unwrap();
+    let mpedb::ExecResult::Rows { rows, .. } = got else { panic!("expected rows") };
+    assert_eq!(rows[0][0], Value::Int(20), "the move was lost");
+    assert_eq!(rows[0][1], Value::Int(200), "the edit was lost");
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Two writes to the SAME column of the same row still conflict — without
+/// this, the column filter could be "always allow".
+#[test]
+fn two_writes_to_one_column_still_conflict() {
+    let (d, path) = db("samecol");
+    d.query("INSERT INTO orders (id, v) VALUES (1, 1)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+    let sql = ["UPDATE orders SET v = $1 WHERE id = $2"];
+
+    let mut a = d.begin_guarded_for(snap, &sql).unwrap();
+    a.query(sql[0], &[Value::Int(2), Value::Int(1)]).unwrap();
+    a.commit().unwrap();
+
+    let mut b = d.begin_guarded_for(snap, &sql).unwrap();
+    b.query(sql[0], &[Value::Int(3), Value::Int(1)]).unwrap();
+    match b.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!("two writes to the same column both committed ({other:?})"),
+    }
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A DELETE names no columns because it removes the whole row, so it must
+/// conflict with a write to any of them. The fail-safe direction for K1.
+#[test]
+fn a_delete_conflicts_with_a_single_column_write() {
+    let (d, path) = db("delcols");
+    d.query("INSERT INTO orders (id, v) VALUES (1, 1)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+
+    let mut a = d.begin_guarded_for(snap, &["DELETE FROM orders WHERE id = $1"]).unwrap();
+    a.query("DELETE FROM orders WHERE id = 1", &[]).unwrap();
+    a.commit().unwrap();
+
+    let mut b = d
+        .begin_guarded_for(snap, &["UPDATE orders SET v = $1 WHERE id = $2"])
+        .unwrap();
+    b.query("UPDATE orders SET v = 5 WHERE id = 1", &[]).unwrap();
+    match b.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!(
+            "a column write did not conflict with a DELETE of the same row ({other:?}) — \
+             the row is gone, so every column is"
+        ),
+    }
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An expression that READS a column puts it in the mask, because a concurrent
+/// change to it would have altered the result. `SET ord = ord + 1` therefore
+/// conflicts with a write to `ord`, where `SET ord = $1` would not.
+///
+/// This is where the column filter earns its exactness: `Instr::PushCol` is the
+/// only instruction that touches the row, so "reads nothing" is provable rather
+/// than assumed.
+#[test]
+fn an_expression_that_reads_a_column_guards_it() {
+    let (d, path) = db("readcol");
+    d.query("INSERT INTO blocks (id, ord, body) VALUES (1, 10, 100)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+
+    // Someone bumps `body`.
+    d.query("UPDATE blocks SET body = 999 WHERE id = 1", &[]).unwrap();
+
+    // An action that writes `ord` but READS `body` must feel that.
+    let sql = ["UPDATE blocks SET ord = body WHERE id = $1"];
+    let mut s = d.begin_guarded_for(snap, &sql).unwrap();
+    s.query(sql[0], &[Value::Int(1)]).unwrap();
+    match s.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!(
+            "an action computing from `body` committed after `body` changed ({other:?}) — \
+             the read side of the column mask is missing"
         ),
     }
     drop(d);

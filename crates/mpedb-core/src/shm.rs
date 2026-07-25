@@ -89,7 +89,7 @@ fn memory_backing_file() -> Result<File> {
     }
 }
 
-pub const FORMAT_VERSION: u32 = 5; // v5: notify region on its own page (#147)
+pub const FORMAT_VERSION: u32 = 6; // v6: ring entry carries a column mask (#146 K1)
                                    //     (DESIGN-BLOBEXTENT §3.4); WAL3 trailer.
                                    // v2: intent-ring region between reader table and data
 
@@ -172,12 +172,28 @@ const LA_OPT_RING: usize = 256;
 /// Committed-footprint ring capacity (also the max snapshot-age a validator can
 /// trust before conservatively conflicting).
 pub const OPT_RING_SLOTS: u64 = 64;
-const OPT_RING_ENTRY: usize = 32; // txn_id ‖ kind ‖ table_bits ‖ key_hash
+const OPT_RING_ENTRY: usize = 40; // txn_id ‖ kind ‖ table_bits ‖ key_hash ‖ cols
+// 256 + 64 * 40 = 2816, inside the lock page. The room came from #147 moving
+// the notification region off this page; the ring grew into it rather than
+// packing two meanings into one field, which is the mistake `khash` already
+// carries three of.
 // entry field offsets
 const OFP_TXN: usize = 0;
 const OFP_KIND: usize = 8;
 const OFP_TBITS: usize = 16;
 const OFP_KHASH: usize = 24;
+/// Columns this commit wrote, as a bitmask over column index folded `& 63`
+/// (#146 K1). `u64::MAX` means "unknown / all", which is what anything that
+/// cannot name its columns must publish.
+///
+/// **Why a fourth dimension.** Moving a document block writes `ord`; editing
+/// its text writes `body`. Those are the same row, so every coarser rule
+/// conflicts them — and a concurrent edit then cannot *follow* a move, which is
+/// the hard case in collaborative editing. Distinguishing columns is what makes
+/// the move and the edit independent.
+const OFP_COLS: usize = 32;
+/// The mask meaning "every column" — the fail-safe value.
+pub const COLS_ANY: u64 = u64::MAX;
 /// Footprint kinds recorded per committed txn.
 pub const OFP_KIND_EMPTY: u64 = 0; // touched no user table (catalog/sys only)
 pub const OFP_KIND_POINT: u64 = 1; // exactly one table, one PK (table_bits+key_hash)
@@ -291,6 +307,30 @@ pub enum GuardVerdict {
     /// A ring slot did not hold the txn id it should — overwritten, or written
     /// by a process whose commits we cannot see. Conservative.
     RingGap,
+}
+
+/// The four dimensions a guarded action is checked on (#142–#146).
+///
+/// They are one concept and travel together: a conflict needs an overlap in
+/// EVERY dimension, and each one that can be named narrows the answer. Passing
+/// them separately was seven arguments and counting, which is the shape of a
+/// type that has not been written down yet.
+///
+/// Each field's "unknown" value is the widest one, so a surface built from
+/// nothing conflicts with everything:
+///
+/// | field | unknown | meaning |
+/// |---|---|---|
+/// | `tables` | — | folded `& 63`; empty conflicts with nothing |
+/// | `regions` | [`Shm::REGION_ANY`] | which keys |
+/// | `shard` | `None` | which tenant, when provable |
+/// | `cols` | [`COLS_ANY`] | which columns |
+#[derive(Debug, Clone, Copy)]
+pub struct GuardSurface {
+    pub tables: u64,
+    pub regions: u64,
+    pub shard: Option<u64>,
+    pub cols: u64,
 }
 
 const INIT_READY: u32 = 2;
@@ -2798,7 +2838,8 @@ impl Shm {
     /// The txn_id field is stored LAST (Release) so a reader that sees it can
     /// trust the payload; in practice every read is also serialized by the
     /// writer mutex, which is a full barrier.
-    pub fn opt_record(&self, txn_id: u64, kind: u64, table_bits: u64, key_hash: u64) {
+    pub fn opt_record(&self, txn_id: u64, kind: u64, table_bits: u64, key_hash: u64, cols: u64) {
+        self.opt_field(txn_id, OFP_COLS).store(cols, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_KIND).store(kind, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_TBITS).store(table_bits, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_KHASH).store(key_hash, Ordering::Relaxed);
@@ -2913,11 +2954,10 @@ impl Shm {
         &self,
         snap_txn: u64,
         current_txn: u64,
-        table_bits: u64,
-        regions: u64,
-        shard: Option<u64>,
+        surface: &GuardSurface,
         why: &mut GuardVerdict,
     ) -> bool {
+        let GuardSurface { tables: table_bits, regions, shard, cols } = *surface;
         if current_txn <= snap_txn {
             return false; // nothing committed since our snapshot
         }
@@ -2972,7 +3012,18 @@ impl Shm {
                 // landed, so it must be taken to have landed anywhere.
                 _ => true,
             };
-            if overlap {
+            if !overlap {
+                continue;
+            }
+            // #146 K1, checked LAST because it is the only test that can clear
+            // an otherwise-overlapping pair: same table, same key, same shard,
+            // but different COLUMNS. A move writes `ord` while an edit writes
+            // `body`, and that is what lets the edit follow the move.
+            //
+            // `COLS_ANY` on either side means "could be any column", so the
+            // masks always intersect and the pair conflicts — which is the
+            // pre-#146 behaviour and the direction anything unnameable takes.
+            if self.opt_field(t, OFP_COLS).load(Ordering::Relaxed) & cols != 0 {
                 *why = GuardVerdict::Overlap;
                 return true;
             }

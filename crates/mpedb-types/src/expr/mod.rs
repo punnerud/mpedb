@@ -412,6 +412,28 @@ pub struct ExprProgram {
 }
 
 impl ExprProgram {
+    /// Every column this expression reads, folded into a `& 63` bitmask
+    /// (#146 K1).
+    ///
+    /// [`Instr::PushCol`] is the only instruction that touches the row, which
+    /// is what makes this exact rather than an approximation — an expression
+    /// with no `PushCol` provably depends on nothing in the row, so an action
+    /// built from such expressions can be guarded on the columns it WRITES and
+    /// nothing more. That is what lets a move (`SET ord = $1`) and an edit
+    /// (`SET body = $1`) stop conflicting.
+    pub fn cols_read_mask(&self) -> u64 {
+        let mut m = 0u64;
+        for i in &self.instrs {
+            if let Instr::PushCol(c) = i {
+                m |= 1u64 << (c & 63);
+            }
+        }
+        m
+    }
+}
+
+
+impl ExprProgram {
     /// Is this program the single constant `TRUE`? The shape a vacuous
     /// predicate compiles to — a comma join's `ON true`, or an ON whose every
     /// conjunct was consumed into an access path. EXPLAIN uses it to tell a

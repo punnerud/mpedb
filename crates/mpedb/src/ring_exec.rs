@@ -343,6 +343,50 @@ pub(crate) fn widen_guard(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, params: &
     // per-user workload has the wrong shape for one anyway — whether two
     // actions conflict should depend on whether it is the same user, not on
     // how many users exist.
+    // #146 K1: which COLUMNS. `PlanStmt::Update` names what it assigns, and
+    // `Instr::PushCol` is the only instruction that reads the row — so an
+    // UPDATE's true column footprint is (assigned) ∪ (read by its expressions
+    // and filter), exactly.
+    //
+    // That exactness is the whole feature: `SET ord = $1` and `SET body = $1`
+    // read nothing, so a move and an edit on one row stop conflicting. Add a
+    // column reference — `SET ord = ord + 1` — and that column joins the mask,
+    // because a concurrent change to it would have altered the result.
+    //
+    // Everything else widens to ALL columns. A DELETE removes every column; an
+    // INSERT creates every column; and a SELECT that DECIDED depends on more
+    // than its filter names, so narrowing it would risk losing a conflict.
+    let mut mask_all = plan.footprint.tables_read.iter().next().is_some()
+        && !matches!(plan.stmt, PlanStmt::Update { .. });
+    let mut cols: Vec<u16> = Vec::new();
+    if let PlanStmt::Update { set, filter, .. } = &plan.stmt {
+        let mut read = filter.as_ref().map_or(0u64, |f| f.cols_read_mask());
+        for (col, e) in set {
+            cols.push(*col);
+            read |= e.cols_read_mask();
+        }
+        for b in 0..64u16 {
+            if read & (1u64 << b) != 0 {
+                cols.push(b);
+            }
+        }
+    } else {
+        mask_all = true;
+    }
+    if mask_all {
+        txn.guard_touch_col(None);
+        if !plan.footprint.tables_written.is_empty() {
+            txn.record_written_col(None);
+        }
+    } else {
+        for c in cols {
+            txn.guard_touch_col(Some(c));
+            if !plan.footprint.tables_written.is_empty() {
+                txn.record_written_col(Some(c));
+            }
+        }
+    }
+
     let sh = plan_shard(plan, params);
     txn.guard_shard(sh);
     if !plan.footprint.tables_written.is_empty() {

@@ -83,17 +83,17 @@ impl<'e> WriteTxn<'e> {
         // writeback and no freelist fixpoint, it just aborts. Retrying is the
         // expected outcome, not the exceptional one, so it must not be
         // expensive.
-        if let Some((snap_txn, surface, regions, shard)) = self.guard_state() {
+        if let Some((snap_txn, surface, regions, shard, cols)) = self.guard_state() {
             let mut why = crate::shm::GuardVerdict::Clear;
             // A guard that touched no resolvable key guards its whole surface;
             // one that named its keys guards only those. Zero would mean "no
             // keys", which would make an untouched guard conflict with nothing.
             let regions = if regions == 0 { crate::shm::Shm::REGION_ANY } else { regions };
-            if self
-                .eng
-                .shm
-                .opt_conflict_set(snap_txn, self.meta.txn_id, surface, regions, shard, &mut why)
-            {
+            // Zero means "no column was named", which must read as every
+            // column — the same widening the committer applies below.
+            let cols = if cols == 0 { crate::shm::COLS_ANY } else { cols };
+            let gs = crate::shm::GuardSurface { tables: surface, regions, shard, cols };
+            if self.eng.shm.opt_conflict_set(snap_txn, self.meta.txn_id, &gs, &mut why) {
                 self.eng.guard_stats.record(why);
                 self.abort();
                 return Err(Error::WriteConflict);
@@ -484,7 +484,9 @@ impl<'e> WriteTxn<'e> {
                 }
                 None => (OFP_KIND_EMPTY, 0, 0),
             };
-            self.eng.shm.opt_record(new_txn, kind, tbits, khash);
+            let wcols =
+                if self.written_cols == 0 { crate::shm::COLS_ANY } else { self.written_cols };
+            self.eng.shm.opt_record(new_txn, kind, tbits, khash, wcols);
         }
 
         // 4. publish (fence(Release) + atomic stores inside)

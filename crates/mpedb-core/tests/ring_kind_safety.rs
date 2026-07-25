@@ -49,7 +49,7 @@ primary_key = ["id"]
     // The one kind that may legitimately answer "no conflict": a point write
     // to a DIFFERENT key. This is the behaviour the catch-all used to give
     // every unknown kind.
-    shm.opt_record(1, OFP_KIND_POINT, tbits, my_key ^ 1);
+    shm.opt_record(1, OFP_KIND_POINT, tbits, my_key ^ 1, u64::MAX);
     assert!(
         !shm.opt_conflict(0, 1, 0, my_key),
         "a point write to another key should not conflict — if this fails the \
@@ -63,7 +63,7 @@ primary_key = ["id"]
     // everything above is a value no writer emits, which is exactly the case
     // the catch-all decides.
     for kind in [5u64, 7, 42, 255, u64::MAX] {
-        shm.opt_record(1, kind, tbits, my_key ^ 1);
+        shm.opt_record(1, kind, tbits, my_key ^ 1, u64::MAX);
         assert!(
             shm.opt_conflict(0, 1, 0, my_key),
             "ring kind {kind} was read as a point write and reported NO conflict — \
