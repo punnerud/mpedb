@@ -183,6 +183,36 @@ pub const OFP_KIND_EMPTY: u64 = 0; // touched no user table (catalog/sys only)
 pub const OFP_KIND_POINT: u64 = 1; // exactly one table, one PK (table_bits+key_hash)
 pub const OFP_KIND_TABLE: u64 = 2; // table-level write set (table_bits), any keys
 
+// ---- change-notification region (#139) ----
+//
+// A fixed table of per-table change generations in the free tail of the lock
+// page, so a process can WAIT for a table to change instead of polling. This
+// is what lets mpedb answer LISTEN/NOTIFY without Postgres's global commit
+// lock: Postgres serializes commits to deliver notifications in commit order
+// across every channel, and that ordering is a promise mpedb deliberately does
+// not make. Per table, order comes free — the writer lock already serializes
+// commits, so a counter bumped under it is monotone.
+//
+// Slot = `table_id % NOTIFY_SLOTS`, with the EXACT table id stored alongside.
+// A collision therefore costs a spurious wakeup and never a missed one. That
+// direction is deliberate: the committed-footprint ring above folds ids `& 63`
+// and is sound because a false conflict only costs a retry, but the same fold
+// used as *identity* would wake the wrong listener — the bug class `cdc.rs`
+// documents having already had to fix once.
+const LA_NOTIFY: usize = 2304;
+/// Notification slots. Collisions are false wakeups, so this trades memory for
+/// wakeup precision, not for correctness.
+pub const NOTIFY_SLOTS: u32 = 64;
+const NOTIFY_ENTRY: usize = 24;
+const NF_GEN: usize = 0; // AtomicU64: bumped once per commit that wrote the table
+const NF_SEQ: usize = 8; // AtomicU32: the futex word; changes on every publish
+const NF_TABLE: usize = 12; // AtomicU32: exact table id (not folded)
+const NF_KEY: usize = 16; // AtomicU64: digest of the key touched, 0 = whole table
+/// Global count of parked listeners, right after the slot table. A commit with
+/// nobody listening pays ONE relaxed load and issues no syscall — the property
+/// that makes notification free when unused.
+const LA_NOTIFY_WAITERS: usize = LA_NOTIFY + NOTIFY_SLOTS as usize * NOTIFY_ENTRY;
+
 const INIT_READY: u32 = 2;
 const INIT_FORMATTING: u32 = 1;
 
@@ -2364,6 +2394,80 @@ impl Shm {
         oldest
     }
 
+    // ---------- change notification (#139) ----------
+
+    #[inline]
+    fn notify_slot_off(table_id: u32) -> usize {
+        Self::lock_area_off(LA_NOTIFY) + (table_id % NOTIFY_SLOTS) as usize * NOTIFY_ENTRY
+    }
+
+    /// Parked-listener count. Read by every commit, so it is the one thing on
+    /// this path that must stay cheap.
+    pub fn notify_waiters(&self) -> &AtomicU32 {
+        self.atomic_u32(Self::lock_area_off(LA_NOTIFY_WAITERS))
+    }
+
+    /// The futex word for `table_id`'s slot. Listeners wait on it; publishers
+    /// change it. Shared by every table that hashes here — a false wakeup.
+    pub fn notify_seq(&self, table_id: u32) -> &AtomicU32 {
+        self.atomic_u32(Self::notify_slot_off(table_id) + NF_SEQ)
+    }
+
+    /// This table's change generation, and the key digest of the last change
+    /// (0 = unknown / whole table). Returns `None` when the slot currently
+    /// belongs to a DIFFERENT table — the caller then knows only that
+    /// something hashing here changed, which is a false wakeup, not a lie.
+    pub fn notify_read(&self, table_id: u32) -> Option<(u64, u64)> {
+        let off = Self::notify_slot_off(table_id);
+        // gen last, Acquire: pairs with the publisher's Release store, so a
+        // reader that sees a bumped generation also sees the id and key that
+        // belong to it.
+        let owner = self.atomic_u32(off + NF_TABLE).load(Ordering::Acquire);
+        let key = self.atomic_u64(off + NF_KEY).load(Ordering::Acquire);
+        let gen = self.atomic_u64(off + NF_GEN).load(Ordering::Acquire);
+        (owner == table_id).then_some((gen, key))
+    }
+
+    /// *Writer-lock holder, after the meta flip.* Record that `table_id`
+    /// changed, and wake anyone parked on its slot.
+    ///
+    /// `key` is a digest of the key range the statement touched, or 0 for
+    /// "somewhere in this table" — a listener filtering on a key may skip a
+    /// nonzero mismatch, and must never skip a 0.
+    ///
+    /// Ordering: the id and key are stored BEFORE the generation (Release), so
+    /// a listener that observes the new generation observes the pair that
+    /// produced it. The sequence word moves last, because that is what a
+    /// parked futex re-checks.
+    pub fn notify_publish(&self, table_id: u32, key: u64) {
+        let off = Self::notify_slot_off(table_id);
+        self.atomic_u32(off + NF_TABLE).store(table_id, Ordering::Release);
+        self.atomic_u64(off + NF_KEY).store(key, Ordering::Release);
+        self.atomic_u64(off + NF_GEN).fetch_add(1, Ordering::AcqRel);
+        self.atomic_u32(off + NF_SEQ).fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Wake parked listeners for `table_id`. Split from [`Self::notify_publish`]
+    /// so a commit can publish every table it wrote and then issue the syscalls
+    /// in one pass — and skip them entirely when nobody is parked.
+    pub fn notify_wake(&self, table_id: u32) {
+        crate::os::futex_wake_all(self.notify_seq(table_id));
+    }
+
+    /// Zero the whole notification region. Called at format and on a boot-epoch
+    /// change: generations that outlive a reboot would let a listener conclude
+    /// "unchanged" about a file that is no longer the one it read.
+    pub fn notify_reset(&self) {
+        for slot in 0..NOTIFY_SLOTS {
+            let off = Self::lock_area_off(LA_NOTIFY) + slot as usize * NOTIFY_ENTRY;
+            self.atomic_u64(off + NF_GEN).store(0, Ordering::Relaxed);
+            self.atomic_u32(off + NF_SEQ).store(0, Ordering::Relaxed);
+            self.atomic_u32(off + NF_TABLE).store(u32::MAX, Ordering::Relaxed);
+            self.atomic_u64(off + NF_KEY).store(0, Ordering::Relaxed);
+        }
+        self.notify_waiters().store(0, Ordering::Release);
+    }
+
     // ---------- committed-footprint ring (optimistic concurrency) ----------
 
     #[inline]
@@ -2767,6 +2871,9 @@ impl Shm {
         }
         // re-set state: the zeroing above cleared it
         self.init_state().store(INIT_FORMATTING, Ordering::Release);
+        // Zeroed notification slots would read as "slot owned by table 0", so
+        // stamp the no-owner sentinel rather than inheriting that accident.
+        self.notify_reset();
 
         // robust, error-checking, process-shared writer mutex (Linux only).
         // macOS uses the flock-based writer lock: the zeroing above already set
@@ -2963,6 +3070,11 @@ impl Shm {
                     (self.at(ns_off) as *mut u64).write(my_ns);
                     std::ptr::copy_nonoverlapping(my_bid.as_ptr(), self.at(bid_off), 16);
                 }
+                // Change generations are pre-reboot facts about a mapping that
+                // no longer exists. Left standing, a listener that remembered
+                // "table 7 was at generation 900" could conclude "unchanged"
+                // about a file it has never actually read.
+                self.notify_reset();
                 let newest = self.newest_meta_ungated()?;
                 self.durable_txn().store(newest.txn_id, Ordering::Release);
                 self.oldest_pinned_cache()

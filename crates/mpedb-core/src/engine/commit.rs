@@ -452,6 +452,29 @@ impl<'e> WriteTxn<'e> {
             Durability::None | Durability::Async => {}
         }
 
+        // Change notification (#139). The meta is published, so a listener
+        // woken here can already read what changed. `mutated_tables` is the
+        // exact write set — the same record the mod_gen bump above consumes —
+        // so this costs no new bookkeeping, and it runs under the writer lock
+        // we are already holding, so it adds no serialization: unlike
+        // Postgres, whose NOTIFY takes a global exclusive lock held across
+        // fsync precisely to deliver notifications in commit order across
+        // every channel. mpedb promises that order per table only, which the
+        // writer lock already provides for free.
+        //
+        // The wake syscalls are skipped entirely when nobody is parked, so a
+        // database with no listeners pays one relaxed load per commit.
+        if !mutated.is_empty() {
+            for &tid in &mutated {
+                self.eng.shm.notify_publish(tid, 0);
+            }
+            if self.eng.shm.notify_waiters().load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                for &tid in &mutated {
+                    self.eng.shm.notify_wake(tid);
+                }
+            }
+        }
+
         after_flip();
         if self.eng.shm.durability.uses_wal() {
             // Amortized checkpoint (wal AND async), still under the writer

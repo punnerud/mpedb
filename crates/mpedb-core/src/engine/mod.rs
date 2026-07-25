@@ -1296,6 +1296,84 @@ impl Engine {
         res
     }
 
+    /// Where `table_id`'s change counter stands right now, and the key digest
+    /// of the last change (0 = "somewhere in the table"). `None` means the
+    /// notification slot currently belongs to another table that hashes here —
+    /// the caller learns nothing, which is a false wakeup, never a false
+    /// "unchanged".
+    pub fn change_generation(&self, table_id: u32) -> Option<(u64, u64)> {
+        self.shm.notify_read(table_id)
+    }
+
+    /// How many listeners are parked right now. A commit reads this to decide
+    /// whether the wake syscalls are worth issuing at all.
+    pub fn notify_waiter_count(&self) -> u32 {
+        self.shm.notify_waiters().load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Park until one of `tables` changes, or `timeout` elapses. `seen` is what
+    /// [`Self::change_generation`] returned when the caller last looked; the
+    /// call returns as soon as any table's generation has moved past it.
+    ///
+    /// Returns the tables that changed (possibly empty on timeout). The result
+    /// may over-report: slots are shared by `table_id % NOTIFY_SLOTS`, and a
+    /// write rolled back by a savepoint still counts as a change, because the
+    /// write set is deliberately monotone. Both are false wakeups — the caller
+    /// re-reads and finds nothing new. Neither direction can hide a change.
+    ///
+    /// **Platform:** a real futex only exists on Linux. Elsewhere
+    /// `os::futex_wait` is a bounded sleep and `futex_wake_all` is a no-op, so
+    /// this degrades to polling at ~200 µs granularity — correct, just not
+    /// instant (crate::os).
+    pub fn wait_for_change(
+        &self,
+        tables: &[u32],
+        seen: &[u64],
+        timeout: std::time::Duration,
+    ) -> Vec<u32> {
+        debug_assert_eq!(tables.len(), seen.len());
+        let deadline = std::time::Instant::now() + timeout;
+        // Announce before the first look. Announcing after would open the
+        // window this whole protocol exists to close: a commit that lands
+        // between the look and the park would see no waiters, skip the wake,
+        // and leave us asleep on a change that already happened.
+        self.shm.notify_waiters().fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let out = loop {
+            // Sample the futex word BEFORE testing the condition. The other
+            // order loses wakeups: a publish landing between the test and the
+            // sample would make `expect` the post-publish value, and the park
+            // below would then sleep through a change that already happened.
+            // Sampling first turns that same interleaving into an immediate
+            // return, because the word no longer matches.
+            let word = self.shm.notify_seq(tables[0]);
+            let expect = word.load(std::sync::atomic::Ordering::Acquire);
+            let mut changed = Vec::new();
+            for (i, &t) in tables.iter().enumerate() {
+                if let Some((gen, _)) = self.shm.notify_read(t) {
+                    if gen > seen[i] {
+                        changed.push(t);
+                    }
+                }
+            }
+            if !changed.is_empty() {
+                break changed;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break Vec::new();
+            }
+            // One word can be waited on at a time, so a multi-table listener
+            // parks on the first table's and re-checks them all on return.
+            // Watching several tables whose slots differ therefore relies on
+            // the timeout to bound how long the others go unlooked-at; the
+            // common case (#139: 82k of 94k corpus statements touch one table)
+            // is a single table, where the park is exact.
+            crate::os::futex_wait(word, expect, deadline - now);
+        };
+        self.shm.notify_waiters().fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        out
+    }
+
     pub fn begin_read(&self) -> Result<ReadTxn<'_>> {
         let txn = self.begin_read_unchecked()?;
         // #47 stage 3: a DDL commit bumped the meta's schema_gen past our
