@@ -161,61 +161,67 @@ Two sub-arms: **E-shard** gives each worker a disjoint slice of users, so
 nothing can collide; **E-hot** puts every worker on four users, so everything
 does. Run `mpedb-bench --notify-load`.
 
-### Linux (2 cores) — actions/s
+Two profiles are published. **local** is engine-to-engine with no network
+modelled; **networked** adds a 1 ms client round trip per statement **to
+PostgreSQL only**, five read/write pairs per action, and a 40 ms think time.
+That asymmetry is a deliberate model and needs saying plainly rather than
+burying: mpedb is embedded and has no hop to pay, PostgreSQL in any real
+deployment pays one per statement, and those round trips sit *inside* the
+transaction where they extend how long its row lock is held. The RTT is a knob
+(`MPEDB_E_RTT_MS`) so a reader who disagrees with 1 ms can pick another.
 
-| workers | mpedb *no guard (ctl)* | mpedb guarded | postgres E-shard | postgres E-hot |
-|---:|---:|---:|---:|---:|
-| 2 | 82 | 42 | **80** | 76 |
-| 4 | 164 | 42 | **155** | 135 |
-| 8 | 307 | 42 | **310** | 152 |
+### actions/s — local profile (20 ms think, 1 read/write pair)
 
-### macOS (M3, 11 cores) — actions/s
+| workers | Linux mpedb *unguarded (ctl)* | Linux mpedb guarded | Linux pg | M3 mpedb *unguarded (ctl)* | M3 mpedb guarded | M3 pg |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 81 | 67 | 77 | 63 | 54 | 61 |
+| 4 | 162 | 121 | **156** | 123 | 94 | **118** |
+| 8 | 298 | 167 | **301** | 231 | 134 | **231** |
 
-| workers | mpedb *no guard (ctl)* | mpedb guarded | postgres E-shard | postgres E-hot |
-|---:|---:|---:|---:|---:|
-| 2 | 65 | 34 | **62** | 60 |
-| 4 | 128 | 34 | **119** | 104 |
-| 8 | 231 | 34 | **229** | 114 |
+### actions/s — networked profile (40 ms think, 5 pairs, 1 ms RTT to pg)
 
-E-shard and E-hot are **indistinguishable for mpedb** — 42 and 42 on Linux, 34
-and 34 on the M3 — so they are one column.
+| workers | Linux mpedb *unguarded (ctl)* | Linux mpedb guarded | Linux pg | M3 mpedb *unguarded (ctl)* | M3 mpedb guarded | M3 pg |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 44 | 44 | 43 | 38 | 39 | 37 |
+| 4 | 89 | 66 | **85** | 75 | 58 | **72** |
+| 8 | 174 | 88 | **165** | 149 | 78 | **143** |
 
-### What this says, and it is not in our favour
+### E-hot (deliberate collision), 8 workers
 
-**The guard does not scale, and the control proves it is the guard.** mpedb
-unguarded tracks PostgreSQL almost exactly (82/164/307 against 80/155/310).
-Guarded it is flat. The single writer lock is *not* the cap — the engine scales
-fine — the guard is.
+| | Linux | M3 |
+|---|---:|---:|
+| mpedb guarded | 69 | 96 |
+| postgres | **83** | **112** |
 
-**Why: the guarded surface is table-granular.** Every worker declares `acct`
-and `audit`, so every commit invalidates every other worker's snapshot no matter
-which user it touched. "One shard per user" therefore shards **nothing**: the
-guard knows tables, not users, which is why E-shard and E-hot produce the same
-number. That limitation was already written down — *key precision only for point
-writes* — but its cost had never been measured, and the cost is all of the
-scaling.
+### What this says
 
-**mpedb is non-blocking; it is just not non-conflicting.** p50 sits at the 20 ms
-think-time floor for small worker counts, so a guarded worker genuinely never
-waits on anyone. It fails fast and retries instead. Non-blocking and non-scaling
-are different properties, and this workload wants the second one.
+**#143 turned a flat line into a scaling one.** Before key regions the guarded
+column was 42, 42, 42 on Linux and 34, 34, 34 on the M3 — every worker
+conflicted with every other because the guard compared *tables*. Recording
+which keys a commit landed on, and checking against the keys an action touched,
+takes it to 67 → 121 → 167. Retries fell from 2492 to 324 at 8 workers.
 
-**PostgreSQL's row locks are the right granularity here**, which is the honest
-reason it wins this arm. Disjoint users touch disjoint rows and do not contend
-at all. Its lock does cost under real contention — E-hot at 8 workers is 152
-against E-shard's 310 on Linux, 114 against 229 on the M3, so roughly half —
-but half of a scaling curve beats all of a flat line.
+**It does not close the gap.** Guarded mpedb reaches roughly **half** the
+unguarded ceiling at 8 workers, on both machines and both profiles, while
+PostgreSQL reaches all of it. The cause is the summary's width: the ring entry
+has 8 bytes, so the region set is a 64-bit Bloom filter with one bit per key.
+Two keys collide with probability 1/64, and a guard's window contains every
+commit since its snapshot — so the retry rate grows with **think time × commit
+rate**, which is why the networked profile (40 ms think) is worse than the
+local one (20 ms). That is the same rate-law shape as #135, and closing it is a
+format question, not an algorithmic one.
 
-**Caveat that cuts our way and is stated anyway:** the retry loop here re-runs
-the 20 ms think time on every attempt. A handler whose decision does not depend
-on the re-read could skip that, so this models the expensive case.
+**Under real contention, waiting still beats retrying.** In E-hot PostgreSQL
+leads on both machines. The reason is not subtle: a waiter is handed the row
+and does its work once, while a retry throws away everything it already did —
+here a full think time — and starts over. Optimistic concurrency is the wrong
+tool when conflicts are common *and* the work between read and commit is
+expensive. That is exactly the case a lease (#142 G2) exists for, and this
+table is the argument for building it.
 
-**What would change it:** the guard needs key-granular surfaces, so two workers
-on different users stop conflicting. The key regions built for notification
-(§ above) are the mechanism; the commit-conflict ring records point writes
-exactly but everything else table-wide, so the work is to carry regions into
-that ring. Until then, per-user sharding is a design intent rather than a
-measured property, and this table is why.
+**Where the guard is unambiguously right:** two workers, either profile, both
+engines at the think-time floor. Nothing waits, nothing retries, and mpedb
+holds nothing across the work at all.
 
 ## What this does not measure
 

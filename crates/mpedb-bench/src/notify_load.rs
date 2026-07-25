@@ -189,17 +189,23 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                     // think — holding NOTHING
                     std::thread::sleep(think);
                     // act, guarded
-                    audit_id += 1;
                     let mut s = if guarded {
                         db.begin_guarded_for(snap, &may_run)?
                     } else {
                         db.begin()?
                     };
-                    s.query(may_run[1], &[Value::Int(bal + 1), Value::Int(user)])?;
-                    s.query(
-                        may_run[2],
-                        &[Value::Int(audit_id), Value::Int(user), Value::Int(bal + 1)],
-                    )?;
+                    // `n_ops` read/write pairs, so the action is a real unit of
+                    // work rather than one statement. Every pair widens the
+                    // guard by the key it touched.
+                    for _ in 0..n_ops {
+                        s.query(may_run[0], &[Value::Int(user)])?;
+                        audit_id += 1;
+                        s.query(may_run[1], &[Value::Int(bal + 1), Value::Int(user)])?;
+                        s.query(
+                            may_run[2],
+                            &[Value::Int(audit_id), Value::Int(user), Value::Int(bal + 1)],
+                        )?;
+                    }
                     match s.commit() {
                         Ok(()) => break,
                         Err(Error::WriteConflict) => {
@@ -229,14 +235,21 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                     .map_err(|e| format!("select for update: {e}"))?;
                 let bal: i64 = row.get(0);
                 std::thread::sleep(think);
-                audit_id += 1;
-                txn.execute("UPDATE acct SET bal = $1 WHERE id = $2", &[&(bal + 1), &user])
-                    .map_err(|e| format!("update: {e}"))?;
-                txn.execute(
-                    "INSERT INTO audit (id, acct, note) VALUES ($1, $2, $3)",
-                    &[&audit_id, &user, &(bal + 1)],
-                )
-                .map_err(|e| format!("insert: {e}"))?;
+                for _ in 0..n_ops {
+                    rtt();
+                    txn.query_one("SELECT bal FROM acct WHERE id = $1", &[&user])
+                        .map_err(|e| format!("select: {e}"))?;
+                    audit_id += 1;
+                    rtt();
+                    txn.execute("UPDATE acct SET bal = $1 WHERE id = $2", &[&(bal + 1), &user])
+                        .map_err(|e| format!("update: {e}"))?;
+                    rtt();
+                    txn.execute(
+                        "INSERT INTO audit (id, acct, note) VALUES ($1, $2, $3)",
+                        &[&audit_id, &user, &(bal + 1)],
+                    )
+                    .map_err(|e| format!("insert: {e}"))?;
+                }
                 txn.batch_execute("NOTIFY acct_ch, 'x'").map_err(|e| format!("notify: {e}"))?;
                 txn.commit().map_err(|e| format!("commit: {e}"))?;
                 lat.push(t0.elapsed().as_micros() as u64);
