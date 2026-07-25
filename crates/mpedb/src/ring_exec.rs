@@ -318,12 +318,25 @@ fn locality_key(p: &PreparedIntent) -> SortKey {
 /// Called from the same place as `hint_notify_keys`, because both want exactly
 /// what has already been resolved here: the plan's footprint against these
 /// params.
-pub(crate) fn widen_guard(txn: &mut WriteTxn<'_>, plan: &CompiledPlan) {
+pub(crate) fn widen_guard(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, params: &[Value]) {
     for t in plan.footprint.tables_read.iter() {
         txn.guard_widen(t);
     }
     for t in plan.footprint.tables_written.iter() {
         txn.guard_widen(t);
+    }
+    // #143: the key, not only the table. Arm E measured what table granularity
+    // costs — two workers on different rows of one table conflicted on every
+    // commit, and per-user sharding bought nothing. A statement that names a
+    // single point contributes that key; anything else contributes "anywhere",
+    // which is the pre-#143 behaviour and the safe direction.
+    let key = match &plan.footprint.key_access {
+        KeyAccess::Point(parts) => resolve_key_bytes(parts, plan, params).map(|b| key_hash(&b)),
+        _ => None,
+    };
+    txn.guard_touch_key(key);
+    if !plan.footprint.tables_written.is_empty() {
+        txn.record_written_key(key);
     }
 }
 

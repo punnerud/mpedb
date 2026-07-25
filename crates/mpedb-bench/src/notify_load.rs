@@ -51,12 +51,47 @@ use std::time::{Duration, Instant};
 use crate::eng_pg::PgServer;
 use crate::util::BResult;
 
-/// Actions each worker attempts.
-const ACTIONS: usize = 60;
-/// Think time between the read and the write. Long enough that a held lock is
-/// unmistakably visible against process startup noise, short enough that the
-/// whole cell finishes in a couple of minutes.
-const DELAY_MS: u64 = 20;
+/// Actions each worker attempts. `MPEDB_E_ACTIONS` overrides.
+fn actions() -> usize {
+    env_u64("MPEDB_E_ACTIONS", 60) as usize
+}
+/// Think time between the read and the write. `MPEDB_E_DELAY_MS` overrides.
+fn delay_ms() -> u64 {
+    env_u64("MPEDB_E_DELAY_MS", 20)
+}
+/// Read+write pairs inside one action. `MPEDB_E_OPS` overrides. More pairs
+/// means a longer-lived transaction, which is what a real handler has and what
+/// a held lock is held across.
+fn ops() -> usize {
+    env_u64("MPEDB_E_OPS", 1) as usize
+}
+/// **Modelled client↔server round trip, applied to PostgreSQL only**
+/// (`MPEDB_E_RTT_MS`, default 0 = the purely local profile).
+///
+/// This is a deliberate asymmetry and it needs stating plainly rather than
+/// buried: mpedb is embedded and has no network hop to pay, so giving it one
+/// would model something that does not exist. PostgreSQL in any real
+/// deployment pays one per statement, and — the part that matters here — those
+/// round trips happen INSIDE the transaction, so they extend how long its row
+/// lock is held.
+///
+/// It is a model, and the number is a knob precisely so a reader who disagrees
+/// with it can pick another. Both profiles are published; neither is "the"
+/// answer.
+fn rtt_ms() -> u64 {
+    env_u64("MPEDB_E_RTT_MS", 0)
+}
+
+fn env_u64(k: &str, d: u64) -> u64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+fn rtt() {
+    let r = rtt_ms();
+    if r > 0 {
+        std::thread::sleep(Duration::from_millis(r));
+    }
+}
 /// Distinct users. In E-shard each worker owns a disjoint slice of these; in
 /// E-hot every worker fights over `HOT` of them.
 const USERS: i64 = 512;
@@ -114,7 +149,10 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
         }
     };
 
-    let mut lat = Vec::with_capacity(ACTIONS);
+    let n_actions = actions();
+    let n_ops = ops();
+    let think = Duration::from_millis(delay_ms());
+    let mut lat = Vec::with_capacity(n_actions);
     let mut retries = 0u64;
 
     match engine.as_str() {
@@ -133,7 +171,7 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                 "INSERT INTO audit (id, acct, note) VALUES ($1, $2, $3)",
             ];
             let mut audit_id = w * 1_000_000;
-            for i in 0..ACTIONS {
+            for i in 0..n_actions {
                 let user = user_at(i);
                 let t0 = Instant::now();
                 loop {
@@ -149,7 +187,7 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                         _ => 0,
                     };
                     // think — holding NOTHING
-                    std::thread::sleep(Duration::from_millis(DELAY_MS));
+                    std::thread::sleep(think);
                     // act, guarded
                     audit_id += 1;
                     let mut s = if guarded {
@@ -178,9 +216,10 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
             let mut c = postgres::Client::connect(target, postgres::NoTls)
                 .map_err(|e| format!("pg connect: {e}"))?;
             let mut audit_id = w * 1_000_000;
-            for i in 0..ACTIONS {
+            for i in 0..n_actions {
                 let user = user_at(i);
                 let t0 = Instant::now();
+                rtt();
                 let mut txn = c.transaction().map_err(|e| format!("begin: {e}"))?;
                 // read AND lock — the row stays locked across the think time.
                 // This is the ordinary correct way to write it here, and it is
@@ -189,7 +228,7 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                     .query_one("SELECT bal FROM acct WHERE id = $1 FOR UPDATE", &[&user])
                     .map_err(|e| format!("select for update: {e}"))?;
                 let bal: i64 = row.get(0);
-                std::thread::sleep(Duration::from_millis(DELAY_MS));
+                std::thread::sleep(think);
                 audit_id += 1;
                 txn.execute("UPDATE acct SET bal = $1 WHERE id = $2", &[&(bal + 1), &user])
                     .map_err(|e| format!("update: {e}"))?;
@@ -261,7 +300,7 @@ fn spawn_and_collect(
     }
     let elapsed = t0.elapsed().as_secs_f64();
     lat.sort_unstable();
-    let total = workers * ACTIONS;
+    let total = workers * actions();
     Ok((
         total as f64 / elapsed,
         pct(&lat, 0.50) / 1000,
@@ -350,8 +389,12 @@ fn pg_setup(pg: &PgServer) -> BResult<String> {
 pub fn run(scratch: PathBuf) -> BResult<()> {
     std::fs::create_dir_all(&scratch)?;
     println!(
-        "arm E: acting on a notification. {ACTIONS} actions/worker, {DELAY_MS} ms think time \
-         between read and write, REAL PROCESSES on both engines."
+        "arm E: acting on a notification. {} actions/worker, {} ms think time between read \
+         and write, {} ms modelled RTT (PostgreSQL only — mpedb is embedded and has no \
+         network hop), REAL PROCESSES on both engines.",
+        actions(),
+        delay_ms(),
+        rtt_ms()
     );
     println!(
         "  E-shard = one shard per user (worker w owns a disjoint slice) — nothing collides.\n  \
@@ -416,8 +459,9 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
     }
     println!();
     println!(
-        "The floor for one action is the {DELAY_MS} ms think time, so p50 at or near it means \
-         the worker never waited on anyone."
+        "The floor for one action is the {} ms think time, so p50 at or near it means the \
+         worker never waited on anyone.",
+        delay_ms()
     );
     Ok(())
 }

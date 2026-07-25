@@ -69,6 +69,17 @@ impl Hasher for PageIdHasher {
 #[derive(Debug, Clone, Copy)]
 pub struct Guard {
     pub snap_txn: u64,
+    /// Key-region summary of everything this action has actually touched
+    /// (#143). `None` until a statement runs; once any statement cannot name
+    /// its key it becomes `REGION_ANY` and stays there.
+    ///
+    /// Regions accumulate from EXECUTION while the table set is DECLARED, and
+    /// the asymmetry is deliberate. The table set must be stable before
+    /// anything runs, because that is the shard's identity. A key is only known
+    /// once its parameters are bound, and a key never touched cannot have been
+    /// invalidated — so narrowing by what actually ran is sound where narrowing
+    /// the table set would not be.
+    pub regions: u64,
     /// Union of every statement's footprint, folded `& 63` to match the OPT
     /// ring. Folding costs false conflicts (table 7 aliases 71), never a
     /// missed one — the same trade the ring already makes.
@@ -190,6 +201,9 @@ pub struct WriteTxn<'e> {
     /// Validated once in `commit_inner`, under the writer lock, before the
     /// meta flip.
     pub(super) guard: Option<Guard>,
+    /// Key-region summary of what this txn WROTE, published to the commit ring
+    /// so later guards can tell "same table" from "same row" (#143).
+    pub(super) written_regions: u64,
     /// Per-table key REGION for change notification (#139 S2, widened by
     /// #141 N2): the common `keycode` byte prefix of every key this
     /// transaction is known to have touched in that table. `None` means
@@ -384,9 +398,30 @@ impl<'e> WriteTxn<'e> {
         }
     }
 
+    /// Add one exact key to the guard's region summary, or `None` for a
+    /// statement whose keys cannot be named — which widens it to everything
+    /// and cannot be narrowed again (#143).
+    pub fn guard_touch_key(&mut self, key_hash: Option<u64>) {
+        if let Some(g) = self.guard.as_mut() {
+            g.regions |= match key_hash {
+                Some(h) => crate::shm::Shm::region_bit(h),
+                None => crate::shm::Shm::REGION_ANY,
+            };
+        }
+    }
+
+    /// Add one exact key to what THIS txn is recording as written, for the
+    /// benefit of guards that come later. Same widening rule.
+    pub fn record_written_key(&mut self, key_hash: Option<u64>) {
+        self.written_regions |= match key_hash {
+            Some(h) => crate::shm::Shm::region_bit(h),
+            None => crate::shm::Shm::REGION_ANY,
+        };
+    }
+
     /// The guard's snapshot and accumulated surface, for the commit path.
-    pub fn guard_state(&self) -> Option<(u64, u64)> {
-        self.guard.as_ref().map(|g| (g.snap_txn, g.surface))
+    pub fn guard_state(&self) -> Option<(u64, u64, u64)> {
+        self.guard.as_ref().map(|g| (g.snap_txn, g.surface, g.regions))
     }
 
     pub fn hint_notify_key(&mut self, table_id: u32, region: Option<&[u8]>) {

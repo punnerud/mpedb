@@ -1571,7 +1571,7 @@ impl Engine {
     /// serializing every writer.
     pub fn begin_write_guarded(&self, snap_txn: u64) -> Result<WriteTxn<'_>> {
         let mut txn = self.begin_write()?;
-        txn.guard = Some(crate::engine::write::Guard { snap_txn, surface: 0 });
+        txn.guard = Some(crate::engine::write::Guard { snap_txn, surface: 0, regions: 0 });
         Ok(txn)
     }
 
@@ -1647,6 +1647,7 @@ impl Engine {
             colwm_cache: HashMap::new(),
             commit_point: None,
             guard: None,
+            written_regions: 0,
             notify_keys: std::collections::HashMap::new(),
             capture_enabled: true,
             capture_cfg: None,

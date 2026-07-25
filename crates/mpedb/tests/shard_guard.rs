@@ -283,3 +283,120 @@ fn the_expected_retry_succeeds_on_the_second_attempt() {
     drop(d);
     let _ = std::fs::remove_file(&path);
 }
+
+/// **#143, and the reason it exists.** Two actions on the SAME table but
+/// different rows must both commit. Table granularity made these conflict, and
+/// arm E measured what that cost: per-user sharding bought nothing and guarded
+/// throughput was flat while the unguarded control scaled linearly.
+///
+/// The key is what distinguishes them, so this is the row-level analogue of
+/// `two_disjoint_actions_both_commit` — and like that one, a guard that only
+/// caught conflicts would pass every other test in this file and still fail
+/// here.
+#[test]
+fn two_actions_on_different_rows_of_one_table_both_commit() {
+    let (d, path) = db("rows");
+    d.query("INSERT INTO orders (id, v) VALUES (1, 1)", &[]).unwrap();
+    d.query("INSERT INTO orders (id, v) VALUES (2, 2)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+
+    let sql = ["UPDATE orders SET v = $1 WHERE id = $2"];
+
+    let mut a = d.begin_guarded_for(snap, &sql).unwrap();
+    a.query("UPDATE orders SET v = 10 WHERE id = 1", &[]).unwrap();
+    a.commit().expect("action on id=1 should commit");
+
+    // Same table, same snapshot, different row. Before #143 this was refused.
+    let mut b = d.begin_guarded_for(snap, &sql).unwrap();
+    b.query("UPDATE orders SET v = 20 WHERE id = 2", &[]).unwrap();
+    b.commit().expect(
+        "action on id=2 was refused because id=1 moved — the guard is still \
+         table-granular and per-row sharding buys nothing",
+    );
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same key still conflicts. Without this, the row-level filter could be
+/// "always allow" and the test above would not notice.
+#[test]
+fn two_actions_on_the_same_row_still_conflict() {
+    let (d, path) = db("samerow");
+    d.query("INSERT INTO orders (id, v) VALUES (1, 1)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+    let sql = ["UPDATE orders SET v = $1 WHERE id = $2"];
+
+    let mut a = d.begin_guarded_for(snap, &sql).unwrap();
+    a.query("UPDATE orders SET v = 10 WHERE id = 1", &[]).unwrap();
+    a.commit().unwrap();
+
+    let mut b = d.begin_guarded_for(snap, &sql).unwrap();
+    b.query("UPDATE orders SET v = 20 WHERE id = 1", &[]).unwrap();
+    match b.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!("two actions on the SAME row both committed ({other:?}) — a lost update"),
+    }
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A writer that cannot name where it landed must still conflict with
+/// everything on its tables. This is the fail-safe direction of #143: refining
+/// by key may only narrow conflicts for writers that NAMED a key.
+#[test]
+fn a_wide_write_still_conflicts_with_every_key() {
+    let (d, path) = db("widewrite");
+    for id in 1..=3i64 {
+        d.query("INSERT INTO orders (id, v) VALUES ($1, 1)", &[Value::Int(id)]).unwrap();
+    }
+    let snap = d.snapshot_txn();
+
+    // Names no single key: the region summary must degrade to "anywhere".
+    d.query("UPDATE orders SET v = v + 1", &[]).unwrap();
+
+    let mut s = d
+        .begin_guarded_for(snap, &["UPDATE orders SET v = $1 WHERE id = $2"])
+        .unwrap();
+    s.query("UPDATE orders SET v = 99 WHERE id = 3", &[]).unwrap();
+    match s.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!(
+            "a table-wide UPDATE did not conflict with a point action ({other:?}) — \
+             the key filter narrowed for a writer that never named a key"
+        ),
+    }
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Symmetric fail-safe: a READER that cannot name its key must be guarded
+/// against every write to its tables, or an action deciding from a scan could
+/// commit on data that moved underneath it.
+#[test]
+fn a_guard_that_scanned_conflicts_with_any_write() {
+    let (d, path) = db("scanguard");
+    for id in 1..=3i64 {
+        d.query("INSERT INTO orders (id, v) VALUES ($1, 1)", &[Value::Int(id)]).unwrap();
+    }
+    let snap = d.snapshot_txn();
+    d.query("UPDATE orders SET v = 5 WHERE id = 1", &[]).unwrap();
+
+    let mut s = d
+        .begin_guarded_for(
+            snap,
+            &["SELECT v FROM orders", "INSERT INTO audit (id, v) VALUES ($1, $2)"],
+        )
+        .unwrap();
+    s.query("SELECT v FROM orders", &[]).unwrap(); // names no key
+    s.query("INSERT INTO audit (id, v) VALUES (1, 1)", &[]).unwrap();
+    match s.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!(
+            "an action that decided from a full scan committed after the scanned \
+             table changed ({other:?})"
+        ),
+    }
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}

@@ -83,9 +83,17 @@ impl<'e> WriteTxn<'e> {
         // writeback and no freelist fixpoint, it just aborts. Retrying is the
         // expected outcome, not the exceptional one, so it must not be
         // expensive.
-        if let Some((snap_txn, surface)) = self.guard_state() {
+        if let Some((snap_txn, surface, regions)) = self.guard_state() {
             let mut why = crate::shm::GuardVerdict::Clear;
-            if self.eng.shm.opt_conflict_set(snap_txn, self.meta.txn_id, surface, &mut why) {
+            // A guard that touched no resolvable key guards its whole surface;
+            // one that named its keys guards only those. Zero would mean "no
+            // keys", which would make an untouched guard conflict with nothing.
+            let regions = if regions == 0 { crate::shm::Shm::REGION_ANY } else { regions };
+            if self
+                .eng
+                .shm
+                .opt_conflict_set(snap_txn, self.meta.txn_id, surface, regions, &mut why)
+            {
                 self.eng.guard_stats.record(why);
                 self.abort();
                 return Err(Error::WriteConflict);
@@ -445,7 +453,7 @@ impl<'e> WriteTxn<'e> {
         // it removes spurious gaps and can never invent a conflict that did not
         // happen.
         {
-            use crate::shm::{OFP_KIND_EMPTY, OFP_KIND_POINT, OFP_KIND_TABLE};
+            use crate::shm::{OFP_KIND_EMPTY, OFP_KIND_POINT};
             // The OFP ring stays a `u64` table bitmap even though footprints are
             // now sparse (DESIGN-TABLE-CAP §5): the `& 63` fold aliases tables
             // mod 64 (e.g. 0, 64 and 4096 share a bit). This
@@ -454,10 +462,20 @@ impl<'e> WriteTxn<'e> {
             // tables see a false conflict, costing an extra optimistic
             // re-validation, never correctness. Point kind also compares khash,
             // so aliased tables with different keys don't even false-conflict.
+            use crate::shm::OFP_KIND_REGION;
             let (kind, tbits, khash) = match self.commit_point {
                 Some((table, khash)) => (OFP_KIND_POINT, 1u64 << (table & 63), khash),
+                // #143: publish WHERE in the table this commit landed, not just
+                // which table. `written_regions` is 0 when nothing named a key,
+                // which must read as "anywhere" — the fail-safe direction, and
+                // the pre-#143 behaviour exactly.
                 None if self.written_tables != 0 => {
-                    (OFP_KIND_TABLE, self.written_tables, 0)
+                    let regions = if self.written_regions == 0 {
+                        crate::shm::Shm::REGION_ANY
+                    } else {
+                        self.written_regions
+                    };
+                    (OFP_KIND_REGION, self.written_tables, regions)
                 }
                 None => (OFP_KIND_EMPTY, 0, 0),
             };

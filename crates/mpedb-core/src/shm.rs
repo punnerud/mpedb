@@ -182,6 +182,16 @@ const OFP_KHASH: usize = 24;
 pub const OFP_KIND_EMPTY: u64 = 0; // touched no user table (catalog/sys only)
 pub const OFP_KIND_POINT: u64 = 1; // exactly one table, one PK (table_bits+key_hash)
 pub const OFP_KIND_TABLE: u64 = 2; // table-level write set (table_bits), any keys
+/// Table set PLUS a key-region summary in `khash` (#143). Same 32-byte entry —
+/// `khash` was simply unused for `TABLE`, so this costs no format change.
+///
+/// **Why this kind had to exist.** Arm E measured what `TABLE` costs the shard
+/// guard: two workers writing different rows of the same table conflicted on
+/// every commit, so "one shard per user" sharded nothing and throughput was
+/// flat at 42 actions/s while the unguarded control scaled to 307
+/// (benchmarks/notify.md). The write set alone is the wrong resolution for a
+/// workload keyed by row.
+pub const OFP_KIND_REGION: u64 = 3;
 
 // ---- change-notification region (#139) ----
 //
@@ -2590,6 +2600,24 @@ impl Shm {
     // fingerprint is therefore never 0 (length ≥ 1), which keeps 0 free as
     // "unknown" — the value every fail-safe path publishes.
 
+    /// The region bit for one exact key hash. A commit's region summary is the
+    /// OR of these over every key it wrote; a guard's is the OR over every key
+    /// it touched. Two summaries that share no bit touched no common key.
+    ///
+    /// This is a 64-bit Bloom filter with k = 1, and its limits are worth being
+    /// exact about. Two keys collide with probability 1/64, which costs a false
+    /// conflict and therefore a retry. A commit touching many keys saturates the
+    /// word and degenerates to "everything" — correct, and the reason a bulk
+    /// write should not expect the guard to keep sharding for it.
+    #[inline]
+    pub fn region_bit(key_hash: u64) -> u64 {
+        1u64 << (key_hash % 64)
+    }
+
+    /// The summary meaning "could be any key" — what a range write, a
+    /// multi-key statement, or anything unresolvable must publish.
+    pub const REGION_ANY: u64 = u64::MAX;
+
     /// Fingerprint of a key prefix. `None` (empty prefix) has no fingerprint:
     /// there is nothing to filter on, which is the 0 case.
     pub fn key_fingerprint(prefix: &[u8]) -> u64 {
@@ -2683,6 +2711,17 @@ impl Shm {
                         return true;
                     }
                 }
+                OFP_KIND_REGION => {
+                    // Region summary (#143): our one key conflicts only if its
+                    // bit is in the committed summary.
+                    if tbits & my_bit != 0
+                        && self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed)
+                            & Self::region_bit(key_hash)
+                            != 0
+                    {
+                        return true;
+                    }
+                }
                 _ => {
                     // point: conflict only on the same table AND same key
                     if tbits & my_bit != 0
@@ -2719,6 +2758,7 @@ impl Shm {
         snap_txn: u64,
         current_txn: u64,
         table_bits: u64,
+        regions: u64,
         why: &mut GuardVerdict,
     ) -> bool {
         if current_txn <= snap_txn {
@@ -2740,7 +2780,26 @@ impl Shm {
                 continue; // catalog/sys only — touched no user table
             }
             let tbits = self.opt_field(t, OFP_TBITS).load(Ordering::Relaxed);
-            if tbits & table_bits != 0 {
+            if tbits & table_bits == 0 {
+                continue; // disjoint tables — nothing further to ask
+            }
+            // Same table(s). Whether that is a real conflict now depends on the
+            // KEYS, and this is the whole of #143: without it, two workers
+            // writing different rows of one table conflicted on every commit.
+            let overlap = match kind {
+                OFP_KIND_REGION => {
+                    self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed) & regions != 0
+                }
+                OFP_KIND_POINT => {
+                    Self::region_bit(self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed))
+                        & regions
+                        != 0
+                }
+                // TABLE says "any keys": the committer could not name where it
+                // landed, so it must be taken to have landed anywhere.
+                _ => true,
+            };
+            if overlap {
                 *why = GuardVerdict::Overlap;
                 return true;
             }

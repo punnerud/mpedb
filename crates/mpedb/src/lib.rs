@@ -3041,7 +3041,7 @@ impl WriteSession<'_> {
         // declared surface widens it rather than escaping it. Declaring is how
         // you get a SMALL guard; this is what stops a wrong declaration from
         // becoming a wrong answer.
-        ring_exec::widen_guard(&mut self.txn, plan);
+        ring_exec::widen_guard(&mut self.txn, plan, &full);
         let triggers = self.db.trigger_set()?;
         // Execute against the session's OWN schema view (== the txn's captured
         // bundle), so a statement touching a table this session created/altered
