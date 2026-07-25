@@ -2486,6 +2486,25 @@ impl Shm {
 
     /// Parked-listener count. Read by every commit, so it is the one thing on
     /// this path that must stay cheap.
+    ///
+    /// **Known leak (review finding R1), stated rather than discovered.** This
+    /// is a bare counter in shared memory with no liveness sweep. A listener
+    /// **SIGKILLed while parked** never decrements it, and nothing else will:
+    /// the only reset is [`Self::notify_reset`], at format or boot-epoch
+    /// change. Every later commit then issues wake syscalls for a listener that
+    /// does not exist, forever, and repeated kills accumulate.
+    ///
+    /// It is a performance leak and never a wrong answer — the count may only
+    /// ever be too HIGH, and too high costs syscalls while too low would cost a
+    /// missed wakeup. That asymmetry is why the fix must not be a naive pid
+    /// sweep: misjudging liveness in the other direction (the zombie case in
+    /// #136) would turn a cost into a lost notification.
+    ///
+    /// The real fix is a slot registry with the reader table's pid +
+    /// start-time identity, swept the way reader slots are. It does not fit in
+    /// the ~230 bytes left on the lock page, so it needs the notification
+    /// region moved off page 2 — a format change, and therefore a decision
+    /// rather than something to slip into a review.
     pub fn notify_waiters(&self) -> &AtomicU32 {
         self.atomic_u32(Self::lock_area_off(LA_NOTIFY_WAITERS))
     }
@@ -2746,11 +2765,26 @@ impl Shm {
                         return true;
                     }
                 }
-                _ => {
-                    // point: conflict only on the same table AND same key
+                OFP_KIND_POINT => {
+                    // Conflict only on the same table AND the same key.
                     if tbits & my_bit != 0
                         && self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed) == key_hash
                     {
+                        return true;
+                    }
+                }
+                // **Review finding R2.** This arm used to be the POINT arm, so
+                // any kind this reader did not know was silently read AS a
+                // point — and POINT is the one kind that can answer "no
+                // conflict". A future kind would therefore have its `khash`
+                // compared for equality against a key hash, almost never
+                // match, and produce a MISSED conflict: the wrong-answer
+                // direction, from nothing worse than adding a variant.
+                //
+                // #143 and #144 both added kinds, and both had to remember to
+                // add an arm here. The next one must not have to.
+                _ => {
+                    if tbits & my_bit != 0 {
                         return true;
                     }
                 }

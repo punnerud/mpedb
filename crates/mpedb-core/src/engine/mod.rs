@@ -1350,6 +1350,14 @@ impl Engine {
         self.shm.notify_read(table_id)
     }
 
+    /// The shared-memory handle, for tests that must construct ring states no
+    /// public API can produce — notably an unrecognised `kind` (review finding
+    /// R2), which by definition no writer emits.
+    #[doc(hidden)]
+    pub fn shm_for_test(&self) -> &Shm {
+        &self.shm
+    }
+
     /// The notification region's incarnation stamp (#140). Generations from
     /// two different epochs are not comparable; see [`crate::shm`]'s
     /// `LA_NOTIFY_EPOCH` for why comparing them anyway loses a wakeup.
@@ -1409,7 +1417,19 @@ impl Engine {
         // window this whole protocol exists to close: a commit that lands
         // between the look and the park would see no waiters, skip the wake,
         // and leave us asleep on a change that already happened.
+        // **Review finding R1, partial.** The count lives in SHARED memory and
+        // is decremented on the way out — so any exit that skips the decrement
+        // leaks it for every process, permanently, until the next format or
+        // boot-epoch reset. A guard covers unwinding; a SIGKILL while parked
+        // does not, and cannot without a swept registry (see the type's docs).
+        struct Parked<'a>(&'a std::sync::atomic::AtomicU32);
+        impl Drop for Parked<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
         self.shm.notify_waiters().fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _parked = Parked(self.shm.notify_waiters());
         let out = loop {
             // Sample the futex word BEFORE testing the condition. The other
             // order loses wakeups: a publish landing between the test and the
@@ -1450,7 +1470,6 @@ impl Engine {
             }
             crate::os::futex_wait(word, expect, deadline - now);
         };
-        self.shm.notify_waiters().fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         out
     }
 

@@ -118,7 +118,75 @@ The ring's limits (64 commits of history, `& 63` table folding, point-only key
 precision) all fail toward a retry and are pinned as tests, with `GuardStats`
 counting which one actually bites.
 
-## 7. Invariants that bite
+## 7. The commit-path review (2026-07-25)
+
+Five layers went into the commit path in one day — the epoch word (#140), key
+regions (#141 N2), the "any table" park (#141 N3), the guard (#142 G1),
+unconditional `opt_record` + the REGION kind (#143), and the SHARD kind (#144).
+Each was tested; none had been examined together. This records the outcome so
+the next change does not have to re-derive it.
+
+### Two findings
+
+**R1 — `notify_waiters` leaks on SIGKILL (live, performance only).** The parked
+listener count is a bare counter in shared memory with no liveness sweep. A
+listener killed while parked never decrements it, and only `notify_reset` (at
+format or boot-epoch change) ever clears it. Every later commit then issues
+wake syscalls for a listener that no longer exists, and repeated kills
+accumulate.
+
+Direction matters: the count may only ever be too HIGH. Too high costs
+syscalls; too low would cost a *missed wakeup*. That asymmetry is why the fix
+cannot be a naive pid sweep — misjudging liveness the other way (the zombie
+case in #136) turns a cost into a lost notification.
+
+*Mitigated* with a `Drop` guard, which covers unwinding. SIGKILL is not covered
+and cannot be without a swept slot registry, which does not fit in the ~230
+bytes left on the lock page. That needs the notification region moved off
+page 2 — a format change, and therefore a decision rather than a review
+side-effect. Filed.
+
+**R2 — an unknown ring kind was read as POINT (latent, wrong-answer
+direction). FIXED.** `opt_conflict`'s catch-all arm fell through to the POINT
+comparison, and POINT is the only kind that can answer *no conflict* — it
+compares an exact key hash. Any kind the reader did not recognise therefore had
+its `khash` compared for equality against an unrelated value, almost never
+matched, and reported no conflict.
+
+Nothing emitted an unknown kind today, so it was latent. But #143 and #144 each
+added a kind and each had to *remember* to add an arm here; forgetting would
+have silently lost conflicts. The catch-all is now conservative and POINT is
+explicit, with `tests/ring_kind_safety.rs` asserting that kinds 5, 7, 42, 255
+and `u64::MAX` all conflict.
+
+### Four cleared, with the reasoning that clears them
+
+**Ring written before the meta flip, now with a second reader.** `opt_record`
+runs before `write_meta_slot`, so a writer dying between them leaves an entry
+for a txn that never committed. It is unreachable: the next guard's window is
+`(snap, current]` where `current` is the newest *committed* txn, which is
+`N-1`, so slot `N` is never visited. A later real txn `N` overwrites it.
+
+**`notify_reset` against a concurrent publish.** Boot-epoch recovery takes
+`FlockGuard::exclusive` and **re-reads the boot id under that lock**. That
+double-check is what makes it safe: only the genuinely-first attacher after a
+reboot resets, and any process able to commit has already completed
+`post_attach` and would therefore have found the boot id current. Hoisting the
+re-check out of the lock would break this.
+
+**The guard aborting after statements have COWed pages.** No leak, and no work:
+an allocation that was never committed never entered the meta. `abort()`
+restores in-place undo and unlocks; the next writer starts from the same
+committed state and reuses those pages. The COW discipline covers it.
+
+**Shard/region across savepoint rollback.** `mutated_tables` is deliberately
+monotone, so a rolled-back statement still contributes. Regions inherit that and
+end up *wider* than the truth — more conflicts, the safe direction. The shard
+cannot be poisoned because the rule is set-once-else-`None`: a rolled-back
+statement claiming shard S and a committed one claiming T disagree, so the
+commit records `None` and conflicts with everything.
+
+## 8. Invariants that bite
 
 - The exact table id in the slot is **identity**; the ring's `& 63` fold is
   **conflict detection**. Do not swap them (`cdc.rs` documents that bug class
