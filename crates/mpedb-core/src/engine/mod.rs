@@ -1541,6 +1541,7 @@ impl Engine {
             mutated_tables: std::collections::BTreeSet::new(),
             colwm_cache: HashMap::new(),
             commit_point: None,
+            notify_keys: std::collections::HashMap::new(),
             capture_enabled: true,
             capture_cfg: None,
             reserved_alloc: false,

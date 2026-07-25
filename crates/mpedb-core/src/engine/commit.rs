@@ -466,7 +466,11 @@ impl<'e> WriteTxn<'e> {
         // database with no listeners pays one relaxed load per commit.
         if !mutated.is_empty() {
             for &tid in &mutated {
-                self.eng.shm.notify_publish(tid, 0);
+                // 0 = "somewhere in this table": the honest answer whenever the
+                // statement's key was not a single resolvable point, or when a
+                // batch touched more than one key here.
+                let key = self.notify_keys.get(&tid).copied().unwrap_or(0);
+                self.eng.shm.notify_publish(tid, key);
             }
             if self.eng.shm.notify_waiters().load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 for &tid in &mutated {

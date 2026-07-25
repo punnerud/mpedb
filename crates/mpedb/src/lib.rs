@@ -1247,6 +1247,33 @@ impl Database {
     /// discriminator. Compiles through the same path `prepare`/`execute` do, so
     /// the pair is the one the executed statement will carry. DDL compiles to no
     /// plan and yields `Unsupported` (use [`Database::access_report`] there).
+    /// Where `table_id`'s change counter stands, and the key digest of the
+    /// last change (0 = "somewhere in this table"). `None` means the
+    /// notification slot currently belongs to another table that hashes there,
+    /// so nothing can be said — a false wakeup, never a false "unchanged".
+    ///
+    /// This is the observation half of change notification (#139); the waiting
+    /// half is [`Database::wait_for_change`].
+    pub fn change_generation(&self, table_id: u32) -> Option<(u64, u64)> {
+        self.engine.change_generation(table_id)
+    }
+
+    /// Park until one of `tables` changes past the generations in `seen`, or
+    /// `timeout` elapses. Returns the tables that moved.
+    ///
+    /// Unlike Postgres's LISTEN/NOTIFY this needs no global commit lock,
+    /// because it makes no cross-table ordering promise: per table the writer
+    /// lock already orders commits, and a listener reads what changed from its
+    /// own MVCC snapshot rather than from a queued payload.
+    pub fn wait_for_change(
+        &self,
+        tables: &[u32],
+        seen: &[u64],
+        timeout: std::time::Duration,
+    ) -> Vec<u32> {
+        self.engine.wait_for_change(tables, seen, timeout)
+    }
+
     pub fn plan_footprint(&self, sql: &str) -> Result<(PlanHash, Footprint)> {
         if mpedb_sql::parse_ddl(sql)?.is_some() {
             return Err(Error::Unsupported(
@@ -2884,6 +2911,11 @@ impl WriteSession<'_> {
         // shared-registry eviction is needed here.
         self.db.validate_policy_write(None, plan, &mut self.txn)?;
         let full = session::resolve_params(plan, params, &self.session)?;
+        // Change-notification key hint (#139 S2). An interactive session runs
+        // several statements into ONE commit, so this is the path where the
+        // collapse-on-conflicting-keys rule earns its keep — and the path a
+        // ring-only wiring would have missed entirely.
+        ring_exec::hint_notify_keys(&mut self.txn, plan, &full);
         let triggers = self.db.trigger_set()?;
         // Execute against the session's OWN schema view (== the txn's captured
         // bundle), so a statement touching a table this session created/altered

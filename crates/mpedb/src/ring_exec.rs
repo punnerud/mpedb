@@ -297,6 +297,35 @@ fn locality_key(p: &PreparedIntent) -> SortKey {
 /// TxnCtx` the statement executes against, inside the same savepoint, at the
 /// same point in the round. No staging, posting, commit, or release ordering is
 /// touched.
+/// Tell the transaction which key this statement's change is confined to, for
+/// change notification (#139 S2). The footprint already knows: `KeyAccess`
+/// resolves to concrete key bytes from (plan, params) alone, which is the same
+/// trick `locality_key` above uses to sort a batch without executing it.
+///
+/// Every written table is hinted, with 0 meaning "somewhere in here". Hinting
+/// only the resolvable ones would be a lie by omission: a batch where
+/// statement 1 rewrites the whole table and statement 2 touches key K would
+/// then advertise K, and a listener watching a different key would sleep
+/// through statement 1.
+pub(crate) fn hint_notify_keys(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, params: &[Value]) {
+    let written: Vec<u32> = plan.footprint.tables_written.iter().collect();
+    // A key names one table's key space. With several written tables there is
+    // no single key space for it to name.
+    let digest = if written.len() == 1 {
+        match &plan.footprint.key_access {
+            KeyAccess::Point(parts) => {
+                resolve_key_bytes(parts, plan, params).map(|b| key_hash(&b)).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    for t in written {
+        txn.hint_notify_key(t, digest);
+    }
+}
+
 fn exec_own(
     db: &Database,
     txn: &mut WriteTxn<'_>,
@@ -312,6 +341,7 @@ fn exec_own(
         tables.as_ref().map(|(_, a, _)| a as &dyn mpedb_types::HostAggs);
     let colls: Option<&dyn mpedb_types::HostColls> =
         tables.as_ref().map(|(_, _, c)| c as &dyn mpedb_types::HostColls);
+    hint_notify_keys(txn, plan, params);
     let mut ctx = WriteCtx::new(txn, host, aggs, colls);
     exec_stmt_triggered(&mut ctx, &db.schema(), plan, params, partial, triggers, 0)
 }
@@ -330,6 +360,7 @@ fn execute_prepared(
     triggers: &TriggerSet,
     partial: &mut bool,
 ) -> Result<u64> {
+    hint_notify_keys(txn, plan, params);
     match exec_stmt_triggered(txn, &db.schema(), plan, params, partial, triggers, 0)? {
         ExecResult::Affected(n) => Ok(n),
         _ => Err(Error::Internal("write plan returned rows".into())),
