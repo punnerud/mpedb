@@ -11,7 +11,7 @@ the main event.
 | [vector.md](vector.md) | Qdrant | Filtered kNN and abandonment |
 | [graph.md](graph.md) | Neo4j | Traversal at a converged frontier |
 | [routing.md](routing.md) | the original MPEE solver | Exact sequencing against the generic solver |
-| [notify.md](notify.md) | PostgreSQL LISTEN/NOTIFY | Change notification: throughput, latency, contention, fan-out |
+| [notify.md](notify.md) | PostgreSQL LISTEN/NOTIFY | Change notification: throughput, latency, contention, fan-out — and arm E, **acting** on a notification, where PostgreSQL currently wins |
 | [minisqlite.md](minisqlite.md) | minisqlite, sqlite3, PostgreSQL | Two SQL engines built the same way, and the number nobody publishes |
 | [turso.md](turso.md) | Turso | Side document for the fourth engine in the head-to-head |
 

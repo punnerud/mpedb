@@ -143,82 +143,79 @@ Linux (67×), 147 µs vs 3313 µs on the M3 (23×). No queue, no server round tr
 polls at ~200 µs granularity. It is still 23× under PostgreSQL, but it is not
 the design's number — it is the platform's.
 
-## Acting on a notification: the shard guard
+## Arm E — acting on a notification, measured
 
-A benchmark of notification alone measures half the problem. A notification
-says *something changed*; the reason you wanted it is to **do** something, and
-two listeners that wake on the same change and both write will race.
+Arms A–D measure what a *notification* costs. This measures what **acting on
+one** costs, which is the half that decides whether the feature is usable. One
+action is: read a row, think for 20 ms, then write that row and an audit row in
+a second table. **Real processes on both engines** — the bench binary
+re-invokes itself as a worker.
 
-PostgreSQL's answers are `SELECT … FOR UPDATE SKIP LOCKED` and advisory locks —
-row locks, or a key you pick by hand and hope is right — layered on top of the
-cluster-global commit lock measured above. Both hold something across the work.
+The think time is the point. It stands for whatever a handler does between
+deciding and committing, and it is exactly the window a lock is held across, or
+not. PostgreSQL takes `SELECT … FOR UPDATE` before thinking, which is the
+ordinary correct way to write it there. mpedb holds nothing and guards at
+commit (`begin_guarded_for`).
 
-mpedb's answer reuses what made the notification cheap: **the surface is
-already computed.** Every statement is a compiled plan carrying a `Footprint`
-that names the tables it reads and writes, so an action made of several
-statements has the union of theirs. That union is the shard: bigger than one
-statement, far smaller than global, and *derived from the SQL* rather than
-declared by hand.
+Two sub-arms: **E-shard** gives each worker a disjoint slice of users, so
+nothing can collide; **E-hot** puts every worker on four users, so everything
+does. Run `mpedb-bench --notify-load`.
 
-```rust
-let snap = listener.snapshot();          // the token from the doorbell
-// ... read, compute, call out, take as long as you like — no lock held ...
-let mut s = db.begin_guarded_for(snap, &[
-    "SELECT total FROM orders WHERE id = $1",       // the read that decides
-    "UPDATE orders SET state = $1 WHERE id = $2",
-    "INSERT INTO audit (order_id, note) VALUES ($1, $2)",   // another table
-])?;
-// ... run whichever of them apply ...
-s.commit()?   // Err(WriteConflict) if anything in that union moved since `snap`
-```
+### Linux (2 cores) — actions/s
 
-**The operations are declared, not accumulated.** You list what the action
-*might* do — any number of inserts, updates and deletes across any number of
-tables — and they are compiled, not executed. A branch not taken would
-otherwise shrink the surface, so two workers running the same logical action
-would guard different things; declaring gives the shard an identity that exists
-before anything runs. Executing still widens it, so a wrong declaration makes
-the guard bigger, never wrong.
+| workers | mpedb *no guard (ctl)* | mpedb guarded | postgres E-shard | postgres E-hot |
+|---:|---:|---:|---:|---:|
+| 2 | 82 | 42 | **80** | 76 |
+| 4 | 164 | 42 | **155** | 135 |
+| 8 | 307 | 42 | **310** | 152 |
 
-**Reads are guarded too**, and that is deliberate: guarding only the writes
-would let the row a decision rested on move and still let the action commit — a
-lost update wearing a guard.
+### macOS (M3, 11 cores) — actions/s
 
-### Why this needs no global lock
+| workers | mpedb *no guard (ctl)* | mpedb guarded | postgres E-shard | postgres E-hot |
+|---:|---:|---:|---:|---:|
+| 2 | 65 | 34 | **62** | 60 |
+| 4 | 128 | 34 | **119** | 104 |
+| 8 | 231 | 34 | **229** | 114 |
 
-The check runs first in the commit path, **under the writer lock the commit
-already holds**. That is the whole trick: being under that lock is what makes
-the check atomic with the commit, so nothing new has to be locked. PostgreSQL
-needs a cluster-global lock to make the equivalent statement because its
-ordering guarantee spans a shared queue; there is no shared structure here to
-keep ordered.
+E-shard and E-hot are **indistinguishable for mpedb** — 42 and 42 on Linux, 34
+and 34 on the M3 — so they are one column.
 
-What it guarantees: **no lost updates on your surface.** If you commit, nothing
-you read or wrote moved since `snap`.
-What it does not: exclusivity of the *work*. Two actors may both compute; one
-commits. For work without external side effects that is strictly better than a
-lock — nothing to lease, nothing to reap, and a SIGKILLed actor costs nothing
-because a dead process simply did not commit. Where the work has external
-effects that cannot run twice, a lease is required instead (#142 G2, not built).
+### What this says, and it is not in our favour
 
-### Limits, pinned as tests
+**The guard does not scale, and the control proves it is the guard.** mpedb
+unguarded tracks PostgreSQL almost exactly (82/164/307 against 80/155/310).
+Guarded it is flat. The single writer lock is *not* the cap — the engine scales
+fine — the guard is.
 
-Conflict history rides the existing 64-entry commit ring, so three limits apply.
-All fail toward a **retry**, never a wrong answer, and each is a test rather
-than a paragraph:
+**Why: the guarded surface is table-granular.** Every worker declares `acct`
+and `audit`, so every commit invalidates every other worker's snapshot no matter
+which user it touched. "One shard per user" therefore shards **nothing**: the
+guard knows tables, not users, which is why E-shard and E-hot produce the same
+number. That limitation was already written down — *key precision only for point
+writes* — but its cost had never been measured, and the cost is all of the
+scaling.
 
-| Limit | Effect |
-|---|---|
-| 64 commits of history | An older snapshot is refused even against a disjoint surface — it bounds how long you may think between reading and writing |
-| Table ids folded `& 63` | Tables 64 apart alias into a false conflict |
-| Key precision only for point writes | A range write is recorded table-wide, so the key regions above sharpen *notification* but not yet the guard |
+**mpedb is non-blocking; it is just not non-conflicting.** p50 sits at the 20 ms
+think-time floor for small worker counts, so a guarded worker genuinely never
+waits on anyone. It fails fast and retries instead. Non-blocking and non-scaling
+are different properties, and this workload wants the second one.
 
-Counters (`GuardStats`: cleared / overlap / snapshot-too-old / ring-gap) exist
-so "should the ring be widened?" stays a measurement rather than an argument —
-the discipline that closed #24 and this document's own N4 as *measured, not
-worth it*.
+**PostgreSQL's row locks are the right granularity here**, which is the honest
+reason it wins this arm. Disjoint users touch disjoint rows and do not contend
+at all. Its lock does cost under real contention — E-hot at 8 workers is 152
+against E-shard's 310 on Linux, 114 against 229 on the M3, so roughly half —
+but half of a scaling curve beats all of a flat line.
 
-## What this does not measure
+**Caveat that cuts our way and is stated anyway:** the retry loop here re-runs
+the 20 ms think time on every attempt. A handler whose decision does not depend
+on the re-read could skip that, so this models the expensive case.
+
+**What would change it:** the guard needs key-granular surfaces, so two workers
+on different users stop conflicting. The key regions built for notification
+(§ above) are the mechanism; the commit-conflict ring records point writes
+exactly but everything else table-wide, so the work is to carry regions into
+that ring. Until then, per-user sharding is a design intent rather than a
+measured property, and this table is why.
 
 ## What this does not measure
 
