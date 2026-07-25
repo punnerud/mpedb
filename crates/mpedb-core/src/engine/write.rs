@@ -80,6 +80,16 @@ pub struct Guard {
     /// invalidated — so narrowing by what actually ran is sound where narrowing
     /// the table set would not be.
     pub regions: u64,
+    /// The shard this action runs under (#144), or `None` when it cannot be
+    /// proven — no session context, or a table without a policy on that key.
+    ///
+    /// Set once and only narrowed to `None`: statements must AGREE on the
+    /// shard. Two statements under different tenants are not one shard, and
+    /// letting the last one win would be exactly the wrong-answer direction.
+    pub shard: Option<u64>,
+    /// Has any statement run yet? Distinguishes "no shard proven" from "no
+    /// statement has spoken", which would otherwise both read as `None`.
+    pub shard_seen: bool,
     /// Union of every statement's footprint, folded `& 63` to match the OPT
     /// ring. Folding costs false conflicts (table 7 aliases 71), never a
     /// missed one — the same trade the ring already makes.
@@ -204,6 +214,10 @@ pub struct WriteTxn<'e> {
     /// Key-region summary of what this txn WROTE, published to the commit ring
     /// so later guards can tell "same table" from "same row" (#143).
     pub(super) written_regions: u64,
+    /// The shard this txn's writes all belong to (#144), or `None` if they do
+    /// not all belong to one provable shard.
+    pub(super) written_shard: Option<u64>,
+    pub(super) written_shard_seen: bool,
     /// Per-table key REGION for change notification (#139 S2, widened by
     /// #141 N2): the common `keycode` byte prefix of every key this
     /// transaction is known to have touched in that table. `None` means
@@ -401,6 +415,30 @@ impl<'e> WriteTxn<'e> {
     /// Add one exact key to the guard's region summary, or `None` for a
     /// statement whose keys cannot be named — which widens it to everything
     /// and cannot be narrowed again (#143).
+    /// Narrow the guard's shard to what this statement proved (#144). The
+    /// first statement sets it; every later one must agree or the shard is
+    /// lost.
+    pub fn guard_shard(&mut self, shard: Option<u64>) {
+        if let Some(g) = self.guard.as_mut() {
+            if !g.shard_seen {
+                g.shard_seen = true;
+                g.shard = shard;
+            } else if g.shard != shard {
+                g.shard = None;
+            }
+        }
+    }
+
+    /// Same rule, for what THIS txn is recording as its committed shard.
+    pub fn record_written_shard(&mut self, shard: Option<u64>) {
+        if !self.written_shard_seen {
+            self.written_shard_seen = true;
+            self.written_shard = shard;
+        } else if self.written_shard != shard {
+            self.written_shard = None;
+        }
+    }
+
     pub fn guard_touch_key(&mut self, key_hash: Option<u64>) {
         if let Some(g) = self.guard.as_mut() {
             g.regions |= match key_hash {
@@ -420,8 +458,8 @@ impl<'e> WriteTxn<'e> {
     }
 
     /// The guard's snapshot and accumulated surface, for the commit path.
-    pub fn guard_state(&self) -> Option<(u64, u64, u64)> {
-        self.guard.as_ref().map(|g| (g.snap_txn, g.surface, g.regions))
+    pub fn guard_state(&self) -> Option<(u64, u64, u64, Option<u64>)> {
+        self.guard.as_ref().map(|g| (g.snap_txn, g.surface, g.regions, g.shard))
     }
 
     pub fn hint_notify_key(&mut self, table_id: u32, region: Option<&[u8]>) {

@@ -1329,6 +1329,35 @@ impl Database {
     /// and the right choice when the action is a fixed short sequence — but it
     /// gives no stable shard identity before execution, so `begin_guarded_for`
     /// is what G2/G3 build on.
+    /// [`Database::begin_guarded_for`] under a session context (#144).
+    ///
+    /// When the session carries the key a table's RLS policy is written
+    /// against — `app.tenant` and friends — the guard identifies itself by
+    /// **that value** rather than by the rows it touched, and two actions under
+    /// different values stop conflicting entirely.
+    ///
+    /// The identity is only taken when it can be PROVEN: every table the
+    /// statements touch must carry a policy on that key, because the policy is
+    /// what makes "different tenant ⇒ different rows" a fact. One uncovered
+    /// table and the guard falls back to the row-level behaviour, which is
+    /// correct and simply coarser.
+    ///
+    /// **The trust model is RLS's, and RLS in one file is cooperative
+    /// (design/DESIGN-MULTIDB.md).** A caller that asserts the wrong tenant
+    /// already writes another tenant's rows today, so this adds no failure
+    /// mode — but it does tie the guard's precision to the policies actually
+    /// being configured, which is worth knowing before relying on it.
+    pub fn begin_guarded_as(
+        &self,
+        snap: u64,
+        session: &Session,
+        may_run: &[&str],
+    ) -> Result<WriteSession<'_>> {
+        let mut s = self.begin_guarded_for(snap, may_run)?;
+        s.session = session.clone();
+        Ok(s)
+    }
+
     pub fn begin_guarded(&self, snap: u64) -> Result<WriteSession<'_>> {
         Ok(WriteSession {
             db: self,

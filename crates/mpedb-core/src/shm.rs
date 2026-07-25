@@ -192,6 +192,23 @@ pub const OFP_KIND_TABLE: u64 = 2; // table-level write set (table_bits), any ke
 /// (benchmarks/notify.md). The write set alone is the wrong resolution for a
 /// workload keyed by row.
 pub const OFP_KIND_REGION: u64 = 3;
+/// Table set plus a **shard identity** in `khash` (#144). Compared for
+/// EQUALITY, not overlap: two commits under different shards touched disjoint
+/// rows by construction.
+///
+/// **Why equality and not a key set.** `REGION` summarises the rows a commit
+/// touched, and that summary saturates — six keys in a 64-bit filter collide
+/// better than half the time, which arm E measured as the guard failing to
+/// scale. A per-user shard has the wrong shape for a key set: whether two
+/// actions conflict should depend on *whether it is the same user*, never on
+/// how many users exist. One value compared for equality gives exactly that,
+/// and 10 users cost what 10 million do.
+///
+/// The identity is the session context an action ran under (`app.tenant`), and
+/// it is recorded ONLY when every table the plan touches carries a policy on
+/// that key — the policy is what makes "different tenant ⇒ different rows" a
+/// fact rather than a hope. Anything less records `REGION` or `TABLE`.
+pub const OFP_KIND_SHARD: u64 = 4;
 
 // ---- change-notification region (#139) ----
 //
@@ -2711,6 +2728,13 @@ impl Shm {
                         return true;
                     }
                 }
+                OFP_KIND_SHARD => {
+                    // A shard-scoped commit cannot be compared against one bare
+                    // key: conservative.
+                    if tbits & my_bit != 0 {
+                        return true;
+                    }
+                }
                 OFP_KIND_REGION => {
                     // Region summary (#143): our one key conflicts only if its
                     // bit is in the committed summary.
@@ -2759,6 +2783,7 @@ impl Shm {
         current_txn: u64,
         table_bits: u64,
         regions: u64,
+        shard: Option<u64>,
         why: &mut GuardVerdict,
     ) -> bool {
         if current_txn <= snap_txn {
@@ -2787,6 +2812,22 @@ impl Shm {
             // KEYS, and this is the whole of #143: without it, two workers
             // writing different rows of one table conflicted on every commit.
             let overlap = match kind {
+                // #144: both sides name a shard ⇒ they conflict only if it is
+                // the SAME shard. This is the whole per-user story, and it is a
+                // u64 compare, so the user count never enters the cost.
+                OFP_KIND_SHARD => match shard {
+                    Some(mine) => {
+                        self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed) == mine
+                    }
+                    // We cannot name a shard, so we cannot prove we are outside
+                    // theirs.
+                    None => true,
+                },
+                // A committer that named rows and a guard that named a shard
+                // are not comparable. Conservative rather than clever: mixing
+                // the two modes is the exception, and guessing across them
+                // would be guessing about correctness.
+                _ if shard.is_some() => true,
                 OFP_KIND_REGION => {
                     self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed) & regions != 0
                 }

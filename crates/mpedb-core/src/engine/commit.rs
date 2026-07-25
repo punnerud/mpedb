@@ -83,7 +83,7 @@ impl<'e> WriteTxn<'e> {
         // writeback and no freelist fixpoint, it just aborts. Retrying is the
         // expected outcome, not the exceptional one, so it must not be
         // expensive.
-        if let Some((snap_txn, surface, regions)) = self.guard_state() {
+        if let Some((snap_txn, surface, regions, shard)) = self.guard_state() {
             let mut why = crate::shm::GuardVerdict::Clear;
             // A guard that touched no resolvable key guards its whole surface;
             // one that named its keys guards only those. Zero would mean "no
@@ -92,7 +92,7 @@ impl<'e> WriteTxn<'e> {
             if self
                 .eng
                 .shm
-                .opt_conflict_set(snap_txn, self.meta.txn_id, surface, regions, &mut why)
+                .opt_conflict_set(snap_txn, self.meta.txn_id, surface, regions, shard, &mut why)
             {
                 self.eng.guard_stats.record(why);
                 self.abort();
@@ -453,7 +453,7 @@ impl<'e> WriteTxn<'e> {
         // it removes spurious gaps and can never invent a conflict that did not
         // happen.
         {
-            use crate::shm::{OFP_KIND_EMPTY, OFP_KIND_POINT};
+            use crate::shm::{OFP_KIND_EMPTY, OFP_KIND_POINT, OFP_KIND_SHARD};
             // The OFP ring stays a `u64` table bitmap even though footprints are
             // now sparse (DESIGN-TABLE-CAP §5): the `& 63` fold aliases tables
             // mod 64 (e.g. 0, 64 and 4096 share a bit). This
@@ -469,6 +469,11 @@ impl<'e> WriteTxn<'e> {
                 // which table. `written_regions` is 0 when nothing named a key,
                 // which must read as "anywhere" — the fail-safe direction, and
                 // the pre-#143 behaviour exactly.
+                // #144 first: a provable shard is a sharper statement than any
+                // key summary, and it is the one that does not saturate.
+                None if self.written_tables != 0 && self.written_shard.is_some() => {
+                    (OFP_KIND_SHARD, self.written_tables, self.written_shard.unwrap())
+                }
                 None if self.written_tables != 0 => {
                     let regions = if self.written_regions == 0 {
                         crate::shm::Shm::REGION_ANY

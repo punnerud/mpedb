@@ -338,6 +338,57 @@ pub(crate) fn widen_guard(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, params: &
     if !plan.footprint.tables_written.is_empty() {
         txn.record_written_key(key);
     }
+
+    // #144: the shard, when it can be PROVEN. A key summary saturates and a
+    // per-user workload has the wrong shape for one anyway — whether two
+    // actions conflict should depend on whether it is the same user, not on
+    // how many users exist.
+    let sh = plan_shard(plan, params);
+    txn.guard_shard(sh);
+    if !plan.footprint.tables_written.is_empty() {
+        txn.record_written_shard(sh);
+    }
+}
+
+/// The shard identity this statement runs under, or `None` when it cannot be
+/// proven (#144).
+///
+/// **The coverage requirement is the whole soundness argument.** Two sessions
+/// with different `app.tenant` values cannot touch the same row *because the
+/// policy on each touched table keeps them apart* — on the write path too
+/// (`policy_store::validate_policy_write`). Touch one table without such a
+/// policy and that proof is gone, so the answer is `None`: unknown, conflicts
+/// with everything, exactly the pre-#144 behaviour.
+///
+/// The values come from the tail of the resolved params, where
+/// `session::resolve_params` already bound them — the same vector this
+/// function is handed.
+fn plan_shard(plan: &CompiledPlan, params: &[Value]) -> Option<u64> {
+    if plan.context_keys.is_empty() {
+        return None;
+    }
+    // Every table this statement touches — read or written — must carry a
+    // policy. `plan.policies` is the set the binder stamped, so this is the
+    // compiler's own record of what it folded in.
+    let covered = |t: u32| plan.policies.iter().any(|p| p.table == t);
+    if !plan.footprint.tables_read.iter().all(covered)
+        || !plan.footprint.tables_written.iter().all(covered)
+    {
+        return None;
+    }
+    // Context slots are the last `context_keys.len()` params (plan/mod.rs).
+    let base = params.len().checked_sub(plan.context_keys.len())?;
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    for (k, v) in plan.context_keys.iter().zip(&params[base..]) {
+        buf.extend_from_slice(k.as_bytes());
+        buf.push(0x1f);
+        write_value(&mut buf, v);
+        buf.push(0x1e);
+    }
+    // Never 0: 0 is a legitimate hash and `Option` already carries "unknown",
+    // but keeping it nonzero means a zeroed ring slot can never read as a
+    // valid shard.
+    Some(key_hash(&buf) | 1)
 }
 
 pub(crate) fn hint_notify_keys(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, params: &[Value]) {
