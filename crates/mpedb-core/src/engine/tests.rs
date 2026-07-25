@@ -806,11 +806,36 @@ fn reserved_pages_extend_the_alloc_ceiling_past_normal_dbfull() {
         }
     }
     assert!(i > 0, "db should hold at least some rows");
-    // normal mode is now full
-    assert!(matches!(
-        w.insert_row(0, &user(i, "x@x.no", Some(0))),
-        Err(Error::DbFull)
-    ));
+
+    // Drive normal mode to a ceiling it cannot get past. A single `DbFull` is
+    // not that ceiling, and two things this test taught are worth keeping:
+    //
+    //  - A failed insert leaves its COW work in the txn — this is the raw
+    //    `WriteTxn`, with no statement savepoint — so an immediate retry needs
+    //    fewer new pages and can succeed.
+    //  - It may also have applied PART of itself: retrying the SAME key gives
+    //    `PrimaryKeyViolation`, not `DbFull`. Hence a fresh key per attempt.
+    //
+    // The old form probed once with a short literal row, which happened to fail
+    // at the boundary this geometry produced and stopped doing so the moment
+    // #147 added a page. Retrying with fresh keys until refusal sticks says the
+    // same thing without depending on where the boundary lands.
+    let mut stuck = 0;
+    for _ in 0..256 {
+        i += 1;
+        match w.insert_row(0, &user(i, &format!("u{i}@x.no"), Some(i))) {
+            Err(Error::DbFull) => {
+                stuck += 1;
+                if stuck == 3 {
+                    break;
+                }
+            }
+            Ok(()) => stuck = 0,
+            Err(e) => panic!("unexpected error at the ceiling: {e}"),
+        }
+    }
+    assert_eq!(stuck, 3, "normal mode never settled at a ceiling");
+    i += 1;
     // reserved mode reaches into the reserve band and succeeds (the normal
     // ceiling was RESERVED_CONTROL_PAGES below page_count)
     w.set_reserved_alloc(true);

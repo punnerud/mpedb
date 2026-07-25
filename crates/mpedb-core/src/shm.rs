@@ -89,7 +89,7 @@ fn memory_backing_file() -> Result<File> {
     }
 }
 
-pub const FORMAT_VERSION: u32 = 4; // v4: schema_gen in the meta snapshot (#47 DDL)
+pub const FORMAT_VERSION: u32 = 5; // v5: notify region on its own page (#147)
                                    //     (DESIGN-BLOBEXTENT §3.4); WAL3 trailer.
                                    // v2: intent-ring region between reader table and data
 
@@ -226,7 +226,14 @@ pub const OFP_KIND_SHARD: u64 = 4;
 // and is sound because a false conflict only costs a retry, but the same fold
 // used as *identity* would wake the wrong listener — the bug class `cdc.rs`
 // documents having already had to fix once.
-const LA_NOTIFY: usize = 2304;
+// ---- change notification (#139–#147), page-relative ----
+//
+// Offsets below are within the notification PAGE (`notify_start_page`), not
+// the lock page. It moved off the lock page in #147: the tail there had ~230
+// bytes left, enough for the slots but not for the waiter registry, and
+// without a registry a SIGKILLed listener leaked the parked-waiter count
+// forever (review finding R1).
+const NF_SLOTS_OFF: usize = 0;
 /// Notification slots. Collisions are false wakeups, so this trades memory for
 /// wakeup precision, not for correctness.
 pub const NOTIFY_SLOTS: u32 = 64;
@@ -235,42 +242,32 @@ const NF_GEN: usize = 0; // AtomicU64: bumped once per commit that wrote the tab
 const NF_SEQ: usize = 8; // AtomicU32: the futex word; changes on every publish
 const NF_TABLE: usize = 12; // AtomicU32: exact table id (not folded)
 const NF_KEY: usize = 16; // AtomicU64: digest of the key touched, 0 = whole table
-/// Global count of parked listeners, right after the slot table. A commit with
-/// nobody listening pays ONE relaxed load and issues no syscall — the property
-/// that makes notification free when unused.
-const LA_NOTIFY_WAITERS: usize = LA_NOTIFY + NOTIFY_SLOTS as usize * NOTIFY_ENTRY;
-/// The "any table changed" futex word (N3), bumped by every publish alongside
-/// the per-table one.
+
+const NF_WAITERS: usize = NF_SLOTS_OFF + NOTIFY_SLOTS as usize * NOTIFY_ENTRY; // 1536
+const NF_ANY: usize = NF_WAITERS + 8; // 1544
+const NF_EPOCH: usize = NF_ANY + 8; // 1552
+
+/// Waiter registry (#147). One slot per parked listener, carrying the same
+/// identity the reader table uses — pid plus `/proc` start time — so a slot
+/// whose owner died can be told from one whose owner is merely quiet.
 ///
-/// A futex waits on ONE word, but a listener may watch several tables. Before
-/// this existed such a listener parked on `tables[0]`'s word and noticed the
-/// others only when its timeout expired — the answer was right and the latency
-/// was three orders of magnitude wrong.
+/// **Why a registry at all.** `NF_WAITERS` is the hot path: a commit reads it
+/// once to decide whether the wake syscalls are worth issuing. A bare counter
+/// can only be repaired by someone who knows which increments are stale, and
+/// that is what identity buys.
 ///
-/// So the park is chosen by arity: ONE table parks on its exact slot word and
-/// keeps the precise filter, several park here and re-check their generations
-/// on every wakeup. That trades a missed-until-timeout — a latency defect — for
-/// false wakeups, which is the same fail-safe direction as slot collisions and
-/// the honest-degradation rule on key digests.
-const LA_NOTIFY_ANY: usize = LA_NOTIFY_WAITERS + 8;
-/// Incarnation stamp for the whole notification region (#140), rewritten on
-/// every [`Shm::notify_reset`].
-///
-/// Generations are only meaningful WITHIN one incarnation of this file, and
-/// nothing in a bare generation says which incarnation it came from. A live
-/// in-process listener cannot notice, because it dies with the reboot that
-/// resets the counters. A listener that PERSISTS its last-seen generation and
-/// presents it later — the reconnecting-client shape S3's API exists to serve —
-/// very much can: it returns holding 900, meets a counter reset to 3, and
-/// `3 > 900` is false for the next 900 commits. That is the one failure this
-/// feature may never have, and resetting alone does not prevent it; it only
-/// moves the stale value from the file to the client.
-///
-/// So a resumable cursor carries `(epoch, generation)`, and a changed epoch
-/// means "everything, go look" — a false wakeup, the safe direction. One word
-/// covers reboot, reformat, and delete-and-recreate; the boot id alone covers
-/// only the first.
-const LA_NOTIFY_EPOCH: usize = LA_NOTIFY_ANY + 8;
+/// **Ownership decides who decrements.** A slot is cleared by exactly one
+/// party — its owner on the way out, or a sweeper that wins the CAS — and only
+/// that party decrements. Without that rule a sweep racing a clean exit would
+/// double-decrement, and an undercount is a MISSED WAKEUP, the one direction
+/// this whole subsystem may not fail in.
+const NF_REG: usize = NF_EPOCH + 8; // 1560
+pub const NOTIFY_WAITER_SLOTS: usize = 128;
+const NFW_ENTRY: usize = 16;
+const NFW_PID: usize = 0; // AtomicU32: 0 = free
+const NFW_START: usize = 8; // AtomicU64: /proc start time, the incarnation tag
+
+const _: () = assert!(NF_REG + NOTIFY_WAITER_SLOTS * NFW_ENTRY <= PAGE_SIZE);
 
 /// Why a guard's conflict check answered yes (#142 G1).
 ///
@@ -324,8 +321,23 @@ pub fn ring_start_page(max_readers: u32) -> u64 {
     READER_TABLE_PAGE + reader_table_pages(max_readers)
 }
 
-pub fn data_start_page(max_readers: u32) -> u64 {
+/// Change-notification region (#139–#147): its own page, directly after the
+/// intent ring.
+///
+/// It lived in the lock page's free tail until #147. That tail had ~230 bytes
+/// left, which was enough for the per-table slots but not for the waiter
+/// registry a SIGKILLed listener needs in order to be cleaned up — so the
+/// counter leaked forever and every later commit paid wake syscalls for a
+/// process that was gone. One page buys the registry and leaves room; the cost
+/// is 4 KiB per database and one format version.
+pub const NOTIFY_PAGES: u64 = 1;
+
+pub fn notify_start_page(max_readers: u32) -> u64 {
     ring_start_page(max_readers) + RING_PAGES
+}
+
+pub fn data_start_page(max_readers: u32) -> u64 {
+    notify_start_page(max_readers) + NOTIFY_PAGES
 }
 
 fn durability_tag(d: Durability) -> u32 {
@@ -2479,9 +2491,17 @@ impl Shm {
 
     // ---------- change notification (#139) ----------
 
+    /// Byte offset of `field` within the notification page (#147). The region
+    /// is page-relative now, so every accessor goes through here rather than
+    /// through `lock_area_off`.
     #[inline]
-    fn notify_slot_off(table_id: u32) -> usize {
-        Self::lock_area_off(LA_NOTIFY) + (table_id % NOTIFY_SLOTS) as usize * NOTIFY_ENTRY
+    fn notify_off(&self, field: usize) -> usize {
+        notify_start_page(self.max_readers) as usize * PAGE_SIZE + field
+    }
+
+    #[inline]
+    fn notify_slot_off(&self, table_id: u32) -> usize {
+        self.notify_off(NF_SLOTS_OFF + (table_id % NOTIFY_SLOTS) as usize * NOTIFY_ENTRY)
     }
 
     /// Parked-listener count. Read by every commit, so it is the one thing on
@@ -2506,25 +2526,25 @@ impl Shm {
     /// region moved off page 2 — a format change, and therefore a decision
     /// rather than something to slip into a review.
     pub fn notify_waiters(&self) -> &AtomicU32 {
-        self.atomic_u32(Self::lock_area_off(LA_NOTIFY_WAITERS))
+        self.atomic_u32(self.notify_off(NF_WAITERS))
     }
 
     /// The futex word for `table_id`'s slot. Listeners wait on it; publishers
     /// change it. Shared by every table that hashes here — a false wakeup.
     pub fn notify_seq(&self, table_id: u32) -> &AtomicU32 {
-        self.atomic_u32(Self::notify_slot_off(table_id) + NF_SEQ)
+        self.atomic_u32(self.notify_slot_off(table_id) + NF_SEQ)
     }
 
     /// The futex word every publish bumps, whatever it wrote. A listener
     /// watching more than one table parks here (see [`LA_NOTIFY_ANY`]).
     pub fn notify_any_seq(&self) -> &AtomicU32 {
-        self.atomic_u32(Self::lock_area_off(LA_NOTIFY_ANY))
+        self.atomic_u32(self.notify_off(NF_ANY))
     }
 
     /// This region's incarnation stamp (#140). A persisted generation is only
     /// comparable against a generation read under the SAME epoch.
     pub fn notify_epoch(&self) -> u64 {
-        self.atomic_u64(Self::lock_area_off(LA_NOTIFY_EPOCH)).load(Ordering::Acquire)
+        self.atomic_u64(self.notify_off(NF_EPOCH)).load(Ordering::Acquire)
     }
 
     /// A value that differs from every previous incarnation's. Wall time gives
@@ -2550,7 +2570,7 @@ impl Shm {
     /// belongs to a DIFFERENT table — the caller then knows only that
     /// something hashing here changed, which is a false wakeup, not a lie.
     pub fn notify_read(&self, table_id: u32) -> Option<(u64, u64)> {
-        let off = Self::notify_slot_off(table_id);
+        let off = self.notify_slot_off(table_id);
         // gen last, Acquire: pairs with the publisher's Release store, so a
         // reader that sees a bumped generation also sees the id and key that
         // belong to it.
@@ -2572,7 +2592,7 @@ impl Shm {
     /// produced it. The sequence word moves last, because that is what a
     /// parked futex re-checks.
     pub fn notify_publish(&self, table_id: u32, key: u64) {
-        let off = Self::notify_slot_off(table_id);
+        let off = self.notify_slot_off(table_id);
         self.atomic_u32(off + NF_TABLE).store(table_id, Ordering::Release);
         self.atomic_u64(off + NF_KEY).store(key, Ordering::Release);
         self.atomic_u64(off + NF_GEN).fetch_add(1, Ordering::AcqRel);
@@ -2580,7 +2600,7 @@ impl Shm {
         // Last, and after the per-table word: a multi-table listener parked
         // here re-reads every generation it watches, so it must not be released
         // before those generations are visible.
-        self.atomic_u32(Self::lock_area_off(LA_NOTIFY_ANY)).fetch_add(1, Ordering::AcqRel);
+        self.atomic_u32(self.notify_off(NF_ANY)).fetch_add(1, Ordering::AcqRel);
     }
 
     /// Wake parked listeners for `table_id`. Split from [`Self::notify_publish`]
@@ -2588,6 +2608,80 @@ impl Shm {
     /// in one pass — and skip them entirely when nobody is parked.
     pub fn notify_wake(&self, table_id: u32) {
         crate::os::futex_wake_all(self.notify_seq(table_id));
+    }
+
+    // ---------- waiter registry (#147) ----------
+
+    #[inline]
+    fn waiter_slot(&self, i: usize, field: usize) -> usize {
+        self.notify_off(NF_REG + i * NFW_ENTRY + field)
+    }
+
+    /// This process's `/proc` start time — the incarnation half of the identity
+    /// a registry slot records. Exposed so a caller registers with exactly the
+    /// value the sweep will compare against, rather than reconstructing it.
+    pub fn own_start_time(&self) -> Option<u64> {
+        proc_start_time(crate::os::process_id())
+    }
+
+    /// Claim a registry slot for this process, returning its index.
+    ///
+    /// Sweeps first, so the party that benefits from a clean registry is the
+    /// one that pays for it, and a database with no listeners never sweeps at
+    /// all. `None` means every slot is taken by a live process: the caller
+    /// still parks and still counts, it is simply not reclaimable if killed.
+    /// Refusing to listen would be a far worse failure than an unreclaimable
+    /// slot.
+    pub fn waiter_register(&self, pid: u32, start: u64) -> Option<usize> {
+        self.waiter_sweep();
+        for i in 0..NOTIFY_WAITER_SLOTS {
+            let p = self.atomic_u32(self.waiter_slot(i, NFW_PID));
+            if p.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                self.atomic_u64(self.waiter_slot(i, NFW_START)).store(start, Ordering::Release);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Release a slot this process owns. Returns true if THIS call cleared it,
+    /// which is the caller's licence to decrement the counter — see the
+    /// ownership rule on [`NF_REG`].
+    pub fn waiter_release(&self, i: usize, pid: u32) -> bool {
+        let p = self.atomic_u32(self.waiter_slot(i, NFW_PID));
+        p.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    }
+
+    /// Reclaim slots whose owner is gone, decrementing the parked count once
+    /// per slot actually reclaimed. Returns how many.
+    ///
+    /// Liveness uses the reader table's identity — pid plus `/proc` start time
+    /// — so a recycled pid is not mistaken for the original owner. The
+    /// predicate errs toward ALIVE (it never sweeps on `EPERM`), which is the
+    /// only safe direction here: sweeping a live waiter would decrement a
+    /// count it will decrement again on the way out, and an undercount is a
+    /// missed wakeup.
+    pub fn waiter_sweep(&self) -> usize {
+        let mut freed = 0;
+        for i in 0..NOTIFY_WAITER_SLOTS {
+            let p = self.atomic_u32(self.waiter_slot(i, NFW_PID));
+            let pid = p.load(Ordering::Acquire);
+            if pid == 0 {
+                continue;
+            }
+            let start = self.atomic_u64(self.waiter_slot(i, NFW_START)).load(Ordering::Acquire);
+            if pid_alive_identity(pid, start) {
+                continue;
+            }
+            // Only the winner of this CAS may decrement: the owner could be
+            // releasing concurrently, and two decrements for one increment is
+            // an undercount.
+            if p.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                self.notify_waiters().fetch_sub(1, Ordering::AcqRel);
+                freed += 1;
+            }
+        }
+        freed
     }
 
     /// Wake listeners parked on the "any table" word (N3). Issued once per commit,
@@ -2602,17 +2696,21 @@ impl Shm {
     /// "unchanged" about a file that is no longer the one it read.
     pub fn notify_reset(&self) {
         for slot in 0..NOTIFY_SLOTS {
-            let off = Self::lock_area_off(LA_NOTIFY) + slot as usize * NOTIFY_ENTRY;
+            let off = self.notify_off(NF_SLOTS_OFF + slot as usize * NOTIFY_ENTRY);
             self.atomic_u64(off + NF_GEN).store(0, Ordering::Relaxed);
             self.atomic_u32(off + NF_SEQ).store(0, Ordering::Relaxed);
             self.atomic_u32(off + NF_TABLE).store(u32::MAX, Ordering::Relaxed);
             self.atomic_u64(off + NF_KEY).store(0, Ordering::Relaxed);
         }
         self.notify_any_seq().store(0, Ordering::Relaxed);
+        for i in 0..NOTIFY_WAITER_SLOTS {
+            self.atomic_u32(self.waiter_slot(i, NFW_PID)).store(0, Ordering::Relaxed);
+            self.atomic_u64(self.waiter_slot(i, NFW_START)).store(0, Ordering::Relaxed);
+        }
         // Stamped LAST, with Release: a reader that sees the new epoch sees the
         // zeroed generations that belong to it, never the previous
         // incarnation's still standing behind a fresh stamp.
-        self.atomic_u64(Self::lock_area_off(LA_NOTIFY_EPOCH))
+        self.atomic_u64(self.notify_off(NF_EPOCH))
             .store(Self::fresh_epoch(), Ordering::Release);
         self.notify_waiters().store(0, Ordering::Release);
     }

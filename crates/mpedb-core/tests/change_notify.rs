@@ -230,3 +230,75 @@ fn a_multi_table_listener_wakes_on_the_second_table_promptly() {
     drop(eng);
     let _ = std::fs::remove_file(&path);
 }
+
+/// **#147: a listener killed while parked must not leak the count forever.**
+///
+/// Before the waiter registry there was nothing but a bare counter, so a
+/// SIGKILL mid-park left it raised until the next format or reboot, and every
+/// commit after that paid wake syscalls for a process that was gone. The count
+/// is only an optimisation, so this was never a wrong answer — but it was
+/// unbounded in time and triggered by exactly the event this engine is built
+/// around.
+///
+/// The phantom is planted directly rather than by forking and killing, so the
+/// test does not depend on teardown timing. It uses OUR pid with a start time
+/// that is not ours — the pid-reuse case the identity exists for. A dead-pid
+/// phantom would be the obvious choice and is the wrong one: `kill(1, 0)`
+/// answers EPERM for an unowned process, and the sweep treats EPERM as ALIVE
+/// on purpose. Erring toward alive is the safe direction, because sweeping a
+/// live waiter would undercount and an undercount is a missed wakeup.
+#[test]
+fn a_dead_waiters_slot_is_reclaimed_and_the_count_corrected() {
+    let (eng, path) = open("sweep");
+    let shm = eng.shm_for_test();
+    assert_eq!(eng.notify_waiter_count(), 0, "a fresh database has no waiters");
+
+    // Plant a phantom: a registered slot whose owner is not this incarnation.
+    // pid 1 exists but its start time is not ours, so the identity check
+    // rejects it — the same rule the reader table uses for pid reuse.
+    let phantom_pid = std::process::id();
+    let bogus_start = shm.own_start_time().expect("own start time") ^ 0xFFFF;
+    shm.waiter_register(phantom_pid, bogus_start)
+        .expect("a fresh registry has room");
+    shm.notify_waiters().fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    assert_eq!(eng.notify_waiter_count(), 1, "the phantom should be counted");
+
+    // A sweep must reclaim it and correct the count.
+    assert_eq!(eng.sweep_listeners(), 1, "the dead slot was not reclaimed");
+    assert_eq!(
+        eng.notify_waiter_count(),
+        0,
+        "the slot was reclaimed but the count was left raised — every later \
+         commit still pays wake syscalls for a listener that does not exist"
+    );
+
+    // And sweeping again is a no-op: reclaiming twice would UNDERCOUNT, which
+    // is the fatal direction (a missed wakeup, not a wasted syscall).
+    assert_eq!(eng.sweep_listeners(), 0, "a second sweep reclaimed the same slot again");
+    assert_eq!(eng.notify_waiter_count(), 0);
+
+    drop(eng);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A LIVE waiter must never be swept: that would decrement a count its owner
+/// will decrement again on the way out, and an undercount is a missed wakeup.
+#[test]
+fn a_live_waiters_slot_survives_a_sweep() {
+    let (eng, path) = open("sweeplive");
+    let shm = eng.shm_for_test();
+    // Register through the same path a real listener uses, so the identity is
+    // whatever this platform actually records rather than something the test
+    // reconstructs and could get wrong.
+    let pid = std::process::id();
+    let start = shm.own_start_time().expect("own start time");
+
+    shm.waiter_register(pid, start).expect("room");
+    shm.notify_waiters().fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+    assert_eq!(eng.sweep_listeners(), 0, "a live listener's slot was reclaimed");
+    assert_eq!(eng.notify_waiter_count(), 1, "a live listener was decremented");
+
+    drop(eng);
+    let _ = std::fs::remove_file(&path);
+}

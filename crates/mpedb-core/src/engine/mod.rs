@@ -1365,6 +1365,14 @@ impl Engine {
         self.shm.notify_epoch()
     }
 
+    /// Reclaim notification-waiter slots whose owner is gone (#147), returning
+    /// how many. Registration already sweeps, so this is for the case a
+    /// registration never comes: a phantom left by a killed listener on a
+    /// database nobody listens to again.
+    pub fn sweep_listeners(&self) -> usize {
+        self.shm.waiter_sweep()
+    }
+
     /// How many listeners are parked right now. A commit reads this to decide
     /// whether the wake syscalls are worth issuing at all.
     pub fn notify_waiter_count(&self) -> u32 {
@@ -1422,14 +1430,38 @@ impl Engine {
         // leaks it for every process, permanently, until the next format or
         // boot-epoch reset. A guard covers unwinding; a SIGKILL while parked
         // does not, and cannot without a swept registry (see the type's docs).
-        struct Parked<'a>(&'a std::sync::atomic::AtomicU32);
+        // A registry slot carries this process's identity, so a listener killed
+        // while parked can be reclaimed by the next one (#147). Registration
+        // sweeps first, which is what makes the leak self-healing without
+        // touching the commit path.
+        //
+        // The counter is incremented AFTER the slot is claimed and decremented
+        // only by whoever clears it, so an increment and its decrement are
+        // always the same party. `None` (registry full of live listeners) still
+        // parks and still counts: refusing to listen would be worse than an
+        // unreclaimable slot.
+        struct Parked<'a> {
+            shm: &'a Shm,
+            slot: Option<usize>,
+            pid: u32,
+        }
         impl Drop for Parked<'_> {
             fn drop(&mut self) {
-                self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                let mine = match self.slot {
+                    Some(i) => self.shm.waiter_release(i, self.pid),
+                    // Unregistered: nobody else can clear it for us, so we are
+                    // still the one who must decrement.
+                    None => true,
+                };
+                if mine {
+                    self.shm.notify_waiters().fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
             }
         }
+        let pid = crate::os::process_id();
+        let slot = crate::os::proc_start_time(pid).and_then(|st| self.shm.waiter_register(pid, st));
         self.shm.notify_waiters().fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let _parked = Parked(self.shm.notify_waiters());
+        let _parked = Parked { shm: &self.shm, slot, pid };
         let out = loop {
             // Sample the futex word BEFORE testing the condition. The other
             // order loses wakeups: a publish landing between the test and the

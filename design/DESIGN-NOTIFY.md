@@ -21,14 +21,37 @@ of accumulating.
 The price, stated so nobody has to discover it: **no total order across
 unrelated tables**, and **no payload delivery**.
 
-## 2. Shared-memory layout (lock area, page 2)
+## 2. Shared-memory layout (its own page, `notify_start_page`)
+
+Format v5 (#147). The region lived in the lock page's free tail until then;
+that tail had ~230 bytes left, enough for the slots but not for the waiter
+registry, and without a registry a SIGKILLed listener leaked the parked count
+forever. One page buys the registry and leaves room. The page sits between the
+intent ring and the data pages, so only `data_start_page` moved.
 
 | Offset | Field | Purpose |
 |---|---|---|
-| `LA_NOTIFY` | 64 × 24 B slots | `gen` u64, `seq` u32 (futex word), `table` u32 (exact id), `key` u64 (region) |
-| `LA_NOTIFY_WAITERS` | u32 | parked listeners; a commit with none pays one relaxed load |
-| `LA_NOTIFY_ANY` | u32 | the "any table changed" futex word |
-| `LA_NOTIFY_EPOCH` | u64 | incarnation stamp (§5) |
+| 0 | 64 × 24 B slots | `gen` u64, `seq` u32 (futex word), `table` u32 (exact id), `key` u64 (region) |
+| 1536 | waiters u32 | parked listeners; a commit with none pays one relaxed load |
+| 1544 | any-seq u32 | the "any table changed" futex word |
+| 1552 | epoch u64 | incarnation stamp (§5) |
+| 1560 | 128 × 16 B registry | pid u32 + `/proc` start time u64 per parked listener |
+
+**The registry's rule is ownership.** A slot is cleared by exactly one party —
+its owner on the way out, or a sweeper that wins the CAS — and only that party
+decrements the counter. Two decrements for one increment would UNDERCOUNT, and
+an undercount is a missed wakeup, the one direction this subsystem may not fail
+in. That is also why liveness errs toward *alive*: `pid_alive_identity` never
+sweeps on `EPERM`, so an unowned process is left alone.
+
+Registration sweeps first, so the party that benefits pays and a database with
+no listeners never sweeps. The commit path is untouched — deliberately, given
+it had just been reviewed. `Database::sweep_listeners()` covers the case a
+registration never comes.
+
+A full registry does not refuse the listen: the caller still parks and still
+counts, it is simply not reclaimable if killed. Refusing to listen would be a
+worse failure than an unreclaimable slot.
 
 Slot = `table_id % 64`, with the **exact** id stored alongside. A collision is a
 false wakeup, never a missed one. The exact id matters: the committed-footprint
