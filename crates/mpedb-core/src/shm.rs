@@ -226,6 +226,24 @@ const LA_NOTIFY_WAITERS: usize = LA_NOTIFY + NOTIFY_SLOTS as usize * NOTIFY_ENTR
 /// false wakeups, which is the same fail-safe direction as slot collisions and
 /// the honest-degradation rule on key digests.
 const LA_NOTIFY_ANY: usize = LA_NOTIFY_WAITERS + 8;
+/// Incarnation stamp for the whole notification region (#140), rewritten on
+/// every [`Shm::notify_reset`].
+///
+/// Generations are only meaningful WITHIN one incarnation of this file, and
+/// nothing in a bare generation says which incarnation it came from. A live
+/// in-process listener cannot notice, because it dies with the reboot that
+/// resets the counters. A listener that PERSISTS its last-seen generation and
+/// presents it later — the reconnecting-client shape S3's API exists to serve —
+/// very much can: it returns holding 900, meets a counter reset to 3, and
+/// `3 > 900` is false for the next 900 commits. That is the one failure this
+/// feature may never have, and resetting alone does not prevent it; it only
+/// moves the stale value from the file to the client.
+///
+/// So a resumable cursor carries `(epoch, generation)`, and a changed epoch
+/// means "everything, go look" — a false wakeup, the safe direction. One word
+/// covers reboot, reformat, and delete-and-recreate; the boot id alone covers
+/// only the first.
+const LA_NOTIFY_EPOCH: usize = LA_NOTIFY_ANY + 8;
 
 const INIT_READY: u32 = 2;
 const INIT_FORMATTING: u32 = 1;
@@ -2433,6 +2451,30 @@ impl Shm {
         self.atomic_u32(Self::lock_area_off(LA_NOTIFY_ANY))
     }
 
+    /// This region's incarnation stamp (#140). A persisted generation is only
+    /// comparable against a generation read under the SAME epoch.
+    pub fn notify_epoch(&self) -> u64 {
+        self.atomic_u64(Self::lock_area_off(LA_NOTIFY_EPOCH)).load(Ordering::Acquire)
+    }
+
+    /// A value that differs from every previous incarnation's. Wall time gives
+    /// the across-reboot and across-recreate spread; the pid and a
+    /// process-local counter cover two stamps landing in the same clock tick,
+    /// which is not hypothetical — the `:memory:` temp-file namer had exactly
+    /// that collision on macOS. Never 0: 0 is free to mean "no epoch known".
+    fn fresh_epoch() -> u64 {
+        use std::sync::atomic::AtomicU64;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mix = nanos
+            ^ ((std::process::id() as u64) << 32)
+            ^ SEQ.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        mix | 1
+    }
+
     /// This table's change generation, and the key digest of the last change
     /// (0 = unknown / whole table). Returns `None` when the slot currently
     /// belongs to a DIFFERENT table — the caller then knows only that
@@ -2497,6 +2539,11 @@ impl Shm {
             self.atomic_u64(off + NF_KEY).store(0, Ordering::Relaxed);
         }
         self.notify_any_seq().store(0, Ordering::Relaxed);
+        // Stamped LAST, with Release: a reader that sees the new epoch sees the
+        // zeroed generations that belong to it, never the previous
+        // incarnation's still standing behind a fresh stamp.
+        self.atomic_u64(Self::lock_area_off(LA_NOTIFY_EPOCH))
+            .store(Self::fresh_epoch(), Ordering::Release);
         self.notify_waiters().store(0, Ordering::Release);
     }
 

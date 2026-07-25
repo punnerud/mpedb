@@ -1284,6 +1284,33 @@ impl Database {
         self.engine.notify_waiter_count()
     }
 
+    /// A resumable [`Listener`] over `tables`, positioned at the present:
+    /// only changes committed AFTER this call are reported (#141 S3).
+    pub fn listen(&self, tables: &[u32]) -> Listener<'_> {
+        self.listen_keyed(tables, &vec![None; tables.len()])
+    }
+
+    /// [`Database::listen`], narrowed to one key per table. `keys[i] = None`
+    /// takes every change to `tables[i]`.
+    pub fn listen_keyed(&self, tables: &[u32], keys: &[Option<Vec<Value>>]) -> Listener<'_> {
+        let mut l = Listener {
+            db: self,
+            tables: tables.to_vec(),
+            keys: keys.to_vec(),
+            epoch: 0,
+            seen: vec![0; tables.len()],
+        };
+        l.advance();
+        l
+    }
+
+    /// The notification region's incarnation stamp (#140). Exposed for the
+    /// same reason [`ChangeCursor`] carries it: a generation is meaningless
+    /// without it.
+    pub fn notify_epoch(&self) -> u64 {
+        self.engine.notify_epoch()
+    }
+
     /// [`Database::wait_for_change`], narrowed to a key per table (#141 N2).
     ///
     /// `keys[i]` is the primary-key value list this listener cares about in
@@ -3358,11 +3385,84 @@ macro_rules! params {
     };
 }
 
-// -------------------------------------------------------------------- tests
+/// A resumable position in a database's change stream (#140).
+///
+/// Generations alone are NOT a position: they are counters inside one
+/// incarnation of the file, and `notify_reset` zeroes them on reboot, on
+/// reformat, and on delete-and-recreate. A client that stores a bare
+/// generation and presents it after any of those returns holding a number
+/// larger than the counter it meets, and concludes "unchanged" until the
+/// counter catches up — sleeping through its own changes the whole way.
+///
+/// So a position is `(epoch, generations)`, and [`Listener::resume`] treats an
+/// epoch it does not recognise as "everything may have changed". That is a
+/// false wakeup, which is the direction this protocol always errs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeCursor {
+    pub epoch: u64,
+    pub seen: Vec<u64>,
+}
 
-/// In-crate tests that need access to the private engine handle (raw registry
-/// corruption, eviction accounting). The end-to-end suite lives in
-/// `tests/facade.rs`.
+/// A parked-and-resumable listener over a set of tables (#141 S3).
+///
+/// Wraps [`Database::wait_for_change_keyed`] so a caller stops hand-managing
+/// the `seen` vector — the mistake that makes is silent (a stale `seen`
+/// re-reports forever, a too-fresh one skips) and it is the same mistake for
+/// every caller, so it belongs here once.
+pub struct Listener<'a> {
+    db: &'a Database,
+    tables: Vec<u32>,
+    keys: Vec<Option<Vec<Value>>>,
+    epoch: u64,
+    seen: Vec<u64>,
+}
+
+impl<'a> Listener<'a> {
+    /// Park until one of the watched tables changes, or `timeout` elapses.
+    /// Returns the table ids that moved, and advances the cursor past them.
+    pub fn wait(&mut self, timeout: std::time::Duration) -> Vec<u32> {
+        let changed = self.db.wait_for_change_keyed(&self.tables, &self.seen, &self.keys, timeout);
+        self.advance();
+        changed
+    }
+
+    /// Re-read every watched generation into the cursor. Called after each
+    /// wait so the next one does not re-report what was just reported, and
+    /// exposed because a caller that acts on a change wants to bank it.
+    pub fn advance(&mut self) {
+        self.epoch = self.db.notify_epoch();
+        for (i, &t) in self.tables.iter().enumerate() {
+            if let Some((gen, _)) = self.db.change_generation(t) {
+                self.seen[i] = gen;
+            }
+        }
+    }
+
+    /// The position, for storing somewhere and presenting later.
+    pub fn cursor(&self) -> ChangeCursor {
+        ChangeCursor { epoch: self.epoch, seen: self.seen.clone() }
+    }
+
+    /// Resume from a stored position.
+    ///
+    /// A cursor from a different epoch, or with a different table count, is
+    /// not comparable with what this file holds now — so it is discarded and
+    /// every table reads as unseen. The caller then looks and finds either
+    /// something or nothing, which is the correct outcome in both cases and
+    /// the only one that cannot silently skip a change.
+    pub fn resume(&mut self, cursor: &ChangeCursor) {
+        if cursor.epoch == self.epoch && cursor.seen.len() == self.seen.len() {
+            self.seen.clone_from(&cursor.seen);
+        } else {
+            self.seen.iter_mut().for_each(|g| *g = 0);
+        }
+    }
+
+    pub fn tables(&self) -> &[u32] {
+        &self.tables
+    }
+}
+
 /// Could a change advertised as `published` (the second half of
 /// [`Database::change_generation`]) have touched the primary key `key`?
 ///
@@ -3374,6 +3474,11 @@ pub fn key_region_matches(published: u64, key: &[Value]) -> bool {
     mpedb_core::shm::Shm::fingerprint_matches(published, &keycode::encode_key(key))
 }
 
+// -------------------------------------------------------------------- tests
+
+/// In-crate tests that need access to the private engine handle (raw registry
+/// corruption, eviction accounting). The end-to-end suite lives in
+/// `tests/facade.rs`.
 #[cfg(test)]
 mod tests {
     use super::*;

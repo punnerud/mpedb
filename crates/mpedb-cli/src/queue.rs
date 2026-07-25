@@ -69,7 +69,8 @@ usage: mpedb queue <subcommand>
         --delay <secs>       run no earlier than now + secs
         --run-at <iso8601>   run no earlier than this instant
         --max-attempts <n>   claims before failed/dead (default 5)
-  queue run     <target>                            drain due tasks, then exit
+  queue run     <target> [--wait <s>]                drain due tasks; exit, or park on
+                                                    the change doorbell for s seconds
         --queue <name>       only this queue (default: all)
         --lease <secs>       claim visibility timeout (default 60);
                              set ABOVE the longest task runtime
@@ -428,7 +429,7 @@ fn proc_value_str(v: &ProcValue) -> String {
 }
 
 fn cmd_run(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["queue", "lease", "retry-delay", "limit"], &[])?;
+    let p = args::parse(argv, &["queue", "lease", "retry-delay", "limit", "wait"], &[])?;
     let [target] = &p.positional[..] else {
         return usage("queue run needs <target>");
     };
@@ -436,11 +437,31 @@ fn cmd_run(argv: &[String]) -> CliResult {
     let lease_s = p.u64_or("lease", 60)?.max(1);
     let retry_delay_s = p.u64_or("retry-delay", 1)?;
     let limit = p.u64_or("limit", 0)?;
+    // `--wait <s>`: instead of exiting at idle, park on the change doorbell
+    // for mq_task and resume when an enqueue lands (#141 S3). This is still
+    // Model A -- no daemon, no polling loop -- it just hibernates in the
+    // kernel between batches rather than in the process table between cron
+    // ticks. Absent, the drain-and-exit behaviour is unchanged.
+    let wait_s = p.value("wait").map(|_| p.u64_or("wait", 0)).transpose()?;
     let pid = i64::from(std::process::id());
 
     let db = crate::util::open_target(target)?;
     ensure_table(&db)?;
     let engine = ProcEngine::new(&db);
+
+    // Positioned BEFORE the first drain, so an enqueue that lands while this
+    // batch is running is already recorded and the following park returns at
+    // once instead of sleeping through work that is sitting right there.
+    let mut doorbell = wait_s.map(|_| {
+        let id = db
+            .schema()
+            .schema
+            .tables
+            .iter()
+            .position(|t| t.name == "mq_task")
+            .map(|i| i as u32);
+        id.map(|i| db.listen(&[i]))
+    });
 
     let mut ran = 0u64;
     // Drain-and-exit: claim while due work exists; when the queue looks idle,
@@ -459,7 +480,18 @@ fn cmd_run(argv: &[String]) -> CliResult {
             if reclaimed > 0 {
                 continue;
             }
-            break;
+            // Idle. With --wait, sleep on the doorbell and go round again if
+            // anything touched the table; without it, exit (hibernate).
+            match doorbell.as_mut().and_then(|d| d.as_mut()) {
+                Some(l) => {
+                    let secs = wait_s.unwrap_or(0);
+                    if !l.wait(std::time::Duration::from_secs(secs)).is_empty() {
+                        continue;
+                    }
+                    break;
+                }
+                None => break,
+            }
         };
         // The claim is committed; run the proc (its body is one atomic write
         // txn of its own), then the guarded completion commit.

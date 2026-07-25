@@ -1305,6 +1305,13 @@ impl Engine {
         self.shm.notify_read(table_id)
     }
 
+    /// The notification region's incarnation stamp (#140). Generations from
+    /// two different epochs are not comparable; see [`crate::shm`]'s
+    /// `LA_NOTIFY_EPOCH` for why comparing them anyway loses a wakeup.
+    pub fn notify_epoch(&self) -> u64 {
+        self.shm.notify_epoch()
+    }
+
     /// How many listeners are parked right now. A commit reads this to decide
     /// whether the wake syscalls are worth issuing at all.
     pub fn notify_waiter_count(&self) -> u32 {

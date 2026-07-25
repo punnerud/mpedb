@@ -21,6 +21,7 @@ mod mirror_collide;
 mod powerloss;
 mod powerloss_commit;
 mod proc_cmd;
+mod listen;
 mod queue;
 mod queue_collide;
 mod render;
@@ -182,6 +183,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "call" => cmd_call(rest),
         "proc" => proc_cmd::run(rest),
         "queue" => queue::run(rest),
+        "listen" => listen::run(rest),
         "queue-collide" => queue_collide::run_parent(rest),
         "repl" => repl::run(rest),
         "blob" => blob::run(rest),
