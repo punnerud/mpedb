@@ -245,6 +245,30 @@ const LA_NOTIFY_ANY: usize = LA_NOTIFY_WAITERS + 8;
 /// only the first.
 const LA_NOTIFY_EPOCH: usize = LA_NOTIFY_ANY + 8;
 
+/// Why a guard's conflict check answered yes (#142 G1).
+///
+/// Three of these are the OPT ring's documented limits rather than a real
+/// overlap, and they are separated because the difference decides whether the
+/// ring is worth widening. A guard that mostly fails on `SnapshotTooOld` says
+/// callers think for too long; one that mostly fails on `Overlap` says the
+/// workload genuinely contends. Guessing which without counting is how a
+/// format change gets built for nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuardVerdict {
+    /// No conflict.
+    #[default]
+    Clear,
+    /// A committed txn in the window wrote a table in the guarded surface.
+    /// This is the only verdict that is an actual conflict.
+    Overlap,
+    /// The snapshot is older than the ring can witness (> `OPT_RING_SLOTS`
+    /// commits ago), so the question is unanswerable and answered safely.
+    SnapshotTooOld,
+    /// A ring slot did not hold the txn id it should — overwritten, or written
+    /// by a process whose commits we cannot see. Conservative.
+    RingGap,
+}
+
 const INIT_READY: u32 = 2;
 const INIT_FORMATTING: u32 = 1;
 
@@ -2667,6 +2691,58 @@ impl Shm {
                         return true;
                     }
                 }
+            }
+        }
+        false
+    }
+
+    /// *Writer-lock holder.* [`Self::opt_conflict`] for a SET of tables at once
+    /// (#142 G1): did any commit in `(snap_txn, current_txn]` write a table in
+    /// `table_bits`?
+    ///
+    /// This is the guard's whole engine. It is deliberately a single walk of
+    /// the ring for the entire surface rather than one walk per table — a
+    /// guarded action names the union of its statements' footprints, so the
+    /// per-table loop would re-read the same 64 entries once per table for no
+    /// new information.
+    ///
+    /// No key refinement: a POINT commit is treated as touching its table.
+    /// Refining it would need the guard to carry a key per table, and the
+    /// surface a multi-statement action names is a set of tables, not a set of
+    /// keys. Coarse in the safe direction — a false conflict costs a retry.
+    ///
+    /// `why` receives the reason when the answer is a conservative yes, so the
+    /// caller can count how often each of the ring's three limits actually
+    /// bites instead of guessing (`GuardStats`).
+    pub fn opt_conflict_set(
+        &self,
+        snap_txn: u64,
+        current_txn: u64,
+        table_bits: u64,
+        why: &mut GuardVerdict,
+    ) -> bool {
+        if current_txn <= snap_txn {
+            return false; // nothing committed since our snapshot
+        }
+        if current_txn - snap_txn > OPT_RING_SLOTS {
+            // The caller thought for longer than the ring can witness. Not a
+            // real conflict — an unanswerable question, answered safely.
+            *why = GuardVerdict::SnapshotTooOld;
+            return true;
+        }
+        for t in (snap_txn + 1)..=current_txn {
+            if self.opt_field(t, OFP_TXN).load(Ordering::Acquire) != t {
+                *why = GuardVerdict::RingGap;
+                return true; // gap / overwritten / foreign writer: conservative
+            }
+            let kind = self.opt_field(t, OFP_KIND).load(Ordering::Relaxed);
+            if kind == OFP_KIND_EMPTY {
+                continue; // catalog/sys only — touched no user table
+            }
+            let tbits = self.opt_field(t, OFP_TBITS).load(Ordering::Relaxed);
+            if tbits & table_bits != 0 {
+                *why = GuardVerdict::Overlap;
+                return true;
             }
         }
         false

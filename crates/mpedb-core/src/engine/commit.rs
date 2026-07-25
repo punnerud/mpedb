@@ -70,6 +70,29 @@ impl<'e> WriteTxn<'e> {
     }
 
     fn commit_inner<F: FnOnce()>(mut self, after_flip: F) -> Result<()> {
+        // 0. The optimistic guard (#142 G1), FIRST — before a single page is
+        //    written back.
+        //
+        // Placement is the whole design. We are already under the writer lock
+        // and no other commit can interleave, so the check is atomic with the
+        // commit without introducing any lock of its own: that is what lets a
+        // guarded action be serializable on its surface while Postgres needs a
+        // cluster-global lock to say the same thing (design/PG-NOTIFY-ANATOMY.md).
+        //
+        // First also means CHEAP to refuse: a conflicting txn does no catalog
+        // writeback and no freelist fixpoint, it just aborts. Retrying is the
+        // expected outcome, not the exceptional one, so it must not be
+        // expensive.
+        if let Some((snap_txn, surface)) = self.guard_state() {
+            let mut why = crate::shm::GuardVerdict::Clear;
+            if self.eng.shm.opt_conflict_set(snap_txn, self.meta.txn_id, surface, &mut why) {
+                self.eng.guard_stats.record(why);
+                self.abort();
+                return Err(Error::WriteConflict);
+            }
+            self.eng.guard_stats.record(crate::shm::GuardVerdict::Clear);
+        }
+
         let new_txn = self.meta.txn_id + 1;
 
         // 1. write back catalog entries (may COW catalog pages → more frees)
@@ -408,7 +431,20 @@ impl<'e> WriteTxn<'e> {
         // under the writer lock). Every commit records — data writes as POINT
         // or TABLE, catalog/sys-only commits as EMPTY — so an optimistic
         // validator never sees a spurious gap for a same-mode committer.
-        if self.eng.concurrency == Concurrency::Optimistic {
+        // **Unconditional since #142 G1.** This used to run only under
+        // `Concurrency::Optimistic`, because the optimistic validator was the
+        // ring's only reader and a same-mode committer was the only thing it
+        // had to see. The shard guard is a second reader, and it exists
+        // whatever the concurrency setting is — so a ring populated only in one
+        // mode made `opt_conflict_set` report a gap for every ordinary commit
+        // and refuse every guarded action. Conservative, and useless: the guard
+        // behaved exactly like the global lock it exists to avoid.
+        //
+        // Recording is four atomic stores under the writer lock we already
+        // hold, and recording MORE can only make the history more accurate —
+        // it removes spurious gaps and can never invent a conflict that did not
+        // happen.
+        {
             use crate::shm::{OFP_KIND_EMPTY, OFP_KIND_POINT, OFP_KIND_TABLE};
             // The OFP ring stays a `u64` table bitmap even though footprints are
             // now sparse (DESIGN-TABLE-CAP §5): the `& 63` fold aliases tables

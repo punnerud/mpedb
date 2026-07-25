@@ -1284,6 +1284,69 @@ impl Database {
         self.engine.notify_waiter_count()
     }
 
+    /// Begin a write session guarded against everything committed since
+    /// `snap` (#142 G1), with the guarded surface **declared up front** as the
+    /// union of `may_run`'s footprints.
+    ///
+    /// The statements are compiled, not executed. Listing them says *these are
+    /// the operations this action might perform* — any number of INSERTs,
+    /// UPDATEs and DELETEs across any number of tables — and the guard then
+    /// covers exactly their union and nothing more. That is what makes the
+    /// lock the smallest one that still covers the action.
+    ///
+    /// Declaring up front rather than growing as statements run matters for
+    /// three reasons:
+    ///
+    /// 1. **Stability.** A branch not taken would otherwise shrink the surface,
+    ///    so two workers running the same logical action would guard different
+    ///    things. A shard needs an identity that does not depend on which way
+    ///    an `if` went — which is also what #142 G2's lease and G3's queue
+    ///    dispatch key on.
+    /// 2. **Minimality.** The alternative to declaring is guarding a whole
+    ///    table set, or everything. Here you pay for precisely the statements
+    ///    you might issue.
+    /// 3. **It is nearly free.** Compilation is content-hash cached, so
+    ///    declaring the same action repeatedly costs a lookup, not a compile.
+    ///
+    /// Execution still widens (see `WriteSession::query`): declaring wrong
+    /// makes the guard bigger, never wrong.
+    pub fn begin_guarded_for(&self, snap: u64, may_run: &[&str]) -> Result<WriteSession<'_>> {
+        let mut surface: Vec<u32> = Vec::new();
+        for sql in may_run {
+            let (_, fp) = self.plan_footprint(sql)?;
+            surface.extend(fp.tables_read.iter());
+            surface.extend(fp.tables_written.iter());
+        }
+        let mut s = self.begin_guarded(snap)?;
+        for t in surface {
+            s.txn.guard_widen(t);
+        }
+        Ok(s)
+    }
+
+    /// [`Database::begin_guarded_for`] with an empty declaration: the surface
+    /// starts at nothing and is built only from what actually runs. Correct,
+    /// and the right choice when the action is a fixed short sequence — but it
+    /// gives no stable shard identity before execution, so `begin_guarded_for`
+    /// is what G2/G3 build on.
+    pub fn begin_guarded(&self, snap: u64) -> Result<WriteSession<'_>> {
+        Ok(WriteSession {
+            db: self,
+            txn: self.engine.begin_write_guarded(snap)?,
+            session: Session::empty(),
+            poisoned: false,
+            savepoints: Vec::new(),
+        })
+    }
+
+    /// The newest committed txn id — the token [`Database::begin_guarded_for`]
+    /// is taken against. A listener that just woke should use
+    /// [`Listener::snapshot`] instead, which is the same value captured at the
+    /// moment it observed the change.
+    pub fn snapshot_txn(&self) -> u64 {
+        self.engine.snapshot_txn()
+    }
+
     /// A resumable [`Listener`] over `tables`, positioned at the present:
     /// only changes committed AFTER this call are reported (#141 S3).
     pub fn listen(&self, tables: &[u32]) -> Listener<'_> {
@@ -1295,6 +1358,7 @@ impl Database {
     pub fn listen_keyed(&self, tables: &[u32], keys: &[Option<Vec<Value>>]) -> Listener<'_> {
         let mut l = Listener {
             db: self,
+            snap_txn: 0,
             tables: tables.to_vec(),
             keys: keys.to_vec(),
             epoch: 0,
@@ -2973,6 +3037,11 @@ impl WriteSession<'_> {
         // collapse-on-conflicting-keys rule earns its keep — and the path a
         // ring-only wiring would have missed entirely.
         ring_exec::hint_notify_keys(&mut self.txn, plan, &full);
+        // Guard safety net (#142 G1): a statement that reaches outside the
+        // declared surface widens it rather than escaping it. Declaring is how
+        // you get a SMALL guard; this is what stops a wrong declaration from
+        // becoming a wrong answer.
+        ring_exec::widen_guard(&mut self.txn, plan);
         let triggers = self.db.trigger_set()?;
         // Execute against the session's OWN schema view (== the txn's captured
         // bundle), so a statement touching a table this session created/altered
@@ -3411,6 +3480,8 @@ pub struct ChangeCursor {
 /// every caller, so it belongs here once.
 pub struct Listener<'a> {
     db: &'a Database,
+    /// Committed txn id as of the last `advance()` — see [`Listener::snapshot`].
+    snap_txn: u64,
     tables: Vec<u32>,
     keys: Vec<Option<Vec<Value>>>,
     epoch: u64,
@@ -3431,6 +3502,7 @@ impl<'a> Listener<'a> {
     /// exposed because a caller that acts on a change wants to bank it.
     pub fn advance(&mut self) {
         self.epoch = self.db.notify_epoch();
+        self.snap_txn = self.db.snapshot_txn();
         for (i, &t) in self.tables.iter().enumerate() {
             if let Some((gen, _)) = self.db.change_generation(t) {
                 self.seen[i] = gen;
@@ -3460,6 +3532,17 @@ impl<'a> Listener<'a> {
 
     pub fn tables(&self) -> &[u32] {
         &self.tables
+    }
+
+    /// The txn id this listener is caught up to — the token to hand
+    /// [`Database::begin_guarded_for`] (#142 G1).
+    ///
+    /// Captured at the same moment as the generations, so acting on a wakeup
+    /// guards against exactly what the listener has NOT seen. Taking a fresh
+    /// snapshot after waking would silently include the very commit you woke
+    /// for, and guard against nothing.
+    pub fn snapshot(&self) -> u64 {
+        self.snap_txn
     }
 }
 

@@ -533,6 +533,46 @@ impl Covering {
 /// The schema plus every per-table cache derived from it, immutable as a
 /// unit (#47): transactions capture ONE `Arc<SchemaBundle>` at begin, so a
 /// txn sees one schema version even while DDL swaps the engine's current
+/// Counters for how the optimistic guard actually behaves (#142 G1/G0).
+///
+/// The three non-`Overlap` verdicts are the OPT ring's documented limits, not
+/// real contention, and the plan for widening the ring hangs on which one
+/// dominates. Counting is what turns "should we widen it?" from an argument
+/// into a measurement — the same discipline that closed #24 and #141 N4 as
+/// "measured, not worth it".
+#[derive(Debug, Default)]
+pub struct GuardStats {
+    pub cleared: std::sync::atomic::AtomicU64,
+    pub overlap: std::sync::atomic::AtomicU64,
+    pub snapshot_too_old: std::sync::atomic::AtomicU64,
+    pub ring_gap: std::sync::atomic::AtomicU64,
+}
+
+impl GuardStats {
+    pub fn record(&self, v: crate::shm::GuardVerdict) {
+        use crate::shm::GuardVerdict as G;
+        use std::sync::atomic::Ordering::Relaxed;
+        match v {
+            G::Clear => &self.cleared,
+            G::Overlap => &self.overlap,
+            G::SnapshotTooOld => &self.snapshot_too_old,
+            G::RingGap => &self.ring_gap,
+        }
+        .fetch_add(1, Relaxed);
+    }
+
+    /// `(cleared, overlap, snapshot_too_old, ring_gap)`.
+    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.cleared.load(Relaxed),
+            self.overlap.load(Relaxed),
+            self.snapshot_too_old.load(Relaxed),
+            self.ring_gap.load(Relaxed),
+        )
+    }
+}
+
 /// bundle underneath. `TableDef.indexes` is the single derivation source.
 pub struct SchemaBundle {
     /// The meta `schema_gen` this bundle was loaded at — compared against
@@ -706,6 +746,9 @@ impl SchemaBundle {
 
 pub struct Engine {
     shm: Arc<Shm>,
+    /// How the optimistic guard has fared on this handle (#142 G1). Process
+    /// local and monotone; read via [`Engine::guard_stats`].
+    guard_stats: GuardStats,
     /// The CURRENT schema bundle. Swapped whole by DDL / staleness reload;
     /// read paths clone the Arc once per transaction, never per operation.
     bundle: std::sync::RwLock<Arc<SchemaBundle>>,
@@ -772,6 +815,7 @@ impl Engine {
         let flusher = (config.options.durability == Durability::Async)
             .then(|| spawn_flusher(shm.clone()));
         let engine = Engine {
+            guard_stats: GuardStats::default(),
             shm,
             bundle: std::sync::RwLock::new(Arc::new(SchemaBundle::new(schema, checks))),
             concurrency: config.options.concurrency,
@@ -970,6 +1014,7 @@ impl Engine {
         let _ = sec_indexes; // derived inside SchemaBundle::new
         let checks = vec![Vec::new(); schema.tables.len()];
         Ok(Engine {
+            guard_stats: GuardStats::default(),
             shm: Arc::new(shm),
             bundle: std::sync::RwLock::new(Arc::new(SchemaBundle::new(schema, checks))),
             concurrency: Concurrency::Serial,
@@ -1516,6 +1561,31 @@ impl Engine {
         self.make_write_txn(recovered)
     }
 
+    /// [`Self::begin_write`], guarded against anything committed since
+    /// `snap_txn` (#142 G1).
+    ///
+    /// The surface starts EMPTY and grows as statements run: an action that
+    /// touches nothing conflicts with nothing. That is the shard property —
+    /// two guarded actions on disjoint tables both commit, which a global lock
+    /// could never allow, and it is the assertion that distinguishes this from
+    /// serializing every writer.
+    pub fn begin_write_guarded(&self, snap_txn: u64) -> Result<WriteTxn<'_>> {
+        let mut txn = self.begin_write()?;
+        txn.guard = Some(crate::engine::write::Guard { snap_txn, surface: 0 });
+        Ok(txn)
+    }
+
+    /// How the optimistic guard has fared: `(cleared, overlap,
+    /// snapshot_too_old, ring_gap)` (#142 G1).
+    pub fn guard_stats(&self) -> (u64, u64, u64, u64) {
+        self.guard_stats.snapshot()
+    }
+
+    /// The newest committed txn id — the token a guard is taken against.
+    pub fn snapshot_txn(&self) -> u64 {
+        self.shm.newest_meta().map(|m| m.txn_id).unwrap_or(0)
+    }
+
     fn make_write_txn(&self, recovered: bool) -> Result<WriteTxn<'_>> {
         let meta = match self.shm.newest_meta() {
             Ok(m) => m,
@@ -1576,6 +1646,7 @@ impl Engine {
             mutated_tables: std::collections::BTreeSet::new(),
             colwm_cache: HashMap::new(),
             commit_point: None,
+            guard: None,
             notify_keys: std::collections::HashMap::new(),
             capture_enabled: true,
             capture_cfg: None,

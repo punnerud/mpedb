@@ -51,6 +51,30 @@ impl Hasher for PageIdHasher {
     }
 }
 
+/// An optimistic guard on a write transaction (#142 G1).
+///
+/// The contract in one line: **this transaction commits only if nothing in
+/// `surface` was written by a commit after `snap_txn`.** Otherwise
+/// `Error::WriteConflict`, and the caller re-reads and retries.
+///
+/// It is not a lock. Nothing is held, nothing must be released, and a
+/// SIGKILLed holder costs exactly nothing — a process that died simply did not
+/// commit. In an engine whose premise is that processes may be killed at any
+/// instant, that is worth more than mutual exclusion, and it is why the task
+/// queue's claim was already written this way (`queue.rs`'s guarded UPDATE).
+///
+/// What it does NOT provide is exclusivity of the WORK: two actors may both
+/// compute, and only one commits. Where the work has external side effects
+/// that cannot run twice, a lease is required instead (#142 G2).
+#[derive(Debug, Clone, Copy)]
+pub struct Guard {
+    pub snap_txn: u64,
+    /// Union of every statement's footprint, folded `& 63` to match the OPT
+    /// ring. Folding costs false conflicts (table 7 aliases 71), never a
+    /// missed one — the same trade the ring already makes.
+    pub surface: u64,
+}
+
 pub struct WriteTxn<'e> {
     pub(super) eng: &'e Engine,
     /// Schema view captured at begin (#47). For writers this always equals
@@ -157,6 +181,15 @@ pub struct WriteTxn<'e> {
     /// (table, key_hash) point footprint at commit instead of a table-level
     /// one. `None` for every other path.
     pub(super) commit_point: Option<(u32, u64)>,
+    /// The optimistic guard (#142 G1), when this txn was begun guarded.
+    ///
+    /// `snap_txn` is what the caller had observed; `surface` is the union of
+    /// every statement's footprint run through the session, folded to the same
+    /// `& 63` bitmap the OPT ring records — READS included, because the SELECT
+    /// that decided is as much a part of the action as the INSERT that acted.
+    /// Validated once in `commit_inner`, under the writer lock, before the
+    /// meta flip.
+    pub(super) guard: Option<Guard>,
     /// Per-table key REGION for change notification (#139 S2, widened by
     /// #141 N2): the common `keycode` byte prefix of every key this
     /// transaction is known to have touched in that table. `None` means
@@ -339,6 +372,23 @@ impl<'e> WriteTxn<'e> {
     /// Narrowing is never allowed: the region only ever grows (prefix only
     /// ever shortens), because a hint that named just the last writer's key
     /// would let the earlier one's listener sleep through its own change.
+    /// Widen the guarded surface by one statement's footprint (#142 G1).
+    /// A no-op on an unguarded txn, so the query path can call it blindly.
+    ///
+    /// Surfaces only ever GROW. A guard that could narrow would let a later
+    /// statement drop the table an earlier one read, and the read is exactly
+    /// what a lost update would invalidate.
+    pub fn guard_widen(&mut self, table_id: u32) {
+        if let Some(g) = self.guard.as_mut() {
+            g.surface |= 1u64 << (table_id & 63);
+        }
+    }
+
+    /// The guard's snapshot and accumulated surface, for the commit path.
+    pub fn guard_state(&self) -> Option<(u64, u64)> {
+        self.guard.as_ref().map(|g| (g.snap_txn, g.surface))
+    }
+
     pub fn hint_notify_key(&mut self, table_id: u32, region: Option<&[u8]>) {
         let slot = self.notify_keys.entry(table_id).or_insert_with(|| region.map(|r| r.to_vec()));
         let (Some(have), Some(add)) = (slot.as_mut(), region) else {

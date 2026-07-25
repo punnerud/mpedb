@@ -307,6 +307,26 @@ fn locality_key(p: &PreparedIntent) -> SortKey {
 /// statement 1 rewrites the whole table and statement 2 touches key K would
 /// then advertise K, and a listener watching a different key would sleep
 /// through statement 1.
+/// Widen an open guard by this statement's whole footprint (#142 G1).
+///
+/// READS are included, and that is the point rather than an oversight: the
+/// SELECT that decided what to write is as much a part of a guarded action as
+/// the INSERT that acted on it. Guarding only the writes would let another
+/// commit change the row you based the decision on and still let you through —
+/// a lost update wearing a guard.
+///
+/// Called from the same place as `hint_notify_keys`, because both want exactly
+/// what has already been resolved here: the plan's footprint against these
+/// params.
+pub(crate) fn widen_guard(txn: &mut WriteTxn<'_>, plan: &CompiledPlan) {
+    for t in plan.footprint.tables_read.iter() {
+        txn.guard_widen(t);
+    }
+    for t in plan.footprint.tables_written.iter() {
+        txn.guard_widen(t);
+    }
+}
+
 pub(crate) fn hint_notify_keys(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, params: &[Value]) {
     let written: Vec<u32> = plan.footprint.tables_written.iter().collect();
     // A key names one table's key space. With several written tables there is
