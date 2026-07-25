@@ -5,6 +5,15 @@ machine, same workloads, same measurement loop. This page is the curated
 cross-machine comparison; each machine's full generated tables (every cell, both
 durability classes, all latency percentiles) live in its own file.
 
+## Change notification (LISTEN/NOTIFY class)
+
+Measured separately in [NOTIFY-BENCH.md](NOTIFY-BENCH.md), because it is a
+paired A/B instrument with its own controls rather than a matrix cell. Headline:
+PostgreSQL's `NOTIFY` costs ~50 % of write throughput under 4 concurrent
+writers (its commit lock is global), mpedb's costs nothing at any concurrency
+measured, and notification latency differs by 22-64x. Run it with
+`mpedb-bench --notify`.
+
 ## Machines measured
 
 | machine | engines | full results |
