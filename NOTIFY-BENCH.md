@@ -36,7 +36,8 @@ Four arms, each run against both engines, `ROWS = 3000`:
 | **A** | one row per transaction, notify per commit |
 | **B** | 100 rows per transaction, one notify at the end (DBOS's workaround) |
 | **C** | **4 concurrent writers**, one row per transaction, notify per commit |
-| *ctl* | every arm has a control that does the identical work with **no notification at all** |
+| **D** | one writer, **1 / 10 / 100 listeners** — the fan-out axis |
+| *ctl* | arms A–C have a control that does the identical work with **no notification at all** |
 
 The controls are the point. Without them, an arm-A number cannot be attributed
 — it could be the notify lock, or it could be plain fsync — and the whole
@@ -50,69 +51,96 @@ this benchmark, and I walked into it again on the first run of this cell.
 
 ## Results
 
-### Linux (dev box, /mnt/xfs)
+### Linux (dev box, /mnt/xfs — **2 cores**)
 
 | engine | arm | writes/s | notify cost | lat p50 | lat p99 |
 |---|---|---:|---:|---:|---:|
-| mpedb | A no listener *(ctl)* | 339 | — | | |
-| mpedb | A per-commit | 360 | **none** | 38 µs | 1080 µs |
-| mpedb | B no listener *(ctl)* | 17222 | — | | |
-| mpedb | B batched | 22235 | **none** | 3 µs | 2201 µs |
-| mpedb | A, page-publish mode | 37 | | 48 µs | 1466 µs |
-| mpedb | **C conc no listener** *(ctl)* | 870 | — | | |
-| mpedb | **C concurrent** | **922** | **none** | | |
-| postgres | A no notify *(ctl)* | 315 | — | | |
-| postgres | A per-commit | 300 | 5 % | 2433 µs | 6879 µs |
-| postgres | B no notify *(ctl)* | 6199 | — | | |
-| postgres | B batched | 6128 | 1 % | 2969 µs | 5839 µs |
-| postgres | **C conc no notify** *(ctl)* | 783 | — | | |
-| postgres | **C concurrent** | **408** | **48 %** | | |
+| mpedb | A no listener *(ctl)* | 395 | — | | |
+| mpedb | A per-commit | 392 | **none** | 36 µs | 1004 µs |
+| mpedb | B no listener *(ctl)* | 18371 | — | | |
+| mpedb | B batched | 18753 | **none** | 39 µs | 93 µs |
+| mpedb | A, page-publish mode | 38 | | 46 µs | 966 µs |
+| mpedb | C conc no listener *(ctl)* | 866 | — | | |
+| mpedb | **C concurrent** | **894** | **none** | | |
+| mpedb | D 1 listener | 383 | | | |
+| mpedb | D 10 listeners | 369 | | | |
+| mpedb | D 100 listeners | 285 | | | |
+| postgres | A no notify *(ctl)* | 341 | — | | |
+| postgres | A per-commit | 314 | 8 % | 2397 µs | 7068 µs |
+| postgres | B no notify *(ctl)* | 5780 | — | | |
+| postgres | B batched | 5693 | 2 % | 3140 µs | 16136 µs |
+| postgres | C conc no notify *(ctl)* | 863 | — | | |
+| postgres | **C concurrent** | **347** | **60 %** | | |
+| postgres | D 1 listener | 303 | | | |
+| postgres | D 10 listeners | 268 | | | |
+| postgres | D 100 listeners | 217 | | | |
 
-### macOS (M3, /tmp)
+### macOS (M3, /tmp — **11 cores**)
 
 | engine | arm | writes/s | notify cost | lat p50 | lat p99 |
 |---|---|---:|---:|---:|---:|
-| mpedb | A no listener *(ctl)* | 313 | — | | |
-| mpedb | A per-commit | 391 | **none** | 160 µs | 312 µs |
-| mpedb | B no listener *(ctl)* | 19269 | — | | |
-| mpedb | B batched | 18856 | 2 % | 123 µs | 284 µs |
-| mpedb | A, page-publish mode | 231 | | 164 µs | 371 µs |
-| mpedb | **C conc no listener** *(ctl)* | 895 | — | | |
-| mpedb | **C concurrent** | **810** | 10 % | | |
-| postgres | A no notify *(ctl)* | 269 | — | | |
-| postgres | A per-commit | 261 | 3 % | 3562 µs | 5184 µs |
-| postgres | B no notify *(ctl)* | 10039 | — | | |
-| postgres | B batched | 10316 | none | 3391 µs | 3892 µs |
-| postgres | **C conc no notify** *(ctl)* | 862 | — | | |
-| postgres | **C concurrent** | **401** | **53 %** | | |
+| mpedb | A no listener *(ctl)* | 315 | — | | |
+| mpedb | A per-commit | 317 | **none** | 147 µs | 304 µs |
+| mpedb | B no listener *(ctl)* | 20472 | — | | |
+| mpedb | B batched | 22776 | **none** | 143 µs | 289 µs |
+| mpedb | A, page-publish mode | 143 | | 154 µs | 323 µs |
+| mpedb | C conc no listener *(ctl)* | 785 | — | | |
+| mpedb | **C concurrent** | **799** | **none** | | |
+| mpedb | **D 1 listener** | **320** | | | |
+| mpedb | **D 10 listeners** | **316** | | | |
+| mpedb | **D 100 listeners** | **333** | | | |
+| postgres | A no notify *(ctl)* | 292 | — | | |
+| postgres | A per-commit | 284 | 3 % | 3313 µs | 3920 µs |
+| postgres | B no notify *(ctl)* | 11346 | — | | |
+| postgres | B batched | 10229 | 10 % | 3168 µs | 3994 µs |
+| postgres | C conc no notify *(ctl)* | 661 | — | | |
+| postgres | **C concurrent** | **329** | **50 %** | | |
+| postgres | **D 1 listener** | **289** | | | |
+| postgres | **D 10 listeners** | **280** | | | |
+| postgres | **D 100 listeners** | **211** | **27 %** | | |
 
 ## What the numbers say
 
 **1. A global lock needs contention to be visible, and the single-writer arms
-do not have it.** With one writer, PostgreSQL's `NOTIFY` costs 3–5 %. That is
+do not have it.** With one writer, PostgreSQL's `NOTIFY` costs 3–8 %. That is
 worth stating plainly because the obvious mistake is to quote DBOS's 20× and
 imply a single-writer cell reproduces it. It does not. Their workload had
-concurrent streams; arm C is what adds them.
+concurrent streams; arms C and D are what add them.
 
-**2. With four writers, PostgreSQL's notify costs about half its throughput**
-— 783 → 408 on Linux (48 %), 862 → 401 on the M3 (53 %). Same commits, same
-durability, the only difference being whether they notify. That is the
-database-0 lock, reproduced: four writers, one lock, held across each other's
-fsyncs.
+**2. With four writers, PostgreSQL's notify costs half its throughput** — 863 →
+347 on Linux (60 %), 661 → 329 on the M3 (50 %). Same commits, same durability,
+the only difference being whether they notify. That is the database-0 lock,
+reproduced: four writers, one lock, held across each other's fsyncs.
 
-**3. mpedb's notification costs nothing, at either concurrency.** 870 → 922 on
-Linux and 895 → 810 on the M3 straddle zero, which is what a counter bumped
+**3. mpedb's notification costs nothing, at either concurrency.** 866 → 894 on
+Linux and 785 → 799 on the M3 straddle zero, which is what a counter bumped
 under a lock the writer already holds should look like. There is no arm where
 mpedb has to choose between notifying and performing, which is the choice DBOS
 had to engineer around.
 
-**4. Latency differs by more than an order of magnitude**: 38 µs vs 2433 µs on
-Linux (64×), 160 µs vs 3562 µs on the M3 (22×). No queue, no server round trip
+**4. Fan-out (arm D) separates the engines — but only on a machine with cores
+to spare, and that caveat is the finding's own footnote.** On the 11-core M3,
+mpedb is **flat** across 1 / 10 / 100 listeners (320 → 316 → 333) while
+PostgreSQL falls 27 % (289 → 280 → 211). That is `SignalBackends`' walk over
+every listener in the cluster, under an exclusive `NotifyQueueLock`, against
+one `futex_wake_all` that costs the same whatever is parked on the word.
+
+On the **2-core** Linux box both engines fall about the same (mpedb 383 → 285,
+PostgreSQL 303 → 217). That measurement says nothing about either design: 100
+listener threads on 2 cores is scheduler oversubscription, and it hits both.
+I predicted a flat mpedb line there and did not get one; the M3 is what shows
+the prediction was right about the mechanism and wrong about the hardware.
+
+Delivery was exact on both engines and both machines — 1.00 wakeups per
+listener per commit, no amplification.
+
+**5. Latency differs by more than an order of magnitude**: 36 µs vs 2397 µs on
+Linux (67×), 147 µs vs 3313 µs on the M3 (23×). No queue, no server round trip
 — a futex wake on shared memory, and the listener reads the table itself.
 
-**5. The macOS floor is real and is a platform fact.** 160 µs against Linux's
-38 µs is `futex_wake_all` being a documented no-op off Linux, so the listener
-polls at ~200 µs granularity. It is still 22× under PostgreSQL, but it is not
+**6. The macOS floor is real and is a platform fact.** 147 µs against Linux's
+36 µs is `futex_wake_all` being a documented no-op off Linux, so the listener
+polls at ~200 µs granularity. It is still 23× under PostgreSQL, but it is not
 the design's number — it is the platform's.
 
 ## What this does not measure
@@ -122,10 +150,16 @@ the design's number — it is the platform's.
   production, not better; mpedb's model has no network to add.
 - **Four writers is a small contention arm.** The trend direction is clear at
   1 vs 4; where PostgreSQL's curve goes at 16 or 64 is unmeasured.
+- **Arm D is fan-out, not slot collision.** Every listener watches the written
+  table, so all 100 wakeups per commit are legitimate. What it establishes is
+  that a wakeup is free at 100× on adequate hardware — which is why #141 N4
+  (a cost-model-chosen table→slot assignment, to remove *false* wakeups) closes
+  as "measured, not worth it": you cannot save anything by removing a fraction
+  of a cost that is already zero.
 - **No payload delivery.** mpedb notifications carry "table T moved to
   generation G", not the row. A consumer that needs the data reads it from its
   own snapshot. Comparing that to a queue that ships bytes is comparing two
   contracts, and the contracts are different on purpose.
 - **Single runs, not medians of repeated trials.** The per-arm numbers move a
-  few percent between runs; the 48 %/53 % contention result and the ~20-60×
-  latency gap are far outside that, the single-writer 3-5 % readings are not.
+  few percent between runs; the 50–60 % contention result and the ~20–70×
+  latency gap are far outside that, the single-writer 3–8 % readings are not.
