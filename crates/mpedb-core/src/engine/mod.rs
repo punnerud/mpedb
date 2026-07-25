@@ -1331,7 +1331,27 @@ impl Engine {
         seen: &[u64],
         timeout: std::time::Duration,
     ) -> Vec<u32> {
+        self.wait_for_change_keyed(tables, seen, &vec![None; tables.len()], timeout)
+    }
+
+    /// [`Self::wait_for_change`], filtered by key (#141 N2).
+    ///
+    /// `keys[i]` is the encoded key this listener cares about in `tables[i]`,
+    /// or `None` to take every change to that table. A change is skipped only
+    /// when the commit ADVERTISED a region (a nonzero fingerprint) and the
+    /// listener's key lies outside it — a decidable "not yours". Everything
+    /// else wakes: an unadvertised region, an unresolvable one, a batch whose
+    /// writes shared no prefix. The filter may cost a spurious wakeup and may
+    /// never cost a missed one.
+    pub fn wait_for_change_keyed(
+        &self,
+        tables: &[u32],
+        seen: &[u64],
+        keys: &[Option<&[u8]>],
+        timeout: std::time::Duration,
+    ) -> Vec<u32> {
         debug_assert_eq!(tables.len(), seen.len());
+        debug_assert_eq!(tables.len(), keys.len());
         let deadline = std::time::Instant::now() + timeout;
         // Announce before the first look. Announcing after would open the
         // window this whole protocol exists to close: a commit that lands
@@ -1345,12 +1365,26 @@ impl Engine {
             // below would then sleep through a change that already happened.
             // Sampling first turns that same interleaving into an immediate
             // return, because the word no longer matches.
-            let word = self.shm.notify_seq(tables[0]);
+            //
+            // Which word depends on arity. One table: its own slot word, so
+            // the park is exact and only that table's writes can wake us.
+            // Several: the "any table" word, because a futex waits on one word
+            // and parking on `tables[0]`'s would let the others go unnoticed
+            // until the timeout (#141 N3). The generation re-check below is
+            // unchanged either way, so the extra wakeups cost a loop and
+            // nothing else.
+            let word = if tables.len() == 1 {
+                self.shm.notify_seq(tables[0])
+            } else {
+                self.shm.notify_any_seq()
+            };
             let expect = word.load(std::sync::atomic::Ordering::Acquire);
             let mut changed = Vec::new();
             for (i, &t) in tables.iter().enumerate() {
-                if let Some((gen, _)) = self.shm.notify_read(t) {
-                    if gen > seen[i] {
+                if let Some((gen, published)) = self.shm.notify_read(t) {
+                    if gen > seen[i]
+                        && keys[i].is_none_or(|k| Shm::fingerprint_matches(published, k))
+                    {
                         changed.push(t);
                     }
                 }
@@ -1362,12 +1396,6 @@ impl Engine {
             if now >= deadline {
                 break Vec::new();
             }
-            // One word can be waited on at a time, so a multi-table listener
-            // parks on the first table's and re-checks them all on return.
-            // Watching several tables whose slots differ therefore relies on
-            // the timeout to bound how long the others go unlooked-at; the
-            // common case (#139: 82k of 94k corpus statements touch one table)
-            // is a single table, where the park is exact.
             crate::os::futex_wait(word, expect, deadline - now);
         };
         self.shm.notify_waiters().fetch_sub(1, std::sync::atomic::Ordering::AcqRel);

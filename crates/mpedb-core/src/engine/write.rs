@@ -157,11 +157,11 @@ pub struct WriteTxn<'e> {
     /// (table, key_hash) point footprint at commit instead of a table-level
     /// one. `None` for every other path.
     pub(super) commit_point: Option<(u32, u64)>,
-    /// Per-table key digest for change notification (#139 S2), when this
-    /// transaction touched exactly ONE key in that table. `Some(0)` means
-    /// "several keys, or an unknown one" — a listener filtering on a key must
-    /// treat 0 as "could be yours" and look.
-    pub(super) notify_keys: std::collections::HashMap<u32, u64>,
+    /// Per-table key REGION for change notification (#139 S2, widened by
+    /// #141 N2): the common `keycode` byte prefix of every key this
+    /// transaction is known to have touched in that table. `None` means
+    /// "unknown" — a listener filtering on a key must then look.
+    pub(super) notify_keys: std::collections::HashMap<u32, Option<Vec<u8>>>,
     /// CDC dirty-set capture is on for this txn (default). The replication
     /// plane (mirror applier/importer) turns it OFF via [`WriteTxn::set_capture`]
     /// so its own writes are not self-captured (DESIGN-MIRROR §3.8). Transient:
@@ -323,25 +323,35 @@ impl<'e> WriteTxn<'e> {
         self.commit_point = Some((table_id, key_hash));
     }
 
-    /// Hint that this transaction's change to `table_id` is confined to the
-    /// key hashing to `digest`, so a listener watching a different key can
-    /// skip the wakeup (#139 S2).
+    /// Hint that this transaction's change to `table_id` is confined to keys
+    /// under the `keycode` prefix `region`, so a listener watching a key
+    /// outside it can skip the wakeup (#139 S2). `None` = unknown.
     ///
-    /// A batch commit runs many statements: if two of them name DIFFERENT keys
-    /// in the same table, the transaction as a whole is no longer confined to
-    /// either, and the digest collapses to 0 — "somewhere in this table". A
-    /// digest that named only the last writer's key would let a listener sleep
-    /// through the other one, which is the one failure mode this whole feature
-    /// may not have.
-    pub fn hint_notify_key(&mut self, table_id: u32, digest: u64) {
-        self.notify_keys
-            .entry(table_id)
-            .and_modify(|d| {
-                if *d != digest {
-                    *d = 0;
-                }
-            })
-            .or_insert(digest);
+    /// A batch commit runs many statements, and the transaction as a whole is
+    /// confined to whatever region contains ALL of them — the **common
+    /// prefix**. S2 collapsed straight to "unknown" whenever two statements
+    /// disagreed; keeping the common prefix instead is strictly sharper and
+    /// just as safe, because a key outside the shared prefix is outside every
+    /// contributing region by construction. Two INSERTs at `id = 11` and
+    /// `id = 22` still share the encoding's leading bytes, so a listener on a
+    /// far-away key keeps its filter instead of losing it to the batch.
+    ///
+    /// Narrowing is never allowed: the region only ever grows (prefix only
+    /// ever shortens), because a hint that named just the last writer's key
+    /// would let the earlier one's listener sleep through its own change.
+    pub fn hint_notify_key(&mut self, table_id: u32, region: Option<&[u8]>) {
+        let slot = self.notify_keys.entry(table_id).or_insert_with(|| region.map(|r| r.to_vec()));
+        let (Some(have), Some(add)) = (slot.as_mut(), region) else {
+            // Either side unknown ⇒ the union is unknown.
+            *slot = None;
+            return;
+        };
+        let common = have.iter().zip(add).take_while(|(a, b)| a == b).count();
+        if common == 0 {
+            *slot = None;
+        } else {
+            have.truncate(common);
+        }
     }
 
     /// Blind INSERT of a pre-validated, pre-encoded row (optimistic apply).

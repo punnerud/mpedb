@@ -311,18 +311,37 @@ pub(crate) fn hint_notify_keys(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, para
     let written: Vec<u32> = plan.footprint.tables_written.iter().collect();
     // A key names one table's key space. With several written tables there is
     // no single key space for it to name.
-    let digest = if written.len() == 1 {
+    let region: Option<Vec<u8>> = if written.len() == 1 {
         match &plan.footprint.key_access {
-            KeyAccess::Point(parts) => {
-                resolve_key_bytes(parts, plan, params).map(|b| key_hash(&b)).unwrap_or(0)
+            // A point is its own region: the whole key.
+            KeyAccess::Point(parts) => resolve_key_bytes(parts, plan, params),
+            // #141 N2: a bounded range names a region too, and the footprint
+            // has known it all along — S2 threw it away and published
+            // "somewhere in this table" for every range write.
+            //
+            // `keycode` is memcmp-ordered, so every key between `lo` and `hi`
+            // shares their common byte prefix. Inclusivity does not matter:
+            // excluding an endpoint only removes keys from a region that still
+            // contains all the rest, and the region is allowed to be wider
+            // than the truth — never narrower.
+            KeyAccess::Range { lo: Some(lo), hi: Some(hi) } => {
+                match (resolve_key_bytes(&lo.parts, plan, params), resolve_key_bytes(&hi.parts, plan, params)) {
+                    (Some(l), Some(h)) => {
+                        let n = l.iter().zip(&h).take_while(|(a, b)| a == b).count();
+                        (n > 0).then(|| l[..n].to_vec())
+                    }
+                    _ => None,
+                }
             }
-            _ => 0,
+            // Half-open below or above: unbounded on one side, so no prefix
+            // bounds it. Unknown is the honest answer.
+            _ => None,
         }
     } else {
-        0
+        None
     };
     for t in written {
-        txn.hint_notify_key(t, digest);
+        txn.hint_notify_key(t, region.as_deref());
     }
 }
 

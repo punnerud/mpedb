@@ -467,15 +467,24 @@ impl<'e> WriteTxn<'e> {
         if !mutated.is_empty() {
             for &tid in &mutated {
                 // 0 = "somewhere in this table": the honest answer whenever the
-                // statement's key was not a single resolvable point, or when a
-                // batch touched more than one key here.
-                let key = self.notify_keys.get(&tid).copied().unwrap_or(0);
+                // statement's keys were not resolvable, or when a batch's
+                // writes here share no common prefix at all.
+                let key = self
+                    .notify_keys
+                    .get(&tid)
+                    .and_then(|r| r.as_deref())
+                    .map(Shm::key_fingerprint)
+                    .unwrap_or(0);
                 self.eng.shm.notify_publish(tid, key);
             }
             if self.eng.shm.notify_waiters().load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 for &tid in &mutated {
                     self.eng.shm.notify_wake(tid);
                 }
+                // Once, not per table: multi-table listeners all park on the
+                // one "any" word, so a single wake releases every one of them
+                // (#141 N3).
+                self.eng.shm.notify_wake_any();
             }
         }
 

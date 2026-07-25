@@ -4,14 +4,26 @@ Measured 2026-07-25 with `mpedb-bench --notify`, on both machines, isolated.
 The shape is DBOS's ([postgres-listen-notify-scalability](https://www.dbos.dev/blog/postgres-listen-notify-scalability)),
 because their measurement is the reason this cell exists.
 
-**Their finding.** Committing a transaction that calls `NOTIFY` takes a
-**global exclusive lock**, held from the start of commit until the transaction
-is fsync'ed. It exists so notifications can be delivered in commit order across
-every channel. They measured 2.9K writes/s that way, and 60K (20×) once
+**Their finding.** Committing a transaction that calls `NOTIFY` takes a global
+exclusive lock, held across the commit fsync, so notifications are delivered in
+commit order. They measured 2.9K writes/s that way, and 60K (20×) once
 notifications were batched off the commit path.
 
-**The question this cell answers.** mpedb makes no cross-table ordering
-promise, so it needs no such lock: the writer lock already orders commits per
+**Verified at source level** in [design/PG-NOTIFY-ANATOMY.md](design/PG-NOTIFY-ANATOMY.md),
+which is worth reading before trusting anything below. Two things it corrects:
+
+- The lock is `LockSharedObject(DatabaseRelationId, InvalidOid, 0, AccessExclusiveLock)`
+  — a heavyweight lock on "database 0", i.e. **cluster-global, not per database**,
+  and it spans the queue insert, the fsync, *and* `SignalBackends()`.
+- **Modern PostgreSQL does filter by channel.** `master` indexes listeners in a
+  dshash keyed `(database, channel)`. The claim "it can't know who cares" is
+  out of date. What remains true is sharper: its *filtering* granularity
+  (channel) and its *serialization* granularity (cluster) are decoupled, and
+  `SignalBackends` still walks **every** listener in the cluster under an
+  exclusive `NotifyQueueLock` for the direct-advance optimization.
+
+**The question this cell answers.** mpedb has no queue, so it has no ordering to
+protect and nothing to serialize: the writer lock already orders commits per
 table, and a listener reads what changed from its own MVCC snapshot instead of
 from a queued payload. Does that actually show up in a measurement?
 
@@ -84,8 +96,9 @@ concurrent streams; arm C is what adds them.
 
 **2. With four writers, PostgreSQL's notify costs about half its throughput**
 — 783 → 408 on Linux (48 %), 862 → 401 on the M3 (53 %). Same commits, same
-durability, the only difference being whether they notify. That is the global
-lock, reproduced.
+durability, the only difference being whether they notify. That is the
+database-0 lock, reproduced: four writers, one lock, held across each other's
+fsyncs.
 
 **3. mpedb's notification costs nothing, at either concurrency.** 870 → 922 on
 Linux and 895 → 810 on the M3 straddle zero, which is what a counter bumped

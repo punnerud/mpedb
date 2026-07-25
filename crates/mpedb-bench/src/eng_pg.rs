@@ -160,6 +160,19 @@ impl PgServer {
         fsync: &str,
         sync_commit: &str,
     ) -> BResult<PgServer> {
+        Self::start_general_conn(datadir, sockdir, fsync, sync_commit, 32)
+    }
+
+    /// [`start_general`] with an explicit `max_connections`. The default 32 is
+    /// ample for every cell that measures one or a few writers; the notify
+    /// cell's listener-scaling arm needs a connection per listener.
+    pub fn start_general_conn(
+        datadir: PathBuf,
+        sockdir: PathBuf,
+        fsync: &str,
+        sync_commit: &str,
+        max_conn: u32,
+    ) -> BResult<PgServer> {
         std::fs::create_dir_all(&sockdir)?;
         std::fs::create_dir_all(datadir.parent().unwrap_or(Path::new("/")))?;
 
@@ -181,7 +194,7 @@ impl PgServer {
         let opts = format!(
             "-c port={PORT} -c unix_socket_directories={} -c listen_addresses= \
              -c fsync={fsync} -c synchronous_commit={sync_commit}{} \
-             -c shared_buffers=256MB -c max_connections=32",
+             -c shared_buffers=256MB -c max_connections={max_conn}",
             sockdir.display(),
             apple_wal_sync_method(fsync),
         );

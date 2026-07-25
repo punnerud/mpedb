@@ -110,6 +110,8 @@ use mpedb_core::{CheckPrograms, Engine, WriteTxn};
 use mpedb_sql::{CompiledPlan, HostUdfSet, PlanStmt};
 use registry::{decode_registry_plan, patched_last_used, plan_subkey};
 use std::collections::HashMap;
+
+use mpedb_types::keycode;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -1272,6 +1274,34 @@ impl Database {
         timeout: std::time::Duration,
     ) -> Vec<u32> {
         self.engine.wait_for_change(tables, seen, timeout)
+    }
+
+    /// How many listeners are parked on this database right now. A commit
+    /// reads it to decide whether the wake syscalls are worth issuing at all;
+    /// a test or benchmark reads it to know its listeners are actually parked
+    /// before it starts measuring.
+    pub fn notify_waiter_count(&self) -> u32 {
+        self.engine.notify_waiter_count()
+    }
+
+    /// [`Database::wait_for_change`], narrowed to a key per table (#141 N2).
+    ///
+    /// `keys[i]` is the primary-key value list this listener cares about in
+    /// `tables[i]`, or `None` for every change to that table. A table is
+    /// reported only when the commit's advertised key region could contain
+    /// that key — and a region that cannot be evaluated always could, so the
+    /// filter costs spurious wakeups and never a missed one.
+    pub fn wait_for_change_keyed(
+        &self,
+        tables: &[u32],
+        seen: &[u64],
+        keys: &[Option<Vec<Value>>],
+        timeout: std::time::Duration,
+    ) -> Vec<u32> {
+        let encoded: Vec<Option<Vec<u8>>> =
+            keys.iter().map(|k| k.as_ref().map(|v| keycode::encode_key(v))).collect();
+        let refs: Vec<Option<&[u8]>> = encoded.iter().map(|e| e.as_deref()).collect();
+        self.engine.wait_for_change_keyed(tables, seen, &refs, timeout)
     }
 
     pub fn plan_footprint(&self, sql: &str) -> Result<(PlanHash, Footprint)> {
@@ -3333,6 +3363,17 @@ macro_rules! params {
 /// In-crate tests that need access to the private engine handle (raw registry
 /// corruption, eviction accounting). The end-to-end suite lives in
 /// `tests/facade.rs`.
+/// Could a change advertised as `published` (the second half of
+/// [`Database::change_generation`]) have touched the primary key `key`?
+///
+/// The listener-side half of #141 N2, exposed on its own so a caller can
+/// filter a generation it already observed without parking. `published == 0`
+/// means the writer could not name a region, and answers `true` for every key
+/// — the fail-safe direction this whole feature is built around.
+pub fn key_region_matches(published: u64, key: &[Value]) -> bool {
+    mpedb_core::shm::Shm::fingerprint_matches(published, &keycode::encode_key(key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

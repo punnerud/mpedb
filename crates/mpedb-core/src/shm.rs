@@ -212,6 +212,20 @@ const NF_KEY: usize = 16; // AtomicU64: digest of the key touched, 0 = whole tab
 /// nobody listening pays ONE relaxed load and issues no syscall — the property
 /// that makes notification free when unused.
 const LA_NOTIFY_WAITERS: usize = LA_NOTIFY + NOTIFY_SLOTS as usize * NOTIFY_ENTRY;
+/// The "any table changed" futex word (N3), bumped by every publish alongside
+/// the per-table one.
+///
+/// A futex waits on ONE word, but a listener may watch several tables. Before
+/// this existed such a listener parked on `tables[0]`'s word and noticed the
+/// others only when its timeout expired — the answer was right and the latency
+/// was three orders of magnitude wrong.
+///
+/// So the park is chosen by arity: ONE table parks on its exact slot word and
+/// keeps the precise filter, several park here and re-check their generations
+/// on every wakeup. That trades a missed-until-timeout — a latency defect — for
+/// false wakeups, which is the same fail-safe direction as slot collisions and
+/// the honest-degradation rule on key digests.
+const LA_NOTIFY_ANY: usize = LA_NOTIFY_WAITERS + 8;
 
 const INIT_READY: u32 = 2;
 const INIT_FORMATTING: u32 = 1;
@@ -2413,6 +2427,12 @@ impl Shm {
         self.atomic_u32(Self::notify_slot_off(table_id) + NF_SEQ)
     }
 
+    /// The futex word every publish bumps, whatever it wrote. A listener
+    /// watching more than one table parks here (see [`LA_NOTIFY_ANY`]).
+    pub fn notify_any_seq(&self) -> &AtomicU32 {
+        self.atomic_u32(Self::lock_area_off(LA_NOTIFY_ANY))
+    }
+
     /// This table's change generation, and the key digest of the last change
     /// (0 = unknown / whole table). Returns `None` when the slot currently
     /// belongs to a DIFFERENT table — the caller then knows only that
@@ -2445,6 +2465,10 @@ impl Shm {
         self.atomic_u64(off + NF_KEY).store(key, Ordering::Release);
         self.atomic_u64(off + NF_GEN).fetch_add(1, Ordering::AcqRel);
         self.atomic_u32(off + NF_SEQ).fetch_add(1, Ordering::AcqRel);
+        // Last, and after the per-table word: a multi-table listener parked
+        // here re-reads every generation it watches, so it must not be released
+        // before those generations are visible.
+        self.atomic_u32(Self::lock_area_off(LA_NOTIFY_ANY)).fetch_add(1, Ordering::AcqRel);
     }
 
     /// Wake parked listeners for `table_id`. Split from [`Self::notify_publish`]
@@ -2452,6 +2476,13 @@ impl Shm {
     /// in one pass — and skip them entirely when nobody is parked.
     pub fn notify_wake(&self, table_id: u32) {
         crate::os::futex_wake_all(self.notify_seq(table_id));
+    }
+
+    /// Wake listeners parked on the "any table" word (N3). Issued once per commit,
+    /// not once per table — the word moved once for each published table, but
+    /// a single wake releases everyone parked on it.
+    pub fn notify_wake_any(&self) {
+        crate::os::futex_wake_all(self.notify_any_seq());
     }
 
     /// Zero the whole notification region. Called at format and on a boot-epoch
@@ -2465,7 +2496,60 @@ impl Shm {
             self.atomic_u32(off + NF_TABLE).store(u32::MAX, Ordering::Relaxed);
             self.atomic_u64(off + NF_KEY).store(0, Ordering::Relaxed);
         }
+        self.notify_any_seq().store(0, Ordering::Relaxed);
         self.notify_waiters().store(0, Ordering::Release);
+    }
+
+    // ---------- key fingerprints (#141 N2) ----------
+
+    // The published digest answers "where in this table did the change land",
+    // in 8 bytes, for a listener that cares about one key. S2 could only answer
+    // it for a single resolvable POINT; every range write fell back to 0
+    // ("somewhere") and switched key filtering off — even though the footprint
+    // knew the range perfectly well.
+    //
+    // The generalisation rides on `keycode` being memcmp-ordered: every key in
+    // `lo..=hi` shares the common byte prefix of `lo` and `hi`, so that prefix
+    // IS the region, and a key outside it cannot be in the range. Points are
+    // the degenerate case where the prefix is the whole key.
+    //
+    // Layout: high byte = prefix length, low 56 bits = its hash. Length is in
+    // the fingerprint because a listener must hash the SAME prefix of its own
+    // key to compare, and it has no other way to learn how much to hash. A
+    // fingerprint is therefore never 0 (length ≥ 1), which keeps 0 free as
+    // "unknown" — the value every fail-safe path publishes.
+
+    /// Fingerprint of a key prefix. `None` (empty prefix) has no fingerprint:
+    /// there is nothing to filter on, which is the 0 case.
+    pub fn key_fingerprint(prefix: &[u8]) -> u64 {
+        if prefix.is_empty() {
+            return 0;
+        }
+        let len = prefix.len().min(255);
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in &prefix[..len] {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        ((len as u64) << 56) | (h & 0x00ff_ffff_ffff_ffff)
+    }
+
+    /// Could a change advertised as `published` have touched `key`?
+    ///
+    /// Wrong in the "no" direction means a listener sleeps through its own
+    /// change, so every case that cannot be decided answers **yes**: an unknown
+    /// fingerprint, and a key shorter than the advertised prefix (which cannot
+    /// be hashed to compare, and whose length semantics are keycode's business,
+    /// not this function's).
+    pub fn fingerprint_matches(published: u64, key: &[u8]) -> bool {
+        if published == 0 {
+            return true;
+        }
+        let len = (published >> 56) as usize;
+        if key.len() < len {
+            return true;
+        }
+        Self::key_fingerprint(&key[..len]) == published
     }
 
     // ---------- committed-footprint ring (optimistic concurrency) ----------

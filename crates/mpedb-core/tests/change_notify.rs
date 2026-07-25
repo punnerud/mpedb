@@ -195,3 +195,38 @@ fn a_slot_collision_reports_unknown_not_a_wrong_answer() {
     drop(eng);
     let _ = std::fs::remove_file(&path);
 }
+
+/// **N3.** A listener watching several tables must be woken by a change to ANY
+/// of them, not just the first. Before the fix `wait_for_change` parked on
+/// `tables[0]`'s futex word alone, so a write to `b` was noticed only when the
+/// timeout expired — the return value was right and the latency was three
+/// orders of magnitude wrong, which is why this asserts on elapsed time and
+/// not just on what came back.
+#[test]
+fn a_multi_table_listener_wakes_on_the_second_table_promptly() {
+    let (eng, path) = open("multi");
+    let seen_a = eng.change_generation(A).map(|(g, _)| g).unwrap_or(0);
+    let seen_b = eng.change_generation(B).map(|(g, _)| g).unwrap_or(0);
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            let mut w = eng.begin_write().unwrap();
+            w.insert_row(B, &row(3)).unwrap();
+            w.commit().unwrap();
+        });
+        let t0 = Instant::now();
+        // A long timeout, so "returned because it was woken" and "returned
+        // because it gave up" are far apart and cannot be confused.
+        let woke = eng.wait_for_change(&[A, B], &[seen_a, seen_b], Duration::from_secs(10));
+        let waited = t0.elapsed();
+        assert_eq!(woke, vec![B], "the listener did not report table b as changed");
+        assert!(
+            waited < Duration::from_secs(1),
+            "waited {waited:?} for a change to the SECOND watched table — it \
+             parked on table a's word and only noticed at timeout"
+        );
+    });
+    drop(eng);
+    let _ = std::fs::remove_file(&path);
+}

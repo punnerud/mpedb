@@ -48,6 +48,16 @@ const ROWS: usize = 3_000;
 const BATCH: usize = 100;
 /// Concurrent writers in arm C — the arm where a GLOBAL lock is visible at all.
 const WRITERS: usize = 4;
+/// Listener counts for arm D. PostgreSQL's `SignalBackends()` walks EVERY
+/// listener in the cluster under an exclusive `NotifyQueueLock` (async.c:2337,
+/// see design/PG-NOTIFY-ANATOMY.md), so its per-notify cost is O(all
+/// listeners) rather than O(interested). mpedb wakes one futex word whatever
+/// is parked on it. This arm is where that difference is either visible or is
+/// not, and the answer also decides whether #141 N4 has a target.
+const LISTENER_COUNTS: [usize; 3] = [1, 10, 100];
+/// Rows for arm D. Lower than `ROWS`: the arm runs six times (three counts x
+/// two engines) and the question is a ratio between counts, not an absolute.
+const D_ROWS: usize = 1_000;
 
 pub struct ArmResult {
     pub engine: &'static str,
@@ -432,6 +442,156 @@ primary_key = ["id"]
 
 // ------------------------------------------------------------------- driver
 
+
+/// **Arm D — listener scaling.** One writer, `n` listeners, on both engines.
+///
+/// This is the axis arms A-C leave untested: they all run a single listener,
+/// so PostgreSQL's per-notify walk over every listener in the cluster costs
+/// the same as a walk over one. Here the walk gets something to walk.
+///
+/// mpedb's side is a control on the same axis: `futex_wake_all` is one
+/// syscall whatever is parked on the word, so the prediction is a flat line.
+/// A line that is NOT flat would mean the wakeup fan-out costs the writer
+/// something, which is exactly what #141 N4 would then have to fix.
+fn pg_listener_scaling(pg: &PgServer, n: usize) -> BResult<ArmResult> {
+    let conn = pg.conn_str();
+    {
+        let mut c = postgres::Client::connect(&conn, postgres::NoTls)
+            .map_err(|e| format!("pg setup: {e}"))?;
+        c.batch_execute("DROP TABLE IF EXISTS nscale; CREATE TABLE nscale (id bigserial primary key);")
+            .map_err(|e| format!("pg schema: {e}"))?;
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut listeners = Vec::new();
+    for _ in 0..n {
+        let conn = conn.clone();
+        let stop = stop.clone();
+        let ready = ready.clone();
+        listeners.push(std::thread::spawn(move || -> Result<usize, String> {
+            let mut c = postgres::Client::connect(&conn, postgres::NoTls)
+                .map_err(|e| format!("listener connect: {e}"))?;
+            c.batch_execute("LISTEN nscale_ch").map_err(|e| format!("listen: {e}"))?;
+            ready.fetch_add(1, std::sync::atomic::Ordering::Release);
+            let mut seen = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let mut notifs = c.notifications();
+                let mut it = notifs.timeout_iter(Duration::from_millis(50));
+                while let Some(_n) = it.next().map_err(|e| format!("notif: {e}"))? {
+                    seen += 1;
+                }
+            }
+            Ok(seen)
+        }));
+    }
+    // Every listener must be inside LISTEN before the writer starts, or the
+    // arm measures a partly-empty listener table.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while ready.load(std::sync::atomic::Ordering::Acquire) < n {
+        if Instant::now() > deadline {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            return Err(format!("only {} of {n} listeners connected", ready.load(std::sync::atomic::Ordering::Acquire)).into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut c = postgres::Client::connect(&conn, postgres::NoTls)
+        .map_err(|e| format!("pg writer: {e}"))?;
+    let t0 = Instant::now();
+    for _ in 0..D_ROWS {
+        let mut txn = c.transaction().map_err(|e| format!("begin: {e}"))?;
+        txn.execute("INSERT INTO nscale DEFAULT VALUES", &[]).map_err(|e| format!("insert: {e}"))?;
+        txn.batch_execute("NOTIFY nscale_ch, 'x'").map_err(|e| format!("notify: {e}"))?;
+        txn.commit().map_err(|e| format!("commit: {e}"))?;
+    }
+    let rate = D_ROWS as f64 / t0.elapsed().as_secs_f64();
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let mut woke = 0usize;
+    for h in listeners {
+        woke += h.join().map_err(|_| "listener panicked".to_string())??;
+    }
+    Ok(ArmResult {
+        engine: "postgres",
+        arm: Box::leak(format!("D {n} listeners").into_boxed_str()),
+        writes_per_sec: rate,
+        lat_p50_us: 0,
+        lat_p99_us: 0,
+        notifications: woke,
+    })
+}
+
+fn mpedb_listener_scaling(dir: &std::path::Path, n: usize) -> BResult<ArmResult> {
+    use mpedb::{Config, Database, Value};
+    let path = dir.join(format!("notify-scale-{n}.mpedb"));
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 256
+max_readers = 256
+durability = "wal"
+
+[[table]]
+name = "nscale"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+"#,
+        path.display()
+    );
+    let db = std::sync::Arc::new(
+        Database::open_with_config(Config::from_toml_str(&toml).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?,
+    );
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut listeners = Vec::new();
+    for _ in 0..n {
+        let db = db.clone();
+        let stop = stop.clone();
+        listeners.push(std::thread::spawn(move || -> usize {
+            let mut seen = db.change_generation(0).map(|(g, _)| g).unwrap_or(0);
+            let mut woke = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                if !db.wait_for_change(&[0], &[seen], Duration::from_millis(50)).is_empty() {
+                    woke += 1;
+                    seen = db.change_generation(0).map(|(g, _)| g).unwrap_or(seen);
+                }
+            }
+            woke
+        }));
+    }
+    // Parked-listener count is observable, so waiting for it beats sleeping.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while db.notify_waiter_count() < n as u32 {
+        if Instant::now() > deadline {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            return Err(format!("only {} of {n} listeners parked", db.notify_waiter_count()).into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let t0 = Instant::now();
+    for i in 0..D_ROWS {
+        db.query("INSERT INTO nscale (id) VALUES ($1)", &[Value::Int(i as i64)])
+            .map_err(|e| e.to_string())?;
+    }
+    let rate = D_ROWS as f64 / t0.elapsed().as_secs_f64();
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let woke: usize = listeners.into_iter().map(|h| h.join().unwrap_or(0)).sum();
+    let _ = std::fs::remove_file(&path);
+    Ok(ArmResult {
+        engine: "mpedb",
+        arm: Box::leak(format!("D {n} listeners").into_boxed_str()),
+        writes_per_sec: rate,
+        lat_p50_us: 0,
+        lat_p99_us: 0,
+        notifications: woke,
+    })
+}
+
 pub fn run(scratch: PathBuf) -> BResult<()> {
     std::fs::create_dir_all(&scratch).map_err(|e| format!("scratch: {e}"))?;
     println!(
@@ -465,12 +625,15 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
         mpedb_concurrent(&scratch, 0)?,
         mpedb_concurrent(&scratch, 1)?,
     ];
+    for n in LISTENER_COUNTS {
+        rows.push(mpedb_listener_scaling(&scratch, n)?);
+    }
 
     let datadir = scratch.join("pgdata");
     let sockdir = scratch.join("pgsock");
     let _ = std::fs::remove_dir_all(&datadir);
     std::fs::create_dir_all(&sockdir).map_err(|e| format!("sockdir: {e}"))?;
-    match PgServer::start(datadir, sockdir, true) {
+    match PgServer::start_general_conn(datadir, sockdir, "on", "on", 256) {
         Ok(pg) => {
             // The symmetric control: same commits, no NOTIFY. Without it the
             // arm-A number cannot be attributed — it could be the notify lock
@@ -481,6 +644,9 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
             rows.push(pg_arm(&pg, "B batched", BATCH, true)?);
             rows.push(pg_concurrent(&pg, false)?);
             rows.push(pg_concurrent(&pg, true)?);
+            for n in LISTENER_COUNTS {
+                rows.push(pg_listener_scaling(&pg, n)?);
+            }
         }
         Err(e) => println!("postgres unavailable, mpedb-only run: {e}"),
     }
