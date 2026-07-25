@@ -11,6 +11,7 @@ pub mod fts;
 pub mod ident;
 pub mod keycode;
 pub mod model;
+pub mod ordkey;
 pub mod policy;
 pub mod schema;
 pub mod subedit;
