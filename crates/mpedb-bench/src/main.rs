@@ -11,6 +11,7 @@
 //! to crates/mpedb-bench/RESULTS-<machine>.md.
 
 mod bulk;
+mod notify;
 mod dur_compare;
 mod eng_mpedb;
 mod extents;
@@ -345,17 +346,19 @@ fn main() {
     for (i, a) in args.iter().enumerate() {
         let known = a == "--quick"
             || a == "--io"
+            || a == "--notify"
             || VALUED.contains(&a.as_str())
             || (i > 0 && VALUED.contains(&args[i - 1].as_str()));
         if !known {
             eprintln!(
                 "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres|turso|mpedb,sqlite] \
                  [--tmpfs DIR] [--disk DIR] [--out FILE] [--value-bytes N] \
-                 [--h2h REPS] [--extents ITERS]"
+                 [--h2h REPS] [--extents ITERS] [--notify]"
             );
             std::process::exit(2);
         }
     }
+    let notify_arg = args.iter().any(|a| a == "--notify");
     let cfg = if quick { RunCfg::quick() } else { RunCfg::full() };
 
     let pid = std::process::id();
@@ -399,6 +402,13 @@ fn main() {
     // the generated per-machine report — both are paired A/B instruments, not
     // a matrix cell, and mixing the two output kinds is how a ratio measured
     // under one method ends up quoted as an absolute measured under another.
+    if notify_arg {
+        if let Err(e) = notify::run(disk_base.clone()) {
+            eprintln!("notify cell failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(iters) = extents_arg {
         let r = extents::run(&disk_base, iters, 16 * 1024);
         if let Err(e) = r {
