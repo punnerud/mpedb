@@ -101,18 +101,41 @@ impl Xorshift {
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
-/// A per-test scratch directory under /dev/shm (mpedb's natural habitat),
-/// removed on drop. Database files inside always use the `.mpedb` extension.
+/// A per-test scratch directory, removed on drop. Database files inside
+/// always use the `.mpedb` extension.
+///
+/// Default base is `/dev/shm` — mpedb's natural habitat, and fast. But it is
+/// a tmpfs sized from RAM (3.8 GB on the dev box), which the suite can
+/// exhaust: a run that leaves debris behind, or one heavy test, and the next
+/// `fallocate` fails with `StorageFull` deep inside an unrelated test while
+/// the real disk sits empty. `MPEDB_TEST_DIR` moves the whole suite onto a
+/// real volume for those runs — also the honest place to measure durability
+/// modes, since tmpfs has no platter to flush to.
+///
+///     MPEDB_TEST_DIR=/mnt/xfs/mpedb-scratch cargo test --workspace
+///
+/// A path that does not exist is created; if that fails, the value is
+/// refused loudly rather than silently falling back — a test run that
+/// quietly ignores where you told it to write is worse than one that stops.
 pub struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
     pub fn new(prefix: &str) -> Result<TempDir> {
-        let base = if Path::new("/dev/shm").is_dir() {
-            PathBuf::from("/dev/shm")
-        } else {
-            std::env::temp_dir()
+        let base = match std::env::var_os("MPEDB_TEST_DIR") {
+            Some(dir) if !dir.is_empty() => {
+                let dir = PathBuf::from(dir);
+                std::fs::create_dir_all(&dir).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("MPEDB_TEST_DIR={} is unusable: {e}", dir.display()),
+                    )
+                })?;
+                dir
+            }
+            _ if Path::new("/dev/shm").is_dir() => PathBuf::from("/dev/shm"),
+            _ => std::env::temp_dir(),
         };
         let path = base.join(format!(
             "mpedb-testkit-{prefix}-{}-{}",
