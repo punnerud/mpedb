@@ -12,6 +12,7 @@
 
 mod bulk;
 mod notify;
+mod notify_load;
 mod dur_compare;
 mod eng_mpedb;
 mod extents;
@@ -263,6 +264,18 @@ fn run_bulk(
 }
 
 fn main() {
+    // Arm E re-invokes this binary as a worker process. Handled before any
+    // other parsing: a worker's argv is its own grammar, not the bench's.
+    {
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        if raw.first().map(|a| a == "--notify-worker").unwrap_or(false) {
+            if let Err(e) = notify_load::worker_main(&raw[1..]) {
+                eprintln!("notify worker failed: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     // Short-cell fairness (esp. Darwin): a mid-sample WAL checkpoint msyncs
     // every logged page into the main mapping. On APFS that cost tracks range
     // width and can dominate a few of the 7 interleaved durable-batch samples
@@ -347,6 +360,7 @@ fn main() {
         let known = a == "--quick"
             || a == "--io"
             || a == "--notify"
+            || a == "--notify-load"
             || VALUED.contains(&a.as_str())
             || (i > 0 && VALUED.contains(&args[i - 1].as_str()));
         if !known {
@@ -359,6 +373,7 @@ fn main() {
         }
     }
     let notify_arg = args.iter().any(|a| a == "--notify");
+    let notify_load_arg = args.iter().any(|a| a == "--notify-load");
     let cfg = if quick { RunCfg::quick() } else { RunCfg::full() };
 
     let pid = std::process::id();
@@ -405,6 +420,13 @@ fn main() {
     if notify_arg {
         if let Err(e) = notify::run(disk_base.clone()) {
             eprintln!("notify cell failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if notify_load_arg {
+        if let Err(e) = notify_load::run(disk_base.clone()) {
+            eprintln!("notify load cell failed: {e}");
             std::process::exit(1);
         }
         return;
