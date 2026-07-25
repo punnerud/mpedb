@@ -2,8 +2,8 @@
 
 Lest i `src/backend/commands/async.c` på `master` (3299 linjer, hentet
 2026-07-25). Linjenumre gjelder den revisjonen. Dette dokumentet finnes fordi
-NOTIFY-BENCH.md sammenligner mot Postgres og bør kunne forsvare påstandene sine
-på kildenivå, ikke bare mot en blogg.
+[varslings-benchmarken](../benchmarks/notify.md) sammenligner mot Postgres og bør
+kunne forsvare påstandene sine på kildenivå, ikke bare mot en blogg.
 
 ## Hva som serialiserer
 
@@ -106,4 +106,4 @@ runtime-streng, `pg_notify(text, text)` kan regnes ut — er vår matching en
 fotavtrykk, så hvilke spor den kan ringe på er kjent før den kjøres.
 
 Prisen vi betaler for det: ingen total orden på tvers av urelaterte tabeller, og
-ingen payload-leveranse. Begge er bevisste, og begge står i NOTIFY-BENCH.md.
+ingen payload-leveranse. Begge er bevisste, og begge står i [benchmarken](../benchmarks/notify.md).

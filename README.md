@@ -54,7 +54,7 @@ engine is Unix-only by construction (mmap, flock, robust `PROCESS_SHARED`
 mutexes, `/proc` reader identity). macOS and Windows run nightly, Linux on every
 change.
 
-> **[mpedb vs sqlite3 vs Cursor's minisqlite →](minisqlite-vs-mpedb.md)** — what
+> **[mpedb vs sqlite3 vs Cursor's minisqlite →](benchmarks/minisqlite.md)** — what
 > each engine can even be asked to do, and speed on operations an application
 > actually runs. Both directions plotted: 4000× ahead on indexed `min`/`max`,
 > 0.40× on a single-row INSERT.
@@ -206,7 +206,7 @@ than either ancestor. It is not there yet; see Status.
 **Many processes writing one file, and none of them has to cope with that.**
 This is the point. Concurrent *readers* are not — sqlite3 in WAL mode has those,
 and in a like-for-like durable comparison it out-reads mpedb (658k vs 561k
-reads/s; [BENCHMARKS.md](BENCHMARKS.md)). What sqlite3 does not give you is
+reads/s; [benchmarks/head-to-head.md](benchmarks/head-to-head.md)). What sqlite3 does not give you is
 several processes *writing* without `SQLITE_BUSY`, a retry loop and a
 `busy_timeout` — the benchmark's sqlite3 adapter needs a **60-second**
 busy_timeout to survive the contended-write cell at all. mpedb's writers queue
@@ -226,7 +226,7 @@ is locked".
   Honest counterpart: with *durability on* concurrent writing is mpedb's
   **worst** cell — a tie with sqlite3 and **8× behind PostgreSQL**, because group
   commit only amortizes what one writer lock lets through. See
-  [BENCHMARKS.md](BENCHMARKS.md#known-issues--improvement-opportunities).
+  [benchmarks/head-to-head.md](benchmarks/head-to-head.md#known-issues--improvement-opportunities).
 - **~300 KB of heap per writer process** — peak `RssAnon` across 4 concurrent
   writers: **1.2 MB for mpedb vs 4.4 MB for sqlite3**. (Peak *VmHWM* goes the
   other way, 196 MB vs 16 MB, and that is an accounting artifact worth knowing:
@@ -479,14 +479,19 @@ reused — capping lifetime creates at 64 (`regenerate` resets it). See
 
 ## Performance
 
+**Every measured comparison lives in [`benchmarks/`](benchmarks/)** — the
+head-to-head, DuckDB (OLAP), Qdrant (vector), Neo4j (graph), PostgreSQL
+LISTEN/NOTIFY, and the shared method the whole set follows. Start at
+[`benchmarks/README.md`](benchmarks/README.md).
+
 Head-to-head against SQLite and PostgreSQL through one shared Rust measurement
 loop (each engine on its own fast path — mpedb's `execute(hash, …)`, prepared
-statements for the others). **[`BENCHMARKS.md`](BENCHMARKS.md) is the detailed
+statements for the others). **[`benchmarks/head-to-head.md`](benchmarks/head-to-head.md) is the detailed
 comparison** — methodology, every machine, and a link to each machine's full
 generated tables. The highlights from all of them are below.
 [Turso](https://github.com/tursodatabase/turso), the Rust SQLite rewrite, is
 measured as a fourth engine — numbers and a compatibility-parity comparison in
-[design/TURSO.md](design/TURSO.md).
+[benchmarks/turso.md](benchmarks/turso.md).
 
 Two things to know before reading any of it: numbers are only comparable
 **within a durability class** (none-class has no fsync guarantee, commit-class is
@@ -507,7 +512,7 @@ And one finding worth stealing even if you never use mpedb: **for deciding
 whether a change helped, a Raspberry Pi 3 running a live ADS-B decoder is a 6×
 better instrument than this dev box** — 1.6% run-to-run CV against 9.0%. Steady
 load beats fast-but-bursty. Three reps at 9% CV had us reject a real +3.5%
-improvement as a "regression", with a commit message to match. BENCHMARKS.md has
+improvement as a "regression", with a commit message to match. benchmarks/head-to-head.md has
 the method and the two other ways the same A/B went wrong first.
 
 ### Linux — AMD EPYC-Milan, 2 cores (re-run 2026-07-16)
@@ -534,7 +539,7 @@ Durable writes: `wal` leads single-client (1,883 vs 864 / 1,742) and batched
 100/commit (**132k** vs 62k / 18k). Weakest cell: `durability=commit`
 single-client (~390 ops/s) — every commit msyncs with no batching partner; use
 `wal`. Contended writes (4 threads) mpedb leads 126k vs 28k/34k, but that is the
-cell most sensitive to core count — see [BENCHMARKS.md](BENCHMARKS.md).
+cell most sensitive to core count — see [benchmarks/head-to-head.md](benchmarks/head-to-head.md).
 
 ### Apple Silicon — M3 Pro, 11 cores, macOS 26.6 (2026-07-14)
 
@@ -613,7 +618,7 @@ flip — so a commit costs *(runs + 1)* whole drive-cache flushes. `F_FULLFSYNC`
 per-**fd**, not per-range, so one barrier before the ack would do. That is a
 Linux-shaped optimisation (there `msync(MS_SYNC)` really does sync only the
 range) meeting a platform where it multiplies. Logged as known-issue #0; use
-`wal`. Details: [BENCHMARKS.md](BENCHMARKS.md#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed).
+`wal`. Details: [benchmarks/head-to-head.md](benchmarks/head-to-head.md#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed).
 
 **Bulk bytes: extents changed the game — measured, per platform.** Large
 values now take the WiscKey path from
@@ -628,7 +633,7 @@ the default differs per platform: **on by default at 16 KiB on Linux, off on
 macOS** — `extent_threshold_kb` in the config overrides either way (`0` =
 off). The 4 KiB cell and the macOS curve share one queued fix: per-commit
 coalesced `pwritev`. See
-[BENCHMARKS.md](BENCHMARKS.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
+[benchmarks/head-to-head.md](benchmarks/head-to-head.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
 
 ```sh
 cargo run --release -p mpedb-bench      # full head-to-head -> RESULTS-<machine>.md
@@ -641,7 +646,7 @@ mpedb bench --auto --durability wal     # quick mpedb-only
 > left single-client ratios intact but silently compressed the parallel cells.
 > SQLite/PostgreSQL act as the control group: if all three engines move together
 > it is the host, not mpedb's code
-> ([method](BENCHMARKS.md#reading-run-to-run-deltas--the-control-group-method)).
+> ([method](benchmarks/head-to-head.md#reading-run-to-run-deltas--the-control-group-method)).
 
 ## Mirroring & cross-database migration
 

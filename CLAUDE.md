@@ -13,6 +13,12 @@ macros — SQL-EXTENSIONS.md is the contract; `mpedb fn list` / `mpedb op list`
 show what a given database defines. The workload model (design/
 DESIGN-MODEL-LANG.md, `mpedb model show`) declares what a database is FOR.
 
+Measured comparisons all live in `benchmarks/` (index: `benchmarks/README.md`) —
+head-to-head, OLAP/vector/graph, and the LISTEN/NOTIFY cell against PostgreSQL.
+Three rules bind every one of them: a control arm for anything claimed to cost
+something, like-for-like durability (#122 — never mpedb's weaker mode against a
+log-based engine), and the hardware published when the hardware is the answer.
+
 ## Commands
 
 - Build/test all: `cargo test --workspace` (mpedb-capi is its OWN workspace —

@@ -33,7 +33,7 @@ pub fn usage(msg: &str) -> CliResult {
            --key <v>      only changes that could touch this primary key;\n\
                           applies to every named table, and is honoured only\n\
                           as far as the writer could name its key region --\n\
-                          a wide write always wakes you (see NOTIFY-BENCH.md)\n"
+                          a wide write always wakes you (see benchmarks/notify.md)\n"
     )))
 }
 

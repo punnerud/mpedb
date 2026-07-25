@@ -123,7 +123,7 @@ installs, from the stored model:
   to `EXISTS (SELECT 1 FROM <edge> WHERE src = a AND dst = b)`.
 - `role = "embedding"` + `knn` → **`:~:`** — `emb :~: $q` expands to
   `vec_l2(emb, $q)`, so `ORDER BY emb :~: $q LIMIT 10` IS the exact-kNN fast
-  path (BENCHMARKS-VECTOR.md).
+  path (benchmarks/vector.md).
 
 ### Guarantees and limits
 

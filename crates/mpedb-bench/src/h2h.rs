@@ -6,7 +6,7 @@
 //! durable arm ONCE and then walks them round-robin, `reps` times, so each
 //! repetition contains one measurement of every arm within seconds of the
 //! others. Ratios are formed **inside a repetition** and the spread across
-//! repetitions is reported next to the median — the method BENCHMARKS.md
+//! repetitions is reported next to the median — the method benchmarks/head-to-head.md
 //! requires of anything it publishes.
 //!
 //! The arms, all durable-on-ack, all on the same real disk:

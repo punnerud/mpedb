@@ -569,7 +569,7 @@ doing database work actually run concurrently.
 ## Where to go next
 
 - [README](README.md) — what this is and why, plus the exact SQL surface
-- [BENCHMARKS.md](BENCHMARKS.md) — head-to-head against SQLite and PostgreSQL,
+- [benchmarks/head-to-head.md](benchmarks/head-to-head.md) — head-to-head against SQLite and PostgreSQL,
   with the methodology and every machine's numbers
 - [design/DESIGN.md](design/DESIGN.md) — the concurrency, locking and commit protocols. Read
   this before touching that code; every protocol in it survived a 37-finding

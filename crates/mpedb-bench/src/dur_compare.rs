@@ -33,7 +33,7 @@ pub const BATCH: i64 = 100;
 /// How many interleaved reps for durable-on-ack **batched** cells. One-shot
 /// measurements on a shared laptop disk sit inside host drift (M3 showed
 /// mpedb 27.1k vs sqlite 27.4k, then 25k vs 31k on the next full suite);
-/// BENCHMARKS.md's control-group method requires ratios formed inside a
+/// benchmarks/head-to-head.md's control-group method requires ratios formed inside a
 /// rep and summarized across reps. Single-client rows stay one-shot.
 const BATCH_REPS: usize = 7;
 
@@ -111,7 +111,7 @@ fn median_lat(samples: Vec<BResult<LatStats>>) -> BResult<LatStats> {
 ///
 /// Durable-on-ack **batched** rows are measured with [`BATCH_REPS`] interleaved
 /// round-robin reps (mpedb → sqlite → postgres each rep) and reported as the
-/// median ops/s. That is the control-group method required by BENCHMARKS.md
+/// median ops/s. That is the control-group method required by benchmarks/head-to-head.md
 /// for a published ratio on a drifting host.
 pub fn run(
     disk_base: &Path,

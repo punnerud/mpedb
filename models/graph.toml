@@ -1,4 +1,4 @@
-# The graphbench workload (BENCHMARKS-GRAPH.md) as a model: one edge table,
+# The graphbench workload (benchmarks/graph.md) as a model: one edge table,
 # walked from the source side, closed via (src, dst).
 
 [model]

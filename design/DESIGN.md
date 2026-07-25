@@ -1017,7 +1017,7 @@ last is covered elsewhere here, in §9):
 │   ├── mpedb-sqlitefmt/  the sqlite file format read natively, no sqlite library
 │   │                     in the graph (DESIGN-SQLITE-BACKED §4)
 │   ├── mpedb-testkit/    sqllogictest runner, corpus, differential tester
-│   ├── mpedb-bench/      the head-to-head harness vs sqlite/PG (BENCHMARKS.md)
+│   ├── mpedb-bench/      the head-to-head harness vs sqlite/PG (../benchmarks/head-to-head.md)
 │   └── mpedb-py/         PyO3 bindings (§9)
 ```
 

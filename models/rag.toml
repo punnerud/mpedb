@@ -1,4 +1,4 @@
-# The vecbench workload (BENCHMARKS-VECTOR.md) as a model: embeddings under
+# The vecbench workload (benchmarks/vector.md) as a model: embeddings under
 # kNN, usually behind a category filter — RAG inside a database.
 
 [model]

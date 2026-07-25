@@ -1,6 +1,6 @@
 //! mpedb vs DuckDB vs SQLite on an analytics workload.
 //!
-//! Two rules, inherited from BENCHMARKS.md and non-negotiable here:
+//! Two rules, inherited from benchmarks/head-to-head.md and non-negotiable here:
 //!
 //! 1. **Every engine answers the same question, and the harness checks.** Each
 //!    query's result is rendered canonically and compared across engines before

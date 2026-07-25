@@ -2,7 +2,7 @@ use super::*;
 
 /// A/B escape hatch for #111: restore the historical one-msync-per-contiguous-
 /// run data barrier in `durability = commit`. Both arms therefore live in one
-/// binary, which is what BENCHMARKS.md's paired-arm method requires (two builds
+/// binary, which is what benchmarks/head-to-head.md's paired-arm method requires (two builds
 /// have been the source of at least one false A/B here already).
 fn msync_per_run() -> bool {
     static ON: std::sync::LazyLock<bool> =

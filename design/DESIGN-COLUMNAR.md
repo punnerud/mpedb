@@ -8,7 +8,7 @@ returns a **wrong answer**, not a mis-price.
 
 ## 1. Why — the gap is the storage model, measured
 
-The 2026-07-23 OLAP head-to-head (BENCHMARKS-OLAP.md, `4643aeb`, 2M-row fact):
+The 2026-07-23 OLAP head-to-head (../benchmarks/olap.md, `4643aeb`, 2M-row fact):
 
 | cell | mpedb vs SQLite | mpedb vs DuckDB |
 |---|---|---|

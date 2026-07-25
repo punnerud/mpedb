@@ -1,7 +1,7 @@
 # DESIGN-MPEE-GENERAL — one solver kernel, per-domain cost plugins
 
 **Status: design + staged plan, 2026-07-22.** Grounded in two measurements from
-the same day: the OLAP head-to-head ([BENCHMARKS-OLAP.md](../BENCHMARKS-OLAP.md))
+the same day: the OLAP head-to-head ([../benchmarks/olap.md](../../benchmarks/olap.md))
 that showed the join-order solver working correctly *inside* a plan space whose
 pricing cannot see a star schema, and the original MPEE engine
 (github.com/punnerud/mpee), whose cost model was always a pluggable set of
@@ -205,7 +205,7 @@ warnings`) before the next; measured results are appended to this doc per stage.
   engines now count narrow trees; answering from interior-node subtree counts
   would be a page-format change and is deliberately not planned.
 - **C — graph vs Neo4j.** **SHIPPED + MEASURED 2026-07-23** (`600ece0`, then
-  the depth sweep `a53d427`/`f0b842d`; [BENCHMARKS-GRAPH.md](../BENCHMARKS-GRAPH.md)).
+  the depth sweep `a53d427`/`f0b842d`; [../benchmarks/graph.md](../../benchmarks/graph.md)).
   The sweep found the hole: reach-k grew LINEARLY in k (UNION dedups
   (node, depth) pairs → every level re-expanded the reached set; 833 ms at
   k=8 vs Neo4j's flat 38). Closed by **converged-frontier dedup** — the
@@ -216,7 +216,7 @@ warnings`) before the next; measured results are appended to this doc per stage.
   composite (#55 machinery, schema only). The §3 monotonicity contract now has
   a THIRD consumer.
 - **D — vector: exact kNN + Qdrant.** **SHIPPED + MEASURED 2026-07-23**
-  (`03626bc`, [BENCHMARKS-VECTOR.md](../BENCHMARKS-VECTOR.md)). Early
+  (`03626bc`, [../benchmarks/vector.md](../../benchmarks/vector.md)). Early
   abandonment bought **2.9×** (52.3 → 17.9 ms median on 100k × 128d), measured
   as an in-binary A/B, answers bit-identical. Unfiltered: Qdrant HNSW 3.6 ms @
   0.992 recall vs exact 17.9 @ 1.000 — the expected trade. **Filtered
@@ -332,7 +332,7 @@ cost** (open TSP), and the honest frame is the one vecbench established:
   NUMBER (fraction of the N×N matrix ever materialized), which is the claim
   both engines actually share.
 
-**Built and measured 2026-07-23** ([BENCHMARKS-ROUTING.md](../BENCHMARKS-ROUTING.md)):
+**Built and measured 2026-07-23** ([../benchmarks/routing.md](../../benchmarks/routing.md)):
 the kernel's `(subset, last)` mode is `mpedb_sql::sequence` (Held-Karp, exact
 to N = 18, brute-force-differential-tested, DECLINES past the cap), the
 harness is `crates/mpedb-routebench`, and the instances are brooom's bundled

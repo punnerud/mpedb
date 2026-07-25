@@ -1,4 +1,4 @@
-# The olapbench workload (BENCHMARKS-OLAP.md), as a model. This file IS the
+# The olapbench workload (benchmarks/olap.md), as a model. This file IS the
 # claim "this application is a star schema" made machine-readable — the same
 # information the bench encodes in Rust, at the resolution a Django model has.
 

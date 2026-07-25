@@ -100,7 +100,7 @@ State that as a line, do not round it away.
 
 ## 2. Performance (P8 — the active phase)
 
-Corpus, Linux, 621 files, `bc45e69`/`bd420e8` (`minisqlite-vs-mpedb.md` §11):
+Corpus, Linux, 621 files, `bc45e69`/`bd420e8` (`benchmarks/minisqlite.md` §11):
 **mpedb 239.2 s · minisqlite 153.0 s · sqlite 67.6 s** — mpedb/sqlite ≈ **3.5×**
 (was 3.9×), mpedb/minisqlite ≈ **1.56×** (was 1.72×).
 

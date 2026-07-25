@@ -1330,7 +1330,7 @@ mod tests {
 
     /// **Stage A (design/DESIGN-MPEE-GENERAL.md §4): the NDV discount flips a
     /// star schema to dimension-first.** The measured failure this encodes
-    /// (BENCHMARKS-OLAP.md): without per-index NDV, driving the 2M-row fact
+    /// (benchmarks/olap.md): without per-index NDV, driving the 2M-row fact
     /// table and probing the dimension prices at bucket(2M) = 21, while
     /// dimension-first prices at bucket(5k) + bucket(2M) = 34 — so the solver
     /// scanned the fact table and discarded 89% of it after the join. With

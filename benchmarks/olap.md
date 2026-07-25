@@ -412,7 +412,7 @@ vector got a language, OLAP got a pricing console — each domain's actual gap.
 - **Larger than memory.** Two million rows fit in page cache on every engine
   here. Spill behaviour, compression ratios and out-of-core joins are untested.
 - **Write amplification and durability.** `durability = "none"`. See
-  [BENCHMARKS.md](BENCHMARKS.md) for the durable head-to-head.
+  [head-to-head.md](head-to-head.md) for the durable head-to-head.
 - **TPC-H.** Deliberately not run: its value is its published, audited numbers,
   and producing comparable ones needs the full qualification kit. This is a
   star schema chosen to separate three mechanisms, not a standard benchmark.

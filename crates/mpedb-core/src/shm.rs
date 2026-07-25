@@ -1466,7 +1466,7 @@ impl Shm {
     /// durable.** On macOS `msync(MS_SYNC)` only hands the pages to the
     /// filesystem; the drive's write cache still holds them, so skipping the
     /// barrier makes `durability=commit` faster and a lie — the exact failure
-    /// this codebase has caught all three engines committing (BENCHMARKS.md).
+    /// this codebase has caught all three engines committing (benchmarks/head-to-head.md).
     ///
     /// It exists because `F_FULLFSYNC` is per-FD, not per-range: a caller with
     /// several ranges to make durable can msync them all and barrier ONCE. The

@@ -7,7 +7,7 @@ durability classes, all latency percentiles) live in its own file.
 
 ## Change notification (LISTEN/NOTIFY class)
 
-Measured separately in [NOTIFY-BENCH.md](NOTIFY-BENCH.md), because it is a
+Measured separately in [notify.md](notify.md), because it is a
 paired A/B instrument with its own controls rather than a matrix cell. Headline:
 PostgreSQL's `NOTIFY` costs 50-60 % of write throughput under 4 concurrent
 writers (its commit lock is cluster-global, verified in the source), and 27 %
@@ -59,13 +59,13 @@ changed measurement.
 
 **Routing is measured separately** — real San Francisco road durations, the
 kernel's exact `(subset, last)` mode as ground truth vs the original MPEE
-solver (brooom): [BENCHMARKS-ROUTING.md](BENCHMARKS-ROUTING.md). brooom finds
+solver (brooom): [routing.md](routing.md). brooom finds
 the exact optimum on every checkable sub-instance (gap +0.00%, N = 9…18);
 exact answers in milliseconds where available and declines past its cap.
 
 **Vector search is measured separately**, exact against Qdrant's approximate
 HNSW with recall@10 scored against mpedb's own ground truth:
-[BENCHMARKS-VECTOR.md](BENCHMARKS-VECTOR.md). Unfiltered, the vector index
+[vector.md](vector.md). Unfiltered, the vector index
 wins the expected trade (3.6 ms @ 0.992 vs 17.9 @ 1.000 exact); **filtered,
 the result inverts 13×** — predicate-first exact search beats the graph
 traversal fighting its filter. Early abandonment bought 2.9× with answers
@@ -73,13 +73,13 @@ bit-identical.
 
 **Graph workloads are measured separately**, against Neo4j 5.26 with an edge
 table and recursive CTEs — no graph machinery at all:
-[BENCHMARKS-GRAPH.md](BENCHMARKS-GRAPH.md). The crossover is at hop 3: the edge
+[graph.md](graph.md). The crossover is at hop 3: the edge
 table wins one and two probes out, native adjacency wins deeper traversals
 (up to 13× on a global triangle sweep). Same per-probe execution cost the OLAP
 page brackets against SQLite, measured from the other side.
 
 **Analytics is measured separately**, against DuckDB with SQLite as the control
-group: [BENCHMARKS-OLAP.md](BENCHMARKS-OLAP.md). Two findings there are mpedb's
+group: [olap.md](olap.md). Two findings there are mpedb's
 own rather than "row store versus column store" — `count(*)` counted the PK tree
 because the benchmark schema declared nothing NOT NULL — the narrow-tree path
 existed and was tested all along, and engages once the schema says what the
@@ -92,7 +92,7 @@ and 7,675× faster than SQLite.
 
 Turso (the Rust SQLite rewrite) joined the field 2026-07-17; its adapter's
 honesty decisions and a compatibility-parity comparison live in
-[design/TURSO.md](design/TURSO.md).
+[turso.md](turso.md).
 
 The Pi is not a third data point in the engine comparison and never will be:
 `mpedb-bench` links SQLite (bundled C) and PostgreSQL, which needs a C
@@ -702,7 +702,7 @@ is that a result that matters gets reproduced in a second session:
 | 4 writer processes | 8 pairs | **+63.3 %** | [+42.9, +86.6] | **idle** |
 
 `MPEDB_MSYNC_PER_RUN=1` restores the old loop, so both arms are the same binary
-— the mistake BENCHMARKS.md records under "the arms were the same binary" cuts
+— the mistake head-to-head.md records under "the arms were the same binary" cuts
 both ways, and one binary with a switch is the safe side of it.
 
 ⚠ **Absolutes in this section are on ext4 (`/dev/sdc`); the 07-17 tables were on

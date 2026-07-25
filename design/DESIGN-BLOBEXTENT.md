@@ -9,7 +9,7 @@ Owner task: #50. Prereqs met: #40 (warm end-numbers), #42 (scatter-gather),
 ## 1. Why — the measured gap, honestly attributed
 
 Pushing 256 MiB of 4 KiB blobs (durability `none`, **tmpfs, batched 256
-rows/commit**, Linux EPYC — BENCHMARKS.md): sqlite writes **998 MiB/s (38% of
+rows/commit**, Linux EPYC — ../benchmarks/head-to-head.md): sqlite writes **998 MiB/s (38% of
 raw)**, mpedb **602 MiB/s (23%)**. **[R]** On the M3 the same cell already
 goes the other way (mpedb 2274 vs sqlite 1163) — the gap this document closes
 is the Linux one, and the honest metric is *% of raw*, never MiB/s.
@@ -21,7 +21,7 @@ has behind it **[R]**:
    faults; warm path ~2250 MiB/s once clones died). Payload lands through the
    shared mmap; every fresh page is a minor fault plus kernel zeroing that
    the memcpy immediately overwrites. sqlite appends via `pwrite`.
-2. **Per-row engine cost** — *the measured limiter at 4 KiB* (BENCHMARKS.md:
+2. **Per-row engine cost** — *the measured limiter at 4 KiB* (../benchmarks/head-to-head.md:
    these cells did not move when the row buffer died; #32's territory).
    Extents shrink the per-row work (no chain page, no chain header, a 20-byte
    reference instead) but the 4 KiB verdict belongs to §13's A/B, not to this

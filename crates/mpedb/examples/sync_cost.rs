@@ -1,6 +1,6 @@
 //! What does a durability barrier actually cost, and does its SHAPE matter?
 //!
-//! This is the probe behind #111 (BENCHMARKS.md, "The one cell PostgreSQL
+//! This is the probe behind #111 (benchmarks/head-to-head.md, "The one cell PostgreSQL
 //! wins"). Two questions the commit path's design hangs on, each answered by
 //! measurement rather than by reading a man page:
 //!
