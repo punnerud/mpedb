@@ -51,53 +51,44 @@ this benchmark, and I walked into it again on the first run of this cell.
 
 ## Results
 
+One row per arm, one column group per engine, so a comparison is read across a
+row rather than by counting rows in two separate blocks. The control sits
+directly above the arm it controls, because that pair is the only thing that
+makes an arm's number mean anything.
+
 ### Linux (dev box, /mnt/xfs — **2 cores**)
 
-| engine | arm | writes/s | notify cost | lat p50 | lat p99 |
-|---|---|---:|---:|---:|---:|
-| mpedb | A no listener *(ctl)* | 395 | — | | |
-| mpedb | A per-commit | 392 | **none** | 36 µs | 1004 µs |
-| mpedb | B no listener *(ctl)* | 18371 | — | | |
-| mpedb | B batched | 18753 | **none** | 39 µs | 93 µs |
-| mpedb | A, page-publish mode | 38 | | 46 µs | 966 µs |
-| mpedb | C conc no listener *(ctl)* | 866 | — | | |
-| mpedb | **C concurrent** | **894** | **none** | | |
-| mpedb | D 1 listener | 383 | | | |
-| mpedb | D 10 listeners | 369 | | | |
-| mpedb | D 100 listeners | 285 | | | |
-| postgres | A no notify *(ctl)* | 341 | — | | |
-| postgres | A per-commit | 314 | 8 % | 2397 µs | 7068 µs |
-| postgres | B no notify *(ctl)* | 5780 | — | | |
-| postgres | B batched | 5693 | 2 % | 3140 µs | 16136 µs |
-| postgres | C conc no notify *(ctl)* | 863 | — | | |
-| postgres | **C concurrent** | **347** | **60 %** | | |
-| postgres | D 1 listener | 303 | | | |
-| postgres | D 10 listeners | 268 | | | |
-| postgres | D 100 listeners | 217 | | | |
+| Arm | writes/s mpedb | writes/s pg | notify cost mpedb | notify cost pg | p50 mpedb | p50 pg | p99 mpedb | p99 pg |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| A control — no notification | 395 | 341 | — | — | | | | |
+| **A per-commit** | **392** | **314** | **none** | 8 % | **36 µs** | 2397 µs | 1004 µs | 7068 µs |
+| B control — no notification | 18371 | 5780 | — | — | | | | |
+| **B batched (100/txn)** | **18753** | **5693** | **none** | 2 % | **39 µs** | 3140 µs | 93 µs | 16136 µs |
+| C control — 4 writers, no notification | 866 | 863 | — | — | | | | |
+| **C concurrent — 4 writers** | **894** | **347** | **none** | **60 %** | | | | |
+| D — 1 listener | 383 | 303 | | | | | | |
+| D — 10 listeners | 369 | 268 | | | | | | |
+| D — 100 listeners | 285 | 217 | | | | | | |
 
 ### macOS (M3, /tmp — **11 cores**)
 
-| engine | arm | writes/s | notify cost | lat p50 | lat p99 |
-|---|---|---:|---:|---:|---:|
-| mpedb | A no listener *(ctl)* | 315 | — | | |
-| mpedb | A per-commit | 317 | **none** | 147 µs | 304 µs |
-| mpedb | B no listener *(ctl)* | 20472 | — | | |
-| mpedb | B batched | 22776 | **none** | 143 µs | 289 µs |
-| mpedb | A, page-publish mode | 143 | | 154 µs | 323 µs |
-| mpedb | C conc no listener *(ctl)* | 785 | — | | |
-| mpedb | **C concurrent** | **799** | **none** | | |
-| mpedb | **D 1 listener** | **320** | | | |
-| mpedb | **D 10 listeners** | **316** | | | |
-| mpedb | **D 100 listeners** | **333** | | | |
-| postgres | A no notify *(ctl)* | 292 | — | | |
-| postgres | A per-commit | 284 | 3 % | 3313 µs | 3920 µs |
-| postgres | B no notify *(ctl)* | 11346 | — | | |
-| postgres | B batched | 10229 | 10 % | 3168 µs | 3994 µs |
-| postgres | C conc no notify *(ctl)* | 661 | — | | |
-| postgres | **C concurrent** | **329** | **50 %** | | |
-| postgres | **D 1 listener** | **289** | | | |
-| postgres | **D 10 listeners** | **280** | | | |
-| postgres | **D 100 listeners** | **211** | **27 %** | | |
+| Arm | writes/s mpedb | writes/s pg | notify cost mpedb | notify cost pg | p50 mpedb | p50 pg | p99 mpedb | p99 pg |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| A control — no notification | 315 | 292 | — | — | | | | |
+| **A per-commit** | **317** | **284** | **none** | 3 % | **147 µs** | 3313 µs | 304 µs | 3920 µs |
+| B control — no notification | 20472 | 11346 | — | — | | | | |
+| **B batched (100/txn)** | **22776** | **10229** | **none** | 10 % | **143 µs** | 3168 µs | 289 µs | 3994 µs |
+| C control — 4 writers, no notification | 785 | 661 | — | — | | | | |
+| **C concurrent — 4 writers** | **799** | **329** | **none** | **50 %** | | | | |
+| **D — 1 listener** | **320** | **289** | | | | | | |
+| **D — 10 listeners** | **316** | **280** | | | | | | |
+| **D — 100 listeners** | **333** | **211** | **flat** | **−27 %** | | | | |
+
+**mpedb-only row, with no counterpart to sit beside.** `durability = commit` —
+whole-page publish, mpedb's *slowest* durable mode — run through arm A so the
+unflattering number is on the record rather than omitted: **38 writes/s** at
+46 µs p50 on Linux, **143 writes/s** at 154 µs p50 on the M3. PostgreSQL has no
+equivalent mode, so it is a footnote and not a column.
 
 ## What the numbers say
 
