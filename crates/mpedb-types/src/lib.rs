@@ -13,6 +13,7 @@ pub mod keycode;
 pub mod model;
 pub mod policy;
 pub mod schema;
+pub mod subedit;
 pub mod value;
 
 pub use config::{
