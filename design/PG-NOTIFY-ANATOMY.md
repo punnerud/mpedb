@@ -92,6 +92,8 @@ krever serialisering. Ikke leveransen — ordningen.
 
 ## Hvorfor mpedb ikke trenger det samme
 
+(Protokollen vår i sin helhet: [DESIGN-NOTIFY.md](DESIGN-NOTIFY.md).)
+
 Ikke fordi vi er smartere om låser — fordi vi ikke har objektet som krever dem.
 
 Vi har ingen kø. Varselet bærer «tabell T er på generasjon G», ikke en payload,

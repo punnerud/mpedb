@@ -22,6 +22,9 @@ which is worth reading before trusting anything below. Two things it corrects:
   `SignalBackends` still walks **every** listener in the cluster under an
   exclusive `NotifyQueueLock` for the direct-advance optimization.
 
+The protocol itself is specified in
+[design/DESIGN-NOTIFY.md](../design/DESIGN-NOTIFY.md).
+
 **The question this cell answers.** mpedb has no queue, so it has no ordering to
 protect and nothing to serialize: the writer lock already orders commits per
 table, and a listener reads what changed from its own MVCC snapshot instead of
@@ -133,6 +136,83 @@ Linux (67×), 147 µs vs 3313 µs on the M3 (23×). No queue, no server round tr
 36 µs is `futex_wake_all` being a documented no-op off Linux, so the listener
 polls at ~200 µs granularity. It is still 23× under PostgreSQL, but it is not
 the design's number — it is the platform's.
+
+## Acting on a notification: the shard guard
+
+A benchmark of notification alone measures half the problem. A notification
+says *something changed*; the reason you wanted it is to **do** something, and
+two listeners that wake on the same change and both write will race.
+
+PostgreSQL's answers are `SELECT … FOR UPDATE SKIP LOCKED` and advisory locks —
+row locks, or a key you pick by hand and hope is right — layered on top of the
+cluster-global commit lock measured above. Both hold something across the work.
+
+mpedb's answer reuses what made the notification cheap: **the surface is
+already computed.** Every statement is a compiled plan carrying a `Footprint`
+that names the tables it reads and writes, so an action made of several
+statements has the union of theirs. That union is the shard: bigger than one
+statement, far smaller than global, and *derived from the SQL* rather than
+declared by hand.
+
+```rust
+let snap = listener.snapshot();          // the token from the doorbell
+// ... read, compute, call out, take as long as you like — no lock held ...
+let mut s = db.begin_guarded_for(snap, &[
+    "SELECT total FROM orders WHERE id = $1",       // the read that decides
+    "UPDATE orders SET state = $1 WHERE id = $2",
+    "INSERT INTO audit (order_id, note) VALUES ($1, $2)",   // another table
+])?;
+// ... run whichever of them apply ...
+s.commit()?   // Err(WriteConflict) if anything in that union moved since `snap`
+```
+
+**The operations are declared, not accumulated.** You list what the action
+*might* do — any number of inserts, updates and deletes across any number of
+tables — and they are compiled, not executed. A branch not taken would
+otherwise shrink the surface, so two workers running the same logical action
+would guard different things; declaring gives the shard an identity that exists
+before anything runs. Executing still widens it, so a wrong declaration makes
+the guard bigger, never wrong.
+
+**Reads are guarded too**, and that is deliberate: guarding only the writes
+would let the row a decision rested on move and still let the action commit — a
+lost update wearing a guard.
+
+### Why this needs no global lock
+
+The check runs first in the commit path, **under the writer lock the commit
+already holds**. That is the whole trick: being under that lock is what makes
+the check atomic with the commit, so nothing new has to be locked. PostgreSQL
+needs a cluster-global lock to make the equivalent statement because its
+ordering guarantee spans a shared queue; there is no shared structure here to
+keep ordered.
+
+What it guarantees: **no lost updates on your surface.** If you commit, nothing
+you read or wrote moved since `snap`.
+What it does not: exclusivity of the *work*. Two actors may both compute; one
+commits. For work without external side effects that is strictly better than a
+lock — nothing to lease, nothing to reap, and a SIGKILLed actor costs nothing
+because a dead process simply did not commit. Where the work has external
+effects that cannot run twice, a lease is required instead (#142 G2, not built).
+
+### Limits, pinned as tests
+
+Conflict history rides the existing 64-entry commit ring, so three limits apply.
+All fail toward a **retry**, never a wrong answer, and each is a test rather
+than a paragraph:
+
+| Limit | Effect |
+|---|---|
+| 64 commits of history | An older snapshot is refused even against a disjoint surface — it bounds how long you may think between reading and writing |
+| Table ids folded `& 63` | Tables 64 apart alias into a false conflict |
+| Key precision only for point writes | A range write is recorded table-wide, so the key regions above sharpen *notification* but not yet the guard |
+
+Counters (`GuardStats`: cleared / overlap / snapshot-too-old / ring-gap) exist
+so "should the ring be widened?" stays a measurement rather than an argument —
+the discipline that closed #24 and this document's own N4 as *measured, not
+worth it*.
+
+## What this does not measure
 
 ## What this does not measure
 
