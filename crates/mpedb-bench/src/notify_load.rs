@@ -170,6 +170,18 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                 "UPDATE acct SET bal = $1 WHERE id = $2",
                 "INSERT INTO audit (id, acct, note) VALUES ($1, $2, $3)",
             ];
+            // Declared WITH the values (#148). Bare SQL names every row of
+            // each table — `WHERE id = $2` with no `$2` genuinely does — so
+            // the guard would widen to table granularity and this arm would
+            // measure the pre-#143 engine. The placeholders that are not key
+            // parts are never read.
+            let declare = |user: i64, audit_id: i64| {
+                (
+                    [Value::Int(user)],
+                    [Value::Int(0), Value::Int(user)],
+                    [Value::Int(audit_id), Value::Int(user), Value::Int(0)],
+                )
+            };
             let mut audit_id = w * 1_000_000;
             for i in 0..n_actions {
                 let user = user_at(i);
@@ -190,7 +202,15 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                     std::thread::sleep(think);
                     // act, guarded
                     let mut s = if guarded {
-                        db.begin_guarded_for(snap, &may_run)?
+                        let (p0, p1, p2) = declare(user, audit_id + 1);
+                        db.begin_guarded_with(
+                            snap,
+                            &[
+                                (may_run[0], &p0[..]),
+                                (may_run[1], &p1[..]),
+                                (may_run[2], &p2[..]),
+                            ],
+                        )?
                     } else {
                         db.begin()?
                     };

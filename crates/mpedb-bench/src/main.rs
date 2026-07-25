@@ -12,6 +12,7 @@
 
 mod bulk;
 mod notify;
+mod doc_load;
 mod notify_load;
 mod dur_compare;
 mod eng_mpedb;
@@ -275,6 +276,13 @@ fn main() {
             }
             return;
         }
+        if raw.first().map(|a| a == "--doc-worker").unwrap_or(false) {
+            if let Err(e) = doc_load::worker_main(&raw[1..]) {
+                eprintln!("doc worker failed: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
     }
     // Short-cell fairness (esp. Darwin): a mid-sample WAL checkpoint msyncs
     // every logged page into the main mapping. On APFS that cost tracks range
@@ -361,19 +369,21 @@ fn main() {
             || a == "--io"
             || a == "--notify"
             || a == "--notify-load"
+            || a == "--doc-load"
             || VALUED.contains(&a.as_str())
             || (i > 0 && VALUED.contains(&args[i - 1].as_str()));
         if !known {
             eprintln!(
                 "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres|turso|mpedb,sqlite] \
                  [--tmpfs DIR] [--disk DIR] [--out FILE] [--value-bytes N] \
-                 [--h2h REPS] [--extents ITERS] [--notify]"
+                 [--h2h REPS] [--extents ITERS] [--notify] [--notify-load] [--doc-load]"
             );
             std::process::exit(2);
         }
     }
     let notify_arg = args.iter().any(|a| a == "--notify");
     let notify_load_arg = args.iter().any(|a| a == "--notify-load");
+    let doc_load_arg = args.iter().any(|a| a == "--doc-load");
     let cfg = if quick { RunCfg::quick() } else { RunCfg::full() };
 
     let pid = std::process::id();
@@ -427,6 +437,13 @@ fn main() {
     if notify_load_arg {
         if let Err(e) = notify_load::run(disk_base.clone()) {
             eprintln!("notify load cell failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if doc_load_arg {
+        if let Err(e) = doc_load::run(disk_base.clone()) {
+            eprintln!("doc load cell failed: {e}");
             std::process::exit(1);
         }
         return;

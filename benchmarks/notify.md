@@ -155,7 +155,11 @@ The think time is the point. It stands for whatever a handler does between
 deciding and committing, and it is exactly the window a lock is held across, or
 not. PostgreSQL takes `SELECT … FOR UPDATE` before thinking, which is the
 ordinary correct way to write it there. mpedb holds nothing and guards at
-commit (`begin_guarded_for`).
+commit (`begin_guarded_with`, declaring the statements **with their parameter
+values** — bare SQL names every row of each table and would measure the
+pre-#143 engine; see [documents.md](documents.md) for why that stopped being a
+detail). Re-measured after that change: the numbers below did not move, because
+this arm's read and its write name the same key either way.
 
 Two sub-arms: **E-shard** gives each worker a disjoint slice of users, so
 nothing can collide; **E-hot** puts every worker on four users, so everything

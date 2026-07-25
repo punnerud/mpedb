@@ -182,16 +182,19 @@ fn without_a_session_the_guard_falls_back() {
     d.query("INSERT INTO shared (id, v) VALUES (1, 0)", &[]).unwrap();
     d.query("INSERT INTO shared (id, v) VALUES (2, 0)", &[]).unwrap();
     let snap = d.snapshot_txn();
-    let sql = ["UPDATE shared SET v = $1 WHERE id = $2"];
+    let sql = "UPDATE shared SET v = $1 WHERE id = $2";
 
     // Different rows, no tenant anywhere: #143's key filter should still let
-    // both through.
-    let mut a = d.begin_guarded_for(snap, &sql).unwrap();
-    a.query(sql[0], &[Value::Int(7), Value::Int(1)]).unwrap();
+    // both through. Declared WITH the values, because that is the form in
+    // which a statement names one row rather than the whole table.
+    let pa = [Value::Int(7), Value::Int(1)];
+    let mut a = d.begin_guarded_with(snap, &[(sql, &pa[..])]).unwrap();
+    a.query(sql, &pa).unwrap();
     a.commit().unwrap();
 
-    let mut b = d.begin_guarded_for(snap, &sql).unwrap();
-    b.query(sql[0], &[Value::Int(9), Value::Int(2)]).unwrap();
+    let pb = [Value::Int(9), Value::Int(2)];
+    let mut b = d.begin_guarded_with(snap, &[(sql, &pb[..])]).unwrap();
+    b.query(sql, &pb).unwrap();
     b.commit().expect("the pre-#144 row-level path stopped working");
     drop(d);
     let _ = std::fs::remove_file(&path);

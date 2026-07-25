@@ -118,8 +118,9 @@ holding anything:
    caught up to, captured with its generations. A *fresh* snapshot after waking
    would include the very commit you woke for and guard against nothing.
 2. Work, outside any lock, for as long as you like.
-3. `Database::begin_guarded_for(snap, &[…sql…])` — the declared surface is the
-   union of those statements' footprints, reads included.
+3. `Database::begin_guarded_with(snap, &[(sql, params), …])` — the declared
+   surface is the union of those statements' footprints: their tables, their
+   key regions, their columns, reads included.
 4. Commit. The check runs first in `commit_inner`, under the writer lock the
    commit already holds, against the committed-footprint ring. Overlap ⇒
    `Error::WriteConflict`, cheaply: no catalog writeback, no freelist fixpoint.
@@ -129,6 +130,34 @@ surface, so two workers running the same logical action would guard different
 things — and a shard needs an identity that exists before anything runs, which
 is what a lease (G2) and shard-aware queue dispatch (G3) key on. Execution still
 widens, so a wrong declaration makes the guard bigger, never wrong.
+
+**The parameters are part of the declaration, not a convenience.** `UPDATE doc
+SET body = $1 WHERE id = $2` with no value for `$2` names **every** row of
+`doc`, and a declaration has to hold for the statement that never runs — so
+`begin_guarded_for`, which takes bare SQL, widens to the whole table and every
+column. That is exactly the granularity the guard had before #143, and it is
+correct. `begin_guarded_with` takes the values, resolves the point key, and is
+what makes a thousand editors on a thousand documents stop meeting each other.
+The two forms are pinned against each other in `tests/shard_guard.rs`.
+
+This is not a style preference. Between #143 (key regions) and this, the
+declaration contributed **only tables** while the conflict test had narrowed to
+keys and columns — so the documented pattern above, whose whole point is that
+the read happens outside the session, silently dropped its read dependency.
+Nothing inside the session ever touches that row, so nothing could re-add it.
+`a_read_taken_before_the_session_is_still_guarded` is that lost update, and it
+committed on HEAD before this was fixed.
+
+**What a declared statement contributes, exactly.** An UPDATE names its
+assigned columns plus whatever its expressions and filter read. A SELECT names
+its projected and filtered columns — but only in the shape where that is the
+whole answer: one table, no join, no aggregate, no window, no DISTINCT, no
+ORDER BY, no LIMIT. Richer shapes can turn on a column that appears nowhere in
+the plan (a join's row count, an aggregate's input set, a LIMIT's ordering), so
+they keep the whole row. INSERT and DELETE always keep every column: one
+creates them all and the other removes them all. Row identity needs no special
+case — the binder refuses `UPDATE … SET <pk column>`, so only INSERT and DELETE
+can move a row, and both are already total.
 
 **Guarantee:** no lost updates on your surface.
 **Not a guarantee:** exclusivity of the work. Two actors may compute, one

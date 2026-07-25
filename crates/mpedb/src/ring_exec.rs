@@ -60,7 +60,7 @@ use crate::exec::{exec_stmt_triggered, resolve_part, WriteCtx};
 use crate::trigger::TriggerSet;
 use crate::{Database, ExecResult};
 use mpedb_core::{row, PendingIntent, WriteTxn};
-use mpedb_sql::{AccessPath, CompiledPlan, InsertSource, PlanStmt};
+use mpedb_sql::{AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
 use mpedb_types::value::{read_value, write_value};
 use mpedb_types::{
     keycode, Concurrency, DefaultExpr, Error, KeyAccess, KeyPart, PlanHash, Result, Value,
@@ -307,6 +307,87 @@ fn locality_key(p: &PreparedIntent) -> SortKey {
 /// statement 1 rewrites the whole table and statement 2 touches key K would
 /// then advertise K, and a listener watching a different key would sleep
 /// through statement 1.
+/// The columns a statement's outcome depends on, or `None` for "all of them".
+///
+/// Shared by execution (`widen_guard`) and by declaration
+/// (`Database::begin_guarded_with`) precisely so the two cannot drift: a
+/// declaration that summarised columns differently from the execution it
+/// declares would be a guarantee that changes depending on which branch ran.
+///
+/// **UPDATE** is exact: `PlanStmt::Update` names what it assigns, and
+/// `Instr::PushCol` is the only instruction that reads the row, so the true
+/// footprint is (assigned) ∪ (read by its expressions and filter). `SET ord =
+/// $1` and `SET body = $1` read nothing, which is why a move and an edit on one
+/// row stop conflicting; write `SET ord = ord + 1` and `ord` joins the mask,
+/// because a concurrent change to it would have altered the result.
+///
+/// **SELECT** is exact only in the shape where the question has one answer: a
+/// single table, no join, no aggregate, no window, no DISTINCT, no ORDER BY.
+/// Then the result is a function of the projected columns, the filter's
+/// columns, and nothing else — a concurrent change to any other column of the
+/// same row cannot alter what this statement returned, so it cannot alter the
+/// decision made from it. Every richer shape (a join's row count, an
+/// aggregate's input set, a LIMIT's ordering) can turn on a column that appears
+/// nowhere in the plan's expressions, so those keep the whole row. A statement
+/// carrying subplans keeps the whole row for the same reason: a subquery's
+/// column reads live on the subplan, not in any field examined here.
+///
+/// **INSERT and DELETE** are always all columns: one creates every column and
+/// the other removes every column.
+pub(crate) fn plan_cols(plan: &CompiledPlan) -> Option<u64> {
+    // A subquery reads whatever it reads — including other columns of THIS
+    // table — and none of it appears in the fields examined below. It arrives
+    // through a parameter slot, not through `Instr::PushCol`, so the masks are
+    // blind to it. This covers UPDATE's `SET x = (SELECT …)` as well as a
+    // SELECT with an `IN (SELECT …)`.
+    if !plan.subplans.is_empty() {
+        return None;
+    }
+    match &plan.stmt {
+        PlanStmt::Update { set, filter, .. } => {
+            let mut m = filter.as_ref().map_or(0u64, |f| f.cols_read_mask());
+            for (col, e) in set {
+                m |= 1u64 << (col & 63);
+                m |= e.cols_read_mask();
+            }
+            Some(m)
+        }
+        PlanStmt::Select(sp) => {
+            if !sp.joins.is_empty()
+                || sp.aggregate.is_some()
+                || !sp.windows.is_empty()
+                || sp.distinct
+                || !sp.order_by.is_empty()
+                || sp.joined_filter.is_some()
+                || sp.post_filter.is_some()
+                || sp.limit.is_some()
+                || sp.offset.is_some()
+            {
+                return None;
+            }
+            let mut m = sp.filter.as_ref().map_or(0u64, |f| f.cols_read_mask());
+            for p in &sp.projection {
+                match p {
+                    Projection::Column(c) => m |= 1u64 << (c & 63),
+                    Projection::Expr { program, .. } => m |= program.cols_read_mask(),
+                }
+            }
+            Some(m)
+        }
+        _ => None,
+    }
+}
+
+/// The point key a statement names, resolved against `params`, or `None` when
+/// it names anything other than exactly one key. `None` is "anywhere".
+pub(crate) fn plan_key(plan: &CompiledPlan, params: &[Value]) -> Option<u64> {
+    match &plan.footprint.key_access {
+        KeyAccess::Point(parts) => resolve_key_bytes(parts, plan, params).map(|b| key_hash(&b)),
+        _ => None,
+    }
+}
+
+
 /// Widen an open guard by this statement's whole footprint (#142 G1).
 ///
 /// READS are included, and that is the point rather than an oversight: the
@@ -356,22 +437,15 @@ pub(crate) fn widen_guard(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, params: &
     // Everything else widens to ALL columns. A DELETE removes every column; an
     // INSERT creates every column; and a SELECT that DECIDED depends on more
     // than its filter names, so narrowing it would risk losing a conflict.
-    let mut mask_all = plan.footprint.tables_read.iter().next().is_some()
-        && !matches!(plan.stmt, PlanStmt::Update { .. });
+    let mask = plan_cols(plan);
+    let mask_all = mask.is_none();
     let mut cols: Vec<u16> = Vec::new();
-    if let PlanStmt::Update { set, filter, .. } = &plan.stmt {
-        let mut read = filter.as_ref().map_or(0u64, |f| f.cols_read_mask());
-        for (col, e) in set {
-            cols.push(*col);
-            read |= e.cols_read_mask();
-        }
+    if let Some(m) = mask {
         for b in 0..64u16 {
-            if read & (1u64 << b) != 0 {
+            if m & (1u64 << b) != 0 {
                 cols.push(b);
             }
         }
-    } else {
-        mask_all = true;
     }
     if mask_all {
         txn.guard_touch_col(None);

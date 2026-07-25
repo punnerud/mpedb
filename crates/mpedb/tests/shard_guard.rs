@@ -309,6 +309,10 @@ fn the_expected_retry_succeeds_on_the_second_attempt() {
 /// `two_disjoint_actions_both_commit` — and like that one, a guard that only
 /// caught conflicts would pass every other test in this file and still fail
 /// here.
+///
+/// It declares with VALUES, because that is the only form in which the claim
+/// is true: `WHERE id = $2` with no value for `$2` names every row of the
+/// table, and a declaration has to hold for the statement that never runs.
 #[test]
 fn two_actions_on_different_rows_of_one_table_both_commit() {
     let (d, path) = db("rows");
@@ -316,19 +320,54 @@ fn two_actions_on_different_rows_of_one_table_both_commit() {
     d.query("INSERT INTO orders (id, v) VALUES (2, 2)", &[]).unwrap();
     let snap = d.snapshot_txn();
 
-    let sql = ["UPDATE orders SET v = $1 WHERE id = $2"];
+    let sql = "UPDATE orders SET v = $1 WHERE id = $2";
 
-    let mut a = d.begin_guarded_for(snap, &sql).unwrap();
-    a.query("UPDATE orders SET v = 10 WHERE id = 1", &[]).unwrap();
+    let pa = [Value::Int(10), Value::Int(1)];
+    let mut a = d.begin_guarded_with(snap, &[(sql, &pa[..])]).unwrap();
+    a.query(sql, &pa).unwrap();
     a.commit().expect("action on id=1 should commit");
 
     // Same table, same snapshot, different row. Before #143 this was refused.
-    let mut b = d.begin_guarded_for(snap, &sql).unwrap();
-    b.query("UPDATE orders SET v = 20 WHERE id = 2", &[]).unwrap();
+    let pb = [Value::Int(20), Value::Int(2)];
+    let mut b = d.begin_guarded_with(snap, &[(sql, &pb[..])]).unwrap();
+    b.query(sql, &pb).unwrap();
     b.commit().expect(
         "action on id=2 was refused because id=1 moved — the guard is still \
          table-granular and per-row sharding buys nothing",
     );
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **The same pair, declared without values, MUST conflict.** `WHERE id = $2`
+/// with no `$2` is a statement that may touch any row, and a guard that let
+/// this through would be promising something it cannot keep for the branch
+/// that did not run.
+///
+/// This is the price of the fix and it is deliberately pinned: the convenient
+/// form is the safe one, and the precise one is opt-in.
+#[test]
+fn the_same_pair_declared_without_values_is_table_granular() {
+    let (d, path) = db("rows-novalues");
+    d.query("INSERT INTO orders (id, v) VALUES (1, 1)", &[]).unwrap();
+    d.query("INSERT INTO orders (id, v) VALUES (2, 2)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+
+    let sql = ["UPDATE orders SET v = $1 WHERE id = $2"];
+    let mut a = d.begin_guarded_for(snap, &sql).unwrap();
+    a.query("UPDATE orders SET v = 10 WHERE id = 1", &[]).unwrap();
+    a.commit().expect("the first action should commit");
+
+    let mut b = d.begin_guarded_for(snap, &sql).unwrap();
+    b.query("UPDATE orders SET v = 20 WHERE id = 2", &[]).unwrap();
+    match b.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!(
+            "expected WriteConflict, got {other:?} — a declaration with no values named every \
+             row, so it cannot be treated as naming one"
+        ),
+    }
 
     drop(d);
     let _ = std::fs::remove_file(&path);
@@ -537,6 +576,187 @@ fn an_expression_that_reads_a_column_guards_it() {
              the read side of the column mask is missing"
         ),
     }
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **The declaration must cover a read taken BEFORE the session opened.**
+///
+/// This is the documented pattern, and the only one that makes sense with a
+/// think time in it: take a snapshot, read what you need, work for as long as
+/// you like outside any lock, then open the guarded session and write. The
+/// read is what the write is derived from, so a concurrent change to it is
+/// exactly the lost update the guard exists to refuse.
+///
+/// Nothing executed inside the session ever touches that row — only the
+/// declaration names it. So this is a test of the DECLARATION, not of
+/// accumulation, and it is the case #143's key regions can silently drop: the
+/// surface narrowed from "the table" to "the keys I touched", and the key I
+/// read outside is not one of them.
+#[test]
+fn a_read_taken_before_the_session_is_still_guarded() {
+    let (d, path) = db("declared-read");
+    d.query("INSERT INTO orders (id, v) VALUES (1, 10)", &[]).unwrap();
+    // A DIFFERENT key from the one being read: the region summary does not
+    // include the table, so reusing key 1 on both sides would collide in the
+    // bloom and pass for the wrong reason.
+    d.query("INSERT INTO audit (id, v) VALUES (7, 0)", &[]).unwrap();
+
+    let snap = d.snapshot_txn();
+    // Read row 1 of `orders` OUTSIDE the session — the value the decision is
+    // made from.
+    let seen = match d.query("SELECT v FROM orders WHERE id = 1", &[]).unwrap() {
+        mpedb::ExecResult::Rows { rows, .. } => match rows[0][0] {
+            Value::Int(v) => v,
+            _ => panic!("expected an int"),
+        },
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(seen, 10);
+
+    // Someone else changes precisely that row while we think. Through a
+    // session, so the commit records the exact key it wrote — an auto-commit
+    // publishes "anywhere in this table" and would make this pass without
+    // proving anything.
+    let mut other = d.begin().unwrap();
+    other.query("UPDATE orders SET v = 99 WHERE id = 1", &[]).unwrap();
+    other.commit().unwrap();
+
+    // Now act on what we read, writing somewhere else entirely.
+    let mut s = d
+        .begin_guarded_for(
+            snap,
+            &[
+                "SELECT v FROM orders WHERE id = $1",
+                "UPDATE audit SET v = $1 WHERE id = $2",
+            ],
+        )
+        .unwrap();
+    s.query("UPDATE audit SET v = 11 WHERE id = 7", &[]).unwrap();
+    match s.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!(
+            "expected WriteConflict, got {other:?} — the guarded action committed a decision \
+             derived from a value that had already changed. The declared read was not covered."
+        ),
+    }
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same declared read, this time named EXACTLY — and it must still catch
+/// the change. Precision is only worth having if it does not quietly become
+/// permission: the guard now knows the read was of `orders` row 1, and row 1
+/// is what moved.
+#[test]
+fn a_precisely_declared_read_still_catches_its_own_row() {
+    let (d, path) = db("declared-read-exact");
+    d.query("INSERT INTO orders (id, v) VALUES (1, 10)", &[]).unwrap();
+    d.query("INSERT INTO audit (id, v) VALUES (7, 0)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+
+    let read = "SELECT v FROM orders WHERE id = $1";
+    let write = "UPDATE audit SET v = $1 WHERE id = $2";
+    let rp = [Value::Int(1)];
+    let wp = [Value::Int(11), Value::Int(7)];
+
+    let mut other = d.begin().unwrap();
+    other.query("UPDATE orders SET v = 99 WHERE id = 1", &[]).unwrap();
+    other.commit().unwrap();
+
+    let mut s = d
+        .begin_guarded_with(snap, &[(read, &rp[..]), (write, &wp[..])])
+        .unwrap();
+    s.query(write, &wp).unwrap();
+    match s.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!(
+            "expected WriteConflict, got {other:?} — the declared read named row 1 and row 1 \
+             changed, so the decision was made from a stale value"
+        ),
+    }
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// And the half that makes precision worth anything: a change to a DIFFERENT
+/// row of the table that was read must not refuse the action. Without this the
+/// test above is satisfied by "always conflict".
+#[test]
+fn a_precisely_declared_read_ignores_another_row() {
+    let (d, path) = db("declared-read-other");
+    d.query("INSERT INTO orders (id, v) VALUES (1, 10)", &[]).unwrap();
+    d.query("INSERT INTO orders (id, v) VALUES (3, 30)", &[]).unwrap();
+    d.query("INSERT INTO audit (id, v) VALUES (7, 0)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+
+    let read = "SELECT v FROM orders WHERE id = $1";
+    let write = "UPDATE audit SET v = $1 WHERE id = $2";
+    let rp = [Value::Int(1)];
+    let wp = [Value::Int(11), Value::Int(7)];
+
+    // Someone changes row 3. We read row 1.
+    let mut other = d.begin().unwrap();
+    other.query("UPDATE orders SET v = 99 WHERE id = 3", &[]).unwrap();
+    other.commit().unwrap();
+
+    let mut s = d
+        .begin_guarded_with(snap, &[(read, &rp[..]), (write, &wp[..])])
+        .unwrap();
+    s.query(write, &wp).unwrap();
+    s.commit().expect(
+        "a change to row 3 refused an action whose declared read named row 1 — the declaration \
+         is not using the key it was given",
+    );
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **The move and the edit, through the declared API (#146 K1).** One editor
+/// declares it may read and write `body`; a mover declares it may read and
+/// write `ord`. Same row, same snapshot, both must commit — which is only true
+/// if a declared SELECT contributes the columns it actually reads rather than
+/// the whole row.
+#[test]
+fn a_declared_move_and_a_declared_edit_on_one_row_both_commit() {
+    let (d, path) = db("declared-move");
+    d.query("INSERT INTO blocks (id, ord, body) VALUES (1, 1, 100)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+
+    let ed_read = "SELECT body FROM blocks WHERE id = $1";
+    let ed_write = "UPDATE blocks SET body = $1 WHERE id = $2";
+    let mv_read = "SELECT ord FROM blocks WHERE id = $1";
+    let mv_write = "UPDATE blocks SET ord = $1 WHERE id = $2";
+    let k = [Value::Int(1)];
+    let wp = [Value::Int(2), Value::Int(1)];
+
+    let mut ed = d
+        .begin_guarded_with(snap, &[(ed_read, &k[..]), (ed_write, &wp[..])])
+        .unwrap();
+    ed.query(ed_write, &[Value::Int(200), Value::Int(1)]).unwrap();
+    ed.commit().expect("the edit should commit");
+
+    let mut mv = d
+        .begin_guarded_with(snap, &[(mv_read, &k[..]), (mv_write, &wp[..])])
+        .unwrap();
+    mv.query(mv_write, &[Value::Int(9), Value::Int(1)]).unwrap();
+    mv.commit().expect(
+        "the move was refused by an edit to a different column of the same row — a declared \
+         SELECT is still claiming the whole row",
+    );
+
+    // Both landed.
+    match d.query("SELECT ord, body FROM blocks WHERE id = 1", &[]).unwrap() {
+        mpedb::ExecResult::Rows { rows, .. } => {
+            assert_eq!(rows[0][0], Value::Int(9), "the move did not land");
+            assert_eq!(rows[0][1], Value::Int(200), "the edit did not land");
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
     drop(d);
     let _ = std::fs::remove_file(&path);
 }

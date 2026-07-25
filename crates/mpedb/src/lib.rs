@@ -1311,15 +1311,55 @@ impl Database {
     /// Execution still widens (see `WriteSession::query`): declaring wrong
     /// makes the guard bigger, never wrong.
     pub fn begin_guarded_for(&self, snap: u64, may_run: &[&str]) -> Result<WriteSession<'_>> {
-        let mut surface: Vec<u32> = Vec::new();
-        for sql in may_run {
-            let (_, fp) = self.plan_footprint(sql)?;
-            surface.extend(fp.tables_read.iter());
-            surface.extend(fp.tables_written.iter());
-        }
+        let with: Vec<(&str, &[Value])> = may_run.iter().map(|s| (*s, &[][..])).collect();
+        self.begin_guarded_with(snap, &with)
+    }
+
+    /// [`Database::begin_guarded_for`] with the parameter values, which is what
+    /// makes the declaration precise instead of merely sound.
+    ///
+    /// A declaration is a promise about what the action MAY do, and the guard
+    /// has to be able to keep that promise for a statement that never runs.
+    /// `UPDATE doc SET body = $1 WHERE id = $2` with no values names **every**
+    /// row of `doc`, so the string-only form must widen to the whole table —
+    /// correct, and exactly the granularity the guard had before key regions
+    /// (#143) existed. Supply the values and the same statement names one row,
+    /// which is what lets a thousand editors on a thousand documents stop
+    /// meeting each other.
+    ///
+    /// **This is not an optimisation, it is the guarantee.** A read taken
+    /// outside the session — the whole point of a guard, since the think time
+    /// belongs outside any lock — is covered only because it was declared.
+    /// Nothing else can cover it: no statement inside the session touches that
+    /// row.
+    pub fn begin_guarded_with(
+        &self,
+        snap: u64,
+        may_run: &[(&str, &[Value])],
+    ) -> Result<WriteSession<'_>> {
         let mut s = self.begin_guarded(snap)?;
-        for t in surface {
-            s.txn.guard_widen(t);
+        for (sql, params) in may_run {
+            let (plan, _) = self.compile_maybe_explain(sql)?;
+            for t in plan.footprint.tables_read.iter() {
+                s.txn.guard_widen(t);
+            }
+            for t in plan.footprint.tables_written.iter() {
+                s.txn.guard_widen(t);
+            }
+            // `None` on either of these means "anywhere" / "every column" —
+            // the fail-safe direction, and the only honest reading of a
+            // statement whose parameters are not known yet.
+            s.txn.guard_touch_key(ring_exec::plan_key(&plan, params));
+            match ring_exec::plan_cols(&plan) {
+                Some(m) => {
+                    for b in 0..64u16 {
+                        if m & (1u64 << b) != 0 {
+                            s.txn.guard_touch_col(Some(b));
+                        }
+                    }
+                }
+                None => s.txn.guard_touch_col(None),
+            }
         }
         Ok(s)
     }
