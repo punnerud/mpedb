@@ -537,6 +537,11 @@ mod win_lock {
                 .read(true)
                 .write(true)
                 .create(true)
+                // Explicit: the sidecar's CONTENT is never read — the lock
+                // lives in the kernel, not in the bytes — but truncating an
+                // existing one would still be wrong, because a second process
+                // may hold a lock on it right now.
+                .truncate(false)
                 .open(path)?;
             // Canonicalize so two spellings of one path share an Inner. It can
             // only fail if the file vanished between create and here, in which
@@ -963,7 +968,7 @@ pub fn boot_id() -> Option<[u8; 16]> {
         let mut out = [0u8; 16];
         out[..8].copy_from_slice(&boot_ms.to_le_bytes());
         out[8..].copy_from_slice(b"mpedb-wi");
-        return Some(out);
+        Some(out)
     }
     #[cfg(target_os = "linux")]
     {

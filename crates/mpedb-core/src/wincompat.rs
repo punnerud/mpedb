@@ -235,7 +235,7 @@ pub fn errno() -> libc::c_int {
 /// `WaitOnAddress` — a direct futex equivalent, not a degradation. macOS has to
 /// poll here; Windows does not.
 pub fn futex_wait(word: &std::sync::atomic::AtomicU32, expected: u32, timeout: std::time::Duration) {
-    let ms = timeout.as_millis().min(u32::from(u32::MAX - 1) as u128) as u32;
+    let ms = timeout.as_millis().min((u32::MAX - 1) as u128) as u32;
     let cmp = expected;
     unsafe {
         WaitOnAddress(

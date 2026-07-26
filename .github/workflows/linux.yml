@@ -100,10 +100,21 @@ jobs:
       # Windows gets the engine too, not just the portable crates: it is a port
       # in progress (#159) and the compile half of its gate should be as cheap
       # and as early as everything else's.
+      #
+      # CLIPPY, not just check, for the Windows arm: cfg-gated code is invisible
+      # to the lint pass on this host, and the first real-Windows run of the
+      # engine job failed on exactly that — three lints in `cfg(windows)` code,
+      # after the build and both stages had passed. Same debt macOS accrued in
+      # #107. Cross-linting costs seconds and moves the finding from a
+      # Windows-runner round trip to the push that caused it.
+      #
+      # wasm32 stays at `check`: its arm has no lint history and `check` is what
+      # catches the failure mode that actually occurred (overlapping cfgs).
       - name: the engine must COMPILE for Windows and wasm32
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo check -p mpedb-core --target x86_64-pc-windows-gnu
+          rustup component add clippy --target x86_64-pc-windows-gnu
+          cargo clippy -p mpedb-core --lib --target x86_64-pc-windows-gnu -- -D warnings
           cargo check -p mpedb-core --target wasm32-unknown-unknown
       - name: test
         run: cargo test --workspace
