@@ -34,18 +34,27 @@
 //! a 2-core Linux box at a 1 s deadline: 32 editors on one block still meet it,
 //! 64 do not.
 //!
-//! **The cap composes with a global limit, and that surprised the measurement.**
-//! Splitting a paragraph into 20 blocks and putting 50 editors on each did NOT
-//! give 20× the capacity: total throughput stayed flat, and so did the
-//! *unguarded* control. The ceiling is the single writer lock, not the guard.
-//! So an admission policy needs both halves — per block, and overall:
+//! **The cap does NOT compose with a global editor limit — that was an
+//! artefact of the benchmark.** Splitting a paragraph into 20 blocks and
+//! putting 50 editors on each did not give 20× the capacity, and neither did
+//! the *unguarded* control, so the guard was not what was in the way. The
+//! ceiling was one commit per edit. Fold K edits into one commit and the edit
+//! rate rises 76× on a two-core box and 106× on an M3, while commits run
+//! SLOWER on both:
 //!
 //! ```text
-//! editors on one block  <=  cap          (measured; ~32 at 1 s on that box)
-//! editors in total      <=  D x global commit rate
+//! K edits/commit:      1       8      64      256
+//! Linux commits/s:   197     171      71       59
+//! Linux edits/s:     197    1370    4525    14988     (76x)
+//! M3 commits/s:     1178    1072     794      490
+//! M3 edits/s:       1178    8577   50828   125333    (106x)
 //! ```
 //!
-//! Splitting removes *conflicts*; it does not raise the ceiling.
+//! So there is one rule, `editors on one block <= cap`, plus a design
+//! obligation: an edit must not be a commit of its own. The answer an editor
+//! waits for is *did my edit win* — a question about conflict, not durability —
+//! and those can be answered at different times. Byte-range conflict units and
+//! acknowledge-on-claim are filed (see design/DESIGN-COLLAB.md §3), not built.
 //!
 //! ## Why the lease is not a lock
 //!

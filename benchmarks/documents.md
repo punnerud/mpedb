@@ -216,20 +216,45 @@ blocks. The intuition is that capacity becomes blocks × cap. **It does not.**
 | 20 | 1000 | 182 | 341 | 52.9 % | 209 | 394 |
 
 Throughput is flat as the document is split — **and so is the unguarded
-control**, which is what settles the attribution. The ceiling is the single
-writer lock, not the guard. Splitting removes *conflicts*; it cannot raise the
-rate at which commits are possible at all.
+control**, which settles the attribution: the guard is not what is in the way.
 
-So the admission rule has two halves, and the second one is the surprise:
+### F-batch — the ceiling is per COMMIT, not per edit
+
+The obvious reading of the table above is that the write path is saturated.
+That reading is wrong, and this arm is what catches it. Eight editors, K edits
+folded into a single commit:
+
+| K | Linux commits/s | Linux **edits/s** | M3 commits/s | M3 **edits/s** |
+|---:|---:|---:|---:|---:|
+| 1 | 197 | 197 | 1178 | 1178 |
+| 8 | 171 | **1370** | 1072 | **8577** |
+| 64 | 71 | **4525** | 794 | **50828** |
+| 256 | 59 | **14988** | 490 | **125333** |
+
+**76× the edit rate on the two-core box and 106× on the M3 — while commits run
+*slower* on both.** The engine's limit is commits, and an edit never had to be
+one. A thousand concurrent editors is a thousand edits: a fifth of a second of
+capacity at K = 64 on the slow box, eight milliseconds on the M3.
+
+So the earlier draft of this page was wrong to conclude that a thousand editors
+needs a machine committing a thousand times a second. What it needs is that an
+edit is not a commit of its own — and note that the M3 clears a thousand commits
+a second anyway, which is how thin that conclusion was. The rule that survives
+is one line:
 
 ```text
-editors on one block  ≤  cap                      (16–32 at a 1 s deadline)
-editors in total      ≤  D × global commit rate   (~340–480/s on these boxes)
+editors on one block  ≤  cap        (16–32 at a 1 s deadline)
 ```
 
-A thousand concurrent editors needs a machine that commits a thousand times a
-second — not more blocks. What splitting buys is the difference between 182 and
-nothing: it converts conflicts into independent work, up to the ceiling.
+`F-words` measured a benchmark that gives every edit its own commit, which is
+the shape a naive client would have. It is a real limit *for that shape*, and
+the fix is the shape, not the machine.
+
+**What batching does not do:** it does not make an edit durable sooner. The
+answer an editor waits for is "did my edit win" — a question about **conflict**
+— and that is decided the moment the surface is claimed. Durability arrives with
+the batch. Splitting those two answers apart is filed, with byte-range conflict
+units, in [design/DESIGN-COLLAB.md](../design/DESIGN-COLLAB.md) §3.
 
 ## What the verdict counter is for
 

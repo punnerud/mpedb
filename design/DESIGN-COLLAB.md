@@ -60,13 +60,12 @@ magnitude, and wrong in the dangerous direction, because a refused editor
 concurrency does not conserve work the way a lock queue does. Anyone tempted to
 compute this number instead of measuring it should read the sweep first.
 
-## 3. The limit that surprised the measurement
+## 3. The limit that was an artefact, and the one that is real
 
 The intuition was: a block can be as small as you like — a word — so a paragraph
-of 20 words supports 20 × cap editors. Splitting is the lever; the cap is the
-safety valve.
+of 20 words supports 20 × cap editors. Splitting is the lever.
 
-**Splitting does not multiply capacity.** Measured, 50 editors per block:
+**Splitting alone does not multiply capacity.** Measured, 50 editors per block:
 
 | blocks | editors | actions/s | *unguarded control* |
 |---:|---:|---:|---:|
@@ -74,24 +73,55 @@ safety valve.
 | 4 | 200 | 200 | 356 |
 | 20 | 1000 | 182 | 341 |
 
-Throughput is flat — and **so is the unguarded control**, which is what settles
-it. The ceiling is the single writer lock, not the guard. Splitting removes
-*conflicts*; it cannot raise the rate at which commits can happen at all.
+Flat — and **so is the unguarded control**, which is what settles the
+attribution. The ceiling is not the guard.
 
-So an admission policy needs both halves:
+**But it is not the write path either. It is one commit per edit.** Eight
+editors, K edits folded into a single commit:
+
+| K | Linux commits/s | Linux edits/s | M3 commits/s | M3 edits/s |
+|---:|---:|---:|---:|---:|
+| 1 | 197 | 197 | 1178 | 1178 |
+| 8 | 171 | **1370** | 1072 | **8577** |
+| 64 | 71 | **4525** | 794 | **50828** |
+| 256 | 59 | **14988** | 490 | **125333** |
+
+**76× the edit rate on the two-core box, 106× on the M3 — with commits running
+*slower* on both.** The engine's limit is commits, and an edit never had to be
+one. A thousand concurrent editors is 1000 edits: a fifth of a second of
+capacity at K = 64 on the slow box, eight milliseconds on the M3.
+
+So the rule is one line, not two:
 
 ```text
-editors on one block  ≤  cap                      (measured: 16–32 at 1 s)
-editors in total      ≤  D × global commit rate   (measured: ~340–480/s)
+editors on one block  ≤  cap        (16–32 at a 1 s deadline)
 ```
 
-On the Linux box that is ~340 concurrent editors across the whole document, with
-≤32 on any one block. A thousand needs a machine whose commit rate is a thousand
-per second — not more blocks.
+There is no global editor limit worth stating. What there is instead is a
+**design obligation**: an edit must not be a commit of its own.
 
-What splitting *does* buy is real: it converts conflicts into independent work,
-which is the difference between the guarded rate (182) and nothing at all. It
-just cannot exceed the unguarded ceiling.
+### What that implies, and what is not built yet
+
+The answer an editor waits for is *"did my edit win"* — a question about
+**conflict**, not about durability. Those can be answered at different times:
+claim the surface and reply at once; fold the write into the next batch. `#150`
+ships the first half (the verdict is decided by the guard at commit and returned
+immediately) and measures that the second half pays for itself. It does not yet
+ship the batching itself, nor the finer granularity that makes batching most
+valuable:
+
+- **Byte-range conflict units.** Two edits to disjoint byte ranges of the *same*
+  cell do not conflict. The range is known before execution, exactly as the key
+  is (#148), so it can be declared and compared the same way — which extends the
+  guard's dimensions from (table, key, shard, column) to (…, byte range). Ranges
+  within one batch share a base and compare directly; across batches the base
+  has moved, which is what `subedit::Splice::rebase` exists for.
+- **Acknowledge on claim, commit in batches.** The engine already group-commits
+  (`ring_exec`); what is missing is letting the *answer* precede the batch
+  rather than ride it.
+
+Both are #145's splice write form seen from the concurrency side, and both are
+filed rather than assumed.
 
 ## 4. Seats, heartbeats, and reaping
 

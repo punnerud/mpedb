@@ -90,6 +90,10 @@ const CAP_SWEEP: [usize; 6] = [2, 4, 8, 16, 32, 64];
 /// the arm that makes that claim falsifiable rather than arithmetic.
 const WORDS_BLOCKS: [usize; 3] = [1, 4, 20];
 const WORDS_EDITORS: usize = 50;
+/// `F-batch`: edits folded into ONE commit. The question this settles is
+/// whether the write ceiling is per **commit** or per **edit** — because if it
+/// is per commit, an editor's answer never had to wait for one.
+const BATCH_SIZES: [usize; 4] = [1, 8, 64, 256];
 /// Body length. Big enough for 8 editors' 16-byte slots with room to spare,
 /// small enough that the measurement is not about row size.
 const BODY: usize = 1024;
@@ -190,7 +194,8 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
     // `w % N`. `cap` is the N = 1 extreme, kept separate because its sweep is
     // over editors rather than over blocks.
     let words: Option<usize> = kind.strip_prefix("words").and_then(|n| n.parse().ok());
-    let calibrating = words.is_some() || kind == "cap";
+    let batch: Option<usize> = kind.strip_prefix("batch").and_then(|n| n.parse().ok());
+    let calibrating = words.is_some() || batch.is_some() || kind == "cap";
 
     let n_actions = if calibrating { cap_actions() } else { actions() };
     // The calibration arms measure the engine, so they do not sleep.
@@ -254,6 +259,60 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                 may_run.push(("SELECT id FROM doc", &[]));
             }
 
+            if let Some(k) = batch {
+                // Each worker owns a disjoint slice of blocks, so the batch's
+                // edits never conflict with each other — the arm is about the
+                // COST of a commit, not about contention, which `F-cap` covers.
+                let base = doc * BLOCK_STRIDE + (w * k) as i64;
+                let mut declared: Vec<[Value; 2]> = Vec::with_capacity(k);
+                for j in 0..k {
+                    declared.push([Value::Int(0), Value::Int(base + j as i64)]);
+                }
+                for i in 0..n_actions {
+                    let t0 = Instant::now();
+                    loop {
+                        let snap = db.snapshot_txn();
+                        let mut may: Vec<(&str, &[Value])> = Vec::with_capacity(k);
+                        for d in declared.iter().take(k) {
+                            may.push((write_sql, &d[..]));
+                        }
+                        let mut s = if guarded {
+                            db.begin_guarded_with(snap, &may)?
+                        } else {
+                            db.begin()?
+                        };
+                        for j in 0..k {
+                            s.query(
+                                write_sql,
+                                &[
+                                    Value::Text(format!("{i}-{j}")),
+                                    Value::Int(base + j as i64),
+                                ],
+                            )?;
+                        }
+                        match s.commit() {
+                            Ok(()) => break,
+                            Err(Error::WriteConflict) => {
+                                retries += 1;
+                                continue;
+                            }
+                            Err(e) => return Err(format!("mpedb commit: {e}").into()),
+                        }
+                    }
+                    let el = t0.elapsed().as_micros() as u64;
+                    lat.push((el, el));
+                }
+                verdicts = db.guard_stats();
+                for (total, work) in &lat {
+                    println!("L {total} {work}");
+                }
+                println!("RETRIES {retries}");
+                println!(
+                    "VERDICTS {} {} {} {} {}",
+                    verdicts.0, verdicts.1, verdicts.2, verdicts.3, verdicts.4
+                );
+                return Ok(());
+            }
             for i in 0..n_actions {
                 let t0 = Instant::now();
                 let mut work = Duration::ZERO;
@@ -723,6 +782,19 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
         word_rows.push((nb, r.aps, r.within.0, r.p99, r.retries, r.verdicts.1, ctl.aps));
     }
 
+    // ---- C1b: is the write ceiling per COMMIT or per EDIT? Eight editors,
+    // each folding K edits into one commit. If edits/s scales with K, an
+    // editor's answer never had to wait for a commit of its own — and the
+    // "total editors <= deadline x commit rate" limit was a limit on how the
+    // benchmark was written, not on the engine.
+    let mut batch_rows: Vec<(usize, f64, f64, u64)> = Vec::new();
+    for &k in &BATCH_SIZES {
+        let target = mpedb_setup(&scratch, 1, 8 * k)?;
+        let r = spawn_and_collect("mpedb", &target, &format!("batch{k}"), 8, 1)?;
+        // aps counts COMMITS; each carries k edits.
+        batch_rows.push((k, r.aps, r.aps * k as f64, r.p99));
+    }
+
     let datadir = scratch.join("pgdata-doc");
     let sockdir = scratch.join("pgsock-doc");
     let _ = std::fs::remove_dir_all(&datadir);
@@ -846,6 +918,15 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
             nb * WORDS_EDITORS,
             within * 100.0
         );
+    }
+    println!();
+    println!(
+        "`F-batch`: 8 editors, K edits folded into one commit. Is the ceiling per commit or \
+         per edit?"
+    );
+    println!("{:>7} {:>12} {:>14} {:>9}", "K", "commits/s", "edits/s", "p99 ms");
+    for (k, cps, eps, p99) in &batch_rows {
+        println!("{k:>7} {cps:>12.0} {eps:>14.0} {p99:>9}");
     }
     println!();
     println!("guard verdicts (mpedb only) — a refusal is a CONFLICT or a LIMIT, never both:");
