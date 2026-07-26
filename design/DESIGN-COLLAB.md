@@ -246,13 +246,46 @@ edit; wanting the same bytes is. This is why no anti-starvation rule is needed
 — the question dissolves rather than being answered, and
 `the_last_in_sort_order_still_lands_every_round` pins it.
 
-### The recommended service shape (not built here)
+### The recommended service shape — measured, and it works
 
 Collect submissions per block; flush when a **quorum** of the editors with
 outstanding work has delivered, with a time limit as the upper bound that should
 normally not fire. `collab::Lease` (#150) is already the presence table. The
 number that says whether the idea worked is *flush-on-quorum vs flush-on-timeout*
 — if the timeout dominates, the time limit is the design and the quorum is not.
+
+`F-quorum` measured it (benchmarks/documents.md). The timeout fires 0–2 times in
+~20 flushes when every editor is healthy and 6–16 in ~25 when a quarter of them
+are ten times slower, on both machines. So it is a bound and not the mechanism,
+which is what the idea claimed. Average batch size reached 32 — discovered from
+arrivals, where the intent ring carried exactly 1.
+
+What it does *not* buy is immunity for the fast editors: throughput roughly
+halves when a quarter are slow, because a majority of active editors usually
+cannot be assembled from the fast ones alone. Quorum picked the right trigger; it
+did not remove the coupling.
+
+### The one place two conservative choices multiply
+
+`F-quorum` also exposed a throughput bug that is invisible to any correctness
+test, because both halves fail *safe*:
+
+- step 2 guards against the **oldest** member snapshot, so one lagging editor
+  drags every other member's rebase walk back over commits those members had
+  already seen; and
+- `WriteTxn::record_written_range` publishes `(min lo, max hi)` — the union over
+  the whole transaction — so a K-member batch declares one span covering all of
+  them, which for 32 editors is most of the block.
+
+Either alone costs nothing. Together, a single lagging member makes its batch
+walk a range that covers everybody, and **every member loses**. Instrumented, a
+counter for "oldest member lags the previous commit" equalled the counter for
+"whole batch lost" in all eighteen cells measured — no fresh batch was ever
+wiped, and no wipe lacked a lagging member.
+
+The fix is to walk each member from **its own** snapshot rather than the batch
+minimum; the guard still has to be taken against the oldest, since that is what
+makes the transaction's own refusal honest. Filed, not built.
 
 ## 4. Seats, heartbeats, and reaping
 

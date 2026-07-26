@@ -226,15 +226,23 @@ folded into a single commit:
 
 | K | Linux commits/s | Linux **edits/s** | M3 commits/s | M3 **edits/s** |
 |---:|---:|---:|---:|---:|
-| 1 | 197 | 197 | 1178 | 1178 |
-| 8 | 171 | **1370** | 1072 | **8577** |
-| 64 | 71 | **4525** | 794 | **50828** |
-| 256 | 59 | **14988** | 490 | **125333** |
+| 1 | 2024 | 2024 | 1183 | 1183 |
+| 8 | 1365 | **10921** | 960 | **7682** |
+| 64 | 508 | **32506** | 514 | **32907** |
+| 256 | 377 | **96390** | 462 | **118234** |
 
-**76× the edit rate on the two-core box and 106× on the M3 — while commits run
+**46× the edit rate on the two-core box and 100× on the M3 — while commits run
 *slower* on both.** The engine's limit is commits, and an edit never had to be
-one. A thousand concurrent editors is a thousand edits: a fifth of a second of
-capacity at K = 64 on the slow box, eight milliseconds on the M3.
+one. A thousand concurrent editors is a thousand edits: thirty milliseconds of
+capacity at K = 64 on either box.
+
+> **The Linux column was re-measured on 2026-07-26 and every cell moved up 7–10×**
+> (it read 197 / 1370 / 4525 / 14988). The M3 column reproduced to within run
+> variance — 1183 against the 1178 published — and that pairing is what says the
+> *first Linux run* was wrong rather than the arm. The likeliest cause is that it
+> shared the two cores with other work; `benchmarks/README.md` already says to run
+> isolated, and this is what that rule is worth. The conclusion is unchanged and
+> the multiplier is smaller.
 
 So the earlier draft of this page was wrong to conclude that a thousand editors
 needs a machine committing a thousand times a second. What it needs is that an
@@ -255,6 +263,88 @@ answer an editor waits for is "did my edit win" — a question about **conflict*
 — and that is decided the moment the surface is claimed. Durability arrives with
 the batch. Splitting those two answers apart is filed, with byte-range conflict
 units, in [design/DESIGN-COLLAB.md](../design/DESIGN-COLLAB.md) §3.
+
+### F-quorum — flush on a majority, with time as the upper bound
+
+`F-batch` says a commit can carry K edits, but it is a *stated* K: the arm is
+told to fold 64 edits and folds 64. A real service does not know K. It knows who
+is editing, and it can wait — and the question is what it should wait **for**.
+
+The etcd answer is: not for the clock. Flush when a majority of the editors with
+outstanding work have delivered, and keep a deadline only as the bound that
+should never be reached. `F-quorum` builds that on `submit_batch` — editors are
+threads on disjoint 16-byte slices, a channel stands in for transport, quorum is
+`n/2 + 1` of those with work outstanding, and the upper bound is 5 ms.
+
+| | | Linux | | | | M3 | | |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **editors** | | on quorum | on timeout | avg K | edits/s | on quorum | on timeout | avg K | edits/s |
+| 8 | all healthy | 15 | **2** | 4.7 | 1744 | 16 | **0** | 5.0 | 1870 |
+| 32 | all healthy | 18 | **1** | 16.8 | 4090 | 18 | **1** | 16.8 | 4057 |
+| 64 | all healthy | 19 | **1** | 32.0 | 7085 | 19 | **1** | 32.0 | 6935 |
+| 8 | ¼ are 10× slow | 13 | 8 | 3.8 | 468 | 12 | 16 | 2.9 | 334 |
+| 32 | ¼ are 10× slow | 16 | 12 | 11.4 | 1745 | 16 | 6 | 14.5 | 1375 |
+| 64 | ¼ are 10× slow | 17 | 6 | 27.8 | 1612 | 16 | 13 | 22.1 | 2745 |
+
+**The batch fills.** Average K reaches 32 — where #152 measured the intent ring
+carrying exactly 1, every time, because a guarded session never reaches it. The
+K in `F-batch` was declared; this one was discovered from arrivals.
+
+**The deadline is a bound, not the mechanism.** With everyone healthy it fires
+1–2 times in ~20 flushes on Linux and 0–1 on the M3. It is what fires when a
+quarter of the editors are ten times slower — 6–16 times in ~25. That is the
+result the design asked for: time is the thing that should never happen, and it
+happens exactly when something is wrong.
+
+**Quorum does not insulate the fast from the slow, though.** Healthy → quartered
+costs 1744 → 468, 4090 → 1745, 7085 → 1612. The reason is arithmetic: a majority
+of *active* editors usually cannot be assembled out of the fast ones alone, so
+the fast editors wait for slow ones anyway — just via the majority rather than
+via the clock. Quorum bought the right *trigger*, not immunity.
+
+**Against the ceiling:** at avg K = 32 the arm gets 7085 edits/s where `F-batch`
+at K = 64 gets 32506. Most of that gap is not the engine — `F-batch` children
+loop without pausing, while a `F-quorum` editor waits for its own verdict before
+submitting again, so offered load is capped by the round trip. The arm is a floor
+on what the flush path sustains, not a competitor to the ceiling.
+
+#### The 40% loss, and what the control proved
+
+Between 27 and 285 edits lose per run, on **disjoint** offsets that should never
+collide. Two hypotheses died: stale snapshots (losses are unchanged with every
+editor fast) and whole-batch refusal (a `wiped` counter for batches where every
+member lost came back far too small).
+
+What killed it was a third counter. `behind` marks a batch whose *oldest* member
+snapshot predates the previous batch's commit, and `b.wiped` the ones of those
+that lost everybody:
+
+| | Linux 8 / 32 / 64 | M3 8 / 32 / 64 |
+|---|---|---|
+| `wiped` | 2 / 4 / 8 | 3 / 5 / 7 |
+| `b.wiped` | 2 / 4 / 8 | 3 / 5 / 7 |
+
+**Equal in all eighteen cells measured, across both machines and both health
+settings.** Not one batch of fresh members was ever wiped, and not one wipe
+happened without a lagging member. The cause is two conservative choices
+multiplying:
+
+- `submit_batch` walks the committed ring from `min(snap)` over its members, so
+  **one lagging editor drags every other member's rebase walk back** across
+  commits those members had already seen.
+- `record_written_range` publishes `(min lo, max hi)` — the union over the whole
+  transaction (`engine/write.rs`). So the previous batch declared *one* span
+  covering all K of its members, which for 32 editors is most of the block.
+
+Either alone is a rounding error. Together, one lagging member makes its whole
+batch walk over a range that covers everyone, and everyone loses. Both are
+fail-safe in the correct direction — a spurious conflict, never a missed one —
+which is exactly why this cost throughput and not correctness, and why it took a
+counter rather than a failing test to find.
+
+The fix is per-member snapshots on the rebase walk, and it is filed rather than
+built here: this arm exists to find out whether the quorum idea works, and that
+answer does not depend on it.
 
 ## What the verdict counter is for
 

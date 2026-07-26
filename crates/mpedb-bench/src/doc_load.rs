@@ -929,6 +929,41 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
         println!("{k:>7} {cps:>12.0} {eps:>14.0} {p99:>9}");
     }
     println!();
+    println!(
+        "`F-quorum`: flush when a MAJORITY of editors with outstanding work have delivered, \
+         5 ms as the upper bound. A quarter of the editors are 10x slower. Transport is a \
+         channel (not built \u{2014} DESIGN-COLLAB \u{a7}3b); this measures the FLUSH path, like \
+         `F-batch` does."
+    );
+    println!(
+        "{:>8} {:>10} {:>10} {:>7} {:>12} {:>11} {:>7} {:>7} {:>8} {:>8}",
+        "editors",
+        "on quorum",
+        "on timeout",
+        "avg K",
+        "edits/s",
+        "fast p50 ms",
+        "lost",
+        "wiped",
+        "behind",
+        "b.wiped"
+    );
+    for &e in &[8usize, 32, 64] {
+        let (t, rate, fast, slow) = run_quorum(&scratch, e, seats.max(e * 2))?;
+        println!(
+            "{e:>8} {:>10} {:>10} {:>7.1} {rate:>12.0} {:>11} {:>7} {:>7} {:>8} {:>8}",
+            t.on_quorum,
+            t.on_timeout,
+            t.members as f64 / (t.on_quorum + t.on_timeout).max(1) as f64,
+            pct(&fast, 0.50) / 1000,
+            t.lost,
+            t.wiped,
+            t.behind,
+            t.behind_wiped
+        );
+        let _ = &slow;
+    }
+    println!();
     println!("guard verdicts (mpedb only) — a refusal is a CONFLICT or a LIMIT, never both:");
     println!(
         "{:<18} {:>8} {:>10} {:>10} {:>16} {:>10} {:>10}",
@@ -987,4 +1022,196 @@ mod tests {
         assert_eq!(read_slot(&body, 0), Some(0));
         assert_eq!(read_slot(&body, 1), None);
     }
+}
+
+// ------------------------------------------------------- F-quorum (#153 E3)
+
+/// **Does quorum flushing reach the F-batch ceiling, and does the timeout stay
+/// unfired?**
+///
+/// The flush rule Morten proposed, borrowed from etcd: do not wait on the
+/// clock, wait until a *majority* of the editors with outstanding work have
+/// delivered. The slowest do not gate the fast ones. The time limit is an upper
+/// bound that should normally not fire — and *how often it fires* is the number
+/// that says whether the idea worked, which is why it is reported first.
+///
+/// **What this measures, and what it models.** The flush path: submissions
+/// already in the service's hands, applied through
+/// [`Database::submit_batch`](mpedb::Database::submit_batch). Editors are
+/// threads and the transport is a channel, because transport is deliberately
+/// not built (DESIGN-COLLAB §3b) — modelling it as free is honest here, since
+/// the comparison is against `F-batch`, which is also one process folding K
+/// statements into one commit. A network would add latency to both sides
+/// equally and change neither ratio.
+///
+/// A quarter of the editors are **ten times slower**. Without them the arm
+/// could not tell "the fast do not wait" from "everyone is fast".
+struct Job {
+    sub: mpedb::collab::Submission,
+    made: Instant,
+    slow: bool,
+    reply: std::sync::mpsc::Sender<(bool, Instant)>,
+}
+
+/// Flush trigger, counted separately: the whole claim is that the first one
+/// dominates.
+#[derive(Default)]
+struct FlushTally {
+    on_quorum: u64,
+    on_timeout: u64,
+    members: u64,
+    committed: u64,
+    lost: u64,
+    /// Batches where EVERY member lost. Distinguishes "the batch as a whole was
+    /// refused" from "individual members collided" — opposite causes.
+    wiped: u64,
+    /// Batches whose OLDEST member snapshot predates the previous batch's
+    /// commit. `submit_batch` walks the committed ring from `min(snap)`, so one
+    /// lagging member drags every other member's walk back over the previous
+    /// batch's written range — which is the union of ITS members' spans.
+    behind: u64,
+    /// Of those, the ones that lost every member. If `behind_wiped ≈ wiped`,
+    /// the losses are that compounding and not a collision at all.
+    behind_wiped: u64,
+}
+
+fn quorum_of(active: usize) -> usize {
+    // With two or fewer, a majority IS everyone and the quorum buys nothing —
+    // flush on the first arrival instead of degenerating into the timeout.
+    if active <= 2 {
+        1
+    } else {
+        active / 2 + 1
+    }
+}
+
+fn run_quorum(scratch: &Path, editors: usize, seats: usize) -> BResult<(FlushTally, f64, Vec<u64>, Vec<u64>)> {
+    use mpedb::{Config, Database};
+    let target = mpedb_setup(scratch, 1, seats)?;
+    let db = std::sync::Arc::new(Database::open_with_config(Config::from_toml_str(
+        &std::fs::read_to_string(&target)?,
+    )?)?);
+
+    let n_actions = cap_actions();
+    let timeout = Duration::from_millis(5);
+    let (tx, rx) = std::sync::mpsc::channel::<Job>();
+
+    let mut handles = Vec::with_capacity(editors);
+    for e in 0..editors {
+        let tx = tx.clone();
+        let db = db.clone();
+        // Every editor owns a 16-byte slice of the block, so the common case is
+        // a rebase and not a collision — which is the case the design claims to
+        // serve. Collisions get their own arms.
+        let at = (e * 16) as u64;
+        // `MPEDB_F_SLOW_EVERY=0` makes everyone fast — the control that says
+        // whether the losses come from the slow editors' stale snapshots.
+        let every = env_u64("MPEDB_F_SLOW_EVERY", 4) as usize;
+        let slow = every > 0 && e % every == 0;
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..n_actions {
+                let (rtx, rrx) = std::sync::mpsc::channel();
+                let job = Job {
+                    sub: mpedb::collab::Submission {
+                        editor: e as i64,
+                        snap: db.snapshot_txn(),
+                        key: 0,
+                        at,
+                        remove: 4,
+                        insert: "xxxx".into(),
+                    },
+                    made: Instant::now(),
+                    slow,
+                    reply: rtx,
+                };
+                if tx.send(job).is_err() {
+                    return;
+                }
+                if rrx.recv().is_err() {
+                    return;
+                }
+                if slow {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }));
+    }
+    drop(tx);
+
+    let t0 = Instant::now();
+    let mut tally = FlushTally::default();
+    let (mut fast_lat, mut slow_lat) = (Vec::new(), Vec::new());
+    let mut pending: Vec<Job> = Vec::new();
+    let mut first_at: Option<Instant> = None;
+    let mut last_txn = db.snapshot_txn();
+    let need = quorum_of(editors);
+    let mut done = false;
+    while !done || !pending.is_empty() {
+        let wait = match first_at {
+            Some(t) => timeout.saturating_sub(t.elapsed()),
+            None => Duration::from_millis(50),
+        };
+        match rx.recv_timeout(wait) {
+            Ok(job) => {
+                first_at.get_or_insert_with(Instant::now);
+                pending.push(job);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => done = true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let expired = first_at.map(|t| t.elapsed() >= timeout).unwrap_or(false);
+        let quorum = pending.len() >= need;
+        if pending.is_empty() || !(quorum || expired || done) {
+            continue;
+        }
+        if quorum {
+            tally.on_quorum += 1;
+        } else {
+            tally.on_timeout += 1;
+        }
+        let subs: Vec<_> = pending.iter().map(|j| j.sub.clone()).collect();
+        // `submit_batch` walks the committed ring from the OLDEST member
+        // snapshot. If that predates the previous batch's commit, every member
+        // — however disjoint — is walked over that commit's written range,
+        // which is the union of ITS members' spans.
+        let behind = subs.iter().map(|s| s.snap).min().unwrap_or(0) < last_txn;
+        let verdicts = db.submit_batch("block", "body", &subs)?;
+        last_txn = db.snapshot_txn();
+        tally.members += subs.len() as u64;
+        let wiped = verdicts
+            .iter()
+            .all(|v| !matches!(v, mpedb::collab::EditVerdict::Committed));
+        tally.wiped += u64::from(wiped);
+        tally.behind += u64::from(behind);
+        tally.behind_wiped += u64::from(behind && wiped);
+        let now = Instant::now();
+        for (j, v) in pending.drain(..).zip(verdicts) {
+            let ok = matches!(v, mpedb::collab::EditVerdict::Committed);
+            if ok {
+                tally.committed += 1;
+            } else {
+                tally.lost += 1;
+            }
+            let us = now.duration_since(j.made).as_micros() as u64;
+            if j.slow {
+                slow_lat.push(us);
+            } else {
+                fast_lat.push(us);
+            }
+            let _ = j.reply.send((ok, now));
+        }
+        first_at = None;
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    fast_lat.sort_unstable();
+    slow_lat.sort_unstable();
+    let rate = tally_rate(&tally, elapsed);
+    Ok((tally, rate, fast_lat, slow_lat))
+}
+
+fn tally_rate(t: &FlushTally, elapsed: f64) -> f64 {
+    t.members as f64 / elapsed.max(f64::MIN_POSITIVE)
 }
