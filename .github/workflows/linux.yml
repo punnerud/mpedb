@@ -68,6 +68,27 @@ jobs:
               exit 1
             fi
           done
+      # The guard above catches the DEPENDENCY route to mpedb-core and names the
+      # path, which is what you need to fix it. It does not catch a direct
+      # `use std::os::unix` written into a portable crate, or a third-party dep
+      # that is Unix-only on its own. This does: it compiles the exact crates the
+      # Windows job compiles, for a Windows target, and reproduces that job's
+      # failure verbatim — `cannot find 'unix' in 'os'` — in about ten seconds.
+      #
+      # `check`/`clippy` do not link, so no MSVC toolchain or mingw is needed;
+      # the target's std is the whole requirement. The `-gnu` target is used
+      # because `-msvc` needs `ml64.exe` for a dependency's assembly, which does
+      # not exist on Linux. That is a real difference from CI's toolchain and it
+      # does not matter for the property being guarded: whether OUR code reaches
+      # for Unix does not depend on which Windows linker would run afterwards.
+      #
+      # What this does NOT do is run anything. Windows RUNTIME behaviour is still
+      # only covered by the nightly Windows job.
+      - name: the portable crates must COMPILE for Windows
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo clippy -p mpedb-types -p mpedb-sql --all-targets \
+            --target x86_64-pc-windows-gnu -- -D warnings
       - name: test
         run: cargo test --workspace
       - name: clippy
