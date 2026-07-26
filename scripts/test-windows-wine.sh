@@ -51,13 +51,27 @@ export WINEPREFIX="${WINEPREFIX:-$WINE_ROOT/mpedb}"
 # failure comes back on the exit code regardless.
 export WINEDEBUG="${WINEDEBUG:--all}"
 
-for tool in wine x86_64-w64-mingw32-gcc; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        echo "error: $tool not found." >&2
-        echo "  sudo apt install --no-install-recommends wine64 mingw-w64" >&2
-        exit 127
-    fi
-done
+# `wine64` alone installs /usr/lib/wine/wine64 and NOT the /usr/bin/wine
+# wrapper — that comes from the `wine` package, which --no-install-recommends
+# skips. The binary works standalone, so look for it in both places rather than
+# making the caller install a shell script they do not need.
+WINE_BIN="${WINE_BIN:-}"
+if [ -z "$WINE_BIN" ]; then
+    for cand in wine wine64 /usr/lib/wine/wine64; do
+        if command -v "$cand" >/dev/null 2>&1; then WINE_BIN=$(command -v "$cand"); break; fi
+        if [ -x "$cand" ]; then WINE_BIN="$cand"; break; fi
+    done
+fi
+if [ -z "$WINE_BIN" ]; then
+    echo "error: no wine binary found (tried wine, wine64, /usr/lib/wine/wine64)." >&2
+    echo "  sudo apt install --no-install-recommends wine64 mingw-w64" >&2
+    exit 127
+fi
+if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    echo "error: x86_64-w64-mingw32-gcc not found (the linker for windows-gnu)." >&2
+    echo "  sudo apt install --no-install-recommends wine64 mingw-w64" >&2
+    exit 127
+fi
 
 if ! rustup target list --installed | grep -qx x86_64-pc-windows-gnu; then
     echo "error: the windows-gnu target is not installed." >&2
@@ -79,10 +93,11 @@ export WINEPATH="$MINGW_DLLS"
 
 # `cargo test` builds native and runs the result; the runner is what makes it
 # hand the Windows binary to Wine instead of exec'ing it.
-export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine
+export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER="$WINE_BIN"
 
 echo "WINEPREFIX = $WINEPREFIX"
-echo "target     = x86_64-pc-windows-gnu (mingw), runner = wine"
+echo "wine       = $WINE_BIN"
+echo "target     = x86_64-pc-windows-gnu (mingw)"
 echo
 
 cargo test -p mpedb-types -p mpedb-sql --target x86_64-pc-windows-gnu "$@"
