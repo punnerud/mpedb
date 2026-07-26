@@ -3434,7 +3434,7 @@ impl Shm {
         // Synthetic path for macOS .wlock sidecar only; never used as a real
         // multi-process attach name. Linux ignores it in `map`.
         let pseudo = Path::new(":memory:");
-        let mut shm = Self::map(&file, size, max_readers, durability, pseudo)?;
+        let mut shm = Self::map(&file, size, max_readers, durability, pseudo, true)?;
         shm.is_private = true;
         shm.format(page_count, max_readers, durability, schema_hash)?;
         shm.post_attach(schema_hash)?;
@@ -3476,7 +3476,7 @@ impl Shm {
         // Fast path: fully-sized file that reports READY attaches lock-free.
         let st_size = file.metadata()?.len();
         if st_size == size {
-            let mut shm = Self::map(&file, size, max_readers, durability, path)?;
+            let mut shm = Self::map(&file, size, max_readers, durability, path, false)?;
             if shm.init_state().load(Ordering::Acquire) == INIT_READY {
                 shm.validate_frozen(page_count, max_readers, durability, schema_hash)?;
                 if durability.uses_wal() {
@@ -3498,7 +3498,7 @@ impl Shm {
             // mismatch on a live db is config drift, and extending/shrinking
             // it would brick every correctly-configured process. Probe first.
             if st_size >= (LOCK_PAGE + 1) * PAGE_SIZE as u64 {
-                let probe = Self::map(&file, st_size, max_readers, durability, path)?;
+                let probe = Self::map(&file, st_size, max_readers, durability, path, false)?;
                 let ready = probe.init_state().load(Ordering::Acquire) == INIT_READY;
                 drop(probe);
                 if ready {
@@ -3531,7 +3531,7 @@ impl Shm {
                 }
             }
         }
-        let mut shm = Self::map(&file, size, max_readers, durability, path)?;
+        let mut shm = Self::map(&file, size, max_readers, durability, path, false)?;
         if durability.uses_wal() {
             shm.attach_wal(path)?; // before format: format truncates debris
         }
@@ -3564,7 +3564,7 @@ impl Shm {
                 "file size is not a valid mpedb database".into(),
             ));
         }
-        let mut shm = Self::map(&file, st_size, 1, Durability::None, path)?;
+        let mut shm = Self::map(&file, st_size, 1, Durability::None, path, false)?;
         if shm.init_state().load(Ordering::Acquire) != INIT_READY {
             return Err(Error::Corrupt(
                 "database file is not initialized (READY marker absent)".into(),
@@ -3612,12 +3612,17 @@ impl Shm {
         Ok(shm)
     }
 
+    /// `private`: this is an in-memory mapping backed by a process-private
+    /// temp handle, so no sidecar writer lock is built. See
+    /// [`crate::os::WriterLock::private`] — on Windows the sentinel path
+    /// `:memory:` is not even a legal filename.
     fn map(
         file: &File,
         size: u64,
         max_readers: u32,
         durability: Durability,
         db_path: &Path,
+        private: bool,
     ) -> Result<Shm> {
         // Q1 (DESIGN-BLOBEXTENT §14): on a 32-bit target `size as usize`
         // below would silently TRUNCATE a ≥ 4 GiB size — the mapping comes up
@@ -3652,9 +3657,17 @@ impl Shm {
         }
         // opportunistic; harmless where unsupported (macOS: no-op)
         crate::os::madvise_hugepage(ptr, size as usize);
-        // macOS crash-safe writer lock: open (creating if absent) `<db>.wlock`.
+        // macOS/Windows crash-safe writer lock: open (creating if absent)
+        // `<db>.wlock`. A private mapping gets the file-less form.
+        //
+        // Linux takes neither arm — it uses the robust pthread mutex in shared
+        // memory and never builds a sidecar at all, so `private` is unread
+        // there.
+        let _ = private;
         #[cfg(not(target_os = "linux"))]
-        let wl = {
+        let wl = if private {
+            crate::os::WriterLock::private()
+        } else {
             let mut p = db_path.as_os_str().to_owned();
             p.push(".wlock");
             crate::os::WriterLock::open(Path::new(&p))?
@@ -4182,6 +4195,27 @@ mod tests {
         assert!(shm.release_slot(i1, w1));
         assert!(shm.release_slot(i2, w2));
         std::fs::remove_file(&p).unwrap();
+    }
+
+    /// An in-memory database must touch the filesystem NOWHERE — and in
+    /// particular must not drop a `:memory:.wlock` sidecar into the process's
+    /// current directory. It did, on every non-Linux platform, until #159:
+    /// harmless-looking litter on macOS, and fatal on Windows, where `:` is
+    /// not a legal filename character so the create fails and `:memory:`
+    /// cannot open at all. Wine caught it by leaving the file in the repo.
+    #[test]
+    fn an_in_memory_database_leaves_no_sidecar() {
+        let zero = [0u8; 32];
+        let dir = std::env::current_dir().unwrap();
+        let shm = Shm::open_memory(8 << 20, 8, Durability::None, &zero).unwrap();
+        let _ = shm.claim_and_pin().unwrap();
+        for litter in [":memory:.wlock", ":memory:"] {
+            assert!(
+                !dir.join(litter).exists(),
+                "in-memory open created {litter} in {}",
+                dir.display()
+            );
+        }
     }
 
     #[test]

@@ -439,6 +439,14 @@ mod wasm_lock {
             })
         }
 
+        /// Every wasm32 lock is already the private one — this exists so the
+        /// caller can be written once for both file-less platforms.
+        pub fn private() -> WriterLock {
+            WriterLock {
+                held: HELD.with(|h| h.clone()),
+            }
+        }
+
         pub fn lock(&self) -> Result<()> {
             if self.held.replace(true) {
                 return Err(Error::Internal(
@@ -502,7 +510,11 @@ mod win_lock {
     }
 
     struct Inner {
-        file: File, // owns the handle; drop → close → lock auto-release
+        /// `None` for a PRIVATE (`:memory:`) mapping: there is no file to
+        /// exclude on and no second process that could see it, so the local
+        /// `owner` guard is the whole lock. Some(f) owns the handle; drop →
+        /// close → lock auto-release.
+        file: Option<File>,
         owner: Mutex<Option<ThreadId>>,
     }
 
@@ -535,9 +547,25 @@ mod win_lock {
                 drop(file);
                 return Ok(WriterLock { inner });
             }
-            let inner = Arc::new(Inner { file, owner: Mutex::new(None) });
+            let inner = Arc::new(Inner { file: Some(file), owner: Mutex::new(None) });
             reg.insert(key, Arc::downgrade(&inner));
             Ok(WriterLock { inner })
+        }
+
+        /// A lock for a PRIVATE (`:memory:`) mapping — no sidecar file, and
+        /// deliberately not in the registry, because two private mappings are
+        /// two unrelated databases that happen to share a name.
+        ///
+        /// The cross-process half of the lock has nothing to exclude: the
+        /// backing file is a process-private temp handle no other process can
+        /// name. Building it anyway is not merely wasteful on Windows, it is
+        /// broken — the sentinel path is `:memory:`, and `:` cannot appear in
+        /// a Windows filename, so the create fails and an in-memory database
+        /// cannot open at all.
+        pub fn private() -> WriterLock {
+            WriterLock {
+                inner: Arc::new(Inner { file: None, owner: Mutex::new(None) }),
+            }
         }
 
         fn claim(&self) -> Result<()> {
@@ -559,7 +587,8 @@ mod win_lock {
 
         pub fn lock(&self) -> Result<()> {
             self.claim()?;
-            let fd = self.inner.file.as_raw_fd();
+            let Some(f) = self.inner.file.as_ref() else { return Ok(()) };
+            let fd = f.as_raw_fd();
             if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
                 return Ok(());
             }
@@ -569,7 +598,8 @@ mod win_lock {
 
         pub fn trylock(&self) -> Result<Option<()>> {
             self.claim()?;
-            let fd = self.inner.file.as_raw_fd();
+            let Some(f) = self.inner.file.as_ref() else { return Ok(Some(())) };
+            let fd = f.as_raw_fd();
             if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(Some(()));
             }
@@ -584,7 +614,11 @@ mod win_lock {
         }
 
         pub fn release_exclusion(&self) {
-            let fd = self.inner.file.as_raw_fd();
+            let Some(f) = self.inner.file.as_ref() else {
+                self.unclaim();
+                return;
+            };
+            let fd = f.as_raw_fd();
             unsafe { libc::flock(fd, libc::LOCK_UN) };
             self.unclaim();
         }
@@ -614,7 +648,10 @@ mod macos_lock {
     }
 
     struct Inner {
-        file: File,                        // OWNS the wl_fd; drop → close → flock auto-release
+        /// `None` for a PRIVATE (`:memory:`) mapping — see
+        /// [`WriterLock::private`]. Some(f) OWNS the wl_fd; drop → close →
+        /// flock auto-release.
+        file: Option<File>,
         local_mtx: *mut libc::pthread_mutex_t, // process-private ERRORCHECK
     }
     // The pthread mutex is thread-safe; the File is Send+Sync. One Inner per
@@ -685,11 +722,30 @@ mod macos_lock {
                 return Ok(WriterLock { inner });
             }
             let inner = Arc::new(Inner {
-                file,
+                file: Some(file),
                 local_mtx: make_errorcheck_mutex(),
             });
             reg.insert(devino, Arc::downgrade(&inner));
             Ok(WriterLock { inner })
+        }
+
+        /// A lock for a PRIVATE (`:memory:`) mapping — no sidecar file, and
+        /// deliberately not in the registry, since two private mappings are two
+        /// unrelated databases that happen to share a sentinel name.
+        ///
+        /// The `flock` half has nothing to exclude: the backing store is a
+        /// process-private temp handle no other process can name. Building it
+        /// anyway wrote a file called `:memory:.wlock` into the caller's
+        /// working directory — litter here, and fatal on Windows where `:` is
+        /// not a legal filename character (#159). The ERRORCHECK mutex is kept,
+        /// because nested write transactions must still be caught.
+        pub fn private() -> WriterLock {
+            WriterLock {
+                inner: Arc::new(Inner {
+                    file: None,
+                    local_mtx: make_errorcheck_mutex(),
+                }),
+            }
         }
 
         /// Blocking acquire of exclusion: local mutex (re-entrancy → Err), then
@@ -702,7 +758,8 @@ mod macos_lock {
                 libc::EDEADLK => return Err(reentered()),
                 rc => return Err(Error::Internal(format!("local writer mutex lock: {rc}"))),
             }
-            let fd = self.inner.file.as_raw_fd();
+            let Some(f) = self.inner.file.as_ref() else { return Ok(()) };
+            let fd = f.as_raw_fd();
             loop {
                 if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
                     return Ok(());
@@ -725,7 +782,8 @@ mod macos_lock {
                 libc::EBUSY => return Ok(None),
                 rc => return Err(Error::Internal(format!("local writer mutex trylock: {rc}"))),
             }
-            let fd = self.inner.file.as_raw_fd();
+            let Some(f) = self.inner.file.as_ref() else { return Ok(Some(())) };
+            let fd = f.as_raw_fd();
             if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 let e = std::io::Error::last_os_error().raw_os_error();
                 unsafe { libc::pthread_mutex_unlock(m) };
@@ -739,7 +797,11 @@ mod macos_lock {
 
         /// Release both levels (infallible; `flock(UN)` retried on EINTR).
         pub fn release_exclusion(&self) {
-            let fd = self.inner.file.as_raw_fd();
+            let Some(f) = self.inner.file.as_ref() else {
+                unsafe { libc::pthread_mutex_unlock(self.inner.local_mtx) };
+                return;
+            };
+            let fd = f.as_raw_fd();
             loop {
                 if unsafe { libc::flock(fd, libc::LOCK_UN) } == 0
                     || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
