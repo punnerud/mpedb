@@ -1292,7 +1292,11 @@ fn ephemeral_path() -> PathBuf {
 
 fn seed_toml(path: &std::path::Path, size_mb: u64) -> String {
     // Escape for a TOML basic string.
-    let p = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    // One shared escape (mpedb_types::toml_escape). This used to be an inline
+    // pair of `replace` calls here and in openpath.rs, absent in cli/util.rs,
+    // and a LOSSY rewrite in the Python binding — four sites, three behaviours,
+    // two of them wrong on Windows. #159 found it by running on Windows.
+    let p = mpedb::toml_escape(&path.to_string_lossy());
     // Modest max_readers keeps the reader-table pages (and thus high_water for
     // a nearly empty :memory: DB) small — backup progress paces over that.
     format!(

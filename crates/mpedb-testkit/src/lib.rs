@@ -144,6 +144,18 @@ pub fn scratch_base_str() -> String {
     scratch_base().display().to_string()
 }
 
+/// A scratch path, escaped for a TOML `path = "..."` line.
+///
+/// On Unix this is the identity, which is why every test that hand-builds
+/// config text got away without it. On Windows `C:\Users\...` makes `\U` a
+/// TOML unicode escape, so the unescaped path is a *parse error* — the config
+/// never reaches the engine and the failure looks nothing like a path problem.
+/// #159 found it in four production call sites first (each with a different
+/// wrong answer, one of them lossy); the test tree has the same shape.
+pub fn toml_path(p: impl AsRef<Path>) -> String {
+    mpedb_types::toml_escape(&p.as_ref().display().to_string())
+}
+
 /// Scratch on a REAL filesystem — for tests that measure memory.
 ///
 /// `/dev/shm` is a tmpfs, so a database file living there IS resident

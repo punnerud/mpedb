@@ -21,6 +21,18 @@ mod os;
 /// to come from a host import: two clock sources would mean the engine and the
 /// executor could disagree about what `'now'` is.
 pub use os::wall_clock_micros;
+
+/// TOML-escape a path so it can be interpolated into a `path = "..."` line.
+///
+/// Only tests build config text from a live path, and on Unix this is the
+/// identity — which is exactly why it was missing until the Windows port ran
+/// them: `C:\Users\...` makes `\U` a TOML unicode escape, so an unescaped
+/// path is a *parse error*, not a path.
+#[cfg(test)]
+pub(crate) fn toml_escape_path(p: &std::path::Path) -> String {
+    mpedb_types::toml_escape(&p.display().to_string())
+}
+
 pub mod pagestore;
 pub mod plsim;
 pub mod ring;
@@ -29,6 +41,9 @@ pub mod shm;
 /// The `wasm32` OS emulation for the process-private (`:memory:`) path. Empty
 /// on every native target; read its header for why each stub is sound.
 pub mod wasmcompat;
+/// The Windows arm of the same idea (#159): Unix-shaped names over real Win32
+/// calls, so the engine's call sites compile unchanged. Empty on Unix.
+pub mod wincompat;
 
 /// The platform's **real** durability barrier — the one an acked durable commit
 /// waits on: `fdatasync` on Linux, `fcntl(F_FULLFSYNC)` on macOS (where plain
@@ -42,8 +57,16 @@ pub mod wasmcompat;
 ///
 /// # Safety
 /// `fd` must be a valid open file descriptor.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 pub fn durability_barrier(fd: std::os::unix::io::RawFd) -> libc::c_int {
+    os::fdatasync(fd)
+}
+
+/// Windows: `FlushFileBuffers`, which is the real platter barrier there —
+/// `FlushViewOfFile` (the `msync` position) only reaches the filesystem cache,
+/// so the two compose exactly as `msync` + `F_FULLFSYNC` do on macOS.
+#[cfg(windows)]
+pub fn durability_barrier(fd: crate::wincompat::RawFd) -> core::ffi::c_int {
     os::fdatasync(fd)
 }
 

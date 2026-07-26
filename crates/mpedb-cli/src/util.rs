@@ -296,7 +296,9 @@ pub fn write_config_concurrency(
     let text = format!(
         "[database]\npath = \"{}\"\nsize_mb = {size_mb}\ndurability = \"{durability}\"\n\
          concurrency = \"{concurrency}\"\n{extent}\n{tables_toml}",
-        db_path.display()
+        // Escaped: a Windows path contains backslashes, and `C:\Users` is a
+        // TOML unicode escape. This site had none at all (#159).
+        mpedb_types::toml_escape(&db_path.to_string_lossy())
     );
     std::fs::write(cfg_path, text)?;
     Ok(())

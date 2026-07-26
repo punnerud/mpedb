@@ -1507,7 +1507,10 @@ fn connect(py: Python<'_>, path: PathBuf, engine: Option<&str>) -> PyResult<PyCo
             "[database]\npath = \"{}\"\nsize_mb = 64\nmax_readers = 64\n\n\
              [[table]]\nname = \"_mpedb_py_bootstrap\"\nprimary_key = [\"id\"]\n\
              [[table.column]]\nname = \"id\"\ntype = \"int64\"\n",
-            spelled.replace('\\', "/").replace('"', "")
+            // Was `replace('\\', "/").replace('"', "")` — which rewrote the
+            // path rather than escaping it, and DELETING a quote silently opens
+            // a different file than the caller named. Escape, never rewrite.
+            mpedb::toml_escape(&spelled)
         );
         py.detach(move || {
             let cfg = mpedb::Config::from_toml_str(&toml)?;

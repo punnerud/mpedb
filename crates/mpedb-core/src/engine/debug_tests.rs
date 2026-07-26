@@ -61,7 +61,7 @@ fn decompose_write_phases() {
          [[table]]\nname = \"t\"\nprimary_key = [\"id\"]\n\
            [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n\
            [[table.column]]\n  name = \"v\"\n  type = \"int64\"\n  nullable = false\n",
-        path.display()
+        crate::toml_escape_path(&path)
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let eng = Engine::open(&cfg, vec![vec![]]).unwrap();
@@ -209,7 +209,7 @@ primary_key = ["id"]
   name = "age"
   type = "int64"
 "#,
-        path.display()
+        crate::toml_escape_path(&path)
     );
     Config::from_toml_str(&toml).unwrap()
 }

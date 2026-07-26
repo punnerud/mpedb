@@ -818,8 +818,10 @@ impl<'e> WriteTxn<'e> {
                 if remaining > 0 {
                     // wasm32: `read_exact_at` is an inherent method on the
                     // wasmcompat File, so no extension trait to import.
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(all(unix, not(target_arch = "wasm32")))]
                     use std::os::unix::fs::FileExt;
+                    #[cfg(windows)]
+                    use crate::wincompat::FileExt;
                     let mut buf = vec![0u8; PAGE_SIZE.min(64 * 1024)];
                     let mut src_off = copied;
                     while remaining > 0 {

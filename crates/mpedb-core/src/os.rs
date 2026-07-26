@@ -26,8 +26,12 @@
 //! narrowed to `all(unix, …)` purely so wasm can take that third arm — the
 //! Linux and macOS code paths are unchanged.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 use std::os::unix::io::RawFd;
+// Windows: the handle type and a `libc`-shaped module over real Win32 calls,
+// so the functions below gain a fourth arm rather than a fourth signature.
+#[cfg(windows)]
+use crate::wincompat::{libc, RawFd};
 
 // Large-file support on 32-bit glibc Linux (armv7): the plain libc wrappers
 // take a 32-bit `off_t` there, and the engine addresses files past 2 GiB —
@@ -50,6 +54,13 @@ use libc::{
 /// `ftruncate` with a 64-bit length on every platform (LFS on 32-bit glibc).
 /// The shm layer calls this instead of `libc::ftruncate` directly — including
 /// on wasm32, where it lands on the `wasmcompat` buffer-resize shim.
+/// Windows: `SetFilePointerEx` + `SetEndOfFile` — there is no single call that
+/// sets a length, which is why the shim pairs them.
+#[cfg(windows)]
+pub fn ftruncate_len(fd: RawFd, len: u64) -> libc::c_int {
+    unsafe { libc::ftruncate(fd, len as i64) }
+}
+
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 pub fn ftruncate_len(fd: RawFd, len: u64) -> libc::c_int {
     #[cfg(target_os = "linux")]
@@ -85,6 +96,13 @@ pub fn fdatasync(fd: RawFd) -> libc::c_int {
         let _ = fd;
         0
     }
+    // Windows: `FlushFileBuffers` IS the platter barrier. `FlushViewOfFile`
+    // (the `msync` position) reaches only the filesystem cache, so the two
+    // compose exactly as macOS's `msync` + `F_FULLFSYNC` do.
+    #[cfg(windows)]
+    {
+        unsafe { libc::fsync(fd) }
+    }
     #[cfg(target_os = "linux")]
     {
         unsafe { libc::fdatasync(fd) }
@@ -119,7 +137,12 @@ pub fn sync_granularity() -> usize {
     // multiple of the engine's logical PAGE_SIZE.
     #[cfg(target_arch = "wasm32")]
     let g: isize = 4096;
-    #[cfg(not(target_arch = "wasm32"))]
+    // Windows wants the ALLOCATION granularity (64 KiB), not the page size:
+    // `MapViewOfFile` rejects an offset that is page- but not 64-KiB-aligned.
+    // Same class of trap as macOS's 16 KiB `msync` base.
+    #[cfg(windows)]
+    let g = crate::wincompat::sync_granularity() as isize;
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
     let g = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let g = if g > 0 { g as usize } else { 4096 };
     CACHE.store(g, Ordering::Relaxed);
@@ -130,6 +153,22 @@ pub fn sync_granularity() -> usize {
 /// so a mid-commit touch never hits a lazy hole → no SIGBUS). macOS
 /// (bench-grade): grow the file with `ftruncate` (may leave a sparse hole; fine
 /// while disk space is available). Never shrinks.
+/// Windows: grow the file. `SetFileValidData` would mark the range valid
+/// without writing it, but it requires SE_MANAGE_VOLUME_NAME — a privilege a
+/// library must not assume it has — and going without costs only the same
+/// lazy-hole behaviour the macOS arm already accepts.
+#[cfg(windows)]
+pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
+    let want = offset + len;
+    let cur = unsafe { libc::file_size(fd) };
+    if want > cur {
+        unsafe { libc::ftruncate(fd, want) }
+    } else {
+        0
+    }
+}
+
+#[cfg(not(windows))]
 pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
     // wasm32: `ftruncate` already zero-fills the whole reserve up front, so
     // every byte is backed. There is no lazy hole and no SIGBUS to avoid.
@@ -183,6 +222,9 @@ pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
 /// gates this on file size: a multi-hundred-GiB reserve is left unwritten, since
 /// zeroing it at create would dwarf any per-commit saving. Returns 0 on success.
 /// No-op on non-Linux (macOS reserves via sparse `ftruncate`; it is bench-grade).
+/// Windows likewise has nothing to convert: the unwritten-extent stall is an
+/// ext4/xfs behaviour and NTFS has no equivalent state for a `SetEndOfFile`
+/// grow, so zeroing the reserve would be pure cost.
 #[cfg(target_os = "linux")]
 pub fn prewrite_zeros(fd: RawFd, len: u64) -> libc::c_int {
     const CHUNK: usize = 1 << 20; // 1 MiB write buffer
@@ -208,6 +250,15 @@ pub fn prewrite_zeros(_fd: RawFd, _len: u64) -> libc::c_int {
 
 /// Reclaim `[offset, offset+len)` as a hole (WAL checkpoint). Best-effort;
 /// failure only wastes space. macOS: no-op (space is not reclaimed).
+/// Windows: `FSCTL_SET_ZERO_DATA` on a sparse file would do this. Not wired in
+/// stage 1 — punching returns space to the filesystem and is never a
+/// correctness requirement, which is the same call the macOS arm makes.
+#[cfg(windows)]
+pub fn punch_hole(fd: RawFd, offset: i64, len: i64) {
+    let _ = (fd, offset, len);
+}
+
+#[cfg(not(windows))]
 pub fn punch_hole(fd: RawFd, offset: i64, len: i64) {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -226,6 +277,15 @@ pub fn punch_hole(fd: RawFd, offset: i64, len: i64) {
 }
 
 /// Advise transparent huge pages over the mapping. Opportunistic; macOS: no-op.
+/// Windows: large pages need SE_LOCK_MEMORY_NAME and a non-pageable
+/// allocation, which does not fit a file-backed shared mapping. This is a
+/// throughput hint, not a requirement.
+#[cfg(windows)]
+pub fn madvise_hugepage(ptr: *mut libc::c_void, len: usize) {
+    let _ = (ptr, len);
+}
+
+#[cfg(not(windows))]
 pub fn madvise_hugepage(ptr: *mut libc::c_void, len: usize) {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -264,6 +324,14 @@ pub unsafe fn mutex_make_consistent(m: *mut libc::pthread_mutex_t) -> libc::c_in
 /// timeout. Callers always re-check state, so an early/spurious return is fine.
 /// macOS has no cross-process futex: **park briefly and return** ⇒ the caller
 /// polls (correct, just busier).
+/// Windows: `WaitOnAddress` is a DIRECT futex equivalent, not a degradation —
+/// macOS has to fall back to polling here and Windows does not.
+#[cfg(windows)]
+pub fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) {
+    crate::wincompat::futex_wait(word, expected, timeout);
+}
+
+#[cfg(not(windows))]
 pub fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -295,6 +363,13 @@ pub fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) {
 }
 
 /// Wake all waiters on `word`. macOS: no-op (waiters poll).
+/// Windows: `WakeByAddressAll`.
+#[cfg(windows)]
+pub fn futex_wake_all(word: &AtomicU32) {
+    crate::wincompat::futex_wake_all(word);
+}
+
+#[cfg(not(windows))]
 pub fn futex_wake_all(word: &AtomicU32) {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -391,6 +466,133 @@ mod wasm_lock {
         }
     }
 }
+
+/// Windows writer lock: a sidecar `LockFileEx` plus a process-private
+/// re-entrancy guard — the same two-level shape as the macOS FLD-2 lock, for
+/// the same reason.
+///
+/// **Owner death is handled by the kernel**, exactly as `flock` does on macOS:
+/// Windows releases every lock a handle holds when that handle closes, and it
+/// closes them all when the process dies, however it dies. That is the property
+/// the whole FLD-2 design exists to reconstruct, and here it comes for free.
+///
+/// The local guard is a plain `Mutex<Option<ThreadId>>` rather than a
+/// pthread ERRORCHECK mutex: its only job is to turn a nested write transaction
+/// into a named error instead of a self-deadlock, and the owning thread id is
+/// enough to see that. A second `LockFileEx` from the SAME handle would
+/// succeed silently on Windows, so without this a re-entrant writer would
+/// quietly get two locks and release one.
+#[cfg(windows)]
+mod win_lock {
+    use crate::wincompat::{libc, AsRawFd};
+    use mpedb_types::{Error, Result};
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::sync::{Arc, LazyLock, Mutex, Weak};
+    use std::thread::ThreadId;
+
+    fn reentered() -> Error {
+        Error::Internal("writer lock re-entered by its owner (nested write transaction)".into())
+    }
+    fn ioerr(ctx: &str) -> Error {
+        Error::Io(std::io::Error::new(
+            std::io::Error::last_os_error().kind(),
+            format!("{ctx}: {}", std::io::Error::last_os_error()),
+        ))
+    }
+
+    struct Inner {
+        file: File, // owns the handle; drop → close → lock auto-release
+        owner: Mutex<Option<ThreadId>>,
+    }
+
+    /// One shared `Inner` per canonical path per process. Windows byte-range
+    /// locks are per HANDLE, so two opens of the same file in one process would
+    /// not exclude each other — the second would take the lock while the first
+    /// still held it, and both would believe they were the only writer. The
+    /// registry hands every in-process handle the same one, which turns that
+    /// into the re-entrancy error it actually is.
+    type LockRegistry = HashMap<std::path::PathBuf, Weak<Inner>>;
+    static REGISTRY: LazyLock<Mutex<LockRegistry>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub struct WriterLock {
+        inner: Arc<Inner>,
+    }
+
+    impl WriterLock {
+        pub fn open(path: &std::path::Path) -> Result<WriterLock> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(path)?;
+            // Canonicalize so two spellings of one path share an Inner. It can
+            // only fail if the file vanished between create and here, in which
+            // case the un-canonical path is still a correct key for this run.
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(inner) = reg.get(&key).and_then(Weak::upgrade) {
+                drop(file);
+                return Ok(WriterLock { inner });
+            }
+            let inner = Arc::new(Inner { file, owner: Mutex::new(None) });
+            reg.insert(key, Arc::downgrade(&inner));
+            Ok(WriterLock { inner })
+        }
+
+        fn claim(&self) -> Result<()> {
+            let me = std::thread::current().id();
+            let mut g = self.inner.owner.lock().unwrap_or_else(|e| e.into_inner());
+            if *g == Some(me) {
+                return Err(reentered());
+            }
+            // Another THREAD holding it is ordinary contention, and the blocking
+            // `LockFileEx` below is what waits for it — but the guard must not
+            // record us as owner until we actually hold the file lock.
+            *g = Some(me);
+            Ok(())
+        }
+
+        fn unclaim(&self) {
+            *self.inner.owner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+
+        pub fn lock(&self) -> Result<()> {
+            self.claim()?;
+            let fd = self.inner.file.as_raw_fd();
+            if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+                return Ok(());
+            }
+            self.unclaim();
+            Err(ioerr("LockFileEx(exclusive)"))
+        }
+
+        pub fn trylock(&self) -> Result<Option<()>> {
+            self.claim()?;
+            let fd = self.inner.file.as_raw_fd();
+            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Some(()));
+            }
+            self.unclaim();
+            if libc::last_errno() == libc::EAGAIN {
+                // ERROR_LOCK_VIOLATION: somebody else holds it. Contention, not
+                // failure — the caller retries or backs off.
+                Ok(None)
+            } else {
+                Err(ioerr("LockFileEx(exclusive, nonblocking)"))
+            }
+        }
+
+        pub fn release_exclusion(&self) {
+            let fd = self.inner.file.as_raw_fd();
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            self.unclaim();
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use win_lock::WriterLock;
 
 #[cfg(all(unix, not(target_os = "linux")))]
 mod macos_lock {
@@ -555,6 +757,16 @@ mod macos_lock {
 /// A per-process start time; `(pid, start_time)` survives PID reuse. Linux:
 /// `/proc/<pid>/stat` field 22. macOS: `proc_pidinfo(PROC_PIDTBSDINFO)` start
 /// instant. Returns `None` if the pid is gone (caller treats that as dead).
+/// Windows: the process CREATION TIME, which plays exactly the role
+/// `/proc/<pid>/stat`'s start time plays on Linux — a pid can be recycled, a
+/// (pid, creation-time) pair cannot, and that pair is what the reader table
+/// needs to tell a live holder from a dead one whose pid was reused.
+#[cfg(windows)]
+pub fn proc_start_time(pid: u32) -> Option<u64> {
+    crate::wincompat::proc_start_time(pid)
+}
+
+#[cfg(not(windows))]
 pub fn proc_start_time(pid: u32) -> Option<u64> {
     // wasm32: one process, born with the module instance. Any pid other than
     // ours is debris that cannot exist, and ours has a single fixed
@@ -599,8 +811,52 @@ pub fn proc_start_time(pid: u32) -> Option<u64> {
     }
 }
 
+/// Does the OS state, definitely, that no process holds this pid?
+///
+/// The reader-slot sweep may only reclaim a slot on a DEFINITE answer, so this
+/// is deliberately one-sided: `false` means "alive, or we cannot tell", and a
+/// caller that cannot tell must leave the slot alone. Reclaiming a slot whose
+/// owner is merely unreadable would drop a live reader's pin and let the writer
+/// reuse pages out from under it.
+///
+/// This is the seam. `shm.rs` used to ask `kill(pid, 0)` and compare
+/// `last_os_error()` to `ESRCH` — which on Windows reads the raw Win32 code
+/// (`ERROR_INVALID_PARAMETER`, 87) and never equals any errno, so every dead
+/// pid answered "alive" and the sweep reclaimed nothing. Two shm tests caught
+/// exactly that.
+#[cfg(windows)]
+pub fn pid_definitely_dead(pid: u32) -> bool {
+    crate::wincompat::pid_definitely_dead(pid)
+}
+
+#[cfg(not(windows))]
+pub fn pid_definitely_dead(pid: u32) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // One process, and it is us: any other pid is debris.
+        pid != crate::wasmcompat::MY_PID
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if unsafe { libc::kill(pid as i32, 0) } == 0 {
+            return false; // exists
+        }
+        // EPERM and anything else mean "exists but not ours to signal" —
+        // only ESRCH is the definite answer.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+}
+
 /// PID-namespace identity (Linux: `/proc/self/ns/pid` inode). macOS has no PID
 /// namespaces → a fixed constant (boot recovery relies on [`boot_id`] instead).
+/// Windows has no pid namespaces, so the question the Linux arm asks — "are
+/// these two pids even comparable?" — always answers yes.
+#[cfg(windows)]
+pub fn pid_namespace_id() -> Option<u64> {
+    crate::wincompat::pid_namespace_id()
+}
+
+#[cfg(not(windows))]
 pub fn pid_namespace_id() -> Option<u64> {
     // wasm32: no namespaces. A fixed non-zero id, which is all the check needs
     // (it only ever compares against what a PREVIOUS attach recorded, and the
@@ -633,6 +889,19 @@ pub fn boot_id() -> Option<[u8; 16]> {
     #[cfg(target_arch = "wasm32")]
     {
         Some(*b"mpedb-wasm-inst\0")
+    }
+    // Windows: derive it from the system boot time (now minus uptime), which is
+    // constant within a boot and changes across one — the only property this is
+    // used for. Windows also clears the kernel object namespace on reboot, so a
+    // stale lock cannot survive one in the first place; this exists so the
+    // stored epoch still MOVES, and boot recovery still runs.
+    #[cfg(windows)]
+    {
+        let boot_ms = crate::wincompat::boot_epoch_ms();
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&boot_ms.to_le_bytes());
+        out[8..].copy_from_slice(b"mpedb-wi");
+        return Some(out);
     }
     #[cfg(target_os = "linux")]
     {
@@ -679,6 +948,13 @@ pub fn boot_id() -> Option<[u8; 16]> {
 /// process concept, and std's stub aborts rather than inventing one. A tab is
 /// a single process, so the constant is not a placeholder: it is the complete
 /// truth about how many processes can touch this database.
+/// Windows: `GetCurrentProcessId`.
+#[cfg(windows)]
+pub fn process_id() -> u32 {
+    crate::wincompat::process_id()
+}
+
+#[cfg(not(windows))]
 pub fn process_id() -> u32 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -704,6 +980,14 @@ pub fn process_id() -> u32 {
 ///
 /// A clock before the epoch yields 0 rather than a negative surprise, matching
 /// the native helpers this replaces.
+/// Windows: `GetSystemTimePreciseAsFileTime`, shifted from the 1601 FILETIME
+/// epoch to the Unix one.
+#[cfg(windows)]
+pub fn wall_clock_micros() -> i64 {
+    crate::wincompat::wall_clock_micros()
+}
+
+#[cfg(not(windows))]
 pub fn wall_clock_micros() -> i64 {
     #[cfg(target_arch = "wasm32")]
     {

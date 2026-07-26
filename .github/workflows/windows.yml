@@ -1,21 +1,21 @@
-# Windows — the portable crates only, and deliberately not the workspace.
+# Windows — two jobs, because they guarantee two different things.
 #
-# The ENGINE is Unix-only BY CONSTRUCTION, not by neglect: MAP_SHARED mmap,
-# flock/fcntl locks, robust PROCESS_SHARED pthread mutexes, `/proc/<pid>/stat`
-# start-time reader identity, msync/fdatasync ordering. 18 files use libc or
-# `std::os::unix` and there is not one `cfg(windows)` in the tree. A Windows port
-# is a real project, not a CI switch; a job that "tries the workspace" would fail
-# on line one forever and teach nothing.
+# `windows-portable-core` is a SETTLED guarantee: `mpedb-types` (values, schema
+# + canonical bytes + blake3, memcmp key encoding, the expression IR with SQL
+# 3VL, plan footprints) and `mpedb-sql` (tokenizer → AST → binder → planner →
+# plan encode/decode/validate) have zero Unix dependencies and must never
+# silently acquire one. ~320 tests. Red here fails the run and always should.
 #
-# What IS portable is large and load-bearing: `mpedb-types` (values, schema +
-# canonical bytes + blake3, memcmp key encoding, the expression IR with SQL 3VL,
-# plan footprints) and `mpedb-sql` (tokenizer → AST → binder → planner → plan
-# encode/decode/validate). Zero Unix dependencies, no dependency on mpedb-core,
-# ~320 tests.
+# `windows-engine` is a PORT IN PROGRESS (#159). Keeping them apart is the
+# point: a gap in an unfinished stage must not read as an SQL front-end
+# regression.
 #
-# So this guards one property worth guarding — the SQL front end and the type
-# system must not silently acquire a platform dependency — and it is a REAL gate
-# on that subset: a red here fails the run.
+# The engine WAS Unix-only by construction — MAP_SHARED mmap, flock/fcntl,
+# robust PROCESS_SHARED pthread mutexes, `/proc/<pid>/stat` reader identity,
+# msync/fdatasync ordering. What made the port tractable is that the seam
+# already existed for macOS and wasm32: `crates/mpedb-core/src/os.rs` plus a
+# `wincompat` module supplying the Unix-shaped names over real Win32 calls, so
+# the call sites compile unchanged. See design/DESIGN-WINDOWS.md.
 name: Windows
 
 on:
@@ -38,3 +38,37 @@ jobs:
         run: cargo test -p mpedb-types -p mpedb-sql
       - name: clippy the portable crates
         run: cargo clippy -p mpedb-types -p mpedb-sql --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------
+  # #159 stages 1 and 2: the ENGINE on real Windows.
+  #
+  # Stage 1 = one process opens a `.mpedb`, reads and writes (`--lib`).
+  # Stage 2 = several processes on one file: mapping coherence, writer
+  # exclusion, MVCC snapshots across processes, owner death
+  # (`--test multiproc_attach`). That test is deliberately fork-free — it
+  # re-invokes this same binary via `std::process` and kills it with
+  # `Child::kill`, which is `TerminateProcess` here and `SIGKILL` on Unix.
+  #
+  # This is the job that DECIDES. Wine (`scripts/test-windows-wine.sh`) screens
+  # locally and has earned more trust than expected — it found the TOML
+  # path-escape bug and drove both stages green — but it EMULATES precisely the
+  # primitives these stages rest on, so it cannot be the verdict.
+  #
+  # NOT here: stage 3 (durability/recovery ordering) and stage 4 (the
+  # stress/crash/powerloss/collide harnesses, which are POSIX `fork` + signals).
+  # Until stage 4 runs, Windows is "compiles and runs", not "crash-safe".
+  windows-engine:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: toolchain
+        run: rustc --version; cargo --version
+      - name: build the engine for Windows
+        run: cargo build -p mpedb-core
+      - name: stage 1 — engine unit tests (single-process)
+        run: cargo test -p mpedb-core --lib
+      - name: stage 2 — multi-process attach
+        run: cargo test -p mpedb-core --test multiproc_attach
+      - name: clippy the engine
+        run: cargo clippy -p mpedb-core --lib -- -D warnings

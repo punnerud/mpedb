@@ -14,10 +14,16 @@ use mpedb_types::{Durability, Error, FilePerms, Result, PAGE_SIZE};
 use std::cell::UnsafeCell;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{File, OpenOptions};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 use std::os::unix::io::{AsRawFd, RawFd};
+// Windows: `crate::wincompat` supplies the same names over real Win32 calls —
+// the extension traits in the Unix spelling, and a `libc` module that SHADOWS
+// the real crate for this file. Same trick as the wasm32 arm below, except
+// nothing here is emulated: every call is a genuine cross-process primitive.
+#[cfg(windows)]
+use crate::wincompat::{libc, AsRawFd, FileExt, OpenOptionsExt, RawFd};
 // wasm32 has no filesystem and no fds. `crate::wasmcompat` supplies the same
 // names over a process-private byte buffer — including a `libc` module that
 // SHADOWS the real crate for this file, so every `libc::…` call site below is
@@ -898,7 +904,11 @@ pub fn extent_sync_log(ranges: &[(u64, u32)]) -> Result<()> {
         buf.extend_from_slice(&npages.to_le_bytes());
     }
     f.write_all(&buf).map_err(|_| io_err("write(extent sync log)"))?;
-    if crate::os::fdatasync(std::os::fd::AsRawFd::as_raw_fd(&f)) != 0 {
+    #[cfg(unix)]
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&f);
+    #[cfg(windows)]
+    let raw = crate::wincompat::AsRawFd::as_raw_fd(&f);
+    if crate::os::fdatasync(raw) != 0 {
         return Err(io_err("fdatasync(extent sync log)"));
     }
     Ok(())
@@ -1005,6 +1015,30 @@ fn io_err(context: &str) -> Error {
 /// (default: leave it 0o600) and, if requested, `chown`s it. A configured
 /// owner/group that cannot be applied is a hard error — a silently-unenforced
 /// isolation boundary is worse than a loud failure (design/DESIGN-MULTIDB.md §1.4).
+/// Windows: NTFS has no POSIX mode bits and no uid/gid, so `mode` is ignored —
+/// a fresh file is already owner-private by inheritance, which is what `0o600`
+/// asks for. A CONFIGURED `owner`/`group` is a hard error rather than a silent
+/// no-op: the whole reason this function fails loudly on Unix is that an
+/// unenforced isolation boundary is worse than a refused one
+/// (design/DESIGN-MULTIDB.md §1.4), and that argument does not weaken by
+/// changing platform.
+#[cfg(windows)]
+fn apply_file_perms(_fd: RawFd, perms: &FilePerms) -> Result<()> {
+    if perms.owner.is_some() || perms.group.is_some() {
+        return Err(Error::Config(
+            "database.owner / database.group are POSIX concepts and cannot be applied on \
+             Windows; remove them or run on Unix"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+// `not(windows)`, not `unix`: wasm32 is neither, and `crate::wasmcompat::libc`
+// shadows the real crate in this file with honest no-op `fchmod`/`fchown` —
+// so the one body covers both. Splitting this on `unix` silently dropped the
+// wasm32 target, which no test run in the workspace would have noticed.
+#[cfg(not(windows))]
 fn apply_file_perms(fd: RawFd, perms: &FilePerms) -> Result<()> {
     let mode = perms.mode.unwrap_or(0o600);
     if unsafe { libc::fchmod(fd, mode as libc::mode_t) } != 0 {
@@ -1030,6 +1064,10 @@ fn apply_file_perms(fd: RawFd, perms: &FilePerms) -> Result<()> {
 /// Resolve a user (`is_user`) or group name to a numeric id. A purely-numeric
 /// string is taken as the id directly; otherwise it is looked up via
 /// `getpwnam_r`/`getgrnam_r` (thread-safe, buffer-growing on ERANGE).
+///
+/// Unix-only: Windows has no uid/gid, and `apply_file_perms` refuses a
+/// configured owner/group there rather than reaching this.
+#[cfg(unix)]
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_id(name: &str, is_user: bool) -> Result<u32> {
     if let Ok(n) = name.parse::<u32>() {
@@ -1141,21 +1179,15 @@ pub fn own_process_start_time() -> Option<u64> {
 }
 
 fn pid_alive_identity(pid: u32, recorded_start: u64) -> bool {
-    let alive = unsafe { libc::kill(pid as i32, 0) };
-    if alive != 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        if errno == libc::ESRCH {
-            return false; // definitely dead
-        }
-        // EPERM or anything else: process exists → alive (never sweep on EPERM)
-        return true;
+    if crate::os::pid_definitely_dead(pid) {
+        return false;
     }
     // pid exists — but is it the same incarnation?
     match proc_start_time(pid) {
         Some(st) => st == recorded_start,
-        // /proc race (died between kill and read): treat as dead only if
-        // kill confirms
-        None => unsafe { libc::kill(pid as i32, 0) == 0 },
+        // Raced with its own exit (died between the liveness check and the
+        // start-time read): dead only if a second check agrees.
+        None => !crate::os::pid_definitely_dead(pid),
     }
 }
 
@@ -1734,8 +1766,10 @@ impl Shm {
     /// makes them durable exactly like mapping stores.
     pub fn file_write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
         // wasm32: `write_all_at` is inherent on the wasmcompat File.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
         use std::os::unix::fs::FileExt;
+        #[cfg(windows)]
+        use crate::wincompat::FileExt;
         self.file
             .write_all_at(buf, offset)
             .map_err(|_| io_err("pwrite(extent)"))
@@ -1762,6 +1796,7 @@ impl Shm {
     ) -> Result<u64> {
         #[cfg(target_os = "linux")]
         {
+            #[cfg(unix)]
             use std::os::unix::io::AsRawFd;
             // The kernel updates these in place; a cast-temporary here would
             // silently discard the progress and loop on the same offsets.
@@ -1847,6 +1882,7 @@ impl Shm {
             // wasm32: `as_raw_fd` is inherent on the wasmcompat File, and
             // `fdatasync` there is the documented no-op (nothing is durable).
             #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(unix)]
             use std::os::unix::io::AsRawFd;
             if crate::os::fdatasync(self.file.as_raw_fd()) != 0 {
                 return Err(io_err("F_FULLFSYNC after msync"));
@@ -2625,12 +2661,11 @@ impl Shm {
             let pid = pid_half & !Self::CLAIMING;
             let dead = if pid_half & Self::CLAIMING != 0 {
                 // mid-claim: pid_start is not yet trustworthy, so only a
-                // definite ESRCH counts as dead (a claimer dying in this
-                // µs-window whose pid is instantly recycled leaks one slot
-                // until that pid exits — accepted residual, it pins nothing)
-                let kill_failed = unsafe { libc::kill(pid as i32, 0) } != 0;
-                kill_failed
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                // definite "no such pid" counts as dead (a claimer dying in
+                // this µs-window whose pid is instantly recycled leaks one
+                // slot until that pid exits — accepted residual, it pins
+                // nothing)
+                crate::os::pid_definitely_dead(pid)
             } else {
                 let recorded_start = self.slot_pid_start(idx).load(Ordering::Acquire);
                 !pid_alive_identity(pid, recorded_start)
@@ -3944,6 +3979,8 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
     }
 
+    /// POSIX mode bits: Unix-only by construction, not by neglect.
+    #[cfg(unix)]
     #[test]
     fn born_restrictive_default_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -3961,6 +3998,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn configured_mode_widens_main_and_wal() {
         use std::os::unix::fs::PermissionsExt;
         let p = tmp_path("perms-wal");
@@ -3980,6 +4018,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn resolve_id_accepts_numeric_and_rejects_unknown_name() {
         assert_eq!(resolve_id("0", true).unwrap(), 0);
         assert_eq!(resolve_id("1234", false).unwrap(), 1234);

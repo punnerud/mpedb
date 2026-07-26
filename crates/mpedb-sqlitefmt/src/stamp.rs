@@ -45,10 +45,36 @@ pub struct BaseStamp {
     pub wal: Option<([u8; 8], u64)>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn read_at(path: &Path, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     std::fs::File::open(path)?.read_exact_at(buf, off)
+}
+
+/// Windows: the same positional read. `seek_read` is not obliged to fill the
+/// buffer in one call, so this loops — the Unix `read_exact_at` promises to and
+/// Windows does not give that for free. A header stamp read short would be a
+/// wrong answer about the file's format, not a slow one.
+#[cfg(windows)]
+fn read_at(path: &Path, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let f = std::fs::File::open(path)?;
+    let (mut done, mut at) = (0usize, off);
+    while done < buf.len() {
+        match f.seek_read(&mut buf[done..], at)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short read of sqlite header stamp",
+                ))
+            }
+            n => {
+                done += n;
+                at += n as u64;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// wasm32: `File::open` cannot succeed (no filesystem), so this only ever

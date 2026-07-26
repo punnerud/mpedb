@@ -27,9 +27,20 @@
 //! lock could not be taken, never that it was. Silently "succeeding" at a
 //! lock against a foreign sqlite writer is the one answer that would be
 //! dangerous, and it is the one answer this cannot give.
+//!
+//! **Windows takes the same stub, and for a stronger reason than wasm32's**
+//! (#159). Windows has byte-range locks — `LockFileEx` — so this *could* be
+//! written. It must not be written by analogy: sqlite's Windows VFS uses its
+//! own locking protocol, with different byte offsets and a different
+//! shared/pending/reserved scheme from the POSIX one encoded here. A
+//! LockFileEx translation of these `fcntl` calls would take locks a foreign
+//! sqlite writer does not look at, and report exclusion it does not have —
+//! the exact dangerous answer the paragraph above rules out. Real interop
+//! locking on Windows means implementing sqlite's Windows protocol, which is
+//! its own piece of work and not a cfg arm.
 
 use std::fs::File;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -38,35 +49,35 @@ use std::path::Path;
 /// on macOS (the consts are already `c_short`) — which is why clippy on macOS
 /// flags the inline spelling as `unnecessary_cast`. One allowed cast here, and
 /// every use site stays cast-free on both platforms.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 #[allow(clippy::unnecessary_cast)]
 const RDLCK: i16 = libc::F_RDLCK as i16;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 #[allow(clippy::unnecessary_cast)]
 const UNLCK: i16 = libc::F_UNLCK as i16;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", windows))]
 const RDLCK: i16 = 0;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", windows))]
 const UNLCK: i16 = 2;
 
 /// The lock-command triple's type, `libc::c_int` natively.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", windows))]
 type LockCmd = i32;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 type LockCmd = libc::c_int;
 
 /// The fd a lock op targets. wasm32 has no fds; unreachable (see module doc).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn fd_of(f: &File) -> i32 {
     f.as_raw_fd()
 }
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", windows))]
 fn fd_of(_f: &File) -> i32 {
     -1
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", windows))]
 fn no_locks<T>() -> Result<T> {
     Err(Error::Io(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -81,7 +92,7 @@ const RESERVED_BYTE: i64 = PENDING_BYTE + 1;
 const SHARED_FIRST: i64 = PENDING_BYTE + 2;
 const SHARED_SIZE: i64 = 510;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn flock(ty: i16, start: i64, len: i64) -> libc::flock {
     // Zeroed base: l_whence = SEEK_SET (0), l_pid filled by the kernel.
     let mut f: libc::flock = unsafe { std::mem::zeroed() };
@@ -97,12 +108,12 @@ fn flock(ty: i16, start: i64, len: i64) -> libc::flock {
 
 /// Try a non-blocking lock op; `Ok(true)` = acquired, `Ok(false)` = someone
 /// conflicting holds it.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", windows))]
 fn setlk(_fd: i32, _cmd: LockCmd, _ty: i16, _start: i64, _len: i64) -> Result<bool> {
     no_locks()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn setlk(fd: i32, cmd: libc::c_int, ty: i16, start: i64, len: i64) -> Result<bool> {
     let mut f = flock(ty, start, len);
     let r = unsafe { libc::fcntl(fd, cmd, &mut f) };
@@ -118,12 +129,12 @@ fn setlk(fd: i32, cmd: libc::c_int, ty: i16, start: i64, len: i64) -> Result<boo
 
 /// Would a `ty` lock on `[start, start+len)` be granted right now? (F_GETLK
 /// probe — takes nothing.)
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", windows))]
 fn getlk_free(_fd: i32, _cmd: LockCmd, _ty: i16, _start: i64, _len: i64) -> Result<bool> {
     no_locks()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn getlk_free(fd: i32, cmd_getlk: libc::c_int, ty: i16, start: i64, len: i64) -> Result<bool> {
     let mut f = flock(ty, start, len);
     let r = unsafe { libc::fcntl(fd, cmd_getlk, &mut f) };
@@ -137,7 +148,7 @@ fn getlk_free(fd: i32, cmd_getlk: libc::c_int, ty: i16, start: i64, len: i64) ->
 fn lock_cmds() -> (LockCmd, LockCmd, bool) {
     // wasm32: no fcntl commands exist; `false` (not OFD) is the conservative
     // report, and no caller gets this far anyway.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", windows))]
     {
         (0, 0, false)
     }

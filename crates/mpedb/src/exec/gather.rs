@@ -112,7 +112,19 @@ fn budget_fits_in_memory(cells: u64) -> bool {
     {
         bound = bound.min(4 << 30);
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    // Windows has no address-space rlimit: a process is bounded by the commit
+    // limit (RAM + pagefile), which is a SYSTEM property rather than a
+    // per-process one, so there is nothing here that plays `RLIMIT_AS`'s role.
+    // Leaving `bound` at u64::MAX takes the documented "falls back to fits"
+    // path — the same answer a Unix box with no rlimit set gives, and the
+    // `max_join_cells` budget (#74) is the real backstop either way.
+    #[cfg(windows)]
+    {
+        // A job object CAN cap process memory, and reading it would be the
+        // Windows analogue. Not wired in stage 1: it is an optimisation that
+        // refuses a doomed plan earlier, never a correctness gate.
+    }
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
     unsafe {
         let mut rl: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_AS, &mut rl) == 0 && rl.rlim_cur != libc::RLIM_INFINITY {

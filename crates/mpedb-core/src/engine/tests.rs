@@ -64,7 +64,7 @@ primary_key = ["id"]
   name = "age"
   type = "int64"
 "#,
-        path.display()
+        crate::toml_escape_path(&path)
     );
     TestCfg {
         cfg: Config::from_toml_str(&toml).unwrap(),
@@ -386,7 +386,7 @@ primary_key = ["id"]
   name = "age"
   type = "int64"
 "#,
-        path.display()
+        crate::toml_escape_path(&path)
     );
     Config::from_toml_str(&toml).unwrap()
 }
@@ -534,7 +534,7 @@ primary_key = ["id"]
   name = "data"
   type = "blob"
 "#,
-        path.display()
+        crate::toml_escape_path(&path)
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let eng = open(&cfg);
@@ -864,7 +864,7 @@ fn cdc_write_block_refuses_optimistic_blind_apply() {
          [[table]]\nname = \"kv\"\nprimary_key = [\"id\"]\n\
          [[table.column]]\nname = \"id\"\ntype = \"int64\"\n\
          [[table.column]]\nname = \"v\"\ntype = \"int64\"\n",
-        path.display()
+        crate::toml_escape_path(&path)
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let eng = Engine::open(&cfg, vec![vec![]]).unwrap();
@@ -1012,7 +1012,7 @@ fn cdc_capture_hooks_optimistic_blind_apply() {
          [[table]]\nname = \"kv\"\nprimary_key = [\"id\"]\n\
          [[table.column]]\nname = \"id\"\ntype = \"int64\"\n\
          [[table.column]]\nname = \"v\"\ntype = \"int64\"\n",
-        path.display()
+        crate::toml_escape_path(&path)
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let eng = Engine::open(&cfg, vec![vec![]]).unwrap();
@@ -1110,7 +1110,7 @@ primary_key = ["id"]
   name = "data"
   type = "blob"
 "#,
-        path.display()
+        crate::toml_escape_path(&path)
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let mut eng = Engine::open(&cfg, vec![vec![]]).unwrap();
@@ -1228,7 +1228,7 @@ primary_key = ["id"]
   name = "data"
   type = "blob"
 "#,
-        path.display()
+        crate::toml_escape_path(&path)
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let mut eng = Engine::open(&cfg, vec![vec![]]).unwrap();
@@ -1279,7 +1279,7 @@ primary_key = ["id"]
   name = "data"
   type = "blob"
 "#,
-        path.display()
+        crate::toml_escape_path(&path)
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     let mut eng = Engine::open(&cfg, vec![vec![]]).unwrap();
@@ -1400,7 +1400,7 @@ primary_key = ["id"]
   columns = ["b", "c"]
   unique = true
 "#,
-        path.display()
+        crate::toml_escape_path(&path)
     );
     let cfg = Config::from_toml_str(&toml).unwrap();
     assert_eq!(cfg.schema.tables[0].indexes.len(), 2);

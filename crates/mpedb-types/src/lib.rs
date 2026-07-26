@@ -17,6 +17,7 @@ pub mod schema;
 pub mod subedit;
 pub mod value;
 
+pub use config::toml_escape;
 pub use config::{
     resolve_storage_path, BareGroupBy, Concurrency, Config, DbOptions, Durability, FilePerms,
     StorageKind, WorkspaceConfig, WorkspaceMember, DEFAULT_MAX_JOIN_CELLS, DEFAULT_MAX_WORK_ROWS,

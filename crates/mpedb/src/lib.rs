@@ -100,6 +100,11 @@ pub use tier::TierReport;
 pub use workspace::{Workspace, WorkspaceTxn, WsPlan};
 
 pub use mpedb_types::model::WorkloadModel;
+/// Escape a path for embedding in a TOML basic string — see
+/// [`mpedb_types::toml_escape`]. Re-exported because every binding that builds
+/// a config from a user-supplied path needs it, and #159 found three that had
+/// each solved it differently.
+pub use mpedb_types::toml_escape;
 pub use mpedb_types::{
     BudgetKind, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, Footprint,
     HostAggState, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema,
@@ -445,7 +450,10 @@ impl mpedb_core::btree::BlobSource for FileBlobSource {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
+            #[cfg(unix)]
             use std::os::unix::fs::FileExt;
+            #[cfg(windows)]
+            use mpedb_core::wincompat::FileExt;
             self.file.read_exact_at(buf, self.pos)?;
             self.pos += buf.len() as u64;
             Ok(())

@@ -73,7 +73,7 @@ const NEW_DB_SIZE_MB: u64 = 64;
 /// The TOML that seeds a brand-new native database: geometry plus one inert
 /// bootstrap table, because a schema with no tables is refused.
 fn seed_toml(path: &Path, size_mb: u64) -> String {
-    let p = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let p = mpedb_types::toml_escape(&path.to_string_lossy());
     format!(
         "[database]\npath = \"{p}\"\nsize_mb = {size_mb}\n\n\
          [[table]]\nname = \"{SEED_TABLE}\"\nprimary_key = [\"id\"]\n\n  \

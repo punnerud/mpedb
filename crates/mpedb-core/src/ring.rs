@@ -431,21 +431,18 @@ impl<'a> IntentRing<'a> {
             if state != ST_RESERVED && state != ST_DONE {
                 continue;
             }
-            // wasm32: the intent ring only exists for durability commit|wal,
-            // which the private path refuses outright — so this loop never
-            // sees an occupied slot there. `crate::wasmcompat::kill` still
-            // answers honestly (every pid but ours is gone) via its own errno,
-            // because wasm has no OS errno for `last_os_error` to read.
-            #[cfg(target_arch = "wasm32")]
-            let dead = {
-                let kill_failed = unsafe { crate::wasmcompat::libc::kill(pid as i32, 0) } != 0;
-                kill_failed && crate::wasmcompat::errno() == crate::wasmcompat::libc::ESRCH
-            };
-            #[cfg(not(target_arch = "wasm32"))]
-            let dead = {
-                let kill_failed = unsafe { libc::kill(pid as i32, 0) } != 0;
-                kill_failed && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            };
+            // Only a DEFINITE "no such pid" may free a reserved slot: an owner
+            // we merely cannot query is an owner whose intent is still live,
+            // and stealing its slot loses the intent. Three platforms once
+            // spelled this three ways here; the Windows spelling read every
+            // `OpenProcess` failure as death, which includes ACCESS_DENIED and
+            // is the unsafe direction. `os::pid_definitely_dead` is one-sided
+            // by construction, so the spelling cannot drift again.
+            //
+            // wasm32: the ring only exists for durability commit|wal, which
+            // the private path refuses outright, so this loop never sees an
+            // occupied slot there at all.
+            let dead = crate::os::pid_definitely_dead(pid);
             if !dead {
                 continue;
             }

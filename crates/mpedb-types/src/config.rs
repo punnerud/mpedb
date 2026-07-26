@@ -534,6 +534,41 @@ fn default_true() -> bool {
     true
 }
 
+/// Escape a filesystem path for embedding in a TOML **basic string** (`"…"`).
+///
+/// Found by running the engine on Windows (#159): `C:\Users\bob\app.db`
+/// interpolated straight into `path = "…"` contains `\U`, which TOML reads as
+/// a unicode escape — so `sqlite3_open` through the C-API shim, `mpedb open`,
+/// and the Python `connect()` all failed on an ordinary Windows path with
+/// `invalid unicode 4-digit hex code`. It never showed on Unix because Unix
+/// paths contain no backslashes.
+///
+/// Escaping rather than switching to a TOML *literal* string (`'…'`): a literal
+/// has no escapes at all, which is tempting, but it also cannot contain a
+/// single quote — and `'` is a legal filename character on both Windows and
+/// Unix. Trading one unrepresentable path for another is not a fix.
+///
+/// Handles the full basic-string escape set, not just backslash: a path may
+/// legally contain a quote, and control characters are rejected outright by
+/// TOML rather than passed through.
+pub fn toml_escape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 impl Config {
     pub fn from_toml_str(text: &str) -> Result<Config> {
         let raw: RawConfig =
@@ -1198,5 +1233,40 @@ path = "/dev/shm/shared.mpedb"
             "durability = \"none\"\nconcurrency = \"yolo\"",
         );
         assert!(Config::from_toml_str(&bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod toml_escape_tests {
+    use super::toml_escape;
+
+    /// The exact string that broke on Windows: `\U` in `C:\Users` is a TOML
+    /// unicode escape, so an unescaped path is a parse error, not a path.
+    #[test]
+    fn a_windows_path_survives_the_round_trip() {
+        let p = r"C:\Users\bob\AppData\Local\app.mpedb";
+        let toml = format!("[database]\npath = \"{}\"\nsize_mb = 8\n", toml_escape(p));
+        let v: toml::Value = toml::from_str(&toml).expect("escaped path must parse");
+        assert_eq!(v["database"]["path"].as_str().unwrap(), p);
+    }
+
+    /// A Unix path must come out byte-identical — the escape may not "fix"
+    /// anything that was never broken.
+    #[test]
+    fn a_unix_path_is_unchanged() {
+        let p = "/home/morten/db/app.mpedb";
+        assert_eq!(toml_escape(p), p);
+    }
+
+    /// Quotes and single quotes are both legal in filenames. The quote is why
+    /// this escapes rather than switching to a TOML literal string, which
+    /// cannot contain a single quote at all.
+    #[test]
+    fn quotes_of_both_kinds_survive() {
+        for p in [r#"/tmp/it"s.mpedb"#, "/tmp/it's.mpedb", r#"C:\a"b\c's.mpedb"#] {
+            let toml = format!("[database]\npath = \"{}\"\n", toml_escape(p));
+            let v: toml::Value = toml::from_str(&toml).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+            assert_eq!(v["database"]["path"].as_str().unwrap(), p, "round trip failed for {p:?}");
+        }
     }
 }

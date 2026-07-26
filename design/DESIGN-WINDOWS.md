@@ -1,10 +1,14 @@
 # DESIGN-WINDOWS — porting the engine, and why it is smaller than it looks
 
-**Status: design (2026-07-26). Nothing is built.** Today Windows runs the
-portable crates only (`mpedb-types`, `mpedb-sql`); `.github/workflows/windows.yml`
-says so and is right about today. This document is about what the rest would
-cost, because the usual answer — "the engine is Unix-only, so Windows is out" —
-is true as a description and wrong as a prediction.
+**Status: stages 1 and 2 built (2026-07-26).** The engine compiles for
+`x86_64-pc-windows-gnu`, its 86 unit tests pass, and four multi-process
+properties pass — mapping coherence, writer exclusion, cross-process MVCC
+snapshots, and owner death. Stages 3–5 are unbuilt, and §4 still describes
+them.
+
+Everything below §0 was written before any of it existed; the parts that turned
+out to be wrong are marked rather than deleted, because what a prediction got
+wrong is the more useful record.
 
 ## 0. The claim this corrects
 
@@ -31,6 +35,12 @@ than hardwired to `mmap`.
 **Measurement 3: the gap has a number.** `cargo check -p mpedb-core --target
 x86_64-pc-windows-gnu` reports **68 errors across 5 files** — 56 in `shm.rs`,
 8 in `os.rs`, 2 in `engine/write.rs`, 1 each in `ring.rs` and `lib.rs`.
+
+*(Held up. All 68 were symbol substitution, and the shape of the fix was a
+`wincompat` module supplying the Unix-shaped names — `RawFd`, `FileExt`,
+`OpenOptionsExt`, and a `libc` module that SHADOWS the real crate for the files
+that need it — so `shm.rs`'s 56 call sites compiled unchanged. The same trick
+the wasm32 arm already used. Not one of the 68 needed a design change.)*
 
 Every one is the same shape: a missing `libc` function, type or constant, or a
 Unix-only method on `std::fs::File` (`as_raw_fd`, `write_all_at`, `mode`). There
@@ -87,6 +97,13 @@ Three things do not have a clean one-liner, and they are where the real work is:
    `FILE_SHARE_READ | FILE_SHARE_WRITE` cannot be opened by a second process at
    all. Getting this wrong turns the headline property — several processes on
    one database — into an `ERROR_SHARING_VIOLATION` that looks like corruption.
+
+   *(Stage 2: a non-issue, and worth recording why. Rust's `OpenOptions`
+   defaults `share_mode` to `FILE_SHARE_READ | FILE_SHARE_WRITE |
+   FILE_SHARE_DELETE`, so the engine's plain `File::open` already asks for
+   everything. The trap is real for code that reaches for `CreateFileW`
+   directly, which `wincompat` deliberately does not — it opens through `std`
+   and only drops to Win32 for the mapping and the lock.)*
 3. **The crash harnesses assume `fork` + signals.** `stress`, `crash`,
    `powerloss`, `collide`, `mirror-collide` — nine CLI files — are how
    crash-safety is *proven*, and they are POSIX to the bone. A Windows port that
@@ -113,11 +130,28 @@ else follows it.
 
 ## 4. Staging, if this is ever picked up
 
-1. **`os.rs` Windows arm + `Shm` open/map path.** The mechanical part. Ends at:
-   one process opens a `.mpedb` on Windows, reads and writes, single-process.
-2. **Multi-process attach.** Sharing modes, the named-mutex writer lock, the
-   reader table's pid identity via `GetProcessTimes`. Ends at: two processes,
-   one file, MVCC readers against a writer.
+1. ~~**`os.rs` Windows arm + `Shm` open/map path.**~~ **DONE.** `wincompat.rs`
+   (hand-declared `extern "system"` kernel32 bindings — no `windows-sys`
+   dependency) plus Windows arms in `os.rs`. 86 engine unit tests pass.
+2. ~~**Multi-process attach.**~~ **DONE.** `crates/mpedb-core/tests/multiproc_attach.rs`
+   — mapping coherence, writer exclusion, cross-process MVCC snapshots, owner
+   death. Fork-free: it re-invokes its own binary via `std::process` and hard-kills
+   with `Child::kill` (`TerminateProcess` here, `SIGKILL` on Unix), so the SAME
+   test is the gate on both platforms.
+
+   Two things came out differently than planned. The writer lock is
+   `LockFileEx`, **not** the named mutex §1 recommends: `not(target_os =
+   "linux")` already routes to the macOS FLD-2 shape (a sidecar advisory lock
+   plus the shared tri-state DIRTY word), and `LockFileEx` drops into that
+   position with owner-death release from the kernel, where a named mutex would
+   have needed a second recovery path for the same property. And the reader
+   sweep needed a new seam: `shm.rs` asked `kill(pid, 0)` and compared
+   `last_os_error()` to `ESRCH`, which on Windows reads the raw Win32 code and
+   never matches any errno — so every dead pid answered "alive" and the sweep
+   reclaimed nothing. That is now `os::pid_definitely_dead`, one-sided by
+   construction, and the Windows arm answers it BETTER than Linux does: it sees
+   through a terminated-but-still-referenced process, which on Linux is known
+   issue #136.
 3. **Durability + recovery.** `FlushFileBuffers` ordering, the WAL, boot-epoch
    recovery. Ends at: `powerloss` equivalent passes.
 4. **The crash harnesses on `CreateProcess`/`TerminateProcess`.** Until this
@@ -129,52 +163,67 @@ Stages 1–3 are tractable and mostly mechanical against an abstraction that
 exists. Stage 4 is the one to budget for, and the one that decides whether the
 claim on the tin is true on Windows.
 
+**What stage 5 will cost that nobody counted.** The facade's ~150 integration
+tests hand-build config text with an unescaped path — the same bug §6 describes,
+in every one of them. `mpedb_testkit::toml_path` exists now, so each is a
+one-token change, but until they are swept, `cargo test -p mpedb` on Windows
+measures the escape and nothing else. Stage 3's real gate should therefore be
+that sweep plus `-p mpedb`, not the WAL work alone.
+
 ## 5. Running the engine tests on REAL Windows
 
-This is the only thing that would settle it, and the CI side of it is trivial —
-`windows.yml` would change one line, from
+This is what settles it, and it is now wired: `windows.yml` has a
+`windows-engine` job separate from `windows-portable-core`, running stage 1
+(`cargo test -p mpedb-core --lib`) and stage 2 (`--test multiproc_attach`).
 
-```yaml
-run: cargo test -p mpedb-types -p mpedb-sql
-```
+Separate jobs, per stage, was the right call and stays the rule. The portable
+crates are a settled guarantee whose red means a regression; the engine job is a
+port in progress whose red means an unfinished stage. One job would have made
+those indistinguishable, and the workspace-wide `cargo test --workspace` this
+section originally proposed would have been red for reasons that have nothing to
+do with the engine — see the sweep noted in §4.
 
-to `cargo test --workspace`. That is the whole CI change. The 68 errors in §0
-are what stand between, and after them stage 4's crash harnesses are what decide
-whether the result deserves the word "supported".
-
-There is no useful intermediate. A job that attempts the workspace today fails
-on line one and teaches nothing, which is exactly what `windows.yml`'s header
-rejects and why it is scoped the way it is. What *is* worth doing, if the port
-is ever started, is running that job **per stage**: stage 1 turns `cargo build
--p mpedb-core` green, stage 2 adds the multi-process tests, and so on. Each
-stage is a real gate rather than a promise.
-
-## 6. What Wine actually bought — measured, and it is not much
+## 6. What Wine bought — the first assessment was wrong
 
 `scripts/test-windows-wine.sh` runs the portable crates' tests as Windows `.exe`
-under Wine. First run, 2026-07-26: **360 tests, 0 failures.** It found nothing.
+under Wine. First run, 2026-07-26: **360 tests, 0 failures.** From that I wrote
+that Wine "found nothing", that it would keep finding nothing, and that pointing
+it at the engine would produce failures nobody could act on. The first claim was
+accurate about the portable crates. The rest did not survive the engine.
 
-That is the honest report, and it generalises. The two crates it can reach are
-pure computation — tokenizer, binder, planner, plan codec, keycode, blake3.
-There is no filesystem in them, no processes, no locale-dependent formatting on
-the tested paths. So the class of bug Wine is *for* barely exists on the surface
-Wine can reach.
+**Pointed at the engine, its first run found a production bug.** 28 of 86 tests
+failed, all on one cause: a `.mpedb` path interpolated into a TOML `path = "…"`
+line unescaped. `C:\Users\…` makes `\U` a TOML unicode escape, so the config is
+a *parse error* — and the error names TOML, not paths, so nothing about it
+points at the cause. Four production call sites had the same shape and three
+were wrong in three different ways:
 
-And there is an inversion worth naming, because it decides how much to invest:
+| Site | Before |
+|---|---|
+| `mpedb-capi/src/lib.rs` | `\\`+`"` escaped — correct, and the only one |
+| `mpedb-cli/src/openpath.rs` | same |
+| `mpedb-cli/src/util.rs` | **no escaping at all** |
+| `mpedb-py/src/lib.rs` | `\\`→`/`, and quotes **deleted** — silently opens a different file |
 
-> **Wine is most trustworthy exactly where we need it least, and least
-> trustworthy exactly where we would want it most.**
+All four now call `mpedb_types::toml_escape`. None of this is Windows-specific:
+the Python binding would drop a quote out of a Unix path just as happily. It is
+Windows-specific only in that no Unix path contains a backslash, so nothing ever
+exercised it.
 
-Pure computation under Wine is reliable and uninteresting. The engine — shared
-mmap, cross-process locks, owner-death recovery, process identity — is the part
-where a Windows port could genuinely go wrong, and it is also the part where
-Wine's emulation is thinnest and a red result is most likely to be Wine's fault
-rather than ours. Pointing Wine at the engine, once it compiles, would produce
-failures nobody could act on with confidence.
+**The corrected reading.** Wine is not a Windows substitute, and the caution
+below is still right about *why*:
 
-So: keep the Wine script as a cheap regression net for the SQL front end, expect
-it to keep finding nothing, and do not treat it as a step toward the port. The
-port's verification is real Windows in Actions, per stage.
+> Wine is most trustworthy exactly where we need it least, and least trustworthy
+> exactly where we would want it most.
+
+What that misses is that a **red** result is cheap and actionable even when a
+green one proves nothing. Every failure Wine reported here was ours, none were
+Wine's, and the debugging loop — rebuild, rerun, ten seconds — is not something
+CI can offer. The right role is a fast local screen that catches the portable
+mistakes (path handling, string encoding, missing symbols) before the slow
+authoritative run, with real Windows in Actions keeping the verdict.
+
+Stages 1 and 2 were developed against it in an afternoon. That is the measurement.
 
 ## 7. What we do instead, today
 

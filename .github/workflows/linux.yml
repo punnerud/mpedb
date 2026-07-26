@@ -89,6 +89,22 @@ jobs:
           rustup target add x86_64-pc-windows-gnu
           cargo clippy -p mpedb-types -p mpedb-sql --all-targets \
             --target x86_64-pc-windows-gnu -- -D warnings
+      # The engine now has THREE non-Linux arms (windows, macos, wasm32), and
+      # `cargo test --workspace` exercises exactly one of them. That asymmetry
+      # already cost: adding the Windows arm as `#[cfg(windows)]` /
+      # `#[cfg(not(windows))]` where the original split was on `target_os =
+      # "linux"` made both bodies compile on wasm32 — a duplicate-definition
+      # error no green Linux run could see, because nothing in the workspace
+      # builds for wasm32. Ten seconds of `check` closes it.
+      #
+      # Windows gets the engine too, not just the portable crates: it is a port
+      # in progress (#159) and the compile half of its gate should be as cheap
+      # and as early as everything else's.
+      - name: the engine must COMPILE for Windows and wasm32
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check -p mpedb-core --target x86_64-pc-windows-gnu
+          cargo check -p mpedb-core --target wasm32-unknown-unknown
       - name: test
         run: cargo test --workspace
       - name: clippy
