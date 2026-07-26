@@ -89,7 +89,7 @@ fn memory_backing_file() -> Result<File> {
     }
 }
 
-pub const FORMAT_VERSION: u32 = 6; // v6: ring entry carries a column mask (#146 K1)
+pub const FORMAT_VERSION: u32 = 7; // v7: footprint ring on its own pages, exact key sets (#149)
                                    //     (DESIGN-BLOBEXTENT §3.4); WAL3 trailer.
                                    // v2: intent-ring region between reader table and data
 
@@ -168,19 +168,37 @@ const LA_WAL_APPENDED: usize = 248; // AtomicU64: append cursor — bytes writte
 // makes the ring self-protecting against a foreign serial-mode writer (its
 // commits leave gaps → conservative conflict → serial fallback, never a missed
 // conflict).
-const LA_OPT_RING: usize = 256;
 /// Committed-footprint ring capacity (also the max snapshot-age a validator can
 /// trust before conservatively conflicting).
-pub const OPT_RING_SLOTS: u64 = 64;
-const OPT_RING_ENTRY: usize = 40; // txn_id ‖ kind ‖ table_bits ‖ key_hash ‖ cols
-// 256 + 64 * 40 = 2816, inside the lock page. The room came from #147 moving
-// the notification region off this page; the ring grew into it rather than
-// packing two meanings into one field, which is the mistake `khash` already
-// carries three of.
+///
+/// **This bounds think time, in commits.** A guarded action holds a snapshot
+/// while it works; if more than this many commits land in the meantime the ring
+/// can no longer witness the window and the guard refuses conservatively. At 64
+/// that was milliseconds of think time under load — fine for a handler, useless
+/// for a person editing a document. Arm F never reached it (measured: zero
+/// `SnapshotTooOld` at 8 editors), but arm F thinks for 10 ms, and the workload
+/// it stands for thinks for seconds.
+pub const OPT_RING_SLOTS: u64 = 256;
+/// Exact key hashes a ring entry can carry before falling back to the summary.
+///
+/// **The width that actually bit.** Before #149 the comparison folded every key
+/// through `region_bit` — a 64-bit Bloom with k = 1 — even when both sides
+/// named a single exact key. Eight editors on eight distinct rows collide on a
+/// bit with probability ≈ 35 %, and arm F measured exactly that: seats 2 and 5
+/// share bit 19, conflict on every commit, and the whole gap to PostgreSQL was
+/// two rows that are not related at all.
+///
+/// Eight covers a real action: arm E's networked profile touches one account
+/// row plus five audit rows. Beyond eight the entry falls back to the Bloom,
+/// which is correct and simply coarser — the fail-safe direction.
+pub const OFP_MAX_KEYS: usize = 8;
+const OPT_RING_ENTRY: usize = 128; // 16 u64: header (5) ‖ keys (8) ‖ spare (3)
 // entry field offsets
 const OFP_TXN: usize = 0;
 const OFP_KIND: usize = 8;
 const OFP_TBITS: usize = 16;
+/// The key summary: an exact hash for `POINT`, a shard hash for `SHARD`, a
+/// Bloom for `REGION`. `OFP_NKEYS` says whether the exact set below is usable.
 const OFP_KHASH: usize = 24;
 /// Columns this commit wrote, as a bitmask over column index folded `& 63`
 /// (#146 K1). `u64::MAX` means "unknown / all", which is what anything that
@@ -192,6 +210,11 @@ const OFP_KHASH: usize = 24;
 /// the hard case in collaborative editing. Distinguishing columns is what makes
 /// the move and the edit independent.
 const OFP_COLS: usize = 32;
+/// How many of the `OFP_MAX_KEYS` exact slots below are valid. `0` means the
+/// commit could not name its keys exactly and only `OFP_KHASH` applies.
+const OFP_NKEYS: usize = 40;
+/// First of `OFP_MAX_KEYS` exact key-hash slots.
+const OFP_KEYS: usize = 48;
 /// The mask meaning "every column" — the fail-safe value.
 pub const COLS_ANY: u64 = u64::MAX;
 /// Footprint kinds recorded per committed txn.
@@ -322,13 +345,24 @@ pub enum GuardVerdict {
 /// | field | unknown | meaning |
 /// |---|---|---|
 /// | `tables` | — | folded `& 63`; empty conflicts with nothing |
-/// | `regions` | [`Shm::REGION_ANY`] | which keys |
+/// | `regions` | [`Shm::REGION_ANY`] | which keys, as a 64-bit Bloom |
+/// | `keys` | `None` | which keys, EXACTLY, when there are few enough |
 /// | `shard` | `None` | which tenant, when provable |
 /// | `cols` | [`COLS_ANY`] | which columns |
-#[derive(Debug, Clone, Copy)]
+///
+/// `keys` and `regions` describe the same thing at two precisions, and both are
+/// carried because either side of a comparison may have lost exactness. When
+/// both sides can name their keys the test is a set intersection with no false
+/// positives; when either cannot, it falls back to the Bloom. Keeping only the
+/// Bloom is what made two unrelated rows conflict 35 % of the time at eight
+/// editors (#149).
+#[derive(Debug, Clone)]
 pub struct GuardSurface {
     pub tables: u64,
     pub regions: u64,
+    /// Every key this surface touches, or `None` once there were more than
+    /// [`OFP_MAX_KEYS`] of them and exactness was given up.
+    pub keys: Option<Vec<u64>>,
     pub shard: Option<u64>,
     pub cols: u64,
 }
@@ -376,8 +410,24 @@ pub fn notify_start_page(max_readers: u32) -> u64 {
     ring_start_page(max_readers) + RING_PAGES
 }
 
-pub fn data_start_page(max_readers: u32) -> u64 {
+/// Committed-footprint ring (#142–#149): its own pages, directly after the
+/// notification region.
+///
+/// It lived in the lock page's free tail until #149, which capped it at 64
+/// entries of 40 bytes. Both of those numbers were limits with consequences —
+/// 64 entries bounds how long a guarded action may think, and 40 bytes left
+/// room for exactly one key, which forced every comparison through a 64-bit
+/// Bloom. Its own pages buy both: 256 entries and eight exact keys each, for
+/// 32 KiB per database.
+pub const OPT_RING_PAGES: u64 =
+    ((OPT_RING_SLOTS as usize * OPT_RING_ENTRY).div_ceil(PAGE_SIZE)) as u64;
+
+pub fn opt_ring_start_page(max_readers: u32) -> u64 {
     notify_start_page(max_readers) + NOTIFY_PAGES
+}
+
+pub fn data_start_page(max_readers: u32) -> u64 {
+    opt_ring_start_page(max_readers) + OPT_RING_PAGES
 }
 
 fn durability_tag(d: Durability) -> u32 {
@@ -2830,7 +2880,11 @@ impl Shm {
     #[inline]
     fn opt_field(&self, txn_id: u64, field: usize) -> &AtomicU64 {
         let slot = (txn_id % OPT_RING_SLOTS) as usize;
-        self.atomic_u64(Self::lock_area_off(LA_OPT_RING) + slot * OPT_RING_ENTRY + field)
+        self.atomic_u64(
+            opt_ring_start_page(self.max_readers) as usize * PAGE_SIZE
+                + slot * OPT_RING_ENTRY
+                + field,
+        )
     }
 
     /// *Writer-lock holder.* Record this commit's footprint BEFORE the meta
@@ -2838,12 +2892,49 @@ impl Shm {
     /// The txn_id field is stored LAST (Release) so a reader that sees it can
     /// trust the payload; in practice every read is also serialized by the
     /// writer mutex, which is a full barrier.
-    pub fn opt_record(&self, txn_id: u64, kind: u64, table_bits: u64, key_hash: u64, cols: u64) {
+    pub fn opt_record(
+        &self,
+        txn_id: u64,
+        kind: u64,
+        table_bits: u64,
+        key_hash: u64,
+        cols: u64,
+        keys: Option<&[u64]>,
+    ) {
         self.opt_field(txn_id, OFP_COLS).store(cols, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_KIND).store(kind, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_TBITS).store(table_bits, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_KHASH).store(key_hash, Ordering::Relaxed);
+        // The exact set, when this commit could name it. `nkeys = 0` is the
+        // fail-safe reading: no exact set, use the summary. It is therefore
+        // also what a commit with too many keys, or with none it could name,
+        // publishes — and what a torn or unwritten slot reads as.
+        let n = match keys {
+            Some(k) if !k.is_empty() && k.len() <= OFP_MAX_KEYS => k.len(),
+            _ => 0,
+        };
+        for (i, h) in keys.unwrap_or(&[]).iter().take(n).enumerate() {
+            self.opt_field(txn_id, OFP_KEYS + i * 8).store(*h, Ordering::Relaxed);
+        }
+        self.opt_field(txn_id, OFP_NKEYS).store(n as u64, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_TXN).store(txn_id, Ordering::Release);
+    }
+
+    /// The exact key set commit `t` published, or `None` when it had none.
+    /// A count outside `1..=OFP_MAX_KEYS` reads as "none" rather than being
+    /// trusted — the same bounds-checking every other decoder here does.
+    fn opt_keys(&self, t: u64) -> Option<[u64; OFP_MAX_KEYS]> {
+        let n = self.opt_field(t, OFP_NKEYS).load(Ordering::Relaxed) as usize;
+        if n == 0 || n > OFP_MAX_KEYS {
+            return None;
+        }
+        let mut out = [0u64; OFP_MAX_KEYS];
+        for (i, slot) in out.iter_mut().enumerate().take(n) {
+            *slot = self.opt_field(t, OFP_KEYS + i * 8).load(Ordering::Relaxed);
+        }
+        // Unused tail stays 0, which `key_hash` never produces (`h | 1`), so a
+        // padded array can be compared without carrying the length.
+        Some(out)
     }
 
     /// *Writer-lock holder.* First-committer-wins conflict test for an
@@ -2957,7 +3048,7 @@ impl Shm {
         surface: &GuardSurface,
         why: &mut GuardVerdict,
     ) -> bool {
-        let GuardSurface { tables: table_bits, regions, shard, cols } = *surface;
+        let GuardSurface { tables: table_bits, regions, ref keys, shard, cols } = *surface;
         if current_txn <= snap_txn {
             return false; // nothing committed since our snapshot
         }
@@ -3000,13 +3091,29 @@ impl Shm {
                 // the two modes is the exception, and guessing across them
                 // would be guessing about correctness.
                 _ if shard.is_some() => true,
-                OFP_KIND_REGION => {
-                    self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed) & regions != 0
-                }
-                OFP_KIND_POINT => {
-                    Self::region_bit(self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed))
-                        & regions
-                        != 0
+                OFP_KIND_REGION | OFP_KIND_POINT => {
+                    // #149: exact first. When BOTH sides could name their keys
+                    // the answer is a set intersection and there are no false
+                    // positives at all — which is the common case, because
+                    // most actions touch a handful of rows by primary key.
+                    //
+                    // The Bloom below is the fallback for when either side gave
+                    // up on exactness, and its cost is why this arm exists: at
+                    // k = 1 over 64 bits, eight distinct keys collide ~35 % of
+                    // the time, and a collision is a permanent conflict between
+                    // two rows that have nothing to do with each other.
+                    match (keys.as_deref(), self.opt_keys(t)) {
+                        (Some(mine), Some(theirs)) => {
+                            mine.iter().any(|m| theirs.contains(m))
+                        }
+                        _ if kind == OFP_KIND_POINT => {
+                            Self::region_bit(
+                                self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed),
+                            ) & regions
+                                != 0
+                        }
+                        _ => self.opt_field(t, OFP_KHASH).load(Ordering::Relaxed) & regions != 0,
+                    }
                 }
                 // TABLE says "any keys": the committer could not name where it
                 // landed, so it must be taken to have landed anywhere.

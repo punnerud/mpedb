@@ -83,7 +83,7 @@ impl<'e> WriteTxn<'e> {
         // writeback and no freelist fixpoint, it just aborts. Retrying is the
         // expected outcome, not the exceptional one, so it must not be
         // expensive.
-        if let Some((snap_txn, surface, regions, shard, cols)) = self.guard_state() {
+        if let Some((snap_txn, surface, regions, keys, shard, cols)) = self.guard_state() {
             let mut why = crate::shm::GuardVerdict::Clear;
             // A guard that touched no resolvable key guards its whole surface;
             // one that named its keys guards only those. Zero would mean "no
@@ -92,7 +92,11 @@ impl<'e> WriteTxn<'e> {
             // Zero means "no column was named", which must read as every
             // column — the same widening the committer applies below.
             let cols = if cols == 0 { crate::shm::COLS_ANY } else { cols };
-            let gs = crate::shm::GuardSurface { tables: surface, regions, shard, cols };
+            // An empty exact set means "this action named no key at all", which
+            // is not the same as "it named none I can compare" — it must fall
+            // back to the summary, and the summary was just widened to ANY.
+            let keys = keys.filter(|k| !k.is_empty());
+            let gs = crate::shm::GuardSurface { tables: surface, regions, keys, shard, cols };
             if self.eng.shm.opt_conflict_set(snap_txn, self.meta.txn_id, &gs, &mut why) {
                 self.eng.guard_stats.record(why);
                 self.abort();
@@ -486,7 +490,11 @@ impl<'e> WriteTxn<'e> {
             };
             let wcols =
                 if self.written_cols == 0 { crate::shm::COLS_ANY } else { self.written_cols };
-            self.eng.shm.opt_record(new_txn, kind, tbits, khash, wcols);
+            // The exact set rides alongside the summary. A POINT commit already
+            // had one key here; what is new is that a guard can now compare
+            // against it without folding both through 64 bits (#149).
+            let wkeys = self.written_keys.as_deref().filter(|k| !k.is_empty());
+            self.eng.shm.opt_record(new_txn, kind, tbits, khash, wcols, wkeys);
         }
 
         // 4. publish (fence(Release) + atomic stores inside)

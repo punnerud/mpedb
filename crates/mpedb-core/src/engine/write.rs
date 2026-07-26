@@ -66,7 +66,7 @@ impl Hasher for PageIdHasher {
 /// What it does NOT provide is exclusivity of the WORK: two actors may both
 /// compute, and only one commits. Where the work has external side effects
 /// that cannot run twice, a lease is required instead (#142 G2).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Guard {
     pub snap_txn: u64,
     /// Key-region summary of everything this action has actually touched
@@ -80,6 +80,15 @@ pub struct Guard {
     /// invalidated — so narrowing by what actually ran is sound where narrowing
     /// the table set would not be.
     pub regions: u64,
+    /// The same keys, EXACTLY, or `None` once there were more than
+    /// `OFP_MAX_KEYS` of them or one could not be named (#149).
+    ///
+    /// The Bloom above is a 64-bit summary with one bit per key, so two
+    /// unrelated rows share a bit 1/64 of the time — which at eight concurrent
+    /// rows is a coin flip, and a permanent one for the pair that collides.
+    /// Carrying the exact set alongside costs a `Vec` per guarded transaction
+    /// and removes every false conflict the summary would have invented.
+    pub keys: Option<Vec<u64>>,
     /// The shard this action runs under (#144), or `None` when it cannot be
     /// proven — no session context, or a table without a policy on that key.
     ///
@@ -219,6 +228,10 @@ pub struct WriteTxn<'e> {
     /// Key-region summary of what this txn WROTE, published to the commit ring
     /// so later guards can tell "same table" from "same row" (#143).
     pub(super) written_regions: u64,
+    /// The exact keys this txn wrote, or `None` once it could not name them
+    /// all (#149). Published alongside the summary so a later guard can answer
+    /// exactly instead of through a 64-bit Bloom.
+    pub(super) written_keys: Option<Vec<u64>>,
     /// The shard this txn's writes all belong to (#144), or `None` if they do
     /// not all belong to one provable shard.
     /// Columns this txn WROTE, same folding and same widening rule.
@@ -471,6 +484,22 @@ impl<'e> WriteTxn<'e> {
                 Some(h) => crate::shm::Shm::region_bit(h),
                 None => crate::shm::Shm::REGION_ANY,
             };
+            // The exact set is given up permanently the first time a key
+            // cannot be named or the set outgrows the ring entry — never
+            // re-acquired, because a key already forgotten cannot be added
+            // back and a surface that shrank would stop guarding it.
+            match (key_hash, g.keys.as_mut()) {
+                (Some(h), Some(ks)) => {
+                    if !ks.contains(&h) {
+                        ks.push(h);
+                        if ks.len() > crate::shm::OFP_MAX_KEYS {
+                            g.keys = None;
+                        }
+                    }
+                }
+                (None, _) => g.keys = None,
+                (Some(_), None) => {}
+            }
         }
     }
 
@@ -481,11 +510,28 @@ impl<'e> WriteTxn<'e> {
             Some(h) => crate::shm::Shm::region_bit(h),
             None => crate::shm::Shm::REGION_ANY,
         };
+        match (key_hash, self.written_keys.as_mut()) {
+            (Some(h), Some(ks)) => {
+                if !ks.contains(&h) {
+                    ks.push(h);
+                    if ks.len() > crate::shm::OFP_MAX_KEYS {
+                        self.written_keys = None;
+                    }
+                }
+            }
+            (None, _) => self.written_keys = None,
+            (Some(_), None) => {}
+        }
     }
 
     /// The guard's snapshot and accumulated surface, for the commit path.
-    pub fn guard_state(&self) -> Option<(u64, u64, u64, Option<u64>, u64)> {
-        self.guard.as_ref().map(|g| (g.snap_txn, g.surface, g.regions, g.shard, g.cols))
+    #[allow(clippy::type_complexity)]
+    pub fn guard_state(
+        &self,
+    ) -> Option<(u64, u64, u64, Option<Vec<u64>>, Option<u64>, u64)> {
+        self.guard
+            .as_ref()
+            .map(|g| (g.snap_txn, g.surface, g.regions, g.keys.clone(), g.shard, g.cols))
     }
 
     pub fn hint_notify_key(&mut self, table_id: u32, region: Option<&[u8]>) {

@@ -1332,6 +1332,16 @@ impl Database {
     /// belongs outside any lock — is covered only because it was declared.
     /// Nothing else can cover it: no statement inside the session touches that
     /// row.
+    /// This process's guard verdict tally: `(cleared, overlap, snapshot_too_old,
+    /// ring_gap)`.
+    ///
+    /// A refusal count alone cannot tell a real conflict from a limit of the
+    /// machinery, and the two call for opposite fixes — so the counter that
+    /// separates them is part of the API rather than a debug aid.
+    pub fn guard_stats(&self) -> (u64, u64, u64, u64) {
+        self.engine.guard_stats()
+    }
+
     pub fn begin_guarded_with(
         &self,
         snap: u64,

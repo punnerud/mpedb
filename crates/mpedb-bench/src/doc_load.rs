@@ -84,6 +84,9 @@ pub struct DocResult {
     pub p50_ms: u64,
     pub p99_ms: u64,
     pub retries: u64,
+    /// `(cleared, overlap, snapshot_too_old, ring_gap)` — WHY the guard
+    /// refused, which a retry count on its own cannot say.
+    pub verdicts: (u64, u64, u64, u64),
     /// Edits that were written and then overwritten by a concurrent editor
     /// that had read the older value. `None` where the arm cannot lose one.
     pub lost: Option<u64>,
@@ -151,6 +154,10 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
     let think = Duration::from_millis(delay_ms());
     let mut lat = Vec::with_capacity(n_actions);
     let mut retries = 0u64;
+    // (cleared, overlap, snapshot_too_old, ring_gap). A refusal count alone
+    // cannot say whether the guard caught a real conflict or ran out of ring,
+    // and those call for opposite fixes.
+    let mut verdicts = (0u64, 0u64, 0u64, 0u64);
     println!("DOC {doc}");
 
     match engine.as_str() {
@@ -239,6 +246,7 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                 }
                 lat.push(t0.elapsed().as_micros() as u64);
             }
+            verdicts = db.guard_stats();
         }
         "postgres" => {
             let mut c = postgres::Client::connect(target, postgres::NoTls)
@@ -299,6 +307,7 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
         println!("{l}");
     }
     println!("RETRIES {retries}");
+    println!("VERDICTS {} {} {} {}", verdicts.0, verdicts.1, verdicts.2, verdicts.3);
     Ok(())
 }
 
@@ -309,6 +318,8 @@ struct Run {
     p50: u64,
     p99: u64,
     retries: u64,
+    /// `(cleared, overlap, snapshot_too_old, ring_gap)` summed over editors.
+    verdicts: (u64, u64, u64, u64),
     /// actions/s per document, for the independence arm.
     per_doc: BTreeMap<i64, f64>,
 }
@@ -342,6 +353,7 @@ fn spawn_and_collect(
     }
     let mut lat = Vec::new();
     let mut retries = 0u64;
+    let mut verd = (0u64, 0u64, 0u64, 0u64);
     let mut doc_actions: BTreeMap<i64, usize> = BTreeMap::new();
     for k in kids {
         let out = k.wait_with_output().map_err(|e| format!("worker wait: {e}"))?;
@@ -355,6 +367,15 @@ fn spawn_and_collect(
                 doc = d.trim().parse().unwrap_or(0);
             } else if let Some(n) = line.strip_prefix("RETRIES ") {
                 retries += n.trim().parse::<u64>().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("VERDICTS ") {
+                let n: Vec<u64> =
+                    v.split_whitespace().map(|x| x.parse().unwrap_or(0)).collect();
+                if n.len() == 4 {
+                    verd.0 += n[0];
+                    verd.1 += n[1];
+                    verd.2 += n[2];
+                    verd.3 += n[3];
+                }
             } else if let Ok(v) = line.trim().parse::<u64>() {
                 lat.push(v);
                 *doc_actions.entry(doc).or_default() += 1;
@@ -368,6 +389,7 @@ fn spawn_and_collect(
         p50: pct(&lat, 0.50) / 1000,
         p99: pct(&lat, 0.99) / 1000,
         retries,
+        verdicts: verd,
         per_doc: doc_actions.into_iter().map(|(d, n)| (d, n as f64 / elapsed)).collect(),
     })
 }
@@ -539,6 +561,7 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
                 p50_ms: r.p50,
                 p99_ms: r.p99,
                 retries: r.retries,
+                verdicts: r.verdicts,
                 lost,
             });
         }
@@ -563,6 +586,7 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
                 p50_ms: r.p50,
                 p99_ms: r.p99,
                 retries: r.retries,
+                verdicts: r.verdicts,
                 lost: None,
             });
         }
@@ -588,6 +612,7 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
                         p50_ms: r.p50,
                         p99_ms: r.p99,
                         retries: 0,
+                        verdicts: (0, 0, 0, 0),
                         lost,
                     });
                 }
@@ -605,6 +630,7 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
                     p50_ms: r.p50,
                     p99_ms: r.p99,
                     retries: 0,
+                    verdicts: (0, 0, 0, 0),
                     lost: None,
                 });
             }
@@ -630,6 +656,16 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
         );
     }
 
+    println!();
+    println!("guard verdicts (mpedb only) — a refusal is a CONFLICT or a LIMIT, never both:");
+    println!(
+        "{:<18} {:>8} {:>10} {:>10} {:>16} {:>10}",
+        "arm", "editors", "cleared", "overlap", "snapshot_too_old", "ring_gap"
+    );
+    for r in rows.iter().filter(|r| r.engine == "mpedb") {
+        let (c, o, s, g) = r.verdicts;
+        println!("{:<18} {:>8} {:>10} {:>10} {:>16} {:>10}", r.arm, r.workers, c, o, s, g);
+    }
     println!();
     println!(
         "per-document rates, {EDITORS_PER_DOC} editors per document. A document whose rate \

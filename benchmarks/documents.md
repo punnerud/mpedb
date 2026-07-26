@@ -65,17 +65,17 @@ a p50 sitting on it means the editor never waited on anyone.
 
 | Editors | Linux mpedb | Linux pg | M3 mpedb | M3 pg |
 |---:|---:|---:|---:|---:|
-| 2 | **73** | 69 | **56** | 51 |
-| 4 | **71** | 69 | **57** | 51 |
-| 8 | **73** | 70 | **59** | 51 |
+| 2 | **73** | 70 | **57** | 51 |
+| 4 | **73** | 69 | **58** | 51 |
+| 8 | **74** | 69 | **59** | 52 |
 
 Latency, where the two models actually differ:
 
 | Editors | Linux mpedb p50 / p99 | Linux pg p50 / p99 | M3 mpedb p50 / p99 | M3 pg p50 / p99 |
 |---:|---:|---:|---:|---:|
-| 2 | **13** / 21 ms | 27 / **43** ms | **18** / 204 ms | 39 / **42** ms |
-| 4 | **13** / 552 ms | 56 / **71** ms | **19** / 447 ms | 77 / **83** ms |
-| 8 | **13** / 2197 ms | 112 / **205** ms | **19** / 648 ms | 154 / **167** ms |
+| 2 | **13** / 117 ms | 27 / **41** ms | **19** / 219 ms | 39 / **43** ms |
+| 4 | **13** / 562 ms | 56 / **71** ms | **19** / 470 ms | 77 / **84** ms |
+| 8 | **13** / 2171 ms | 111 / **201** ms | **19** / 690 ms | 153 / **166** ms |
 
 Throughput is a tie, and it should be: one field everyone rewrites is one
 serial chain in both engines. What differs is *where the waiting lands*, and
@@ -94,31 +94,47 @@ better instrument, and this measurement says so.
 
 ### F-blocks — the document is a table of blocks
 
-| Editors | Linux mpedb | Linux pg | M3 mpedb | M3 pg | mpedb retries (Linux / M3) |
+| Editors | Linux mpedb | Linux pg | M3 mpedb | M3 pg | mpedb refusals (Linux / M3) |
 |---:|---:|---:|---:|---:|---:|
-| 2 | **139** | 133 | **102** | 98 | 0 / 0 |
-| 4 | **282** | 260 | **202** | 198 | 0 / 0 |
-| 8 | 229 | **358** | 169 | **257** | 65 / 51 |
+| 2 | **145** | 131 | **106** | 104 | 0 / 0 |
+| 4 | **287** | 253 | **204** | 199 | 0 / 0 |
+| 8 | 314 | **352** | 255 | **306** | 0 / 0 |
 
-Both scale, because both are row-granular. PostgreSQL wins at 8 editors on both
-machines, and mpedb's retries say why: at 8 editors × 40 actions the guard's
-**64-commit ring history** wraps inside a single 10 ms think time, and a
-snapshot the ring can no longer witness is refused conservatively
-(`GuardVerdict::SnapshotTooOld`). That is a width limit, not a conflict — the
-same saturation [notify.md](notify.md) records for arm E, and it is filed.
+Both scale, because both are row-granular, and after #149 mpedb refuses nothing
+at all here — every editor owns a row, no two editors are related, and the guard
+now says so.
+
+**This row is where a benchmark earned its keep.** Before #149 it read 229 a/s
+on Linux and 169 on the M3, with 65 and 51 refusals, and the page said the
+guard's 64-commit ring history had wrapped inside the think time. That was wrong, and the fix for it would have
+fixed nothing. `GuardStats` separates a real conflict from each of the ring's
+limits, and it reported `snapshot_too_old = 0`, `ring_gap = 0`, `overlap = 65` —
+the guard believed those were genuine conflicts.
+
+They were an artefact of the comparison's width. Both sides held an exact key
+and then folded it through `region_bit`, a 64-bit Bloom with one bit per key.
+Editors 2 and 5 hash to bit 19; they conflicted on every commit for forty
+actions while editing rows that have nothing to do with each other. Eight keys
+collide on a bit about 35 % of the time, so this was not bad luck — it was the
+expected outcome at eight editors.
+
+The ring entry now carries up to eight **exact** keys beside the summary, and a
+comparison where both sides can name their keys is a set intersection with no
+false positives. Beyond eight keys it falls back to the Bloom, which is coarser
+and still correct.
 
 ### F-move — a move and an edit on the same row
 
 | Editors | Linux mpedb | Linux pg | M3 mpedb | M3 pg |
 |---:|---:|---:|---:|---:|
-| 2 | **145** | 68 | **103** | 51 |
-| 4 | **141** | 68 | **106** | 52 |
-| 8 | **141** | 70 | **109** | 52 |
+| 2 | **149** | 69 | **104** | 51 |
+| 4 | **145** | 69 | **107** | 52 |
+| 8 | **148** | 69 | **110** | 52 |
 
-**2.0× on Linux, 2.1× on the M3**, and the factor is exactly right: mpedb's
-141/s is twice the 73/s of a single serial chain, because the row split into two
+**2.1× on both machines**, and the factor is exactly right: mpedb's 148/s is
+twice the 74/s of a single serial chain, because the row split into two
 independent columns. p50 stays on the think time (13 / 19 ms) against
-PostgreSQL's 112 / 154 ms. One person moving a paragraph and another editing it
+PostgreSQL's 112 / 153 ms. One person moving a paragraph and another editing it
 are not in each other's way; `FOR UPDATE` takes the row and both sides queue.
 
 This is the case that motivated [`ordkey`](../crates/mpedb-types/src/ordkey.rs):
@@ -132,33 +148,50 @@ contention were a property of the *table*, adding documents would add nothing.
 
 | Documents | Editors | Linux mpedb | Linux **coarse** | Linux pg | M3 mpedb | M3 **coarse** | M3 pg |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 4 | 73 | 73 | 49 | 57 | 56 | 51 |
-| 2 | 8 | **146** | 66 | 138 | **111** | 59 | 102 |
-| 4 | 16 | **238** | 72 | 270 | **211** | 60 | 210 |
+| 1 | 4 | **74** | 73 | 69 | **57** | 58 | 53 |
+| 2 | 8 | **148** | 73 | 98 | **112** | 59 | 104 |
+| 4 | 16 | 264 | 73 | **267** | **210** | 59 | 210 |
 
 Per-document rates — the number that makes the claim falsifiable:
 
 | Documents | Linux mpedb per doc | Linux pg per doc | M3 mpedb per doc | M3 pg per doc |
 |---:|---|---|---|---|
-| 1 | 73/s | 49/s | 57/s | 51/s |
-| 2 | 73, 73 | 69, 69 | 56, 56 | 51, 51 |
-| 4 | 60 ×4 | 67 ×4 | 53 ×4 | 53 ×4 |
+| 1 | 74/s | 69/s | 57/s | 53/s |
+| 2 | 74, 74 | 49, 49 | 56, 56 | 52, 52 |
+| 4 | 66 ×4 | 67 ×4 | 53 ×4 | 52 ×4 |
 
 Each document runs at its own rate and does not notice the others. (Linux's drop
-to 60/s at four documents is 16 processes on 2 cores, not locking — the 11-core
-M3 holds 53/s against PostgreSQL's identical 53/s.)
+to 66/s at four documents is 16 processes on 2 cores, not locking — the 11-core
+M3 holds 53/s against PostgreSQL's 52/s.)
 
 **The `coarse` columns are the control, and they are the important ones.** They
 run the identical work with one extra *declared* statement — a whole-table scan
 — and nothing else changed. A scan names no single key, so the guard widens to
 "anywhere in this table", which is exactly what the guard was before key regions
-(#143). It goes **flat no matter how many documents exist**: 73 → 66 → 72 on
-Linux, 56 → 59 → 60 on the M3, with 8730 refusals in the last cell.
+(#143). It goes **flat no matter how many documents exist**: 73 → 73 → 73 on
+Linux, 58 → 59 → 59 on the M3, with 8269 refusals in the last cell against 1381
+for the precise declaration doing the same work.
 
 That is the attribution: document independence comes from the declared surface
 naming one row, not from anything else in the engine. Without the control this
 page would be a plausible story about a number that could have had three other
 causes.
+
+## What the verdict counter is for
+
+Every mpedb arm reports `(cleared, overlap, snapshot_too_old, ring_gap)` beside
+its refusal count, because a refusal alone cannot say whether the guard caught a
+real conflict or ran out of machinery — and those call for opposite fixes. The
+counter is what turned "widen the ring" from a plausible plan into the right
+one: it said `snapshot_too_old = 0` everywhere, which killed the history
+hypothesis, and left the width of the *comparison* as the only candidate.
+
+`OPT_RING_SLOTS` went 64 → 256 anyway, and that is worth being honest about: no
+measurement here needed it. It bounds how long a guarded action may think, in
+commits, and arm F thinks for 10 ms. The workload arm F stands for thinks for
+seconds, so the limit is real even though this page did not hit it — and it is
+pinned from both sides, at 100 commits (must be witnessed) and 300 (must still
+refuse).
 
 ## What this cost, and what it exposed
 

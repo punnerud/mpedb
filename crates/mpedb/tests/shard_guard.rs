@@ -239,21 +239,24 @@ fn an_unguarded_session_is_unaffected() {
 }
 
 /// **A documented limit, as a test rather than as prose.** The OPT ring
-/// witnesses 64 commits. A guard whose snapshot is older cannot be answered, so
-/// it is refused — even when the surface is disjoint from everything that
-/// happened. That binds how long a caller may think between reading and
+/// witnesses [`OPT_RING_SLOTS`](mpedb_core::shm::OPT_RING_SLOTS) commits — 256
+/// since #149, 64 before it. A guard whose snapshot is older cannot be
+/// answered, so it is refused even when the surface is disjoint from everything
+/// that happened. That binds how long a caller may think between reading and
 /// writing, and it is the same shape as #135's rate law: a property of a
 /// bounded structure, not a bug.
 ///
-/// If someone later widens the ring, this test fails and should be updated
-/// deliberately — which is the point of pinning it.
+/// If someone later widens the ring again, this test fails and should be
+/// updated deliberately — which is the point of pinning it. Its companion
+/// `a_snapshot_a_hundred_commits_old_is_still_witnessed` pins the other side,
+/// so a widening cannot be faked by simply trusting everything.
 #[test]
 fn a_snapshot_older_than_the_ring_is_refused_conservatively() {
     let (d, path) = db("toodold");
     let snap = d.snapshot_txn();
 
-    // 65 commits, all to a table the guarded action never mentions.
-    for i in 0..65i64 {
+    // Past the window, all to a table the guarded action never mentions.
+    for i in 0..300i64 {
         d.query("INSERT INTO other (id, v) VALUES ($1, 1)", &[Value::Int(i)]).unwrap();
     }
 
@@ -262,9 +265,8 @@ fn a_snapshot_older_than_the_ring_is_refused_conservatively() {
     match s.commit() {
         Err(Error::WriteConflict) => {}
         other => panic!(
-            "a snapshot {} commits old was trusted ({other:?}) — the ring cannot \
-             witness that far back, so the only safe answer is to refuse",
-            65
+            "a snapshot 300 commits old was trusted ({other:?}) — the ring cannot \
+             witness that far back, so the only safe answer is to refuse"
         ),
     }
     drop(d);
@@ -760,3 +762,132 @@ fn a_declared_move_and_a_declared_edit_on_one_row_both_commit() {
     drop(d);
     let _ = std::fs::remove_file(&path);
 }
+
+/// **#149, the width that actually bit.** Two guarded actions on rows whose key
+/// hashes land on the SAME 64-bit region bit must both commit.
+///
+/// Keys 2 and 5 are not a coincidence: they are the pair arm F measured
+/// colliding, and before #149 those two editors conflicted on every single
+/// commit while touching rows that have nothing to do with each other. The
+/// comparison folded both exact keys through `region_bit`, so exactness was
+/// thrown away at the last step by both sides.
+#[test]
+fn two_rows_that_share_a_bloom_bit_no_longer_conflict() {
+    let (d, path) = db("bloom-collide");
+    for id in [2i64, 5] {
+        d.query("INSERT INTO orders (id, v) VALUES ($1, 0)", &[Value::Int(id)]).unwrap();
+    }
+    let snap = d.snapshot_txn();
+    let sql = "UPDATE orders SET v = $1 WHERE id = $2";
+
+    let pa = [Value::Int(10), Value::Int(2)];
+    let mut a = d.begin_guarded_with(snap, &[(sql, &pa[..])]).unwrap();
+    a.query(sql, &pa).unwrap();
+    a.commit().expect("the first action should commit");
+
+    let pb = [Value::Int(20), Value::Int(5)];
+    let mut b = d.begin_guarded_with(snap, &[(sql, &pb[..])]).unwrap();
+    b.query(sql, &pb).unwrap();
+    b.commit().expect(
+        "row 5 was refused because row 2 moved — the two share a region bit, and the \
+         comparison is still folding exact keys through a 64-bit Bloom",
+    );
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same key still conflicts once the comparison is exact. Without this,
+/// "compare the exact sets" could be implemented as "never intersect" and the
+/// test above would not notice.
+#[test]
+fn exact_key_comparison_still_catches_the_same_row() {
+    let (d, path) = db("exact-same");
+    d.query("INSERT INTO orders (id, v) VALUES (2, 0)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+    let sql = "UPDATE orders SET v = $1 WHERE id = $2";
+    let p = [Value::Int(10), Value::Int(2)];
+
+    let mut a = d.begin_guarded_with(snap, &[(sql, &p[..])]).unwrap();
+    a.query(sql, &p).unwrap();
+    a.commit().unwrap();
+
+    let mut b = d.begin_guarded_with(snap, &[(sql, &p[..])]).unwrap();
+    b.query(sql, &p).unwrap();
+    match b.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!("expected WriteConflict on the SAME row, got {other:?}"),
+    }
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **An action wider than the ring entry falls back, and the fallback is
+/// conservative.** More than `OFP_MAX_KEYS` keys cannot be carried exactly, so
+/// exactness is given up and the Bloom decides — which may cost a retry and may
+/// never miss a conflict. Here the two actions genuinely share a row, so the
+/// answer must be refusal regardless of which path was taken.
+#[test]
+fn more_keys_than_the_entry_holds_stays_conservative() {
+    let (d, path) = db("overflow-keys");
+    for id in 0..24i64 {
+        d.query("INSERT INTO orders (id, v) VALUES ($1, 0)", &[Value::Int(id)]).unwrap();
+    }
+    let snap = d.snapshot_txn();
+    let sql = "UPDATE orders SET v = $1 WHERE id = $2";
+
+    // Twelve keys — past the eight a ring entry can name.
+    let mut a = d.begin_guarded_for(snap, &[sql]).unwrap();
+    for id in 0..12i64 {
+        a.query(sql, &[Value::Int(1), Value::Int(id)]).unwrap();
+    }
+    a.commit().expect("the wide action should commit");
+
+    // Row 3 is inside what A wrote, so this must be refused.
+    let pb = [Value::Int(9), Value::Int(3)];
+    let mut b = d.begin_guarded_with(snap, &[(sql, &pb[..])]).unwrap();
+    b.query(sql, &pb).unwrap();
+    match b.commit() {
+        Err(Error::WriteConflict) => {}
+        other => panic!(
+            "expected WriteConflict, got {other:?} — an action too wide to name its keys \
+             exactly must not be read as naming none of them"
+        ),
+    }
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **The ring's history is what bounds think time, and it is now 256 commits.**
+/// A guarded action holding a snapshot across 100 unrelated commits used to be
+/// refused with `SnapshotTooOld` — the question was unanswerable, not a
+/// conflict. It is answerable now.
+#[test]
+fn a_snapshot_a_hundred_commits_old_is_still_witnessed() {
+    let (d, path) = db("deep-history");
+    d.query("INSERT INTO orders (id, v) VALUES (1, 0)", &[]).unwrap();
+    d.query("INSERT INTO other (id, v) VALUES (1, 0)", &[]).unwrap();
+    let snap = d.snapshot_txn();
+
+    // 100 commits to a table we do not touch — well past the old 64.
+    for i in 0..100i64 {
+        let mut w = d.begin().unwrap();
+        w.query("UPDATE other SET v = $1 WHERE id = 1", &[Value::Int(i)]).unwrap();
+        w.commit().unwrap();
+    }
+
+    let sql = "UPDATE orders SET v = $1 WHERE id = $2";
+    let p = [Value::Int(7), Value::Int(1)];
+    let mut s = d.begin_guarded_with(snap, &[(sql, &p[..])]).unwrap();
+    s.query(sql, &p).unwrap();
+    s.commit().expect(
+        "a snapshot 100 commits old was refused — the ring can no longer witness the window, \
+         which caps how long a guarded action may think",
+    );
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+

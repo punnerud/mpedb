@@ -166,9 +166,24 @@ instant, that is worth more than mutual exclusion — nothing to lease, nothing 
 reap, and a dead process simply did not commit. The task queue's claim was
 already written this way.
 
-The ring's limits (64 commits of history, `& 63` table folding, point-only key
-precision) all fail toward a retry and are pinned as tests, with `GuardStats`
-counting which one actually bites.
+The ring's limits all fail toward a retry and are pinned as tests, with
+`GuardStats` counting which one actually bites — which is not a debugging
+nicety. Arm F refused 65 actions at eight editors on eight distinct rows, the
+benchmark said the 64-commit history had wrapped, and the counter said
+`snapshot_too_old = 0`: every one of them was reported as a real conflict. They
+were not. Both sides held an exact key and then folded it through `region_bit`,
+a 64-bit Bloom with one bit per key, and two of the eight rows shared a bit.
+
+**#149 widened the two things that were actually narrow.** The ring moved off
+the lock page to its own 32 KiB, which buys 256 commits of history (the bound on
+how long an action may think) and eight **exact** key hashes per entry beside
+the summary. A comparison where both sides can name their keys is a set
+intersection with no false positives; past eight keys it falls back to the
+Bloom, coarser and still correct. Arm F's F-blocks arm went from 65 refusals to
+zero.
+
+The remaining limits are the `& 63` table fold, the Bloom fallback past eight
+keys, and the history bound — all fail-safe, all counted.
 
 ## 7. The commit-path review (2026-07-25)
 
