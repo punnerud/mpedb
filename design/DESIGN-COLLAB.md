@@ -218,25 +218,39 @@ the user's; this is the minimum that makes them easy to write.
 
 ### The algorithm, and why the order is a guarantee
 
-1. **Sort by offset**, stable, so equal offsets keep arrival order.
+1. **Sort by `(seq, editor)`** — the submitters' own counters (§3c). Total, so
+   no tie can fall back on arrival order.
 2. Guard against the **oldest** snapshot in the set — guarding against a newer
    one would forgive a decision made against a version that had already moved.
-3. Apply in offset order, shifting each member by the **cumulative length
-   delta** of the members before it. `splice()`'s engine-side rebase (#151)
-   handles everything committed *before* the batch; this loop handles the batch
-   itself. They compose and must not be conflated: one counts committed
-   transactions, the other counts members.
+   This is the *transaction's* snapshot; each member is rebased from its own
+   (§the two conservative choices, below).
+3. Apply in counter order, shifting each member by the length delta of the
+   members already applied **whose removed span ends at or before it** — which
+   is the condition "did that edit move my bytes", stated directly.
+   `splice()`'s engine-side rebase (#151) handles everything committed *before*
+   the batch; this loop handles the batch itself. They compose and must not be
+   conflated: one counts committed transactions, the other counts members.
+   - The test is on the predecessor's **end**, not its start, and the difference
+     is the equal-offset case: two people typing at one cursor both have
+     `at == mine` and neither removes anything, so the one that acted first must
+     push the other along. Comparing starts would leave them at the same point
+     and silently reverse them.
 4. **Overlap within the batch is a collision, not a shift**, tested against the
-   furthest byte any applied member reached, in pre-batch coordinates. Getting
-   this wrong is not an error — member A rewrites `[0,4)`, member B wants
-   `[2,4)`, and shifting B by A's delta relocates it onto A's own inserted text.
-   A perfectly valid splice, on bytes B never saw. That is exactly the shape of
-   the committed-path rule, and it was a live bug for one compile.
+   set of applied spans in pre-batch coordinates. Getting this wrong is not an
+   error — member A rewrites `[0,4)`, member B wants `[2,4)`, and shifting B by
+   A's delta relocates it onto A's own inserted text. A perfectly valid splice,
+   on bytes B never saw. That is exactly the shape of the committed-path rule,
+   and it was a live bug for one compile.
+   - An explicit **set**, not a watermark. A watermark was correct only while
+     members were applied in ascending offset; under counter order the applied
+     members are not a prefix of the offset axis, so it would both miss real
+     overlaps and invent false ones.
 5. A loser loses **alone** — a savepoint per member, as the ring's leader
    already does.
 
 **Applying in arrival order instead would make every edit's offset depend on
-network jitter.** That is why the order is documented as a contract.
+network jitter.** That is why the order is documented as a contract, and why the
+counter replaced the stable sort that used to stand in for it.
 
 ### Nobody starves
 
@@ -265,27 +279,74 @@ halves when a quarter are slow, because a majority of active editors usually
 cannot be assembled from the fast ones alone. Quorum picked the right trigger; it
 did not remove the coupling.
 
-### The one place two conservative choices multiply
+### The one place two conservative choices multiply (#154)
 
-`F-quorum` also exposed a throughput bug that is invisible to any correctness
-test, because both halves fail *safe*:
+`F-quorum` exposed this as a throughput bug. It is worse than that, and the
+correction is worth being precise about, because "both halves fail safe" is what
+made it look harmless:
 
-- step 2 guards against the **oldest** member snapshot, so one lagging editor
-  drags every other member's rebase walk back over commits those members had
-  already seen; and
+- step 2 guards against the **oldest** member snapshot, and used the same
+  snapshot for the *rebase walk*; and
 - `WriteTxn::record_written_range` publishes `(min lo, max hi)` — the union over
   the whole transaction — so a K-member batch declares one span covering all of
   them, which for 32 editors is most of the block.
 
-Either alone costs nothing. Together, a single lagging member makes its batch
-walk a range that covers everybody, and **every member loses**. Instrumented, a
-counter for "oldest member lags the previous commit" equalled the counter for
-"whole batch lost" in all eighteen cells measured — no fresh batch was ever
-wiped, and no wipe lacked a lagging member.
+The union half fails safe: a spurious refusal. **The walk half does not.** A
+member whose own snapshot is newer than the batch minimum has already seen the
+commits in between, and its `at` is expressed in coordinates that include them.
+Walking it from the minimum applies those deltas a *second* time — a valid splice
+on bytes its author never saw, reported as `Committed`.
+`collab_mixed_snap.rs` reproduces it: two disjoint edits, two snapshots, and the
+newer one landed four bytes early.
 
-The fix is to walk each member from **its own** snapshot rather than the batch
-minimum; the guard still has to be taken against the oldest, since that is what
-makes the transaction's own refusal honest. Filed, not built.
+**The rule, and the reason the two halves differ:** the guard is about what the
+transaction may refuse, so it must be the oldest — anything newer would forgive a
+decision made against a version that had already moved. The walk is about where
+one member's bytes are, so it must be that member's own. `query_from_snapshot`
+carries it per statement rather than as session state, because a hidden mode is
+what breaks when two calls get reordered. An origin older than the guard is
+clamped to the guard's: the walk may not reach past what the guard validated.
+
+The union half remains, and is now the whole of the residual loss: a member whose
+snapshot predates the previous batch's commit collides with that batch's declared
+span whatever it asks for. Fixing it means recording a small *set* of ranges
+instead of their union (the shape `OFP_MAX_KEYS = 8` already uses for keys, with
+the same fall back to the union on overflow) — a shared-memory format change, so
+it is filed separately.
+
+## 3c. The flush needs no deadline (#155)
+
+`F-quorum` showed the timeout was a bound rather than the mechanism. `F-counter`
+removes it, and the two pieces that make that safe are both already here.
+
+**The counter.** Every `Submission` carries `seq`, drawn by the client from a
+shared clock. The batch applies in `(seq, editor)` order — total, no ties — so
+the same submissions produce the same text however they arrive. The engine never
+assigns `seq`; it only sorts by it.
+
+**The heartbeat carries it.** `Lease::beat(block, editor, now_ms, seq)` publishes
+where an editor has got to, and `Lease::spoken` reports the live holders'
+positions. So an editor with nothing to add needs no separate "abstain" message —
+*having nothing to say is a heartbeat with an unchanged counter*. That is what
+makes "a majority of the membership has spoken" reachable with no clock in the
+flush loop, and the membership a **known set** (lease holders) rather than
+something inferred from arrivals.
+
+Time does not disappear; it moves to the lease TTL, which is membership rather
+than commit, and which the deployment already owns. Measured, that trade is worth
++38 % when slow editors can still speak and −47 % when they cannot
+(`benchmarks/documents.md`, F-counter) — the same condition etcd puts on a
+follower, and the reason the TTL is the number to tune for a network-shaped
+workload.
+
+### What the counter does not buy
+
+A submission whose round has already committed cannot be ordered into the past;
+#151 rebases it forward and it lands late. The counter is a total order **within
+a round**, not over all history. An edit delayed for half an hour is never lost
+and never lands on the wrong bytes, but its counter does not reorder what is
+already committed — that needs commutative operations, which is the CRDT trade
+this design declined.
 
 ## 4. Seats, heartbeats, and reaping
 
