@@ -51,6 +51,23 @@ jobs:
           else
             echo "mold unavailable — building with the default linker"
           fi
+      # The Windows job guards that the SQL front end and the type system stay
+      # portable, but it runs NIGHTLY — so a portable crate that acquires a
+      # Unix dependency is green here and red twelve hours later, on a machine
+      # nobody is looking at. This is the same property, checked in a second on
+      # every push. (#138 added an unused `mpedb-testkit` dev-dependency to
+      # mpedb-types, which drags in mpedb → mpedb-core → mmap/flock/libc; the
+      # nightly caught it a day later.)
+      - name: the portable crates must stay portable
+        run: |
+          for c in mpedb-types mpedb-sql; do
+            if cargo tree -p "$c" --edges normal,build,dev | grep -q mpedb-core; then
+              echo "::error::$c reaches mpedb-core, which is Unix-only by construction."
+              echo "The Windows job builds $c and will fail. Dependency path:"
+              cargo tree -p "$c" --edges normal,build,dev --invert mpedb-core || true
+              exit 1
+            fi
+          done
       - name: test
         run: cargo test --workspace
       - name: clippy

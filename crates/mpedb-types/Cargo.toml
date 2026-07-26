@@ -9,6 +9,3 @@ description = "Shared types for mpedb: values, schema, key encoding, expression 
 blake3 = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-
-[dev-dependencies]
-mpedb-testkit = { path = "../mpedb-testkit" }
