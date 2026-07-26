@@ -113,7 +113,9 @@ jobs:
       - name: the engine must COMPILE for Windows and wasm32
         run: |
           rustup target add wasm32-unknown-unknown
-          rustup component add clippy --target x86_64-pc-windows-gnu
+          # clippy is a HOST component — `rustup component add clippy --target
+          # <T>` is an error, not a no-op. Cross-linting needs only the target's
+          # std, which the step above already installed.
           cargo clippy -p mpedb-core --lib --target x86_64-pc-windows-gnu -- -D warnings
           cargo check -p mpedb-core --target wasm32-unknown-unknown
       - name: test

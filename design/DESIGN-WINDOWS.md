@@ -1,10 +1,16 @@
 # DESIGN-WINDOWS — porting the engine, and why it is smaller than it looks
 
-**Status: stages 1 and 2 built (2026-07-26).** The engine compiles for
-`x86_64-pc-windows-gnu`, its 86 unit tests pass, and four multi-process
-properties pass — mapping coherence, writer exclusion, cross-process MVCC
-snapshots, and owner death. Stages 3–5 are unbuilt, and §4 still describes
-them.
+**Status: stages 1 and 2 built and green on REAL Windows (2026-07-26).** The
+`windows-engine` job builds the engine, runs its 87 unit tests, runs the four
+multi-process properties — mapping coherence, writer exclusion, cross-process
+MVCC snapshots, owner death — and lints it, all on `windows-latest`. Stages 3–5
+are unbuilt, and §4 still describes them.
+
+Three attempts were needed, and the first two failed for reasons worth naming:
+a committed `:memory:.wlock` made `git checkout` fail before any code ran (§6),
+and then three lints inside `cfg(windows)` code that no Linux lint pass
+compiles. `linux.yml` now cross-*lints* the engine for Windows and cross-checks
+it for wasm32 on every push, so both classes are caught where they are made.
 
 Everything below §0 was written before any of it existed; the parts that turned
 out to be wrong are marked rather than deleted, because what a prediction got
