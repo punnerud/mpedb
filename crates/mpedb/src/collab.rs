@@ -182,6 +182,190 @@ impl Database {
     }
 }
 
+/// One editor's pending sub-edit, as a service collects them before flushing
+/// (#153).
+///
+/// `snap` is **that editor's** version — the one their client decided against.
+/// A batch may mix several, and the batch is guarded against the oldest of
+/// them, so nobody's decision is silently treated as newer than it was.
+#[derive(Debug, Clone)]
+pub struct Submission {
+    pub editor: i64,
+    pub snap: u64,
+    /// Which row of the block table.
+    pub key: i64,
+    pub at: u64,
+    pub remove: u64,
+    pub insert: String,
+}
+
+impl Database {
+    /// **Apply a batch of sub-edits in ONE transaction, and answer each one.**
+    ///
+    /// This is the primitive a collaborative service is owed. Measured, a
+    /// commit costs ~2 ms against ~35 µs of execution, so one edit per commit
+    /// wastes ~98 % of the work — and folding K edits into one transaction was
+    /// worth 79× (`benchmarks/documents.md`, F-batch). A guarded session cannot
+    /// group-commit with other processes (#152: it holds the writer lock and
+    /// never reaches the intent ring), so the batching has to be done by
+    /// whoever is collecting the edits. This is that call.
+    ///
+    /// # Offsets are rebased WITHIN the batch, and that is the whole subtlety
+    ///
+    /// Every submitter computed its `at` against the block as they were shown
+    /// it. Two of them in one transaction would otherwise both splice at
+    /// pre-batch coordinates, and the second would land on the wrong bytes —
+    /// silently, because it is not an error, it is a wrong answer.
+    ///
+    /// So: **sort by offset, apply in that order, and shift each member by the
+    /// cumulative length delta of the members before it.** `splice()`'s
+    /// engine-side rebase (#151) walks the committed ring and handles
+    /// everything that landed *before* this batch; this loop handles the batch
+    /// itself. The two compose and must not be conflated — one counts committed
+    /// transactions, the other counts members.
+    ///
+    /// **Applying in arrival order instead would make every edit's offset
+    /// depend on network jitter**, so the order is a guarantee rather than an
+    /// implementation detail. Equal offsets keep arrival order (a stable sort),
+    /// which is the only fair tie-break available.
+    ///
+    /// # Nobody starves
+    ///
+    /// A member that comes last in the sort still lands — it is *rebased*, not
+    /// rejected. Only a genuine overlap loses, and it loses **alone**: a
+    /// savepoint per member means one collision does not take the batch with
+    /// it. Being slow is not what costs you an edit; wanting the same bytes is.
+    pub fn submit_batch(
+        &self,
+        table: &str,
+        col: &str,
+        subs: &[Submission],
+    ) -> Result<Vec<EditVerdict>> {
+        if subs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Offset order, arrival order within a tie. `sort_by_key` is stable.
+        let mut order: Vec<usize> = (0..subs.len()).collect();
+        order.sort_by_key(|&i| subs[i].at);
+
+        // The oldest snapshot in the set: guarding against a newer one would
+        // silently forgive a decision made against a version that had already
+        // moved.
+        let snap = subs.iter().map(|s| s.snap).min().unwrap_or(0);
+
+        let read = format!("SELECT {col} FROM {table} WHERE id = $1");
+        let write = format!("UPDATE {table} SET {col} = splice({col}, $1, $2, $3) WHERE id = $4");
+        let mut declared: Vec<[Value; 4]> = Vec::with_capacity(subs.len());
+        for s in subs {
+            declared.push([
+                Value::Int(s.at as i64),
+                Value::Int(s.remove as i64),
+                Value::Text(s.insert.clone()),
+                Value::Int(s.key),
+            ]);
+        }
+        let rp = [Value::Int(subs[0].key)];
+        let mut may_run: Vec<(&str, &[Value])> = vec![(read.as_str(), &rp[..])];
+        for d in &declared {
+            may_run.push((write.as_str(), &d[..]));
+        }
+
+        let mut out = vec![EditVerdict::Committed; subs.len()];
+        let mut session = self.begin_guarded_with(snap, &may_run)?;
+        // Cumulative length change of the members applied so far. Only members
+        // that STARTED before this one moved its bytes, and offset order is
+        // exactly that condition — which is why the sort is load-bearing.
+        let mut shift: i64 = 0;
+        // The furthest byte any applied member reached, in ORIGINAL (pre-batch)
+        // coordinates. Members are sorted by `at`, so this is exactly "did
+        // anyone before me claim bytes I want".
+        //
+        // **Shifting without this test is silently wrong**, and the test that
+        // caught it is worth keeping in mind: member A rewrites [0,4) and
+        // member B wants [2,4). Shifting B by A's delta relocates it onto A's
+        // own inserted text — a perfectly valid splice, on bytes B never saw.
+        // No error, wrong answer.
+        //
+        // Same shape as the engine's committed-path rule (#151): overlap is a
+        // collision, everything else is a shift. Half-open, so a zero-width
+        // insert exactly at a predecessor's end does NOT overlap — both land,
+        // in commit order, which is the answer a collaborative editor wants.
+        let mut max_end: u64 = 0;
+        let mut any = false;
+        for &i in &order {
+            let s = &subs[i];
+            if s.at < max_end {
+                out[i] = EditVerdict::Lost { at_txn: self.snapshot_txn() };
+                continue;
+            }
+            let at = match (s.at as i64).checked_add(shift) {
+                Some(v) if v >= 0 => v,
+                // A member shifted out of the value by its predecessors is a
+                // collision, not a coordinate to repair.
+                _ => {
+                    out[i] = EditVerdict::Lost { at_txn: self.snapshot_txn() };
+                    continue;
+                }
+            };
+            let sp = session.savepoint();
+            let r = session.query(
+                &write,
+                &[
+                    Value::Int(at),
+                    Value::Int(s.remove as i64),
+                    Value::Text(s.insert.clone()),
+                    Value::Int(s.key),
+                ],
+            );
+            match r {
+                Ok(_) => {
+                    shift += s.insert.len() as i64 - s.remove as i64;
+                    max_end = max_end.max(s.at + s.remove);
+                    any = true;
+                }
+                // A real overlap, or an offset the value cannot hold. One
+                // member's problem, rolled back to just before it.
+                Err(Error::WriteConflict) | Err(Error::TypeMismatch(_)) => {
+                    session.rollback_to(sp);
+                    out[i] = EditVerdict::Lost { at_txn: self.snapshot_txn() };
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if !any {
+            session.rollback();
+            return Ok(out);
+        }
+        match session.commit() {
+            Ok(()) => Ok(out),
+            // The batch as a whole lost to something outside it. Everyone who
+            // was still standing learns it at once.
+            Err(Error::WriteConflict) => {
+                let at_txn = self.snapshot_txn();
+                for v in out.iter_mut() {
+                    if *v == EditVerdict::Committed {
+                        *v = EditVerdict::Lost { at_txn };
+                    }
+                }
+                Ok(out)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Reading a verdict without matching on it — a batch's caller usually wants
+/// "did it land", not which of the two ways it did not.
+pub trait EditVerdictExt {
+    fn is_committed(&self) -> bool;
+}
+
+impl EditVerdictExt for EditVerdict {
+    fn is_committed(&self) -> bool {
+        matches!(self, EditVerdict::Committed)
+    }
+}
+
 // ---------------------------------------------------------------- leases
 
 /// The SQL an application needs for [`Lease`]. Kept as a constant rather than

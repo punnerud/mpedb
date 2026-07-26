@@ -196,6 +196,64 @@ Still not built: acknowledging on claim so the write can ride a later batch.
 Both are #145's splice write form seen from the concurrency side, and both are
 filed rather than assumed.
 
+## 3b. `submit_batch`: the primitive the engine owes a service (#153)
+
+An edit should not be a commit of its own — measured, the commit is ~2 ms
+against ~35 µs of execution, and folding K edits into one transaction was worth
+79× (benchmarks/documents.md, F-batch). But a guarded session **cannot**
+group-commit with other processes: it holds the writer lock for its life and
+never reaches the intent ring, which #152 measured (`intents=0` at every wait
+window, so a linger in the leader had nobody to wait for; built, measured,
+reverted).
+
+So the batching belongs to whoever collects the edits, and the engine's job is
+to make that one call:
+
+```rust
+db.submit_batch("block", "body", &submissions) -> Vec<EditVerdict>
+```
+
+**We do not build the service.** Transport, fan-out and the client library are
+the user's; this is the minimum that makes them easy to write.
+
+### The algorithm, and why the order is a guarantee
+
+1. **Sort by offset**, stable, so equal offsets keep arrival order.
+2. Guard against the **oldest** snapshot in the set — guarding against a newer
+   one would forgive a decision made against a version that had already moved.
+3. Apply in offset order, shifting each member by the **cumulative length
+   delta** of the members before it. `splice()`'s engine-side rebase (#151)
+   handles everything committed *before* the batch; this loop handles the batch
+   itself. They compose and must not be conflated: one counts committed
+   transactions, the other counts members.
+4. **Overlap within the batch is a collision, not a shift**, tested against the
+   furthest byte any applied member reached, in pre-batch coordinates. Getting
+   this wrong is not an error — member A rewrites `[0,4)`, member B wants
+   `[2,4)`, and shifting B by A's delta relocates it onto A's own inserted text.
+   A perfectly valid splice, on bytes B never saw. That is exactly the shape of
+   the committed-path rule, and it was a live bug for one compile.
+5. A loser loses **alone** — a savepoint per member, as the ring's leader
+   already does.
+
+**Applying in arrival order instead would make every edit's offset depend on
+network jitter.** That is why the order is documented as a contract.
+
+### Nobody starves
+
+The member that always sorts last still lands, every round, as long as it does
+not overlap. It is *rebased*, not rejected. Being slow is not what costs an
+edit; wanting the same bytes is. This is why no anti-starvation rule is needed
+— the question dissolves rather than being answered, and
+`the_last_in_sort_order_still_lands_every_round` pins it.
+
+### The recommended service shape (not built here)
+
+Collect submissions per block; flush when a **quorum** of the editors with
+outstanding work has delivered, with a time limit as the upper bound that should
+normally not fire. `collab::Lease` (#150) is already the presence table. The
+number that says whether the idea worked is *flush-on-quorum vs flush-on-timeout*
+— if the timeout dominates, the time limit is the design and the quorum is not.
+
 ## 4. Seats, heartbeats, and reaping
 
 Admission control is ordinary rows, modelled on the task queue's
