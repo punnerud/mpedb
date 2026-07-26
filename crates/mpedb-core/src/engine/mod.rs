@@ -1639,7 +1639,7 @@ impl Engine {
     /// serializing every writer.
     pub fn begin_write_guarded(&self, snap_txn: u64) -> Result<WriteTxn<'_>> {
         let mut txn = self.begin_write()?;
-        txn.guard = Some(crate::engine::write::Guard { snap_txn, surface: 0, regions: 0, keys: Some(Vec::new()), range: Some((u32::MAX, 0)), shard: None, shard_seen: false, cols: 0 });
+        txn.guard = Some(crate::engine::write::Guard { snap_txn, surface: 0, regions: 0, keys: Some(Vec::new()), range: Some((u32::MAX, 0)), rebased: false, shard: None, shard_seen: false, cols: 0 });
         Ok(txn)
     }
 
@@ -1718,6 +1718,7 @@ impl Engine {
             written_regions: 0,
             written_keys: Some(Vec::new()),
             written_range: Some((u32::MAX, 0)),
+            written_delta: 0,
             written_cols: 0,
             written_shard: None,
             written_shard_seen: false,

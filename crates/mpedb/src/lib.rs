@@ -3126,6 +3126,11 @@ impl WriteSession<'_> {
         // declared surface widens it rather than escaping it. Declaring is how
         // you get a SMALL guard; this is what stops a wrong declaration from
         // becoming a wrong answer.
+        // #151: carry a pending sub-edit's offset across the commits it never
+        // saw, BEFORE the statement runs and before the surface is widened —
+        // so both the splice and the guard speak about the same bytes.
+        let mut full = full;
+        ring_exec::rebase_splice_params(&mut self.txn, plan, full.to_mut())?;
         ring_exec::widen_guard(&mut self.txn, plan, &full);
         let triggers = self.db.trigger_set()?;
         // Execute against the session's OWN schema view (== the txn's captured

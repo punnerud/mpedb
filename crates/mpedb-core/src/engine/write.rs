@@ -97,6 +97,9 @@ pub struct Guard {
     /// and conflict with anything inside it. Exact per-splice ranges would need
     /// a list, and one action rarely splices twice.
     pub range: Option<(u32, u32)>,
+    /// A rebase walk already decided the range dimension for this action
+    /// (#151), so the commit-time test skips it.
+    pub rebased: bool,
     /// The shard this action runs under (#144), or `None` when it cannot be
     /// proven — no session context, or a table without a policy on that key.
     ///
@@ -242,6 +245,9 @@ pub struct WriteTxn<'e> {
     pub(super) written_keys: Option<Vec<u64>>,
     /// The byte range this txn rewrote (#151), `None` = the whole value.
     pub(super) written_range: Option<(u32, u32)>,
+    /// How much this txn changed the value's LENGTH (#151) — what lets a later
+    /// pending edit carry its offset across this commit.
+    pub(super) written_delta: i64,
     /// The shard this txn's writes all belong to (#144), or `None` if they do
     /// not all belong to one provable shard.
     /// Columns this txn WROTE, same folding and same widening rule.
@@ -527,6 +533,52 @@ impl<'e> WriteTxn<'e> {
         }
     }
 
+    /// Carry a pending sub-edit's offset forward across the commits it never
+    /// saw (#151), or say it genuinely collides.
+    ///
+    /// Only a GUARDED session can be rebased, and that is the whole rule rather
+    /// than a limitation: the guard's snapshot IS "the version the client
+    /// decided against", and without one there is no coordinate system to carry
+    /// the offset from. An unguarded splice means whatever it says against the
+    /// value as it stands.
+    pub fn rebase_splice(
+        &self,
+        table: u32,
+        key_hash: u64,
+        col: u16,
+        at: u64,
+        len: u64,
+    ) -> Option<crate::shm::RebaseOutcome> {
+        let g = self.guard.as_ref()?;
+        self.eng.shm.opt_rebase(
+            g.snap_txn,
+            self.meta.txn_id,
+            &crate::shm::CellEdit {
+                table_bit: 1u64 << (table & 63),
+                key: key_hash,
+                col_bit: 1u64 << (col & 63),
+                at,
+                len,
+            },
+        )
+    }
+
+    /// Record the length change a sub-edit made (#151). Additive: a txn with
+    /// several splices moves everything after them by the sum.
+    pub fn record_written_delta(&mut self, d: i64) {
+        self.written_delta = self.written_delta.saturating_add(d);
+    }
+
+    /// The guard's range was decided by a rebase walk at execution (#151), so
+    /// the commit-time range test must not re-decide it against coordinates
+    /// that have since moved. Sound because the writer lock is held throughout:
+    /// the window the walk saw is the window the commit sees.
+    pub fn mark_rebased(&mut self) {
+        if let Some(g) = self.guard.as_mut() {
+            g.rebased = true;
+        }
+    }
+
     /// The written half of [`Self::guard_touch_range`].
     pub fn record_written_range(&mut self, r: Option<(u32, u32)>) {
         self.written_range = match (self.written_range, r) {
@@ -560,9 +612,18 @@ impl<'e> WriteTxn<'e> {
     #[allow(clippy::type_complexity)]
     pub fn guard_state(
         &self,
-    ) -> Option<(u64, u64, u64, Option<Vec<u64>>, Option<u64>, u64, Option<(u32, u32)>)> {
+    ) -> Option<(u64, u64, u64, Option<Vec<u64>>, Option<u64>, u64, bool, Option<(u32, u32)>)> {
         self.guard.as_ref().map(|g| {
-            (g.snap_txn, g.surface, g.regions, g.keys.clone(), g.shard, g.cols, g.range)
+            (
+                g.snap_txn,
+                g.surface,
+                g.regions,
+                g.keys.clone(),
+                g.shard,
+                g.cols,
+                g.rebased,
+                g.range,
+            )
         })
     }
 

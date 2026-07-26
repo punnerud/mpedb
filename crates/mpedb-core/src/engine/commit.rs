@@ -83,7 +83,9 @@ impl<'e> WriteTxn<'e> {
         // writeback and no freelist fixpoint, it just aborts. Retrying is the
         // expected outcome, not the exceptional one, so it must not be
         // expensive.
-        if let Some((snap_txn, surface, regions, keys, shard, cols, range)) = self.guard_state() {
+        if let Some((snap_txn, surface, regions, keys, shard, cols, rebased, range)) =
+            self.guard_state()
+        {
             let mut why = crate::shm::GuardVerdict::Clear;
             // A guard that touched no resolvable key guards its whole surface;
             // one that named its keys guards only those. Zero would mean "no
@@ -99,7 +101,14 @@ impl<'e> WriteTxn<'e> {
             // `(u32::MAX, 0)` is the identity of the min/max fold — no
             // statement named a range — and must read as the whole value, not
             // as an empty one that would clear every conflict.
-            let range = range.filter(|(lo, hi)| lo <= hi);
+            let range = if rebased {
+                crate::shm::RangeClaim::Settled
+            } else {
+                match range.filter(|(lo, hi)| lo <= hi) {
+                    Some((lo, hi)) => crate::shm::RangeClaim::Bytes(lo, hi),
+                    None => crate::shm::RangeClaim::Whole,
+                }
+            };
             let gs =
                 crate::shm::GuardSurface { tables: surface, regions, keys, shard, cols, range };
             if self.eng.shm.opt_conflict_set(snap_txn, self.meta.txn_id, &gs, &mut why) {
@@ -512,6 +521,7 @@ impl<'e> WriteTxn<'e> {
                     cols: wcols,
                     keys: wkeys,
                     range: wrange,
+                    delta: self.written_delta,
                 },
             );
         }

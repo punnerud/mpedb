@@ -58,6 +58,7 @@ primary_key = ["id"]
             cols: u64::MAX,
             keys: None,
             range: mpedb_core::shm::RANGE_ANY,
+            delta: 0,
         },
     );
     assert!(
@@ -82,6 +83,7 @@ primary_key = ["id"]
                 cols: u64::MAX,
                 keys: None,
                 range: mpedb_core::shm::RANGE_ANY,
+                delta: 0,
             },
         );
         assert!(

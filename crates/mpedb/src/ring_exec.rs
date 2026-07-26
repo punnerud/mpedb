@@ -418,6 +418,104 @@ pub(crate) fn plan_range(plan: &CompiledPlan, params: &[Value]) -> Option<(u32, 
     Some((at, at.checked_add(remove)?))
 }
 
+/// **Carry a pending sub-edit's offset forward, in place (#151).**
+///
+/// The client computed `at` against the version it was shown. Between then and
+/// now, other commits may have inserted or deleted text *earlier in the same
+/// cell*, so `at` no longer points where the client meant. This rewrites it to
+/// where it means the same thing in the value as it stands — and refuses when
+/// the two edits are genuinely about the same bytes.
+///
+/// Without it the guard has to treat every earlier edit as invalidating: an
+/// edit near the start of a cell would refuse every pending edit after it, and
+/// fifty people editing one paragraph would serialize on whoever typed first.
+///
+/// Returns `Err(WriteConflict)` on a real collision — **at execution rather
+/// than at commit**, which is earlier feedback for the same answer. `Ok(false)`
+/// means there was nothing to rebase (not a guarded session, or not a splice),
+/// and the statement runs unchanged.
+pub(crate) fn rebase_splice_params(
+    txn: &mut WriteTxn<'_>,
+    plan: &CompiledPlan,
+    params: &mut [Value],
+) -> Result<bool> {
+    let PlanStmt::Update { table, set, .. } = &plan.stmt else {
+        return Ok(false);
+    };
+    let [(col, prog)] = set.as_slice() else {
+        return Ok(false);
+    };
+    // The `at` must be a PARAMETER, not a literal: a literal offset is baked
+    // into the plan and shared by every caller of that plan, so rewriting it
+    // would rebase somebody else's statement.
+    let instrs = &prog.instrs;
+    let (Some(Instr::PushCol(c0)), Some(Instr::PushParam(at_slot)), Some(Instr::Call(ScalarFn::Splice, 4))) =
+        (instrs.first(), instrs.get(1), instrs.last())
+    else {
+        return Ok(false);
+    };
+    if c0 != col {
+        return Ok(false);
+    }
+    let at = match params.get(*at_slot as usize) {
+        Some(Value::Int(n)) if *n >= 0 => *n as u64,
+        _ => return Ok(false),
+    };
+    let remove = match const_or_param(&instrs[2], plan, params) {
+        Some(n) => n as u64,
+        None => return Ok(false),
+    };
+    let key = match plan_key(plan, params) {
+        Some(k) => k,
+        // Without an exact key there is no single cell to rebase within.
+        None => return Ok(false),
+    };
+    match txn.rebase_splice(*table, key, *col, at, remove) {
+        Some(mpedb_core::shm::RebaseOutcome::At(new_at)) => {
+            params[*at_slot as usize] = Value::Int(new_at as i64);
+            txn.mark_rebased();
+            Ok(true)
+        }
+        Some(mpedb_core::shm::RebaseOutcome::Collision) => Err(Error::WriteConflict),
+        // The window is unwitnessable, so the offset cannot be carried forward.
+        // Refusing is the same fail-safe direction every other limit takes.
+        None => Err(Error::WriteConflict),
+    }
+}
+
+/// How much a splice changes the value's length: `insert.len() - remove`.
+/// `None` for anything that is not a splice, or whose sizes are not knowable
+/// before execution.
+pub(crate) fn plan_delta(plan: &CompiledPlan, params: &[Value]) -> Option<i64> {
+    let PlanStmt::Update { set, .. } = &plan.stmt else {
+        return None;
+    };
+    let [(col, prog)] = set.as_slice() else {
+        return None;
+    };
+    let instrs = &prog.instrs;
+    let (Some(Instr::PushCol(c0)), Some(Instr::Call(ScalarFn::Splice, 4))) =
+        (instrs.first(), instrs.last())
+    else {
+        return None;
+    };
+    if c0 != col {
+        return None;
+    }
+    let remove = const_or_param(&instrs[2], plan, params)?;
+    let ins = match &instrs[3] {
+        Instr::PushConst(k) => plan.consts.get(*k as usize)?,
+        Instr::PushParam(p) => params.get(*p as usize)?,
+        _ => return None,
+    };
+    let ins_len = match ins {
+        Value::Text(t) => t.len() as i64,
+        Value::Blob(b) => b.len() as i64,
+        _ => return None,
+    };
+    Some(ins_len - remove)
+}
+
 /// A literal or a bound parameter as an integer; anything computed is `None`,
 /// because a range that depends on the row is not known before execution.
 fn const_or_param(i: &Instr, plan: &CompiledPlan, params: &[Value]) -> Option<i64> {
@@ -521,6 +619,13 @@ pub(crate) fn widen_guard(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, params: &
     txn.guard_touch_range(rng);
     if !plan.footprint.tables_written.is_empty() {
         txn.record_written_range(rng);
+        // The length change is what a LATER pending edit needs in order to
+        // carry its own offset across this commit. Publishing the range without
+        // it would say where this edit was but not how far it moved everything
+        // after it — half an answer, and the half that does not compose.
+        if let Some(d) = plan_delta(plan, params) {
+            txn.record_written_delta(d);
+        }
     }
 
     let sh = plan_shard(plan, params);

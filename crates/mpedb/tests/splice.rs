@@ -296,35 +296,34 @@ fn two_splices_of_the_same_range_still_conflict() {
     a.query(sql, &p).unwrap();
     a.commit().unwrap();
 
+    // The refusal arrives at EXECUTION now, not at commit: the rebase walk
+    // decides it before the statement runs, which is earlier feedback for the
+    // same answer.
     let q = [Value::Int(0), Value::Int(4), Value::Text("zzzz".into()), Value::Int(1)];
     let mut b = d.begin_guarded_with(snap, &[(sql, &q[..])]).unwrap();
-    b.query(sql, &q).unwrap();
-    match b.commit() {
+    match b.query(sql, &q) {
         Err(mpedb::Error::WriteConflict) => {}
         other => panic!("expected WriteConflict on the SAME byte range, got {other:?}"),
     }
+    b.rollback();
     drop(d);
     let _ = std::fs::remove_file(&path);
 }
 
-/// **An earlier edit invalidates a later one, and that is deliberate.** Here
-/// the head edit is length-PRESERVING, so nothing actually shifted and
-/// `splice()` itself is perfectly happy — the guard is the one that refuses,
-/// on the rule that a commit beginning before my range *may* have moved the
-/// bytes my offset was computed against.
+/// **The asymmetry is gone: an edit before mine no longer invalidates me.**
 ///
-/// Conservative, and knowingly so: distinguishing "moved" from "did not move"
-/// needs the length delta and then the offsets rebased, which is a per-cell
-/// edit history the engine does not keep (DESIGN-COLLAB §3). Refusing returns
-/// `Lost`, which is exactly the signal a client needs to resubmit.
+/// This test asserted a refusal one commit ago. The engine now carries my
+/// offset forward across the edit I never saw, so the two compose — which is
+/// what stops one person typing at the top of a paragraph from refusing
+/// everyone editing below them.
 #[test]
-fn an_edit_before_mine_invalidates_my_offsets() {
+fn an_edit_before_mine_no_longer_invalidates_my_offsets() {
     let (d, path) = db("guard-shift");
     seed(&d, "AAAA....BBBB");
     let snap = d.snapshot_txn();
     let sql = "UPDATE doc SET body = splice(body, $1, $2, $3) WHERE id = $4";
 
-    // The HEAD commits first this time, replacing 4 bytes with 4.
+    // The HEAD commits first, replacing 4 bytes with 4 — no length change.
     let head = [Value::Int(0), Value::Int(4), Value::Text("xxxx".into()), Value::Int(1)];
     let mut a = d.begin_guarded_with(snap, &[(sql, &head[..])]).unwrap();
     a.query(sql, &head).unwrap();
@@ -333,22 +332,56 @@ fn an_edit_before_mine_invalidates_my_offsets() {
     let tail = [Value::Int(8), Value::Int(4), Value::Text("yyyy".into()), Value::Int(1)];
     let mut b = d.begin_guarded_with(snap, &[(sql, &tail[..])]).unwrap();
     b.query(sql, &tail).unwrap();
-    match b.commit() {
-        Err(mpedb::Error::WriteConflict) => {}
-        other => panic!(
-            "expected WriteConflict, got {other:?} — an edit that began before mine may have \
-             shifted the bytes my offset was computed against, and the rule is deliberately \
-             conservative about that"
-        ),
-    }
+    b.commit().expect(
+        "an edit at 8..12 was refused because someone changed 0..4 of the same cell — the \
+         engine is not carrying the offset forward",
+    );
+    assert_eq!(body(&d), "xxxx....yyyy", "both sub-edits should be in the value");
+
     drop(d);
     let _ = std::fs::remove_file(&path);
 }
 
-/// And when the earlier edit really did shift things, **`splice()` catches it
-/// before the guard ever runs** — at execution, because the offset now points
-/// past the end of a value that got shorter. Two independent layers refuse the
-/// same stale offset, which is the redundancy worth having.
+/// **And the offset actually MOVES when it has to.** The head edit shortens the
+/// value by 3 bytes, so the tail editor's offset 8 — computed against the
+/// version it was shown — must become 5 to still mean the same text. Getting
+/// this wrong does not error; it splices the wrong bytes, which is why the
+/// assertion is on the resulting string and not on `Ok(())`.
+#[test]
+fn a_shifted_offset_is_carried_forward() {
+    let (d, path) = db("guard-carry");
+    seed(&d, "AAAA....BBBB");
+    let snap = d.snapshot_txn();
+    let sql = "UPDATE doc SET body = splice(body, $1, $2, $3) WHERE id = $4";
+
+    // "AAAA....BBBB" -> "A....BBBB": 4 bytes become 1, delta -3.
+    let head = [Value::Int(0), Value::Int(4), Value::Text("A".into()), Value::Int(1)];
+    let mut a = d.begin_guarded_with(snap, &[(sql, &head[..])]).unwrap();
+    a.query(sql, &head).unwrap();
+    a.commit().unwrap();
+
+    // The tail editor still thinks "BBBB" starts at 8. It now starts at 5.
+    let tail = [Value::Int(8), Value::Int(4), Value::Text("yyyy".into()), Value::Int(1)];
+    let mut b = d.begin_guarded_with(snap, &[(sql, &tail[..])]).unwrap();
+    b.query(sql, &tail).unwrap();
+    b.commit().unwrap();
+
+    assert_eq!(
+        body(&d),
+        "A....yyyy",
+        "the tail edit landed in the wrong place — its offset was not carried across the \
+         head edit's length change"
+    );
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **Unguarded, there is nothing to rebase from**, and a stale offset is caught
+/// by `splice()` itself — the offset now points past the end of a value that
+/// got shorter. A session with no guard has no snapshot saying "the version I
+/// decided against", so the engine cannot carry anything forward and does not
+/// pretend to.
 #[test]
 fn a_shifted_offset_is_refused_by_splice_itself() {
     let (d, path) = db("guard-shrunk");
@@ -388,14 +421,15 @@ fn a_whole_value_write_conflicts_with_every_sub_edit() {
     let sql = "UPDATE doc SET body = splice(body, $1, $2, $3) WHERE id = $4";
     let tail = [Value::Int(0), Value::Int(1), Value::Text("y".into()), Value::Int(1)];
     let mut b = d.begin_guarded_with(snap, &[(sql, &tail[..])]).unwrap();
-    b.query(sql, &tail).unwrap();
-    match b.commit() {
+    match b.query(sql, &tail) {
         Err(mpedb::Error::WriteConflict) => {}
         other => panic!(
             "expected WriteConflict, got {other:?} — a write that could not name a range must \
-             be taken to have rewritten the whole value"
+             be taken to have rewritten the whole value, and there is no offset to carry \
+             forward across that"
         ),
     }
+    b.rollback();
     drop(d);
     let _ = std::fs::remove_file(&path);
 }

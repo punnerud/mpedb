@@ -89,7 +89,7 @@ fn memory_backing_file() -> Result<File> {
     }
 }
 
-pub const FORMAT_VERSION: u32 = 8; // v8: ring entry carries a byte range (#151)
+pub const FORMAT_VERSION: u32 = 9; // v9: ring entry carries a splice length delta (#151)
                                    //     (DESIGN-BLOBEXTENT §3.4); WAL3 trailer.
                                    // v2: intent-ring region between reader table and data
 
@@ -227,6 +227,13 @@ const OFP_KEYS: usize = 48;
 /// before any work happens — the same "declared, not accumulated" property the
 /// key has (#148), and the reason a collision is one integer comparison.
 const OFP_RANGE: usize = 112;
+/// How much this commit changed the value's LENGTH, as `i64` bits (#151).
+///
+/// The range says *where*; this says *by how much everything after it moved*.
+/// Together they are enough to carry a pending edit's offset forward across
+/// commits it never saw — which is what stops an edit near the start of a cell
+/// invalidating every pending edit after it.
+const OFP_DELTA: usize = 120;
 /// The mask meaning "every column" — the fail-safe value.
 pub const COLS_ANY: u64 = u64::MAX;
 /// The byte range meaning "anywhere in the value" — what anything that cannot
@@ -347,6 +354,29 @@ pub enum GuardVerdict {
     RingGap,
 }
 
+/// Which bytes of which cell a pending sub-edit is about (#151) — the question
+/// [`Shm::opt_rebase`] answers, as one value rather than five arguments.
+#[derive(Debug, Clone, Copy)]
+pub struct CellEdit {
+    /// The table, folded `& 63` like the ring's own bitmap.
+    pub table_bit: u64,
+    pub key: u64,
+    /// The column, folded `& 63`.
+    pub col_bit: u64,
+    pub at: u64,
+    pub len: u64,
+}
+
+/// The answer to "where is my sub-edit now, and does it collide" (#151).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseOutcome {
+    /// The offset, carried forward through every commit that moved it.
+    At(u64),
+    /// Another commit is about the same bytes. Not a coordinate problem — the
+    /// two edits genuinely disagree, and one of them has to lose.
+    Collision,
+}
+
 /// What a committing txn publishes about what it wrote — the mirror image of
 /// [`GuardSurface`], and the reason both are types: the two travel together
 /// through every dimension, and passing them as loose arguments was eight
@@ -362,6 +392,8 @@ pub struct CommitFootprint<'a> {
     pub keys: Option<&'a [u64]>,
     /// Packed byte range (#151), or [`RANGE_ANY`].
     pub range: u64,
+    /// Length change this commit made to the value, in bytes (#151).
+    pub delta: i64,
 }
 
 /// The five dimensions a guarded action is checked on (#142–#151).
@@ -398,9 +430,26 @@ pub struct GuardSurface {
     pub keys: Option<Vec<u64>>,
     pub shard: Option<u64>,
     pub cols: u64,
-    /// The byte range this action rewrites inside the value, or `None` for
-    /// "the whole value" (#151).
-    pub range: Option<(u32, u32)>,
+    /// What this action claims about WHERE inside the value it writes (#151).
+    pub range: RangeClaim,
+}
+
+/// A guarded action's claim on the bytes of a value (#151).
+///
+/// Three states, not two, and the third is the one that earns the type:
+/// `Settled` says a rebase walk already decided this dimension at execution
+/// time, so the commit-time test must not decide it again against coordinates
+/// that have since moved. Collapsing it into "no range" would read as *the
+/// whole value* — the exact opposite — which is what it did before this was
+/// spelled out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeClaim {
+    /// No range could be named: the whole value, conflicting with any sub-edit.
+    Whole,
+    /// These bytes.
+    Bytes(u32, u32),
+    /// Already decided by [`Shm::opt_rebase`] at execution.
+    Settled,
 }
 
 const INIT_READY: u32 = 2;
@@ -2956,7 +3005,7 @@ impl Shm {
     /// trust the payload; in practice every read is also serialized by the
     /// writer mutex, which is a full barrier.
     pub fn opt_record(&self, txn_id: u64, fp: &CommitFootprint<'_>) {
-        let CommitFootprint { kind, table_bits, key_hash, cols, keys, range } = *fp;
+        let CommitFootprint { kind, table_bits, key_hash, cols, keys, range, delta } = *fp;
         self.opt_field(txn_id, OFP_COLS).store(cols, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_KIND).store(kind, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_TBITS).store(table_bits, Ordering::Relaxed);
@@ -2974,6 +3023,7 @@ impl Shm {
         }
         self.opt_field(txn_id, OFP_NKEYS).store(n as u64, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_RANGE).store(range, Ordering::Relaxed);
+        self.opt_field(txn_id, OFP_DELTA).store(delta as u64, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_TXN).store(txn_id, Ordering::Release);
     }
 
@@ -3078,6 +3128,84 @@ impl Shm {
             }
         }
         false
+    }
+
+    /// *Writer-lock holder.* Carry a pending sub-edit's offset forward across
+    /// the commits it never saw, and say whether it genuinely collides (#151).
+    ///
+    /// The caller decided `at..at+len` against snapshot `snap`. Every commit in
+    /// `(snap, current]` that touched the same cell either overlaps that range —
+    /// a real collision, the two edits are about the same bytes — or lies
+    /// entirely before or after it, in which case it only *moves* the offset.
+    /// One walk answers both, because the two questions are the same walk:
+    ///
+    /// ```text
+    /// for t in snap+1 ..= current, touching this cell, with range [lo, hi) and delta d:
+    ///     if [at, at+len) overlaps [lo, hi)   -> collision
+    ///     else if lo <= at                    -> at += d      (they were before me)
+    ///     else                                -> unchanged    (they were after me)
+    /// ```
+    ///
+    /// **The coordinate systems line up because the walk is in order.** `lo` is
+    /// in the value's coordinates as of `t`, and `at` has already absorbed every
+    /// shift from `t' < t`, so it is in those coordinates too. Comparing them
+    /// out of order, or rebasing before comparing, would silently mix two
+    /// different rulers.
+    ///
+    /// `None` means the question is unanswerable — the window is older than the
+    /// ring can witness, or a slot is missing — and the caller must refuse
+    /// rather than guess, which is the same fail-safe direction every other
+    /// limit here takes.
+    pub fn opt_rebase(&self, snap: u64, current: u64, cell: &CellEdit) -> Option<RebaseOutcome> {
+        let CellEdit { table_bit: my_table_bit, key: my_key, col_bit: my_col_bit, at, len } =
+            *cell;
+        if current <= snap {
+            return Some(RebaseOutcome::At(at));
+        }
+        if current - snap > OPT_RING_SLOTS {
+            return None;
+        }
+        let mut at = at;
+        for t in (snap + 1)..=current {
+            if self.opt_field(t, OFP_TXN).load(Ordering::Acquire) != t {
+                return None;
+            }
+            let kind = self.opt_field(t, OFP_KIND).load(Ordering::Relaxed);
+            if kind == OFP_KIND_EMPTY {
+                continue;
+            }
+            if self.opt_field(t, OFP_TBITS).load(Ordering::Relaxed) & my_table_bit == 0 {
+                continue;
+            }
+            // A different row of the same table cannot have moved my bytes. Only
+            // an EXACT key set can prove that; without one, assume it might have.
+            if let Some(theirs) = self.opt_keys(t) {
+                if !theirs.contains(&my_key) {
+                    continue;
+                }
+            }
+            if self.opt_field(t, OFP_COLS).load(Ordering::Relaxed) & my_col_bit == 0 {
+                continue;
+            }
+            let packed = self.opt_field(t, OFP_RANGE).load(Ordering::Relaxed);
+            if packed == RANGE_ANY {
+                // They rewrote the whole value; there is no offset to carry
+                // forward through that.
+                return Some(RebaseOutcome::Collision);
+            }
+            let (lo, hi) = ((packed >> 32) & 0xffff_ffff, packed & 0xffff_ffff);
+            // Half-open overlap. Two zero-width inserts at one point do NOT
+            // overlap: both texts land, and the order is the commit order —
+            // which is the answer a collaborative editor wants anyway.
+            if at < hi && lo < at + len {
+                return Some(RebaseOutcome::Collision);
+            }
+            if lo <= at {
+                let d = self.opt_field(t, OFP_DELTA).load(Ordering::Relaxed) as i64;
+                at = at.checked_add_signed(d)?;
+            }
+        }
+        Some(RebaseOutcome::At(at))
     }
 
     /// *Writer-lock holder.* [`Self::opt_conflict`] for a SET of tables at once
@@ -3209,14 +3337,17 @@ impl Shm {
             // `subedit::Splice::rebase` at execution; refusing is the fail-safe
             // direction and returns `Lost`, which is exactly the signal a client
             // needs to rebase and resubmit.
-            if let Some((_, my_hi)) = range {
-                let theirs = self.opt_field(t, OFP_RANGE).load(Ordering::Relaxed);
-                if theirs != RANGE_ANY {
-                    let their_lo = (theirs >> 32) as u32;
-                    if their_lo >= my_hi {
+            match range {
+                // The rebase walk saw the same window under the same writer
+                // lock and already cleared it.
+                RangeClaim::Settled => continue,
+                RangeClaim::Bytes(_, my_hi) => {
+                    let theirs = self.opt_field(t, OFP_RANGE).load(Ordering::Relaxed);
+                    if theirs != RANGE_ANY && ((theirs >> 32) as u32) >= my_hi {
                         continue;
                     }
                 }
+                RangeClaim::Whole => {}
             }
             *why = GuardVerdict::Overlap;
             return true;

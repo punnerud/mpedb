@@ -144,25 +144,50 @@ is `splice(<that same column>, at, remove, …)` with constant-or-parameter
 offsets. Everything else rewrites the whole value, which is what "no range"
 says — and a write with no range conflicts with every sub-edit of that cell.
 
-**The rule is `theirs.lo >= mine.hi`, not mere disjointness**, and the asymmetry
-is the whole subtlety. A splice applies to the value *as it stands at write
-time*, so a commit that landed before mine and began before my range has shifted
-the bytes my offset was computed against — my `at` no longer means what it
-meant. Their edit beginning at or after my range ends is the one case that can
-move neither my bytes nor my offsets.
+### Rebase in the engine: the asymmetry is gone
 
-So an edit near the start of a cell does invalidate pending edits after it. Two
-independent layers catch a stale offset: the guard refuses at commit
-(`an_edit_before_mine_invalidates_my_offsets`), and when the value actually got
-shorter, `splice()` itself refuses at execution
-(`a_shifted_offset_is_refused_by_splice_itself`). Both return the client to the
-same place — read what won, rebase, resubmit — which is what
-`EditVerdict::Lost { at_txn }` is for.
+A splice applies to the value *as it stands at write time*, so a commit that
+landed before mine and began before my range moved the bytes my offset was
+computed against. The first cut at this refused those — correct, but asymmetric:
+one person typing at the top of a paragraph invalidated everyone editing below.
 
-**What removes the asymmetry** is rebasing the splice itself: the engine
-adjusting `at` by the length deltas of commits that landed in between, which is
-`subedit::Splice::rebase` applied at execution and needs a per-cell edit history
-the engine does not keep. Worth doing deliberately rather than approximating.
+The engine now carries the offset forward instead. Each ring entry publishes the
+**length delta** beside the range, and one walk of the window answers both
+questions at once:
+
+```text
+for t in snap+1 ..= current, touching this cell, range [lo, hi), delta d:
+    if [at, at+len) overlaps [lo, hi)  -> collision
+    else if lo <= at                   -> at += d      (they were before me)
+    else                               -> unchanged    (they were after me)
+```
+
+**The coordinate systems line up because the walk is in order.** `lo` is in the
+value's coordinates as of `t`, and `at` has already absorbed every shift from
+`t' < t`, so it is in those coordinates too. Rebasing before comparing, or
+comparing out of order, would silently mix two different rulers — and the
+failure would not be an error, it would be a splice landing on the wrong bytes.
+That is why `a_shifted_offset_is_carried_forward` asserts on the resulting
+string rather than on `Ok(())`.
+
+**Why this can run at execution.** The session holds the writer lock from
+`begin()`, so no commit can land between the walk and the commit — the window
+the walk saw is the window the commit sees. That is also why the guard's
+commit-time range test is *skipped* once a walk has decided
+(`RangeClaim::Settled`), rather than re-deciding against coordinates that have
+since moved.
+
+**Only a guarded session is rebased**, and that is the rule rather than a
+limitation: the guard's snapshot IS "the version the client decided against",
+and without one there is no coordinate system to carry from. An unguarded splice
+means exactly what it says against the value as it stands, and a stale offset
+there is caught by `splice()` itself.
+
+A genuine collision is refused **at execution rather than at commit** — earlier
+feedback for the same answer, and the caller still sees `WriteConflict`, which
+`submit_within` turns into `Lost { at_txn }`.
+
+Still not built: acknowledging on claim so the write can ride a later batch.
 
 - **Acknowledge on claim, commit in batches.** The engine already group-commits
   (`ring_exec`); what is missing is letting the *answer* precede the batch
