@@ -217,6 +217,11 @@ pub(crate) fn create_mirror_db(
             // sqlite import → lenient (sqlite) bare columns; PostgreSQL import →
             // strict (postgres), so a query PG refused keeps being refused here.
             bare_group_by,
+            // A mirror target's relationship to its SOURCE is the mirror's own
+            // state machine (§7 authority/epoch); the `[sync]` role is about
+            // mpedb⇄mpedb links and is orthogonal.
+            sync_role: "standalone".to_string(),
+            sync_upstream: None,
             perms: FilePerms {
                 mode: None,
                 owner: None,

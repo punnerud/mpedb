@@ -14,6 +14,7 @@ mod bulk;
 mod notify;
 mod doc_load;
 mod notify_load;
+mod sync_load;
 mod dur_compare;
 mod eng_mpedb;
 mod extents;
@@ -370,13 +371,14 @@ fn main() {
             || a == "--notify"
             || a == "--notify-load"
             || a == "--doc-load"
+            || a == "--sync-load"
             || VALUED.contains(&a.as_str())
             || (i > 0 && VALUED.contains(&args[i - 1].as_str()));
         if !known {
             eprintln!(
                 "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres|turso|mpedb,sqlite] \
                  [--tmpfs DIR] [--disk DIR] [--out FILE] [--value-bytes N] \
-                 [--h2h REPS] [--extents ITERS] [--notify] [--notify-load] [--doc-load]"
+                 [--h2h REPS] [--extents ITERS] [--notify] [--notify-load] [--doc-load] [--sync-load]"
             );
             std::process::exit(2);
         }
@@ -384,6 +386,7 @@ fn main() {
     let notify_arg = args.iter().any(|a| a == "--notify");
     let notify_load_arg = args.iter().any(|a| a == "--notify-load");
     let doc_load_arg = args.iter().any(|a| a == "--doc-load");
+    let sync_load_arg = args.iter().any(|a| a == "--sync-load");
     let cfg = if quick { RunCfg::quick() } else { RunCfg::full() };
 
     let pid = std::process::id();
@@ -437,6 +440,13 @@ fn main() {
     if notify_load_arg {
         if let Err(e) = notify_load::run(disk_base.clone()) {
             eprintln!("notify load cell failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if sync_load_arg {
+        if let Err(e) = sync_load::run(disk_base.clone()) {
+            eprintln!("sync-load failed: {e}");
             std::process::exit(1);
         }
         return;

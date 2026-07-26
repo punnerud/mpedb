@@ -48,6 +48,7 @@ mod testdb;
 mod access;
 pub mod backup;
 pub mod collab;
+pub mod sync;
 mod exec;
 mod multifile;
 mod policy_store;
@@ -598,6 +599,10 @@ pub struct Database {
     /// PostgreSQL-imported mirror. Passed into every `prepare` so a bare column
     /// is accepted (sqlite) or refused (postgres) per the data's origin.
     bare_group_by: mpedb_types::BareGroupBy,
+    /// This process's sync role (#157). Read once at open; it changes nothing
+    /// about how a statement executes, only what a collaborative verdict is
+    /// allowed to CLAIM — a replica's local commit is not the authority's word.
+    role: crate::sync::Role,
     /// Host-registered scalar UDFs (the C-API `create_function` path,
     /// design/DESIGN-UDF.md), keyed by `(name, n_arg)` (`-1` = variadic). The
     /// binder is handed the names + arities at compile; the executor is handed
@@ -727,6 +732,7 @@ impl Database {
             // default any config without `[compat]` gets. A PostgreSQL mirror
             // instead opens via `open_with_config` with the flag already set.
             bare_group_by: mpedb_types::BareGroupBy::default(),
+            role: crate::sync::Role::Standalone,
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
             host_window_aggs: RwLock::new(std::collections::HashSet::new()),
@@ -761,6 +767,7 @@ impl Database {
         let checks = compile_schema_checks(&config.schema)?;
         let path = config.options.path.clone();
         let bare_group_by = config.options.bare_group_by;
+        let role = crate::sync::Role::parse(&config.options.sync_role)?;
         // Resolve the §6.3 assertions against the schema now: an unknown name is
         // a config error, not a no-op assertion nobody notices.
         let mut require_policy = std::collections::HashSet::new();
@@ -799,6 +806,7 @@ impl Database {
             storage,
             require_policy,
             bare_group_by,
+            role,
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
             host_window_aggs: RwLock::new(std::collections::HashSet::new()),
@@ -1339,6 +1347,14 @@ impl Database {
     /// A refusal count alone cannot tell a real conflict from a limit of the
     /// machinery, and the two call for opposite fixes — so the counter that
     /// separates them is part of the API rather than a debug aid.
+    /// This process's sync role (#157, `[sync] role`).
+    ///
+    /// A deployment fact, not a file property: the same `.mpedb` may be open as
+    /// a replica here and standalone in the next process.
+    pub fn role(&self) -> crate::sync::Role {
+        self.role
+    }
+
     pub fn guard_stats(&self) -> (u64, u64, u64, u64, u64) {
         self.engine.guard_stats()
     }

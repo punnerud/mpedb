@@ -478,6 +478,188 @@ impl PyDatabase {
             _db: db,
         })
     }
+
+    // ------------------------------------------------- sync (#157)
+
+    /// This process's sync role: `"standalone"`, `"replica"` or `"authority"`,
+    /// from `[sync] role` in the config. A deployment fact, not a file property.
+    #[getter]
+    fn role(&self) -> &'static str {
+        self.db.role().as_str()
+    }
+
+    /// Turn change capture on for `tables` on BOTH this database and
+    /// `upstream`. Required once before any sync; without it the change log
+    /// stays empty and every sync is a silent no-op.
+    fn sync_enable(
+        &self,
+        py: Python<'_>,
+        upstream: &PyDatabase,
+        tables: Vec<String>,
+    ) -> PyResult<()> {
+        let (a, b) = (&self.db, &upstream.db);
+        py.detach(|| {
+            let names: Vec<&str> = tables.iter().map(|s| s.as_str()).collect();
+            mpedb::sync::SyncLink::new(a, b, 1).enable(&names)
+        })
+        .map_err(map_err)
+    }
+
+    /// Push local changes up, then pull everything down. Returns a dict:
+    /// `{"pulled": n, "pushed": n, "deleted": n, "conflicts": n, "cursor": n}`.
+    ///
+    /// `link` distinguishes this link's cursors from another's — two replicas
+    /// of one upstream must not share a number.
+    ///
+    /// `resolve` is `"upstream-wins"` (default) or `"local-wins"`: who wins when
+    /// both ends changed the same row. Neither merges — for a value many people
+    /// edit at once, use `submit_batch` instead so the edits compose.
+    #[pyo3(signature = (upstream, tables, link=1, resolve="upstream-wins"))]
+    fn sync(
+        &self,
+        py: Python<'_>,
+        upstream: &PyDatabase,
+        tables: Vec<String>,
+        link: u64,
+        resolve: &str,
+    ) -> PyResult<std::collections::HashMap<String, u64>> {
+        let (a, b) = (&self.db, &upstream.db);
+        let policy = mpedb::sync::Resolve::parse(resolve).map_err(map_err)?;
+        let out = py
+            .detach(|| {
+                let names: Vec<&str> = tables.iter().map(|s| s.as_str()).collect();
+                mpedb::sync::SyncLink::new(a, b, link)
+                    .with_resolve(policy)
+                    .sync(&names)
+            })
+            .map_err(map_err)?;
+        Ok(std::collections::HashMap::from([
+            ("pulled".to_string(), out.pulled.upserts),
+            ("pushed".to_string(), out.pushed.upserts),
+            ("deleted".to_string(), out.pulled.deletes + out.pushed.deletes),
+            // Conflicts are decided at PUSH; the pull half never reports any.
+            ("conflicts".to_string(), out.pushed.conflicts),
+            // Rows this call rewrote LOCALLY — upstream values adopted for rows
+            // we lost. Without it a sync can change local data silently.
+            ("local_writes".to_string(), out.pushed.local_writes),
+            ("cursor".to_string(), out.pulled.cursor),
+        ]))
+    }
+
+    /// Copy everything the upstream already has, once, when attaching a replica
+    /// to a database that is **not empty**.
+    ///
+    /// `sync_enable` is not retroactive: rows written before capture was turned
+    /// on are in no change log and replicate never, silently. This is the step
+    /// that fixes it. O(rows) — for bootstrap, not for a schedule.
+    #[pyo3(signature = (upstream, tables, link=1))]
+    fn sync_seed(
+        &self,
+        py: Python<'_>,
+        upstream: &PyDatabase,
+        tables: Vec<String>,
+        link: u64,
+    ) -> PyResult<u64> {
+        let (a, b) = (&self.db, &upstream.db);
+        let rep = py
+            .detach(|| {
+                let names: Vec<&str> = tables.iter().map(|s| s.as_str()).collect();
+                mpedb::sync::SyncLink::new(a, b, link).seed(&names)
+            })
+            .map_err(map_err)?;
+        Ok(rep.upserts)
+    }
+
+    /// How many changed rows this database is behind `upstream` — the number a
+    /// UI shows as "syncing…".
+    #[pyo3(signature = (upstream, tables, link=1))]
+    fn sync_lag(
+        &self,
+        py: Python<'_>,
+        upstream: &PyDatabase,
+        tables: Vec<String>,
+        link: u64,
+    ) -> PyResult<u64> {
+        let (a, b) = (&self.db, &upstream.db);
+        py.detach(|| {
+            let names: Vec<&str> = tables.iter().map(|s| s.as_str()).collect();
+            mpedb::sync::SyncLink::new(a, b, link).lag(&names)
+        })
+        .map_err(map_err)
+    }
+
+    /// Per-table `(row_count, content_hash)` — how you assert that two
+    /// databases actually agree. Order-independent, so scan order does not
+    /// matter.
+    fn fingerprint(
+        &self,
+        py: Python<'_>,
+        tables: Vec<String>,
+    ) -> PyResult<std::collections::HashMap<String, (u64, u64)>> {
+        let db = &self.db;
+        let fp = py
+            .detach(|| {
+                let names: Vec<&str> = tables.iter().map(|s| s.as_str()).collect();
+                mpedb::sync::fingerprint(db, &names)
+            })
+            .map_err(map_err)?;
+        Ok(fp.into_iter().collect())
+    }
+
+    /// Apply many sub-edits to one text cell in ONE transaction, and answer each
+    /// one (#153/#155).
+    ///
+    /// `edits` is a list of dicts with keys `editor`, `seq`, `at`, `remove`,
+    /// `insert` and `key`. `seq` is the ORDER the editors acted in — assigned by
+    /// the caller, never by the engine — so the same edits produce the same text
+    /// however they arrive.
+    ///
+    /// Returns one string per edit: `"committed"`, `"provisional"` (a replica's
+    /// local commit, not yet confirmed by an authority), `"lost"` or
+    /// `"deadline"`.
+    fn submit_batch(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        column: &str,
+        edits: Vec<std::collections::HashMap<String, Bound<'_, PyAny>>>,
+    ) -> PyResult<Vec<&'static str>> {
+        let mut subs = Vec::with_capacity(edits.len());
+        for (i, e) in edits.iter().enumerate() {
+            let need = |k: &str| -> PyResult<&Bound<'_, PyAny>> {
+                e.get(k).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "edit {i} is missing key {k:?} (need editor, seq, key, at, remove, insert)"
+                    ))
+                })
+            };
+            subs.push(mpedb::collab::Submission {
+                editor: need("editor")?.extract()?,
+                seq: need("seq")?.extract()?,
+                snap: match e.get("snap") {
+                    Some(v) => v.extract()?,
+                    None => self.db.snapshot_txn(),
+                },
+                key: need("key")?.extract()?,
+                at: need("at")?.extract()?,
+                remove: need("remove")?.extract()?,
+                insert: need("insert")?.extract()?,
+            });
+        }
+        let db = &self.db;
+        let verdicts = py
+            .detach(|| db.submit_batch(table, column, &subs))
+            .map_err(map_err)?;
+        Ok(verdicts
+            .into_iter()
+            .map(|v| match v {
+                mpedb::collab::EditVerdict::Committed => "committed",
+                mpedb::collab::EditVerdict::Provisional { .. } => "provisional",
+                mpedb::collab::EditVerdict::Lost { .. } => "lost",
+                mpedb::collab::EditVerdict::DeadlineExpired => "deadline",
+            })
+            .collect())
+    }
 }
 
 // --------------------------------------------------------------- Transaction

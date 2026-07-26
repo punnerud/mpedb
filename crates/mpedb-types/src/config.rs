@@ -270,6 +270,22 @@ pub struct DbOptions {
     /// travels with the data's origin. A per-process compilation option like
     /// `durability`, so it lives here rather than in the file-frozen schema.
     pub bare_group_by: BareGroupBy,
+    /// This process's role in a sync topology (`[sync] role`, #157):
+    /// `standalone` (default), `replica` or `authority`.
+    ///
+    /// **Deliberately not file-authoritative.** Schema and geometry hard-error
+    /// on config drift because they describe the bytes on disk; a role describes
+    /// what *this process* is doing with them, and the same `.mpedb` may be
+    /// opened as a replica by one process and standalone by another at the same
+    /// moment. Putting it anywhere hashed would turn a deployment knob into a
+    /// property of the file. Kept as a string here so `mpedb-types` stays
+    /// dependency-light — `mpedb::sync::Role::parse` is where it becomes an enum
+    /// and where an unknown value is refused by name.
+    pub sync_role: String,
+    /// Path of the upstream `.mpedb` a replica syncs against. Advisory: nothing
+    /// opens it implicitly, because an engine that reached out to another file
+    /// at `open` would make a config typo into a surprise I/O dependency.
+    pub sync_upstream: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +326,23 @@ struct RawConfig {
     /// Optional `[compat]` section (COMPAT.md). Applies to this single database.
     #[serde(default)]
     compat: Option<RawCompat>,
+    /// Optional `[sync]` section (#157): this PROCESS's role, not the file's.
+    #[serde(default)]
+    sync: Option<RawSync>,
+}
+
+/// The `[sync]` TOML section (#157).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSync {
+    /// `"standalone"` (default), `"replica"` or `"authority"`. Validated where
+    /// it becomes an enum (`mpedb::sync::Role::parse`) so the refusal can name
+    /// the valid values, which the model language already requires of itself.
+    #[serde(default)]
+    role: Option<String>,
+    /// Path of the upstream `.mpedb`. Advisory — never opened implicitly.
+    #[serde(default)]
+    upstream: Option<String>,
 }
 
 /// The `[runtime]` TOML section (#74): per-process execution limits.
@@ -507,7 +540,11 @@ impl Config {
             toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
         let runtime = RawRuntime::resolve(raw.runtime.as_ref());
         let bare_group_by = RawCompat::resolve(raw.compat.as_ref())?;
-        raw_to_config(raw.database, raw.tables, runtime, bare_group_by)
+        let (sync_role, sync_upstream) = match raw.sync {
+            Some(s) => (s.role, s.upstream),
+            None => (None, None),
+        };
+        raw_to_config(raw.database, raw.tables, runtime, bare_group_by, sync_role, sync_upstream)
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Config> {
@@ -524,6 +561,8 @@ fn raw_to_config(
     raw_tables: Vec<RawTable>,
     runtime: RuntimeLimits,
     bare_group_by: BareGroupBy,
+    sync_role: Option<String>,
+    sync_upstream: Option<String>,
 ) -> Result<Config> {
         if db.path.is_empty() {
             return Err(Error::Config("database.path must be set".into()));
@@ -707,6 +746,8 @@ fn raw_to_config(
                 max_query_threads: runtime.max_query_threads,
                 require_policy,
                 bare_group_by,
+                sync_role: sync_role.unwrap_or_else(|| "standalone".to_string()),
+                sync_upstream,
             },
             schema: Schema::new(tables)?,
         })
@@ -828,7 +869,12 @@ impl WorkspaceConfig {
                     if !seen_alias.insert(alias.clone()) {
                         return Err(Error::Config(format!("duplicate database alias `{alias}`")));
                     }
-                    let config = raw_to_config(db, tables, runtime, bare_group_by)?;
+                    // A workspace member is a separate file with its own writer
+                    // lock; a sync role is per PROCESS, so it is not inherited
+                    // per member — a workspace-wide `[sync]` would have to mean
+                    // something different for each member and therefore means
+                    // nothing.
+                    let config = raw_to_config(db, tables, runtime, bare_group_by, None, None)?;
                     if !seen_path.insert(config.options.path.clone()) {
                         return Err(Error::Config(format!(
                             "two workspace members map to the same file `{}`",

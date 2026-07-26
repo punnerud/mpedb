@@ -70,8 +70,20 @@ use crate::{Database, Error, Result, Value, WriteSession};
 /// What happened to an edit, inside its deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditVerdict {
-    /// The edit landed.
+    /// The edit landed, authoritatively.
     Committed,
+    /// The edit stands **locally** and no authority has confirmed it (#157).
+    ///
+    /// Only a [`Role::Replica`](crate::sync::Role::Replica) produces this;
+    /// standalone and authority instances never do, because for them a local
+    /// commit *is* the authoritative one. It is a third state rather than a
+    /// flavour of `Committed` on purpose: folding it into either of the other
+    /// two reads as the opposite of what happened — the same mistake
+    /// `RangeClaim` made for one compile in #151.
+    ///
+    /// [`EditVerdictExt::is_committed`] stays false for it, so a caller that
+    /// does not care about roles keeps today's meaning without changing a line.
+    Provisional { local_txn: u64 },
     /// Someone else committed to this surface first. `at_txn` is the newest
     /// committed transaction at the moment we were refused — the client reads
     /// its own snapshot at or after that point to see what won.
@@ -392,7 +404,22 @@ impl Database {
             return Ok(out);
         }
         match session.commit() {
-            Ok(()) => Ok(out),
+            Ok(()) => {
+                // #157: on a replica the commit that just happened is LOCAL.
+                // Saying `Committed` would be claiming an authority's word this
+                // instance does not have, and a caller who acted on that would
+                // be told later that it was withdrawn — which is a bug report
+                // rather than a design.
+                if self.role.needs_confirmation() {
+                    let local_txn = self.snapshot_txn();
+                    for v in out.iter_mut() {
+                        if *v == EditVerdict::Committed {
+                            *v = EditVerdict::Provisional { local_txn };
+                        }
+                    }
+                }
+                Ok(out)
+            }
             // The batch as a whole lost to something outside it. Everyone who
             // was still standing learns it at once.
             Err(Error::WriteConflict) => {

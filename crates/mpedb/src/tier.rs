@@ -129,6 +129,10 @@ impl Database {
                 max_query_threads: 0,
                 require_policy: Default::default(),
                 bare_group_by: Default::default(),
+                // A cold tier is opened by the drainer, not by an application:
+                // it has no sync role of its own.
+                sync_role: "standalone".to_string(),
+                sync_upstream: None,
                 perms: FilePerms {
                     mode: None,
                     owner: None,
