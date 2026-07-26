@@ -89,7 +89,7 @@ fn memory_backing_file() -> Result<File> {
     }
 }
 
-pub const FORMAT_VERSION: u32 = 7; // v7: footprint ring on its own pages, exact key sets (#149)
+pub const FORMAT_VERSION: u32 = 8; // v8: ring entry carries a byte range (#151)
                                    //     (DESIGN-BLOBEXTENT §3.4); WAL3 trailer.
                                    // v2: intent-ring region between reader table and data
 
@@ -215,8 +215,23 @@ const OFP_COLS: usize = 32;
 const OFP_NKEYS: usize = 40;
 /// First of `OFP_MAX_KEYS` exact key-hash slots.
 const OFP_KEYS: usize = 48;
+/// The BYTE RANGE inside the value this commit rewrote, packed `lo << 32 | hi`
+/// (#151), or [`RANGE_ANY`] when it could not name one.
+///
+/// **The fifth dimension, and the one that makes a cell divisible.** Four
+/// editors typing in four paragraphs of one `body` are, to every coarser rule,
+/// four writes to the same cell. `splice()` already makes them compose at the
+/// storage layer; this is what stops the guard refusing them anyway.
+///
+/// The range is known from the statement's own parameters, so it is decided
+/// before any work happens — the same "declared, not accumulated" property the
+/// key has (#148), and the reason a collision is one integer comparison.
+const OFP_RANGE: usize = 112;
 /// The mask meaning "every column" — the fail-safe value.
 pub const COLS_ANY: u64 = u64::MAX;
+/// The byte range meaning "anywhere in the value" — what anything that cannot
+/// name a range must publish, and what a zeroed slot reads as.
+pub const RANGE_ANY: u64 = u64::MAX;
 /// Footprint kinds recorded per committed txn.
 pub const OFP_KIND_EMPTY: u64 = 0; // touched no user table (catalog/sys only)
 pub const OFP_KIND_POINT: u64 = 1; // exactly one table, one PK (table_bits+key_hash)
@@ -332,7 +347,24 @@ pub enum GuardVerdict {
     RingGap,
 }
 
-/// The four dimensions a guarded action is checked on (#142–#146).
+/// What a committing txn publishes about what it wrote — the mirror image of
+/// [`GuardSurface`], and the reason both are types: the two travel together
+/// through every dimension, and passing them as loose arguments was eight
+/// parameters and counting, which is the shape of a struct that has not been
+/// written down yet.
+pub struct CommitFootprint<'a> {
+    pub kind: u64,
+    pub table_bits: u64,
+    /// Point key, shard hash, or region Bloom — whichever `kind` says.
+    pub key_hash: u64,
+    pub cols: u64,
+    /// The exact keys written, when there were few enough to name (#149).
+    pub keys: Option<&'a [u64]>,
+    /// Packed byte range (#151), or [`RANGE_ANY`].
+    pub range: u64,
+}
+
+/// The five dimensions a guarded action is checked on (#142–#151).
 ///
 /// They are one concept and travel together: a conflict needs an overlap in
 /// EVERY dimension, and each one that can be named narrows the answer. Passing
@@ -349,6 +381,7 @@ pub enum GuardVerdict {
 /// | `keys` | `None` | which keys, EXACTLY, when there are few enough |
 /// | `shard` | `None` | which tenant, when provable |
 /// | `cols` | [`COLS_ANY`] | which columns |
+/// | `range` | `None` | which bytes inside the value |
 ///
 /// `keys` and `regions` describe the same thing at two precisions, and both are
 /// carried because either side of a comparison may have lost exactness. When
@@ -365,6 +398,9 @@ pub struct GuardSurface {
     pub keys: Option<Vec<u64>>,
     pub shard: Option<u64>,
     pub cols: u64,
+    /// The byte range this action rewrites inside the value, or `None` for
+    /// "the whole value" (#151).
+    pub range: Option<(u32, u32)>,
 }
 
 const INIT_READY: u32 = 2;
@@ -2859,6 +2895,16 @@ impl Shm {
     /// multi-key statement, or anything unresolvable must publish.
     pub const REGION_ANY: u64 = u64::MAX;
 
+    /// Pack a byte range for the ring entry. Offsets past `u32::MAX` (a 4 GiB
+    /// cell) are not representable and widen to "anywhere" rather than
+    /// truncating into a range that would clear a real conflict.
+    pub fn pack_range(lo: u64, hi: u64) -> u64 {
+        match (u32::try_from(lo), u32::try_from(hi)) {
+            (Ok(l), Ok(h)) if l <= h => ((l as u64) << 32) | h as u64,
+            _ => RANGE_ANY,
+        }
+    }
+
     /// Fingerprint of a key prefix. `None` (empty prefix) has no fingerprint:
     /// there is nothing to filter on, which is the 0 case.
     pub fn key_fingerprint(prefix: &[u8]) -> u64 {
@@ -2909,15 +2955,8 @@ impl Shm {
     /// The txn_id field is stored LAST (Release) so a reader that sees it can
     /// trust the payload; in practice every read is also serialized by the
     /// writer mutex, which is a full barrier.
-    pub fn opt_record(
-        &self,
-        txn_id: u64,
-        kind: u64,
-        table_bits: u64,
-        key_hash: u64,
-        cols: u64,
-        keys: Option<&[u64]>,
-    ) {
+    pub fn opt_record(&self, txn_id: u64, fp: &CommitFootprint<'_>) {
+        let CommitFootprint { kind, table_bits, key_hash, cols, keys, range } = *fp;
         self.opt_field(txn_id, OFP_COLS).store(cols, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_KIND).store(kind, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_TBITS).store(table_bits, Ordering::Relaxed);
@@ -2934,6 +2973,7 @@ impl Shm {
             self.opt_field(txn_id, OFP_KEYS + i * 8).store(*h, Ordering::Relaxed);
         }
         self.opt_field(txn_id, OFP_NKEYS).store(n as u64, Ordering::Relaxed);
+        self.opt_field(txn_id, OFP_RANGE).store(range, Ordering::Relaxed);
         self.opt_field(txn_id, OFP_TXN).store(txn_id, Ordering::Release);
     }
 
@@ -3065,7 +3105,7 @@ impl Shm {
         surface: &GuardSurface,
         why: &mut GuardVerdict,
     ) -> bool {
-        let GuardSurface { tables: table_bits, regions, ref keys, shard, cols } = *surface;
+        let GuardSurface { tables: table_bits, regions, ref keys, shard, cols, range } = *surface;
         if current_txn <= snap_txn {
             return false; // nothing committed since our snapshot
         }
@@ -3147,10 +3187,39 @@ impl Shm {
             // `COLS_ANY` on either side means "could be any column", so the
             // masks always intersect and the pair conflicts — which is the
             // pre-#146 behaviour and the direction anything unnameable takes.
-            if self.opt_field(t, OFP_COLS).load(Ordering::Relaxed) & cols != 0 {
-                *why = GuardVerdict::Overlap;
-                return true;
+            if self.opt_field(t, OFP_COLS).load(Ordering::Relaxed) & cols == 0 {
+                continue;
             }
+            // #151, checked LAST because it is the finest: same table, same
+            // key, same shard, same column — but a different part of the VALUE.
+            // Four editors in four paragraphs of one `body` are four writes to
+            // one cell to every coarser rule, and `splice()` makes them compose
+            // at the storage layer; this is what stops the guard refusing them.
+            //
+            // **The rule is `theirs.lo >= mine.hi`, not mere disjointness**, and
+            // the asymmetry is the whole subtlety. A splice applies to the value
+            // as it stands at write time, so a commit that landed BEFORE mine and
+            // BEGAN before my range has shifted the bytes my offset was computed
+            // against — my `at` no longer means what it meant. Their edit
+            // starting at or after my range ends is the one case that can move
+            // neither my bytes nor my offsets.
+            //
+            // So an edit near the start of a cell does invalidate pending edits
+            // after it. Removing that costs a per-cell edit history and
+            // `subedit::Splice::rebase` at execution; refusing is the fail-safe
+            // direction and returns `Lost`, which is exactly the signal a client
+            // needs to rebase and resubmit.
+            if let Some((_, my_hi)) = range {
+                let theirs = self.opt_field(t, OFP_RANGE).load(Ordering::Relaxed);
+                if theirs != RANGE_ANY {
+                    let their_lo = (theirs >> 32) as u32;
+                    if their_lo >= my_hi {
+                        continue;
+                    }
+                }
+            }
+            *why = GuardVerdict::Overlap;
+            return true;
         }
         false
     }

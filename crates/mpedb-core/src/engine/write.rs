@@ -89,6 +89,14 @@ pub struct Guard {
     /// Carrying the exact set alongside costs a `Vec` per guarded transaction
     /// and removes every false conflict the summary would have invented.
     pub keys: Option<Vec<u64>>,
+    /// The byte range inside the value this action rewrites (#151), or `None`
+    /// for "the whole value".
+    ///
+    /// Accumulated as (min lo, max hi) — the union, which is conservative:
+    /// two splices at opposite ends of one cell declare the span between them
+    /// and conflict with anything inside it. Exact per-splice ranges would need
+    /// a list, and one action rarely splices twice.
+    pub range: Option<(u32, u32)>,
     /// The shard this action runs under (#144), or `None` when it cannot be
     /// proven — no session context, or a table without a policy on that key.
     ///
@@ -232,6 +240,8 @@ pub struct WriteTxn<'e> {
     /// all (#149). Published alongside the summary so a later guard can answer
     /// exactly instead of through a 64-bit Bloom.
     pub(super) written_keys: Option<Vec<u64>>,
+    /// The byte range this txn rewrote (#151), `None` = the whole value.
+    pub(super) written_range: Option<(u32, u32)>,
     /// The shard this txn's writes all belong to (#144), or `None` if they do
     /// not all belong to one provable shard.
     /// Columns this txn WROTE, same folding and same widening rule.
@@ -503,6 +513,28 @@ impl<'e> WriteTxn<'e> {
         }
     }
 
+    /// Narrow (or widen) the byte range this action rewrites (#151).
+    ///
+    /// `None` means "somewhere unnameable", and once said it is permanent —
+    /// a range already forgotten cannot be recovered, and a surface that
+    /// shrank would stop guarding what it had already claimed.
+    pub fn guard_touch_range(&mut self, r: Option<(u32, u32)>) {
+        if let Some(g) = self.guard.as_mut() {
+            g.range = match (g.range, r) {
+                (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+                _ => None,
+            };
+        }
+    }
+
+    /// The written half of [`Self::guard_touch_range`].
+    pub fn record_written_range(&mut self, r: Option<(u32, u32)>) {
+        self.written_range = match (self.written_range, r) {
+            (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+            _ => None,
+        };
+    }
+
     /// Add one exact key to what THIS txn is recording as written, for the
     /// benefit of guards that come later. Same widening rule.
     pub fn record_written_key(&mut self, key_hash: Option<u64>) {
@@ -528,10 +560,10 @@ impl<'e> WriteTxn<'e> {
     #[allow(clippy::type_complexity)]
     pub fn guard_state(
         &self,
-    ) -> Option<(u64, u64, u64, Option<Vec<u64>>, Option<u64>, u64)> {
-        self.guard
-            .as_ref()
-            .map(|g| (g.snap_txn, g.surface, g.regions, g.keys.clone(), g.shard, g.cols))
+    ) -> Option<(u64, u64, u64, Option<Vec<u64>>, Option<u64>, u64, Option<(u32, u32)>)> {
+        self.guard.as_ref().map(|g| {
+            (g.snap_txn, g.surface, g.regions, g.keys.clone(), g.shard, g.cols, g.range)
+        })
     }
 
     pub fn hint_notify_key(&mut self, table_id: u32, region: Option<&[u8]>) {

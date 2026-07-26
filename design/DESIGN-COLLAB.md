@@ -100,6 +100,26 @@ editors on one block  ≤  cap        (16–32 at a 1 s deadline)
 There is no global editor limit worth stating. What there is instead is a
 **design obligation**: an edit must not be a commit of its own.
 
+### The sub-edit: `splice()` (#151, shipped)
+
+```sql
+UPDATE doc SET body = splice(body, $at, $remove, $insert) WHERE id = $1
+```
+
+An ordinary scalar in an ordinary `UPDATE` — no new statement form, no plan
+format change. What makes it a *sub-edit* rather than a value is **when** it is
+evaluated: an UPDATE expression reads the row as it stands at write time, not as
+of the session's snapshot (verified, not assumed). So two editors splicing
+disjoint ranges of one cell both land, where two whole-value writes computed
+from the version each of them read would lose one.
+`two_disjoint_splices_of_one_cell_both_land` carries that control inside itself:
+the same two intentions as whole-value writes drop the first edit.
+
+**Strict about offsets, never clamping.** A range past the end, or a cut inside
+a multi-byte character of a TEXT value, is refused. A stale offset is a wrong
+question; clamping would answer it with silently mangled text, and on TEXT could
+produce invalid UTF-8 — worse than an error and discovered much later.
+
 ### What that implies, and what is not built yet
 
 The answer an editor waits for is *"did my edit win"* — a question about
@@ -110,12 +130,40 @@ immediately) and measures that the second half pays for itself. It does not yet
 ship the batching itself, nor the finer granularity that makes batching most
 valuable:
 
-- **Byte-range conflict units.** Two edits to disjoint byte ranges of the *same*
-  cell do not conflict. The range is known before execution, exactly as the key
-  is (#148), so it can be declared and compared the same way — which extends the
-  guard's dimensions from (table, key, shard, column) to (…, byte range). Ranges
-  within one batch share a base and compare directly; across batches the base
-  has moved, which is what `subedit::Splice::rebase` exists for.
+### The fifth dimension: the range is in the request (#151, shipped)
+
+`splice(body, $2, $3, …)` carries its byte range in the same parameters
+`WHERE id = $1` carries its key, so the guard can decide the finest dimension
+**before any work happens** — a collision is one integer comparison, not a page
+read. That is the property that made declaring keys work (#148), applied one
+level finer, and it is why the surface is now
+`(table, key, shard, column, byte range)`.
+
+Recognised only where the answer is exact: a single-column `UPDATE` whose value
+is `splice(<that same column>, at, remove, …)` with constant-or-parameter
+offsets. Everything else rewrites the whole value, which is what "no range"
+says — and a write with no range conflicts with every sub-edit of that cell.
+
+**The rule is `theirs.lo >= mine.hi`, not mere disjointness**, and the asymmetry
+is the whole subtlety. A splice applies to the value *as it stands at write
+time*, so a commit that landed before mine and began before my range has shifted
+the bytes my offset was computed against — my `at` no longer means what it
+meant. Their edit beginning at or after my range ends is the one case that can
+move neither my bytes nor my offsets.
+
+So an edit near the start of a cell does invalidate pending edits after it. Two
+independent layers catch a stale offset: the guard refuses at commit
+(`an_edit_before_mine_invalidates_my_offsets`), and when the value actually got
+shorter, `splice()` itself refuses at execution
+(`a_shifted_offset_is_refused_by_splice_itself`). Both return the client to the
+same place — read what won, rebase, resubmit — which is what
+`EditVerdict::Lost { at_txn }` is for.
+
+**What removes the asymmetry** is rebasing the splice itself: the engine
+adjusting `at` by the length deltas of commits that landed in between, which is
+`subedit::Splice::rebase` applied at execution and needs a per-cell edit history
+the engine does not keep. Worth doing deliberately rather than approximating.
+
 - **Acknowledge on claim, commit in batches.** The engine already group-commits
   (`ring_exec`); what is missing is letting the *answer* precede the batch
   rather than ride it.

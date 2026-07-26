@@ -201,6 +201,22 @@ pub enum ScalarFn {
     /// A zero-magnitude vector has no direction, so its cosine distance is
     /// NULL (the SQL answer to an undefined quantity), not an error.
     VecCosine = 67,
+    /// `splice(x, at, remove, insert)` — replace `remove` bytes of `x` at byte
+    /// offset `at` with `insert` (#151).
+    ///
+    /// **A sub-edit, not a value.** The whole point is that the new value is
+    /// computed from the CURRENT stored one at write time, so two editors
+    /// splicing disjoint ranges of one cell both land — where two whole-value
+    /// writes would lose one. It is the smallest form of that idea: an ordinary
+    /// scalar in an ordinary `UPDATE`, no new statement, no plan format change.
+    ///
+    /// Byte offsets, and **strict about them**. An `at` or `at + remove` past
+    /// the end, or landing inside a multi-byte character of a TEXT value, is a
+    /// refusal — never a clamp. A stale offset is a wrong question, and
+    /// clamping would answer it with silently mangled text; on TEXT it could
+    /// produce invalid UTF-8, which is worse than an error. Same reasoning as
+    /// [`ScalarFn::VecL2`]'s shape rules.
+    Splice = 68,
 }
 
 impl ScalarFn {
@@ -272,6 +288,7 @@ impl ScalarFn {
             65 => ScalarFn::JulianDay,
             66 => ScalarFn::VecL2,
             67 => ScalarFn::VecCosine,
+            68 => ScalarFn::Splice,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -301,6 +318,7 @@ impl ScalarFn {
             ScalarFn::Substr => argc == 2 || argc == 3,
             ScalarFn::Instr | ScalarFn::Pow | ScalarFn::VecL2 | ScalarFn::VecCosine => argc == 2,
             ScalarFn::Replace => argc == 3,
+            ScalarFn::Splice => argc == 4,
             // char() is variadic: 0..=255 code points (the u8 argc caps it).
             ScalarFn::Char => true,
             // printf()/format() are variadic; the format string is required, so
@@ -411,6 +429,7 @@ impl ScalarFn {
             ScalarFn::JulianDay => "julianday",
             ScalarFn::VecL2 => "vec_l2",
             ScalarFn::VecCosine => "vec_cosine",
+            ScalarFn::Splice => "splice",
         }
     }
 }
@@ -789,6 +808,81 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
         // ISO-8601 string (design note in [`super::datetime`]).
         ScalarFn::Date | ScalarFn::Time | ScalarFn::DateTime | ScalarFn::JulianDay => {
             super::datetime::sqlite_date_family(f, args)?
+        }
+        // splice(x, at, remove, insert): the sub-edit (#151). Applied against
+        // the value as it is at write time, which is what lets two editors
+        // splice disjoint ranges of one cell and both land.
+        ScalarFn::Splice => {
+            let text = matches!(args[0], Value::Text(_));
+            let base: &[u8] = match &args[0] {
+                Value::Text(t) => t.as_bytes(),
+                Value::Blob(b) => b,
+                other => {
+                    return Err(Error::TypeMismatch(format!(
+                        "splice(): first argument must be text or blob, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            let at = int(&args[1])?;
+            let remove = int(&args[2])?;
+            let ins: &[u8] = match &args[3] {
+                Value::Text(t) => t.as_bytes(),
+                Value::Blob(b) => b,
+                other => {
+                    return Err(Error::TypeMismatch(format!(
+                        "splice(): insert must be text or blob, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            if at < 0 || remove < 0 {
+                return Err(Error::TypeMismatch(format!(
+                    "splice(): negative offset or length (at={at}, remove={remove})"
+                )));
+            }
+            let (at, remove) = (at as usize, remove as usize);
+            // Strict, not clamping. A stale offset is a wrong question, and
+            // answering it by clamping silently mangles the value.
+            let end = at.checked_add(remove).filter(|e| *e <= base.len()).ok_or_else(|| {
+                Error::TypeMismatch(format!(
+                    "splice(): range {at}..{} is outside a value of {} bytes",
+                    at.saturating_add(remove),
+                    base.len()
+                ))
+            })?;
+            if text {
+                // Splitting a multi-byte character would produce invalid UTF-8,
+                // which is a worse outcome than a refusal.
+                let st = std::str::from_utf8(base).map_err(|_| {
+                    Error::TypeMismatch("splice(): text argument is not valid UTF-8".into())
+                })?;
+                for (what, off) in [("at", at), ("at + remove", end)] {
+                    if !st.is_char_boundary(off) {
+                        return Err(Error::TypeMismatch(format!(
+                            "splice(): {what} = {off} is inside a multi-byte character"
+                        )));
+                    }
+                }
+                if std::str::from_utf8(ins).is_err() {
+                    return Err(Error::TypeMismatch(
+                        "splice(): inserting non-UTF-8 bytes into text".into(),
+                    ));
+                }
+            }
+            let mut out = Vec::with_capacity(base.len() - remove + ins.len());
+            out.extend_from_slice(&base[..at]);
+            out.extend_from_slice(ins);
+            out.extend_from_slice(&base[end..]);
+            if text {
+                // Proven above: both halves were char-boundary-aligned and the
+                // insert was valid UTF-8.
+                Value::Text(String::from_utf8(out).map_err(|_| {
+                    Error::Corrupt("splice(): produced invalid UTF-8 despite boundary checks".into())
+                })?)
+            } else {
+                Value::Blob(out)
+            }
         }
         ScalarFn::VecL2 | ScalarFn::VecCosine => {
             let (a, b) = (vec_arg(f, 1, &args[0])?, vec_arg(f, 2, &args[1])?);

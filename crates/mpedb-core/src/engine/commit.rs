@@ -83,7 +83,7 @@ impl<'e> WriteTxn<'e> {
         // writeback and no freelist fixpoint, it just aborts. Retrying is the
         // expected outcome, not the exceptional one, so it must not be
         // expensive.
-        if let Some((snap_txn, surface, regions, keys, shard, cols)) = self.guard_state() {
+        if let Some((snap_txn, surface, regions, keys, shard, cols, range)) = self.guard_state() {
             let mut why = crate::shm::GuardVerdict::Clear;
             // A guard that touched no resolvable key guards its whole surface;
             // one that named its keys guards only those. Zero would mean "no
@@ -96,7 +96,12 @@ impl<'e> WriteTxn<'e> {
             // is not the same as "it named none I can compare" — it must fall
             // back to the summary, and the summary was just widened to ANY.
             let keys = keys.filter(|k| !k.is_empty());
-            let gs = crate::shm::GuardSurface { tables: surface, regions, keys, shard, cols };
+            // `(u32::MAX, 0)` is the identity of the min/max fold — no
+            // statement named a range — and must read as the whole value, not
+            // as an empty one that would clear every conflict.
+            let range = range.filter(|(lo, hi)| lo <= hi);
+            let gs =
+                crate::shm::GuardSurface { tables: surface, regions, keys, shard, cols, range };
             if self.eng.shm.opt_conflict_set(snap_txn, self.meta.txn_id, &gs, &mut why) {
                 self.eng.guard_stats.record(why);
                 self.abort();
@@ -494,7 +499,21 @@ impl<'e> WriteTxn<'e> {
             // had one key here; what is new is that a guard can now compare
             // against it without folding both through 64 bits (#149).
             let wkeys = self.written_keys.as_deref().filter(|k| !k.is_empty());
-            self.eng.shm.opt_record(new_txn, kind, tbits, khash, wcols, wkeys);
+            let wrange = match self.written_range.filter(|(lo, hi)| lo <= hi) {
+                Some((lo, hi)) => crate::shm::Shm::pack_range(lo as u64, hi as u64),
+                None => crate::shm::RANGE_ANY,
+            };
+            self.eng.shm.opt_record(
+                new_txn,
+                &crate::shm::CommitFootprint {
+                    kind,
+                    table_bits: tbits,
+                    key_hash: khash,
+                    cols: wcols,
+                    keys: wkeys,
+                    range: wrange,
+                },
+            );
         }
 
         // 4. publish (fence(Release) + atomic stores inside)

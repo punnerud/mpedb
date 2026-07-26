@@ -1361,6 +1361,11 @@ impl Database {
             // the fail-safe direction, and the only honest reading of a
             // statement whose parameters are not known yet.
             s.txn.guard_touch_key(ring_exec::plan_key(&plan, params));
+            // #151: the byte range is in the request too — `splice(body, $2,
+            // $3, …)` carries it in the same parameters the key comes from —
+            // so the finest dimension is decided before any work happens, and
+            // a collision is one integer comparison.
+            s.txn.guard_touch_range(ring_exec::plan_range(&plan, params));
             match ring_exec::plan_cols(&plan) {
                 Some(m) => {
                     for b in 0..64u16 {

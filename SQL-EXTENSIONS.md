@@ -33,6 +33,26 @@ mpedb exec app.toml 'SELECT double(amount) FROM orders'
 - Execution is budgeted: a runaway body is a deterministic error at the same
   instruction count everywhere.
 
+## `splice()` — sub-edits inside one cell
+
+```sql
+UPDATE doc SET body = splice(body, $at, $remove, $insert) WHERE id = $1
+```
+
+Replace `$remove` bytes of `body` at byte offset `$at` with `$insert`. Text or
+blob; the result has the type of the first argument.
+
+Not a sqlite function, and not sugar for `substr() || … || substr()`. The point
+is **when** it evaluates: an UPDATE expression reads the row at write time, so
+two editors splicing disjoint ranges of the same cell both land, where two
+whole-value writes each computed from the version its author read would lose
+one. That is the difference between a sub-edit and a value
+(design/DESIGN-COLLAB.md §3).
+
+**Strict about offsets.** A range past the end, or a cut inside a multi-byte
+character of a TEXT value, is refused rather than clamped: a stale offset is a
+wrong question, and clamping answers it with silently mangled text.
+
 ## The cost layer (tune / cost-policy / stats)
 
 The cost calculator itself is adjustable, and the adjustments live in the

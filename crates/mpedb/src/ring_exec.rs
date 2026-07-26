@@ -61,6 +61,7 @@ use crate::trigger::TriggerSet;
 use crate::{Database, ExecResult};
 use mpedb_core::{row, PendingIntent, WriteTxn};
 use mpedb_sql::{AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
+use mpedb_types::expr::{Instr, ScalarFn};
 use mpedb_types::value::{read_value, write_value};
 use mpedb_types::{
     keycode, Concurrency, DefaultExpr, Error, KeyAccess, KeyPart, PlanHash, Result, Value,
@@ -378,6 +379,59 @@ pub(crate) fn plan_cols(plan: &CompiledPlan) -> Option<u64> {
     }
 }
 
+/// The byte range inside a value a statement rewrites, resolved against
+/// `params`, or `None` for "the whole value" (#151).
+///
+/// **It is already in the request.** `UPDATE … SET body = splice(body, $2, $3,
+/// $4)` carries its own range in its parameters, exactly as `WHERE id = $1`
+/// carries its key — so the surface can be decided before a byte is touched,
+/// and a collision is one integer comparison rather than a page read. That is
+/// the same property that made declaring keys work (#148), applied one level
+/// finer.
+///
+/// Recognised only in the shape where the answer is exact: a single-column
+/// UPDATE whose value is `splice(<that same column>, at, remove, …)` with
+/// constant-or-parameter offsets. Anything else rewrites the whole value, which
+/// is what `None` says.
+pub(crate) fn plan_range(plan: &CompiledPlan, params: &[Value]) -> Option<(u32, u32)> {
+    let PlanStmt::Update { set, .. } = &plan.stmt else {
+        return None;
+    };
+    let [(col, prog)] = set.as_slice() else {
+        return None;
+    };
+    // The shape: PushCol(col), <at>, <remove>, <insert>, Call(Splice, 4).
+    let instrs = &prog.instrs;
+    let (Some(Instr::PushCol(c0)), Some(Instr::Call(ScalarFn::Splice, 4))) =
+        (instrs.first(), instrs.last())
+    else {
+        return None;
+    };
+    if c0 != col {
+        // Splicing one column into another is a whole-value write of the
+        // target, not a sub-edit of it.
+        return None;
+    }
+    let at = const_or_param(&instrs[1], plan, params)?;
+    let remove = const_or_param(&instrs[2], plan, params)?;
+    let (at, remove) = (u32::try_from(at).ok()?, u32::try_from(remove).ok()?);
+    Some((at, at.checked_add(remove)?))
+}
+
+/// A literal or a bound parameter as an integer; anything computed is `None`,
+/// because a range that depends on the row is not known before execution.
+fn const_or_param(i: &Instr, plan: &CompiledPlan, params: &[Value]) -> Option<i64> {
+    let v: &Value = match i {
+        Instr::PushConst(k) => plan.consts.get(*k as usize)?,
+        Instr::PushParam(p) => params.get(*p as usize)?,
+        _ => return None,
+    };
+    match v {
+        Value::Int(n) if *n >= 0 => Some(*n),
+        _ => None,
+    }
+}
+
 /// The point key a statement names, resolved against `params`, or `None` when
 /// it names anything other than exactly one key. `None` is "anywhere".
 pub(crate) fn plan_key(plan: &CompiledPlan, params: &[Value]) -> Option<u64> {
@@ -459,6 +513,14 @@ pub(crate) fn widen_guard(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, params: &
                 txn.record_written_col(Some(c));
             }
         }
+    }
+
+    // #151: WHERE in the value, not only which column. The range rides the
+    // same declaration the key does.
+    let rng = plan_range(plan, params);
+    txn.guard_touch_range(rng);
+    if !plan.footprint.tables_written.is_empty() {
+        txn.record_written_range(rng);
     }
 
     let sh = plan_shard(plan, params);

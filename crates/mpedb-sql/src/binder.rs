@@ -2566,6 +2566,7 @@ impl<'a> Binder<'a> {
             // own shape refusals are the specification.
             "vec_l2" => ScalarFn::VecL2,
             "vec_cosine" => ScalarFn::VecCosine,
+            "splice" => ScalarFn::Splice,
             // Math (sqlite 3.45). `log` is base-10 with one argument and
             // log-base-b with two, so it dispatches on the argument count here —
             // `log10`/`log2` name the fixed-base forms directly.
@@ -2702,6 +2703,13 @@ impl<'a> Binder<'a> {
             | ScalarFn::Trunc => (&[], None),
             // Checked below (blob-or-any per argument, Float64 out).
             ScalarFn::VecL2 | ScalarFn::VecCosine => (&[], Some(ColumnType::Float64)),
+            // splice(x, at, remove, insert) — the value's type comes from `x`,
+            // so it is checked below rather than pinned. The offsets are
+            // integers and pinned here.
+            ScalarFn::Splice => (
+                &[None, Some(ColumnType::Int64), Some(ColumnType::Int64), None],
+                None,
+            ),
             ScalarFn::Substr => (
                 &[Some(ColumnType::Text), Some(ColumnType::Int64), Some(ColumnType::Int64)],
                 Some(ColumnType::Text),
@@ -2864,6 +2872,30 @@ impl<'a> Binder<'a> {
                     }
                 }
                 Some(ColumnType::Float64)
+            }
+            // splice() returns whatever it was given: text in, text out. The
+            // value and the insert must agree in kind, and both must be
+            // text-or-blob — checked here so a `splice(int_col, …)` is refused
+            // at compile time rather than at the first row.
+            ScalarFn::Splice => {
+                let mut out_ty = None;
+                for (i, idx) in [0usize, 3].into_iter().enumerate() {
+                    match self.static_type(&out[idx]) {
+                        Some(t @ (ColumnType::Text | ColumnType::Blob)) => {
+                            if i == 0 {
+                                out_ty = Some(t);
+                            }
+                        }
+                        Some(ColumnType::Any) | None => {}
+                        Some(other) => {
+                            return Err(bind_err(format!(
+                                "splice() argument {} must be text or blob, got {other}",
+                                idx + 1
+                            )))
+                        }
+                    }
+                }
+                out_ty
             }
             // hex accepts text or blob (like the runtime); reject anything else
             // at COMPILE time rather than at the first row.
