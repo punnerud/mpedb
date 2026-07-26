@@ -2714,7 +2714,42 @@ impl WriteSession<'_> {
         Ok(access::plan_access(&plan, &schema))
     }
 
+    /// Run a statement whose offsets were computed against `origin` rather than
+    /// against the session's guard snapshot (#154).
+    ///
+    /// This exists for [`Database::submit_batch`], where one transaction
+    /// carries sub-edits from clients that read at **different** versions. The
+    /// guard is still taken against the oldest of them — that is what makes the
+    /// transaction's refusal honest against everything outside the batch — but
+    /// each member's `splice()` offset must be carried forward from the version
+    /// *that member* saw. Walking a newer member from the batch minimum replays
+    /// deltas it already accounted for, which lands the splice on bytes its
+    /// author never saw, with no error.
+    ///
+    /// An `origin` older than the guard's snapshot is clamped to the guard's:
+    /// the walk may not reach back past what the guard validated.
+    ///
+    /// Passed per statement rather than held on the session on purpose — a
+    /// hidden mode is exactly what breaks when two calls get reordered.
+    pub fn query_from_snapshot(
+        &mut self,
+        origin: u64,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecResult> {
+        self.query_with_origin(Some(origin), sql, params)
+    }
+
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<ExecResult> {
+        self.query_with_origin(None, sql, params)
+    }
+
+    fn query_with_origin(
+        &mut self,
+        origin: Option<u64>,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecResult> {
         if self.poisoned {
             return Err(poisoned_err());
         }
@@ -2772,7 +2807,7 @@ impl WriteSession<'_> {
             let mut cache = self.db.cache.write().expect(POISON);
             cache.entry(hash).or_insert_with(|| Arc::new(plan)).clone()
         };
-        self.run(&plan, params)
+        self.run_from(origin, &plan, params)
     }
 
     /// Commit everything written through this session.
@@ -3082,6 +3117,15 @@ impl WriteSession<'_> {
     }
 
     fn run(&mut self, plan: &CompiledPlan, params: &[Value]) -> Result<ExecResult> {
+        self.run_from(None, plan, params)
+    }
+
+    fn run_from(
+        &mut self,
+        origin: Option<u64>,
+        plan: &CompiledPlan,
+        params: &[Value],
+    ) -> Result<ExecResult> {
         // Transaction/savepoint control is handled here against the session's
         // own state, never compiled to an access path. `run` is only reached
         // from `query`/`execute`, which already refuse a poisoned session, so a
@@ -3130,7 +3174,7 @@ impl WriteSession<'_> {
         // saw, BEFORE the statement runs and before the surface is widened —
         // so both the splice and the guard speak about the same bytes.
         let mut full = full;
-        ring_exec::rebase_splice_params(&mut self.txn, plan, full.to_mut())?;
+        ring_exec::rebase_splice_params(&mut self.txn, plan, full.to_mut(), origin)?;
         ring_exec::widen_guard(&mut self.txn, plan, &full);
         let triggers = self.db.trigger_set()?;
         // Execute against the session's OWN schema view (== the txn's captured

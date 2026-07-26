@@ -185,18 +185,41 @@ impl Database {
 /// One editor's pending sub-edit, as a service collects them before flushing
 /// (#153).
 ///
-/// `snap` is **that editor's** version — the one their client decided against.
-/// A batch may mix several, and the batch is guarded against the oldest of
-/// them, so nobody's decision is silently treated as newer than it was.
+/// # `snap` and `seq` are different numbers, and confusing them is easy
+///
+/// `snap` is **the engine's** version: which commit this editor had read when
+/// it decided. It drives the guard and the rebase walk — where the bytes were.
+///
+/// `seq` is **the service's** order: in which order the editors acted. It
+/// decides who wins a conflict and how equal offsets interleave. The engine
+/// never assigns it; it only sorts by `(seq, editor)`, which is a total order
+/// with no ties (#155).
+///
+/// A batch may mix several `snap`s. It is guarded against the oldest, so
+/// nobody's decision is silently treated as newer than it was — but each member
+/// is *rebased* from its own, because a member that already saw a commit must
+/// not have that commit's delta applied to it twice (#154).
 #[derive(Debug, Clone)]
 pub struct Submission {
     pub editor: i64,
     pub snap: u64,
+    /// The service's ordering counter. See the type docs: this is not `snap`.
+    pub seq: u64,
     /// Which row of the block table.
     pub key: i64,
     pub at: u64,
     pub remove: u64,
     pub insert: String,
+}
+
+/// A member that has been applied, in ORIGINAL (pre-batch) coordinates.
+///
+/// Kept as an explicit set rather than a watermark because members are applied
+/// in counter order, so the applied set is not a prefix of the offset axis.
+struct Applied {
+    at: u64,
+    end: u64,
+    delta: i64,
 }
 
 impl Database {
@@ -217,21 +240,30 @@ impl Database {
     /// pre-batch coordinates, and the second would land on the wrong bytes —
     /// silently, because it is not an error, it is a wrong answer.
     ///
-    /// So: **sort by offset, apply in that order, and shift each member by the
-    /// cumulative length delta of the members before it.** `splice()`'s
-    /// engine-side rebase (#151) walks the committed ring and handles
-    /// everything that landed *before* this batch; this loop handles the batch
-    /// itself. The two compose and must not be conflated — one counts committed
-    /// transactions, the other counts members.
+    /// So each member is shifted by the length delta of the members applied
+    /// before it **that lie at a lower original offset** — which is exactly the
+    /// condition "did that edit move my bytes". `splice()`'s engine-side rebase
+    /// (#151) walks the committed ring and handles everything that landed
+    /// *before* this batch; this loop handles the batch itself. The two compose
+    /// and must not be conflated — one counts committed transactions, the other
+    /// counts members.
     ///
-    /// **Applying in arrival order instead would make every edit's offset
-    /// depend on network jitter**, so the order is a guarantee rather than an
-    /// implementation detail. Equal offsets keep arrival order (a stable sort),
-    /// which is the only fair tie-break available.
+    /// # The order is the counter's, not the network's (#155)
+    ///
+    /// Members are applied in `(seq, editor)` order. That is a total order the
+    /// submitters carried with them, so **the same set of submissions produces
+    /// the same text no matter what order they arrived in** — which is what
+    /// lets a client predict the result before its round trip completes.
+    ///
+    /// Sorting by offset instead (as this did before #155) only looks
+    /// equivalent: disjoint splices commute, so the text is the same either
+    /// way. What changes is *who wins a conflict* and *how equal offsets
+    /// interleave*, and deciding those by arrival order means deciding them by
+    /// network jitter.
     ///
     /// # Nobody starves
     ///
-    /// A member that comes last in the sort still lands — it is *rebased*, not
+    /// A member with a high counter still lands — it is *rebased*, not
     /// rejected. Only a genuine overlap loses, and it loses **alone**: a
     /// savepoint per member means one collision does not take the batch with
     /// it. Being slow is not what costs you an edit; wanting the same bytes is.
@@ -244,13 +276,15 @@ impl Database {
         if subs.is_empty() {
             return Ok(Vec::new());
         }
-        // Offset order, arrival order within a tie. `sort_by_key` is stable.
+        // The submitters' own order. `(seq, editor)` is total — two members
+        // cannot tie — so nothing here depends on when they arrived.
         let mut order: Vec<usize> = (0..subs.len()).collect();
-        order.sort_by_key(|&i| subs[i].at);
+        order.sort_by_key(|&i| (subs[i].seq, subs[i].editor));
 
         // The oldest snapshot in the set: guarding against a newer one would
         // silently forgive a decision made against a version that had already
-        // moved.
+        // moved. Note this guards the TRANSACTION; each member is rebased from
+        // its own snapshot below, which is a different question (#154).
         let snap = subs.iter().map(|s| s.snap).min().unwrap_or(0);
 
         let read = format!("SELECT {col} FROM {table} WHERE id = $1");
@@ -272,16 +306,17 @@ impl Database {
 
         let mut out = vec![EditVerdict::Committed; subs.len()];
         let mut session = self.begin_guarded_with(snap, &may_run)?;
-        // Cumulative length change of the members applied so far. Only members
-        // that STARTED before this one moved its bytes, and offset order is
-        // exactly that condition — which is why the sort is load-bearing.
-        let mut shift: i64 = 0;
-        // The furthest byte any applied member reached, in ORIGINAL (pre-batch)
-        // coordinates. Members are sorted by `at`, so this is exactly "did
-        // anyone before me claim bytes I want".
+        // Every member applied so far, in ORIGINAL (pre-batch) coordinates.
         //
-        // **Shifting without this test is silently wrong**, and the test that
-        // caught it is worth keeping in mind: member A rewrites [0,4) and
+        // This is an explicit set rather than a running sum and a watermark,
+        // and that is forced by the counter order (#155): the applied members
+        // are no longer a prefix of the offset axis, so a watermark would both
+        // miss real overlaps and invent false ones. O(n²) at n ≤ 256 is nothing
+        // against one commit, and a Fenwick tree would buy speed we do not need
+        // with clarity we do.
+        //
+        // **Shifting without the overlap test is silently wrong**, and the case
+        // that caught it is worth keeping in mind: member A rewrites [0,4) and
         // member B wants [2,4). Shifting B by A's delta relocates it onto A's
         // own inserted text — a perfectly valid splice, on bytes B never saw.
         // No error, wrong answer.
@@ -289,15 +324,27 @@ impl Database {
         // Same shape as the engine's committed-path rule (#151): overlap is a
         // collision, everything else is a shift. Half-open, so a zero-width
         // insert exactly at a predecessor's end does NOT overlap — both land,
-        // in commit order, which is the answer a collaborative editor wants.
-        let mut max_end: u64 = 0;
+        // in counter order, which is the answer a collaborative editor wants.
+        let mut applied: Vec<Applied> = Vec::with_capacity(subs.len());
         let mut any = false;
         for &i in &order {
             let s = &subs[i];
-            if s.at < max_end {
+            let end = s.at.saturating_add(s.remove);
+            if applied.iter().any(|a| a.at < end && s.at < a.end) {
                 out[i] = EditVerdict::Lost { at_txn: self.snapshot_txn() };
                 continue;
             }
+            // A member moved my position exactly when the bytes it REMOVED lie
+            // at or before it. In offset order this was a running prefix sum;
+            // in counter order it is the condition stated directly.
+            //
+            // The test is on the predecessor's END, not its start, and the
+            // difference is the equal-offset case: two people typing at one
+            // cursor both have `at == mine`, neither removes anything, and the
+            // one that acted first must push the other along. `a.at < s.at`
+            // would leave them both at the same point and silently reverse
+            // them, so the later counter's text would come out first.
+            let shift: i64 = applied.iter().filter(|a| a.end <= s.at).map(|a| a.delta).sum();
             let at = match (s.at as i64).checked_add(shift) {
                 Some(v) if v >= 0 => v,
                 // A member shifted out of the value by its predecessors is a
@@ -308,7 +355,12 @@ impl Database {
                 }
             };
             let sp = session.savepoint();
-            let r = session.query(
+            // #154: rebased from THIS member's snapshot, not the batch's oldest.
+            // The guard stays at the oldest — that is what makes the
+            // transaction's refusal honest — but a member that already saw a
+            // commit must not have that commit's delta applied to it twice.
+            let r = session.query_from_snapshot(
+                s.snap,
                 &write,
                 &[
                     Value::Int(at),
@@ -319,8 +371,11 @@ impl Database {
             );
             match r {
                 Ok(_) => {
-                    shift += s.insert.len() as i64 - s.remove as i64;
-                    max_end = max_end.max(s.at + s.remove);
+                    applied.push(Applied {
+                        at: s.at,
+                        end,
+                        delta: s.insert.len() as i64 - s.remove as i64,
+                    });
                     any = true;
                 }
                 // A real overlap, or an offset the value cannot hold. One
@@ -396,6 +451,10 @@ primary_key = [\"block\", \"editor\"]
   [[table.column]]
   name = \"beat_at\"
   type = \"int64\"
+
+  [[table.column]]
+  name = \"seq\"
+  type = \"int64\"
 ";
 
 /// Outcome of asking for an editing seat.
@@ -456,8 +515,8 @@ impl<'d> Lease<'d> {
         }
         let (pid, start) = own_identity();
         s.query(
-            "INSERT OR REPLACE INTO edit_lease (block, editor, pid, pid_start, beat_at) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT OR REPLACE INTO edit_lease (block, editor, pid, pid_start, beat_at, seq) \
+             VALUES ($1, $2, $3, $4, $5, 0)",
             &[
                 Value::Int(block),
                 Value::Int(editor),
@@ -477,14 +536,27 @@ impl<'d> Lease<'d> {
     /// Deliberately not on the commit path: a heartbeat is a small write every
     /// 10–15 seconds, and putting liveness work into the commit path is exactly
     /// what #147 had to undo.
-    pub fn beat(&self, block: i64, editor: i64, now_ms: i64) -> Result<bool> {
+    ///
+    /// # The heartbeat carries the counter (#155)
+    ///
+    /// `seq` is how far this editor has got. Reporting it here is what lets a
+    /// service flush on a **quorum** with no deadline at all: an editor with
+    /// nothing to say does not need a separate "abstain" message, because its
+    /// heartbeat already says where it is. Having nothing to add IS a heartbeat
+    /// with an unchanged `seq`.
+    ///
+    /// That moves the only remaining clock off the commit path and onto
+    /// membership, where the deployment already controls it — which is the
+    /// shape etcd uses, and the reason the flush needs no timer.
+    pub fn beat(&self, block: i64, editor: i64, now_ms: i64, seq: u64) -> Result<bool> {
         let (pid, start) = own_identity();
         let mut s = self.db.begin()?;
         s.query(
-            "UPDATE edit_lease SET beat_at = $1 \
-             WHERE block = $2 AND editor = $3 AND pid = $4 AND pid_start = $5",
+            "UPDATE edit_lease SET beat_at = $1, seq = $2 \
+             WHERE block = $3 AND editor = $4 AND pid = $5 AND pid_start = $6",
             &[
                 Value::Int(now_ms),
+                Value::Int(seq as i64),
                 Value::Int(block),
                 Value::Int(editor),
                 Value::Int(pid),
@@ -493,6 +565,34 @@ impl<'d> Lease<'d> {
         )?;
         s.commit()?;
         self.holds(block, editor, now_ms)
+    }
+
+    /// Who currently holds a seat on `block`, and how far each has got.
+    ///
+    /// This is the quorum input for a timerless flush (#155): the membership is
+    /// a **known set** — lease holders — rather than something inferred from
+    /// arrivals, which is what makes "a majority has spoken" a condition that
+    /// can actually be reached without a clock. Expired seats are excluded, so a
+    /// crashed editor stops counting after its TTL rather than blocking the
+    /// block forever; that TTL is the only time left in the design.
+    ///
+    /// It also answers the one question a reconnecting client cannot work out on
+    /// its own: `max(seq)` is where the document had got to while it was away.
+    pub fn spoken(&self, block: i64, now_ms: i64) -> Result<Vec<(i64, u64)>> {
+        let cutoff = now_ms - self.ttl.as_millis() as i64;
+        match self.db.query(
+            "SELECT editor, seq FROM edit_lease WHERE block = $1 AND beat_at >= $2",
+            &[Value::Int(block), Value::Int(cutoff)],
+        )? {
+            crate::ExecResult::Rows { rows, .. } => Ok(rows
+                .iter()
+                .filter_map(|r| match (&r[0], &r[1]) {
+                    (Value::Int(e), Value::Int(s)) => Some((*e, (*s).max(0) as u64)),
+                    _ => None,
+                })
+                .collect()),
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Give the seat up. A client that exits cleanly should call this; a client

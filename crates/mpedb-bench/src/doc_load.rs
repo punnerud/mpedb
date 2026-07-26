@@ -964,6 +964,47 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
         let _ = &slow;
     }
     println!();
+    println!(
+        "`F-counter` (#155): the SAME flush, with the deadline REMOVED. A round closes when a \
+         majority of the live membership has published a counter position at or past the oldest \
+         pending edit \u{2014} `recv`, never `recv_timeout`. `F-quorum` above is the control arm: \
+         same harness, same work, the only difference is that it still has a clock."
+    );
+    println!(
+        "  A slow editor is slow for one of two reasons, and they are not interchangeable. \
+         THINK-slow can still say \u{ab}nothing from me yet\u{bb}; NETWORK-slow cannot, because the \
+         message that would say it is late too."
+    );
+    println!(
+        "{:>8} {:>9} {:>8} {:>7} {:>12} {:>11} {:>11} {:>7} {:>7} {:>8}",
+        "editors",
+        "slow kind",
+        "flushes",
+        "avg K",
+        "edits/s",
+        "fast p50 ms",
+        "fast p99 ms",
+        "lost",
+        "wiped",
+        "behind"
+    );
+    for (label, kind) in [("think", SlowKind::Think), ("network", SlowKind::Network)] {
+        for &e in &[8usize, 32, 64] {
+            let (t, rate, fast, slow) = run_counter(&scratch, e, seats.max(e * 2), kind)?;
+            println!(
+                "{e:>8} {label:>9} {:>8} {:>7.1} {rate:>12.0} {:>11} {:>11} {:>7} {:>7} {:>8}",
+                t.on_quorum,
+                t.members as f64 / t.on_quorum.max(1) as f64,
+                pct(&fast, 0.50) / 1000,
+                pct(&fast, 0.99) / 1000,
+                t.lost,
+                t.wiped,
+                t.behind
+            );
+            let _ = &slow;
+        }
+    }
+    println!();
     println!("guard verdicts (mpedb only) — a refusal is a CONFLICT or a LIMIT, never both:");
     println!(
         "{:<18} {:>8} {:>10} {:>10} {:>16} {:>10} {:>10}",
@@ -1114,6 +1155,10 @@ fn run_quorum(scratch: &Path, editors: usize, seats: usize) -> BResult<(FlushTal
                 let job = Job {
                     sub: mpedb::collab::Submission {
                         editor: e as i64,
+                        // The control arm keeps a per-editor counter: it is not
+                        // testing the counter, but a Submission needs one, and
+                        // an arrival-derived value would confound the control.
+                        seq: e as u64,
                         snap: db.snapshot_txn(),
                         key: 0,
                         at,
@@ -1214,4 +1259,182 @@ fn run_quorum(scratch: &Path, editors: usize, seats: usize) -> BResult<(FlushTal
 
 fn tally_rate(t: &FlushTally, elapsed: f64) -> f64 {
     t.members as f64 / elapsed.max(f64::MIN_POSITIVE)
+}
+
+/// What makes an editor slow. The two are not interchangeable, and measuring
+/// only one would flatter the design (#155).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlowKind {
+    /// Slow to decide. It is present and can say "I have nothing yet", so a
+    /// counter-based quorum should be able to close a round without it.
+    Think,
+    /// Slow on the wire. Everything it sends is late, including the message
+    /// that would have said it has nothing — so nothing can rescue it, and the
+    /// only thing that stops it blocking the round is dropping out of the
+    /// membership.
+    Network,
+}
+
+/// One message from an editor. **The heartbeat is a first-class message**, and
+/// that is what removes the clock: an editor with nothing to add does not stay
+/// silent and force a deadline, it publishes the counter position it has
+/// reached (#155).
+enum Msg {
+    Submit(Box<Job>),
+    /// "I am at counter N and have nothing at or before it."
+    Beat(i64, u64),
+    /// Stands in for the lease expiring: this editor is no longer a member, so
+    /// the majority it was counted in shrinks.
+    Gone(i64),
+}
+
+/// `F-counter` — flush on a counter quorum, with **no deadline at all**.
+///
+/// The difference from [`run_quorum`] is one line of policy and it is the whole
+/// point: there is no `recv_timeout` here, only `recv`. A round closes when a
+/// majority of the live membership has published a counter position at or past
+/// the oldest pending submission — which is the same shape as advancing a
+/// committed index once a majority has acknowledged it.
+///
+/// The membership is the **lease holders**, a known set, rather than "whoever
+/// happened to arrive", which is what makes "a majority has spoken" a condition
+/// that can be reached without a clock. The only time left in the design is the
+/// lease TTL, and that is membership, not commit.
+fn run_counter(
+    scratch: &Path,
+    editors: usize,
+    seats: usize,
+    kind: SlowKind,
+) -> BResult<(FlushTally, f64, Vec<u64>, Vec<u64>)> {
+    use mpedb::{Config, Database};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let target = mpedb_setup(scratch, 1, seats)?;
+    let db = std::sync::Arc::new(Database::open_with_config(Config::from_toml_str(
+        &std::fs::read_to_string(&target)?,
+    )?)?);
+
+    let n_actions = cap_actions();
+    // The global counter the editors draw their order from. A position is
+    // `(seq, editor)`, so no two edits can tie however they interleave.
+    let clock = std::sync::Arc::new(AtomicU64::new(1));
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+
+    let mut handles = Vec::with_capacity(editors);
+    for e in 0..editors {
+        let tx = tx.clone();
+        let db = db.clone();
+        let clock = clock.clone();
+        let at = (e * 16) as u64;
+        let every = env_u64("MPEDB_F_SLOW_EVERY", 4) as usize;
+        let slow = every > 0 && e % every == 0;
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..n_actions {
+                if slow && kind == SlowKind::Think {
+                    // Thinking, not absent: publish the position reached and
+                    // then think. This is the message that lets the round close
+                    // without waiting for this editor's edit.
+                    let _ = tx.send(Msg::Beat(e as i64, clock.load(Ordering::Relaxed)));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let (rtx, rrx) = std::sync::mpsc::channel();
+                let job = Job {
+                    sub: mpedb::collab::Submission {
+                        editor: e as i64,
+                        seq: clock.fetch_add(1, Ordering::Relaxed),
+                        snap: db.snapshot_txn(),
+                        key: 0,
+                        at,
+                        remove: 4,
+                        insert: "xxxx".into(),
+                    },
+                    made: Instant::now(),
+                    slow,
+                    reply: rtx,
+                };
+                if slow && kind == SlowKind::Network {
+                    // In flight. Nothing this editor sends arrives on time,
+                    // heartbeats included — which is why this arm exists.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if tx.send(Msg::Submit(Box::new(job))).is_err() || rrx.recv().is_err() {
+                    break;
+                }
+            }
+            let _ = tx.send(Msg::Gone(e as i64));
+        }));
+    }
+    drop(tx);
+
+    let t0 = Instant::now();
+    let mut tally = FlushTally::default();
+    let (mut fast_lat, mut slow_lat) = (Vec::new(), Vec::new());
+    let mut pending: Vec<Job> = Vec::new();
+    // Counter position last published by each editor, by any message.
+    let mut pos = vec![0u64; editors];
+    let mut live: Vec<bool> = vec![true; editors];
+    let mut last_txn = db.snapshot_txn();
+
+    // `recv`, not `recv_timeout`. There is no clock in this loop.
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            Msg::Submit(j) => {
+                pos[j.sub.editor as usize] = pos[j.sub.editor as usize].max(j.sub.seq);
+                pending.push(*j);
+            }
+            Msg::Beat(e, seq) => {
+                let p = &mut pos[e as usize];
+                *p = (*p).max(seq);
+            }
+            Msg::Gone(e) => live[e as usize] = false,
+        }
+        if pending.is_empty() {
+            continue;
+        }
+        // The round is the oldest pending submission's position. A member has
+        // spoken for it once its published position has reached that far.
+        let round = pending.iter().map(|j| j.sub.seq).min().unwrap_or(0);
+        let members = live.iter().filter(|&&l| l).count();
+        let spoken = (0..editors).filter(|&i| live[i] && pos[i] >= round).count();
+        if spoken < quorum_of(members) && members > 0 {
+            continue;
+        }
+        tally.on_quorum += 1;
+
+        let subs: Vec<_> = pending.iter().map(|j| j.sub.clone()).collect();
+        let behind = subs.iter().map(|s| s.snap).min().unwrap_or(0) < last_txn;
+        let verdicts = db.submit_batch("block", "body", &subs)?;
+        last_txn = db.snapshot_txn();
+        tally.members += subs.len() as u64;
+        let wiped = verdicts
+            .iter()
+            .all(|v| !matches!(v, mpedb::collab::EditVerdict::Committed));
+        tally.wiped += u64::from(wiped);
+        tally.behind += u64::from(behind);
+        tally.behind_wiped += u64::from(behind && wiped);
+
+        let now = Instant::now();
+        for (j, v) in pending.drain(..).zip(verdicts) {
+            let ok = matches!(v, mpedb::collab::EditVerdict::Committed);
+            if ok {
+                tally.committed += 1;
+            } else {
+                tally.lost += 1;
+            }
+            let us = now.duration_since(j.made).as_micros() as u64;
+            if j.slow {
+                slow_lat.push(us);
+            } else {
+                fast_lat.push(us);
+            }
+            let _ = j.reply.send((ok, now));
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    fast_lat.sort_unstable();
+    slow_lat.sort_unstable();
+    let rate = tally_rate(&tally, elapsed);
+    Ok((tally, rate, fast_lat, slow_lat))
 }

@@ -342,9 +342,93 @@ fail-safe in the correct direction — a spurious conflict, never a missed one �
 which is exactly why this cost throughput and not correctness, and why it took a
 counter rather than a failing test to find.
 
-The fix is per-member snapshots on the rebase walk, and it is filed rather than
-built here: this arm exists to find out whether the quorum idea works, and that
-answer does not depend on it.
+The fix is per-member snapshots on the rebase walk. It was built next (#154, and
+it turned out to be a wrong answer rather than a lost edit — see below), and the
+`wiped` column is where it shows up: **Linux 0 / 0 / 2 where it had been 2 / 5 /
+8, M3 0 / 0 / 3 where it had been 3 / 5 / 7.** No unit test was consulted to get
+that number; it is the same counter that found the bug.
+
+### F-counter — the same flush with the deadline removed
+
+`F-quorum` established that the timeout is a bound and not the mechanism. The
+next question is whether it is needed at all. In etcd it is not: a round closes
+when a *majority* has acknowledged, and time only decides who is still a member.
+
+`F-counter` does that. Every edit carries a counter its author drew from a shared
+clock, and an editor with nothing to add publishes its position rather than
+staying silent — so "a majority has spoken" is reachable without a deadline. The
+collector calls `recv`, never `recv_timeout`. There is no clock in the loop.
+
+`F-quorum` is the control arm: same harness, same work, same slow editors. The
+only difference is that it still has one.
+
+A slow editor is slow for one of two reasons, and conflating them would flatter
+this design, so both are measured:
+
+| editors | slow kind | Linux avg K | Linux edits/s | Linux wiped | M3 avg K | M3 edits/s | M3 wiped |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 8 | think | 2.6 | 567 | 0 | 2.7 | 410 | 1 |
+| 32 | think | 8.2 | 2006 | 3 | 7.4 | 1494 | 1 |
+| 64 | think | 17.3 | **3986** | 0 | 16.8 | **2896** | 4 |
+| 8 | network | 2.5 | 609 | 3 | 2.5 | 420 | 3 |
+| 32 | network | 6.4 | 1720 | 20 | 5.5 | 1392 | 28 |
+| 64 | network | 7.1 | **1542** | 50 | 7.3 | **2538** | 60 |
+
+Control (`F-quorum`, deadline still present, think-slow), 8/32/64 editors:
+Linux 477 / 1438 / **2887**, M3 331 / 1333 / **2611**.
+
+**Removing the deadline pays when the slow editors can speak.** At 64 editors:
+2887 → 3986 on Linux (+38 %) and 2611 → 2896 on the M3 (+11 %). A think-slow
+editor says "nothing from me yet", the round closes without it, and its edit
+arrives in a later round at a higher counter. It is never refused for being slow,
+only ordered later — which is the property the whole design was after.
+
+**And it costs when they cannot.** Here the two machines agree on the mechanism
+and disagree on the price, so both belong in the claim:
+
+- The mechanism reproduces on both, and is unmistakable: the batch stops filling
+  (K 17.3 → 7.1 Linux, 16.8 → 7.3 M3) and `wiped` climbs an order of magnitude
+  (0 → 50, 4 → 60). Rounds keep closing on the fast majority while the slow
+  members' snapshots go stale in flight.
+- The **throughput** cost does not transfer: 3986 → 1542 on the two-core box
+  (−61 %), 2896 → 2538 on the eleven-core M3 (−12 %). A 10 ms stall is a much
+  smaller share of an M3's capacity, so the same design flaw is nearly invisible
+  there. Reporting only the M3 would have made this look like a rounding error.
+
+That boundary is exactly etcd's: a follower that stops answering heartbeats must
+leave the quorum. Ours leaves at lease expiry, which within one run of this arm
+never happens. **The deadline did not vanish — it moved to the lease TTL, off the
+commit path and onto membership, where the deployment already controls it.** For
+a workload whose slowness is network-shaped rather than human-shaped, that TTL is
+the number to tune, and `F-counter/network` is what says so.
+
+#### What the counter buys that is not throughput
+
+Disjoint splices commute, so for the common case the counter changes no bytes at
+all — `disjoint_members_commute_so_the_counter_changes_nothing` pins that. What
+it changes is the two cases where order is observable:
+
+- **Who wins a real overlap.** It used to be whoever sat at the lower offset,
+  which is to say whoever happened to be typing nearer the start of the
+  paragraph. Now it is whoever acted first, which is what "first wins" was always
+  supposed to mean.
+- **How two people typing at one cursor interleave.** That used to be arrival
+  order, i.e. network jitter.
+
+The test that matters is neither of those individually: it is
+`arrival_order_cannot_change_the_result` — the same submissions, shuffled forty
+ways, must produce byte-identical text. That property is what lets a client
+compute the outcome itself instead of waiting to be told, and it is the one thing
+a benchmark cannot check.
+
+#### The limit, stated rather than discovered
+
+A submission whose round has already committed cannot be ordered into the past.
+The engine rebases it forward (#151) and it lands late. So the counter is a total
+order **within a round**, not over all history — an edit delayed thirty minutes
+is never lost and never lands on the wrong bytes, but a thirty-minute-old counter
+does not reorder what has already been committed. Doing *that* needs commutative
+operations, i.e. a CRDT, which is the trade this design explicitly did not take.
 
 ## What the verdict counter is for
 

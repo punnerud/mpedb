@@ -314,7 +314,7 @@ fn a_heartbeat_keeps_the_seat() {
     assert_eq!(l.acquire(1, 10, 1, t0).unwrap(), Admission::Admitted);
 
     // Beat at +20 s, then check at +31 s: 11 s since the beat, still fresh.
-    assert!(l.beat(1, 10, t0 + 20_000).unwrap());
+    assert!(l.beat(1, 10, t0 + 20_000, 7).unwrap());
     let t1 = t0 + 31_000;
     assert!(l.holds(1, 10, t1).unwrap(), "a beaten seat expired anyway");
     assert!(matches!(
@@ -347,7 +347,7 @@ fn a_reused_pid_cannot_take_over_a_seat() {
     s.commit().unwrap();
 
     assert!(
-        !l.beat(1, 10, now + 1).unwrap(),
+        !l.beat(1, 10, now + 1, 1).unwrap(),
         "a heartbeat matched a seat held under a different process identity"
     );
     assert!(!l.holds(1, 10, now + 1).unwrap());
@@ -386,6 +386,45 @@ fn a_seat_is_not_a_lock() {
         ),
     }
     assert_eq!(body(&d), 1, "the first commit is the one that stands");
+
+    drop(d);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **The timerless flush's safety condition (#155).** `spoken` reports live
+/// seats only, so a crashed editor stops counting toward quorum once its TTL
+/// passes.
+///
+/// Without this the removal of the commit-path deadline would be a deadlock,
+/// not a design: a majority that includes someone who will never speak again is
+/// a majority that is never reached.
+#[test]
+fn an_expired_seat_does_not_count_toward_quorum() {
+    let (d, path) = db("spoken");
+    let l = Lease::new(&d, Duration::from_secs(30));
+    let t0 = 5_000_000i64;
+
+    assert_eq!(l.acquire(1, 10, 4, t0).unwrap(), Admission::Admitted);
+    assert_eq!(l.acquire(1, 11, 4, t0).unwrap(), Admission::Admitted);
+
+    // Both report where they have got to.
+    assert!(l.beat(1, 10, t0 + 1_000, 42).unwrap());
+    assert!(l.beat(1, 11, t0 + 1_000, 7).unwrap());
+
+    let mut now = l.spoken(1, t0 + 2_000).unwrap();
+    now.sort_unstable();
+    assert_eq!(now, vec![(10, 42), (11, 7)], "a live seat did not report its counter");
+
+    // Editor 11 keeps beating; editor 10 goes quiet and ages out.
+    let later = t0 + 60_000;
+    assert!(l.beat(1, 11, later, 9).unwrap());
+    let after = l.spoken(1, later).unwrap();
+    assert_eq!(
+        after,
+        vec![(11, 9)],
+        "a seat whose heartbeat has aged out still counts toward the quorum — \
+         a flush waiting for a majority would never reach it"
+    );
 
     drop(d);
     let _ = std::fs::remove_file(&path);

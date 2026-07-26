@@ -541,6 +541,14 @@ impl<'e> WriteTxn<'e> {
     /// decided against", and without one there is no coordinate system to carry
     /// the offset from. An unguarded splice means whatever it says against the
     /// value as it stands.
+    ///
+    /// `origin` overrides where the walk starts, and a batch of sub-edits needs
+    /// it (#154). One transaction may carry members that read at *different*
+    /// versions; the guard is taken against the oldest of them, because that is
+    /// what makes the transaction's own refusal honest — but a member whose own
+    /// snapshot is newer has ALREADY seen the commits in between, and walking it
+    /// from the batch minimum applies their deltas a second time. That is not a
+    /// refusal, it is a splice on bytes its author never saw.
     pub fn rebase_splice(
         &self,
         table: u32,
@@ -548,10 +556,15 @@ impl<'e> WriteTxn<'e> {
         col: u16,
         at: u64,
         len: u64,
+        origin: Option<u64>,
     ) -> Option<crate::shm::RebaseOutcome> {
         let g = self.guard.as_ref()?;
+        // Never earlier than the guard: a member claiming to have read further
+        // back than the transaction was guarded against would be walked over
+        // commits the guard never validated.
+        let from = origin.map_or(g.snap_txn, |o| o.max(g.snap_txn));
         self.eng.shm.opt_rebase(
-            g.snap_txn,
+            from,
             self.meta.txn_id,
             &crate::shm::CellEdit {
                 table_bit: 1u64 << (table & 63),

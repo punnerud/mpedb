@@ -434,10 +434,14 @@ pub(crate) fn plan_range(plan: &CompiledPlan, params: &[Value]) -> Option<(u32, 
 /// than at commit**, which is earlier feedback for the same answer. `Ok(false)`
 /// means there was nothing to rebase (not a guarded session, or not a splice),
 /// and the statement runs unchanged.
+/// `origin` is the snapshot THIS statement's offset was computed against, when
+/// that differs from the session guard's (a batch of sub-edits — #154). `None`
+/// means "the guard's", which is every ordinary statement.
 pub(crate) fn rebase_splice_params(
     txn: &mut WriteTxn<'_>,
     plan: &CompiledPlan,
     params: &mut [Value],
+    origin: Option<u64>,
 ) -> Result<bool> {
     let PlanStmt::Update { table, set, .. } = &plan.stmt else {
         return Ok(false);
@@ -470,7 +474,7 @@ pub(crate) fn rebase_splice_params(
         // Without an exact key there is no single cell to rebase within.
         None => return Ok(false),
     };
-    match txn.rebase_splice(*table, key, *col, at, remove) {
+    match txn.rebase_splice(*table, key, *col, at, remove, origin) {
         Some(mpedb_core::shm::RebaseOutcome::At(new_at)) => {
             params[*at_slot as usize] = Value::Int(new_at as i64);
             txn.mark_rebased();
