@@ -546,6 +546,12 @@ pub struct GuardStats {
     pub overlap: std::sync::atomic::AtomicU64,
     pub snapshot_too_old: std::sync::atomic::AtomicU64,
     pub ring_gap: std::sync::atomic::AtomicU64,
+    /// Bounded-feedback actions that ran out of deadline before getting a
+    /// definite answer (#150). Not a guard verdict — the guard never saw them —
+    /// but it belongs beside the others, because it is the same question:
+    /// *why* did this action not commit. A rising count means the editor cap on
+    /// some block is set too high, and it is the only place that shows.
+    pub deadline_expired: std::sync::atomic::AtomicU64,
 }
 
 impl GuardStats {
@@ -561,14 +567,20 @@ impl GuardStats {
         .fetch_add(1, Relaxed);
     }
 
-    /// `(cleared, overlap, snapshot_too_old, ring_gap)`.
-    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+    /// Count one action that never got a definite answer inside its deadline.
+    pub fn record_deadline(&self) {
+        self.deadline_expired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(cleared, overlap, snapshot_too_old, ring_gap, deadline_expired)`.
+    pub fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         (
             self.cleared.load(Relaxed),
             self.overlap.load(Relaxed),
             self.snapshot_too_old.load(Relaxed),
             self.ring_gap.load(Relaxed),
+            self.deadline_expired.load(Relaxed),
         )
     }
 }
@@ -1369,6 +1381,11 @@ impl Engine {
     /// how many. Registration already sweeps, so this is for the case a
     /// registration never comes: a phantom left by a killed listener on a
     /// database nobody listens to again.
+    /// Count one deadline expiry (see [`GuardStats::record_deadline`]).
+    pub fn record_deadline_expiry(&self) {
+        self.guard_stats.record_deadline();
+    }
+
     pub fn sweep_listeners(&self) -> usize {
         self.shm.waiter_sweep()
     }
@@ -1628,7 +1645,7 @@ impl Engine {
 
     /// How the optimistic guard has fared: `(cleared, overlap,
     /// snapshot_too_old, ring_gap)` (#142 G1).
-    pub fn guard_stats(&self) -> (u64, u64, u64, u64) {
+    pub fn guard_stats(&self) -> (u64, u64, u64, u64, u64) {
         self.guard_stats.snapshot()
     }
 

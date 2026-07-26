@@ -27,6 +27,9 @@ pub struct WorkloadModel {
     pub tables: Vec<TableModel>,
     pub derived: Vec<DerivedModel>,
     pub statements: Vec<StatementModel>,
+    /// Collaborative-editing sections (#150): which table's rows are the
+    /// contention unit, and what feedback contract they carry.
+    pub sections: Vec<SectionModel>,
 }
 
 /// Level 0: the coarsest useful statement about a workload.
@@ -201,6 +204,40 @@ pub struct StatementModel {
     pub weight: u64,
 }
 
+/// A collaboratively edited section: the table whose rows editors contend over,
+/// and the feedback contract that governs them (#150).
+///
+/// **`max_editors` is measured, not derived.** The obvious formula —
+/// `deadline / service time` — overestimates badly, because a refused editor
+/// re-does its whole action rather than queueing behind the winner. Measured on
+/// a 2-core Linux box at a 1 s deadline the cap is ~32 editors on one row; on an
+/// 11-core M3 it is ~16. `mpedb-bench --doc-load` prints the sweep that produces
+/// it, and the number belongs in the model so every attached process agrees on
+/// the same one.
+///
+/// **It is a cap on contenders, not a lock.** Holding a seat does not decide who
+/// wins a commit — first-committer still does. The cap exists so the tail stays
+/// inside the deadline.
+///
+/// **And it composes with a global limit.** Splitting a document into more
+/// sections removes *conflicts*; it does not raise the write ceiling, which is
+/// the single writer lock. Measured: 20 blocks × 50 editors gave the same total
+/// throughput as 1 block × 50, and so did the unguarded control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionModel {
+    /// Table whose rows are the contention unit — one row per section.
+    pub table: String,
+    /// The column identifying a section. Must exist in `table`.
+    pub key_column: String,
+    /// How long an editor may wait for a definite answer.
+    pub feedback_deadline_ms: u64,
+    /// How often an editor must beat to keep its seat. Never on the commit
+    /// path.
+    pub heartbeat_ms: u64,
+    /// Concurrent editors allowed on one section.
+    pub max_editors: u32,
+}
+
 // ---------------------------------------------------------------------------
 // TOML wire form (strict, like config.rs)
 // ---------------------------------------------------------------------------
@@ -223,6 +260,8 @@ struct RawModel {
     derived: Vec<RawDerived>,
     #[serde(default, rename = "statement")]
     statements: Vec<RawStatement>,
+    #[serde(default, rename = "section")]
+    sections: Vec<RawSection>,
 }
 
 #[derive(Deserialize)]
@@ -259,6 +298,16 @@ struct RawDerived {
 struct RawStatement {
     sql: String,
     weight: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSection {
+    table: String,
+    key_column: String,
+    feedback_deadline_ms: Option<u64>,
+    heartbeat_ms: Option<u64>,
+    max_editors: Option<u32>,
 }
 
 /// Look a name up in a `(name, value)` table, refusing with the full list.
@@ -368,6 +417,44 @@ impl WorkloadModel {
             .map(|s| StatementModel { sql: s.sql, weight: s.weight.unwrap_or(1).max(1) })
             .collect();
 
+        let mut sections = Vec::with_capacity(m.sections.len());
+        for sec in m.sections {
+            // A zero cap would admit nobody and a zero deadline would refuse
+            // everybody — both are almost certainly a typo, and both fail in a
+            // way that looks like the feature is broken rather than misdeclared.
+            let max_editors = sec.max_editors.unwrap_or(32);
+            if max_editors == 0 {
+                return Err(Error::Unsupported(format!(
+                    "section `{}` declares max_editors = 0, which admits no editor at all",
+                    sec.table
+                )));
+            }
+            let feedback_deadline_ms = sec.feedback_deadline_ms.unwrap_or(1000);
+            if feedback_deadline_ms == 0 {
+                return Err(Error::Unsupported(format!(
+                    "section `{}` declares feedback_deadline_ms = 0, which expires every edit \
+                     before it starts",
+                    sec.table
+                )));
+            }
+            let heartbeat_ms = sec.heartbeat_ms.unwrap_or(12_000);
+            if heartbeat_ms <= feedback_deadline_ms {
+                return Err(Error::Unsupported(format!(
+                    "section `{}` beats every {heartbeat_ms} ms but promises an answer in \
+                     {feedback_deadline_ms} ms — a heartbeat that races the deadline would \
+                     evict editors mid-edit",
+                    sec.table
+                )));
+            }
+            sections.push(SectionModel {
+                table: sec.table,
+                key_column: sec.key_column,
+                feedback_deadline_ms,
+                heartbeat_ms,
+                max_editors,
+            });
+        }
+
         if archetype.is_none() && tables.is_empty() {
             // A model with no archetype and no tables says nothing; statements
             // alone are legal (level 2 only) — but a fully empty document is a
@@ -379,10 +466,14 @@ impl WorkloadModel {
                 tables,
                 derived,
                 statements,
+                sections,
             };
-            if model.statements.is_empty() && model.derived.is_empty() {
+            if model.statements.is_empty()
+                && model.derived.is_empty()
+                && model.sections.is_empty()
+            {
                 return Err(Error::Unsupported(
-                    "empty model: declare an archetype, tables, or statements".into(),
+                    "empty model: declare an archetype, tables, statements or sections".into(),
                 ));
             }
             return Ok(model);
@@ -395,6 +486,7 @@ impl WorkloadModel {
             tables,
             derived,
             statements,
+            sections,
         })
     }
 }
@@ -461,5 +553,79 @@ read_write = "read-heavy"
         assert!(e.to_string().contains("parse error"), "{e}");
         // Empty says nothing.
         assert!(WorkloadModel::from_toml_str("[model]\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+
+    /// A section declares the contention unit and its feedback contract.
+    #[test]
+    fn a_section_parses_with_its_defaults() {
+        let m = WorkloadModel::from_toml_str(
+            r#"
+[model]
+name = "doc"
+
+[[model.section]]
+table = "block"
+key_column = "id"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.sections.len(), 1);
+        let s = &m.sections[0];
+        assert_eq!(s.table, "block");
+        assert_eq!(s.feedback_deadline_ms, 1000);
+        assert_eq!(s.heartbeat_ms, 12_000);
+        assert_eq!(s.max_editors, 32);
+    }
+
+    /// **A heartbeat must not race the deadline.** Beating less often than the
+    /// promise is the whole point — a heartbeat inside the feedback window
+    /// would evict editors in the middle of an edit, which looks exactly like
+    /// the feature being broken.
+    #[test]
+    fn a_heartbeat_faster_than_the_deadline_is_refused() {
+        let e = WorkloadModel::from_toml_str(
+            r#"
+[model]
+[[model.section]]
+table = "block"
+key_column = "id"
+feedback_deadline_ms = 1000
+heartbeat_ms = 500
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e}").contains("races the deadline"),
+            "refusal did not say why: {e}"
+        );
+    }
+
+    /// Values that disable the feature by arithmetic are typos, and are named
+    /// as such rather than silently admitting nobody.
+    #[test]
+    fn degenerate_values_are_refused_by_name() {
+        for (field, val) in [("max_editors", "0"), ("feedback_deadline_ms", "0")] {
+            let toml = format!(
+                "[model]\n[[model.section]]\ntable = \"block\"\nkey_column = \"id\"\n{field} = {val}\n"
+            );
+            let e = WorkloadModel::from_toml_str(&toml).unwrap_err();
+            assert!(format!("{e}").contains(field), "{field}: refusal did not name it: {e}");
+        }
+    }
+
+    /// A document that declares only sections is still a model — sections are
+    /// a statement about the workload in their own right.
+    #[test]
+    fn sections_alone_are_a_model() {
+        let m = WorkloadModel::from_toml_str(
+            "[model]\n[[model.section]]\ntable = \"block\"\nkey_column = \"id\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.sections.len(), 1);
     }
 }

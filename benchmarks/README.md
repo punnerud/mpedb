@@ -12,7 +12,7 @@ the main event.
 | [graph.md](graph.md) | Neo4j | Traversal at a converged frontier |
 | [routing.md](routing.md) | the original MPEE solver | Exact sequencing against the generic solver |
 | [notify.md](notify.md) | PostgreSQL LISTEN/NOTIFY | Change notification: throughput, latency, contention, fan-out — and arm E, **acting** on a notification, where PostgreSQL currently wins |
-| [documents.md](documents.md) | PostgreSQL `SELECT … FOR UPDATE` | Arm F: many editors on ONE document, and another document with its own editors — with the control that attributes the scaling |
+| [documents.md](documents.md) | PostgreSQL `SELECT … FOR UPDATE` | Arm F: many editors on ONE document, and another document with its own editors — with the control that attributes the scaling, plus the C1 calibration behind the 1 s feedback contract |
 | [minisqlite.md](minisqlite.md) | minisqlite, sqlite3, PostgreSQL | Two SQL engines built the same way, and the number nobody publishes |
 | [turso.md](turso.md) | Turso | Side document for the fourth engine in the head-to-head |
 

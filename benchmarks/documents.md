@@ -177,6 +177,60 @@ naming one row, not from anything else in the engine. Without the control this
 page would be a plausible story about a number that could have had three other
 causes.
 
+## C1: how many editors fit inside a 1 s answer
+
+The contract (#150, [design/DESIGN-COLLAB.md](../design/DESIGN-COLLAB.md)) is
+that everyone who submits an edit learns within a second whether it landed. That
+is a **fraction**, not a percentile, so every arm above reports one — and two
+arms exist to calibrate it. Both run with **no artificial think time**: they
+measure the engine, not this benchmark's sleep.
+
+### F-cap — editors piled onto ONE block
+
+| Editors | Linux ≤1 s | Linux engine p50 | M3 ≤1 s | M3 engine p50 |
+|---:|---:|---:|---:|---:|
+| 2 | 100.0 % | 2589 µs | 100.0 % | 3003 µs |
+| 4 | 100.0 % | 2833 µs | 100.0 % | 3812 µs |
+| 8 | 100.0 % | 3876 µs | 100.0 % | 3927 µs |
+| 16 | 100.0 % | 4750 µs | **100.0 %** | 4051 µs |
+| 32 | **99.4 %** | 8716 µs | 95.6 % | 5178 µs |
+| 64 | 92.8 % | 10054 µs | 90.5 % | 7131 µs |
+
+**Measured cap: 32 editors per block on Linux, 16 on the M3.**
+
+The arithmetic anyone would reach for first — `deadline ÷ service time` — says
+386 and 333. It is wrong by more than an order of magnitude and wrong in the
+dangerous direction, because a refused editor **re-does its whole action**
+instead of queueing behind the winner. Optimistic concurrency does not conserve
+work the way a lock queue does, so the cap has to be measured.
+
+### F-words — does splitting multiply capacity?
+
+A block can be as small as you like, so a paragraph of 20 words could be 20
+blocks. The intuition is that capacity becomes blocks × cap. **It does not.**
+
+| Blocks | Editors | Linux a/s | Linux *no guard* | Linux ≤1 s | M3 a/s | M3 *no guard* |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 50 | 211 | 365 | 97.0 % | 173 | 369 |
+| 4 | 200 | 200 | 356 | 74.9 % | 201 | 484 |
+| 20 | 1000 | 182 | 341 | 52.9 % | 209 | 394 |
+
+Throughput is flat as the document is split — **and so is the unguarded
+control**, which is what settles the attribution. The ceiling is the single
+writer lock, not the guard. Splitting removes *conflicts*; it cannot raise the
+rate at which commits are possible at all.
+
+So the admission rule has two halves, and the second one is the surprise:
+
+```text
+editors on one block  ≤  cap                      (16–32 at a 1 s deadline)
+editors in total      ≤  D × global commit rate   (~340–480/s on these boxes)
+```
+
+A thousand concurrent editors needs a machine that commits a thousand times a
+second — not more blocks. What splitting buys is the difference between 182 and
+nothing: it converts conflicts into independent work, up to the ceiling.
+
 ## What the verdict counter is for
 
 Every mpedb arm reports `(cleared, overlap, snapshot_too_old, ring_gap)` beside

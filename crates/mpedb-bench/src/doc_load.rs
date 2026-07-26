@@ -55,6 +55,26 @@ fn actions() -> usize {
 fn delay_ms() -> u64 {
     env_u64("MPEDB_F_DELAY_MS", 10)
 }
+/// The feedback deadline the contract promises (#150). Every arm reports the
+/// fraction of actions that finished inside it, because "did everyone know
+/// within a second" is a fraction, not a percentile.
+fn deadline_ms() -> u64 {
+    env_u64("MPEDB_F_DEADLINE_MS", 1000)
+}
+/// Think time for the calibration arms. **Zero by default, deliberately.**
+/// `F-cap` exists to measure what the ENGINE costs per edit, and a 10 ms sleep
+/// inside the measured window would put the benchmark's own artefact into the
+/// derived editor cap.
+fn cap_delay_ms() -> u64 {
+    env_u64("MPEDB_F_CAP_DELAY_MS", 0)
+}
+/// Actions per editor in the calibration arms. Separate from
+/// [`actions`] because `F-words` runs a thousand editors: at the main arms'
+/// count it would dominate the whole cell's runtime without sharpening the
+/// number it exists to produce.
+fn cap_actions() -> usize {
+    env_u64("MPEDB_F_CAP_ACTIONS", 10) as usize
+}
 fn env_u64(k: &str, d: u64) -> u64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
@@ -62,6 +82,14 @@ fn env_u64(k: &str, d: u64) -> u64 {
 /// Editors to scale across. Small, because the serialized arms cost
 /// `workers × actions × think` seconds by construction.
 const WORKERS: [usize; 3] = [2, 4, 8];
+/// `F-cap`: editors piled onto ONE block — the contention unit. The sweep is
+/// what turns "50 per section" from a guess into a measured number.
+const CAP_SWEEP: [usize; 6] = [2, 4, 8, 16, 32, 64];
+/// `F-words`: blocks a paragraph is split into, at [`WORDS_EDITORS`] editors
+/// each. If a block can be a word, capacity should be blocks × cap — this is
+/// the arm that makes that claim falsifiable rather than arithmetic.
+const WORDS_BLOCKS: [usize; 3] = [1, 4, 20];
+const WORDS_EDITORS: usize = 50;
 /// Body length. Big enough for 8 editors' 16-byte slots with room to spare,
 /// small enough that the measurement is not about row size.
 const BODY: usize = 1024;
@@ -84,9 +112,13 @@ pub struct DocResult {
     pub p50_ms: u64,
     pub p99_ms: u64,
     pub retries: u64,
+    /// Fraction inside the deadline, and inside twice it.
+    pub within: (f64, f64),
+    /// Engine share of one action, p50 µs — the service time a cap derives from.
+    pub work_p50_us: u64,
     /// `(cleared, overlap, snapshot_too_old, ring_gap)` — WHY the guard
     /// refused, which a retry count on its own cannot say.
-    pub verdicts: (u64, u64, u64, u64),
+    pub verdicts: (u64, u64, u64, u64, u64),
     /// Edits that were written and then overwritten by a concurrent editor
     /// that had read the older value. `None` where the arm cannot lose one.
     pub lost: Option<u64>,
@@ -99,12 +131,17 @@ fn pct(sorted: &[u64], p: f64) -> u64 {
     sorted[((sorted.len() as f64 - 1.0) * p).round() as usize]
 }
 
+/// Slots the body holds. Beyond this, editors share a slot — which is fine for
+/// the calibration arms (they measure timing, not lost updates) and never
+/// happens in `field` mode, the only arm whose `lost` column is read.
+const SLOTS: usize = BODY / SLOT;
+
 /// Write `n` into worker `w`'s slot of `body`, leaving every other slot alone.
 /// This is the read-modify-write that makes a lost update possible.
 fn splice_slot(body: &str, w: usize, n: usize) -> String {
     let mut b = body.as_bytes().to_vec();
     b.resize(BODY, b'.');
-    let at = w * SLOT;
+    let at = (w % SLOTS) * SLOT;
     let mark = format!("{n:015} ");
     b[at..at + SLOT].copy_from_slice(mark.as_bytes());
     String::from_utf8_lossy(&b).into_owned()
@@ -113,7 +150,7 @@ fn splice_slot(body: &str, w: usize, n: usize) -> String {
 /// The counter in worker `w`'s slot, or `None` if it was never written.
 fn read_slot(body: &str, w: usize) -> Option<usize> {
     let b = body.as_bytes();
-    let at = w * SLOT;
+    let at = (w % SLOTS) * SLOT;
     if b.len() < at + SLOT {
         return None;
     }
@@ -149,15 +186,22 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
     // In `move` mode alternate seats are movers rather than editors: same row,
     // different column.
     let mover = kind == "move" && seat % 2 == 1;
+    // `words<N>` splits the paragraph into N blocks; editor w takes block
+    // `w % N`. `cap` is the N = 1 extreme, kept separate because its sweep is
+    // over editors rather than over blocks.
+    let words: Option<usize> = kind.strip_prefix("words").and_then(|n| n.parse().ok());
+    let calibrating = words.is_some() || kind == "cap";
 
-    let n_actions = actions();
-    let think = Duration::from_millis(delay_ms());
-    let mut lat = Vec::with_capacity(n_actions);
+    let n_actions = if calibrating { cap_actions() } else { actions() };
+    // The calibration arms measure the engine, so they do not sleep.
+    let think = Duration::from_millis(if calibrating { cap_delay_ms() } else { delay_ms() });
+    // (total, engine-share) per action.
+    let mut lat: Vec<(u64, u64)> = Vec::with_capacity(n_actions);
     let mut retries = 0u64;
     // (cleared, overlap, snapshot_too_old, ring_gap). A refusal count alone
     // cannot say whether the guard caught a real conflict or ran out of ring,
     // and those call for opposite fixes.
-    let mut verdicts = (0u64, 0u64, 0u64, 0u64);
+    let mut verdicts = (0u64, 0u64, 0u64, 0u64, 0u64);
     println!("DOC {doc}");
 
     match engine.as_str() {
@@ -188,8 +232,13 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
             let key = match kind {
                 "field" => doc,
                 "blocks" => doc * BLOCK_STRIDE + seat as i64,
-                // `move`: every worker on the SAME block, so the only thing
-                // separating them is which column they write.
+                // `words<N>`: editors spread over N blocks of one paragraph.
+                _ if words.is_some() => {
+                    doc * BLOCK_STRIDE + (w % words.unwrap()) as i64
+                }
+                // `move` and `cap`: every worker on the SAME block, so the only
+                // thing separating them is which column they write (move), or
+                // nothing at all (cap).
                 _ => doc * BLOCK_STRIDE,
             };
             // Declared WITH the values. Without them `WHERE id = $2` names
@@ -207,6 +256,7 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
 
             for i in 0..n_actions {
                 let t0 = Instant::now();
+                let mut work = Duration::ZERO;
                 loop {
                     let snap = db.snapshot_txn();
                     let cur = match db.query(read_sql, &[Value::Int(key)])? {
@@ -215,6 +265,10 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                     };
                     // Think — holding nothing.
                     std::thread::sleep(think);
+                    // From here to the commit's answer is the ENGINE's share of
+                    // the action. Separating it is what lets a derived editor
+                    // cap be free of the benchmark's own sleep.
+                    let w0 = Instant::now();
                     let mut s = if guarded {
                         db.begin_guarded_with(snap, &may_run)?
                     } else {
@@ -235,7 +289,9 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                         Value::Text(splice_slot(body, w, i))
                     };
                     s.query(write_sql, &[next, Value::Int(key)])?;
-                    match s.commit() {
+                    let done = s.commit();
+                    work += w0.elapsed();
+                    match done {
                         Ok(()) => break,
                         Err(Error::WriteConflict) => {
                             retries += 1;
@@ -244,7 +300,7 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                         Err(e) => return Err(format!("mpedb commit: {e}").into()),
                     }
                 }
-                lat.push(t0.elapsed().as_micros() as u64);
+                lat.push((t0.elapsed().as_micros() as u64, work.as_micros() as u64));
             }
             verdicts = db.guard_stats();
         }
@@ -297,17 +353,24 @@ pub fn worker_main(argv: &[String]) -> BResult<()> {
                 }
                 txn.batch_execute("NOTIFY doc_ch, 'x'").map_err(|e| format!("notify: {e}"))?;
                 txn.commit().map_err(|e| format!("commit: {e}"))?;
-                lat.push(t0.elapsed().as_micros() as u64);
+                // PostgreSQL holds its row lock across the think time, so its
+                // "engine share" is the whole transaction minus the sleep —
+                // there is no equivalent split to make.
+                let total = t0.elapsed();
+                lat.push((total.as_micros() as u64, total.saturating_sub(think).as_micros() as u64));
             }
         }
         other => return Err(format!("unknown engine {other}").into()),
     }
 
-    for l in &lat {
-        println!("{l}");
+    for (total, work) in &lat {
+        println!("L {total} {work}");
     }
     println!("RETRIES {retries}");
-    println!("VERDICTS {} {} {} {}", verdicts.0, verdicts.1, verdicts.2, verdicts.3);
+    println!(
+        "VERDICTS {} {} {} {} {}",
+        verdicts.0, verdicts.1, verdicts.2, verdicts.3, verdicts.4
+    );
     Ok(())
 }
 
@@ -317,9 +380,16 @@ struct Run {
     aps: f64,
     p50: u64,
     p99: u64,
+    /// Engine share of one action (think time excluded), p50 in microseconds.
+    /// This is the service time the editor cap is derived from.
+    work_p50_us: u64,
+    /// Fraction of actions that finished inside the deadline, and inside twice
+    /// it. The contract is "everyone knows within a second", which is a
+    /// fraction — a percentile answers a different question.
+    within: (f64, f64),
     retries: u64,
     /// `(cleared, overlap, snapshot_too_old, ring_gap)` summed over editors.
-    verdicts: (u64, u64, u64, u64),
+    verdicts: (u64, u64, u64, u64, u64),
     /// actions/s per document, for the independence arm.
     per_doc: BTreeMap<i64, f64>,
 }
@@ -351,9 +421,10 @@ fn spawn_and_collect(
                 .map_err(|e| format!("spawn worker: {e}"))?,
         );
     }
-    let mut lat = Vec::new();
+    let mut lat: Vec<u64> = Vec::new();
+    let mut work: Vec<u64> = Vec::new();
     let mut retries = 0u64;
-    let mut verd = (0u64, 0u64, 0u64, 0u64);
+    let mut verd = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut doc_actions: BTreeMap<i64, usize> = BTreeMap::new();
     for k in kids {
         let out = k.wait_with_output().map_err(|e| format!("worker wait: {e}"))?;
@@ -370,24 +441,45 @@ fn spawn_and_collect(
             } else if let Some(v) = line.strip_prefix("VERDICTS ") {
                 let n: Vec<u64> =
                     v.split_whitespace().map(|x| x.parse().unwrap_or(0)).collect();
-                if n.len() == 4 {
+                if n.len() == 5 {
                     verd.0 += n[0];
                     verd.1 += n[1];
                     verd.2 += n[2];
                     verd.3 += n[3];
+                    verd.4 += n[4];
                 }
-            } else if let Ok(v) = line.trim().parse::<u64>() {
-                lat.push(v);
-                *doc_actions.entry(doc).or_default() += 1;
+            } else if let Some(v) = line.strip_prefix("L ") {
+                let mut it = v.split_whitespace();
+                if let (Some(t), Some(w)) = (it.next(), it.next()) {
+                    let (t, w) = (t.parse().unwrap_or(0), w.parse().unwrap_or(0));
+                    lat.push(t);
+                    work.push(w);
+                    *doc_actions.entry(doc).or_default() += 1;
+                }
             }
         }
     }
     let elapsed = t0.elapsed().as_secs_f64();
     lat.sort_unstable();
+    work.sort_unstable();
+    let d1 = deadline_ms() * 1000;
+    let d2 = d1 * 2;
+    let n = lat.len().max(1) as f64;
+    let within = (
+        lat.iter().filter(|&&v| v <= d1).count() as f64 / n,
+        lat.iter().filter(|&&v| v <= d2).count() as f64 / n,
+    );
+    let per_worker = if mode.starts_with("cap") || mode.starts_with("words") {
+        cap_actions()
+    } else {
+        actions()
+    };
     Ok(Run {
-        aps: (workers * actions()) as f64 / elapsed,
+        aps: (workers * per_worker) as f64 / elapsed,
         p50: pct(&lat, 0.50) / 1000,
         p99: pct(&lat, 0.99) / 1000,
+        work_p50_us: pct(&work, 0.50),
+        within,
         retries,
         verdicts: verd,
         per_doc: doc_actions.into_iter().map(|(d, n)| (d, n as f64 / elapsed)).collect(),
@@ -542,7 +634,12 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
     println!();
 
     let mut rows: Vec<DocResult> = Vec::new();
-    let seats = *WORKERS.iter().max().unwrap().max(&EDITORS_PER_DOC);
+    let seats = *WORKERS
+        .iter()
+        .max()
+        .unwrap()
+        .max(&EDITORS_PER_DOC)
+        .max(WORDS_BLOCKS.iter().max().unwrap());
 
     for mode in ["field-noguard", "field", "blocks", "move"] {
         for &w in &WORKERS {
@@ -561,6 +658,8 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
                 p50_ms: r.p50,
                 p99_ms: r.p99,
                 retries: r.retries,
+                within: r.within,
+                work_p50_us: r.work_p50_us,
                 verdicts: r.verdicts,
                 lost,
             });
@@ -586,10 +685,42 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
                 p50_ms: r.p50,
                 p99_ms: r.p99,
                 retries: r.retries,
+                within: r.within,
+                work_p50_us: r.work_p50_us,
                 verdicts: r.verdicts,
                 lost: None,
             });
         }
+    }
+
+    // ---- C1: calibration. What does ONE edit cost the engine, and how many
+    // editors can share a block before the deadline stops being met? Both arms
+    // run with no artificial think time, so the answer is about the engine
+    // rather than about this benchmark's sleep.
+    let mut cap_rows: Vec<(usize, f64, u64, u64, u64)> = Vec::new();
+    for &w in &CAP_SWEEP {
+        let target = mpedb_setup(&scratch, 1, seats)?;
+        let r = spawn_and_collect("mpedb", &target, "cap", w, 1)?;
+        cap_rows.push((w, r.within.0, r.work_p50_us, r.p99, r.retries));
+    }
+
+    // ---- C1: does splitting multiply capacity? N blocks, 50 editors each.
+    // The control matters more here than anywhere else on this page: identical
+    // work with the guard OFF. If the unguarded arm flattens at the same rate,
+    // the ceiling is the single writer lock (or the machine), and no amount of
+    // further splitting can move it — the guard is not what is in the way.
+    let mut word_rows: Vec<(usize, f64, f64, u64, u64, u64, f64)> = Vec::new();
+    for &nb in &WORDS_BLOCKS {
+        let editors = WORDS_EDITORS * nb;
+        let ctl_target = mpedb_setup(&scratch, 1, seats)?;
+        let ctl =
+            spawn_and_collect("mpedb", &ctl_target, &format!("words{nb}-noguard"), editors, 1)?;
+        let target = mpedb_setup(&scratch, 1, seats)?;
+        let r = spawn_and_collect("mpedb", &target, &format!("words{nb}"), editors, 1)?;
+        // `overlap` is the attribution that decides what this arm means. Zero
+        // conflicts with flat throughput says the ceiling is the single writer
+        // lock, not the guard — and no amount of further splitting moves it.
+        word_rows.push((nb, r.aps, r.within.0, r.p99, r.retries, r.verdicts.1, ctl.aps));
     }
 
     let datadir = scratch.join("pgdata-doc");
@@ -612,7 +743,9 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
                         p50_ms: r.p50,
                         p99_ms: r.p99,
                         retries: 0,
-                        verdicts: (0, 0, 0, 0),
+                        within: r.within,
+                        work_p50_us: r.work_p50_us,
+                        verdicts: (0, 0, 0, 0, 0),
                         lost,
                     });
                 }
@@ -630,7 +763,9 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
                     p50_ms: r.p50,
                     p99_ms: r.p99,
                     retries: 0,
-                    verdicts: (0, 0, 0, 0),
+                    within: r.within,
+                    work_p50_us: r.work_p50_us,
+                    verdicts: (0, 0, 0, 0, 0),
                     lost: None,
                 });
             }
@@ -639,32 +774,91 @@ pub fn run(scratch: PathBuf) -> BResult<()> {
     }
 
     println!(
-        "{:<10} {:<18} {:>8} {:>12} {:>8} {:>8} {:>9} {:>6}",
-        "engine", "arm", "editors", "actions/s", "p50 ms", "p99 ms", "retries", "lost"
+        "{:<10} {:<18} {:>8} {:>12} {:>8} {:>8} {:>7} {:>11} {:>9} {:>6}",
+        "engine",
+        "arm",
+        "editors",
+        "actions/s",
+        "p50 ms",
+        "p99 ms",
+        "≤1s",
+        "engine µs",
+        "retries",
+        "lost"
     );
     for r in &rows {
         println!(
-            "{:<10} {:<18} {:>8} {:>12.0} {:>8} {:>8} {:>9} {:>6}",
+            "{:<10} {:<18} {:>8} {:>12.0} {:>8} {:>8} {:>6.0}% {:>11} {:>9} {:>6}",
             r.engine,
             r.arm,
             r.workers,
             r.actions_per_sec,
             r.p50_ms,
             r.p99_ms,
+            r.within.0 * 100.0,
+            r.work_p50_us,
             r.retries,
             r.lost.map(|l| l.to_string()).unwrap_or_else(|| "-".into())
         );
     }
 
     println!();
+    println!(
+        "C1 calibration, mpedb, {} ms think (the engine's own cost). `F-cap` piles editors onto \
+         ONE block — the contention unit — and asks where the {} ms deadline stops being met:",
+        cap_delay_ms(),
+        deadline_ms()
+    );
+    println!(
+        "{:>8} {:>14} {:>16} {:>9} {:>9}",
+        "editors", "within deadline", "engine p50 µs", "p99 ms", "retries"
+    );
+    for (w, within, work, p99, retries) in &cap_rows {
+        println!("{w:>8} {:>13.1}% {work:>16} {p99:>9} {retries:>9}", within * 100.0);
+    }
+    // The cap is the highest sweep point that still met the deadline —
+    // MEASURED, not derived. `deadline / service time` overestimates badly,
+    // because every conflict re-does the whole action rather than queueing
+    // behind it: the work is not conserved the way a lock queue conserves it.
+    let cap = cap_rows.iter().filter(|(_, w, ..)| *w >= 0.99).map(|(e, ..)| *e).max();
+    match cap {
+        Some(c) => println!(
+            "  ⇒ measured cap = {c} editors per block at a {} ms deadline (99% met). \
+             Naive deadline/service-time would have said {} — retries re-do work, so it \
+             overestimates.",
+            deadline_ms(),
+            cap_rows.first().map(|(_, _, w, _, _)| (deadline_ms() * 1000) / (*w).max(1)).unwrap_or(0)
+        ),
+        None => println!("  ⇒ no sweep point met the deadline for 99% of actions"),
+    }
+    println!();
+    println!(
+        "`F-words`: a paragraph split into N blocks, {WORDS_EDITORS} editors on each. If a block \
+         can be a word, capacity should be blocks × cap:"
+    );
+    println!(
+        "{:>7} {:>8} {:>12} {:>14} {:>16} {:>9} {:>9}",
+        "blocks", "editors", "actions/s", "*no guard*", "within deadline", "p99 ms", "overlap"
+    );
+    for (nb, aps, within, p99, _retries, overlap, ctl) in &word_rows {
+        println!(
+            "{nb:>7} {:>8} {aps:>12.0} {ctl:>14.0} {:>15.1}% {p99:>9} {overlap:>9}",
+            nb * WORDS_EDITORS,
+            within * 100.0
+        );
+    }
+    println!();
     println!("guard verdicts (mpedb only) — a refusal is a CONFLICT or a LIMIT, never both:");
     println!(
-        "{:<18} {:>8} {:>10} {:>10} {:>16} {:>10}",
-        "arm", "editors", "cleared", "overlap", "snapshot_too_old", "ring_gap"
+        "{:<18} {:>8} {:>10} {:>10} {:>16} {:>10} {:>10}",
+        "arm", "editors", "cleared", "overlap", "snapshot_too_old", "ring_gap", "deadline"
     );
     for r in rows.iter().filter(|r| r.engine == "mpedb") {
-        let (c, o, s, g) = r.verdicts;
-        println!("{:<18} {:>8} {:>10} {:>10} {:>16} {:>10}", r.arm, r.workers, c, o, s, g);
+        let (c, o, s, g, d) = r.verdicts;
+        println!(
+            "{:<18} {:>8} {:>10} {:>10} {:>16} {:>10} {:>10}",
+            r.arm, r.workers, c, o, s, g, d
+        );
     }
     println!();
     println!(

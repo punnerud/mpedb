@@ -64,7 +64,21 @@ read_write = "read-heavy"         # read-heavy|write-heavy|balanced
 [[model.statement]]               # level 2, zero or more
 sql = "SELECT … WHERE customer = $1"
 weight = 120                      # executions per unit of workload
+
+[[model.section]]                 # collaborative editing (#150), zero or more
+table = "block"                   # the rows editors contend over
+key_column = "id"
+feedback_deadline_ms = 1000       # everyone learns their verdict inside this
+heartbeat_ms = 12000              # must EXCEED the deadline (refused otherwise)
+max_editors = 32                  # MEASURED per machine, not derived
 ```
+
+`max_editors` is deliberately not computed from the deadline: measured, the cap
+is 16–32 editors on one row where `deadline / service time` would have said
+~350, because a refused editor re-does its work instead of queueing behind the
+winner. [DESIGN-COLLAB.md](DESIGN-COLLAB.md) has the sweep, and the second
+limit it turned up — splitting a document removes conflicts but does not raise
+the write ceiling.
 
 Parsing is strict the way the config is strict: unknown fields are errors (a
 typo must not silently describe a different workload), every enum names its

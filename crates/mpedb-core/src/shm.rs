@@ -1038,6 +1038,23 @@ fn proc_start_time(pid: u32) -> Option<u64> {
     crate::os::proc_start_time(pid)
 }
 
+/// Is `pid`, started at `recorded_start`, still the process we recorded?
+///
+/// Public because admission control (#150) needs exactly this judgement for
+/// editor seats, and re-deriving it elsewhere is how the direction gets
+/// inverted: **this errs toward ALIVE**. `EPERM` — a process owned by someone
+/// else — reads as alive, because declaring a live process dead evicts a real
+/// editor, while leaving a dead one costs a seat until its lease expires.
+pub fn pid_is_alive(pid: u32, recorded_start: u64) -> bool {
+    pid_alive_identity(pid, recorded_start)
+}
+
+/// This process's `/proc` start time, the second half of the identity that
+/// makes pid reuse harmless.
+pub fn own_process_start_time() -> Option<u64> {
+    proc_start_time(crate::os::process_id())
+}
+
 fn pid_alive_identity(pid: u32, recorded_start: u64) -> bool {
     let alive = unsafe { libc::kill(pid as i32, 0) };
     if alive != 0 {
