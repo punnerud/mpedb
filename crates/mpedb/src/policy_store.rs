@@ -263,6 +263,24 @@ impl Database {
     }
 }
 
+/// One table's policy epoch on this snapshot, `0` when it has never had one.
+///
+/// Bumped by [`Database::create_policy`], [`Database::drop_policy`],
+/// [`Database::enable_rls`] and [`Database::disable_rls`] — every edit that can
+/// change what a compile of the same SQL would produce for this table.
+///
+/// Exposed for the #166 text memo, which needs the check in BOTH directions.
+/// `validate_policy_read` below only inspects the policies a plan BAKED IN, so
+/// it catches a policy that has since changed or been dropped — but a plan
+/// compiled when the table had no policy at all carries no stamp, and nothing
+/// would notice one being added. That asymmetry was invisible while every
+/// `query()` recompiled: the compile picked up the new policy on its own. A
+/// memo that skips the compile is the first thing that can miss it.
+pub(crate) fn policy_epoch(r: &mpedb_core::ReadTxn<'_>, table_id: u32) -> Result<u64> {
+    Ok(r.sys_get(&with_table_id(POLEP_PREFIX, table_id))?
+        .map_or(0, |b| epoch_of(&b)))
+}
+
 fn bump_epoch(w: &mut mpedb_core::WriteTxn<'_>, table_id: u32) -> Result<()> {
     let key = with_table_id(POLEP_PREFIX, table_id);
     let cur = w

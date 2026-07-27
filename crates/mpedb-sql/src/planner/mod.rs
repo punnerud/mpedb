@@ -93,6 +93,7 @@ mod footprint;
 mod fts;
 mod join;
 mod mpee;
+pub use mpee::magnitude;
 pub mod sequence;
 mod partial;
 mod prune;

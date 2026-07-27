@@ -376,6 +376,113 @@ std::thread_local! {
     static TLS_PLAN: std::cell::RefCell<Option<TlsPlanHit>> = const { std::cell::RefCell::new(None) };
 }
 
+/// What a SQL text compiled to, plus everything that answer depended on (#166).
+///
+/// Every other cache here is keyed by `PlanHash`, which is the content hash of
+/// the FINISHED plan — safe by construction (a different compile result is a
+/// different key) but unable to save the work it was built to save, because you
+/// must compile to learn the key. This one is keyed by the TEXT, so it gives up
+/// that property and has to buy it back by naming the compile's inputs:
+///
+/// * **`gen`** — `schema_gen`, which already moves for every catalog input a
+///   compile reads: DDL, views, RLS policies, stored functions, `:op:` macros,
+///   the model, tunables and the cost policy. `stats.rs` documents that breadth
+///   as the reason it does NOT gen-guard its own records; the same breadth is
+///   exactly what a plan memo needs.
+/// * **`tables`** — `(table_id, magnitude(row_count), policy_epoch)` for the
+///   tables the plan touches:
+///   * *magnitude* because row counts reach the planner through
+///     `mpedb_sql::magnitude` and nowhere else, and a table has to DOUBLE
+///     before that moves (design/DESIGN-MPEE-SOLVER.md §6). Without it the memo
+///     would freeze a plan chosen when the table held ten rows.
+///   * *policy epoch* because RLS edits do NOT move `schema_gen` — they bump a
+///     per-table epoch instead (`policy_store::policy_epoch`). The executor's
+///     `validate_policy_read` only re-checks policies a plan baked IN, which
+///     was sufficient while every `query()` recompiled and so could not miss a
+///     policy being ADDED. A memo that skips the compile can, and
+///     `default_deny_when_enabled_without_permissive_policy` caught exactly
+///     that: `SELECT` → `disable_rls` → the same `SELECT` served the
+///     RLS-enabled plan and returned 0 rows instead of 3.
+///
+/// All agreeing means a recompile would have produced this same plan, so a hit
+/// is not an approximation of the compile path — it is that path's answer.
+struct TextMemo {
+    gen: u64,
+    tables: Vec<(u32, u32, u64)>,
+    hash: PlanHash,
+    /// CLOCK reference bit. Set on a hit (which holds only a READ lock — the
+    /// whole point is that a hit takes no write lock), cleared by the eviction
+    /// sweep. Plain FIFO would evict a hot statement the moment an application
+    /// with more distinct statements than `MEMO_CAP` touched a cold one, which
+    /// is the shape a Django app actually has.
+    used: std::sync::atomic::AtomicBool,
+}
+
+/// Entries kept per handle. Applications that inline literals rather than bind
+/// parameters mint a new SQL text per call, so this map must be bounded or it
+/// is a leak; `rusqlite`'s `prepare_cached` is bounded for the same reason.
+const MEMO_CAP: usize = 512;
+
+/// Whether a [`TextMemo`] hit should be re-derived and compared against a cold
+/// compile (#166). On in debug, so every `cargo test` verifies it; a release
+/// build opts in with `MPEDB_VERIFY_PLAN_MEMO=1`, which is what makes running
+/// the whole sqllogictest corpus against the check affordable — the corpus is
+/// where inputs nobody enumerated actually live, and it is far too large to
+/// walk in a debug build.
+fn verify_plan_memo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(debug_assertions) || std::env::var_os("MPEDB_VERIFY_PLAN_MEMO").is_some()
+    })
+}
+
+/// Bounded SQL-text → [`TextMemo`] map with CLOCK eviction.
+#[derive(Default)]
+struct MemoMap {
+    map: HashMap<std::sync::Arc<str>, TextMemo>,
+    /// Eviction order; `hand` walks it looking for a clear reference bit.
+    ring: Vec<std::sync::Arc<str>>,
+    hand: usize,
+}
+
+impl MemoMap {
+    fn get(&self, sql: &str) -> Option<&TextMemo> {
+        let e = self.map.get(sql)?;
+        e.used.store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(e)
+    }
+
+    fn insert(&mut self, sql: &str, entry: TextMemo) {
+        if let Some(slot) = self.map.get_mut(sql) {
+            *slot = entry;
+            return;
+        }
+        while self.map.len() >= MEMO_CAP && !self.ring.is_empty() {
+            self.hand %= self.ring.len();
+            let key = self.ring[self.hand].clone();
+            match self.map.get(&key) {
+                // Referenced since the last sweep: spare it, clear the bit.
+                Some(e) if e.used.swap(false, std::sync::atomic::Ordering::Relaxed) => {
+                    self.hand += 1;
+                }
+                _ => {
+                    self.map.remove(&key);
+                    self.ring.remove(self.hand);
+                }
+            }
+        }
+        let key: std::sync::Arc<str> = std::sync::Arc::from(sql);
+        self.ring.push(key.clone());
+        self.map.insert(key, entry);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.ring.clear();
+        self.hand = 0;
+    }
+}
+
 /// Hands out the process-unique [`Database::conn_id`]. Wrapping is not a
 /// concern: at one handle per nanosecond a `u64` lasts ~584 years.
 fn next_conn_id() -> u64 {
@@ -563,6 +670,20 @@ impl DetachedPlan {
 pub struct Database {
     engine: Engine,
     cache: RwLock<HashMap<PlanHash, Arc<CompiledPlan>>>,
+    /// SQL text → the plan it compiles to (#166), so a repeated statement skips
+    /// tokenizer, binder, planner, MPEE solver, encode and hash — plus the five
+    /// sys-keyspace reads `compile_maybe_explain` does before any of that.
+    ///
+    /// `cache` above cannot serve this: its key is the hash OF the compiled
+    /// plan, so reaching it already costs the compile. Measured (#166,
+    /// `examples/insert_cost.rs`, one idle box, 20k single-row inserts):
+    /// `query(sql)` 13.80 µs against `execute(hash)` 3.97 µs on the same
+    /// insert — 71 % of the statement was re-deriving a plan it had already
+    /// derived. With this memo `query(sql)` is 5.41 µs, and the three arms it
+    /// does not touch (`execute`, and 10- and 100-row batches) are unmoved,
+    /// which is the control that says the 2.55× is this change. See
+    /// [`TextMemo`] for what a hit has to agree with before it may be used.
+    text_memo: RwLock<MemoMap>,
     /// Decoded stored-function IR by content hash (stage M2). Hash-keyed and
     /// immutable by construction, so it never needs invalidation — a
     /// redefinition is a NEW hash, and the old entry just stops being asked
@@ -724,6 +845,7 @@ impl Database {
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),
+            text_memo: RwLock::new(MemoMap::default()),
             spell_cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             conn_id: next_conn_id(),
@@ -806,6 +928,7 @@ impl Database {
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),
+            text_memo: RwLock::new(MemoMap::default()),
             spell_cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             conn_id: next_conn_id(),
@@ -861,6 +984,20 @@ impl Database {
         self.engine.refresh_schema_if_stale()
     }
 
+    /// Drop this handle's local plan caches. The hash-keyed [`Self::cache`] and
+    /// the SQL-text [`Self::text_memo`] must always go together: the memo maps a
+    /// TEXT to a hash, so a text whose meaning just changed has to lose both, or
+    /// the next call re-derives the same stale hash from the memo and never
+    /// notices the plan cache was cleared.
+    ///
+    /// The two locks are taken in separate statements and never held at once —
+    /// `memoized` walks them in the opposite order (memo, then cache), which is
+    /// only safe because neither site overlaps its guards.
+    fn drop_local_plans(&self) {
+        self.cache.write().expect(POISON).clear();
+        self.text_memo.write().expect(POISON).clear();
+    }
+
     /// Register a HOST scalar UDF on this connection (the C-API
     /// `sqlite3_create_function` path, design/DESIGN-UDF.md). A SQL call
     /// `name(args)` that matches no built-in function then invokes `f` with the
@@ -882,7 +1019,7 @@ impl Database {
             .write()
             .expect(POISON)
             .insert((name.to_string(), n_arg), Arc::new(f));
-        self.cache.write().expect(POISON).clear();
+        self.drop_local_plans();
     }
 
     /// Remove a host UDF registered with [`register_host_function`]. Returns
@@ -895,7 +1032,7 @@ impl Database {
             .remove(&(name.to_string(), n_arg))
             .is_some();
         if removed {
-            self.cache.write().expect(POISON).clear();
+            self.drop_local_plans();
         }
         removed
     }
@@ -921,7 +1058,7 @@ impl Database {
             .write()
             .expect(POISON)
             .insert((name.to_string(), n_arg), Arc::new(factory));
-        self.cache.write().expect(POISON).clear();
+        self.drop_local_plans();
     }
 
     /// Register a host aggregate that ALSO carries sqlite's WINDOW protocol —
@@ -974,7 +1111,7 @@ impl Database {
             .write()
             .expect(POISON)
             .insert(name.to_string(), Arc::new(cmp));
-        self.cache.write().expect(POISON).clear();
+        self.drop_local_plans();
     }
 
     /// Remove a host collation registered with [`register_host_collation`]
@@ -985,7 +1122,7 @@ impl Database {
     pub fn unregister_host_collation(&self, name: &str) -> bool {
         let removed = self.host_colls.write().expect(POISON).remove(name).is_some();
         if removed {
-            self.cache.write().expect(POISON).clear();
+            self.drop_local_plans();
         }
         removed
     }
@@ -1005,7 +1142,7 @@ impl Database {
             self.host_window_aggs.write().expect(POISON).remove(name);
         }
         if removed {
-            self.cache.write().expect(POISON).clear();
+            self.drop_local_plans();
         }
         removed
     }
@@ -1129,7 +1266,12 @@ impl Database {
         // gate closes the common case — a DDL that committed in a PRIOR
         // statement — which is the one that would otherwise execute a stale plan.
         if self.cache_gen.swap(gen, std::sync::atomic::Ordering::Relaxed) != gen {
-            self.cache.write().expect(POISON).clear();
+            // The text memo stores its own `gen` per entry, so a stale one
+            // would MISS rather than be served — dropping it here is about
+            // space, not safety: entries compiled against a catalog nobody will
+            // ask about again would otherwise occupy the bounded map and evict
+            // live ones (#166).
+            self.drop_local_plans();
         }
         Ok(())
     }
@@ -1830,6 +1972,15 @@ impl Database {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecResult> {
+        // #166: a text seen before, on an unchanged catalog and unchanged table
+        // magnitudes, already knows its plan. Checked FIRST so a hit also skips
+        // the two routing hooks and the `parse_ddl` probe below, all of which
+        // re-inspect the text on every call. Only statements that reached
+        // compilation are ever memoized, so a hit is by construction a text
+        // those hooks passed through.
+        if let Some(res) = self.memoized(session, sql, params)? {
+            return Ok(res);
+        }
         // sqlite-compat multi-database statements (#51): ATTACH/DETACH mutate
         // the connection-local attach list; database-qualified names resolve
         // before the parser (a `main.`-only statement continues below with
@@ -1837,10 +1988,25 @@ impl Database {
         if let Some(res) = self.attach_stmt_hook(sql)? {
             return Ok(res);
         }
+        // Only the `Passthrough` arm may be memoized. The others resolve
+        // against the connection's ATTACH list, so their routing is not a
+        // function of the text alone: the same SQL routes elsewhere after an
+        // ATTACH/DETACH, and a memo keyed on text would answer with the old
+        // route. Passthrough is the arm that stays put, and it is the bare-name
+        // shadowing rule that makes it so — `dbref.rs` resolves an unqualified
+        // name to `main` whenever main has it, before it looks at any attached
+        // member. A text only reaches the memo by compiling, which means main
+        // did have the table, so no later ATTACH can pull it away; a DROP that
+        // could is a DDL, and moves `schema_gen`.
+        let memoizable;
         let routed;
         let sql = match self.resolve_db_refs_hook(sql)? {
-            multifile::DbRoute::Passthrough => sql,
+            multifile::DbRoute::Passthrough => {
+                memoizable = true;
+                sql
+            }
             multifile::DbRoute::Main(s) => {
+                memoizable = false;
                 routed = s;
                 &routed
             }
@@ -1863,8 +2029,130 @@ impl Database {
         self.warn_if_risky(&plan);
         let hash = plan.hash();
         let plan = self.register(hash, plan, sql)?;
+        if memoizable {
+            self.remember(sql, &plan, hash)?;
+        }
         let full = session::resolve_params_timed(&plan, params, session)?;
         self.run_plan(Some(&hash), &plan, &full)
+    }
+
+    /// The per-table facts `plan`'s compile depended on, read off one snapshot:
+    /// `(table_id, cost magnitude, policy epoch)`.
+    ///
+    /// The magnitude mirrors `compile_maybe_explain`'s cost wiring exactly —
+    /// same [`mpedb_sql::magnitude`], same `unwrap_or(0)` for a table id the
+    /// catalog has no entry for (CTE and derived-table sentinels reach the
+    /// footprint but never the catalog). If the two ever disagree the memo would
+    /// compare buckets the planner never saw, and "unchanged" would stop meaning
+    /// "would compile the same".
+    fn plan_tables(&self, plan: &CompiledPlan) -> Result<Vec<(u32, u32, u64)>> {
+        let mut ids: Vec<u32> = plan
+            .footprint
+            .tables_read
+            .iter()
+            .chain(plan.footprint.tables_written.iter())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let r = self.engine.begin_read()?;
+        let out = ids
+            .into_iter()
+            .map(|t| {
+                Ok((
+                    t,
+                    mpedb_sql::magnitude(r.row_count(t).unwrap_or(0)),
+                    policy_store::policy_epoch(&r, t)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>();
+        r.finish()?;
+        out
+    }
+
+    /// Record what `sql` compiled to, so the next call can skip deriving it.
+    fn remember(&self, sql: &str, plan: &CompiledPlan, hash: PlanHash) -> Result<()> {
+        // A host-UDF plan is deliberately connection-local and never enters the
+        // shared registry; `cached_or_load_tls` would go looking for it there on
+        // a fresh handle. Leave those to the compile path, which is where their
+        // closures are resolved.
+        if plan.contains_host_call() {
+            return Ok(());
+        }
+        let entry = TextMemo {
+            gen: self.cache_gen.load(std::sync::atomic::Ordering::Relaxed),
+            tables: self.plan_tables(plan)?,
+            hash,
+            used: std::sync::atomic::AtomicBool::new(true),
+        };
+        self.text_memo.write().expect(POISON).insert(sql, entry);
+        Ok(())
+    }
+
+    /// The [`TextMemo`] fast path: `Ok(None)` means "no usable entry, take the
+    /// compile road", which is always a legal answer — the memo is an
+    /// optimisation and never the only way to reach a plan.
+    fn memoized(
+        &self,
+        session: &Session,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<ExecResult>> {
+        // Must run even on the fast path: this is where another process's DDL
+        // is picked up, and skipping it is exactly how a plan compiled against
+        // a dropped table would get executed (#47 stage 4).
+        self.gate_cache_on_schema()?;
+        let gen = self.cache_gen.load(std::sync::atomic::Ordering::Relaxed);
+        let (hash, tables) = {
+            let memo = self.text_memo.read().expect(POISON);
+            match memo.get(sql) {
+                Some(e) if e.gen == gen => (e.hash, e.tables.clone()),
+                _ => return Ok(None),
+            }
+        };
+        // Any failure to produce the memoized plan is a MISS, never an error.
+        // The memo must not be able to introduce a failure mode the compile
+        // path does not have: falling through re-derives everything, so the
+        // worst case is doing the work twice. Two ways this legitimately
+        // fails today — `register` publishes to the shared registry
+        // OPPORTUNISTICALLY (a held writer lock skips the insert, #109), and
+        // `validate_policy_read` can `evict` a single plan from the local
+        // cache — and the pair leaves a hash nothing can load.
+        let Ok(plan) = self.cached_or_load_tls(&hash) else {
+            return Ok(None);
+        };
+        // The two inputs `schema_gen` does not cover. Cheap: only the tables
+        // this plan touches, and a row count has to DOUBLE before its bucket
+        // moves. A mismatch is a plain miss — fall through and recompile.
+        if self.plan_tables(&plan)? != tables {
+            return Ok(None);
+        }
+        // The memo's whole claim, checked rather than argued: a hit must be the
+        // plan a recompile would have produced. Deliberately NOT a bespoke test
+        // matrix — this turns every existing test, every sqllogictest corpus
+        // record and every Django/CPython statement into a memo-invalidation
+        // test, which is the only way to cover inputs nobody thought to
+        // enumerate. Two such inputs turned up the first time it ran, and
+        // neither was on my list: the RLS policy epoch (`schema_gen` looks like
+        // it covers every catalog change, and does not) and ANALYZE.
+        if verify_plan_memo() {
+            let (fresh, _) = self.compile_maybe_explain(sql).map_err(|e| {
+                Error::Internal(format!(
+                    "#166: memo served a plan for {sql:?} that no longer compiles: {e}"
+                ))
+            })?;
+            assert_eq!(
+                fresh.hash(),
+                hash,
+                "#166: memo served a stale plan for {sql:?} — some compile input \
+                 moved without moving `schema_gen` or this plan's table facts"
+            );
+        }
+        // Kept on this path deliberately. `plan_can_multiply` is a pure
+        // predicate over the plan — no I/O — so the ordinary statement pays
+        // nothing, and a risky one keeps warning as often as it did before.
+        self.warn_if_risky(&plan);
+        let full = session::resolve_params_timed(&plan, params, session)?;
+        self.run_plan(Some(&hash), &plan, &full).map(Some)
     }
 
     /// One-shot compile + execute **without** publishing to the plan registry
@@ -2980,6 +3268,18 @@ impl WriteSession<'_> {
     /// this: "the operation failed" is not "the operation changed nothing".
     pub fn undo_is_exact(&self, sp: &mpedb_core::TxnSavepoint) -> bool {
         self.txn.undo_is_exact(sp)
+    }
+
+    /// Declare that this transaction changed something every attached process
+    /// must recompile against, bumping `schema_gen` on commit.
+    ///
+    /// The DDL paths call the same thing on their own txn. It is `pub(crate)`
+    /// for writers that are not DDL but ARE compile inputs — `stats::analyze`
+    /// is the one today (#166): NDV records feed `index_ndv_bucket` on every
+    /// compile, so a plan cache that outlived an ANALYZE would make the command
+    /// do nothing at all.
+    pub(crate) fn bump_schema_gen(&mut self) {
+        self.txn.bump_schema_gen();
     }
 
     /// Store a namespaced system record through THIS transaction (atomic with

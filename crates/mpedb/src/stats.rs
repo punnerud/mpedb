@@ -71,12 +71,13 @@ pub fn decode_record(bytes: &[u8], fingerprint: &[u8; 32]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes[33..].try_into().ok()?))
 }
 
-/// `bucket(n) = 64 − leading_zeros(n)` — the same quantization the solver
-/// applies to row counts (`mpee::magnitude`), duplicated here because the
-/// planner deliberately does not export its internals. One `debug_assert`
-/// mirror test in `mpedb-sql` keeps them from drifting.
+/// `bucket(n) = 64 − leading_zeros(n)` — the quantization the solver applies
+/// to row counts. This used to be a copy, because the planner did not export
+/// its internals; #166's plan memo needed the same bucket and exported
+/// `mpee::magnitude`, so the copy is now the solver's own function and cannot
+/// drift from it.
 pub fn bucket(n: u64) -> u32 {
-    64 - n.leading_zeros()
+    mpedb_sql::magnitude(n)
 }
 
 /// One analyzed index, for the report `analyze()` returns.
@@ -177,6 +178,16 @@ impl crate::Database {
                 &encode_record(&index_fingerprint(&t.name, &cols), st.ndv),
             )?;
         }
+        // #166: stats are a COMPILE INPUT — `index_ndv_bucket` reads them on
+        // every compile — so writing them has to invalidate cached plans, here
+        // and in every other attached process. Nothing else about this module
+        // is gen-coupled (a stats RECORD is guarded by its index fingerprint,
+        // for the reasons in this file's header), but ANALYZE is precisely the
+        // operation whose purpose is "re-plan against new statistics", and a
+        // plan cache that outlives it makes the command do nothing at all.
+        // `ndv_stats::analyze_flips_the_star_and_moves_no_rows` is the proof
+        // the flip is real and not a rounding-level hint.
+        s.bump_schema_gen();
         s.commit()?;
         Ok(stats)
     }

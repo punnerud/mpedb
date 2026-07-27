@@ -84,6 +84,19 @@ because the signal already exists: the committed meta carries `M_SCHEMA_HASH`.
   hash ≠ the live schema hash. So a plan compiled against the pre-DDL schema is
   already refused after the DDL — no new invalidation path, and this is tested.
 
+  **One cache does not get this for free, and pays for it explicitly (#166).**
+  The SQL-text memo (`Database::text_memo`) is keyed by the TEXT, not by the
+  plan hash — that is the whole point, since reaching a hash-keyed entry costs
+  the compile it would save. A text keeps compiling to the same hash after a
+  DDL, so nothing about the key rejects a stale answer. What replaces the free
+  property is a stamp on every entry: `schema_gen` (which DDL bumps, and which
+  `gate_cache_on_schema` already reads cross-process), plus each footprint
+  table's cost magnitude and RLS policy epoch — the two compile inputs
+  `schema_gen` does NOT move for. A hit that disagrees on any of them is a
+  miss. Under `MPEDB_VERIFY_PLAN_MEMO=1` (and in every debug build) each hit is
+  additionally recompiled and the hashes compared, so the claim is checked on
+  every test, every corpus record and every Django statement rather than argued.
+
 The word "epoch" in the task title is really just `M_SCHEMA_HASH` doing double
 duty: it is already the schema's version stamp; DDL is the first thing that makes
 it *change* during a database's life.

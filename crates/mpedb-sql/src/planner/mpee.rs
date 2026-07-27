@@ -85,7 +85,15 @@ use std::cell::Cell;
 /// logs of a product. Quantizing here is what makes the chosen plan stable
 /// across commits (design/DESIGN-MPEE-SOLVER.md §6): a table has to double
 /// before any comparison can flip.
-pub(crate) fn magnitude(n: u64) -> u32 {
+///
+/// Exported (#166) because the facade's SQL-text plan memo keys on it. Row
+/// counts reach the planner through this function and nowhere else — the one
+/// call site is `Solver::bucket_of` below — so two compiles that agree on
+/// every table's magnitude produce the same plan. A second definition of
+/// "the bucket" living in the facade would be a drift waiting to happen: the
+/// memo would go on serving plans past the point where the solver had started
+/// choosing differently.
+pub fn magnitude(n: u64) -> u32 {
     64 - n.leading_zeros()
 }
 
