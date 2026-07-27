@@ -131,12 +131,23 @@ non-convertible value) raises the ordinary `TypeError`/`OverflowError`.
 
 ## Locking rules (inherited from the Rust facade)
 
-- **Never call `db.prepare(...)`, `db.verify()`, or `db.query(...)` for a
-  not-yet-cached statement while a `Transaction` from the same handle is open on
-  the same thread.** They may need the single writer lock the transaction
-  already holds; the ERRORCHECK mutex turns the relock into an error rather
-  than a deadlock. Prepare the statements you need *before* `db.begin()`;
-  inside the transaction, `tx.query`/`tx.execute` are always safe.
+- **`db.prepare(...)`, `db.verify()`, `db.query(...)`, `db.query_full(...)` and
+  a second `db.begin()` are REFUSED while a `Transaction` from the same handle
+  is open on the same thread** (#161) — a `ProgrammingError` that names the
+  method and what to do instead. They may need the single writer lock the
+  transaction already holds, and that is a hang, not an error: no traceback, no
+  hint which call was the mistake. Prepare the statements you need *before*
+  `db.begin()`; inside the transaction, `tx.query`/`tx.execute` are always safe.
+
+  It refuses **unconditionally**, not only when the plan is uncached, and that
+  is deliberate: a guard that allows the call when the plan happens to be in
+  the registry reproduces the original bug's worst property — it works in
+  testing and hangs in production. The first thing this caught was a call in
+  mpedb's own test suite, in a test whose comment already said the prepare
+  belonged outside the block.
+
+  Another THREAD calling these is ordinary contention and waits its turn; only
+  the thread holding the lock is refused.
 - **Sessions poison on partially-applied statements.** Statements are not
   internally atomic: if e.g. a multi-row UPDATE fails on its third row, the
   first two are already modified and the session becomes *poisoned* — every
@@ -148,8 +159,12 @@ non-convertible value) raises the ordinary `TypeError`/`OverflowError`.
   session.
 - One writer at a time, process-wide and machine-wide: `db.begin()` blocks on
   (or errors for re-entry into) the single writer lock. Readers never block.
-- Use a `Transaction` from the thread that created it; the writer lock is a
-  pthread mutex with thread affinity.
+- **A `Transaction` is refused from any thread but the one that created it**
+  (#161). The writer lock is a mutex with thread affinity — releasing it from
+  another thread is undefined behaviour in POSIX, not a rule this API invented.
+  `__exit__` is the one exception: it runs on whatever thread is unwinding, and
+  refusing there would leave a `with` block that cannot be left and a writer
+  lock that is never released.
 
 ## Building from source
 

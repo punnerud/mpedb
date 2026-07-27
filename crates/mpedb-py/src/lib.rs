@@ -285,6 +285,60 @@ where
 #[pyclass(frozen, name = "Database", module = "mpedb")]
 struct PyDatabase {
     db: Arc<Db>,
+    /// Threads of this handle that currently have a `Transaction` open (#161).
+    /// A `Vec` and not a set: the count is 0 or 1 in every sane program, and
+    /// the check runs once per call.
+    open_txns: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+}
+
+/// Registers "a transaction from this handle is open on thread T" for exactly
+/// as long as it lives (#161).
+///
+/// Stored INSIDE the same `Option` as the session, so every path that ends a
+/// transaction — `commit`, `rollback`, `__exit__`, or the Python object simply
+/// being collected — releases it with no separate step anyone can forget. A
+/// registration that has to be un-done by hand is one that eventually is not.
+struct TxnGuard {
+    open: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+    thread: std::thread::ThreadId,
+}
+
+impl Drop for TxnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut v) = self.open.lock() {
+            if let Some(i) = v.iter().position(|t| *t == self.thread) {
+                v.swap_remove(i);
+            }
+        }
+    }
+}
+
+impl PyDatabase {
+    /// Refuse a `Database`-level call that would deadlock against a
+    /// `Transaction` this same thread already has open (#161).
+    ///
+    /// The four locking rules used to be documentation. Two of them can be
+    /// ENFORCED, and this is the first: a `Database` method that may publish a
+    /// plan, or autocommit DML, takes the single writer lock — which the open
+    /// transaction is holding. Same thread, same lock: the call does not fail,
+    /// it HANGS, and a hang is the least debuggable outcome an API can offer.
+    ///
+    /// Same-thread only, deliberately. Another thread calling `db.query` while
+    /// this one holds the writer lock is ordinary contention and waits its
+    /// turn; refusing that would break legitimate concurrency.
+    fn refuse_if_txn_open(&self, method: &str, hint: &str) -> PyResult<()> {
+        let me = std::thread::current().id();
+        let open = self.open_txns.lock().expect("open-txn registry poisoned");
+        if open.contains(&me) {
+            return Err(ProgrammingError::new_err(format!(
+                "Database.{method}() cannot run while a Transaction from this \
+                 handle is open on this thread — it needs the single writer lock, \
+                 which that transaction holds, so the call would block forever \
+                 rather than fail. {hint}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -294,12 +348,16 @@ impl PyDatabase {
         let db = py
             .detach(move || Db::open(&config_path))
             .map_err(map_err)?;
-        Ok(PyDatabase { db: Arc::new(db) })
+        Ok(PyDatabase {
+            db: Arc::new(db),
+            open_txns: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     /// Compile SQL to a content-hashed plan, publish it in the shared
     /// registry, and return the 64-hex plan hash.
     fn prepare(&self, py: Python<'_>, sql: &str) -> PyResult<String> {
+        self.refuse_if_txn_open("prepare", "Commit or roll back the transaction first.")?;
         let db = &self.db;
         let h = py.detach(|| db.prepare(sql)).map_err(map_err)?;
         Ok(h.to_string())
@@ -382,6 +440,7 @@ impl PyDatabase {
         sql: &str,
         params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("query", "Use the transaction's own `txn.query(...)`, which runs on its snapshot and sees its uncommitted writes.")?;
         let vals = convert_params(params)?;
         let db = &self.db;
         let res = py
@@ -399,6 +458,7 @@ impl PyDatabase {
         sql: &str,
         params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Vec<String>, Py<PyList>)> {
+        self.refuse_if_txn_open("query_full", "Use the transaction's own `txn.query(...)`, which runs on its snapshot and sees its uncommitted writes.")?;
         let vals = convert_params(params)?;
         let db = &self.db;
         let res = py
@@ -448,6 +508,7 @@ impl PyDatabase {
     /// Takes the writer lock briefly — never call with an open Transaction
     /// on this thread.
     fn verify(&self, py: Python<'_>) -> PyResult<()> {
+        self.refuse_if_txn_open("verify", "Commit or roll back the transaction first.")?;
         let db = &self.db;
         py.detach(move || db.verify()).map_err(map_err)
     }
@@ -458,6 +519,13 @@ impl PyDatabase {
     /// poisons the session: further calls and commit raise OperationalError;
     /// only rollback (or `with`-exit via exception) is allowed.
     fn begin(&self, py: Python<'_>) -> PyResult<PyTransaction> {
+        // A second `begin()` on the same thread would block on the writer lock
+        // this thread already holds — the same hang, from the most obvious
+        // possible mistake (#161).
+        self.refuse_if_txn_open(
+            "begin",
+            "A transaction is not re-entrant; commit or roll back the first one.",
+        )?;
         let db = self.db.clone();
         let session = py
             .detach(|| -> Result<WriteSession<'static>, DbError> {
@@ -472,8 +540,17 @@ impl PyDatabase {
                 })
             })
             .map_err(map_err)?;
+        let me = std::thread::current().id();
+        self.open_txns
+            .lock()
+            .expect("open-txn registry poisoned")
+            .push(me);
         Ok(PyTransaction {
-            session: Mutex::new(Some(session)),
+            session: Mutex::new(Some((
+                session,
+                TxnGuard { open: self.open_txns.clone(), thread: me },
+            ))),
+            owner: me,
             _db: db,
         })
     }
@@ -668,12 +745,35 @@ impl PyDatabase {
 #[pyclass(frozen, name = "Transaction", module = "mpedb")]
 struct PyTransaction {
     /// None once committed / rolled back. Field order matters: `session`
-    /// must drop before `_db` (see the transmute in `begin`).
-    session: Mutex<Option<WriteSession<'static>>>,
+    /// must drop before `_db` (see the transmute in `begin`). The [`TxnGuard`]
+    /// rides in the same `Option` so that ending the transaction, by ANY route,
+    /// also deregisters it (#161).
+    session: Mutex<Option<(WriteSession<'static>, TxnGuard)>>,
+    /// The thread that called `begin` (#161). The writer lock has thread
+    /// affinity, so using this from another thread is undefined at the OS
+    /// level, not merely discouraged.
+    owner: std::thread::ThreadId,
     _db: Arc<Db>,
 }
 
 impl PyTransaction {
+    /// The writer lock is a mutex with THREAD affinity — on Linux a robust
+    /// `PROCESS_SHARED` pthread mutex, on macOS/Windows an errorcheck mutex
+    /// behind the FLD-2 sidecar lock. Unlocking one from a thread that did not
+    /// lock it is undefined behaviour in POSIX, not a policy this API invented,
+    /// so it is refused rather than documented (#161).
+    fn check_owner(&self) -> PyResult<()> {
+        if std::thread::current().id() != self.owner {
+            return Err(ProgrammingError::new_err(
+                "this Transaction belongs to the thread that created it — the \
+                 writer lock has thread affinity, and releasing it from another \
+                 thread is undefined at the OS level. Open a Transaction on the \
+                 thread that will use it, or hand the WORK to the owning thread.",
+            ));
+        }
+        Ok(())
+    }
+
     fn with_session<R>(
         &self,
         py: Python<'_>,
@@ -682,12 +782,13 @@ impl PyTransaction {
     where
         R: Send,
     {
+        self.check_owner()?;
         // The mutex is only ever taken with the GIL released; taking it while
         // holding the GIL could deadlock against a thread that holds the
         // mutex and is waiting to re-acquire the GIL.
         py.detach(|| {
             let mut guard = self.session.lock().expect("transaction mutex poisoned");
-            let session = guard.as_mut().ok_or_else(closed_err)?;
+            let (session, _) = guard.as_mut().ok_or_else(closed_err)?;
             f(session).map_err(map_err)
         })
     }
@@ -755,18 +856,20 @@ impl PyTransaction {
     /// Commit everything written through this transaction. A poisoned
     /// session refuses (OperationalError) and rolls back instead.
     fn commit(&self, py: Python<'_>) -> PyResult<()> {
+        self.check_owner()?;
         py.detach(|| {
             let mut guard = self.session.lock().expect("transaction mutex poisoned");
-            let session = guard.take().ok_or_else(closed_err)?;
+            let (session, _reg) = guard.take().ok_or_else(closed_err)?;
             session.commit().map_err(map_err)
         })
     }
 
     /// Discard everything written through this transaction.
     fn rollback(&self, py: Python<'_>) -> PyResult<()> {
+        self.check_owner()?;
         py.detach(|| {
             let mut guard = self.session.lock().expect("transaction mutex poisoned");
-            let session = guard.take().ok_or_else(closed_err)?;
+            let (session, _reg) = guard.take().ok_or_else(closed_err)?;
             session.rollback();
             Ok(())
         })
@@ -787,12 +890,16 @@ impl PyTransaction {
         traceback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
         let _ = (exc_value, traceback);
+        // NOT owner-checked: `__exit__` runs on whatever thread is unwinding,
+        // and refusing there would turn a bug into an un-exitable `with` block
+        // that leaks the writer lock. The session's own `commit`/`rollback`
+        // still go through the engine, which errors rather than corrupting.
         let clean = exc_type.is_none();
         py.detach(|| {
             let mut guard = self.session.lock().expect("transaction mutex poisoned");
             match guard.take() {
                 None => Ok(false), // closed inside the `with` body: fine
-                Some(session) => {
+                Some((session, _reg)) => {
                     if clean {
                         session.commit().map_err(map_err)?;
                     } else {

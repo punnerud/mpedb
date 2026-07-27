@@ -344,14 +344,19 @@ def test_explain(db):
 
 def test_transaction_commit(db, base):
     i = base + 1
+    # PREPARED BEFORE THE SESSION, which is what this test's comment always
+    # claimed and its code did not: the call sat inside the `with`, and only
+    # worked because an earlier test had already registered that plan. #161
+    # turned the documented rule into an enforced one and this was the first
+    # thing it caught — in mpedb's own suite.
+    h = db.prepare("SELECT * FROM users WHERE id = $1")
     with db.begin() as tx:
         assert tx.query("INSERT INTO users (id, email, age) VALUES ($1, $2, $3)",
                         [i, f"tx{i}@x.no", 7]) == 1
         # the session sees its own uncommitted write
         assert tx.query("SELECT * FROM users WHERE id = $1", [i]) == \
             [(i, f"tx{i}@x.no", 7)]
-        # execute-by-hash inside the session (plan prepared before the session)
-        h = db.prepare("SELECT * FROM users WHERE id = $1")
+        # execute-by-hash inside the session
         assert tx.execute(h, [i]) == [(i, f"tx{i}@x.no", 7)]
     # committed on clean exit
     assert db.query("SELECT * FROM users WHERE id = $1", [i]) == \
@@ -759,6 +764,57 @@ def test_dbapi(cfg_path, base):
     ok("dbapi: close()")
 
 
+def test_locking_rules_are_enforced(db):
+    """#161: two of the four locking rules are checked, not documented.
+
+    Both used to be a hang. A hang is the least debuggable thing an API can
+    do — there is no traceback, no error, and no hint about which call was
+    the mistake."""
+    import threading
+
+    with db.begin() as txn:
+        # Rule 1: a Database-level call from the thread holding the writer
+        # lock. Every one of these needs that lock and would wait for itself.
+        for call in (
+            lambda: db.query("SELECT 1"),
+            lambda: db.query_full("SELECT 1"),
+            lambda: db.prepare("SELECT 1"),
+            lambda: db.verify(),
+            lambda: db.begin(),
+        ):
+            try:
+                call()
+                raise AssertionError("a Database call under an open txn must refuse")
+            except mpedb.ProgrammingError as e:
+                assert "open on this thread" in str(e), e
+
+        # ...and the transaction itself still works, which is the point:
+        # the refusal is about the HANDLE, not about being in a transaction.
+        txn.query("SELECT 1")
+
+        # Rule 4: thread affinity. The writer lock is a mutex owned by the
+        # thread that took it; releasing it elsewhere is UB in POSIX.
+        box = {}
+
+        def other():
+            try:
+                txn.query("SELECT 1")
+                box["r"] = "accepted"
+            except mpedb.ProgrammingError as e:
+                box["r"] = str(e)
+
+        t = threading.Thread(target=other)
+        t.start()
+        t.join()
+        assert "thread that created it" in box["r"], box["r"]
+
+    # The registration is released by leaving the `with`, so the handle works
+    # again — and it is released the same way by commit, rollback, or the
+    # object being collected, because it rides in the session's own Option.
+    db.query("SELECT 1")
+    ok("locking rules: Database-under-txn and thread affinity both refuse (#161)")
+
+
 def main():
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-py-")
     os.makedirs(workdir, exist_ok=True)
@@ -786,6 +842,7 @@ def main():
     base = run_no * 1_000_000
 
     test_open_and_tables(db)
+    test_locking_rules_are_enforced(db)
     h_sel_users = test_crud(db, base)
     test_value_roundtrips(db, base)
     test_integrity_errors(db, base + 200)
