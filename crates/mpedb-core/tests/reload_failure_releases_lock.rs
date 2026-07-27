@@ -36,7 +36,7 @@ primary_key = ["id"]
 
 #[test]
 fn readersfull_during_stale_reload_leaks_the_writer_lock_and_busyfold_masks_it() {
-    let path = std::env::temp_dir().join(format!(
+    let path = mpedb_testkit::scratch_base().join(format!(
         "mpedb-lock-leak-probe-{}.mpedb",
         std::process::id()
     ));

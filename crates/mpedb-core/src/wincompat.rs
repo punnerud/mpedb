@@ -331,6 +331,13 @@ pub fn wall_clock_micros() -> i64 {
 /// wall clock drifts, so two calls in one boot can differ by a few
 /// milliseconds. Without the quantisation the "same boot" test would fail
 /// spuriously — which reads as a reboot that never happened.
+/// Milliseconds since boot (`GetTickCount64`). Monotonic within a boot and
+/// reset by one, which is the exact half of the boot-identity question — see
+/// [`crate::os::boot_id_matches`].
+pub fn uptime_ms() -> u64 {
+    unsafe { GetTickCount64() }
+}
+
 pub fn boot_epoch_ms() -> u64 {
     let now_ms = (wall_clock_micros() / 1000) as u64;
     let up_ms = unsafe { GetTickCount64() };
@@ -557,6 +564,46 @@ pub mod libc {
 
 #[cfg(test)]
 mod tests {
+    /// #159 stage 3. The Windows boot identity is derived from two clocks, and
+    /// the reason it is a PREDICATE and not a byte comparison is that one of
+    /// them moves without a reboot. These cases are constructed rather than
+    /// observed, because a wall-clock step and a reboot are both things a test
+    /// cannot ask for.
+    #[test]
+    fn boot_identity_survives_a_clock_step_but_not_a_reboot() {
+        fn stamp(boot_ms: u64, up_ms: u64) -> [u8; 16] {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&boot_ms.to_le_bytes());
+            b[8..].copy_from_slice(&up_ms.to_le_bytes());
+            b
+        }
+        let now_boot = super::boot_epoch_ms();
+        let now_up = super::uptime_ms();
+        let m = |b| crate::os::boot_id_matches(&b).unwrap();
+
+        assert!(m(stamp(now_boot, now_up)), "our own stamp must match");
+
+        // An NTP correction moves the derived boot instant on a machine that
+        // never rebooted. Byte equality called this a reboot and wiped the
+        // reader table under whatever readers were live.
+        assert!(m(stamp(now_boot + 2_000, now_up)), "a 2 s step is not a reboot");
+        assert!(m(stamp(now_boot - 2_000, now_up)), "…in either direction");
+
+        // A reboot: the tick counter reset, so the stored uptime is ahead of
+        // ours. Exact, no tolerance involved.
+        assert!(
+            !m(stamp(now_boot, now_up + 1)),
+            "a stored uptime ahead of ours means the counter reset"
+        );
+
+        // A reboot after a long previous boot: uptime does not betray it (we
+        // may be up longer than the stored value), the epoch does.
+        assert!(
+            !m(stamp(now_boot.saturating_sub(36_000_000), 1)),
+            "a boot instant 10 h away is a different boot"
+        );
+    }
+
     use super::*;
 
     /// The alignment `MapViewOfFile` demands is the ALLOCATION granularity

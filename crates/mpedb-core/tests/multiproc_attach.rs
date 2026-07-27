@@ -36,12 +36,17 @@ use std::time::{Duration, Instant};
 // no-ops during a normal run, so `cargo test` never spawns anything by itself.
 const ROLE: &str = "MPEDB_MP_ROLE";
 const PATH: &str = "MPEDB_MP_PATH";
+const DUR: &str = "MPEDB_MP_DUR";
 
 fn db_path(name: &str) -> PathBuf {
     let p = mpedb_testkit::scratch_base().join(format!("mpedb-mp-{name}.mpedb"));
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}-lock", p.display()));
     p
+}
+
+fn durability() -> String {
+    std::env::var(DUR).unwrap_or_else(|_| "none".into())
 }
 
 fn cfg_for(path: &Path) -> Config {
@@ -51,6 +56,7 @@ fn cfg_for(path: &Path) -> Config {
 path = "{}"
 size_mb = 16
 max_readers = 16
+durability = "{}"
 
 [[table]]
 name = "kv"
@@ -64,7 +70,8 @@ primary_key = ["id"]
   name = "v"
   type = "int64"
 "#,
-        mpedb_testkit::toml_path(path)
+        mpedb_testkit::toml_path(path),
+        durability()
     );
     Config::from_toml_str(&toml).unwrap()
 }
@@ -80,6 +87,7 @@ fn spawn(role: &str, path: &Path) -> std::process::Child {
         .args(["--exact", "--ignored", "--nocapture", role])
         .env(ROLE, role)
         .env(PATH, path)
+        .env(DUR, durability())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -257,6 +265,68 @@ fn a_writer_killed_mid_transaction_leaves_no_partial_state() {
     let _ = std::fs::remove_file(&path);
 }
 
+// -------------------------------------------- 5. durability across a hard kill
+
+/// #159 stage 3. The same kill as test 4, but at a durability setting that
+/// makes a promise about the DISK — and re-opened by a THIRD process, so the
+/// answer comes from the file and the log, never from a mapping that happened
+/// to survive.
+///
+/// `commit` msyncs and barriers on every commit; `wal` appends and replays.
+/// On Windows those are `FlushViewOfFile` + `FlushFileBuffers`, which compose
+/// the way macOS's `msync` + `F_FULLFSYNC` do — the ordering stage 3 exists to
+/// check. This is not a power-loss test: `Child::kill` takes the process, not
+/// the page cache. It is the strongest crash test that is portable, and the
+/// real power-loss simulator (`mpedb powerloss`) is stage 4's `fork`-bound
+/// work.
+fn durable_kill_leaves_a_prefix(mode: &str) {
+    // SAFETY: single-threaded here, and every child reads it from the env we
+    // hand `spawn` rather than inheriting a race.
+    unsafe { std::env::set_var(DUR, mode) };
+    let path = db_path(&format!("durable-{mode}"));
+
+    let mut child = spawn("mp_child_dies_holding_writes", &path);
+    {
+        // A separate attach, only to watch for the child's committed marker.
+        let watch = open(&path);
+        assert!(
+            until(Duration::from_secs(20), || watch
+                .begin_read()
+                .unwrap()
+                .get_by_pk(0, &[Value::Int(777)])
+                .unwrap()
+                .is_some()),
+            "[{mode}] child never committed its marker"
+        );
+    }
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    // Third process — nothing of the writer's state is inherited.
+    let out = spawn("mp_child_verifies_prefix", &path)
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "[{mode}] reopened database did not hold the all-or-nothing line: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    unsafe { std::env::remove_var(DUR) };
+}
+
+#[test]
+fn a_kill_at_durability_commit_leaves_a_committed_prefix() {
+    durable_kill_leaves_a_prefix("commit");
+}
+
+#[test]
+fn a_kill_at_durability_wal_leaves_a_committed_prefix() {
+    durable_kill_leaves_a_prefix("wal");
+}
+
 // =============================================================== child halves
 // `#[ignore]`d so a normal run never executes them; each is a no-op unless the
 // parent set the env, which keeps `--ignored` runs harmless too.
@@ -312,6 +382,26 @@ fn mp_child_pins_a_snapshot() {
         r.get_by_pk(0, &[Value::Int(39)]).unwrap().is_none(),
         "a pinned snapshot saw a row committed after it was taken"
     );
+}
+
+/// The verifier half of test 5: a fresh process, so recovery has to run from
+/// the file. Its exit status IS the assertion.
+#[test]
+#[ignore]
+fn mp_child_verifies_prefix() {
+    let Some(path) = child_env() else { return };
+    let eng = open(&path);
+    let r = eng.begin_read().unwrap();
+    assert!(
+        r.get_by_pk(0, &[Value::Int(777)]).unwrap().is_some(),
+        "the committed row did not survive the writer's death"
+    );
+    for id in 1000..1010i64 {
+        assert!(
+            r.get_by_pk(0, &[Value::Int(id)]).unwrap().is_none(),
+            "an uncommitted write ({id}) became visible after recovery"
+        );
+    }
 }
 
 #[test]

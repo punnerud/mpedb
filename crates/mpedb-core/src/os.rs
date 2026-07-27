@@ -945,6 +945,66 @@ pub fn pid_namespace_id() -> Option<u64> {
     }
 }
 
+/// Does `stored` name the same boot this process is running in?
+///
+/// The question boot recovery asks, and the only one — so it is a predicate,
+/// not a value comparison. That distinction is load-bearing on Windows.
+///
+/// Linux (`/proc/sys/kernel/random/boot_id`) and macOS (`kern.boottime`) hand
+/// out a genuine identity, so there the answer is byte equality.
+///
+/// **Windows has neither**, and the obvious substitute is wrong: `now -
+/// uptime` reads two clocks that move independently, so an NTP correction
+/// changes the derived "boot instant" on a machine that never rebooted. That
+/// is not a cosmetic drift. A false mismatch runs boot recovery, which wipes
+/// the reader table — and it holds only the file lock, which an
+/// already-attached reader does not, so a live reader's pin is dropped and the
+/// writer may reclaim pages out from under it. Byte equality here traded a
+/// correctness invariant for a clock.
+///
+/// So Windows answers with two facts instead of one:
+///
+/// 1. `GetTickCount64` is monotonic within a boot and resets across one. If it
+///    has gone BACKWARDS since `stored` was written, that is a reboot, exactly
+///    and with no tolerance needed.
+/// 2. Otherwise the derived boot instants must agree within [`BOOT_EPOCH_TOL_MS`].
+///    Across a real reboot they differ by at least the previous boot's uptime;
+///    within one they differ only by clock adjustment.
+///
+/// Two windows remain, and both are narrow enough to state exactly:
+///
+/// - **Missed reboot.** The two boot instants differ by the previous boot's
+///   whole lifetime plus the downtime, so slipping under the tolerance
+///   requires that *entire* interval to be under ten seconds — a boot loop,
+///   in which nothing was durably committed to miss.
+/// - **Spurious recovery.** Requires the wall clock to jump more than ten
+///   seconds while a database is attached. A step that large is a manual clock
+///   change or a first-sync correction, not routine slewing.
+///
+/// The exact fix, if either ever bites, is the per-boot counter Windows keeps
+/// at `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory
+/// Management\PrefetchParameters\BootId` — a real identity, at the cost of a
+/// registry read and a decision about what to do when it is absent.
+pub fn boot_id_matches(stored: &[u8; 16]) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        /// See [`boot_id_matches`] for how this number was chosen.
+        const BOOT_EPOCH_TOL_MS: u64 = 10_000;
+        let s_boot = u64::from_le_bytes(stored[..8].try_into().ok()?);
+        let s_up = u64::from_le_bytes(stored[8..].try_into().ok()?);
+        let now_up = crate::wincompat::uptime_ms();
+        if now_up < s_up {
+            return Some(false); // the tick counter reset: a reboot, exactly
+        }
+        let now_boot = crate::wincompat::boot_epoch_ms();
+        Some(now_boot.abs_diff(s_boot) <= BOOT_EPOCH_TOL_MS)
+    }
+    #[cfg(not(windows))]
+    {
+        Some(boot_id()? == *stored)
+    }
+}
+
 /// Boot identity: changes across reboots, so a post-reboot attach triggers
 /// robust-mutex/reader-table recovery. Linux: `/proc/sys/kernel/random/boot_id`.
 /// macOS: `sysctl(KERN_BOOTTIME)` (the boot instant).
@@ -957,17 +1017,14 @@ pub fn boot_id() -> Option<[u8; 16]> {
     {
         Some(*b"mpedb-wasm-inst\0")
     }
-    // Windows: derive it from the system boot time (now minus uptime), which is
-    // constant within a boot and changes across one — the only property this is
-    // used for. Windows also clears the kernel object namespace on reboot, so a
-    // stale lock cannot survive one in the first place; this exists so the
-    // stored epoch still MOVES, and boot recovery still runs.
+    // Windows has no boot id to read, so this records TWO clocks and
+    // [`boot_id_matches`] reads them together. Neither alone is enough — see
+    // that function for why byte equality is wrong here.
     #[cfg(windows)]
     {
-        let boot_ms = crate::wincompat::boot_epoch_ms();
         let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&boot_ms.to_le_bytes());
-        out[8..].copy_from_slice(b"mpedb-wi");
+        out[..8].copy_from_slice(&crate::wincompat::boot_epoch_ms().to_le_bytes());
+        out[8..].copy_from_slice(&crate::wincompat::uptime_ms().to_le_bytes());
         Some(out)
     }
     #[cfg(target_os = "linux")]

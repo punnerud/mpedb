@@ -40,7 +40,7 @@ jobs:
         run: cargo clippy -p mpedb-types -p mpedb-sql --all-targets -- -D warnings
 
   # ---------------------------------------------------------------------
-  # #159 stages 1 and 2: the ENGINE on real Windows.
+  # #159 stages 1-3: the ENGINE on real Windows.
   #
   # Stage 1 = one process opens a `.mpedb`, reads and writes (`--lib`).
   # Stage 2 = several processes on one file: mapping coherence, writer
@@ -54,9 +54,22 @@ jobs:
   # path-escape bug and drove both stages green — but it EMULATES precisely the
   # primitives these stages rest on, so it cannot be the verdict.
   #
-  # NOT here: stage 3 (durability/recovery ordering) and stage 4 (the
-  # stress/crash/powerloss/collide harnesses, which are POSIX `fork` + signals).
-  # Until stage 4 runs, Windows is "compiles and runs", not "crash-safe".
+  # Stage 3 = durability and recovery, plus the facade's own suite. The two
+  # `multiproc_attach` durability arms kill a writer at `durability = commit`
+  # and `= wal` and then have a THIRD process reopen the file, so the
+  # all-or-nothing answer comes from the disk and the log rather than a mapping
+  # that happened to survive.
+  #
+  # `sqlite3` is installed because ONE differential test needs it and cannot be
+  # made not to: `regexp()` lives in `ext/misc/regexp.c`, which is compiled into
+  # sqlite's SHELL and not its library, so the bundled rusqlite oracle every
+  # other differential uses cannot answer a REGEXP query at all. Skipping those
+  # three tests here would have been cheaper and would have meant Windows never
+  # cross-checks the REGEXP surface.
+  #
+  # NOT here: stage 4 (the stress/crash/powerloss/collide harnesses, which are
+  # POSIX `fork` + signals). Until it runs, Windows is "compiles and runs", not
+  # "crash-safe" — `Child::kill` takes a process, not the page cache.
   windows-engine:
     runs-on: windows-latest
     steps:
@@ -70,5 +83,9 @@ jobs:
         run: cargo test -p mpedb-core --lib
       - name: stage 2 — multi-process attach
         run: cargo test -p mpedb-core --test multiproc_attach
+      - name: the differential oracle's one shell dependency
+        run: choco install sqlite -y --no-progress
+      - name: stage 3 — the engine's integration tests and the facade suite
+        run: cargo test -p mpedb-core -p mpedb --lib --tests
       - name: clippy the engine
         run: cargo clippy -p mpedb-core --lib -- -D warnings

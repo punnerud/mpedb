@@ -77,11 +77,26 @@ fn fd_of(_f: &File) -> i32 {
     -1
 }
 
-#[cfg(any(target_arch = "wasm32", windows))]
+#[cfg(target_arch = "wasm32")]
 fn no_locks<T>() -> Result<T> {
     Err(Error::Io(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "no byte-range locks in the wasm32 build (there is no sqlite base file to lock)",
+    )))
+}
+
+/// Windows reaches the same stub for a different reason, and saying "wasm32"
+/// here sent #159 looking in the wrong place. There IS a sqlite base file and
+/// Windows DOES have byte-range locks — what is missing is sqlite's Windows
+/// locking PROTOCOL, whose byte offsets and shared/pending/reserved scheme
+/// differ from the POSIX one this module implements. See the module header.
+#[cfg(windows)]
+fn no_locks<T>() -> Result<T> {
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "sqlite interop locking is not implemented on Windows: this module speaks \
+         sqlite's POSIX protocol, and sqlite's Windows VFS uses different byte \
+         offsets — translating one to the other would report exclusion we do not hold",
     )))
 }
 

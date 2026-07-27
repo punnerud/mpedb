@@ -211,13 +211,25 @@ fn fixture(shape: &str, cells: u64) -> (Tmp, String) {
 /// Peak resident set size of THIS process, in bytes. `ru_maxrss` is bytes on
 /// Darwin and KiB on Linux — normalised here, and the unit is stated in the
 /// output so a report can never guess wrong.
+/// Windows has no `getrusage`; the equivalent is `GetProcessMemoryInfo`'s
+/// `PeakWorkingSetSize`, which is psapi and not worth a binding for an example.
+/// 0 means "not measured", which the output already has to render honestly for
+/// the `getrusage`-failed case, so the report cannot silently read it as zero
+/// bytes used.
 fn peak_rss_bytes() -> u64 {
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
-        return 0;
+    #[cfg(windows)]
+    {
+        0
     }
-    let raw = ru.ru_maxrss as u64;
-    if cfg!(target_os = "macos") { raw } else { raw * 1024 }
+    #[cfg(not(windows))]
+    {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+            return 0;
+        }
+        let raw = ru.ru_maxrss as u64;
+        if cfg!(target_os = "macos") { raw } else { raw * 1024 }
+    }
 }
 
 /// FNV-1a over a canonical rendering of the result set. The point is only that

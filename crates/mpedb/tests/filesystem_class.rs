@@ -24,6 +24,12 @@
 //! is `REFLINK_HITS` in the leak ledger — which is exactly why §9 reserves
 //! it — asserted here as hits > 0 on a clone-capable volume and 0 on ext4.
 
+// `FICLONERANGE` is an `ioctl` on a raw fd: Unix by construction, and there is
+// no Windows analogue to classify (ReFS block cloning is a different API with
+// different semantics). An empty test binary is the honest result there, not a
+// shimmed one that would report a filesystem class it never probed.
+#![cfg(unix)]
+
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};

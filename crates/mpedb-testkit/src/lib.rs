@@ -125,7 +125,7 @@ static UNIQ: AtomicU64 = AtomicU64::new(0);
 /// PANICS by name rather than silently falling back: a run that quietly
 /// ignores where you told it to write is worse than one that stops.
 pub fn scratch_base() -> PathBuf {
-    match std::env::var_os("MPEDB_TEST_DIR") {
+    let base = match std::env::var_os("MPEDB_TEST_DIR") {
         Some(dir) if !dir.is_empty() => {
             let dir = PathBuf::from(dir);
             if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -135,13 +135,55 @@ pub fn scratch_base() -> PathBuf {
         }
         _ if Path::new("/dev/shm").is_dir() => PathBuf::from("/dev/shm"),
         _ => std::env::temp_dir(),
-    }
+    };
+    PathBuf::from(windows_safe(&base, true))
 }
 
 /// [`scratch_base`] as a `String`, for the call sites that interpolate it
-/// into a path with `format!`.
+/// into a path with `format!("{dir}/name.mpedb")` — so no trailing separator,
+/// because those call sites write the `/` themselves.
 pub fn scratch_base_str() -> String {
-    scratch_base().display().to_string()
+    windows_safe(&scratch_base(), false)
+}
+
+/// Spell a scratch directory so that paths built from it survive being
+/// interpolated into a TOML `path = "..."` line. Identity on Unix.
+///
+/// Around 200 test files build config text by hand, and a backslash in that
+/// string is a TOML escape: `C:\Users\…` makes `\U` an invalid unicode escape
+/// and `…\mpedb-x` makes `\m` an unknown one, so the config is a *parse error*
+/// whose message says nothing about paths (#159). Escaping at all 244
+/// interpolation sites is one fix; spelling the base so no backslash is ever
+/// produced is the other, and it needs no edit to any of them.
+///
+/// Two facts make it work, both verified on Windows rather than assumed:
+/// `std::path` accepts `/` as a separator there, and `PathBuf::push` skips
+/// adding one when the base already ends in a separator. So a base of
+/// `C:/Users/x/Temp/` survives `.join("db.mpedb")` with its spelling intact,
+/// while the same base *without* the trailing slash comes back as
+/// `C:/Users/x/Temp\db.mpedb` — one backslash, and the config no longer parses.
+/// Hence `trailing`: the `PathBuf` form keeps the separator, the `String` form
+/// drops it because its callers add one.
+///
+/// This is not a substitute for [`toml_path`]. A path that comes from
+/// somewhere else — a user, a fixture, `current_exe()` — must still be escaped.
+fn windows_safe(p: &Path, trailing: bool) -> String {
+    let mut s = p.display().to_string();
+    if cfg!(windows) {
+        s = s.replace('\\', "/");
+    }
+    let has = s.ends_with('/') || (cfg!(windows) && s.ends_with('\\'));
+    match (trailing, has) {
+        (true, false) => {
+            s.push('/');
+            s
+        }
+        (false, true) => {
+            s.truncate(s.len() - 1);
+            s
+        }
+        _ => s,
+    }
 }
 
 /// A scratch path, escaped for a TOML `path = "..."` line.

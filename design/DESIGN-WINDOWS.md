@@ -1,10 +1,11 @@
 # DESIGN-WINDOWS — porting the engine, and why it is smaller than it looks
 
-**Status: stages 1 and 2 built and green on REAL Windows (2026-07-26).** The
-`windows-engine` job builds the engine, runs its 87 unit tests, runs the four
-multi-process properties — mapping coherence, writer exclusion, cross-process
-MVCC snapshots, owner death — and lints it, all on `windows-latest`. Stages 3–5
-are unbuilt, and §4 still describes them.
+**Status: stages 1–3 built and green on REAL Windows (2026-07-27).** The
+`windows-engine` job builds the engine, runs its unit tests, the four
+multi-process properties (mapping coherence, writer exclusion, cross-process
+MVCC snapshots, owner death), the two durability arms, **and the facade's own
+integration suite** — ~1100 tests — then lints it, all on `windows-latest`.
+Stages 4–5 are unbuilt, and §4 still describes them.
 
 Three attempts were needed, and the first two failed for reasons worth naming:
 a committed `:memory:.wlock` made `git checkout` fail before any code ran (§6),
@@ -158,8 +159,26 @@ else follows it.
    construction, and the Windows arm answers it BETTER than Linux does: it sees
    through a terminated-but-still-referenced process, which on Linux is known
    issue #136.
-3. **Durability + recovery.** `FlushFileBuffers` ordering, the WAL, boot-epoch
-   recovery. Ends at: `powerloss` equivalent passes.
+3. ~~**Durability + recovery.**~~ **DONE.** Two `multiproc_attach` arms kill a
+   writer at `durability = commit` and `= wal`, then have a third process
+   reopen the file — so the all-or-nothing answer comes from the disk and the
+   log, not from a mapping that survived. The facade's ~1100 integration tests
+   run too (see the sweep note above).
+
+   The substantive finding was in boot-epoch recovery, and it was a live
+   defect: `boot_id()` on Windows derived the boot instant as `wall clock −
+   GetTickCount64`, two clocks that move independently, and `post_attach`
+   compared it for byte equality. An NTP correction therefore looked like a
+   reboot — and boot recovery WIPES the reader table while holding only the
+   file lock, which an already-attached reader does not hold, so a live
+   reader's pin would be dropped and the writer could reclaim pages under it.
+   The question is now a predicate, `os::boot_id_matches`, and Windows answers
+   it from the tick counter's reset (exact) plus a bounded epoch tolerance;
+   both residual windows are stated in its doc comment.
+
+   NOT done, and the reason stage 4 is still the gate: `Child::kill` takes a
+   process, not the page cache. Real power loss is `mpedb powerloss`, which is
+   `fork`-bound.
 4. **The crash harnesses on `CreateProcess`/`TerminateProcess`.** Until this
    passes, Windows is "compiles and runs", not "crash-safe" — and crash-safety
    is the product.
@@ -169,12 +188,25 @@ Stages 1–3 are tractable and mostly mechanical against an abstraction that
 exists. Stage 4 is the one to budget for, and the one that decides whether the
 claim on the tin is true on Windows.
 
-**What stage 5 will cost that nobody counted.** The facade's ~150 integration
-tests hand-build config text with an unescaped path — the same bug §6 describes,
-in every one of them. `mpedb_testkit::toml_path` exists now, so each is a
-one-token change, but until they are swept, `cargo test -p mpedb` on Windows
-measures the escape and nothing else. Stage 3's real gate should therefore be
-that sweep plus `-p mpedb`, not the WAL work alone.
+**The sweep that was predicted, and the edit that replaced it.** ~200 test
+files hand-build config text with an unescaped path — 244 interpolation sites
+across five spellings — and the estimate above was that stage 3 had to touch
+every one of them. It touched none.
+
+Two facts about `std::path` on Windows, verified there rather than assumed:
+it accepts `/` as a separator, and `PathBuf::push` skips adding one when the
+base already ends in a separator. So `mpedb_testkit::scratch_base` now hands
+back `C:/Users/x/Temp/` — forward slashes, trailing separator — and every
+`base.join(name)` downstream keeps that spelling. Without the trailing
+separator the same base comes back as `C:/Users/x/Temp\db.mpedb`, one
+backslash, and the config no longer parses. That single function took the
+facade suite from "the config never parses" to 1364 passing.
+
+What it does NOT cover is a path from anywhere else — a user, a fixture,
+`current_exe()`. Those still need `mpedb_testkit::toml_path`, and the four
+production sites still need `mpedb_types::toml_escape`. The lesson is narrower
+than "no sweep was needed": the sweep was avoidable *because the test paths are
+ours to spell*.
 
 ## 5. Running the engine tests on REAL Windows
 

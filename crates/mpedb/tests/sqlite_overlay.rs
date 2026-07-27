@@ -3,6 +3,14 @@
 //! file, plus the LOCKED-mode contract (a foreign sqlite writer gets
 //! SQLITE_BUSY while the overlay is open) and the divergence refusal.
 
+// Every test here opens a sqlite base file, and every one of them takes the
+// interop lock. That lock is unimplemented on Windows and deliberately so —
+// `mpedb_sqlitefmt::lock` speaks sqlite's POSIX protocol, and translating it
+// to sqlite's *Windows* protocol by analogy would claim exclusion we do not
+// hold against a real sqlite writer. So the honest result here is an empty
+// test binary, not fifteen failures that all say the same thing (#159).
+#![cfg(not(windows))]
+
 use mpedb::{LockMode, ReconcilePolicy, SqliteOverlay, Value};
 use rusqlite::Connection;
 

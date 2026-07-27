@@ -11,7 +11,7 @@
 //! result.
 
 use mpedb::{params, Config, Database, Error, ExecResult, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const THREADS: i64 = 8;
@@ -19,11 +19,10 @@ const PER_THREAD: i64 = 40;
 const DUP_IDS: i64 = 10;
 
 fn test_config(name: &str) -> (Config, PathBuf) {
-    let dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    // `scratch_base` already prefers /dev/shm when it exists — and spells the
+    // result so that joining onto it stays TOML-safe. Reaching past it for the
+    // raw string put a backslash into the config on Windows (#159).
+    let dir = mpedb_testkit::scratch_base();
     let path = dir.join(format!(
         "mpedb-ring-locality-{name}-{}.mpedb",
         std::process::id()

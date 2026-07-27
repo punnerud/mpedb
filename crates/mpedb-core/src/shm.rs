@@ -1205,6 +1205,14 @@ fn boot_id() -> Result<[u8; 16]> {
     crate::os::boot_id().ok_or_else(|| Error::Config("cannot read boot identity".into()))
 }
 
+/// Hard error on failure (see [`my_pid_ns_ino`]). This is a PREDICATE, not a
+/// comparison — [`crate::os::boot_id_matches`] documents why the two are not
+/// the same question on every platform.
+fn boot_id_matches(stored: &[u8; 16]) -> Result<bool> {
+    crate::os::boot_id_matches(stored)
+        .ok_or_else(|| Error::Config("cannot read boot identity".into()))
+}
+
 struct FlockGuard<'a>(&'a File);
 
 impl<'a> FlockGuard<'a> {
@@ -3884,7 +3892,7 @@ impl Shm {
         };
         let my_bid = boot_id()?;
 
-        if stored_bid != my_bid {
+        if !boot_id_matches(&stored_bid)? {
             // First attach since a reboot: pids in the reader table are from a
             // previous boot and the robust mutex's kernel state is gone (a
             // mutex left "locked" by a pre-reboot process would deadlock
@@ -3896,7 +3904,7 @@ impl Shm {
                 std::ptr::copy_nonoverlapping(self.at(bid_off), b.as_mut_ptr(), 16);
                 b
             };
-            if still_stored != my_bid {
+            if !boot_id_matches(&still_stored)? {
                 // WAL replay FIRST, before any volatile reinit: after power
                 // loss the mapping (incl. metas) is whatever the kernel wrote
                 // back; the log is the source of truth. Replay is idempotent
@@ -4666,12 +4674,16 @@ mod tests {
         };
         assert_eq!(at(WAL_LEN_FILE_OFFSET), 0xAABB_CCDD);
         assert_eq!(at(WAL_CKPT_FILE_OFFSET), 0x1122_3344);
-        // boot id offset: what the file holds at that offset equals this
-        // process's boot id (we formatted the file)
-        assert_eq!(
-            &raw[BOOT_ID_FILE_OFFSET as usize..BOOT_ID_FILE_OFFSET as usize + 16],
-            &boot_id().unwrap()
-        );
+        // Boot-id offset: what the file holds there must name THIS boot (we
+        // formatted the file). Deliberately the predicate and not byte
+        // equality — on Windows the stamp carries a live uptime, so two calls
+        // to `boot_id()` differ within one boot and equality would be asking
+        // the wrong question (crate::os::boot_id_matches).
+        let stamped: [u8; 16] = raw
+            [BOOT_ID_FILE_OFFSET as usize..BOOT_ID_FILE_OFFSET as usize + 16]
+            .try_into()
+            .unwrap();
+        assert!(boot_id_matches(&stamped).unwrap());
         shm.wal_len().store(0, Ordering::Release);
         shm.wal_ckpt().store(0, Ordering::Release);
         wal_cleanup(&p);
