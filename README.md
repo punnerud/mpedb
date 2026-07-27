@@ -84,6 +84,29 @@ SQL is compiled **once** into a content-hashed plan; the hot path is
 footprints ("pre-computed locks", Calvin-style), so the engine knows which
 tables and keys a statement touches before it runs.
 
+**And "once" now holds for callers that never prepare.** Every cache here is
+keyed by the hash OF the finished plan — safe by construction, but you have to
+compile to learn the key, so a caller passing SQL text re-derived a plan it had
+already derived. That is most of a small statement, and it is where the
+sqlite-compatible C-API surface lives: `sqlite3_prepare_v2` stores the text and
+each `step` hands it back. A SQL-text memo now sits in front, keyed on
+`(text, schema generation, per-table cost magnitude, RLS policy epoch)` — the
+compile's actual inputs, so a hit is the plan a recompile would have produced
+rather than an approximation of it. Measured on one idle box, 20k single-row
+inserts, against three control arms that this change does not touch and which
+did not move:
+
+| | before | after | |
+|---|---|---|---|
+| `query(sql)` | 13.80 µs | **5.41 µs** | 2.55× |
+| `session.query(sql)`, in a transaction — every ORM | 11.30 µs | **3.76 µs** | 3.0× |
+
+The equivalence is checked rather than argued: under `MPEDB_VERIFY_PLAN_MEMO=1`
+(and in every debug build) each hit is recompiled and the hashes compared, which
+turns every test, all 5.9M sqllogictest records and every Django statement into
+an invalidation test. It found two invalidation bugs on its first run, neither
+of which was on the list that motivated it.
+
 ## Why this exists
 
 The common local-development setup is a lie you find out about in production.
