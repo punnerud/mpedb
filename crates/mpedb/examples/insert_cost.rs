@@ -144,6 +144,29 @@ fn main() {
         let _ = std::fs::remove_file(&p);
     }
 
+    // B3: the CLIENT-CARRIED plan (`execute_detached`), which is what an SDK
+    // caller that holds its own plans pays. #167 asks whether a client should
+    // carry a schema VERSION; this arm says what the version would have to be
+    // worth, because the cost here is not the bytes on the wire — it is that
+    // `execute_detached` re-decodes and re-validates the whole plan blob
+    // against the live schema on EVERY call (lib.rs). A carried generation
+    // that let the engine skip that decode is the only reason to want one.
+    {
+        let (db, p) = open(&dir, "detached");
+        let d = db.prepare_detached(SQL).unwrap();
+        let t = Instant::now();
+        for i in 0..rows as i64 {
+            db.execute_detached(&d, &[Value::Int(i), Value::Text(format!("v{i}"))])
+                .unwrap();
+        }
+        out.push((
+            "execute_detached — re-validates the blob per call",
+            us_per(t, rows),
+        ));
+        drop(db);
+        let _ = std::fs::remove_file(&p);
+    }
+
     // C+D: the same hot path with the commit amortised over a batch.
     for batch in [10u64, 100] {
         let (db, p) = open(&dir, &format!("batch{batch}"));
