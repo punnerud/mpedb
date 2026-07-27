@@ -515,7 +515,13 @@ mod win_lock {
         /// `owner` guard is the whole lock. Some(f) owns the handle; drop →
         /// close → lock auto-release.
         file: Option<File>,
+        /// Which thread is INSIDE the section — accurate because only the
+        /// SRWLOCK holder writes it. Used for re-entrancy only.
         owner: Mutex<Option<ThreadId>>,
+        /// The intra-process half of the lock (#164). Process-PRIVATE and
+        /// never in the mapping: an SRWLOCK has no owner-death property, and
+        /// the cross-process half (`LockFileEx`) is what supplies that.
+        srw: crate::wincompat::SrwLock,
     }
 
     /// One shared `Inner` per canonical path per process. Windows byte-range
@@ -552,7 +558,11 @@ mod win_lock {
                 drop(file);
                 return Ok(WriterLock { inner });
             }
-            let inner = Arc::new(Inner { file: Some(file), owner: Mutex::new(None) });
+            let inner = Arc::new(Inner {
+                file: Some(file),
+                owner: Mutex::new(None),
+                srw: crate::wincompat::SrwLock::new(),
+            });
             reg.insert(key, Arc::downgrade(&inner));
             Ok(WriterLock { inner })
         }
@@ -569,63 +579,117 @@ mod win_lock {
         /// cannot open at all.
         pub fn private() -> WriterLock {
             WriterLock {
-                inner: Arc::new(Inner { file: None, owner: Mutex::new(None) }),
+                inner: Arc::new(Inner {
+                    file: None,
+                    owner: Mutex::new(None),
+                    // A `:memory:` database has no sidecar, so before #164 it
+                    // had NO thread exclusion at all here — only re-entrancy
+                    // detection. The SRWLOCK gives a private mapping the same
+                    // intra-process guarantee a shared one gets, which is what
+                    // the macOS arm already had via its pthread mutex.
+                    srw: crate::wincompat::SrwLock::new(),
+                }),
             }
         }
 
-        fn claim(&self) -> Result<()> {
-            let me = std::thread::current().id();
-            let mut g = self.inner.owner.lock().unwrap_or_else(|e| e.into_inner());
-            if *g == Some(me) {
+        /// Re-entrancy, asked BEFORE the SRWLOCK is touched.
+        ///
+        /// `SRWLOCK` is not recursive: a nested exclusive acquire from the
+        /// owning thread deadlocks rather than failing. The whole stack above
+        /// depends on getting a NAMED error instead — `begin_write_deadline`
+        /// folds it to `Busy`, and the C-API maps it to `SQLITE_BUSY`.
+        ///
+        /// Reading `owner` without holding the section is exact for this one
+        /// question: if it names the caller, only the caller could have put it
+        /// there while holding, so it is a true re-entry. Any other value means
+        /// somebody else holds it or nobody does, and both lead to the acquire
+        /// below.
+        fn check_not_reentered(&self) -> Result<()> {
+            let g = self.inner.owner.lock().unwrap_or_else(|e| e.into_inner());
+            if *g == Some(std::thread::current().id()) {
                 return Err(reentered());
             }
-            // Another THREAD holding it is ordinary contention, and the blocking
-            // `LockFileEx` below is what waits for it — but the guard must not
-            // record us as owner until we actually hold the file lock.
-            *g = Some(me);
             Ok(())
         }
 
-        fn unclaim(&self) {
-            *self.inner.owner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        /// Record (or clear) the owning thread. Only ever called by the thread
+        /// that holds the SRWLOCK, which is what makes it accurate — the old
+        /// `claim()` wrote this field BEFORE winning anything, so under
+        /// contention every arriving thread overwrote it and the re-entrancy
+        /// detector named the wrong thread. Nothing caught that: every test of
+        /// it is single-threaded.
+        fn set_owner(&self, who: Option<std::thread::ThreadId>) {
+            *self.inner.owner.lock().unwrap_or_else(|e| e.into_inner()) = who;
         }
 
+        /// Blocking acquire: the process-private SRWLOCK first, then the
+        /// cross-process `LockFileEx`.
+        ///
+        /// The order is the point (#164). Threads queue on a ~25 ns userspace
+        /// lock, and the file lock is reached by exactly one thread per
+        /// process — so it only ever sees genuine cross-process contention,
+        /// exactly as `flock` does on the macOS arm. Before this, four threads
+        /// all blocked in `LockFileEx` on one shared handle: correct (#165
+        /// proves it excludes) but 4.4x slower than one thread on the same
+        /// machine.
+        ///
+        /// `LockFileEx` stays the cross-process layer and is not up for
+        /// negotiation: the kernel releases it on process death with no
+        /// abandoned state, which is what the DIRTY word's owner-death
+        /// protocol is built on. An SRWLOCK has no such property, which is
+        /// precisely why it is process-PRIVATE here and never in the mapping.
         pub fn lock(&self) -> Result<()> {
-            self.claim()?;
+            self.check_not_reentered()?;
+            self.inner.srw.lock();
+            self.set_owner(Some(std::thread::current().id()));
             let Some(f) = self.inner.file.as_ref() else { return Ok(()) };
             let fd = f.as_raw_fd();
             if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
                 return Ok(());
             }
-            self.unclaim();
+            self.set_owner(None);
+            // SAFETY: acquired three lines up and not released since.
+            unsafe { self.inner.srw.unlock() };
             Err(ioerr("LockFileEx(exclusive)"))
         }
 
         pub fn trylock(&self) -> Result<Option<()>> {
-            self.claim()?;
+            self.check_not_reentered()?;
+            if !self.inner.srw.try_lock() {
+                // Another THREAD of this process holds it. Contention, not
+                // failure — and it no longer costs a kernel round trip to
+                // discover.
+                return Ok(None);
+            }
+            self.set_owner(Some(std::thread::current().id()));
             let Some(f) = self.inner.file.as_ref() else { return Ok(Some(())) };
             let fd = f.as_raw_fd();
             if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(Some(()));
             }
-            self.unclaim();
-            if libc::last_errno() == libc::EAGAIN {
-                // ERROR_LOCK_VIOLATION: somebody else holds it. Contention, not
-                // failure — the caller retries or backs off.
+            let errno = libc::last_errno();
+            self.set_owner(None);
+            // SAFETY: acquired above and not released since.
+            unsafe { self.inner.srw.unlock() };
+            if errno == libc::EAGAIN {
+                // ERROR_LOCK_VIOLATION: another PROCESS holds it.
                 Ok(None)
             } else {
                 Err(ioerr("LockFileEx(exclusive, nonblocking)"))
             }
         }
 
+        /// Release, innermost first: the file lock, then the owner record,
+        /// then the SRWLOCK. `shm::writer_unlock` CASes the DIRTY word 1 to 0
+        /// BEFORE calling this and while still holding exclusion, so that
+        /// ordering is preserved with the file lock dropped first here.
         pub fn release_exclusion(&self) {
-            let Some(f) = self.inner.file.as_ref() else {
-                self.unclaim();
-                return;
-            };
-            let fd = f.as_raw_fd();
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-            self.unclaim();
+            if let Some(f) = self.inner.file.as_ref() {
+                unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+            }
+            self.set_owner(None);
+            // SAFETY: `lock`/`trylock` returned success, so this thread holds it.
+            unsafe { self.inner.srw.unlock() };
         }
     }
 }

@@ -36,6 +36,21 @@
 //! for: in those, fsync cost dominates, and this disk's fsync is not any real
 //! machine's. A durable ratio from here would be precise and meaningless.
 //!
+//! **And that choice has a consequence this probe must not be read around.**
+//! `durability = none` switches OFF the intent ring (`ring_exec::ring_enabled`
+//! admits only `Commit` and `Wal`, deliberately: group commit does not pay
+//! when a commit is microseconds). The ring is the mechanism mpedb's
+//! concurrency claim rests on — writers queue and a leader commits them as a
+//! batch. So the mpedb-vs-sqlite3 ratio measured here is the DIRECT path, and
+//! it is not the product's claim. Reading it as "mpedb is Nx slower at
+//! concurrent writes" would be quoting a number produced with the relevant
+//! feature disabled.
+//!
+//! What the ratio IS good for is holding everything constant except the
+//! PLATFORM: same durability, same shape, same control arm, different OS.
+//! That comparison is what found #164. The engine-vs-engine question belongs
+//! to `mpedb-bench --h2h` on a machine whose disk is real.
+//!
 //! The other thing pairing does not fix is **core count**. mpedb's advantage
 //! in this cell grows with the number of concurrent writers; a 2–4 vCPU runner
 //! caps that below where the interesting difference appears. A ratio measured

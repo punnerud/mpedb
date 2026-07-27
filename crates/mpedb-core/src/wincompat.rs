@@ -95,6 +95,65 @@ unsafe extern "system" {
     fn WaitForSingleObject(h: isize, ms: u32) -> u32;
     fn GetSystemTimePreciseAsFileTime(ft: *mut u64);
     fn GetTickCount64() -> u64;
+    // SRWLOCK — the intra-process half of the writer lock (#164). Slim, so
+    // one pointer of state, and NOT recursive: a nested exclusive acquire
+    // deadlocks rather than erroring, which is why the caller checks
+    // re-entrancy before ever reaching these.
+    fn AcquireSRWLockExclusive(lock: *mut c_void);
+    fn TryAcquireSRWLockExclusive(lock: *mut c_void) -> u8;
+    fn ReleaseSRWLockExclusive(lock: *mut c_void);
+}
+
+/// A Windows `SRWLOCK`, exclusive mode only.
+///
+/// Why this exists (#164): the Windows writer lock used a BLOCKING
+/// `LockFileEx` on one shared handle to serialise threads within a process,
+/// where macOS holds an ERRORCHECK `pthread_mutex` across the section and
+/// reaches `flock` only uncontended. Measured on a 4-core runner: 76k
+/// contended inserts/s with one writer thread, 17.4k with four — a collapse
+/// macOS (same sidecar-lock architecture, 110k at four) does not have.
+///
+/// `SRWLOCK_INIT` is all-zero, so a zeroed word IS an initialised lock and
+/// there is no `InitializeSRWLock` call to forget. Boxed because the OS
+/// requires the lock to keep one address for its lifetime.
+pub struct SrwLock(Box<std::cell::UnsafeCell<usize>>);
+
+// SAFETY: an SRWLOCK is designed to be acquired and released across threads;
+// that is the whole point of it. `UnsafeCell` is what makes the interior
+// mutation legal, and the OS owns the word's contents.
+unsafe impl Send for SrwLock {}
+unsafe impl Sync for SrwLock {}
+
+impl Default for SrwLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SrwLock {
+    pub fn new() -> SrwLock {
+        SrwLock(Box::new(std::cell::UnsafeCell::new(0)))
+    }
+
+    fn ptr(&self) -> *mut c_void {
+        self.0.get().cast()
+    }
+
+    /// Blocking exclusive acquire. NOT recursive — see the extern block.
+    pub fn lock(&self) {
+        unsafe { AcquireSRWLockExclusive(self.ptr()) }
+    }
+
+    /// `true` if acquired, `false` if another thread holds it.
+    pub fn try_lock(&self) -> bool {
+        unsafe { TryAcquireSRWLockExclusive(self.ptr()) != 0 }
+    }
+
+    /// # Safety
+    /// The calling thread must currently hold this lock exclusively.
+    pub unsafe fn unlock(&self) {
+        unsafe { ReleaseSRWLockExclusive(self.ptr()) }
+    }
 }
 
 #[repr(C)]
