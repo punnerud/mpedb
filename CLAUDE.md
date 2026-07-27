@@ -99,6 +99,10 @@ log-based engine), and the hardware published when the hardware is the answer.
   hash on every attach; the LIVE schema is read from the catalog and may have
   grown past the seed via `CREATE TABLE` (#47). `M_SCHEMA_HASH` = seed forever;
   `schema_gen` in the flipping meta is the DDL staleness signal.
+- Windows x86-64 runs the engine (#159 stages 1-3: `wincompat` over kernel32,
+  `LockFileEx` on the FLD-2 path, `GetProcessTimes` pid identity). Its
+  crash-safety is UNPROVEN — the fork-bound harnesses are stage 4, and until
+  they run "Windows works" means compiles-and-runs.
 - Crash-safe on Linux (x86-64 + 32/64-bit ARM) and macOS/Apple Silicon (the FLD-2 flock
   writer lock, `crate::os`); single PID namespace; robust mutexes / flock locks do not
   survive reboot (boot-id recovery in `post_attach` handles that — don't remove it).

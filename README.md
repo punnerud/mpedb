@@ -48,10 +48,10 @@ Or from source anywhere a Rust toolchain runs:
 cargo install --git https://github.com/punnerud/mpedb mpedb-cli
 ```
 
-Linux and macOS run the whole engine and its multi-process crash tests; Windows
-runs the portable crates — the type system and the SQL front end — because the
-engine is Unix-only by construction (mmap, flock, robust `PROCESS_SHARED`
-mutexes, `/proc` reader identity). macOS and Windows run nightly, Linux on every
+Linux and macOS run the whole engine and its multi-process crash tests. Windows
+now runs the engine too — single-process, multi-process attach, and the
+durability paths — but NOT the crash harnesses, which are `fork`-bound, so it is
+"runs" and not yet "crash-safe". macOS and Windows run nightly, Linux on every
 change.
 
 > **[mpedb vs sqlite3 vs Cursor's minisqlite →](benchmarks/minisqlite.md)** — what
@@ -196,7 +196,8 @@ readers, snapshot isolation, and single-file databases are a better fit for that
 than either ancestor. It is not there yet; see Status.
 
 > ⚠️ **Status: personal research project.** Crash-safe on Linux (x86-64 and
-> 32/64-bit ARM) and macOS/Apple Silicon — see [Platforms](#platforms). The
+> 32/64-bit ARM) and macOS/Apple Silicon; Windows runs the engine but its
+> crash-safety is unproven there — see [Platforms](#platforms). The
 > design has been through multiple adversarial review rounds (see the
 > `DESIGN*.md` docs), but this is not production-hardened software. Treat it as a
 > serious experiment.
@@ -336,6 +337,13 @@ rather than unit tests.
   equivalent to Linux's robust mutex; durability uses `fcntl(F_FULLFSYNC)` and
   16 KiB-aligned `msync`. All platform code is `#[cfg]`-gated behind
   `crate::os`, so the Linux path stays byte-identical.
+- **Windows — x86-64** — the engine runs: shared `CreateFileMapping` views, a
+  `LockFileEx` writer lock with owner-death release, `GetProcessTimes` reader
+  identity, `FlushViewOfFile` + `FlushFileBuffers` durability. Several processes
+  share one file with MVCC readers against a writer. **Its crash-safety is
+  unproven**: the `stress`/`crash`/`powerloss`/`collide` harnesses are POSIX
+  `fork` + signals and have not been ported, and crash-safety is the product —
+  so Windows is "runs", not "supported". See `design/DESIGN-WINDOWS.md`.
 
 Platform claims are verified on real hardware, and the table says which hardware:
 
@@ -344,6 +352,7 @@ Platform claims are verified on real hardware, and the table says which hardware
 | Linux x86-64 | everything: `cargo test --workspace`, clippy, the `stress`/`crash`/`powerloss`/`collide` harnesses across `none`/`commit`/`wal`, the 3-way differential |
 | macOS / Apple Silicon (M3) | `cargo test --workspace`, clippy, the `crash` harness under SIGKILL waves across all durability classes (`eowner_recovery=true`), the benchmark suite |
 | **Linux armv7l (32-bit ARM)** | 318 cross-compiled tests, 0 failures — including the whole `mpedb-core` shm/btree/COW suite — plus `examples/multiproc_check.rs`: 4 SIGKILL waves against 3 concurrent writer processes, `verify()` clean after each. A Raspberry Pi 3 B+, kernel 6.1. |
+| **Windows x86-64** | the engine's unit tests, four multi-process properties (mapping coherence, writer exclusion, cross-process MVCC snapshots, owner death), two durability arms (`commit`/`wal`, killed writer, third process reopens), and the facade's ~1100 integration tests — all on `windows-latest` in CI. **NOT** the crash/power-loss harnesses: `Child::kill` takes a process, not the page cache. |
 | Linux aarch64 (64-bit ARM) | **nothing yet.** Covered by inference from the other three, which is exactly the kind of claim this table exists to stop making. |
 
 The 32-bit ARM row is the one worth explaining. This README used to assert that
