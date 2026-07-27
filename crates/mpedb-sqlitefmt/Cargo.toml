@@ -8,7 +8,13 @@ edition = "2021"
 # mpedb's own lock protocol with no sqlite library in the path, so nothing
 # here may drag one in. The library is what VERIFIES us, in dev-deps only.
 [dependencies]
+
 # fcntl byte-range locks (sqlite's own) — no higher-level dep warranted.
+# Unix ONLY: the Windows arm hand-declares LockFileEx/UnlockFileEx, and #159's
+# lesson is that no `libc` may survive in a Windows build — its `-gnu` surface
+# carries POSIX names that `-msvc` does not, so a Linux cross-check cannot see
+# the difference and CI fails to COMPILE.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

@@ -80,6 +80,13 @@ log-based engine), and the hardware published when the hardware is the answer.
 - The fixpoint's fallback to `high_water` **is** its termination argument (§4.5) — it
   frees nothing, so the sets stop growing. That is why `in_freelist_op` must keep
   blocking refill even though refill no longer mutates.
+- `rollback_to` (the cheap savepoint) is exact ONLY under
+  `WriteTxn::undo_is_exact`: nothing allocated since the savepoint, or the txn
+  was pristine when it was taken. It restores roots and accounting, so it cannot
+  undo an in-place mutation of an already-dirty page — a page COWed under a dirty
+  root stays linked while `reusable` re-offers it, and two trees end up sharing
+  it (#160). `partial` is a ROW flag and does not answer this; a split is not a
+  row. `rollback_to_full` is exact regardless (it restores dirty-page bytes).
 - The reader-pin protocol and writer scan pair SeqCst fences; weakening them reintroduces
   a store-buffering race (design/DESIGN.md §4.3).
 - Intent-ring posting is incarnation-safe ONLY because: posts happen under the writer
@@ -99,13 +106,12 @@ log-based engine), and the hardware published when the hardware is the answer.
   hash on every attach; the LIVE schema is read from the catalog and may have
   grown past the seed via `CREATE TABLE` (#47). `M_SCHEMA_HASH` = seed forever;
   `schema_gen` in the flipping meta is the DDL staleness signal.
-- Windows x86-64 runs the engine (#159 stages 1-3: `wincompat` over kernel32,
-  `LockFileEx` on the FLD-2 path, `GetProcessTimes` pid identity). Its
-  crash-safety is UNPROVEN — the fork-bound harnesses are stage 4, and until
-  they run "Windows works" means compiles-and-runs.
-- Crash-safe on Linux (x86-64 + 32/64-bit ARM) and macOS/Apple Silicon (the FLD-2 flock
-  writer lock, `crate::os`); single PID namespace; robust mutexes / flock locks do not
-  survive reboot (boot-id recovery in `post_attach` handles that — don't remove it).
+- Crash-safe on Linux (x86-64 + 32/64-bit ARM), macOS/Apple Silicon and Windows
+  x86-64 — the latter two on the FLD-2 flock writer lock (`crate::os`; Windows via
+  `wincompat` over kernel32 + `LockFileEx`, `GetProcessTimes` pid identity, #159).
+  All six crash harnesses run on all three; `mpedb-cli` contains no `fork`.
+  Single PID namespace; robust mutexes / flock locks do not survive reboot
+  (boot-id recovery in `post_attach` handles that — don't remove it).
 
 ## Testing conventions
 

@@ -4,12 +4,11 @@
 //! SQLITE_BUSY while the overlay is open) and the divergence refusal.
 
 // Every test here opens a sqlite base file, and every one of them takes the
-// interop lock. That lock is unimplemented on Windows and deliberately so —
-// `mpedb_sqlitefmt::lock` speaks sqlite's POSIX protocol, and translating it
-// to sqlite's *Windows* protocol by analogy would claim exclusion we do not
-// hold against a real sqlite writer. So the honest result here is an empty
-// test binary, not fifteen failures that all say the same thing (#159).
-#![cfg(not(windows))]
+// interop lock. These were gated off Windows on the claim that sqlite's
+// Windows VFS uses a different locking protocol — it does not: the lock bytes
+// are defined in sqlite's core, not per-VFS, and shared across platforms on
+// purpose. The Windows arm speaks the same bytes with `LockFileEx`, so the
+// LOCKED-mode contract below is a real cross-engine claim there too (#159).
 
 use mpedb::{LockMode, ReconcilePolicy, SqliteOverlay, Value};
 use rusqlite::Connection;

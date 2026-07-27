@@ -552,13 +552,29 @@ sketch, both review/stress-hardened:
   1. The executor already computes a precise `partial` out-flag per statement
      (`exec/mod.rs`; contract: *may* have applied part of its effects, never
      under-reports). The leader now reads it.
-  2. The cheap undo is **exact** iff `!partial`, or the transaction was
-     *pristine* when the statement began (`WriteTxn::is_pristine` — nothing dirty
-     and the extent allocator untouched) and the statement touched no extent. From
-     a pristine transaction every page a statement writes it also allocated, so the
-     root restore is a complete undo even for a torn statement; extent state is
-     excluded because it lives outside every savepoint (`savepoint_full` refuses
-     across it for the same reason).
+  2. The cheap undo is **exact** iff the statement applied no row AND allocated
+     no page, or the transaction was *pristine* when the statement began
+     (`WriteTxn::is_pristine` — nothing dirty and the extent allocator untouched)
+     and the statement touched no extent. From a pristine transaction every page
+     a statement writes it also allocated, so the root restore is a complete undo
+     even for a torn statement; extent state is excluded because it lives outside
+     every savepoint (`savepoint_full` refuses across it for the same reason).
+
+     ⚠ **The allocation term is not optional (#160), and `!partial` alone was
+     wrong for two releases.** `partial` is a ROW-atomicity flag and is honest
+     about rows; a B-tree split is not a row. A failing statement COWs the leaf
+     it descends into, and from a transaction that has already written, the root
+     is dirty and mutated IN PLACE — so the copy stays linked while restoring
+     `reusable` puts it back on offer. The next allocation hands it out and two
+     trees share a page (`double free of page N`, `page reachable twice`). It
+     took four writer PROCESSES to surface, because the batch is what makes the
+     leader's transaction dirty before the failing statement runs, and it was
+     live at `durability = commit|wal` on every platform. The page half of the
+     question now lives on the engine as `WriteTxn::undo_is_exact`, with a
+     `debug_assert` inside `rollback_to` so any other caller that violates the
+     precondition says so instead of corrupting quietly; `TxnSavepoint` captures
+     `pristine` itself rather than trusting a caller to compute it at the right
+     instant.
   3. Otherwise the round is **torn**. The leader calls `WriteTxn::restart()` —
      discard everything this transaction did and return it to its just-begun state
      **while keeping the writer lock** — and replays the round with that member's

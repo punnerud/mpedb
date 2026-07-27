@@ -270,7 +270,8 @@ fn tables(db_path: &Path) -> Result<String, mpedb::Error> {
     let eng = Engine::open_from_file(db_path)?;
     let r = eng.begin_read()?;
     let mut out = String::new();
-    for (tid, table) in eng.schema().tables.iter().enumerate() {
+    // Skip tombstones: a dropped table keeps its slot with an empty name (#163).
+    for (tid, table) in eng.schema().tables.iter().enumerate().filter(|(_, t)| !t.dead) {
         out.push_str(&format!("{}\t{}\n", table.name, r.row_count(tid as u32)?));
     }
     r.finish()?;

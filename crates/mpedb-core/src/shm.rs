@@ -2659,6 +2659,40 @@ impl Shm {
     /// Free slots whose owning process is provably gone. Safe to run from any
     /// process at any time: every free is a generation-CAS of the exact word
     /// observed dead, so racing a re-claim is harmless.
+    /// Does any reader slot name a process that is ALIVE right now, with
+    /// matching identity?
+    ///
+    /// Used as EVIDENCE against the boot-identity predicate on Windows (#159).
+    /// There is no boot id to read there, so `os::boot_id_matches` derives one
+    /// from two clocks — and a wall-clock step larger than its tolerance makes
+    /// it say "different boot" on a machine that never rebooted. Acting on that
+    /// wipes the reader table, and a wipe is not something a live reader
+    /// survives: its pin is dropped and the writer may reclaim pages under it.
+    ///
+    /// A live, identity-matching pin refutes the clock. Windows records process
+    /// CREATION TIME as an absolute FILETIME, so a stale entry surviving a real
+    /// reboot would need the same pid created at the same 100-nanosecond
+    /// instant. The evidence only ever PREVENTS the destructive action, which
+    /// is the safe direction for a predicate that can be wrong.
+    ///
+    /// Not used on Linux, where the recorded start time is measured in ticks
+    /// SINCE BOOT: pid 1234 at tick 500 is a value a fresh boot can hand out
+    /// again, so the same evidence would be a coincidence rather than a proof.
+    #[cfg(windows)]
+    fn any_live_reader(&self) -> bool {
+        (0..self.max_readers).any(|idx| {
+            let w = self.slot_word(idx).load(Ordering::Acquire);
+            let (pid_half, _) = Self::unpack(w);
+            let pid = pid_half & !Self::CLAIMING;
+            if pid == 0 || pid_half & Self::CLAIMING != 0 {
+                // A mid-claim slot has no trustworthy identity yet, so it is
+                // not evidence of anything.
+                return false;
+            }
+            pid_alive_identity(pid, self.slot_pid_start(idx).load(Ordering::Acquire))
+        })
+    }
+
     pub fn sweep_dead_readers(&self) {
         for idx in 0..self.max_readers {
             let w = self.slot_word(idx).load(Ordering::Acquire);
@@ -3904,7 +3938,19 @@ impl Shm {
                 std::ptr::copy_nonoverlapping(self.at(bid_off), b.as_mut_ptr(), 16);
                 b
             };
-            if !boot_id_matches(&still_stored)? {
+            // Windows only: refute a clock-derived mismatch with evidence
+            // (see `any_live_reader`). Same boot after all — record the fresh
+            // identity so the next attach does not re-derive the mismatch, and
+            // do not touch a thing.
+            #[cfg(windows)]
+            let refuted = self.any_live_reader();
+            #[cfg(not(windows))]
+            let refuted = false;
+            if refuted {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(my_bid.as_ptr(), self.at(bid_off), 16);
+                }
+            } else if !boot_id_matches(&still_stored)? {
                 // WAL replay FIRST, before any volatile reinit: after power
                 // loss the mapping (incl. metas) is whatever the kernel wrote
                 // back; the log is the source of truth. Replay is idempotent
@@ -4211,13 +4257,23 @@ mod tests {
     /// harmless-looking litter on macOS, and fatal on Windows, where `:` is
     /// not a legal filename character so the create fails and `:memory:`
     /// cannot open at all. Wine caught it by leaving the file in the repo.
+    ///
+    /// It sweeps the litter FIRST. Asserting on a bare `exists()` made a file
+    /// dropped by one pre-fix run fail every run after it, on a machine where
+    /// the fix was in — a test that cannot tell "the bug is back" from "the bug
+    /// was here once" (the M3 reported exactly that, from a file dated the day
+    /// before the fix). Sweeping makes the assertion about THIS open.
     #[test]
     fn an_in_memory_database_leaves_no_sidecar() {
+        const LITTER: [&str; 2] = [":memory:.wlock", ":memory:"];
         let zero = [0u8; 32];
         let dir = std::env::current_dir().unwrap();
+        for litter in LITTER {
+            let _ = std::fs::remove_file(dir.join(litter));
+        }
         let shm = Shm::open_memory(8 << 20, 8, Durability::None, &zero).unwrap();
         let _ = shm.claim_and_pin().unwrap();
-        for litter in [":memory:.wlock", ":memory:"] {
+        for litter in LITTER {
             assert!(
                 !dir.join(litter).exists(),
                 "in-memory open created {litter} in {}",

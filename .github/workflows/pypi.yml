@@ -33,9 +33,14 @@ jobs:
 
   # Linux wheels: x86-64 plus the two ARM shapes the engine is actually
   # crash-tested on (aarch64 and 32-bit armv7 — the Raspberry Pi pair).
-  # No Windows wheel: the engine is POSIX at its core (mmap, the FLD-2 flock
-  # writer lock, robust shared-memory mutexes, /proc start-time identity) —
-  # a Windows port is an engine project (#97 territory), not a CI matrix entry.
+  #
+  # The note that used to stand here — "no Windows wheel: the engine is POSIX at
+  # its core ... a Windows port is an engine project, not a CI matrix entry" —
+  # was true when written and is not any more. #159 ported it: shared
+  # `CreateFileMapping` views, a `LockFileEx` writer lock with owner-death
+  # release, `GetProcessTimes` reader identity, and all six crash harnesses
+  # green on `windows-latest`. The wheel is `wheel-windows` below, and the
+  # Python suite runs there in `windows.yml` before this ever builds it.
   wheel-linux:
     needs: test
     runs-on: ubuntu-latest
@@ -56,6 +61,20 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-linux-${{ matrix.target }}
+          path: dist
+
+  wheel-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows
           path: dist
 
   wheel-macos:
@@ -87,7 +106,7 @@ jobs:
           path: dist
 
   publish:
-    needs: [wheel-linux, wheel-macos, sdist]
+    needs: [wheel-linux, wheel-macos, wheel-windows, sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

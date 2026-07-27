@@ -1063,20 +1063,32 @@ pub fn died_by_hard_kill(status: &std::process::ExitStatus) -> bool {
 ///    Across a real reboot they differ by at least the previous boot's uptime;
 ///    within one they differ only by clock adjustment.
 ///
-/// Two windows remain, and both are narrow enough to state exactly:
+/// Two windows remain. One is closed downstream; the other is stated exactly:
 ///
+/// - **Spurious recovery** — the dangerous one, because it is reachable: a VM
+///   resumed from a snapshot, a laptop waking, a first NTP correction on a
+///   machine with a dead RTC battery. The wall clock steps more than ten
+///   seconds while a database is attached and this returns `false` for a boot
+///   that never happened. **Its damage is now refuted downstream rather than
+///   merely made unlikely**: `Shm::post_attach` will not act on a mismatch
+///   while any reader slot names a live process with matching identity, and on
+///   Windows that identity includes an absolute process CREATION FILETIME, so
+///   it cannot be a coincidence across a real reboot (`Shm::any_live_reader`).
+///   A wrong answer here now costs nothing rather than a live reader's pin.
 /// - **Missed reboot.** The two boot instants differ by the previous boot's
 ///   whole lifetime plus the downtime, so slipping under the tolerance
 ///   requires that *entire* interval to be under ten seconds — a boot loop,
-///   in which nothing was durably committed to miss.
-/// - **Spurious recovery.** Requires the wall clock to jump more than ten
-///   seconds while a database is attached. A step that large is a manual clock
-///   change or a first-sync correction, not routine slewing.
+///   in which nothing was durably committed to miss. Left open deliberately:
+///   the fix costs a clock and buys an interval nothing survives.
 ///
-/// The exact fix, if either ever bites, is the per-boot counter Windows keeps
-/// at `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory
-/// Management\PrefetchParameters\BootId` — a real identity, at the cost of a
-/// registry read and a decision about what to do when it is absent.
+/// The registry route — the per-boot counter at `HKLM\SYSTEM\
+/// CurrentControlSet\Control\Session Manager\Memory Management\
+/// PrefetchParameters\BootId` — was considered and NOT taken. It is a real
+/// identity when it is live, but it is the prefetcher's, and whether it still
+/// increments where prefetching is disabled is a fact about Windows that
+/// cannot be measured from this project's machines or from a CI runner that
+/// never reboots. Replacing a stated window with an unmeasured assumption is
+/// not an improvement.
 pub fn boot_id_matches(stored: &[u8; 16]) -> Option<bool> {
     #[cfg(windows)]
     {

@@ -590,7 +590,7 @@ fn mpedb_setup(dir: &Path, docs: usize, seats: usize) -> BResult<String> {
         format!(
             "[database]\npath = \"{}\"\nsize_mb = 256\nmax_readers = 64\n\
              durability = \"wal\"\n{SCHEMA}",
-            db.display()
+            mpedb::toml_escape(&db.display().to_string())
         ),
     )?;
     let s = cfg.to_string_lossy().into_owned();

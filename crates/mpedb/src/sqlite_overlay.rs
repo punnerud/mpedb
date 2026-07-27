@@ -130,10 +130,15 @@ fn scratch_path(base: &Path) -> PathBuf {
 fn overlay_toml(base: &Path, schema: &Schema, size_mb: u64) -> String {
     use std::fmt::Write as _;
     let mut t = String::new();
+    // ESCAPED: the path comes from the caller, and a Windows one
+    // (`C:\data\app.db`) makes `\d` an unknown TOML escape — the config never
+    // parses and the error names a unicode escape, not a path. #159 found four
+    // such sites; this fifth one stayed hidden because the overlay's tests were
+    // gated off Windows, which is what made the gate expensive rather than free.
     let _ = write!(
         t,
         "[database]\npath = \"{}\"\nsize_mb = {size_mb}\ndurability = \"none\"\n",
-        overlay_path(base).display()
+        mpedb_types::toml_escape(&overlay_path(base).display().to_string())
     );
     for table in &schema.tables {
         let pk = &table.columns[table.primary_key[0] as usize].name;

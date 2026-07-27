@@ -112,5 +112,56 @@ jobs:
           run collide --writers 4 --total 400 --drop-rate 0 --durability commit
           run collide --writers 4 --total 400 --durability wal
           d=$(mktemp -d); "$B" tier crash --dir "$d" --waves 2; rm -rf "$d"
+      # The CLI is a product surface, not a test harness, and building it is
+      # not the same as it working: `mpedb <path> "SQL"` creates the file on
+      # first write, and every step below goes through the path handling that
+      # #159 found four wrong spellings of.
+      - name: stage 5 — the CLI end to end
+        shell: bash
+        run: |
+          set -e
+          B=target/debug/mpedb.exe
+          d=$(mktemp -d); f="$d/app.mpedb"
+          "$B" "$f" "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
+          "$B" "$f" "INSERT INTO t (id, s) VALUES (1, 'a')"
+          "$B" "$f" "INSERT INTO t (id, s) VALUES (2, 'b')"
+          # `tail -1`: the CLI prints a header row first. And `! grep -q`
+          # below, not `grep -qv` — the inverted form matches any file with a
+          # second line, so it would pass on a dump full of tombstones.
+          test "$("$B" "$f" "SELECT count(*) FROM t" | tail -1 | tr -d '\r')" = 2
+          "$B" prepare "$f" "SELECT s FROM t WHERE id = ?"
+          "$B" dump "$f" | grep -q 'name = "t"'
+          "$B" "$f" "DROP TABLE t"
+          ! "$B" dump "$f" | grep -q 'name = ""'
+          rm -rf "$d"
       - name: clippy the engine
         run: cargo clippy -p mpedb-core --lib -- -D warnings
+
+  # The Python binding is a published wheel (`pip install mpedb`), so "it
+  # compiles for Windows" is not the claim that matters — the suite has to run
+  # there. It is run TWICE against the same directory, which is its documented
+  # mode: that is how it exercises persistence across process restarts, and it
+  # is what caught live DDL leaving a table behind (#163).
+  windows-python:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
+      - name: install the wheel
+        shell: bash
+        run: pip install --find-links dist --no-index mpedb
+      - name: the python suite, twice against one directory
+        shell: bash
+        run: |
+          set -e
+          d=$(mktemp -d)
+          python crates/mpedb-py/pytest/test_mpedb.py "$d"
+          python crates/mpedb-py/pytest/test_mpedb.py "$d"
+          python crates/mpedb-py/pytest/test_sync.py "$(mktemp -d)"

@@ -1,11 +1,13 @@
 # DESIGN-WINDOWS — porting the engine, and why it is smaller than it looks
 
-**Status: stages 1–3 built and green on REAL Windows (2026-07-27).** The
-`windows-engine` job builds the engine, runs its unit tests, the four
-multi-process properties (mapping coherence, writer exclusion, cross-process
-MVCC snapshots, owner death), the two durability arms, **and the facade's own
-integration suite** — ~1100 tests — then lints it, all on `windows-latest`.
-Stages 4–5 are unbuilt, and §4 still describes them.
+**Status: stages 1–4 built and green on REAL Windows (2026-07-27), and the
+word is now crash-safe.** The `windows-engine` job builds the engine, runs its
+unit tests, the four multi-process properties (mapping coherence, writer
+exclusion, cross-process MVCC snapshots, owner death), the two durability arms,
+**the facade's own integration suite** — ~1100 tests — and **all six crash
+harnesses**, then lints it, all on `windows-latest`. `collide` was the last one
+in: it was held out while #160 was open, and it is in at `--durability commit`,
+the arm that reproduced. Only stage 5 remains, and it is bookkeeping.
 
 Three attempts were needed, and the first two failed for reasons worth naming:
 a committed `:memory:.wlock` made `git checkout` fail before any code ran (§6),
@@ -192,12 +194,25 @@ else follows it.
    file lock, which an already-attached reader does not hold, so a live
    reader's pin would be dropped and the writer could reclaim pages under it.
    The question is now a predicate, `os::boot_id_matches`, and Windows answers
-   it from the tick counter's reset (exact) plus a bounded epoch tolerance;
-   both residual windows are stated in its doc comment.
+   it from the tick counter's reset (exact) plus a bounded epoch tolerance.
 
-   NOT done, and the reason stage 4 is still the gate: `Child::kill` takes a
-   process, not the page cache. Real power loss is `mpedb powerloss`, which is
-   `fork`-bound.
+   **The dangerous residual is closed, and not by a better clock.** The
+   reachable window was spurious recovery — a wall-clock step (VM snapshot
+   resume, laptop wake, first NTP correction) making the predicate say "reboot"
+   on a machine that never rebooted, and boot recovery then wiping a live
+   reader's pin. `post_attach` now refuses to act on a mismatch while any
+   reader slot names a live process with matching identity, and on Windows that
+   identity carries an absolute process CREATION FILETIME — a stale entry
+   surviving a real reboot would need the same pid created at the same
+   100-nanosecond instant. The clock can now be wrong at no cost.
+
+   The other window — a missed reboot — needs a whole boot-to-boot cycle under
+   ten seconds, an interval in which nothing was durably committed to miss, and
+   it stays open deliberately. The registry route (`PrefetchParameters\BootId`)
+   was considered and refused: it is the prefetcher's counter, and whether it
+   still increments where prefetching is disabled cannot be measured from this
+   project's machines or from a CI runner that never reboots. Trading a stated
+   window for an unmeasured assumption is not an improvement.
 4. **The crash harnesses on `CreateProcess`/`TerminateProcess`.** Two seam
    functions, not a rewrite — see §2's correction. `crash` runs on Windows:
    12 children terminated at their chosen instants, all counted as killed,
@@ -206,12 +221,19 @@ else follows it.
 
    **And it immediately found something that is not a Windows problem.**
    `collide` — concurrent writer processes at `durability = commit|wal` —
-   corrupts the btree and freelist, and it does so on LINUX, on the tagged
-   v0.1.4, and on v0.1.3 before it. The engine's own verifier reports it
+   corrupted the btree and freelist, and it did so on LINUX, on the tagged
+   v0.1.4, and on v0.1.3 before it. The engine's own verifier reported it
    (`double free of page N`, `page reachable twice`). Splitting: the DIRECT
-   path (`durability = none`) is clean, one writer is clean, process death is
-   NOT the trigger, and neither is the detached-plan path — what is left is the
-   intent ring. Tracked as #160.
+   path (`durability = none`) was clean, one writer was clean, process death
+   was NOT the trigger, and neither was the detached-plan path — what was left
+   was the intent ring.
+
+   **#160, and it is fixed** (DESIGN.md §5.3): the leader's per-intent undo
+   trusted the executor's `partial` flag, which is honest about ROWS and says
+   nothing about a B-tree split. A failing statement COWs the leaf it descends
+   into; from a transaction the batch has already made dirty, that copy stays
+   linked while the rollback re-offers it. 0/8 across five previously-failing
+   cells, and `collide` is in the Windows job.
 
    That is the argument for stage 4 stated more sharply than the original text
    managed: the harnesses are not a Windows chore, they are the only thing that
@@ -231,14 +253,49 @@ else follows it.
 
    The fix is `os::hard_kill_child`, which terminates with the SAME code
    `hard_kill_self` uses, so the harness controls both sides of the
-   distinction rather than trying to infer it. Five of the six harnesses now
-   run in CI on `windows-latest`; the sixth is `collide`, held out only
-   because of #160.
-5. Only then does `windows.yml` stop being a portable-crates job.
+   distinction rather than trying to infer it. **All six harnesses run in CI on
+   `windows-latest`.**
+5. ~~**`windows.yml` stops being a portable-crates job.**~~ **DONE**, and it
+   grew two things stage 4 did not cover, both product surfaces rather than
+   engine internals:
 
-Stages 1–3 are tractable and mostly mechanical against an abstraction that
-exists. Stage 4 is the one to budget for, and the one that decides whether the
-claim on the tin is true on Windows.
+   * **The CLI end to end** — create-on-first-write, DDL, insert, aggregate
+     read, `prepare`, `dump`, `DROP TABLE`. Building `mpedb-cli` is not the
+     same as it working, and every step goes through the path handling that
+     #159 found four wrong spellings of.
+   * **The Python binding, as a wheel** — `windows-python` builds it with
+     maturin, installs it, and runs the suite TWICE against one directory,
+     which is its documented mode (that is how it tests persistence across
+     process restarts). `pypi.yml` gained the matching `wheel-windows` job;
+     the note there saying a Windows port was "an engine project, not a CI
+     matrix entry" was true when written and is not any more.
+
+   **And the sqlite interop lock, which was the last gated-out feature.** The
+   15 overlay tests were skipped on Windows on the claim that "sqlite's Windows
+   VFS uses its own locking protocol, with different byte offsets and a
+   different shared/pending/reserved scheme". That claim was **wrong**, and
+   checking it against the amalgamation this repo already pins took minutes:
+   the lock bytes are defined once in sqlite's core, not per-VFS, and its own
+   comment says the range is shared across platforms on purpose so win/unix
+   clients *could* interoperate. `winGetReadLock` locks `SHARED_FIRST ..
+   +SHARED_SIZE` shared; `winCheckReservedLock` probes `RESERVED_BYTE` with a
+   shared try-lock it releases at once — which is exactly `getlk_free`, since
+   Windows has no `F_GETLK`. The arm is `LockFileEx`/`UnlockFileEx` over the
+   same bytes, and Windows is STRONGER than the POSIX path in two ways: its
+   locks belong to the handle (so the [R#5] in-process-close trap cannot reach
+   them, and `ofd()` reports `true`), and they are mandatory, which is harmless
+   because sqlite's pager never allocates the page those bytes live in.
+
+   The gate was not free. While it was up, a fifth unescaped-path site (#159's
+   class) sat in the overlay's own `overlay_toml` — production code, not a
+   test — where a Windows path made the config fail to PARSE with an error
+   about unicode escapes. The tests that would have caught it were the ones
+   the gate switched off.
+
+Stages 1–3 were tractable and mostly mechanical against an abstraction that
+exists. Stage 4 was the one to budget for, and it decided whether the claim on
+the tin is true on Windows — it does, and the bug it found was ours on every
+platform, not Windows'.
 
 **The sweep that was predicted, and the edit that replaced it.** ~200 test
 files hand-build config text with an unescaped path — 244 interpolation sites

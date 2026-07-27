@@ -28,16 +28,41 @@
 //! lock against a foreign sqlite writer is the one answer that would be
 //! dangerous, and it is the one answer this cannot give.
 //!
-//! **Windows takes the same stub, and for a stronger reason than wasm32's**
-//! (#159). Windows has byte-range locks — `LockFileEx` — so this *could* be
-//! written. It must not be written by analogy: sqlite's Windows VFS uses its
-//! own locking protocol, with different byte offsets and a different
-//! shared/pending/reserved scheme from the POSIX one encoded here. A
-//! LockFileEx translation of these `fcntl` calls would take locks a foreign
-//! sqlite writer does not look at, and report exclusion it does not have —
-//! the exact dangerous answer the paragraph above rules out. Real interop
-//! locking on Windows means implementing sqlite's Windows protocol, which is
-//! its own piece of work and not a cfg arm.
+//! ## Windows
+//!
+//! Windows speaks the protocol for real (#159), and the paragraph that used to
+//! stand here — "sqlite's Windows VFS uses its own locking protocol, with
+//! different byte offsets and a different shared/pending/reserved scheme" —
+//! was **wrong**, which is why the feature sat gated behind it. The offsets are
+//! not a VFS's business: `PENDING_BYTE`/`RESERVED_BYTE`/`SHARED_FIRST`/
+//! `SHARED_SIZE` are defined once in sqlite's core, and its own comment says
+//! the range is shared across platforms deliberately —
+//!
+//! > *"clients on win95, winNT, and unix all talking to the same shared file
+//! > and all locking correctly … by using the same locking range we are at
+//! > least open to the possibility."*
+//!
+//! So this is not a translation by analogy; it is the same bytes with the
+//! platform's own call. Verified against the amalgamation this crate already
+//! pins as its oracle, not from memory:
+//!
+//! * `winGetReadLock` → `LockFileEx(SHARED_FIRST, SHARED_SIZE, shared,
+//!   FAIL_IMMEDIATELY)` — the same range and the same shared type as `F_RDLCK`
+//!   here. A foreign writer's `EXCLUSIVE` covers that whole range, so it
+//!   conflicts with ours and gets its normal `SQLITE_BUSY`; a foreign reader's
+//!   shared lock coexists, untouched.
+//! * `winCheckReservedLock` → a **shared try-lock on `RESERVED_BYTE` that is
+//!   released immediately**, exactly what [`getlk_free`] means. Windows has no
+//!   `F_GETLK`, and try-then-release is not our workaround for that: it is
+//!   sqlite's own answer, so our probe and its probe are the same operation.
+//!
+//! Two places where Windows is STRONGER than the POSIX path, both load-bearing:
+//! its locks belong to the HANDLE, so an in-process sqlite `CloseHandle` on its
+//! own handle cannot cancel ours — the [R#5] trap that classic POSIX locks have
+//! and OFD locks do not. [`SharedLock::ofd`] therefore reports `true` here: the
+//! caller does not need the drop/re-take dance. And its locks are mandatory
+//! rather than advisory, which is harmless precisely because sqlite's pager
+//! never allocates the page these bytes live in.
 
 use std::fs::File;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -67,13 +92,27 @@ type LockCmd = i32;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 type LockCmd = libc::c_int;
 
-/// The fd a lock op targets. wasm32 has no fds; unreachable (see module doc).
+/// What a lock op names its target by: an fd on unix, a `HANDLE` on Windows
+/// (locks there belong to the handle, which is the whole reason `ofd` is
+/// `true` on that platform), nothing on wasm32.
 #[cfg(all(unix, not(target_arch = "wasm32")))]
-fn fd_of(f: &File) -> i32 {
+type LockFd = i32;
+#[cfg(windows)]
+type LockFd = std::os::windows::io::RawHandle;
+#[cfg(target_arch = "wasm32")]
+type LockFd = i32;
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn fd_of(f: &File) -> LockFd {
     f.as_raw_fd()
 }
-#[cfg(any(target_arch = "wasm32", windows))]
-fn fd_of(_f: &File) -> i32 {
+#[cfg(windows)]
+fn fd_of(f: &File) -> LockFd {
+    use std::os::windows::io::AsRawHandle as _;
+    f.as_raw_handle()
+}
+#[cfg(target_arch = "wasm32")]
+fn fd_of(_f: &File) -> LockFd {
     -1
 }
 
@@ -82,21 +121,6 @@ fn no_locks<T>() -> Result<T> {
     Err(Error::Io(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "no byte-range locks in the wasm32 build (there is no sqlite base file to lock)",
-    )))
-}
-
-/// Windows reaches the same stub for a different reason, and saying "wasm32"
-/// here sent #159 looking in the wrong place. There IS a sqlite base file and
-/// Windows DOES have byte-range locks — what is missing is sqlite's Windows
-/// locking PROTOCOL, whose byte offsets and shared/pending/reserved scheme
-/// differ from the POSIX one this module implements. See the module header.
-#[cfg(windows)]
-fn no_locks<T>() -> Result<T> {
-    Err(Error::Io(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "sqlite interop locking is not implemented on Windows: this module speaks \
-         sqlite's POSIX protocol, and sqlite's Windows VFS uses different byte \
-         offsets — translating one to the other would report exclusion we do not hold",
     )))
 }
 
@@ -123,9 +147,18 @@ fn flock(ty: i16, start: i64, len: i64) -> libc::flock {
 
 /// Try a non-blocking lock op; `Ok(true)` = acquired, `Ok(false)` = someone
 /// conflicting holds it.
-#[cfg(any(target_arch = "wasm32", windows))]
-fn setlk(_fd: i32, _cmd: LockCmd, _ty: i16, _start: i64, _len: i64) -> Result<bool> {
+#[cfg(target_arch = "wasm32")]
+fn setlk(_fd: LockFd, _cmd: LockCmd, _ty: i16, _start: i64, _len: i64) -> Result<bool> {
     no_locks()
+}
+
+#[cfg(windows)]
+fn setlk(fd: LockFd, _cmd: LockCmd, ty: i16, start: i64, len: i64) -> Result<bool> {
+    if ty == UNLCK {
+        return win::unlock(fd, start, len).map(|()| true);
+    }
+    debug_assert_eq!(ty, RDLCK, "this module only ever takes SHARED locks");
+    win::try_lock_shared(fd, start, len)
 }
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -144,9 +177,114 @@ fn setlk(fd: i32, cmd: libc::c_int, ty: i16, start: i64, len: i64) -> Result<boo
 
 /// Would a `ty` lock on `[start, start+len)` be granted right now? (F_GETLK
 /// probe — takes nothing.)
-#[cfg(any(target_arch = "wasm32", windows))]
-fn getlk_free(_fd: i32, _cmd: LockCmd, _ty: i16, _start: i64, _len: i64) -> Result<bool> {
+#[cfg(target_arch = "wasm32")]
+fn getlk_free(_fd: LockFd, _cmd: LockCmd, _ty: i16, _start: i64, _len: i64) -> Result<bool> {
     no_locks()
+}
+
+/// Windows has no `F_GETLK`, so the probe is a shared try-lock released at
+/// once — which is not a workaround but sqlite's own `winCheckReservedLock`,
+/// so its probe and ours are the same operation against the same bytes. The
+/// hold is microscopic and SHARED, so it cannot exclude a foreign reader, and
+/// a foreign writer that collides with it sees the ordinary retry it already
+/// handles.
+#[cfg(windows)]
+fn getlk_free(fd: LockFd, _cmd: LockCmd, ty: i16, start: i64, len: i64) -> Result<bool> {
+    debug_assert_eq!(ty, RDLCK, "this module only ever probes with a read lock");
+    if win::try_lock_shared(fd, start, len)? {
+        win::unlock(fd, start, len)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// `LockFileEx`/`UnlockFileEx`, hand-declared — the crate is dependency-light
+/// by design (DESIGN-SQLITE-BACKED §4) and two `extern "system"` lines do not
+/// justify a windows-sys dependency in the one crate that must not drag one.
+#[cfg(windows)]
+mod win {
+    use super::{Error, Result};
+    use std::os::windows::io::RawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        h_event: usize,
+    }
+
+    // LOCKFILE_FAIL_IMMEDIATELY. The exclusive bit is deliberately absent:
+    // every lock this module takes is SHARED, and taking an exclusive one
+    // would exclude foreign sqlite READERS, which the design forbids.
+    const FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+    // Both spellings a conflicting holder can produce. Anything else is a real
+    // error and propagates — the one answer that must never be invented is
+    // "acquired", and that is returned only on an actual success.
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    const ERROR_IO_PENDING: i32 = 997;
+
+    extern "system" {
+        fn LockFileEx(
+            file: RawHandle,
+            flags: u32,
+            reserved: u32,
+            len_low: u32,
+            len_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn UnlockFileEx(
+            file: RawHandle,
+            reserved: u32,
+            len_low: u32,
+            len_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    /// The offset goes in the OVERLAPPED, the length in the two `len_*` args —
+    /// a split that is easy to get backwards, and getting it backwards would
+    /// lock the wrong bytes silently.
+    fn parts(start: i64, len: i64) -> (Overlapped, u32, u32) {
+        let s = start as u64;
+        let l = len as u64;
+        (
+            Overlapped {
+                offset: s as u32,
+                offset_high: (s >> 32) as u32,
+                ..Default::default()
+            },
+            l as u32,
+            (l >> 32) as u32,
+        )
+    }
+
+    pub(super) fn try_lock_shared(fd: RawHandle, start: i64, len: i64) -> Result<bool> {
+        let (mut ov, lo, hi) = parts(start, len);
+        let ok = unsafe { LockFileEx(fd, FAIL_IMMEDIATELY, 0, lo, hi, &mut ov) };
+        if ok != 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(ERROR_LOCK_VIOLATION) | Some(ERROR_IO_PENDING) => Ok(false),
+            _ => Err(Error::Io(err)),
+        }
+    }
+
+    /// Windows requires the released range to match the locked one EXACTLY —
+    /// no partial or merged unlocks — which every caller here satisfies by
+    /// passing the same `(start, len)` it locked.
+    pub(super) fn unlock(fd: RawHandle, start: i64, len: i64) -> Result<()> {
+        let (mut ov, lo, hi) = parts(start, len);
+        let ok = unsafe { UnlockFileEx(fd, 0, lo, hi, &mut ov) };
+        if ok != 0 {
+            return Ok(());
+        }
+        Err(Error::Io(std::io::Error::last_os_error()))
+    }
 }
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -163,9 +301,16 @@ fn getlk_free(fd: i32, cmd_getlk: libc::c_int, ty: i16, start: i64, len: i64) ->
 fn lock_cmds() -> (LockCmd, LockCmd, bool) {
     // wasm32: no fcntl commands exist; `false` (not OFD) is the conservative
     // report, and no caller gets this far anyway.
-    #[cfg(any(target_arch = "wasm32", windows))]
+    #[cfg(target_arch = "wasm32")]
     {
         (0, 0, false)
+    }
+    // Windows locks belong to the HANDLE, so an in-process sqlite closing its
+    // own handle cannot cancel ours — the same immunity OFD gives, by a
+    // different mechanism. The command pair is unused there.
+    #[cfg(windows)]
+    {
+        (0, 0, true)
     }
     #[cfg(target_os = "linux")]
     {

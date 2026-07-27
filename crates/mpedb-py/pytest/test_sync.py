@@ -40,7 +40,9 @@ primary_key = ["id"]
 def node(workdir, tag, role):
     """Open one instance in `role`. The role is the ONLY difference."""
     cfg = os.path.join(workdir, f"{tag}.toml")
-    db = os.path.join(workdir, f"{tag}.mpedb")
+    # Forward slashes: this goes into a TOML `path = "..."` below, and a
+    # Windows backslash is an escape there (#159). Windows takes `/` fine.
+    db = os.path.join(workdir, f"{tag}.mpedb").replace("\\", "/")
     for p in (db, db + "-wal"):
         if os.path.exists(p):
             os.remove(p)

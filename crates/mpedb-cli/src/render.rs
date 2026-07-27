@@ -76,9 +76,14 @@ fn toml_str(s: &str) -> String {
 }
 
 /// Render a schema in the shape of the config file's `[[table]]` blocks.
+///
+/// LIVE tables only. A `DROP TABLE` retires its slot in place with a
+/// tombstone (an id with an empty name — `Schema::tombstone`), which this
+/// used to render as `[[table]] name = ""`: a config block that names nothing,
+/// in the output people paste back into a config file (#163).
 pub fn schema_toml(schema: &Schema) -> String {
     let mut out = String::new();
-    for table in &schema.tables {
+    for table in schema.live_tables() {
         out.push_str("[[table]]\n");
         out.push_str(&format!("name = {}\n", toml_str(&table.name)));
         let pk: Vec<String> = table

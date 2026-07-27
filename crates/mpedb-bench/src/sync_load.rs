@@ -79,7 +79,7 @@ fn open(dir: &Path, tag: &str, role: &str) -> BResult<Database> {
     let toml = format!(
         "[database]\npath = \"{}\"\nsize_mb = 64\nmax_readers = 64\n\
          durability = \"wal\"\n\n[sync]\nrole = \"{role}\"\n{SCHEMA}",
-        path.display()
+        mpedb::toml_escape(&path.display().to_string())
     );
     Ok(Database::open_with_config(Config::from_toml_str(&toml)?)?)
 }

@@ -733,8 +733,10 @@ impl OverlaySession {
             if stmt == ".tables" {
                 match self.handle() {
                     Ok(h) => {
+                        // Live only — a dropped table's tombstone has an
+                        // empty name and would list as a blank row (#163).
                         let tables: Vec<String> =
-                            h.schema().tables.iter().map(|t| t.name.clone()).collect();
+                            h.schema().live_tables().map(|t| t.name.clone()).collect();
                         for name in tables {
                             let quoted = name.replace('"', "\"\"");
                             let count = match self.handle().and_then(|h| {

@@ -741,7 +741,14 @@ def test_dbapi(cfg_path, base):
     conn.execute("INSERT INTO ddl_ok (id, s) VALUES (?, ?)", [1, "x"])
     conn.commit()
     assert conn.execute("SELECT s FROM ddl_ok WHERE id = 1").fetchone() == ("x",)
-    ok("dbapi: live DDL (CREATE TABLE) works through the DB-API")
+    # DROPPED again: this suite's documented mode is "run it twice against the
+    # same directory" (that is how it tests persistence across processes), and
+    # a table left behind makes run 2 fail `test_open_and_tables` with a list
+    # that looks like a schema bug. Live DDL is exactly the feature that can
+    # break its own suite's re-runnability, so it cleans up after itself.
+    conn.execute("DROP TABLE ddl_ok")
+    conn.commit()
+    ok("dbapi: live DDL (CREATE TABLE/DROP TABLE) works through the DB-API")
 
     conn.close()
     try:
@@ -758,7 +765,13 @@ def main():
     cfg_path = os.path.join(workdir, "app.toml")
     if not os.path.exists(cfg_path):
         with open(cfg_path, "w") as f:
-            f.write(CONFIG_TEMPLATE.format(dbpath=os.path.join(workdir, "app.mpedb")))
+            # Forward slashes even on Windows: this string lands inside a TOML
+            # `path = "..."`, where `C:\Users` makes `\U` an invalid unicode
+            # escape and the config fails to PARSE — an error that says nothing
+            # about paths (#159). Windows accepts `/` in every path API, so
+            # spelling it that way needs no escaping anywhere downstream.
+            dbpath = os.path.join(workdir, "app.mpedb").replace("\\", "/")
+            f.write(CONFIG_TEMPLATE.format(dbpath=dbpath))
     print(f"mpedb python test suite  (workdir: {workdir})")
 
     db = mpedb.Database(cfg_path)

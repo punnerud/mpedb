@@ -436,13 +436,12 @@ impl PyDatabase {
     }
 
     /// Names of all tables in the schema.
+    /// LIVE tables only. `DROP TABLE` retires a slot in place with a tombstone
+    /// whose name is empty, and this returned it as `""` — a table that cannot
+    /// be queried, in the list a program iterates to find out what it can query
+    /// (#163).
     fn tables(&self) -> Vec<String> {
-        self.db
-            .schema()
-            .tables
-            .iter()
-            .map(|t| t.name.clone())
-            .collect()
+        self.db.schema().live_tables().map(|t| t.name.clone()).collect()
     }
 
     /// Verify the engine's page-accounting invariant; raises on failure.

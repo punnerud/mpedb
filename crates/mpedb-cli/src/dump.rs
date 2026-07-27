@@ -31,12 +31,14 @@ pub fn run(argv: &[String]) -> CliResult {
     let schema = r.stored_schema()?;
 
     print!("{}", schema_toml(&schema));
-    for (tid, table) in schema.tables.iter().enumerate() {
+    // Live tables only: a dropped table's slot survives as a tombstone with an
+    // empty name, and listing it reads as a nameless table (#163).
+    for (tid, table) in schema.tables.iter().enumerate().filter(|(_, t)| !t.dead) {
         println!("# table {}: {} rows", table.name, r.row_count(tid as u32)?);
     }
 
     if with_data {
-        for (tid, table) in schema.tables.iter().enumerate() {
+        for (tid, table) in schema.tables.iter().enumerate().filter(|(_, t)| !t.dead) {
             println!("\n# data: {}", table.name);
             println!(
                 "{}",
