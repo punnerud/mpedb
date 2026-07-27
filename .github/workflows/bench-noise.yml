@@ -1,0 +1,70 @@
+# Runner-noise probe — MANUAL ONLY, never on a push or a schedule.
+#
+# It answers one question and refuses the neighbouring one: can a SHARED CI
+# runner resolve an mpedb-vs-sqlite3 ratio, and to what precision? It does NOT
+# publish a benchmark. `benchmarks/` names its hardware because an absolute
+# number without its machine is noise with a decimal point, and a GitHub runner
+# cannot supply that machine.
+#
+# Its primary output is the ratio's coefficient of variation compared against
+# the quadrature sum the two arms would give if they were INDEPENDENT. That
+# comparison is the whole point: it says whether the paired design bought
+# anything on this host, rather than leaving it assumed because "paired" is a
+# good word. Measured on the dev box first, 8 reps: ratio CV 4.2% against a
+# 3.9% independent sum — pairing bought nothing there, and the precision came
+# from averaging. Whether a CI runner differs is exactly what this measures.
+#
+# `workflow_dispatch` only, because minutes are finite and a number nobody
+# asked for is a number nobody reads.
+name: bench-noise
+
+on:
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: paired repetitions
+        default: "10"
+      writers:
+        description: concurrent writer threads
+        default: "4"
+      secs:
+        description: seconds per arm
+        default: "2"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: what machine is this, actually
+        shell: bash
+        run: |
+          echo "cores: $NUMBER_OF_PROCESSORS"
+          wmic cpu get name 2>/dev/null | tail -n +2 || true
+      - name: probe
+        shell: bash
+        run: |
+          cargo run --release -p mpedb --example runner_noise -- \
+            --reps ${{ inputs.reps }} --writers ${{ inputs.writers }} \
+            --secs ${{ inputs.secs }} --dir "$RUNNER_TEMP/noise"
+
+  # The control arm, and the reason this workflow is not one job. A CV from
+  # Windows alone says nothing: it needs a second host measured the same way to
+  # be readable as "noisier" or "no worse". Two machines are the control group
+  # for host noise — the same rule the benchmark suite runs under.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: what machine is this, actually
+        run: nproc; grep -m1 'model name' /proc/cpuinfo || true
+      - name: probe
+        run: |
+          cargo run --release -p mpedb --example runner_noise -- \
+            --reps ${{ inputs.reps }} --writers ${{ inputs.writers }} \
+            --secs ${{ inputs.secs }} --dir "$RUNNER_TEMP/noise"
