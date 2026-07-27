@@ -25,15 +25,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Windows spends most of a test run LINKING, and most of the link on PDBs.
-  # ~150 integration-test binaries is where that lands: stage 3 was 204s of a
-  # 416s job, measured. Dropping debuginfo keeps `debug_assert!` — which is
-  # part of the engine's contract, not a debugging aid — while skipping the
-  # symbol files nothing in CI reads. Set here rather than in Cargo.toml so a
-  # local `cargo test` still produces something a debugger can attach to.
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0" 
-
 jobs:
   windows-portable-core:
     runs-on: windows-latest
