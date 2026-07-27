@@ -422,12 +422,21 @@ rather than unit tests.
   there as on POSIX — the lock bytes are sqlite's, not a VFS's — so the overlay's
   cross-engine contract (a foreign sqlite writer gets `SQLITE_BUSY`) holds on
   Windows too. The CLI and the Python wheel run in CI as well.
-  **Not measured there:** every concurrency claim in
-  [Performance](#performance) is from Linux and the M3. Windows is proven to
-  *work* concurrently — four writer processes, MVCC readers, the whole harness
-  set — and its throughput against sqlite3 is simply unknown, because a shared
-  CI runner is not a place this project is willing to publish a number from.
-  See `design/DESIGN-WINDOWS.md`.
+  **Slower there, and by how much is now measured (#164).** Every number in
+  [Performance](#performance) is from Linux and the M3, and Windows was
+  described here as "works, throughput unknown" until a paired probe was
+  pointed at it. In the contended non-durable insert cell, mpedb reaches
+  **17.4 k op/s** on a 4-core Windows runner against **56 k** on a 4-core Linux
+  box and **110 k** on the M3 — while sqlite3, measured on the same Windows
+  machine as the control arm, loses only 1.2x. So it is not the host. The
+  absolute numbers are from a shared runner and are not publishable as
+  benchmarks; the 4x RATIO gap, with a control arm on the same machine, is far
+  outside what that runner can explain.
+  The cause is **not known**. The obvious suspect — the FLD-2 sidecar lock
+  costing a `LockFileEx` per transaction where Linux costs a futex — is refuted
+  by macOS, which uses the same FLD-2 path and is the fastest of the four.
+  Reproduce it yourself with `cargo run --release -p mpedb --example
+  runner_noise`. See `design/DESIGN-WINDOWS.md`.
 
 Platform claims are verified on real hardware, and the table says which hardware:
 

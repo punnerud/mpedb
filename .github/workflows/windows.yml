@@ -92,6 +92,13 @@ jobs:
         run: cargo test -p mpedb-core --lib
       - name: stage 2 — multi-process attach
         run: cargo test -p mpedb-core --test multiproc_attach
+      # The other shape, and the one nothing covered: several THREADS of one
+      # process through one mapping. Every multi-process test gets each side its
+      # own file handle; this one does not, and on Windows the writer lock's
+      # intra-process exclusion rests entirely on `LockFileEx` over a SHARED
+      # handle. That was a claim in a comment until #165 (and it holds).
+      - name: stage 2b — writer threads inside one process
+        run: cargo test -p mpedb-core --test threads_one_process
       - name: the differential oracle's one shell dependency
         run: choco install sqlite -y --no-progress
       # `-p mpedb-testkit` carries the curated sqllogictest files AND the
