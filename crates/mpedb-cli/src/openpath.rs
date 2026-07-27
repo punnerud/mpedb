@@ -948,7 +948,7 @@ fn run_direct(p: &Path, rest: &[String]) -> CliResult {
         }
         [] => {
             use std::io::BufRead as _;
-            let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+            let interactive = crate::line::stdin_is_tty();
             let stdin = std::io::stdin();
             for line in stdin.lock().lines() {
                 if interactive {

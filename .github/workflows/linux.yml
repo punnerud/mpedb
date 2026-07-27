@@ -110,6 +110,15 @@ jobs:
       #
       # wasm32 stays at `check`: its arm has no lint history and `check` is what
       # catches the failure mode that actually occurred (overlapping cfgs).
+      #
+      # WHAT THIS CANNOT CATCH, and it bit: `-gnu` and `-msvc` disagree about
+      # what `libc` exposes. mingw's libc carries the POSIX names, so
+      # `libc::STDIN_FILENO` compiles here and fails on the MSVC toolchain CI
+      # actually uses. Cross-checking `-msvc` from Linux is not available
+      # either — blake3's build script needs the MSVC toolchain — so this class
+      # belongs to the real Windows job by construction. The mitigation that IS
+      # in our hands is to keep `libc` out of the Windows build entirely, which
+      # `mpedb-cli` now does (every use sits behind `cfg(unix)`).
       - name: the engine must COMPILE for Windows and wasm32
         run: |
           rustup target add wasm32-unknown-unknown

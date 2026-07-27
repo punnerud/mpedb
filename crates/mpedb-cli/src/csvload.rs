@@ -641,7 +641,7 @@ pub fn choose(forced: Option<Action>, t: &CsvTable, target: &Path, src: &Path) -
         return a;
     }
     eprintln!("{}", t.summary(src));
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+    if !crate::line::stdin_is_tty() {
         eprintln!(
             "no tty: analysing in memory (nothing is written). \
              Use --import to load it into {} instead.",

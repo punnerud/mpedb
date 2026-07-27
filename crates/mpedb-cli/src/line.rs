@@ -182,6 +182,7 @@ enum Key {
 /// line discipline in the way. `libc::read` rather than `std::io::stdin()`
 /// because the latter buffers, and a buffer here would swallow keys rustyline
 /// still has to see.
+#[cfg(unix)]
 fn read_byte() -> Option<u8> {
     let mut b = [0u8; 1];
     loop {
@@ -196,7 +197,24 @@ fn read_byte() -> Option<u8> {
     }
 }
 
+/// Windows never reaches the raw-key reader — [`stdin_is_tty`] is false there,
+/// so the source is the plain line reader. Kept as a refusal rather than a
+/// console port: `ReadConsoleInput` is a different model (records, not bytes)
+/// and belongs with a real console arm, not with a stub that pretends fd 0
+/// exists.
+#[cfg(not(unix))]
+fn read_byte() -> Option<u8> {
+    None
+}
+
 /// Does stdin come from a terminal?
+///
+/// The ONE place that asks. It used to be asked in three, each spelling
+/// `libc::isatty(libc::STDIN_FILENO)` — which compiles for
+/// `x86_64-pc-windows-gnu` (mingw's libc has the POSIX names) and does NOT for
+/// `-msvc`, where `STDIN_FILENO` does not exist. The cross-compile guard uses
+/// `-gnu` and therefore cannot see that difference; only the real Windows job
+/// can (#159 stage 4).
 ///
 /// The whole raw-mode editor hangs off this: false and the source is
 /// `stdin().lock().lines()`, which is what every non-interactive caller — a
@@ -205,7 +223,7 @@ fn read_byte() -> Option<u8> {
 /// beneath it (`GetConsoleMode`, `ReadConsoleInput`) are a console port, not
 /// part of the crash-harness work. The CLI works there; it just does not edit
 /// lines.
-fn stdin_is_tty() -> bool {
+pub(crate) fn stdin_is_tty() -> bool {
     #[cfg(unix)]
     {
         unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
