@@ -113,6 +113,12 @@ jobs:
       - name: the engine must COMPILE for Windows and wasm32
         run: |
           rustup target add wasm32-unknown-unknown
+          # mingw is needed because the facade and the CLI pull `libsqlite3-sys`
+          # (the bundled sqlite behind overlay/differential), whose build script
+          # compiles C *for the target*. `check`/`clippy` do not link, but a
+          # build script still has to run. This passed on my box and failed here
+          # for exactly that reason — the dev box already had mingw for Wine.
+          sudo apt-get install -y -qq mingw-w64
           # clippy is a HOST component — `rustup component add clippy --target
           # <T>` is an error, not a no-op. Cross-linting needs only the target's
           # std, which the step above already installed.
