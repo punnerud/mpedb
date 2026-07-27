@@ -72,6 +72,39 @@ fn park(s: &mut WriteSession, kind: ConflictKind, op: &NetOp, now: i64) -> Resul
     s.sys_record_put(state::MIR_NS, &state::park_key(op.table_id, &kc), &rec.encode())
 }
 
+/// Roll back a FAILED per-row op — or refuse to, and say so (#162).
+///
+/// The mirror applies a whole batch in ONE transaction, so from the second row
+/// onward the session is dirty. `rollback_to` restores roots and page
+/// accounting, which cannot undo an in-place mutation of an already-dirty page:
+/// a failing insert that COWed a cold leaf leaves that copy linked while the
+/// rollback re-offers it, and one allocation later two trees share a page
+/// (#160, the ring's version of the same mistake).
+///
+/// `insert_row` does undo itself logically on the constraint classes this
+/// path parks (`undo_partial_insert`), which is why the rollback is usually
+/// redundant AND harmless. But `park_kind_for` parks EVERY error, `DbFull`
+/// included, and a `DbFull` mid-split is not undone by anything. So the engine
+/// is asked rather than assumed: when the undo is not exact, the batch is
+/// abandoned. The cursor was not advanced, so re-running the pull retries from
+/// where it left off — losing a batch's work is the cheap outcome here.
+pub(crate) fn undo_or_abort(
+    s: &mut WriteSession,
+    sp: mpedb_core::TxnSavepoint,
+    what: &str,
+) -> Result<()> {
+    if !s.undo_is_exact(&sp) {
+        return Err(Error::Unsupported(format!(
+            "mirror: {what} failed after allocating from a dirty transaction, so \
+             the cheap undo is not exact (#162). The batch is abandoned rather \
+             than committed with a page two trees can reach; re-run and it \
+             retries from the stored cursor."
+        )));
+    }
+    s.rollback_to(sp);
+    Ok(())
+}
+
 /// Apply `batch` (pulled starting from cursor `from`) to `db`. Advances
 /// `mir\0cur` to `batch.end_cursor` atomically with the row writes.
 pub fn apply_batch(db: &Database, from: &Cursor, batch: &PullBatch) -> Result<ApplyStats> {
@@ -143,6 +176,7 @@ pub fn apply_batch(db: &Database, from: &Cursor, batch: &PullBatch) -> Result<Ap
     //    stricter CHECK/NOT NULL/type rule or a unique block), roll it back,
     //    restore the pre-delete local row so it never vanishes, and PARK the
     //    offender — the batch keeps going instead of wedging on one bad row.
+    //
     for (i, old) in upserts {
         let NetOpKind::Upsert(row) = &batch.ops[i].kind else {
             unreachable!("upserts holds only upsert ops")
@@ -152,11 +186,11 @@ pub fn apply_batch(db: &Database, from: &Cursor, batch: &PullBatch) -> Result<Ap
             Ok(()) => stats.upserts += 1,
             Err(e) => {
                 let kind = park_kind_for(&e);
-                s.rollback_to(sp);
+                undo_or_abort(&mut s, sp, "an upsert")?;
                 if let Some(oldrow) = old {
                     let sp2 = s.savepoint();
                     if s.insert_row(batch.ops[i].table_id, &oldrow).is_err() {
-                        s.rollback_to(sp2);
+                        undo_or_abort(&mut s, sp2, "restoring the pre-delete row")?;
                     }
                 }
                 park(&mut s, kind, &batch.ops[i], now)?;

@@ -20,6 +20,7 @@ use mpedb_core::cdc;
 use mpedb_types::{keycode, Result, Value};
 
 use crate::adapter::{NetOp, NetOpKind, SourceAdapter};
+use crate::apply::undo_or_abort;
 use crate::conflicts::{self, Parked};
 use crate::state;
 
@@ -121,11 +122,17 @@ fn take_source<A: SourceAdapter + ?Sized>(
                             stats.took_source += 1;
                         }
                         Err(_) => {
-                            s.rollback_to(sp);
+                            // #162: see `apply::apply_batch`. The session is
+                            // already dirty here, so a failing insert that
+                            // allocated cannot be undone by restoring roots —
+                            // the cheap rollback would re-offer a page the tree
+                            // still links (#160). Abandon the resolve run and
+                            // say why; the parks are still there to retry.
+                            undo_or_abort(&mut s, sp, "taking the source row")?;
                             if let Some(o) = old {
                                 let sp2 = s.savepoint();
                                 if s.insert_row(table_id, &o).is_err() {
-                                    s.rollback_to(sp2);
+                                    undo_or_abort(&mut s, sp2, "restoring the local row")?;
                                 }
                             }
                             stats.still_parked += 1;

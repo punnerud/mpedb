@@ -391,8 +391,23 @@ impl Database {
                     any = true;
                 }
                 // A real overlap, or an offset the value cannot hold. One
-                // member's problem, rolled back to just before it.
+                // member's problem, rolled back to just before it — WHEN that
+                // rollback is exact (#162). From the second member onward the
+                // session is dirty, so a failing splice that allocated leaves
+                // the copy linked while the rollback re-offers it (#160). The
+                // whole batch fails rather than committing a page two trees can
+                // reach; the caller resubmits, which is what it already does
+                // for a `WriteConflict` on the batch as a whole.
                 Err(Error::WriteConflict) | Err(Error::TypeMismatch(_)) => {
+                    if !session.undo_is_exact(&sp) {
+                        return Err(Error::Unsupported(
+                            "submit_batch: a member failed after allocating from \
+                             a dirty transaction, so the per-member undo is not \
+                             exact (#162). The batch is refused rather than \
+                             committed with a shared page — resubmit it."
+                                .into(),
+                        ));
+                    }
                     session.rollback_to(sp);
                     out[i] = EditVerdict::Lost { at_txn: self.snapshot_txn() };
                 }

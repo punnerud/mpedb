@@ -2962,8 +2962,24 @@ impl WriteSession<'_> {
     }
 
     /// Roll back to a savepoint taken in this session.
+    ///
+    /// **Check [`undo_is_exact`](Self::undo_is_exact) first.** This is the cheap
+    /// undo: it restores roots and page accounting, which does not cover an
+    /// in-place mutation of a page that was already dirty. Calling it when the
+    /// undo is not exact re-offers a page the tree still links (#160), and the
+    /// engine's `debug_assert` will say so in a debug build.
     pub fn rollback_to(&mut self, sp: mpedb_core::TxnSavepoint) {
         self.txn.rollback_to(sp)
+    }
+
+    /// Can [`rollback_to`](Self::rollback_to) undo everything since `sp`
+    /// exactly? See `mpedb_core::WriteTxn::undo_is_exact` — nothing allocated
+    /// since, or the transaction was pristine when the savepoint was taken.
+    ///
+    /// A caller that rolls back a FAILED operation and keeps going must consult
+    /// this: "the operation failed" is not "the operation changed nothing".
+    pub fn undo_is_exact(&self, sp: &mpedb_core::TxnSavepoint) -> bool {
+        self.txn.undo_is_exact(sp)
     }
 
     /// Store a namespaced system record through THIS transaction (atomic with
