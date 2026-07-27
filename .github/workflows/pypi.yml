@@ -30,6 +30,25 @@ jobs:
         run: cargo test --manifest-path crates/mpedb-capi/Cargo.toml
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # The binding's OWN suite, not just the Rust crate that backs it. Run
+      # TWICE against one directory — its documented mode, and how it exercises
+      # persistence across process restarts (that second run is what caught
+      # #163: live DDL leaving a table behind).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
+      - name: the python suite, twice against one directory
+        run: |
+          set -e
+          pip install --find-links dist --no-index mpedb
+          d=$(mktemp -d)
+          python crates/mpedb-py/pytest/test_mpedb.py "$d"
+          python crates/mpedb-py/pytest/test_mpedb.py "$d"
+          python crates/mpedb-py/pytest/test_sync.py "$(mktemp -d)"
 
   # Linux wheels: x86-64 plus the two ARM shapes the engine is actually
   # crash-tested on (aarch64 and 32-bit armv7 — the Raspberry Pi pair).

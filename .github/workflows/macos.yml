@@ -39,3 +39,43 @@ jobs:
         run: |
           cargo test --manifest-path crates/mpedb-capi/Cargo.toml
           cargo clippy --manifest-path crates/mpedb-capi/Cargo.toml --all-targets -- -D warnings
+      # The crash harnesses, the same six Windows runs. They were run here by
+      # HAND and reported in the README's platform table, which is not the same
+      # as running: crash-safety is the product, macOS's writer lock is a
+      # DIFFERENT construction (FLD-2, no robust mutex), and a claim nothing
+      # re-checks is a claim about the day it was made. They are CLI
+      # subcommands rather than tests, so `cargo test` never reaches them.
+      #
+      # Kept short deliberately — the point is that the mechanism holds on this
+      # lock, not to out-soak the Linux box, which runs them longer.
+      - name: the crash harnesses
+        shell: bash
+        run: |
+          set -e
+          cargo build -p mpedb-cli
+          B=target/debug/mpedb
+          run() { d=$(mktemp -d); echo "--- $*"; "$B" "$@" --dir "$d"; rm -rf "$d"; }
+          run crash --waves 3 --children 4
+          run stress --workers 4 --secs 8 --mode mixed
+          run powerloss --rounds 3 --workers 2 --durability wal
+          run powerloss --rounds 2 --workers 2 --durability async
+          run queue-collide --secs 8
+          run mirror-collide --mode pull --writers 2 --secs 8
+          run collide --writers 4 --total 400 --drop-rate 0 --durability commit
+          run collide --writers 4 --total 400 --durability wal
+          d=$(mktemp -d); "$B" tier crash --dir "$d" --waves 2; rm -rf "$d"
+      - name: the CLI end to end
+        shell: bash
+        run: |
+          set -e
+          B=target/debug/mpedb
+          d=$(mktemp -d); f="$d/app.mpedb"
+          "$B" "$f" "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"
+          "$B" "$f" "INSERT INTO t (id, s) VALUES (1, 'a')"
+          "$B" "$f" "INSERT INTO t (id, s) VALUES (2, 'b')"
+          test "$("$B" "$f" "SELECT count(*) FROM t" | tail -1)" = 2
+          "$B" prepare "$f" "SELECT s FROM t WHERE id = ?"
+          "$B" dump "$f" | grep -q 'name = "t"'
+          "$B" "$f" "DROP TABLE t"
+          ! "$B" dump "$f" | grep -q 'name = ""'
+          rm -rf "$d"

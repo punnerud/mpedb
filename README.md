@@ -199,6 +199,82 @@ than either ancestor. It is not there yet; see Status.
 > `DESIGN*.md` docs), but this is not production-hardened software. Treat it as a
 > serious experiment.
 
+### "It's a one-person 0.1.x — if it breaks, I'm alone with it"
+
+That is the right objection, and it is worth separating into the part that is
+true and the part that is an assumption.
+
+**The true part.** This is version 0.1.x with one author. There is no
+community, no track record in production, and no second pair of eyes that has
+not been asked for. Anything below is about how *fixable* a defect is, never
+about how many there are.
+
+**The assumption.** "Small project" is usually shorthand for "no specification"
+— when something misbehaves, you argue about what it was supposed to do, and
+that argument is what you cannot outsource. Here the specification is external
+and executable, and none of it was written by this project:
+
+| what pins the behaviour | scale | current | where it runs |
+|---|---|---|---|
+| sqlite's own **sqllogictest** corpus, run differentially | 5.94 M records attempted | **99.9765 % pass, 0 wrong answers, 0 error mismatches** ([COMPAT.md](COMPAT.md)) | by hand at a named commit; a curated subset rides `cargo test` |
+| the **differential oracle** — the bundled sqlite3 answering the same generated program in-process | every run | any divergence is a record with both engines' answers next to it | in `cargo test --workspace`: Linux on every push, macOS and Windows nightly |
+| the **three-way** arm, adding a throwaway PostgreSQL 16 cluster | every run where a cluster can start | catches what sqlite alone cannot: the strictness a deploy will apply | Linux; it SKIPS loudly, by name, where PostgreSQL is absent |
+| **CPython's `test_sqlite3`** — the authoritative test of the DB-API surface | 467 tests stock 3.53.1 passes | **459/467** through the C-API shim ([C-API-COMPAT.md](C-API-COMPAT.md)) | by hand on the M3 |
+| **Django 5.2**'s own suite, 9 labels, mpedb as the database | 831 tests + `queries` 493 | **831/831** and **493/493** on the M3 (830/831 on the Linux runner) | by hand |
+
+A defect on that surface does not arrive as a hunch. It arrives as a named
+failing record with the answer sqlite gives sitting beside it, reproducible by
+one command. That is the shape of problem a careful engineer, or an AI agent,
+closes in a loop: change, re-run the corpus, keep the number that went up. The
+expensive kind of bug is the one where the correct answer has to be *invented*,
+and on the SQL and DB-API surface somebody else's test suite already answers it.
+
+Be precise about what runs where, because it is easy to overclaim. The full
+corpus and the two ecosystem suites are run **by hand** at named commits, not in
+CI. What CI runs on **all three** platforms is `cargo test --workspace` (which
+carries the curated sqllogictest files and the differential tester), all six
+`SIGKILL` harnesses, and the CLI end to end. The Python wheel's own suite runs
+on Linux and Windows; macOS is the gap, and it is a build-config one
+(`-undefined dynamic_lookup` for the PyO3 cdylib), not an engine one. See
+[Platforms](#platforms).
+
+**Where that argument stops, and it matters.** No external suite covers the part
+of mpedb that is not sqlite: several processes writing one file, MVCC snapshots,
+the commit path, crash-safety under `SIGKILL`. There is no corpus to borrow, so
+those are held up by this project's own harnesses (`stress`, `crash`,
+`powerloss`, `collide`, `queue-collide`, `mirror-collide` — all six on all three
+platforms) and by adversarial design review. That is exactly where the genuinely
+hard defects have been: an unbounded high-water leak under concurrent churn
+(#37), a statement-atomicity hole in the group-commit ring (#119), and a page
+shared between two trees that took four writer processes to reproduce (#160).
+Each was found by a harness, not by a corpus, and each took real diagnosis. If
+you are betting on this engine, that is the surface to be sceptical about — not
+whether `strftime('%j', …)` matches.
+
+**So what should you actually do?** Not switch. Add it as a second opinion:
+
+1. **Keep sqlite3 as your default; run the test suite against mpedb too.** The
+   rigid schema is the point — it fails on the string in an `IntegerField`, the
+   missing `null=False`, the value that will not fit PostgreSQL's `int4`, at the
+   moment you write it rather than at deploy. `import mpedb as sqlite3` is the
+   whole change — but read [PY-COMPAT.md](PY-COMPAT.md) first for how far that
+   actually carries: two real projects' suites were swapped this way and the
+   scores are honest rather than flattering (diskcache 67 of 87 at 0.1.3,
+   sqlitedict 2 of 89), because what blocks is a small fixed *connection
+   bootstrap ritual* — `PRAGMA journal_mode` and friends — that runs before any
+   query. The headline finding there is the one that matters for using it as an
+   oracle: **zero silent wrong answers across all three suites**. Every
+   divergence was a loud exception.
+2. **Use `mpedb mirror` to pre-flight the migration you are actually worried
+   about** — it validates schema and data against a real PostgreSQL before you
+   run it for real.
+3. **Only then consider making it the primary local database**, and only if
+   multi-process local writes are something you actually want.
+
+The honest summary: use it as a sharpening layer during development, not as a
+replacement. What it is *not* is a black box — every claim in this README has a
+command under it, and the ones about performance have a control arm.
+
 ## Highlights
 
 **Many processes writing one file, and none of them has to cope with that.**
@@ -342,14 +418,23 @@ rather than unit tests.
   `mirror-collide`) run nightly on `windows-latest` — they turned out not to be
   `fork`-bound at all; `mpedb-cli` contains no `fork`. Porting them needed two
   seam functions, and the first thing they found was a corruption that was ours
-  on every platform (#160). See `design/DESIGN-WINDOWS.md`.
+  on every platform (#160). The sqlite interop lock speaks the same protocol
+  there as on POSIX — the lock bytes are sqlite's, not a VFS's — so the overlay's
+  cross-engine contract (a foreign sqlite writer gets `SQLITE_BUSY`) holds on
+  Windows too. The CLI and the Python wheel run in CI as well.
+  **Not measured there:** every concurrency claim in
+  [Performance](#performance) is from Linux and the M3. Windows is proven to
+  *work* concurrently — four writer processes, MVCC readers, the whole harness
+  set — and its throughput against sqlite3 is simply unknown, because a shared
+  CI runner is not a place this project is willing to publish a number from.
+  See `design/DESIGN-WINDOWS.md`.
 
 Platform claims are verified on real hardware, and the table says which hardware:
 
 | platform | what has actually run there |
 |---|---|
 | Linux x86-64 | everything: `cargo test --workspace`, clippy, the `stress`/`crash`/`powerloss`/`collide` harnesses across `none`/`commit`/`wal`, the 3-way differential |
-| macOS / Apple Silicon (M3) | `cargo test --workspace`, clippy, the `crash` harness under SIGKILL waves across all durability classes (`eowner_recovery=true`), the benchmark suite |
+| macOS / Apple Silicon (M3) | `cargo test --workspace`, clippy, and all six crash harnesses in CI (`eowner_recovery=true` — the FLD-2 writer lock is a different construction from Linux's robust mutex, so this is not a formality), plus the benchmark suite by hand |
 | **Linux armv7l (32-bit ARM)** | 318 cross-compiled tests, 0 failures — including the whole `mpedb-core` shm/btree/COW suite — plus `examples/multiproc_check.rs`: 4 SIGKILL waves against 3 concurrent writer processes, `verify()` clean after each. A Raspberry Pi 3 B+, kernel 6.1. |
 | **Windows x86-64** | the engine's unit tests, four multi-process properties (mapping coherence, writer exclusion, cross-process MVCC snapshots, owner death), two durability arms (`commit`/`wal`, killed writer, third process reopens), the facade's ~1100 integration tests, and all six crash harnesses (`crash`, `stress`, `powerloss` ×2, `collide` ×2, `queue-collide`, `mirror-collide`, `tier crash`) — all on `windows-latest` in CI |
 | Linux aarch64 (64-bit ARM) | **nothing yet.** Covered by inference from the other three, which is exactly the kind of claim this table exists to stop making. |
