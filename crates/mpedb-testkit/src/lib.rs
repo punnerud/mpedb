@@ -268,8 +268,23 @@ impl TempDir {
     }
 
     /// Path for a database file inside this directory (`.mpedb` extension).
+    ///
+    /// Spelled with forward slashes on Windows, for the same reason
+    /// [`scratch_base`] is: this lands inside a TOML `path = "..."` at nearly
+    /// every call site, and `PathBuf::join` inserts a BACKSLASH. `scratch_base`
+    /// protects the base; joining onto it undoes that protection, which is why
+    /// guarding only the base was not enough (#159, found on the fourth
+    /// instance).
+    ///
+    /// The failure is worse than a parse error, and that is the reason this is
+    /// fixed HERE and not at the call sites. `\b`, `\t`, `\n`, `\r`, `\f`
+    /// are all VALID TOML escapes — so `dir.join("bug.mpedb")` parses happily
+    /// into a string containing a literal backspace, and the caller opens a
+    /// path nobody named. It surfaced as `InvalidFilename` from the OS, a long
+    /// way from the interpolation that caused it. A name starting with any
+    /// other letter would simply have been wrong in silence.
     pub fn db_path(&self, name: &str) -> PathBuf {
-        self.path.join(format!("{name}.mpedb"))
+        PathBuf::from(windows_safe(&self.path.join(format!("{name}.mpedb")), false))
     }
 }
 
