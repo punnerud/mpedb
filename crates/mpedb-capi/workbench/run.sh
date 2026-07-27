@@ -5,9 +5,22 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
-SO="$ROOT/target/release/libmpedb_sqlite3.so"
+# `mpedb-capi` is its OWN cargo workspace — it exports `sqlite3_*` and cannot
+# co-link the bundled sqlite the parent's feature unification pulls in (see
+# CLAUDE.md). So it builds by manifest path, and its artifacts land in ITS
+# target dir, not the parent's. This script used to say `-p mpedb-capi` from
+# the root, which stopped resolving the day that split happened.
+CAPI="$ROOT/crates/mpedb-capi"
 VENV="${WB_VENV:-/tmp/wb-venv}"
-( cd "$ROOT" && cargo build --release -p mpedb-capi ) || exit 1
+cargo build --release --manifest-path "$CAPI/Cargo.toml" || exit 1
+# Ask cargo where the artifact went rather than guessing: a `target-dir` in
+# ~/.cargo/config.toml (this project's dev boxes use one) moves it out of the
+# crate tree entirely, and the old hard-coded `$ROOT/target/...` then pointed at
+# a path that does not exist.
+SO="$(cargo metadata --format-version 1 --no-deps \
+        --manifest-path "$CAPI/Cargo.toml" \
+      | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/release/libmpedb_sqlite3.so"
+[ -f "$SO" ] || { echo "no shim at $SO" >&2; exit 1; }
 [ -d "$VENV" ] || python3 -m venv "$VENV"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
 "$VENV/bin/pip" install --quiet "django>=5,<6"

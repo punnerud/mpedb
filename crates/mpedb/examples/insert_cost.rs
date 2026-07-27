@@ -119,6 +119,31 @@ fn main() {
         let _ = std::fs::remove_file(&p);
     }
 
+    // B2: the shape the C-API shim actually runs (#168). With a transaction
+    // open, `sqlite3_step` routes to `WriteSession::query(text, params)`
+    // (capi/src/lib.rs) — SQL text, inside a txn. That is every ORM, and it is
+    // a different code path from arm A: it compiles against the SESSION's
+    // schema view, so #166's memo did not reach it.
+    {
+        let (db, p) = open(&dir, "txnquery");
+        let t = Instant::now();
+        let mut i = 0i64;
+        for _ in 0..(rows / 10) {
+            let mut s = db.begin().unwrap();
+            for _ in 0..10 {
+                s.query(SQL, &[Value::Int(i), Value::Text(format!("v{i}"))]).unwrap();
+                i += 1;
+            }
+            s.commit().unwrap();
+        }
+        out.push((
+            "session.query(sql) — 10/txn, the shim's shape",
+            us_per(t, (rows / 10) * 10),
+        ));
+        drop(db);
+        let _ = std::fs::remove_file(&p);
+    }
+
     // C+D: the same hot path with the commit amortised over a batch.
     for batch in [10u64, 100] {
         let (db, p) = open(&dir, &format!("batch{batch}"));

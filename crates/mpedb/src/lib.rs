@@ -1587,6 +1587,7 @@ impl Database {
             session: Session::empty(),
             poisoned: false,
             savepoints: Vec::new(),
+            ddl_applied: false,
         })
     }
 
@@ -2030,7 +2031,8 @@ impl Database {
         let hash = plan.hash();
         let plan = self.register(hash, plan, sql)?;
         if memoizable {
-            self.remember(sql, &plan, hash)?;
+            let gen = self.cache_gen.load(std::sync::atomic::Ordering::Relaxed);
+            self.remember(gen, sql, &plan, hash)?;
         }
         let full = session::resolve_params_timed(&plan, params, session)?;
         self.run_plan(Some(&hash), &plan, &full)
@@ -2070,7 +2072,15 @@ impl Database {
     }
 
     /// Record what `sql` compiled to, so the next call can skip deriving it.
-    fn remember(&self, sql: &str, plan: &CompiledPlan, hash: PlanHash) -> Result<()> {
+    /// `gen` is the schema generation the plan was actually COMPILED against,
+    /// passed in rather than read here because the two callers learn it
+    /// differently: autocommit from `cache_gen` (which `gate_cache_on_schema`
+    /// just refreshed), an in-transaction statement from its txn's own schema
+    /// bundle (#168). Reading `cache_gen` here would stamp a session's entry
+    /// with whatever generation this handle last gated on — possibly older than
+    /// the catalog the plan was built from, which is the one direction that
+    /// cannot be allowed to be wrong.
+    fn remember(&self, gen: u64, sql: &str, plan: &CompiledPlan, hash: PlanHash) -> Result<()> {
         // A host-UDF plan is deliberately connection-local and never enters the
         // shared registry; `cached_or_load_tls` would go looking for it there on
         // a fresh handle. Leave those to the compile path, which is where their
@@ -2079,7 +2089,7 @@ impl Database {
             return Ok(());
         }
         let entry = TextMemo {
-            gen: self.cache_gen.load(std::sync::atomic::Ordering::Relaxed),
+            gen,
             tables: self.plan_tables(plan)?,
             hash,
             used: std::sync::atomic::AtomicBool::new(true),
@@ -2370,6 +2380,7 @@ impl Database {
             session: session.clone(),
             poisoned: false,
             savepoints: Vec::new(),
+            ddl_applied: false,
         })
     }
 
@@ -2899,6 +2910,19 @@ pub struct WriteSession<'db> {
     /// (sqlite's shadowing rule) and compare names case-insensitively. The
     /// whole stack is discarded on commit/rollback (both consume the session).
     savepoints: Vec<NamedSavepoint>,
+    /// This transaction has applied DDL, so its schema view (`txn`'s captured
+    /// bundle) has diverged from the committed catalog (#95). It is a one-way
+    /// latch: it disqualifies the session from the SQL-text plan memo for the
+    /// rest of its life, in both directions (#168).
+    ///
+    /// The memo is a map over the COMMITTED catalog — that is what its
+    /// `schema_gen` stamp names, and every other participant reads it that way.
+    /// A plan compiled against uncommitted DDL is not a plan for that catalog:
+    /// remembering `SELECT c FROM t` after an uncommitted `ADD COLUMN c` and
+    /// then rolling back would leave the memo answering for a column that never
+    /// existed. Serving one is the mirror image — the plan would be built for a
+    /// schema this statement is not running against.
+    ddl_applied: bool,
 }
 
 /// One entry on the [`WriteSession`] savepoint stack.
@@ -3075,10 +3099,15 @@ impl WriteSession<'_> {
                     .into(),
             ));
         }
+        let memoizable;
         let routed;
         let sql = match self.db.resolve_db_refs_hook(sql)? {
-            multifile::DbRoute::Passthrough => sql,
+            multifile::DbRoute::Passthrough => {
+                memoizable = true;
+                sql
+            }
             multifile::DbRoute::Main(s) => {
+                memoizable = false;
                 routed = s;
                 &routed
             }
@@ -3104,6 +3133,16 @@ impl WriteSession<'_> {
         if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
             return self.apply_ddl(ddl);
         }
+        // #168: the Django path. The C-API shim routes every statement to this
+        // method whenever a transaction is open (capi/src/lib.rs:599), so
+        // without this an ORM that wraps its work in BEGIN/COMMIT — which is to
+        // say, an ORM — pays a full compile per statement and #166 buys it
+        // nothing.
+        if memoizable {
+            if let Some(res) = self.memoized(origin, sql, params)? {
+                return Ok(res);
+            }
+        }
         // Compile against THIS session's schema view — which includes any DDL
         // this session already applied (its txn's captured bundle), not just the
         // committed schema. Policies/views are read from the committed catalog
@@ -3119,7 +3158,86 @@ impl WriteSession<'_> {
             let mut cache = self.db.cache.write().expect(POISON);
             cache.entry(hash).or_insert_with(|| Arc::new(plan)).clone()
         };
+        if memoizable && !self.ddl_applied {
+            self.db.remember(schema.schema_gen, sql, &plan, hash)?;
+        }
         self.run_from(origin, &plan, params)
+    }
+
+    /// The [`TextMemo`] fast path for a statement inside an open transaction
+    /// (#168) — the in-session twin of [`Database::memoized`]. `Ok(None)` means
+    /// "no usable entry, take the compile road".
+    ///
+    /// Why an in-session hit is the same answer a recompile would give, input
+    /// by input — this is the whole argument, and every clause of it is a
+    /// property of `compile_maybe_explain_with_schema`, not a new promise:
+    ///
+    /// * **schema** — the txn's bundle. Equal to the committed catalog exactly
+    ///   while `ddl_applied` is false, which is what gates this method. The
+    ///   session holds the single writer lock, so no peer can move the
+    ///   committed schema underneath it either.
+    /// * **row counts** — that function reads them off an INDEPENDENT read
+    ///   snapshot of the last committed state, deliberately, so this session's
+    ///   own uncommitted row deltas cannot move a plan (lib.rs, its comment
+    ///   says so in as many words). [`Database::plan_tables`] reads the same
+    ///   way. They agree by construction rather than by luck.
+    /// * **policies and views** — read from the COMMITTED catalog on both
+    ///   paths; a policy created inside this uncommitted session is not visible
+    ///   to either. Same for the per-table policy epoch in the memo key.
+    ///
+    /// No `gate_cache_on_schema` here, for the same reason
+    /// `compile_maybe_explain_with_schema` skips it: the writer lock is held,
+    /// so the committed generation cannot move for the session's lifetime.
+    /// The generation compared against is the txn bundle's own, not this
+    /// handle's `cache_gen`, which nothing refreshes while a session is open.
+    fn memoized(
+        &mut self,
+        origin: Option<u64>,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<ExecResult>> {
+        if self.ddl_applied {
+            return Ok(None);
+        }
+        let schema = self.txn.schema_bundle();
+        let gen = schema.schema_gen;
+        let (hash, tables) = {
+            let memo = self.db.text_memo.read().expect(POISON);
+            match memo.get(sql) {
+                Some(e) if e.gen == gen => (e.hash, e.tables.clone()),
+                _ => return Ok(None),
+            }
+        };
+        // A miss, never an error — same rule as the autocommit path, with one
+        // more way to get here: a plan first compiled INSIDE a session is never
+        // published to the shared registry (that would need its own write txn
+        // while this one holds the lock), so once it falls out of the local
+        // cache the hash resolves to nothing.
+        let Ok(plan) = self.plan_by_hash(&hash) else {
+            return Ok(None);
+        };
+        if self.db.plan_tables(&plan)? != tables {
+            return Ok(None);
+        }
+        if verify_plan_memo() {
+            let (fresh, _) = self
+                .db
+                .compile_maybe_explain_with_schema(sql, &schema)
+                .map_err(|e| {
+                    Error::Internal(format!(
+                        "#168: in-txn memo served a plan for {sql:?} that no \
+                         longer compiles: {e}"
+                    ))
+                })?;
+            assert_eq!(
+                fresh.hash(),
+                hash,
+                "#168: in-txn memo served a stale plan for {sql:?} — a compile \
+                 input moved without moving `schema_gen` or this plan's table facts"
+            );
+        }
+        self.db.warn_if_risky(&plan);
+        self.run_from(origin, &plan, params).map(Some)
     }
 
     /// Commit everything written through this session.
@@ -3654,6 +3772,19 @@ impl WriteSession<'_> {
                     self.poisoned = true;
                     return Err(e);
                 }
+                // This session's view has left the committed catalog behind.
+                self.ddl_applied = true;
+                // `cache` only — and this is the ONE clear site that must not
+                // also drop the text memo (#168). The memo is keyed to the
+                // COMMITTED generation, and this DDL is not committed: its
+                // `schema_gen` bump rides the txn and lands at commit, where
+                // the next `gate_cache_on_schema` drops both. Until then the
+                // memo's entries still describe the catalog every reader
+                // outside this transaction sees, and a ROLLBACK leaves them
+                // correct — throwing them away here would discard live entries
+                // to invalidate nothing. The hash cache is cleared anyway
+                // because plans in it are reachable BY HASH from inside this
+                // session, where the uncommitted schema does apply.
                 self.db.cache.write().expect(POISON).clear();
                 Ok(res)
             }
