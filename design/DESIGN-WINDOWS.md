@@ -217,6 +217,23 @@ else follows it.
    managed: the harnesses are not a Windows chore, they are the only thing that
    exercises this, and CI does not run them because they are CLI subcommands
    rather than tests.
+
+   **The one genuinely Windows-shaped defect in stage 4 was in the kill
+   itself.** A child can die hard two ways — it kills ITSELF at a chosen
+   instant (`crash`, `collide`, `tier`), or the PARENT kills it (`powerloss`,
+   `queue-collide`, `mirror-collide`). On Unix both are SIGKILL, so one
+   predicate covers them. On Windows they are different exit codes, because
+   `Child::kill` is `TerminateProcess(handle, 1)` — and 1 is also the CLI's
+   "runtime error" code, so "we killed it" and "it failed on its own" become
+   the same observation. `powerloss` reported every worker as having "hit an
+   error before the kill", with an empty stderr, which is what that collision
+   looks like from the outside.
+
+   The fix is `os::hard_kill_child`, which terminates with the SAME code
+   `hard_kill_self` uses, so the harness controls both sides of the
+   distinction rather than trying to infer it. Five of the six harnesses now
+   run in CI on `windows-latest`; the sixth is `collide`, held out only
+   because of #160.
 5. Only then does `windows.yml` stop being a portable-crates job.
 
 Stages 1–3 are tractable and mostly mechanical against an abstraction that

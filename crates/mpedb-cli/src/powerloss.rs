@@ -248,7 +248,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         }
         std::thread::sleep(Duration::from_millis(100 + rng.below(500)));
         for child in &mut children {
-            let _ = child.kill(); // SIGKILL
+            let _ = mpedb_core::hard_kill_child(child);
         }
         let mut unexpected = 0u64;
         let mut out_of_space = 0u64;

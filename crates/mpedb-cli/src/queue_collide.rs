@@ -186,7 +186,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
                 }
                 *slot = spawn(&mut rng)?;
             } else if now_ms() >= slot.kill_at {
-                let _ = slot.child.kill();
+                let _ = mpedb_core::hard_kill_child(&mut slot.child);
                 let _ = slot.child.wait();
                 kills += 1;
                 *slot = spawn(&mut rng)?;
@@ -194,7 +194,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         }
     }
     for slot in &mut slots {
-        let _ = slot.child.kill();
+        let _ = mpedb_core::hard_kill_child(&mut slot.child);
         let _ = slot.child.wait();
     }
     // Any tasks the trickle did not reach (slow machine) go in now — the

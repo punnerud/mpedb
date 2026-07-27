@@ -25,7 +25,7 @@ pub use os::wall_clock_micros;
 /// making `os` public: those harnesses are the only thing outside the engine
 /// with a reason to reach into the platform layer, and they need exactly two
 /// functions.
-pub use os::{died_by_hard_kill, hard_kill_self};
+pub use os::{died_by_hard_kill, hard_kill_child, hard_kill_self};
 
 /// TOML-escape a path so it can be interpolated into a `path = "..."` line.
 ///

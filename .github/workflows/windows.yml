@@ -40,7 +40,7 @@ jobs:
         run: cargo clippy -p mpedb-types -p mpedb-sql --all-targets -- -D warnings
 
   # ---------------------------------------------------------------------
-  # #159 stages 1-3: the ENGINE on real Windows.
+  # #159 stages 1-4: the ENGINE on real Windows.
   #
   # Stage 1 = one process opens a `.mpedb`, reads and writes (`--lib`).
   # Stage 2 = several processes on one file: mapping coherence, writer
@@ -67,9 +67,18 @@ jobs:
   # three tests here would have been cheaper and would have meant Windows never
   # cross-checks the REGEXP surface.
   #
-  # NOT here: stage 4 (the stress/crash/powerloss/collide harnesses, which are
-  # POSIX `fork` + signals). Until it runs, Windows is "compiles and runs", not
-  # "crash-safe" — `Child::kill` takes a process, not the page cache.
+  # Stage 4 is the crash harnesses themselves, and they are NOT `fork`-bound —
+  # `mpedb-cli` contains no `fork` at all (see DESIGN-WINDOWS §2's correction).
+  # Five of six run here. The sixth, `collide`, is left out because it fails —
+  # on LINUX too, on the tagged v0.1.4 and on v0.1.3 before it (#160, a live
+  # page being allocated into two trees). Adding it now would pin a known
+  # corruption as the Windows job's verdict rather than the platform's.
+  #
+  # Kept short on purpose: these are minutes-scale by nature, and this job runs
+  # nightly. The point is that the mechanism works there, not to out-soak the
+  # Linux box.
+  #
+  # Until #160 closes, Windows is "runs the crash harnesses", not "crash-safe".
   windows-engine:
     runs-on: windows-latest
     steps:
@@ -87,5 +96,19 @@ jobs:
         run: choco install sqlite -y --no-progress
       - name: stage 3 — the engine's integration tests and the facade suite
         run: cargo test -p mpedb-core -p mpedb --lib --tests
+      - name: stage 4 — the crash harnesses
+        shell: bash
+        run: |
+          set -e
+          cargo build -p mpedb-cli
+          B=target/debug/mpedb.exe
+          run() { d=$(mktemp -d); echo "--- $*"; "$B" "$@" --dir "$d"; rm -rf "$d"; }
+          run crash --waves 3 --children 4
+          run stress --workers 4 --secs 8 --mode mixed
+          run powerloss --rounds 3 --workers 2 --durability wal
+          run powerloss --rounds 2 --workers 2 --durability async
+          run queue-collide --secs 8
+          run mirror-collide --mode pull --writers 2 --secs 8
+          d=$(mktemp -d); "$B" tier crash --dir "$d" --waves 2; rm -rf "$d"
       - name: clippy the engine
         run: cargo clippy -p mpedb-core --lib -- -D warnings

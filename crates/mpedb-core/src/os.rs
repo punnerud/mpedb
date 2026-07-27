@@ -982,7 +982,36 @@ pub fn hard_kill_self() -> ! {
     }
 }
 
-/// Did this child die by [`hard_kill_self`] rather than exiting?
+/// Kill a CHILD process the same way [`hard_kill_self`] kills this one, so
+/// [`died_by_hard_kill`] recognises both.
+///
+/// `Child::kill` would be the obvious call and is the wrong one on Windows: it
+/// is `TerminateProcess(handle, 1)`, and 1 is also the CLI's "runtime error"
+/// exit code — so a killed child and a child that failed on its own become
+/// indistinguishable, which is precisely the distinction the crash harnesses
+/// exist to make. Unix hides this because both directions are SIGKILL.
+///
+/// Found by `mpedb powerloss` on Windows (#159 stage 4): every worker was
+/// reported as "did not die by SIGKILL … hit an error before the kill", with
+/// an empty stderr, because the parent's own kill was being read as a failure.
+pub fn hard_kill_child(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let h = child.as_raw_handle() as isize;
+        if crate::wincompat::terminate_process(h, crate::wincompat::HARD_KILL_CODE) {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    }
+    #[cfg(not(windows))]
+    {
+        child.kill()
+    }
+}
+
+/// Did this child die by [`hard_kill_self`] or [`hard_kill_child`] rather than
+/// exiting?
 ///
 /// The harnesses need to tell "killed at the chosen instant" (the point of the
 /// test) from "exited on its own" (a child that hit an error first, which is a

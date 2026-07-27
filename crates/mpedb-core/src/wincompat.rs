@@ -316,6 +316,12 @@ pub const HARD_KILL_CODE: u32 = 0xDEAD_C0DE;
 /// leave the mapping's dirty pages to the OS, which writes them back anyway.
 /// That is what makes this a PROCESS-death test and not a power-loss one on
 /// either platform.
+/// `TerminateProcess` on someone else's handle — see
+/// [`crate::os::hard_kill_child`].
+pub fn terminate_process(handle: isize, code: u32) -> bool {
+    unsafe { TerminateProcess(handle, code) != 0 }
+}
+
 pub fn hard_kill_self() -> ! {
     unsafe {
         TerminateProcess(GetCurrentProcess(), HARD_KILL_CODE);

@@ -123,12 +123,12 @@ fn kill_loop(
             daemon = spawn()?;
             continue;
         }
-        let _ = daemon.kill();
+        let _ = mpedb_core::hard_kill_child(&mut daemon);
         let _ = daemon.wait();
         kills += 1;
         daemon = spawn()?;
     }
-    let _ = daemon.kill();
+    let _ = mpedb_core::hard_kill_child(&mut daemon);
     let _ = daemon.wait();
     Ok((kills, bad_exits))
 }
