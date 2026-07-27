@@ -108,27 +108,105 @@ fn main() {
     }
 
     let reps: usize = arg(&args, "--reps", "10").parse().expect("--reps");
-    let writers: usize = arg(&args, "--writers", "4").parse().expect("--writers");
+    // A COMMA LIST, because the shape of the curve is the measurement (#164
+    // step A). Linux's own writer lock spins before blocking, and the comment
+    // that justifies it (`shm.rs`, #109, measured) says two writers is the
+    // WORST case for a park/wake ping-pong and that throughput RISES with more
+    // contention once the ping-pong is bought out. So a sweep separates two
+    // hypotheses that need different fixes: a U-curve (worst at 2, better at 8)
+    // is the handoff, and a monotone decline is per-transaction syscall cost.
+    // One dispatch instead of four, and the arms stay adjacent in time.
+    let writers: Vec<usize> = arg(&args, "--writers", "4")
+        .split(',')
+        .map(|w| w.trim().parse().expect("--writers"))
+        .collect();
     // 0 = threads (the default shape). Non-zero switches to PROCESSES, which is
     // the shape the product's headline claim is about: several processes
     // writing one file without SQLITE_BUSY. Threads and processes go through
     // different halves of the writer lock, so a number for one says nothing
     // about the other (#164).
-    let procs: usize = arg(&args, "--procs", "0").parse().expect("--procs");
+    let procs: Vec<usize> = arg(&args, "--procs", "0")
+        .split(',')
+        .map(|w| w.trim().parse().expect("--procs"))
+        .collect();
     let secs: u64 = arg(&args, "--secs", "2").parse().expect("--secs");
     let dir = PathBuf::from(arg(&args, "--dir", "."));
     std::fs::create_dir_all(&dir).expect("--dir");
 
-    let shape = if procs > 0 {
-        format!("{procs} writer PROCESSES")
-    } else {
-        format!("{writers} writer threads")
-    };
+    let procs_mode = procs.iter().any(|&p| p > 0);
+    let counts: Vec<usize> = if procs_mode { procs } else { writers };
     println!(
-        "runner-noise probe: {reps} paired reps, {shape}, {secs}s per arm\n\
-         non-durable on both sides (mpedb none / sqlite synchronous=OFF+WAL)\n"
+        "runner-noise probe: {reps} paired reps, {secs}s per arm, \
+         {} = {counts:?}\n\
+         non-durable on both sides (mpedb none / sqlite synchronous=OFF+WAL)\n",
+        if procs_mode { "writer PROCESSES" } else { "writer threads" }
     );
 
+    let mut curve: Vec<(usize, f64, f64)> = Vec::new();
+    for n in counts {
+        println!("--- {n} writer{}", if n == 1 { "" } else { "s" });
+        let (med, mean_mp) = run_series(reps, n, procs_mode, secs, &dir);
+        curve.push((n, med, mean_mp));
+    }
+
+    if curve.len() > 1 {
+        // The curve IS the answer, so it gets printed as one thing rather than
+        // left for a reader to assemble from the sections above.
+        println!("\n=== the sweep (#164 step A)");
+        for (n, med, ops) in &curve {
+            println!("  {n:>2} writers: mpedb {ops:>10.0} op/s   ratio {med:.3}");
+        }
+        // What the shape can and cannot settle.
+        //
+        // A U — worst in the middle, recovering by the widest count — is
+        // POSITIVE evidence for the park/wake ping-pong: Linux's writer lock
+        // spins precisely because "two is the worst case there is" and
+        // throughput rises again with more contention (#109, measured).
+        //
+        // The absence of a U proves nothing on its own, and saying otherwise
+        // would be this probe reporting a conclusion its data cannot carry.
+        // The dev box shows a shallow monotone decline WITH the spin already
+        // in place — so monotone is what a bought-out ping-pong looks like too.
+        // What separates the cases is the DEPTH against a control that has the
+        // spin: Linux loses ~20% from 1 to 8 writers. Anything far steeper is
+        // the thing to explain.
+        let one = curve.first().filter(|c| c.0 == 1).map(|c| c.2);
+        let worst = curve.iter().min_by(|a, b| a.2.partial_cmp(&b.2).unwrap()).expect("non-empty");
+        let last = curve.last().expect("non-empty");
+        if let Some(one) = one {
+            println!(
+                "\ndepth: {:.0}% of the 1-writer rate at its worst ({} writers)",
+                100.0 * worst.2 / one,
+                worst.0
+            );
+        }
+        if worst.0 != 1 && worst.0 != last.0 && last.2 > worst.2 * 1.1 {
+            println!(
+                "U-CURVE: throughput bottoms at {} writers and recovers by {}.\n\
+                 That is the park/wake ping-pong Linux spins to avoid (#109) —\n\
+                 the handoff, not per-operation cost. Spinning should move it.",
+                worst.0, last.0
+            );
+        } else {
+            println!(
+                "NO U-CURVE. That does NOT settle it: a bought-out ping-pong is\n\
+                 monotone too. Compare the depth above against a control that\n\
+                 already spins (the Linux arm) — a much steeper decline is the\n\
+                 signal, a similar one means look elsewhere than the handoff."
+            );
+        }
+    }
+}
+
+/// One paired series at a fixed writer count. Returns (median ratio, mean
+/// mpedb ops/s).
+fn run_series(
+    reps: usize,
+    n: usize,
+    procs_mode: bool,
+    secs: u64,
+    dir: &std::path::Path,
+) -> (f64, f64) {
     let mut ratios = Vec::with_capacity(reps);
     let mut mp = Vec::with_capacity(reps);
     let mut sq = Vec::with_capacity(reps);
@@ -136,12 +214,11 @@ fn main() {
     for rep in 0..reps {
         // Alternate which arm goes first: a fixed order would fold "the second
         // arm always runs on a warmer page cache" straight into the ratio.
-        let (n, procs_mode) = if procs > 0 { (procs, true) } else { (writers, false) };
         let mp_arm = |rep: usize| {
-            if procs_mode { run_mpedb_procs(&dir, rep, n, secs) } else { run_mpedb(&dir, rep, n, secs) }
+            if procs_mode { run_mpedb_procs(dir, rep, n, secs) } else { run_mpedb(dir, rep, n, secs) }
         };
         let sq_arm = |rep: usize| {
-            if procs_mode { run_sqlite_procs(&dir, rep, n, secs) } else { run_sqlite(&dir, rep, n, secs) }
+            if procs_mode { run_sqlite_procs(dir, rep, n, secs) } else { run_sqlite(dir, rep, n, secs) }
         };
         let (a, b) = if rep % 2 == 0 {
             (mp_arm(rep), sq_arm(rep))
@@ -220,6 +297,7 @@ fn main() {
              calling it 'paired' does not."
         );
     }
+    (med, mp.iter().sum::<f64>() / mp.len() as f64)
 }
 
 fn mean_cv(xs: &[f64]) -> (f64, f64) {

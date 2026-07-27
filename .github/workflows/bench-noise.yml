@@ -25,7 +25,7 @@ on:
         description: paired repetitions
         default: "10"
       writers:
-        description: concurrent writer THREADS
+        description: 'concurrent writer THREADS — a comma list sweeps: 1,2,4,8'
         default: "4"
       procs:
         description: concurrent writer PROCESSES (non-zero overrides writers)
