@@ -73,14 +73,44 @@ fn arg(args: &[String], name: &str, default: &str) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // CHILD MODE (`--procs`): one worker of one arm, self-timed, printing its
+    // own ops/s and nothing else. Re-invoking this binary rather than forking
+    // is the same fork-free shape `multiproc_attach` uses, and the reason is
+    // the same: `mpedb-cli` and everything that must reach Windows contains no
+    // `fork`.
+    if let Some(arm) = args.windows(2).find(|w| w[0] == "--child").map(|w| w[1].clone()) {
+        let idx: usize = arg(&args, "--idx", "0").parse().expect("--idx");
+        let secs: u64 = arg(&args, "--secs", "2").parse().expect("--secs");
+        let path = PathBuf::from(arg(&args, "--path", ""));
+        let ops = match arm.as_str() {
+            "mpedb" => child_mpedb(&path, idx, secs),
+            "sqlite" => child_sqlite(&path, idx, secs),
+            other => panic!("--child {other}?"),
+        };
+        println!("{ops}");
+        return;
+    }
+
     let reps: usize = arg(&args, "--reps", "10").parse().expect("--reps");
     let writers: usize = arg(&args, "--writers", "4").parse().expect("--writers");
+    // 0 = threads (the default shape). Non-zero switches to PROCESSES, which is
+    // the shape the product's headline claim is about: several processes
+    // writing one file without SQLITE_BUSY. Threads and processes go through
+    // different halves of the writer lock, so a number for one says nothing
+    // about the other (#164).
+    let procs: usize = arg(&args, "--procs", "0").parse().expect("--procs");
     let secs: u64 = arg(&args, "--secs", "2").parse().expect("--secs");
     let dir = PathBuf::from(arg(&args, "--dir", "."));
     std::fs::create_dir_all(&dir).expect("--dir");
 
+    let shape = if procs > 0 {
+        format!("{procs} writer PROCESSES")
+    } else {
+        format!("{writers} writer threads")
+    };
     println!(
-        "runner-noise probe: {reps} paired reps, {writers} writer threads, {secs}s per arm\n\
+        "runner-noise probe: {reps} paired reps, {shape}, {secs}s per arm\n\
          non-durable on both sides (mpedb none / sqlite synchronous=OFF+WAL)\n"
     );
 
@@ -91,11 +121,18 @@ fn main() {
     for rep in 0..reps {
         // Alternate which arm goes first: a fixed order would fold "the second
         // arm always runs on a warmer page cache" straight into the ratio.
+        let (n, procs_mode) = if procs > 0 { (procs, true) } else { (writers, false) };
+        let mp_arm = |rep: usize| {
+            if procs_mode { run_mpedb_procs(&dir, rep, n, secs) } else { run_mpedb(&dir, rep, n, secs) }
+        };
+        let sq_arm = |rep: usize| {
+            if procs_mode { run_sqlite_procs(&dir, rep, n, secs) } else { run_sqlite(&dir, rep, n, secs) }
+        };
         let (a, b) = if rep % 2 == 0 {
-            (run_mpedb(&dir, rep, writers, secs), run_sqlite(&dir, rep, writers, secs))
+            (mp_arm(rep), sq_arm(rep))
         } else {
-            let s = run_sqlite(&dir, rep, writers, secs);
-            (run_mpedb(&dir, rep, writers, secs), s)
+            let s = sq_arm(rep);
+            (mp_arm(rep), s)
         };
         let r = a.ops_per_s / b.ops_per_s;
         println!(
@@ -282,4 +319,133 @@ where
         handles.into_iter().map(|h| h.join().unwrap()).sum()
     });
     total as f64 / start.elapsed().as_secs_f64()
+}
+
+// ------------------------------------------------------- the PROCESS shape
+//
+// The thread shape above contends on the writer lock's INTRA-process half;
+// this one contends on the cross-process half. On Linux both are the same
+// robust mutex, but on macOS and Windows they are different primitives, so a
+// number for one genuinely does not transfer (#164).
+//
+// Each child is self-timed and prints its own ops/s, so process SPAWN cost
+// never lands in the rate. The parent sums the children's rates.
+
+fn schema_toml(path: &std::path::Path) -> String {
+    format!(
+        "[database]\npath = \"{}\"\nsize_mb = 256\nmax_readers = 32\n\
+         durability = \"none\"\n{SCHEMA}",
+        mpedb::toml_escape(&path.display().to_string())
+    )
+}
+
+/// Spawn `n` copies of this binary on one arm and sum their reported rates.
+fn spawn_arm(arm: &str, path: &std::path::Path, n: usize, secs: u64) -> f64 {
+    let exe = std::env::current_exe().expect("current_exe");
+    let kids: Vec<_> = (0..n)
+        .map(|i| {
+            std::process::Command::new(&exe)
+                .args([
+                    "--child",
+                    arm,
+                    "--idx",
+                    &i.to_string(),
+                    "--secs",
+                    &secs.to_string(),
+                    "--path",
+                ])
+                .arg(path)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn child")
+        })
+        .collect();
+    let mut total = 0.0;
+    for k in kids {
+        let out = k.wait_with_output().expect("child");
+        assert!(out.status.success(), "{arm} child failed: {:?}", out.status);
+        let s = String::from_utf8_lossy(&out.stdout);
+        total += s.trim().parse::<f64>().unwrap_or_else(|_| panic!("child said {s:?}"));
+    }
+    total
+}
+
+fn run_mpedb_procs(dir: &std::path::Path, rep: usize, n: usize, secs: u64) -> Arm {
+    let path = dir.join(format!("noise-p{rep}.mpedb"));
+    let _ = std::fs::remove_file(&path);
+    // Create + seed the schema once in the parent; the children attach.
+    drop(Database::open_with_config(Config::from_toml_str(&schema_toml(&path)).unwrap()).unwrap());
+    let ops = spawn_arm("mpedb", &path, n, secs);
+    let _ = std::fs::remove_file(&path);
+    Arm { label: "mpedb  ", ops_per_s: ops }
+}
+
+fn child_mpedb(path: &std::path::Path, idx: usize, secs: u64) -> f64 {
+    let db = Database::open_with_config(Config::from_toml_str(&schema_toml(path)).unwrap()).unwrap();
+    run_for(secs, |i| {
+        let id = idx as i64 * 10_000_000 + i;
+        db.query(
+            "INSERT INTO t (id, s) VALUES (?, ?)",
+            &[Value::Int(id), Value::Text(format!("v{id}"))],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn run_sqlite_procs(dir: &std::path::Path, rep: usize, n: usize, secs: u64) -> Arm {
+    let path = dir.join(format!("noise-p{rep}.db"));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT) STRICT;",
+        )
+        .unwrap();
+    }
+    let ops = spawn_arm("sqlite", &path, n, secs);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    Arm { label: "sqlite3", ops_per_s: ops }
+}
+
+fn child_sqlite(path: &std::path::Path, idx: usize, secs: u64) -> f64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    // Same reason as the thread arm: without this, every writer but one gets
+    // SQLITE_BUSY at once and the arm measures error handling. Needing it is
+    // the qualitative half of the comparison, and it never shows in the ratio.
+    conn.busy_timeout(Duration::from_secs(60)).unwrap();
+    conn.execute_batch("PRAGMA synchronous = OFF;").unwrap();
+    run_for(secs, |i| {
+        let id = idx as i64 * 10_000_000 + i;
+        conn.execute("INSERT INTO t (id, s) VALUES (?1, ?2)", (id, format!("v{id}")))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// One child's loop: run for `secs` and report ops/s. Failures count, for the
+/// same reason the thread arm counts them — an arm must not "win" by failing
+/// faster.
+fn run_for<F>(secs: u64, mut op: F) -> f64
+where
+    F: FnMut(i64) -> Result<(), String>,
+{
+    let start = Instant::now();
+    let deadline = Duration::from_secs(secs);
+    let mut n = 0i64;
+    while start.elapsed() < deadline {
+        // Check the clock every 64 ops: `Instant::now()` per insert is a
+        // measurable share of a 13 us operation, and it would land on the
+        // engine's side of the comparison rather than the harness's.
+        for _ in 0..64 {
+            let _ = op(n);
+            n += 1;
+        }
+    }
+    n as f64 / start.elapsed().as_secs_f64()
 }

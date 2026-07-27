@@ -25,8 +25,11 @@ on:
         description: paired repetitions
         default: "10"
       writers:
-        description: concurrent writer threads
+        description: concurrent writer THREADS
         default: "4"
+      procs:
+        description: concurrent writer PROCESSES (non-zero overrides writers)
+        default: "0"
       secs:
         description: seconds per arm
         default: "2"
@@ -50,6 +53,7 @@ jobs:
         run: |
           cargo run --release -p mpedb --example runner_noise -- \
             --reps ${{ inputs.reps }} --writers ${{ inputs.writers }} \
+            --procs ${{ inputs.procs }} \
             --secs ${{ inputs.secs }} --dir "$RUNNER_TEMP/noise"
 
   # The control arm, and the reason this workflow is not one job. A CV from
@@ -67,4 +71,5 @@ jobs:
         run: |
           cargo run --release -p mpedb --example runner_noise -- \
             --reps ${{ inputs.reps }} --writers ${{ inputs.writers }} \
+            --procs ${{ inputs.procs }} \
             --secs ${{ inputs.secs }} --dir "$RUNNER_TEMP/noise"
