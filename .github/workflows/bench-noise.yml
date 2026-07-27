@@ -48,6 +48,15 @@ jobs:
         run: |
           echo "cores: $NUMBER_OF_PROCESSORS"
           wmic cpu get name 2>/dev/null | tail -n +2 || true
+      # The syscall-level companion (#164): what does ONE uncontended
+      # writer-lock acquire/release cost, and how much of it is the file lock?
+      # `:memory:` builds the same lock WITHOUT a sidecar, so the difference
+      # isolates it. Linux is the null control and must print ~0.
+      - name: lock cost
+        shell: bash
+        run: |
+          cargo run --release -p mpedb-core --example lock_cost -- \
+            --iters 200000 --reps 5 --dir "$RUNNER_TEMP/lockcost"
       - name: probe
         shell: bash
         run: |
@@ -67,6 +76,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: what machine is this, actually
         run: nproc; grep -m1 'model name' /proc/cpuinfo || true
+      - name: lock cost
+        run: |
+          cargo run --release -p mpedb-core --example lock_cost -- \
+            --iters 200000 --reps 5 --dir "$RUNNER_TEMP/lockcost"
       - name: probe
         run: |
           cargo run --release -p mpedb --example runner_noise -- \
