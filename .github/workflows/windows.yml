@@ -94,8 +94,14 @@ jobs:
         run: cargo test -p mpedb-core --test multiproc_attach
       - name: the differential oracle's one shell dependency
         run: choco install sqlite -y --no-progress
-      - name: stage 3 — the engine's integration tests and the facade suite
-        run: cargo test -p mpedb-core -p mpedb --lib --tests
+      # `-p mpedb-testkit` carries the curated sqllogictest files AND the
+      # differential tester — the bundled sqlite answering the same generated
+      # program in-process. Without it "the SQL surface is differentially
+      # checked on all three platforms" was a claim about two of them. It costs
+      # under a second of test time; the compile was already paid, since
+      # `-p mpedb`'s dev-deps pull the same bundled sqlite.
+      - name: stage 3 — integration tests, the facade suite, and the differential
+        run: cargo test -p mpedb-core -p mpedb -p mpedb-testkit --lib --tests
       - name: stage 4 — the crash harnesses
         shell: bash
         run: |

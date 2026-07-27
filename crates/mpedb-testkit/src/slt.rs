@@ -87,7 +87,9 @@ pub fn run_slt_file(path: &Path) -> Result<SltStats> {
         .unwrap_or_else(|| "slt".into());
     let config_toml = format!(
         "[database]\npath = \"{}\"\nsize_mb = 16\nmax_readers = 16\n\n{}",
-        dir.db_path(&stem).display(),
+        // ESCAPED: joining onto the scratch base reintroduces a Windows
+        // separator, which TOML reads as an escape (#159).
+        crate::toml_path(dir.db_path(&stem)),
         schema_toml
     );
     let config = Config::from_toml_str(&config_toml)

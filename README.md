@@ -231,8 +231,8 @@ and on the SQL and DB-API surface somebody else's test suite already answers it.
 
 Be precise about what runs where, because it is easy to overclaim. The full
 corpus and the two ecosystem suites are run **by hand** at named commits, not in
-CI. What CI runs on **all three** platforms is `cargo test --workspace` (which
-carries the curated sqllogictest files and the differential tester), all six
+CI. What CI runs on **all three** platforms is the engine and facade suites
+including the curated sqllogictest files and the differential tester, all six
 `SIGKILL` harnesses, and the CLI end to end. The Python wheel's own suite runs
 on Linux and Windows; macOS is the gap, and it is a build-config one
 (`-undefined dynamic_lookup` for the PyO3 cdylib), not an engine one. See

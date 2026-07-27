@@ -442,7 +442,8 @@ fn run_mpedb(program: &[GenStmt]) -> Result<Vec<Outcome>> {
     let dir = TempDir::new("diff")?;
     let toml = format!(
         "[database]\npath = \"{}\"\nsize_mb = 16\nmax_readers = 8\n{}",
-        dir.db_path("diff").display(),
+        // ESCAPED — see `slt.rs`; the base is protected, a join onto it is not.
+        crate::toml_path(dir.db_path("diff")),
         MPEDB_SCHEMA
     );
     let config = Config::from_toml_str(&toml)

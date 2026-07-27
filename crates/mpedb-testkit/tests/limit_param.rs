@@ -6,7 +6,7 @@
 //! compound, aggregate) once with a parameter.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use mpedb_testkit::TempDir;
+use mpedb_testkit::{toml_path as crate_toml_path, TempDir};
 use rusqlite::Connection;
 
 const SCHEMA: &str = r#"
@@ -26,7 +26,12 @@ primary_key = ["pk"]
 fn open_pair(dir: &TempDir) -> (Database, Connection) {
     let toml = format!(
         "[database]\npath = \"{}\"\nsize_mb = 16\nmax_readers = 8\n{}",
-        dir.db_path("limit").display(),
+        // ESCAPED: `TempDir::path()` is protected against backslashes, but
+        // JOINING onto it is not — a Windows build spells that separator `\\`
+        // and TOML reads it as an escape, so the config fails to parse with a
+        // message about unicode escapes (#159). `scratch_base` guards the base;
+        // everything built from it still needs this.
+        crate_toml_path(dir.db_path("limit")),
         SCHEMA
     );
     let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
