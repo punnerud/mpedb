@@ -113,8 +113,11 @@ fn kill_loop(
         std::thread::sleep(Duration::from_millis(kill_ms));
         // did it die on its own (a bug) before we could kill it?
         if let Ok(Some(status)) = daemon.try_wait() {
-            use std::os::unix::process::ExitStatusExt;
-            if !status.success() && status.signal().is_none() {
+            // Tightened by #159 stage 4: this used to accept ANY signal death
+            // as "we killed it". The parent kills with `Child::kill`, so the
+            // only signal it produces is SIGKILL — a SIGSEGV was being waved
+            // through as expected when it is exactly the bug this counts.
+            if !status.success() && !mpedb_core::died_by_hard_kill(&status) {
                 bad_exits += 1;
             }
             daemon = spawn()?;

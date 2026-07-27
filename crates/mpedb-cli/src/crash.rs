@@ -276,8 +276,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         let mut unexpected = 0u64;
         for (k, mut child) in children.into_iter().enumerate() {
             let status = child.wait()?;
-            use std::os::unix::process::ExitStatusExt;
-            if status.signal() == Some(libc::SIGKILL) {
+            if mpedb_core::died_by_hard_kill(&status) {
                 killed += 1;
             } else if status.code() == Some(EXIT_CAPACITY) {
                 // Capacity, not correctness (#38): the child filled the file
@@ -432,9 +431,7 @@ pub fn run_child(argv: &[String]) -> CliResult {
     let kill_ms = 5 + rng.below(56);
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(kill_ms));
-        unsafe {
-            libc::kill(libc::getpid(), libc::SIGKILL);
-        }
+        mpedb_core::hard_kill_self();
     });
 
     let db = Database::open(&dir.join("config.toml"))?;

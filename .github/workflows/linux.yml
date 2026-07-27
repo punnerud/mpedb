@@ -116,7 +116,12 @@ jobs:
           # clippy is a HOST component — `rustup component add clippy --target
           # <T>` is an error, not a no-op. Cross-linting needs only the target's
           # std, which the step above already installed.
-          cargo clippy -p mpedb-core --lib --target x86_64-pc-windows-gnu -- -D warnings
+          # The FACADE and the CLI too, not just the engine: the crash
+          # harnesses live in mpedb-cli and the join budget's Windows arm lives
+          # in mpedb, and neither is compiled by a `-p mpedb-core` lint. Stage 4
+          # found a `mut` that only Windows sees exactly that way.
+          cargo clippy -p mpedb-core -p mpedb -p mpedb-cli --lib --bins \
+            --target x86_64-pc-windows-gnu -- -D warnings
           cargo check -p mpedb-core --target wasm32-unknown-unknown
       - name: test
         run: cargo test --workspace

@@ -196,8 +196,7 @@ fn crash_parent(argv: &[String]) -> CliResult {
             .stderr(Stdio::inherit())
             .spawn()?
             .wait()?;
-        use std::os::unix::process::ExitStatusExt;
-        if status.signal() == Some(libc::SIGKILL) {
+        if mpedb_core::died_by_hard_kill(&status) {
             total_killed += 1;
         } else {
             return runtime(format!(
@@ -359,9 +358,7 @@ pub fn run_crash_child(argv: &[String]) -> CliResult {
     let kill_ms = 5 + rng.below(56);
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(kill_ms));
-        unsafe {
-            libc::kill(libc::getpid(), libc::SIGKILL);
-        }
+        mpedb_core::hard_kill_self();
     });
 
     let hot = Database::open(&dir.join("config.toml"))?;

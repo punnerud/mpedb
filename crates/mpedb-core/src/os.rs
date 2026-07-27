@@ -945,6 +945,69 @@ pub fn pid_namespace_id() -> Option<u64> {
     }
 }
 
+/// Kill THIS process right now: no unwinding, no destructors, no exit
+/// handlers, nothing flushed. The crash harnesses' primitive (#159 stage 4).
+///
+/// The child kills ITSELF rather than the parent racing to kill it at the
+/// right moment — that is what walks the kill point across the attach /
+/// prepare / commit windows deterministically.
+///
+/// Unix: `kill(getpid(), SIGKILL)`, which is unblockable and uncatchable.
+/// Windows: `TerminateProcess` on our own handle, which is the same. What
+/// makes them interchangeable for this purpose is not the API but the
+/// aftermath: both leave the mapping's dirty pages to the OS, which writes
+/// them back regardless. So both platforms are testing PROCESS death, and
+/// neither is testing power loss — that distinction is why `powerloss` is a
+/// separate harness with a separate mechanism.
+pub fn hard_kill_self() -> ! {
+    #[cfg(windows)]
+    {
+        crate::wincompat::hard_kill_self()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // One process and no second one to observe the corpse. A harness that
+        // asked for this on wasm32 would be measuring nothing, so say so
+        // rather than exit quietly and let a green run mean nothing.
+        panic!("hard_kill_self: the crash harnesses need a second process; wasm32 has one")
+    }
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        // SIGKILL to self is not guaranteed to have been delivered when
+        // `kill` returns, so park instead of falling through.
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+/// Did this child die by [`hard_kill_self`] rather than exiting?
+///
+/// The harnesses need to tell "killed at the chosen instant" (the point of the
+/// test) from "exited on its own" (a child that hit an error first, which is a
+/// finding). Unix reads the signal; Windows reads the exit code, which is why
+/// [`crate::wincompat::HARD_KILL_CODE`] is a value no ordinary path returns.
+pub fn died_by_hard_kill(status: &std::process::ExitStatus) -> bool {
+    #[cfg(windows)]
+    {
+        status.code() == Some(crate::wincompat::HARD_KILL_CODE as i32)
+    }
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = status;
+            false
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal() == Some(libc::SIGKILL)
+        }
+    }
+}
+
 /// Does `stored` name the same boot this process is running in?
 ///
 /// The question boot recovery asks, and the only one — so it is a predicate,

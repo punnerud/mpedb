@@ -180,7 +180,6 @@ pub fn run_parent(argv: &[String]) -> CliResult {
 
     let (mut committed, mut pk_coll, mut uniq_coll, mut dels) = (0u64, 0u64, 0u64, 0u64);
     let (mut killed, mut clean, mut failures) = (0u64, 0u64, 0u64);
-    use std::os::unix::process::ExitStatusExt;
     for (k, child) in children.into_iter().enumerate() {
         let out = child.wait_with_output()?;
         for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -194,7 +193,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         }
         if out.status.success() {
             clean += 1;
-        } else if out.status.signal() == Some(libc::SIGKILL) {
+        } else if mpedb_core::died_by_hard_kill(&out.status) {
             killed += 1; // a "dropped packet" — expected for the kill cohort
         } else {
             failures += 1;
@@ -305,9 +304,7 @@ pub fn run_child(argv: &[String]) -> CliResult {
     if kill_ms > 0 {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(kill_ms));
-            unsafe {
-                libc::kill(libc::getpid(), libc::SIGKILL);
-            }
+            mpedb_core::hard_kill_self();
         });
     }
 

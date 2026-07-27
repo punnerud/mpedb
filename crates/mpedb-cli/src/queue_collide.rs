@@ -177,8 +177,9 @@ pub fn run_parent(argv: &[String]) -> CliResult {
             if let Ok(Some(status)) = slot.child.try_wait() {
                 // Self-exit: zero = hibernated (idle), normal. Nonzero and not
                 // a signal = a runner hit a protocol/engine error — a bug.
-                use std::os::unix::process::ExitStatusExt;
-                if status.success() || status.signal().is_some() {
+                // See mirror_collide: "a signal" narrowed to "OUR kill", so a
+                // crashing runner is a bad exit rather than a clean one.
+                if status.success() || mpedb_core::died_by_hard_kill(&status) {
                     clean_exits += 1;
                 } else {
                     bad_exits += 1;

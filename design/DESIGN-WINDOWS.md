@@ -118,7 +118,26 @@ Three things do not have a clean one-liner, and they are where the real work is:
    them on `CreateProcess` + `TerminateProcess` is a project of its own, and it
    is the honest gate on calling Windows "supported" rather than "compiles".
 
-Point 3 is the real cost, and it is larger than the `os.rs` work.
+~~Point 3 is the real cost, and it is larger than the `os.rs` work.~~
+
+**Wrong, and by a wide margin — this is the prediction the port got least
+right.** "POSIX to the bone" was written from the presence of `SIGKILL` in the
+source, not from counting. Counted: `mpedb-cli` contains **no `fork` at all**.
+Every harness already spawns with `std::process::Command`; the entire Unix
+dependency is two patterns, and both are one function each:
+
+- the child kills ITSELF (`kill(getpid(), SIGKILL)`) to hit a precise point in
+  the code — `TerminateProcess` on our own handle is the same thing;
+- the parent asks `status.signal() == SIGKILL` — Windows reads an exit code.
+
+Those are `os::hard_kill_self` and `os::died_by_hard_kill`. The only other
+Unix cluster in the CLI is `line.rs`'s terminal handling (`isatty`, `poll`,
+`TIOCGWINSZ`), which has nothing to do with crash-safety and degrades to the
+plain line reader the non-tty path already uses.
+
+The measurement that would have prevented the wrong estimate is the one §0
+already performed on the engine and this section did not perform on the CLI:
+count the symbols, do not read the prose.
 
 ## 3. "Server" is a framing worth correcting
 
@@ -179,9 +198,25 @@ else follows it.
    NOT done, and the reason stage 4 is still the gate: `Child::kill` takes a
    process, not the page cache. Real power loss is `mpedb powerloss`, which is
    `fork`-bound.
-4. **The crash harnesses on `CreateProcess`/`TerminateProcess`.** Until this
-   passes, Windows is "compiles and runs", not "crash-safe" — and crash-safety
-   is the product.
+4. **The crash harnesses on `CreateProcess`/`TerminateProcess`.** Two seam
+   functions, not a rewrite — see §2's correction. `crash` runs on Windows:
+   12 children terminated at their chosen instants, all counted as killed,
+   owner-death recovery observed, every invariant held including the index
+   probe and the page-accounting verifier. `stress` and `queue-collide` too.
+
+   **And it immediately found something that is not a Windows problem.**
+   `collide` — concurrent writer processes at `durability = commit|wal` —
+   corrupts the btree and freelist, and it does so on LINUX, on the tagged
+   v0.1.4, and on v0.1.3 before it. The engine's own verifier reports it
+   (`double free of page N`, `page reachable twice`). Splitting: the DIRECT
+   path (`durability = none`) is clean, one writer is clean, process death is
+   NOT the trigger, and neither is the detached-plan path — what is left is the
+   intent ring. Tracked as #160.
+
+   That is the argument for stage 4 stated more sharply than the original text
+   managed: the harnesses are not a Windows chore, they are the only thing that
+   exercises this, and CI does not run them because they are CLI subcommands
+   rather than tests.
 5. Only then does `windows.yml` stop being a portable-crates job.
 
 Stages 1–3 are tractable and mostly mechanical against an abstraction that

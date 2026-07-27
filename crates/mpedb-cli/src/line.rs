@@ -196,12 +196,44 @@ fn read_byte() -> Option<u8> {
     }
 }
 
+/// Does stdin come from a terminal?
+///
+/// The whole raw-mode editor hangs off this: false and the source is
+/// `stdin().lock().lines()`, which is what every non-interactive caller — a
+/// pipe, a test, a CI job — already gets. Windows answers false unconditionally
+/// for now: rustyline drives the interactive path and the console primitives
+/// beneath it (`GetConsoleMode`, `ReadConsoleInput`) are a console port, not
+/// part of the crash-harness work. The CLI works there; it just does not edit
+/// lines.
+fn stdin_is_tty() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Is another byte available RIGHT NOW? The only way to tell a lone `Esc`
 /// (cancel) from the start of an arrow key's `Esc [ A`: a real escape sequence
 /// arrives as one burst, a human's Esc does not.
+#[cfg(unix)]
 fn byte_waiting(ms: i32) -> bool {
     let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
     unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+}
+
+/// Windows reaches this only through the raw-key path, and [`stdin_is_tty`]
+/// keeps it off there — the console's equivalent is `WaitForSingleObject` on
+/// the input handle plus `PeekConsoleInput`, which belongs with a real console
+/// port and not with the crash harnesses (#159 stage 4). Answering "no byte
+/// waiting" is also the safe direction if it ever were reached: a lone `Esc`
+/// cancels, which is what a user pressing Esc means.
+#[cfg(not(unix))]
+fn byte_waiting(_ms: i32) -> bool {
+    false
 }
 
 fn read_key() -> Key {
@@ -243,7 +275,13 @@ fn read_key() -> Key {
 
 /// Terminal size, or a conservative 80x24.
 fn term_size() -> (usize, usize) {
+    // Windows: `GetConsoleScreenBufferInfo`. The documented fallback below is
+    // already the conservative answer, and the plain line reader does not wrap.
+    #[cfg(not(unix))]
+    return (80, 24);
+    #[cfg(unix)]
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
     if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0
         && ws.ws_col > 0
         && ws.ws_row > 0
@@ -457,7 +495,7 @@ impl LineSource {
     /// cannot take over falls back to the plain reader rather than failing.
     pub fn new(prompt: &str, names: Rc<RefCell<Names>>) -> LineSource {
         use std::io::BufRead as _;
-        let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+        let interactive = stdin_is_tty();
         if interactive {
             let config = Config::builder()
                 .completion_type(CompletionType::List)

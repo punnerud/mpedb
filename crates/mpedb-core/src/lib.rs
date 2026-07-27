@@ -21,6 +21,11 @@ mod os;
 /// to come from a host import: two clock sources would mean the engine and the
 /// executor could disagree about what `'now'` is.
 pub use os::wall_clock_micros;
+/// The crash harnesses' two primitives (#159 stage 4). Re-exported rather than
+/// making `os` public: those harnesses are the only thing outside the engine
+/// with a reason to reach into the platform layer, and they need exactly two
+/// functions.
+pub use os::{died_by_hard_kill, hard_kill_self};
 
 /// TOML-escape a path so it can be interpolated into a `path = "..."` line.
 ///

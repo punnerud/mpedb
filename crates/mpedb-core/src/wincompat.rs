@@ -84,6 +84,8 @@ unsafe extern "system" {
     fn GetProcessTimes(h: isize, create: *mut u64, exit: *mut u64, kern: *mut u64, user: *mut u64)
         -> i32;
     fn GetCurrentProcessId() -> u32;
+    fn GetCurrentProcess() -> isize;
+    fn TerminateProcess(h: isize, code: u32) -> i32;
     fn GetSystemInfo(info: *mut SystemInfo);
     fn SetEndOfFile(h: isize) -> i32;
     fn SetFilePointerEx(h: isize, dist: i64, new: *mut i64, method: u32) -> i32;
@@ -300,6 +302,30 @@ pub fn pid_definitely_dead(pid: u32) -> bool {
 
 pub fn process_id() -> u32 {
     unsafe { GetCurrentProcessId() }
+}
+
+/// The exit code a hard kill leaves behind — see [`crate::os::hard_kill_self`].
+/// Deliberately not a value any code path returns: the CLI exits 0, 1, 2 or a
+/// named capacity code, so a parent seeing this knows the child was killed and
+/// did not merely fail.
+pub const HARD_KILL_CODE: u32 = 0xDEAD_C0DE;
+
+/// `TerminateProcess` on our own handle: the `SIGKILL` position. Both are
+/// unblockable and uncatchable, neither runs an exit handler or flushes a
+/// buffer, and — the property the crash harnesses actually rest on — both
+/// leave the mapping's dirty pages to the OS, which writes them back anyway.
+/// That is what makes this a PROCESS-death test and not a power-loss one on
+/// either platform.
+pub fn hard_kill_self() -> ! {
+    unsafe {
+        TerminateProcess(GetCurrentProcess(), HARD_KILL_CODE);
+        // TerminateProcess is asynchronous with respect to the caller: it
+        // returns before the process is gone. Park rather than fall through,
+        // so the `!` is honest.
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
 }
 
 /// Windows has no pid namespaces, so the concept is a constant. The reader

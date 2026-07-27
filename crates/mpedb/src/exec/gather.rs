@@ -101,6 +101,12 @@ fn join_oom() -> Error {
 /// leaves room for the transient candidate row and the engine's own maps.
 fn budget_fits_in_memory(cells: u64) -> bool {
     let need = cells.saturating_mul(40);
+    // `mut` only where an arm narrows it: on Windows every arm below is a
+    // no-op, and an unconditional `mut` is a warning the Linux lint pass
+    // cannot see (#159 stage 4 found it by cross-linting the facade).
+    #[cfg(windows)]
+    let bound = u64::MAX;
+    #[cfg(not(windows))]
     let mut bound = u64::MAX;
     // wasm32 has no `getrlimit`, but it does have a HARD address-space
     // ceiling that plays the same role: a 32-bit wasm memory can never exceed

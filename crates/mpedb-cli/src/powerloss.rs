@@ -40,7 +40,13 @@
 //!
 //! Repeats `--rounds` times (default 20).
 
+// The torn-tail simulator pokes a cold file at an exact offset. `write_at`
+// lives behind a Unix trait and a Windows one; `mpedb_core::wincompat` spells
+// the Windows one the same way, so the call sites below are identical.
+#[cfg(not(windows))]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use mpedb_core::wincompat::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -248,8 +254,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         let mut out_of_space = 0u64;
         for mut child in children {
             let status = child.wait()?;
-            use std::os::unix::process::ExitStatusExt;
-            if status.signal() != Some(libc::SIGKILL) {
+            if !mpedb_core::died_by_hard_kill(&status) {
                 if status.code() == Some(EXIT_CAPACITY) {
                     out_of_space += 1; // capacity, not correctness (#38)
                 } else {
