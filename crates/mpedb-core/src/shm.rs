@@ -101,8 +101,61 @@ pub const FORMAT_VERSION: u32 = 9; // v9: ring entry carries a splice length del
 
 /// How many `trylock` attempts before the writer lock blocks. See
 /// [`Shm::writer_lock`] for why this exists and why it is small.
+///
+/// Linux only, and #164 is where that stopped being an accident and became a
+/// measurement: mirroring the spin onto the FLD-2 platforms bought nothing on
+/// Windows and cost 0.4–0.6 % on macOS, against +10–14 % here. The non-Linux
+/// `writer_lock` carries the table.
 #[cfg(target_os = "linux")]
 const WRITER_LOCK_SPINS: u32 = 64;
+
+/// A/B switch for the acquire spin, off-by-default meaning "spin" (#164).
+///
+/// This exists because the first attempt to measure the spin on Windows was
+/// INVALID and said so through its own control: two `bench-noise` dispatches,
+/// one per revision, landed on different runner hardware — the byte-identical
+/// sqlite3 control arm came out 25 % faster in the second, and the 1-writer
+/// arm (where an uncontended `trylock` succeeds first try, so the spin cannot
+/// execute at all) moved MORE than any contended arm. A ratio cannot rescue
+/// that; when the null control moves most, the run measured the host.
+///
+/// So the arms have to share a process, the way `MPEDB_NO_MPEE` puts the
+/// solver's two arms in one binary. Then a repetition alternates spin/no-spin
+/// microseconds apart on one core, and the host cancels for real.
+///
+/// Process-global and deliberately not synchronized with in-flight acquires:
+/// it is for a probe that flips between timed arms, not for per-transaction
+/// control. Relaxed load — the value is a benchmarking choice, it guards no
+/// data, and the acquire it precedes is a syscall pair that dwarfs it.
+static WRITER_SPIN_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the writer-lock acquire spin on (`true`) or off (`false`). Returns the
+/// previous setting so a probe can restore it.
+///
+/// A NO-OP where [`has_writer_spin`] is false. Check that first: a probe that
+/// toggles this on a platform with no spin to toggle measures one arm twice
+/// and reports a confident 1.00 — "no effect" where the truth is "no
+/// mechanism". Those two readings look identical and mean opposite things.
+pub fn set_writer_spin_enabled(on: bool) -> bool {
+    !WRITER_SPIN_OFF.swap(!on, Ordering::Relaxed)
+}
+
+/// Whether this build's writer lock has an acquire spin for the switch to
+/// reach. Linux only — see [`Shm::writer_lock`]'s non-Linux twin for the
+/// measurement that decided the FLD-2 platforms do without one (#164).
+pub const fn has_writer_spin() -> bool {
+    cfg!(target_os = "linux")
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn writer_spins() -> u32 {
+    if WRITER_SPIN_OFF.load(Ordering::Relaxed) {
+        0
+    } else {
+        WRITER_LOCK_SPINS
+    }
+}
 /// Reserves at or below this size get their extents pre-written (zeroed) at
 /// create so per-commit COW writes never pay an unwritten→written extent
 /// conversion (`crate::os::prewrite_zeros`). Above it, the reserve is left
@@ -1550,7 +1603,7 @@ impl Shm {
         // Bounded, and deliberately small: spinning while the holder is
         // descheduled is pure waste, and a writer holds this lock for a whole
         // commit — not a few instructions. This buys the handoff, not the wait.
-        for _ in 0..WRITER_LOCK_SPINS {
+        for _ in 0..writer_spins() {
             match unsafe { libc::pthread_mutex_trylock(self.mutex_ptr()) } {
                 0 => return Ok(false),
                 libc::EOWNERDEAD => return self.adopt_after_owner_death(),
@@ -1595,6 +1648,27 @@ impl Shm {
 
     /// macOS: acquire exclusion via the sidecar flock + private ERRORCHECK
     /// mutex, then read the tri-state DIRTY word (design/DESIGN-MACOS-LOCK.md §2).
+    /// NO ACQUIRE SPIN HERE, and that is a measured decision rather than an
+    /// oversight (#164). Linux spins 64 `trylock`s above because #109 measured
+    /// a park/wake ping-pong worth buying out. The obvious move was to mirror
+    /// it here; the obvious move was wrong. Same-process A/B
+    /// (`runner_noise --spin-ab`, 15 reps x 3 s), each platform judged against
+    /// its own 1-writer null control — a column where an uncontended `trylock`
+    /// succeeds first try, so the spin provably cannot act:
+    ///
+    /// | writers | Linux (has the spin) | Windows | macOS |
+    /// |---|---|---|---|
+    /// | 1 (null control) | OK 0.1 % | FAILED 1.3 % | OK 0.1 % |
+    /// | 2 | **+11 %** | no effect | no effect |
+    /// | 4 | **+14 %** | no effect | **-0.6 %** |
+    /// | 8 | **+10 %** | no effect | **-0.4 %** |
+    ///
+    /// Linux is the positive control: the instrument recovers the known #109
+    /// effect, so it can see one when there is one. On the FLD-2 platforms
+    /// there is none — nothing on Windows at any width, and a small resolvable
+    /// COST on macOS at 4 and 8. So the residual Windows depth gap is not the
+    /// handoff; that hypothesis is dead, and what #164 step 2 left standing —
+    /// the per-transaction `LockFileEx` syscall pair — is what remains.
     #[cfg(not(target_os = "linux"))]
     pub fn writer_lock(&self) -> Result<bool> {
         self.wl.lock()?; // on Err both levels are already released

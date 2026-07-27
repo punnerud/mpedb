@@ -142,6 +142,57 @@ fn main() {
         if procs_mode { "writer PROCESSES" } else { "writer threads" }
     );
 
+    // #164: the writer-lock spin A/B, both arms in ONE process.
+    //
+    // The first attempt at this measured two `bench-noise` dispatches, one per
+    // git revision, and was INVALID — its own controls said so. The sqlite3
+    // arm is byte-identical between the revisions and came out 25 % faster in
+    // the second run, and the 1-writer arm moved MORE than any contended arm
+    // even though an uncontended `trylock` succeeds first try, so the spin
+    // cannot execute there at all. Two dispatches are two runners.
+    //
+    // So the arms share a process and a core, alternating microseconds apart,
+    // exactly as `MPEDB_NO_MPEE` does for the solver. And the 1-writer column
+    // stays in the sweep as a built-in NULL CONTROL: the spin provably cannot
+    // act there, so a ratio that departs from 1.00 at one writer is this host
+    // misbehaving, and it invalidates the contended columns beside it.
+    if arg(&args, "--spin-ab", "0") != "0" {
+        if procs_mode {
+            // Each process reads the switch in its OWN address space, so a
+            // parent that flips it changes nothing in the children. Refuse
+            // rather than silently measure the same arm twice.
+            eprintln!("--spin-ab is threads-only: the switch is process-global, so it \
+                       cannot reach spawned writer processes");
+            std::process::exit(2);
+        }
+        if !mpedb_core::shm::has_writer_spin() {
+            // The one refusal that matters most. Only Linux's acquire has a
+            // spin to toggle (#164 measured the FLD-2 platforms and removed
+            // theirs), so here the switch is a no-op and both arms would be
+            // the same code — yielding a confident 1.00 that reads exactly
+            // like "no effect" and actually means "no mechanism". Those are
+            // opposite findings and must not share an output.
+            eprintln!("--spin-ab: this platform's writer lock has no acquire spin to \
+                       toggle, so both arms would be identical. Refusing rather than \
+                       printing a 1.00 that looks like a measurement (#164).");
+            std::process::exit(2);
+        }
+        println!("=== writer-lock spin A/B (#164), both arms in one process\n");
+        // WARM UP FIRST, and this is not a nicety. Measured on the M3: run with
+        // `--writers 1,2,4,8` the 1-writer series came out with CV 2.9 % while
+        // every contended series that followed sat at 0.2 %, and the null
+        // control failed on 1.7 % it had no business showing. Reversed to
+        // `8,4,2,1` the same box gave 0.1 % and passed. The first series in a
+        // sweep pays for cold caches and a CPU still ramping its clock, and
+        // when that series is the null control it condemns a readable run.
+        let _ = run_mpedb(&dir, 0, *counts.first().unwrap_or(&1), secs.min(1));
+        for n in counts {
+            println!("--- {n} writer{}", if n == 1 { "" } else { "s" });
+            run_spin_series(reps, n, secs, &dir);
+        }
+        return;
+    }
+
     let mut curve: Vec<(usize, f64, f64)> = Vec::new();
     for n in counts {
         println!("--- {n} writer{}", if n == 1 { "" } else { "s" });
@@ -298,6 +349,78 @@ fn run_series(
         );
     }
     (med, mp.iter().sum::<f64>() / mp.len() as f64)
+}
+
+/// One writer count of the spin A/B: `reps` paired reps of the SAME mpedb
+/// binary with the acquire spin on and off, alternating which goes first.
+///
+/// The pairing is the point. Both arms are the same code in the same process
+/// on the same core, seconds apart, so a runner's neighbour, its thermal state
+/// and its clock all cancel in the ratio — the failure mode that made the
+/// two-dispatch attempt worthless.
+fn run_spin_series(reps: usize, n: usize, secs: u64, dir: &std::path::Path) {
+    let mut ratios = Vec::with_capacity(reps);
+    let (mut on, mut off) = (Vec::with_capacity(reps), Vec::with_capacity(reps));
+
+    for rep in 0..reps {
+        // Alternate order: a fixed one folds "the second arm runs on a warmer
+        // page cache" straight into the ratio.
+        let arm = |spin: bool, rep: usize| {
+            mpedb_core::shm::set_writer_spin_enabled(spin);
+            run_mpedb(dir, rep, n, secs).ops_per_s
+        };
+        let (a, b) = if rep % 2 == 0 {
+            let x = arm(true, rep);
+            (x, arm(false, rep))
+        } else {
+            let y = arm(false, rep);
+            (arm(true, rep), y)
+        };
+        println!("  rep {rep:2}: spin {a:>10.0} op/s   no-spin {b:>10.0} op/s   ratio {:.3}", a / b);
+        on.push(a);
+        off.push(b);
+        ratios.push(a / b);
+    }
+    mpedb_core::shm::set_writer_spin_enabled(true);
+
+    let (rm, rcv) = mean_cv(&ratios);
+    let (_, oncv) = mean_cv(&on);
+    let (_, offcv) = mean_cv(&off);
+    ratios.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let med = ratios[ratios.len() / 2];
+    let half = 1.96 * rcv / (ratios.len() as f64).sqrt();
+
+    println!(
+        "\nratio (spin / no-spin)  median {med:.3}  mean {rm:.3}\n\
+         CV: ratio {:.1}%   spin arm {:.1}%   no-spin arm {:.1}%\n\
+         RESOLVES: +/-{:.1}% on the mean ratio (95%, normal approximation)",
+        rcv * 100.0,
+        oncv * 100.0,
+        offcv * 100.0,
+        half * 100.0
+    );
+
+    if n == 1 {
+        // THE NULL CONTROL, and the reason this column is swept at all. With a
+        // single writer nothing ever holds the lock when we ask for it, so the
+        // first `trylock` succeeds and the spin loop cannot execute a second
+        // iteration. Any effect here is the host, not the change — and it
+        // bounds what the contended columns are allowed to claim.
+        let dev = (rm - 1.0).abs() * 100.0;
+        if dev > half * 100.0 {
+            println!(
+                "NULL CONTROL FAILED: {dev:.1}% at ONE writer, where the spin cannot run.\n\
+                 This host moved more than the effect it is being asked to resolve;\n\
+                 the contended rows below are not trustworthy. Re-run, or use a\n\
+                 quieter machine — do NOT read the sweep."
+            );
+        } else {
+            println!("null control OK: {dev:.1}% at one writer, within resolution.");
+        }
+    } else if (rm - 1.0).abs() <= half {
+        println!("NO EFFECT RESOLVED at {n} writers: the ratio is 1.00 within this run's resolution.");
+    }
+    println!();
 }
 
 fn mean_cv(xs: &[f64]) -> (f64, f64) {

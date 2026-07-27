@@ -33,6 +33,9 @@ on:
       secs:
         description: seconds per arm
         default: "2"
+      spin_ab:
+        description: 'also run the writer-lock spin A/B (#164) — 1 to enable'
+        default: "1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -64,6 +67,21 @@ jobs:
             --reps ${{ inputs.reps }} --writers ${{ inputs.writers }} \
             --procs ${{ inputs.procs }} \
             --secs ${{ inputs.secs }} --dir "$RUNNER_TEMP/noise"
+      # #164: the writer-lock spin A/B, and the reason it is a STEP here rather
+      # than a second dispatch. The first attempt compared two dispatches, one
+      # per git revision, and its own controls killed it: the byte-identical
+      # sqlite3 arm came out 25% faster in the second, and the 1-writer arm —
+      # where the spin provably cannot execute — moved more than any contended
+      # arm. Two dispatches are two runners. Both arms now share one process on
+      # one core, and the probe refuses to report a sweep whose 1-writer null
+      # control drifted further than the effect it is resolving.
+      - name: spin A/B
+        if: ${{ inputs.spin_ab != '0' }}
+        shell: bash
+        run: |
+          cargo run --release -p mpedb --example runner_noise -- \
+            --reps ${{ inputs.reps }} --writers ${{ inputs.writers }} \
+            --secs ${{ inputs.secs }} --spin-ab 1 --dir "$RUNNER_TEMP/spinab"
 
   # The control arm, and the reason this workflow is not one job. A CV from
   # Windows alone says nothing: it needs a second host measured the same way to
@@ -86,3 +104,18 @@ jobs:
             --reps ${{ inputs.reps }} --writers ${{ inputs.writers }} \
             --procs ${{ inputs.procs }} \
             --secs ${{ inputs.secs }} --dir "$RUNNER_TEMP/noise"
+      # #164: the writer-lock spin A/B, and the reason it is a STEP here rather
+      # than a second dispatch. The first attempt compared two dispatches, one
+      # per git revision, and its own controls killed it: the byte-identical
+      # sqlite3 arm came out 25% faster in the second, and the 1-writer arm —
+      # where the spin provably cannot execute — moved more than any contended
+      # arm. Two dispatches are two runners. Both arms now share one process on
+      # one core, and the probe refuses to report a sweep whose 1-writer null
+      # control drifted further than the effect it is resolving.
+      - name: spin A/B
+        if: ${{ inputs.spin_ab != '0' }}
+        shell: bash
+        run: |
+          cargo run --release -p mpedb --example runner_noise -- \
+            --reps ${{ inputs.reps }} --writers ${{ inputs.writers }} \
+            --secs ${{ inputs.secs }} --spin-ab 1 --dir "$RUNNER_TEMP/spinab"
