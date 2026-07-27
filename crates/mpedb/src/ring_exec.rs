@@ -759,24 +759,34 @@ fn execute_prepared(
     }
 }
 
-/// Can the cheap per-statement savepoint undo this failure EXACTLY?
+/// Can the cheap per-statement savepoint undo this FAILED statement exactly,
+/// or is the round torn?
 ///
-/// `rollback_to` restores root pointers and page accounting. That is exact for
-/// everything a statement COW-allocated (the restore drops those pages), but it
-/// cannot undo an in-place mutation of a page that was ALREADY dirty when the
-/// savepoint was taken — the page id does not change, so the restored root
-/// points at the same, already-mutated page. Nor does any savepoint cover the
-/// extent allocator. So the undo is exact iff either:
+/// Two separate obligations, and `partial` alone discharges only one:
 ///
-/// * the statement applied nothing at all (`!partial` — the executor's
-///   contract is that this never under-reports), or
-/// * the transaction was pristine when the statement began AND the statement
-///   did not touch extents, in which case every page it wrote it also
-///   allocated.
+/// * **Pages** — [`WriteTxn::undo_is_exact`] (#160). `rollback_to` restores
+///   root pointers and page accounting, which undoes everything the statement
+///   COW-allocated off a COMMITTED page. It cannot undo an in-place mutation
+///   of a page that was already dirty: the page id does not change, so a child
+///   linked into it stays linked while the restore of `reusable` puts that
+///   child back on offer. The next allocation hands it out and two trees share
+///   a page.
+/// * **Rows** — `partial` (#119), the executor's ROW-atomicity flag: false
+///   means no row survived, and it is honest about that. But a B-tree split is
+///   not a row, so `!partial` says nothing about structure. That is the whole
+///   of #160: a failing statement allocated, linked, and truthfully reported
+///   `partial == false`. It took four writer PROCESSES to see, because a batch
+///   is what makes the transaction dirty before the failing statement runs.
 ///
-/// When neither holds the round is torn and the leader must `restart` (§5.3).
-fn undo_is_exact(txn: &WriteTxn<'_>, partial: bool, pristine_before: bool) -> bool {
-    !partial || (pristine_before && txn.extents_untouched())
+/// The pristine arm answers both at once: from a pristine transaction every
+/// page the statement wrote it also allocated, so the root restore drops the
+/// lot, rows included. It needs the extent allocator untouched, because no
+/// savepoint covers it.
+///
+/// When this is false the round is torn and the leader must `restart` (§5.3).
+fn undo_is_exact(txn: &WriteTxn<'_>, sp: &mpedb_core::TxnSavepoint, partial: bool) -> bool {
+    let pristine_arm = sp.was_pristine() && txn.extents_untouched();
+    txn.undo_is_exact(sp) && (!partial || pristine_arm)
 }
 
 /// Leader round: drain all READY intents into `txn` (one savepoint each),
@@ -1374,14 +1384,13 @@ pub(crate) fn lead_and_execute(
             }
             match &p.prepared {
                 Ok((plan, params)) => {
-                    let pristine = txn.is_pristine();
                     let sp = txn.savepoint();
                     let mut partial = false;
                     match execute_prepared(db, &mut txn, plan, params, &triggers, &mut partial) {
                         Ok(affected) => ring.stage_result(p.intent.idx, affected, 0, &[], next_txn),
                         Err(e) => {
                             let (code, msg) = encode_error(&e);
-                            if !undo_is_exact(&txn, partial, pristine) {
+                            if !undo_is_exact(&txn, &sp, partial) {
                                 predecided[i] = Some((code, msg));
                                 txn.restart();
                                 continue 'round;
@@ -1408,13 +1417,12 @@ pub(crate) fn lead_and_execute(
             if let Some(e) = own_predecided.take() {
                 own_result = Some(Err(e));
             } else {
-                let pristine = txn.is_pristine();
                 let sp = txn.savepoint();
                 let mut partial = false;
                 match exec_own(db, &mut txn, plan, params, &triggers, &mut partial) {
                     Ok(out) => own_result = Some(Ok(out)),
                     Err(e) => {
-                        if !undo_is_exact(&txn, partial, pristine) {
+                        if !undo_is_exact(&txn, &sp, partial) {
                             own_predecided = Some(e);
                             txn.restart();
                             continue 'round;

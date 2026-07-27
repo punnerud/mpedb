@@ -68,16 +68,17 @@ jobs:
   #
   # Stage 4 is the crash harnesses themselves, and they are NOT `fork`-bound —
   # `mpedb-cli` contains no `fork` at all (see DESIGN-WINDOWS §2's correction).
-  # Five of six run here. The sixth, `collide`, is left out because it fails —
-  # on LINUX too, on the tagged v0.1.4 and on v0.1.3 before it (#160, a live
-  # page being allocated into two trees). Adding it now would pin a known
-  # corruption as the Windows job's verdict rather than the platform's.
+  # All six run here. `collide` was held back while #160 was open — it failed on
+  # LINUX too, on the tagged v0.1.4 and on v0.1.3 before it, so running it would
+  # have pinned a known corruption as the Windows job's verdict rather than the
+  # platform's. #160 is fixed, so it is in, and it is in at `--durability commit`
+  # because that is the arm that reproduced: the ring only leads a batch when
+  # commits are durable, and the batch is what makes the leader's transaction
+  # dirty before a failing statement runs.
   #
   # Kept short on purpose: these are minutes-scale by nature, and this job runs
   # nightly. The point is that the mechanism works there, not to out-soak the
   # Linux box.
-  #
-  # Until #160 closes, Windows is "runs the crash harnesses", not "crash-safe".
   windows-engine:
     runs-on: windows-latest
     steps:
@@ -108,6 +109,8 @@ jobs:
           run powerloss --rounds 2 --workers 2 --durability async
           run queue-collide --secs 8
           run mirror-collide --mode pull --writers 2 --secs 8
+          run collide --writers 4 --total 400 --drop-rate 0 --durability commit
+          run collide --writers 4 --total 400 --durability wal
           d=$(mktemp -d); "$B" tier crash --dir "$d" --waves 2; rm -rf "$d"
       - name: clippy the engine
         run: cargo clippy -p mpedb-core --lib -- -D warnings

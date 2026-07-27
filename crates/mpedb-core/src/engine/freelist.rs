@@ -132,6 +132,10 @@ impl WriteTxn<'_> {
     /// Pick the next page id (freelist-reuse first, then high-water), without
     /// touching its contents. Shared by `alloc` and `alloc_raw`.
     fn alloc_id(&mut self) -> Result<u64> {
+        // #160: every page this txn takes bumps the counter a savepoint
+        // captures, so `undo_is_exact` can tell "the statement changed nothing"
+        // from "the statement changed no ROWS".
+        self.allocs = self.allocs.wrapping_add(1);
         // Draw a POOL, not one page's worth. Drawing is read-only and costs
         // nothing at commit unless the pages get consumed (see `taken`), so a
         // deep pool is free — and it is what keeps the fixpoint below from

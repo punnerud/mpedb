@@ -1702,6 +1702,7 @@ impl Engine {
             high_water: meta.high_water,
             table_roots: HashMap::new(),
             dirty: DirtySet::default(),
+            allocs: 0,
             reusable: Vec::new(),
             freed: BTreeSet::new(),
             taken: Vec::new(),

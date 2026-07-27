@@ -1533,3 +1533,76 @@ fn mod_gen_over_bumps_rather_than_under_bumps() {
     );
     eng.verify_page_accounting().unwrap();
 }
+
+#[test]
+fn a_failed_insert_that_allocated_is_not_exactly_undoable() {
+    // #160. Found by `mpedb collide --durability commit` (four writer
+    // PROCESSES) as `double free of page N` / `page reachable twice`.
+    //
+    // The mechanism, pinned here at the level it actually lives at.
+    // `rollback_to` restores root pointers and the allocator's bookkeeping.
+    // That undoes a COW of a COMMITTED page **when the root restore drops it**
+    // — which it does only if the whole path down was clean, so the COW made a
+    // fresh copy of every node including the root. From a transaction that has
+    // already written, the root is dirty and mutated IN PLACE: the copy of the
+    // cold leaf is linked into it, the restore does not unlink it, and
+    // restoring `reusable` puts that copy back on offer. One allocation later,
+    // two trees share it. The trap that caught this recorded exactly that
+    // shape: high-water unmoved, so the page came from `reusable`.
+    //
+    // The ring reached it by trusting the executor's `partial` flag, which
+    // truthfully says "no ROW survived" and says nothing about page identity.
+    let cfg = test_config("undo160", 8);
+    let eng = open(&cfg);
+
+    // Even ids only, so odd ids are free keys in COLD interior leaves.
+    let mut w = eng.begin_write().unwrap();
+    for i in 0..1200 {
+        w.insert_row(0, &user(i * 2, &format!("u{i}@x.no"), Some(i))).unwrap();
+    }
+    w.commit().unwrap();
+
+    // PRISTINE: the savepoint predates every mutation, so the COW copied the
+    // path all the way to the root and the root restore drops the lot. Exact
+    // even though it allocated — the arm that keeps the cheap savepoint useful.
+    let mut w = eng.begin_write().unwrap();
+    let sp = w.savepoint();
+    assert!(sp.was_pristine());
+    let before = w.allocs();
+    assert!(matches!(
+        w.insert_row(0, &user(501, "u1@x.no", Some(1))),
+        Err(Error::UniqueViolation { .. })
+    ));
+    assert!(w.allocs() > before, "the failing insert was expected to COW");
+    assert!(w.undo_is_exact(&sp), "a pristine savepoint always undoes exactly");
+    w.rollback_to(sp);
+    w.commit().unwrap();
+    eng.verify_page_accounting().unwrap();
+
+    // DIRTY: identical statement, but the transaction has already written, so
+    // the root is dirty and the copy of the cold leaf survives the restore.
+    let mut w = eng.begin_write().unwrap();
+    for i in 0..40 {
+        w.insert_row(0, &user(5000 + i * 2, &format!("d{i}@x.no"), Some(i))).unwrap();
+    }
+    let sp = w.savepoint();
+    assert!(!sp.was_pristine());
+    let before = w.allocs();
+    assert!(matches!(
+        w.insert_row(0, &user(503, "u2@x.no", Some(1))),
+        Err(Error::UniqueViolation { .. })
+    ));
+    assert!(
+        w.allocs() > before,
+        "a failed statement that allocates is the whole premise of #160"
+    );
+    assert!(
+        !w.undo_is_exact(&sp),
+        "rollback_to here would re-offer a page the tree still links"
+    );
+
+    // The leader's escape hatch is the only correct move from here (§5.3).
+    w.restart();
+    w.commit().unwrap();
+    eng.verify_page_accounting().unwrap();
+}

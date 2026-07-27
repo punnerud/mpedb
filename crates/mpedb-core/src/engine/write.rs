@@ -142,6 +142,11 @@ pub struct WriteTxn<'e> {
     /// into the catalog at commit.
     pub(super) table_roots: HashMap<(u32, u32), (u64, u64)>,
     pub(super) dirty: DirtySet,
+    /// Pages allocated by this transaction, ever. Monotone; only ever compared
+    /// against a value captured in a savepoint, so it is a change DETECTOR and
+    /// not a count of anything live. Read it with `allocs()`; #160 is what it
+    /// is for.
+    pub(super) allocs: u64,
     /// Pages this txn may allocate. They are **still listed in the freelist**:
     /// `refill_reusable` reads entries, it does not remove them (design/DESIGN.md
     /// §4.5). `taken` remembers where each came from so the commit fixpoint can
@@ -2365,6 +2370,8 @@ impl<'e> WriteTxn<'e> {
     /// Used by the batch leader so one failing intent aborts only itself.
     pub fn savepoint(&self) -> TxnSavepoint {
         TxnSavepoint {
+            allocs: self.allocs,
+            pristine: self.is_pristine(),
             catalog_root: self.catalog_root,
             freelist_root: self.freelist_root,
             table_roots: self.table_roots.clone(),
@@ -2398,6 +2405,21 @@ impl<'e> WriteTxn<'e> {
     /// the commit fixpoint moves it, and `rollback_to` refuses to run inside
     /// one.)
     pub fn rollback_to(&mut self, sp: TxnSavepoint) {
+        debug_assert!(
+            self.undo_is_exact(&sp),
+            "#160: rollback_to would re-offer a page that is still linked into \
+             a tree — the statement allocated from a non-pristine transaction. \
+             Check undo_is_exact() first and take the caller's escape hatch."
+        );
+        self.rollback_to_inner(sp);
+    }
+
+    /// [`rollback_to`](Self::rollback_to) without the exactness tripwire — for
+    /// [`rollback_to_full`](Self::rollback_to_full), which restores the bytes of
+    /// every page that was dirty at the savepoint and is therefore exact even
+    /// when pages were allocated: the parent's restored bytes no longer link
+    /// them, so re-offering them is correct.
+    fn rollback_to_inner(&mut self, sp: TxnSavepoint) {
         debug_assert!(!self.in_freelist_op);
         self.catalog_root = sp.catalog_root;
         self.freelist_root = sp.freelist_root;
@@ -2412,10 +2434,50 @@ impl<'e> WriteTxn<'e> {
         }
     }
 
-    /// True iff the extent allocator (DESIGN-BLOBEXTENT) has not been touched
-    /// by this transaction. Extent state lives OUTSIDE every savepoint — no
-    /// `rollback_to`/`rollback_to_full` restores it — so a caller that must
-    /// undo a statement has to check this to know whether the undo is exact.
+    /// How many pages this transaction has allocated, ever (#160).
+    ///
+    /// Monotone and never rewound — not by [`rollback_to`](Self::rollback_to)
+    /// and not by [`restart`](Self::restart) — because the only question asked
+    /// of it is whether it *differs* from a value captured earlier. Compare it
+    /// against [`allocs_at`](Self::allocs_at) of a savepoint to learn whether
+    /// anything was allocated since; the difference is not a count of live
+    /// pages and must not be read as one.
+    pub fn allocs(&self) -> u64 {
+        self.allocs
+    }
+
+    /// The allocation counter as it stood when `sp` was taken; see
+    /// [`allocs`](Self::allocs).
+    pub fn allocs_at(sp: &TxnSavepoint) -> u64 {
+        sp.allocs
+    }
+
+    /// Would [`rollback_to`](Self::rollback_to) undo everything since `sp`
+    /// **exactly** — leaving no page both reachable from a live root and back
+    /// on offer as reusable? (#160)
+    ///
+    /// `rollback_to` restores root pointers and the allocator's private
+    /// bookkeeping. That undoes a mutation of a page that was COMMITTED at
+    /// savepoint time, because COW gave the statement a fresh page and the
+    /// root restore drops it. It does NOT undo a mutation of a page that was
+    /// already dirty: the page id never changes, so a child linked into it
+    /// stays linked while the restore of `reusable` puts that child back on
+    /// offer. The next allocation hands it out and two trees share a page —
+    /// which the verifier reports as `double free` or `page reachable twice`.
+    ///
+    /// So the undo is exact iff either nothing was allocated since the
+    /// savepoint, or the transaction was pristine when it was taken (every
+    /// page the statement wrote it also allocated) and the extent allocator —
+    /// which no savepoint covers — is still untouched.
+    ///
+    /// **This is about page identity, not about rows.** A caller that must
+    /// also undo rows a statement already applied needs more than this; see
+    /// [`savepoint_full`](Self::savepoint_full), or the ring's own predicate
+    /// which pairs this with the executor's `partial` flag (#119).
+    pub fn undo_is_exact(&self, sp: &TxnSavepoint) -> bool {
+        self.allocs == sp.allocs || (sp.pristine && self.extents_untouched())
+    }
+
     pub fn extents_untouched(&self) -> bool {
         self.extent_map_root == self.meta.extent_map_root
             && self.pending_map_edits.is_empty()
@@ -2510,13 +2572,21 @@ impl<'e> WriteTxn<'e> {
     /// (the COW allocates a fresh page, which the root-pointer restore drops).
     /// It does NOT revert an in-place mutation of a page that was ALREADY dirty
     /// (txn-local) at savepoint time — the page id never changes, so restoring
-    /// root pointers leaves the mutated bytes in place. That is fine for the
-    /// mirror, which only rolls back a FAILED op (a constraint violation fails
-    /// before mutating, so there is nothing in-place to undo), but a SQL
-    /// `ROLLBACK TO` must undo SUCCESSFUL statements, whose in-place mutations
-    /// this method captures and [`rollback_to_full`](Self::rollback_to_full)
-    /// restores. Heavier (it copies dirty-page bytes), so it is deliberately not
-    /// on the mirror's per-row path.
+    /// root pointers leaves the mutated bytes in place. A SQL `ROLLBACK TO`
+    /// must undo SUCCESSFUL statements, whose in-place mutations this method
+    /// captures and [`rollback_to_full`](Self::rollback_to_full) restores.
+    /// Heavier (it copies dirty-page bytes), which is why the cheap pair still
+    /// exists — under the precondition [`undo_is_exact`](Self::undo_is_exact)
+    /// states.
+    ///
+    /// This comment used to add that the cheap pair "is fine for the mirror,
+    /// which only rolls back a FAILED op — a constraint violation fails before
+    /// mutating, so there is nothing in-place to undo". **That is false**, and
+    /// it is the same wrong reasoning #160 found in the ring: a failing insert
+    /// COWs the leaf it is descending into, and from a dirty transaction that
+    /// copy survives the root restore. `insert_row` does undo itself logically
+    /// (`undo_partial_insert`), which is what makes the caller's `rollback_to`
+    /// redundant there — and, being redundant, purely harmful. See #162.
     pub fn savepoint_full(&self) -> Result<TxnSavepointFull> {
         let base = self.savepoint();
         let mut page_images = Vec::with_capacity(self.dirty.len());
@@ -2559,7 +2629,7 @@ impl<'e> WriteTxn<'e> {
                 "ROLLBACK TO across a large blob/overflow-extent write is not supported".into(),
             ));
         }
-        self.rollback_to(sp.base);
+        self.rollback_to_inner(sp.base);
         self.schema_gen_bump = sp.schema_gen_bump;
         self.written_tables = sp.written_tables;
         self.commit_point = sp.commit_point;
@@ -2602,6 +2672,12 @@ fn index_value_equal(a: &Value, b: &Value, spec: keycode::KeySpec) -> bool {
 /// the stack.
 #[derive(Clone)]
 pub struct TxnSavepoint {
+    pub(super) allocs: u64,
+    /// Was the transaction pristine when this savepoint was taken? Captured
+    /// here rather than asked of the caller: it is the load-bearing half of
+    /// [`WriteTxn::undo_is_exact`], and a caller that computes it a line too
+    /// late gets a wrong answer that looks right.
+    pristine: bool,
     catalog_root: u64,
     freelist_root: u64,
     table_roots: HashMap<(u32, u32), (u64, u64)>,
@@ -2611,6 +2687,14 @@ pub struct TxnSavepoint {
     taken: Vec<TakenEntry>,
     refill_cursor: Option<[u8; 11]>,
     high_water: u64,
+}
+
+impl TxnSavepoint {
+    /// Was the transaction pristine when this savepoint was taken? See
+    /// [`WriteTxn::undo_is_exact`].
+    pub fn was_pristine(&self) -> bool {
+        self.pristine
+    }
 }
 
 /// A full statement-savepoint for the SQL `SAVEPOINT` surface (see
