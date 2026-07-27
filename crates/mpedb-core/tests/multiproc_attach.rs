@@ -45,11 +45,16 @@ fn db_path(name: &str) -> PathBuf {
     p
 }
 
-fn durability() -> String {
+/// The child's durability, read from the env the PARENT set on its `Command`.
+/// The parent never sets it on itself: `set_var` mutates the whole process, and
+/// this binary runs its tests on several threads, so one arm choosing `wal`
+/// would silently reconfigure every other test in flight. That is exactly what
+/// happened — green under `--test-threads 1`, red on CI.
+fn child_durability() -> String {
     std::env::var(DUR).unwrap_or_else(|_| "none".into())
 }
 
-fn cfg_for(path: &Path) -> Config {
+fn cfg_for(path: &Path, durability: &str) -> Config {
     let toml = format!(
         r#"
 [database]
@@ -71,23 +76,31 @@ primary_key = ["id"]
   type = "int64"
 "#,
         mpedb_testkit::toml_path(path),
-        durability()
+        durability
     );
     Config::from_toml_str(&toml).unwrap()
 }
 
 fn open(path: &Path) -> Engine {
-    let cfg = cfg_for(path);
+    open_dur(path, "none")
+}
+
+fn open_dur(path: &Path, durability: &str) -> Engine {
+    let cfg = cfg_for(path, durability);
     Engine::open(&cfg, vec![vec![]; cfg.schema.tables.len()]).unwrap()
 }
 
 /// Re-invoke this binary as `role`, pointed at `path`.
 fn spawn(role: &str, path: &Path) -> std::process::Child {
+    spawn_dur(role, path, "none")
+}
+
+fn spawn_dur(role: &str, path: &Path, durability: &str) -> std::process::Child {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "--ignored", "--nocapture", role])
         .env(ROLE, role)
         .env(PATH, path)
-        .env(DUR, durability())
+        .env(DUR, durability)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -280,15 +293,12 @@ fn a_writer_killed_mid_transaction_leaves_no_partial_state() {
 /// real power-loss simulator (`mpedb powerloss`) is stage 4's `fork`-bound
 /// work.
 fn durable_kill_leaves_a_prefix(mode: &str) {
-    // SAFETY: single-threaded here, and every child reads it from the env we
-    // hand `spawn` rather than inheriting a race.
-    unsafe { std::env::set_var(DUR, mode) };
     let path = db_path(&format!("durable-{mode}"));
 
-    let mut child = spawn("mp_child_dies_holding_writes", &path);
+    let mut child = spawn_dur("mp_child_dies_holding_writes", &path, mode);
     {
         // A separate attach, only to watch for the child's committed marker.
-        let watch = open(&path);
+        let watch = open_dur(&path, mode);
         assert!(
             until(Duration::from_secs(20), || watch
                 .begin_read()
@@ -303,7 +313,7 @@ fn durable_kill_leaves_a_prefix(mode: &str) {
     let _ = child.wait();
 
     // Third process — nothing of the writer's state is inherited.
-    let out = spawn("mp_child_verifies_prefix", &path)
+    let out = spawn_dur("mp_child_verifies_prefix", &path, mode)
         .wait_with_output()
         .unwrap();
     assert!(
@@ -314,7 +324,6 @@ fn durable_kill_leaves_a_prefix(mode: &str) {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));
-    unsafe { std::env::remove_var(DUR) };
 }
 
 #[test]
@@ -335,7 +344,7 @@ fn a_kill_at_durability_wal_leaves_a_committed_prefix() {
 #[ignore]
 fn mp_child_writes_ten() {
     let Some(path) = child_env() else { return };
-    let eng = open(&path);
+    let eng = open_dur(&path, &child_durability());
     for id in 0..10i64 {
         let mut w = eng.begin_write().unwrap();
         w.insert_row(0, &[Value::Int(id), Value::Int(id * 7)]).unwrap();
@@ -347,7 +356,7 @@ fn mp_child_writes_ten() {
 #[ignore]
 fn mp_child_holds_writer() {
     let Some(path) = child_env() else { return };
-    let eng = open(&path);
+    let eng = open_dur(&path, &child_durability());
     {
         let mut w = eng.begin_write().unwrap();
         w.insert_row(0, &[Value::Int(999), Value::Int(1)]).unwrap();
@@ -363,7 +372,7 @@ fn mp_child_holds_writer() {
 #[ignore]
 fn mp_child_pins_a_snapshot() {
     let Some(path) = child_env() else { return };
-    let eng = open(&path);
+    let eng = open_dur(&path, &child_durability());
     {
         let mut w = eng.begin_write().unwrap();
         w.insert_row(0, &[Value::Int(500), Value::Int(500)]).unwrap();
@@ -390,7 +399,7 @@ fn mp_child_pins_a_snapshot() {
 #[ignore]
 fn mp_child_verifies_prefix() {
     let Some(path) = child_env() else { return };
-    let eng = open(&path);
+    let eng = open_dur(&path, &child_durability());
     let r = eng.begin_read().unwrap();
     assert!(
         r.get_by_pk(0, &[Value::Int(777)]).unwrap().is_some(),
@@ -408,7 +417,7 @@ fn mp_child_verifies_prefix() {
 #[ignore]
 fn mp_child_dies_holding_writes() {
     let Some(path) = child_env() else { return };
-    let eng = open(&path);
+    let eng = open_dur(&path, &child_durability());
     {
         let mut w = eng.begin_write().unwrap();
         w.insert_row(0, &[Value::Int(777), Value::Int(777)]).unwrap();
