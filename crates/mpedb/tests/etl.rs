@@ -272,12 +272,13 @@ fn revert_refuses_a_column_changed_outside_the_pipeline() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// §12.2 attack 3 (the half that is constructible today): a MISSING residual
-/// row is a hard error naming the run and the row — what was lost is gone,
-/// and reverting without it would fabricate data. (The other half — NULL as a
-/// residual VALUE — is legal by design but no PySpell pair can currently
-/// produce a NULL, so it is untestable end-to-end; the revert path reads a
-/// present row's value verbatim, whatever it is.)
+/// §12.2 attack 3, the missing-row half: a MISSING residual row is a hard
+/// error naming the run and the row — what was lost is gone, and reverting
+/// without it would fabricate data. (An earlier version of this comment
+/// claimed the NULL-VALUE half was untestable because PySpell could not
+/// produce NULL — wrong: `None` is a literal in the subset, and
+/// `a_null_residual_value_round_trips_and_is_distinct_from_missing` now
+/// exercises it for real.)
 #[test]
 fn a_missing_residual_row_is_a_hard_error() {
     let (d, path) = db("gone");
@@ -498,5 +499,284 @@ fn bijective_putback_carries_edits_and_new_rows() {
     let back = d.etl_putback(report.run_id).unwrap();
     assert_eq!(back.rows, 3);
     assert_eq!(col_v(&d), vec![100, -2, -50], "edit and new row both inverted");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// NULL as a residual VALUE, end to end — and the correction of a wrong
+/// claim: an earlier comment here said no PySpell pair can produce NULL, but
+/// `None` is a literal in the subset. The clamp pair returns None for rows
+/// that were NOT clamped (nothing was lost) and the original for rows that
+/// were — so the residual column legitimately holds NULL, and the distinction
+/// from a MISSING row (hard error) is exercised for real, not argued.
+#[test]
+fn a_null_residual_value_round_trips_and_is_distinct_from_missing() {
+    let (d, path) = db("nullres");
+    def(&d, "def clamp(x):\n    if x > 100:\n        return 100\n    return x\n");
+    def(
+        &d,
+        "def clamp_rex(x):\n    if x > 100:\n        return x\n    return None\n",
+    );
+    def(
+        &d,
+        "def unclamp(y, r):\n    if r is None:\n        return y\n    return r\n",
+    );
+    // `any`, not int64: the probe corpus routes Float(inf) through the
+    // clamped branch, and rex then returns a float — the same
+    // integral-floats-shadow-ints fact every pair here keeps meeting.
+    d.create_residual_lens("clamp", "clamp", "clamp_rex", "unclamp", ColumnType::Any)
+        .unwrap();
+
+    let original = vec![5i64, 250, 100, 101];
+    seed(&d, &original);
+    let report = d.etl_apply("clamp", "t", "v").unwrap();
+    assert_eq!(col_v(&d), vec![5, 100, 100, 100], "clamped in place");
+    // Every row has a residual ROW; two of them hold the VALUE NULL.
+    let nulls = rows(
+        d.query(
+            "SELECT count(*) FROM etl_residual WHERE run_id = $1 AND residual IS NULL",
+            &[Value::Int(report.run_id)],
+        )
+        .unwrap(),
+    );
+    assert_eq!(nulls[0][0], Value::Int(2), "unclamped rows lost nothing: residual = NULL");
+
+    // Putback carries an edit back through a NULL residual (r is None ⇒
+    // x' = y'), and revert-after would be refused; do the full putback.
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE t SET v = 7 WHERE id = 0", &[]).unwrap();
+    s.commit().unwrap();
+    d.etl_putback(report.run_id).unwrap();
+    assert_eq!(col_v(&d), vec![7, 250, 100, 101], "edit kept; clamped values restored");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Text values through the whole loop: redaction with recovery. The forward
+/// is CONSTANT — maximally non-injective — and registers as a residual pair
+/// because x ↦ ("[REDACTED]", x) is injective via the residual alone. Revert
+/// restores the exact originals. (Putback of an edited redaction is
+/// meaningless and PutRes refuses it — also asserted.)
+#[test]
+fn text_redaction_applies_and_reverts_exactly() {
+    let (d, path) = db("redact");
+    def(&d, "def redact(s):\n    return \"x\" + s + \"\" and \"[REDACTED]\"\n");
+    def(&d, "def redact_rex(s):\n    return s\n");
+    def(&d, "def unredact(y, r):\n    return r\n");
+    d.create_residual_lens("redact", "redact", "redact_rex", "unredact", ColumnType::Any)
+        .unwrap();
+
+    let originals = ["password=hunter2", "", "æøå"];
+    let mut s = d.begin().unwrap();
+    for (i, t) in originals.iter().enumerate() {
+        s.query(
+            "INSERT INTO t (id, v, w) VALUES ($1, 0, $2)",
+            &[Value::Int(i as i64), Value::Text(t.to_string())],
+        )
+        .unwrap();
+    }
+    s.commit().unwrap();
+
+    let report = d.etl_apply("redact", "t", "w").unwrap();
+    let redacted = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
+    for r in &redacted {
+        assert_eq!(r[0], Value::Text("[REDACTED]".into()));
+    }
+
+    // Editing a redaction has no preimage — PutRes refuses it by name.
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE t SET w = 'peek' WHERE id = 0", &[]).unwrap();
+    s.commit().unwrap();
+    let e = d.etl_putback(report.run_id).unwrap_err().to_string();
+    assert!(e.contains("outside the pair's image"), "{e}");
+
+    // Restore the redaction text and revert exactly.
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE t SET w = '[REDACTED]' WHERE id = 0", &[]).unwrap();
+    s.commit().unwrap();
+    let back = d.etl_revert(report.run_id).unwrap();
+    assert_eq!(back.rows, 3);
+    let after = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
+    for (r, want) in after.iter().zip(originals.iter()) {
+        assert_eq!(r[0], Value::Text(want.to_string()));
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An empty table is a legal, boring run: 0 rows, 0 residuals, revert works.
+/// The edge exists because both hash chains are the empty chain — they must
+/// agree rather than trip the verifier.
+#[test]
+fn an_empty_table_applies_and_reverts_without_drama() {
+    let (d, path) = db("empty-tbl");
+    define_abs_pair(&d);
+    let report = d.etl_apply("mag", "t", "v").unwrap();
+    assert_eq!((report.rows, report.residuals), (0, 0));
+    d.etl_revert(report.run_id).unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The residuals and lineage live in the FILE, not the handle: apply with one
+/// Database, drop it, reopen the same file, and putback with the second
+/// handle — the run must be fully resumable across process lifetimes.
+#[test]
+fn a_run_survives_reopen_and_puts_back_from_a_fresh_handle() {
+    let (d, path) = db("reopen");
+    define_abs_pair(&d);
+    seed(&d, &[-5, 3, -700]);
+    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let run_id = report.run_id;
+    drop(d);
+
+    let d2 = Database::open_from_file(std::path::Path::new(&path)).unwrap();
+    let mut s = d2.begin().unwrap();
+    s.query("UPDATE t SET v = 9 WHERE id = 1", &[]).unwrap();
+    s.commit().unwrap();
+    d2.etl_putback(run_id).unwrap();
+    assert_eq!(
+        rows(d2.query("SELECT v FROM t ORDER BY id", &[]).unwrap())
+            .into_iter()
+            .map(|r| r[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int(-5), Value::Int(9), Value::Int(-700)],
+        "sign restored where unedited; the edit (3 -> 9, positive stays) kept"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A TEXT primary key: pk_enc is canonical value bits, not an integer
+/// assumption. Apply + revert keyed by text pks.
+#[test]
+fn a_text_primary_key_carries_residuals() {
+    let path = format!(
+        "{}/etl-textpk-{}.mpedb",
+        mpedb_testkit::scratch_base_str(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        r#"
+[database]
+path = "{path}"
+size_mb = 32
+max_readers = 8
+durability = "none"
+
+[[table]]
+name = "t"
+primary_key = ["k"]
+  [[table.column]]
+  name = "k"
+  type = "text"
+  [[table.column]]
+  name = "v"
+  type = "int64"
+"#
+    );
+    let d = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    def(&d, "def mag(x):\n    if x < 0:\n        return 0 - x\n    return x\n");
+    def(&d, "def sgn(x):\n    if x < 0:\n        return 1\n    return 0\n");
+    def(&d, "def unmag(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n");
+    d.create_residual_lens("mag", "mag", "sgn", "unmag", ColumnType::Int64).unwrap();
+
+    let mut s = d.begin().unwrap();
+    for (k, v) in [("alpha", -5i64), ("æøå", 3), ("", -9)] {
+        s.query(
+            "INSERT INTO t (k, v) VALUES ($1, $2)",
+            &[Value::Text(k.into()), Value::Int(v)],
+        )
+        .unwrap();
+    }
+    s.commit().unwrap();
+
+    let report = d.etl_apply("mag", "t", "v").unwrap();
+    assert_eq!(report.residuals, 3);
+    d.etl_revert(report.run_id).unwrap();
+    let vals = rows(d.query("SELECT v FROM t ORDER BY k", &[]).unwrap());
+    assert_eq!(
+        vals.into_iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        vec![Value::Int(-9), Value::Int(-5), Value::Int(3)],
+        "exact restore keyed by text pks (empty and non-ASCII included)"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The whole loop under `durability = "wal"` — the ring/group-commit path,
+/// not the `none` shortcut every other test here uses. One smoke: the ETL
+/// transaction shape must be durable-mode-agnostic.
+#[test]
+fn etl_works_under_wal_durability() {
+    let path = format!(
+        "{}/etl-wal-{}.mpedb",
+        mpedb_testkit::scratch_base_str(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        r#"
+[database]
+path = "{path}"
+size_mb = 32
+max_readers = 8
+durability = "wal"
+
+[[table]]
+name = "t"
+primary_key = ["id"]
+  [[table.column]]
+  name = "id"
+  type = "int64"
+  [[table.column]]
+  name = "v"
+  type = "int64"
+"#
+    );
+    let d = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    def(&d, "def mag(x):\n    if x < 0:\n        return 0 - x\n    return x\n");
+    def(&d, "def sgn(x):\n    if x < 0:\n        return 1\n    return 0\n");
+    def(&d, "def unmag(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n");
+    d.create_residual_lens("mag", "mag", "sgn", "unmag", ColumnType::Int64).unwrap();
+    let mut s = d.begin().unwrap();
+    for i in 0..50i64 {
+        s.query(
+            "INSERT INTO t (id, v) VALUES ($1, $2)",
+            &[Value::Int(i), Value::Int(-i)],
+        )
+        .unwrap();
+    }
+    s.commit().unwrap();
+    let report = d.etl_apply("mag", "t", "v").unwrap();
+    d.etl_revert(report.run_id).unwrap();
+    let neg = rows(d.query("SELECT count(*) FROM t WHERE v < 0", &[]).unwrap());
+    assert_eq!(neg[0][0], Value::Int(49), "restored under wal durability");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Scale smoke, not a benchmark: 5 000 rows through apply -> edit -> putback.
+/// Exists so a super-linear regression in the per-row loops shows up as a
+/// timeout rather than a user report. The residual probe is verified to plan
+/// as PkPoint(run_id, pk_enc), so the ~65 s this takes is debug-build
+/// per-statement overhead, linear — hence #[ignore], per the house rule.
+#[test]
+#[ignore = "slow in debug (~65 s, linear): run with --ignored"]
+fn five_thousand_rows_apply_and_put_back() {
+    let (d, path) = db("scale");
+    define_abs_pair(&d);
+    let mut s = d.begin().unwrap();
+    for i in 0..5000i64 {
+        s.query(
+            "INSERT INTO t (id, v, w) VALUES ($1, $2, 0)",
+            &[Value::Int(i), Value::Int(if i % 2 == 0 { -i } else { i })],
+        )
+        .unwrap();
+    }
+    s.commit().unwrap();
+    let report = d.etl_apply("mag", "t", "v").unwrap();
+    assert_eq!(report.rows, 5000);
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE t SET v = 12345 WHERE id = 100", &[]).unwrap();
+    s.commit().unwrap();
+    d.etl_putback(report.run_id).unwrap();
+    let v100 = rows(d.query("SELECT v FROM t WHERE id = 100", &[]).unwrap());
+    assert_eq!(v100[0][0], Value::Int(-12345), "edit carried back with its sign");
     let _ = std::fs::remove_file(&path);
 }

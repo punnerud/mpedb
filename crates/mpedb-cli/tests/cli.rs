@@ -1050,3 +1050,92 @@ fn etl_apply_sigkilled_at_any_instant_is_all_or_nothing() {
     assert_ok(&run(&["etl", "revert", dbs, &run_id]));
     assert_eq!(count_where("v < 0"), n, "and the revert restores the seed exactly");
 }
+
+/// SIGKILL mid-`etl putback` — the write path the apply-kill test does not
+/// cover. Same all-or-nothing contract: at every kill instant the column is
+/// either fully transformed (putback never committed) or fully source-domain
+/// (it did), never mixed — and the run's outcome agrees with the data.
+#[test]
+fn etl_putback_sigkilled_at_any_instant_is_all_or_nothing() {
+    let td = TestDir::new("etl-putback-sigkill");
+    let dbf = td.path().join("etl.mpedb");
+    let dbs = dbf.to_str().unwrap();
+
+    assert_ok(&run(&[dbs, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"]));
+    let n = 800i64;
+    for chunk in (0..n).collect::<Vec<_>>().chunks(200) {
+        let tuples: Vec<String> =
+            chunk.iter().map(|i| format!("({}, {})", i, -(i + 1))).collect();
+        assert_ok(&run(&[
+            dbs,
+            &format!("INSERT INTO t (id, v) VALUES {}", tuples.join(", ")),
+        ]));
+    }
+    let fns = [
+        ("mag.py", "def mag(x):\n    if x < 0:\n        return 0 - x\n    return x\n"),
+        ("sgn.py", "def sgn(x):\n    if x < 0:\n        return 1\n    return 0\n"),
+        ("unmag.py", "def unmag(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n"),
+    ];
+    for (name, src) in fns {
+        let p = td.path().join(name);
+        std::fs::write(&p, src).unwrap();
+        assert_ok(&run(&["fn", "define", dbs, p.to_str().unwrap()]));
+    }
+    assert_ok(&run(&[
+        "lens", "define", dbs, "mag", "mag", "unmag", "--class", "residual", "--rex", "sgn",
+        "--residual-type", "int64",
+    ]));
+
+    let count_where = |pred: &str| -> i64 {
+        let o = run(&[dbs, &format!("SELECT count(*) FROM t WHERE {pred}")]);
+        assert_ok(&o);
+        String::from_utf8_lossy(&o.stdout).lines().last().unwrap().trim().parse().unwrap()
+    };
+    let run_id_of = |outcome: &str| -> String {
+        let o = run(&[
+            dbs,
+            &format!("SELECT max(run_id) FROM etl_lineage WHERE outcome = '{outcome}'"),
+        ]);
+        assert_ok(&o);
+        String::from_utf8_lossy(&o.stdout).lines().last().unwrap().trim().to_string()
+    };
+
+    for delay_ms in [0u64, 5, 12, 25, 50] {
+        assert_ok(&run(&["etl", "apply", dbs, "mag", "t.v"]));
+        assert_eq!(count_where("v < 0"), 0, "applied: all magnitudes");
+        let applied_run = run_id_of("applied");
+        // An edit, so the interrupted operation is genuinely a PUTBACK
+        // (an unedited column would also accept revert).
+        assert_ok(&run(&[dbs, "UPDATE t SET v = 999999 WHERE id = 0"]));
+
+        let mut child = Command::new(bin())
+            .args(["etl", "putback", dbs, &applied_run])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let neg = count_where("v < 0");
+        let committed = neg > 0;
+        if committed {
+            // Fully back in the source domain, edit carried: id 0 must be
+            // -999999, every other row negative, and the run marked putback.
+            assert_eq!(neg, n, "mixed column after putback SIGKILL at {delay_ms}ms");
+            assert_eq!(count_where("v = 0 - 999999"), 1, "the edit came back signed");
+            assert_eq!(run_id_of("putback"), applied_run);
+            // reset for the next wave
+            assert_ok(&run(&[dbs, "UPDATE t SET v = 0 - 1 WHERE id = 0"]));
+        } else {
+            // Untouched: still all-magnitude (plus the positive edit), the
+            // residuals still complete, and the run still 'applied' — so the
+            // putback is simply retried to completion.
+            assert_eq!(count_where("v >= 0"), n, "mixed column at {delay_ms}ms");
+            assert_ok(&run(&["etl", "putback", dbs, &applied_run]));
+            assert_eq!(count_where("v < 0"), n);
+            assert_ok(&run(&[dbs, "UPDATE t SET v = 0 - 1 WHERE id = 0"]));
+        }
+    }
+}
