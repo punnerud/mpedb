@@ -452,3 +452,102 @@ Tre shipped/reelle systemer markerer hva som faktisk er oppnåelig, sortert ette
 - **Per versjon: `author, timestamp, comment, prev_hash`** — mer metadata trengte ingen av systemene; mindre gjorde historikken ubrukelig.
 - **Vær trusted language for alle brukere**: ingen untrusted escape hatch. Untrusted-språk blir admin-privilegier og dør (PL/Python-lærdommen).
 - **Dependents-spørringen**: ny versjon av en funksjon skal kunne liste hvilke pipelines som fortsatt pinner gammel hash (Unisons `todo`) — trygt nettopp fordi gamle hasher aldri slutter å virke.
+
+## Addendum 2026-07-28 — sveip etter steg 1 (Jeopardy, Hermes, CRIL, RC 2023–2025, Sparcl JFP, wire-formater, lineage-praksis)
+
+Kjørt som forarbeid til steg 2 (residual + lineage), seks målrettede sveip over
+det hovedsveipet 16/7 ikke dekket. Hovedfunnet på tvers, og det viktigste:
+**ingen av de reversible språkene — heller ikke de nyeste — har en historie for
+å PERSISTERE komplementet.** De holder det inline i output (Sparcl), utleder det
+fra kontekst ved inverteringspunktet (Jeopardy), eller forbyr det å eksistere
+(Hermes). Residualen-som-lagret-data er ubestridt terreng; forpliktelsene 5–9
+konkurrerer ikke med noen, og steg 2 bygger noe litteraturen ikke har.
+
+### Jeopardy (Kristensen/Kaarsgaard/Thomsen; RC 2024, LNCS 14680; arXiv 2209.02422, 2212.03161)
+
+Global-ikke-lokal invertibilitet: lokalt ikke-injektive (til og med
+ikke-deterministiske) operasjoner er lov når konteksten kan avgjøre inversjonen.
+Mekanismen er «available implicit arguments»-analysen — available-expressions-
+dataflyt kjørt bidireksjonalt (seedet både fra `main{input}` og
+`invert main{output}`), fixpoint over kall-konfigurasjoner. Komplement-enheten
+er GRENVALGET (hvilken case-arm fyrte), og Bennett-historikk avvises eksplisitt
+som «extra unwanted data»: i stedet spesialiseres funksjonen ved kompilering til
+å kopiere et allerede-tilgjengelig input inn i output. Komplementet eksisterer
+aldri som eget kjøretidsobjekt — følgelig null serialisering, null format, null
+versjonering. To lærdommer: (1) analysen er konservativ og delvis (én
+rekursjons-steg-lookback; uavgjørbar i det generelle — Rice), som REFORSTERKER
+vår runtime-verifisering-med-navngitt-motverdi over statisk tillit; (2) idéen
+er en **residual-elisjonsanalyse**: en residualkomponent som beviselig kan
+utledes av kolonner som alt finnes i output-raden, trenger ikke lagres — for
+mpedb en korpusverifisert (ikke statisk) steg-3+-optimalisering, aldri en
+kontraktsendring.
+
+### Hermes (Mogensen; RC 2020, SCP 2022) og CRIL (Oguchi & Yuen, EPTCS 387, 2023)
+
+Hermes er reversibilitet ved konstruksjon (kun `+=`/`-=`/`^=`/rotasjoner/swaps,
+statisk anti-aliasing), og det kopierbare er ancilla-disiplinen: lokale
+variabler fødes null og RUNTIME-SJEKKES til null ved deallokering
+(`disposelocation_z`) — avkomputering håndheves, ikke antas. Overført: et
+`Bijective`-deklarert par får en billig kjøretids-assert på tom residual ved
+hver forward (steg 2, dybdeforsvar mot korpus-blinde hull). CRIL (Concurrent
+Reversible Intermediate Language — «Concurrent», ikke «Clean») viser
+advarselens form: med delt mutérbar tilstand må en kausalitets-DAG over
+oppdateringer akkumuleres ved kjøretid — SELVE KJØREPLANEN blir residual-data.
+Per-rad-residualer forblir ordningsfrie KUN når spells er raduavhengige; PySpell
+uten delt tilstand mellom kall gir oss det gratis i dag, og `etl apply` må aldri
+introdusere en delt akkumulator uten å vite at planen da må inn i residualen.
+
+### RC 2023–2025 for øvrig
+
+Programmeringsspråk-andelen er liten (~4–5 artikler/år). «Towards Clean
+Reversible Lossless Compression» (RC 2024, Glück/Yokoyama m.fl.): garbage-fri
+reversibel LZW i Θ(n), men clean BWT betaler ~n³ mot den irreversible — **prisen
+for null komplement kan være polynomisk, og det er nøyaktig det å lagre en
+residual kjøper oss fri fra.** Hybrid SSA (RC 2024) gjør ikke-reversibilitet
+førsteklasses i en reversibel IR — samme delvis-reversible pipelineform som
+lens-designet (kun verifisert-bijektive steg dropper residualen). Ingen
+teoretisk oppfølger til minimal-garbage-uavgjørbarheten; resultatet står.
+Mønster over årgangene: garbage unngås ved REKOMPUTERING (tid mot plass), aldri
+gratis.
+
+### Sparcl JFP 2024 (Matsuda & Wang; + Kalpis ESOP 2024, Bifrons 2025)
+
+Journalversjonen endrer ingenting semantisk (egen delta-liste: Agda-formalisering,
+aritmetisk koding/LZ77-eksempler, oppdatert relatert arbeid). `lift` er fortsatt
+uverifisert («by nature unsafe»); beste tilbud er `safeLift`s dynamiske
+rundtursjekk — **svakere enn vår korpus-verifisering med navngitt motverdi ved
+deklarasjonstid.** Komplementer rir inline i invertibel output (Huffman-tabellen
+reiser i paret) og residualer er CLOSURES — per konstruksjon userialiserbare.
+Etterfølgere: Kalpis (ESOP 2024; partiell invertibilitet som effekt,
+Agda-mekanisert), Bifrons (2025; symmetrisk-linse-bibliotek + linse-TESTING mot
+heterogene databaser — nærmest oss i ånd, fortsatt uten persistert komplement).
+
+### Wire-formater: pristine-tar, Lepton, JPEG XL jbrd — konvergerte regler
+
+1. **Magic + versjon TIDLIG, og versjonen ER algoritmevalget** (pristine-tar
+   v2=xdelta/v3=xdelta3; Lepton 1-byte versjon), med navngitt nekt på nyere
+   («delta is version N, newer than maximum supported M»). Én levende versjon om
+   gangen er forenlig med vår no-backward-compat — men byten må finnes fra dag én.
+2. **Hash av ORIGINALEN lagres for verify-on-reconstruct** (pristine-tar la til
+   sha256sum av originalartefakten; Lepton verifiserer bit-eksakthet på
+   SKRIVE-siden). Vår `source_hash` i lineage er samme grep.
+3. **Strukturert + opak splitt** (jbrd: bit-pakkede felt med harde
+   verdiområder — ugyldig område = reject — pluss ÉN opak bytestrøm; Lepton:
+   metadata-felt + én zlib-blob). For skalar-residualer bærer radkodeken
+   strukturen; regelen aktiveres for steg-3-kompositter.
+4. Residualer KOMPONERER ved nesting (pristine-tars `wrapper`-medlem er et
+   komplett innkapslet delta med egen type+versjon) — steg-3-konvoluttens form.
+
+### Lineage-praksis (OpenLineage, Cui/Widom, ProvSQL, DVC/MLflow)
+
+Konvergert minimum per rad: *(kjørings-id, steg-identitet, artefakt-identitet
+inn/ut, kode-identitet, tidspunkt, utfall)*. Tre funn som endrer §7-skjemaet:
+(1) **feilede kjøringer er førsteklasses lineage** (START/FAIL/ABORT +
+errorMessage overalt) — tabellen får `outcome` + `error`; (2) kjørings-id er
+ALDRI innholdshash (to kjøringer kan produsere identiske bytes og må skilles) —
+run_id forblir teller/tid, hashene identifiserer artefakter og kode; (3) for
+per-rad-transformer uten join/aggregat kollapser lineage = why = where —
+residualen ER per-rad-annotasjonen (ProvSQL-mønsteret: per-tuppel-id inn i delt
+struktur), og Cui/Widoms lazy-reverse-queries-observasjon sier at for et
+verifisert invertibelt par er INVERSEN selve reverse-spørringen — materialisert
+radnivå-lineage er redundant hos oss.

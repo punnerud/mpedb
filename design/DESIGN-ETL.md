@@ -1,16 +1,16 @@
 # DESIGN-ETL — reversible PySpell ETL: lens pairs, residuals, round-trip verification
 
-**Status: DESIGNED, and stage 1 (the bijective corner) IMPLEMENTED
-(2026-07-28)** — `crates/mpedb/src/lens.rs`, `mpedb lens` in the CLI, tests in
-`crates/mpedb/tests/lens.rs`. The prior-art groundwork is `design/ETL-BIDI.md`,
-whose eleven design commitments bind this document; every section below names the
-commitment it discharges. Sections marked **[not built]** are designed here and
-built later — the residual format is an eternity promise (commitment 9) and an
-eternity promise cannot be designed incrementally, so it is designed now and
-written to disk never, until stage 2.
+**Status: DESIGNED; stage 1 (the bijective corner) IMPLEMENTED 2026-07-28,
+stage 2 (residual pairs + apply/revert + lineage) IN PROGRESS** —
+`crates/mpedb/src/lens.rs`, `mpedb lens` in the CLI, tests in
+`crates/mpedb/tests/lens.rs`. The prior-art groundwork is `design/ETL-BIDI.md`
+(including the 2026-07-28 addendum: Jeopardy, Hermes, CRIL, RC 2023–2025,
+Sparcl JFP 2024, wire-format practice, lineage practice), whose eleven design
+commitments bind this document; every section below names the commitment it
+discharges.
 
-Three things the implementation changed in this document, each because building
-it proved the first draft wrong:
+Three things stage-1 implementation changed in this document, each because
+building it proved the first draft wrong:
 
 - **NaN canonicalises; it is not compared by payload** (§5.1). The first draft
   had the opposite rule, which would have made verification platform-dependent.
@@ -18,6 +18,24 @@ it proved the first draft wrong:
   makes the collision arm unreachable.
 - **`celsius ⇄ fahrenheit` fails for two independent reasons**, not one (§12.1),
   and the precision claim needed its own floats-only proof to be honest.
+
+Four more from stage-2 design review (a 6-sweep research pass plus an
+adversarial check of the build sketch, 2026-07-28):
+
+- **The residual type is DECLARED in the pair record and verified at
+  registration** (§8.1). The first sketch stored residuals in an `Any` column
+  with no declaration anywhere — exactly the "free-form bag" commitment 5
+  forbids. `Any` remains a legal declaration; it must be said, not defaulted.
+- **The v1 record's reserved bytes could not absorb stage 2** (§8.1) — a third
+  32-byte hash does not ride a u8. v2 changes the shape under the standing
+  no-backward-compat rule; v1 records decode as bijective pairs, not as
+  "not defined", because degradation-to-undefined was designed for corruption.
+- **Scalar residuals ride the row codec; the §8.2 envelope is reserved for
+  stage-3 composites** (§8.2) — with the condition that `revert` refuses hard
+  when the lineage row is missing.
+- **The lineage table records failed runs, and the verification level that
+  actually ran** (§7) — every surveyed lineage system treats failures as
+  first-class, and §5 already forbade a bare "verified".
 
 The idea (#52): mpedb already stores enough provenance that
 PG→mpedb→sqlite3→mpedb→PG is a round trip. Generalise it to user-defined ETL via
@@ -204,7 +222,7 @@ The same reasoning rules the random tail of the corpus: it is generated as real
 values, not as random bit patterns. Random 64-bit patterns are overwhelmingly
 NaN, so a `from_bits` tail would probe the rule above and nothing else.
 
-## 6. The residual is explicit and typed (commitments 5, 6, 7) **[not built in stage 1]**
+## 6. The residual is explicit and typed (commitments 5, 6, 7) **[stage 2]**
 
 **Typed per stage.** Implicit garbage accumulates through composition (the RFun
 experience). Each `Residual` pair declares the residual's type; it is not a
@@ -239,14 +257,43 @@ O(S·log T) as the theoretically favourable midpoint. Git packfiles have shipped
 exactly this — delta chains with a depth limit and periodic full snapshots — for
 twenty years. It is a knob, never a guarantee.
 
-## 7. Lineage: content hash, never filename (commitment 8) **[not built in stage 1]**
+## 7. Lineage: content hash, never filename (commitment 8) **[stage 2]**
+
+Two ordinary tables, created through the normal DDL path inside the first ETL
+run's own transaction:
 
 ```
-(run_id, step_no, source_hash, output_hash, plan_hash, residual_ref, lens_hash)
+etl_lineage   (run_id, step_no) →
+              lens_name, forward_hash, rex_hash, inverse_hash,
+              tbl, col, source_hash, output_hash, rows,
+              verified, outcome, error, ts_micros
+
+etl_residual  (run_id, pk) → residual        -- column type Any
 ```
 
 One stable run id per pipeline run (Pachyderm's global-id move) makes multi-step
-lineage a single lookup. blake3 and content-hashed plans already exist in mpedb.
+lineage a single lookup. blake3 already exists in mpedb. Field decisions, each
+paid for by the 2026-07-28 survey (ETL-BIDI addendum):
+
+- **`step_no` is a constant 1 in stage 2** — it exists so stage-3 pipelines
+  extend the data, not the shape.
+- **`plan_hash` is dropped, with a reason**: the unit of ETL execution here is a
+  lens pair, not a SQL plan, and the three function hashes ARE the code
+  identity — strictly stronger than OpenLineage's name-based job references.
+- **`verified` records the level that actually ran** (§5 requires reporting
+  "what was verified and against what", never a bare "verified").
+- **`outcome` + `error` make failed runs first-class lineage** — every surveyed
+  system (OpenLineage START/FAIL/ABORT + errorMessage) treats them so; a table
+  that only logs successes cannot answer "why is this column half-stale".
+- **`run_id` is a counter, never a content hash** — two runs can produce
+  identical bytes and must still be distinguishable; hashes identify artifacts
+  and code, the id identifies the execution.
+- **The residual table is keyed `(run_id, pk)`**, so one run's residuals are
+  addressable as a set (`residual_ref` from the original tuple = the run id)
+  and two runs on the same table can never collide. A residual VALUE of NULL is
+  legal and distinct from a MISSING row — reading absence as NULL would smuggle
+  the refused creation path `inverse(y, ∅)` (§4) back in as a silent wrong
+  answer.
 
 **Positional/path-based correlation is not an option we are weighing.** It was "a
 show-stopper" already in Boomerang, and every mature tool — DVC, Pachyderm,
@@ -275,28 +322,42 @@ paid forward.
 
 ## 8. Formats, and the eternity promise (commitment 9)
 
-### 8.1 `lens/<name>` — the pair record, v1, **built in stage 1**
+### 8.1 `lens/<name>` — the pair record, v2 (stage 2; v1 was stage 1's)
 
-The only format stage 1 writes to disk. Fixed width, version-prefixed, decoded
-through a bounds-checked `decode_lens_record → Option`, where a corrupt record
-degrades to "that pair is not defined" and never panics — exactly the shape of
-`decode_func_record` (spellfn.rs:64-71), and the project rule that every decoder
-gets truncation-at-every-offset tests.
+Fixed width, version-prefixed, decoded through a bounds-checked
+`decode_lens_record → Option`, where a corrupt record degrades to "that pair is
+not defined" and never panics — exactly the shape of `decode_func_record`
+(spellfn.rs:64-71), and the project rule that every decoder gets
+truncation-at-every-offset tests.
 
 ```
-version        u8    = 1
+version        u8    = 2
 class          u8    0 = Bijective, 1 = Residual, 2 = Lossy
 forward_hash   [u8; 32]     ProcHash of the forward function's IR blob
 inverse_hash   [u8; 32]     ProcHash of the inverse function's IR blob
+rex_hash       [u8; 32]     ProcHash of the residual extractor; all-zero when
+                            the class has no residual (Bijective, Lossy)
+residual_type  u8    ColumnType tag of the DECLARED residual type; 0xff = none.
+                     Declared by the registrant and VERIFIED against actual
+                     rex outputs during registration (commitment 5 — an Any
+                     column alone is the free-form bag the commitment forbids;
+                     ColumnType::Any is a legal declaration, but it must be
+                     SAID, not defaulted into)
+branch_policy  u8    0 = residual carries the branch tag; 1 = outputs verified
+                     disjoint (first-match) — the §6 choice, explicit per pair
 canonizer      u8    0 = identity (byte-for-byte); other ids reserved
 probe_corpus   u8    id of the corpus the verification ran against
 samples        u32   how many samples passed
 verified_gen   u64   schema_gen at which the verification was recorded
-residual_ref   u8    = 0 in v1 (no residual); reserved for stage 2
 ```
 
-`residual_ref` and the reserved canonizer ids are present in v1 **on purpose**:
-stage 2 must be able to add residuals without changing the record's shape.
+**v1 records decode into v2 shape with a zero rex hash and no residual type** —
+not as "not defined". Degradation-to-undefined was designed for *corruption*,
+not deliberate retirement, and stage-1 records exist in this project's own dev
+and M3 databases. The v1 claim that reserved bytes would absorb stage 2
+("without changing the record's shape") was undersized — a third 32-byte hash
+cannot ride a u8 — and the shape change is taken under the standing
+no-backward-compat rule, with this paragraph as the record of why.
 
 **The pair is pinned by CONTENT HASH, not by name**, and this is inherited, not
 invented: DESIGN-TRIGGERS §5.1 planned to pin procedures by name and shipped
@@ -309,20 +370,46 @@ against. Re-register the pair to rebind, and it is re-verified when you do. A
 verification that could be invalidated by an unrelated `fn define` would be
 worthless.
 
-### 8.2 The residual envelope, v1 — designed, **not written in stage 1**
+### 8.2 Residual persistence: scalars ride the row codec; the envelope is stage 3
+
+**Amended in stage 2.** Stage 2's residuals are scalars in an `Any` column of an
+ordinary table (`etl_residual`, §7), and they deliberately do NOT get the
+envelope below: the row codec already tags the value's type, it inherits exactly
+the durability contract of every other row in the file, and the standing rule
+that format breaks fund a free migration of the project's own files means the
+codec cannot break in a way that loses residual rows without losing the user's
+data too. The envelope's version/kind bytes would be redundant bureaucracy on a
+scalar.
+
+The condition that makes this acceptable rather than a breach of commitment 9:
+a residual's *meaning* lives in its lineage row (which pair version consumes
+it — the pinned `inverse_hash` is the upcasting rule discharged by content
+addressing), so **`revert` refuses hard when the lineage row is missing**. A
+residual whose lineage row was deleted is an uninterpretable scalar, and an
+equally explicit error, never a NULL read.
+
+The envelope, reserved for stage-3 COMPOSITE residuals (pipelines, containers,
+base+diff), where a residual is no longer one scalar:
 
 ```
-version   u8
+version   u8      version-as-dispatch: the value selects the inverse algorithm,
+                  and a newer version is refused WITH ITS NUMBER NAMED
+                  (pristine-tar's rule: "delta is version N, newer than
+                  maximum supported M")
 kind      u8      what the residual is (typed per pair)
 len       u32     byte length of the payload
 payload   [u8; len]
 ```
 
-Versioned from day one; the decoder is minimal, bounds-checked, `Corrupt`-never-
-panic (the mpedb rule applies double here). **A new version of a pair that cannot
-consume old residuals is a NEW pair with a new hash** — the upcasting rule from
-event sourcing. Content addressing gives us this for free: the old blobs stay,
-and anything pinned to them keeps working.
+Structured fields with hard-bounded ranges plus ONE opaque payload — the
+jbrd/Lepton split — and composition by nesting (pristine-tar's `wrapper`
+member): stacked transforms get stacked, self-describing residuals.
+
+The decoder is minimal, bounds-checked, `Corrupt`-never-panic (the mpedb rule
+applies double here). **A new version of a pair that cannot consume old
+residuals is a NEW pair with a new hash** — the upcasting rule from event
+sourcing. Content addressing gives us this for free: the old blobs stay, and
+anything pinned to them keeps working.
 
 The pipeline's own definition format is versioned for the same reason. Cambria's
 prototype became unusable as a system of record because the *tool's* format
@@ -383,7 +470,42 @@ in stage 1, since pairs are not a compilation input yet. It is taken anyway: it
 becomes required the moment they are, and the alternative is a silent staleness
 bug on that day. This is a rare admin operation.
 
-**Stage 2 — residual, lineage, tuple pairs. [not built]** §6, §7, §8.2.
+**Stage 2 — residual pairs + apply/revert + lineage. IN PROGRESS (A1–A4).**
+
+The Residual class becomes real as a TRIPLE of stored functions —
+`forward/1`, `rex/1` (the residual extractor: Sparcl's complement as a plain
+function), `inverse/2` — all bound by content hash, zero interpreter changes
+(`call_spell_fn` is arity-generic). The law verified over the probe corpus is
+GetPut: `inverse(forward(x), rex(x)) == x`. PutRes is NOT run over the corpus —
+on image pairs it is a tautology given GetPut plus determinism, and running a
+tautology and reporting it as an independent law is the bare "verified" §5
+forbids; the argument lives here instead of in a test.
+
+The collision key is class-conditional: `Bijective` keys on `y` alone (a
+collision IS the defect); `Residual` keys on `blake3(len‖bits(y)‖len‖bits(r))` —
+multiple preimages of `y` are the entire point when `r` disambiguates, and the
+length framing is load-bearing because unframed concatenation makes
+`("a\x04","")` and `("a","\x04")` collide falsely. The Hermes borrow: for
+`Bijective` pairs, every forward run asserts the residual is empty — cheap
+defence in depth against corpus-blind non-bijectivity.
+
+`mpedb etl apply <target> <pair> <table>.<col>` transforms a column IN PLACE in
+ONE WriteSession: class-gated (`Lossy` refused by name — in-place is source
+deletion, commitment 2; `Bijective` writes lineage only), a row the pair refuses
+ABORTS the run with the row named (silently skipping would reintroduce Cambria's
+grey zone per-row), output type pre-checked against the column's declared type
+(type-changing pairs need an `Any` column; ALTER COLUMN does not exist yet).
+Verification before commit is total (the source is being deleted) at O(1)
+memory: `source_hash` = blake3 over PK-ordered `value_bits`-CANONICAL bytes —
+never raw storage bits, or legal NaN canonicalisation produces a false
+"artifact changed" — and the `inverse(y, r)` stream is re-read inside the same
+txn and hashed against it. `revert <run_id>` re-hashes against `output_hash`
+first (mismatch = "artifact changed outside the pipeline", hard error), and a
+new apply on a column with an unreverted run is refused. A pre-flight size
+guard refuses oversized runs with numbers: the single big txn is the design
+(total verification requires it), an OOM-killed apply is deterministic on
+retry, and a named refusal beats an un-completable loop. Apply is an offline
+operation — it holds the writer lock for the duration, and says so.
 
 **Stage 3 — the domains. [not built]** Version storage as base+diff (binds #50
 and #52: `forward(v1, edit) → v2` with the diff as residual, verified
@@ -444,8 +566,10 @@ in `crates/mpedb/tests/lens.rs` plus the floats-only unit test in `lens.rs`;
 `truncation_at_every_offset_is_none_not_panic`); 6 by reading — every production
 `sys_scan` is a prefix-bounded range, and the only two unbounded `sys_scan()`
 call sites in the tree are both inside `#[cfg(test)]`, so a bounded `lens`
-catalog costs nothing per compile; 7 by running the suites; 8 by the record
-layout in §8.1, whose `residual_ref` byte is reserved and asserted zero.
+catalog costs nothing per compile; 7 by running the suites; 8 held for stage 1
+(the v1 record's `residual_ref` byte was asserted zero in its round-trip test)
+and is now discharged differently: stage 2 DOES persist residuals, through the
+§7 tables, under §8.2's amended rule.
 
 Attack 3 is worth its own sentence, because the answer is not what the phrasing
 suggests: dropping the *function* leaves the pair perfectly healthy.
@@ -454,3 +578,35 @@ holds the blob's hash, and content-addressed blobs are never deleted. Tested
 (`dropping_the_function_name_does_not_break_the_pair`), and it is the same
 property from the other side as the redefinition test: what the pair points at
 cannot be changed by anything that happens to a name.
+
+### 12.2 The stage-2 attack list
+
+Written before stage 2 is built, from the 2026-07-28 adversarial check of the
+build sketch — the three found VIOLATIONS are already folded into §7/§8.1/§11;
+these are the residual risks each stage-2 test must discharge:
+
+1. **The joint collision key is unframed.** `value_bits` has no length framing,
+   so naive concatenation makes distinct `(y, r)` pairs collide and falsely
+   refuses a valid pair. The key is `blake3(len‖bits(y)‖len‖bits(r))`, and a
+   test constructs the `("a\x04","")` / `("a","\x04")` trap explicitly.
+2. **Hashes over raw bits instead of canonical bits.** A pair that legally
+   canonicalises a NaN payload would verify clean and then fail revert with a
+   false "artifact changed". `source_hash`/`output_hash` are blake3 over
+   `value_bits`-canonical encodings, tested with a NaN-carrying column.
+3. **NULL residual read as missing (or vice versa).** `rex(x)` may return NULL;
+   a missing row is a hard error. Confusing them smuggles the refused creation
+   path back in as a silent wrong answer — the fail-safe-per-consumer trap.
+4. **The apply loop that can never complete.** One big txn + a table over the
+   memory guard = OOM-kill, deterministic on retry. The pre-flight refusal with
+   numbers is the fix; chunked commits are NOT (they break total verification).
+5. **Rows the pair refuses, skipped instead of aborting.** Per-row skipping
+   leaves transformed and untransformed values indistinguishable in one column —
+   Cambria's grey zone, per-row. Abort with the row named.
+6. **A second apply stacked on an unreverted column.** Refused in v1; the
+   `(run_id, pk)` key makes stacking representable later, but representable is
+   not the same as supported.
+7. **SIGKILL mid-apply.** Single-txn atomicity plus FLD-2 recovery must leave
+   the file verifying and the column untouched — the crash harness variant is
+   the proof, not the argument.
+8. **The suites moved.** Same as stage 1: nothing here touches the SQL surface;
+   corpus/Django/CPython numbers must not move.
