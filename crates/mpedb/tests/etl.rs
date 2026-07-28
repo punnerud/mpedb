@@ -337,3 +337,166 @@ fn the_bookkeeping_tables_are_refused_as_targets() {
     assert!(e.contains("bookkeeping"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
+
+/// THE goal scenario, engine-level: putback — reverse that CARRIES EDITS BACK.
+/// The image story on rows: a packed-RGB "pixel" column is stripped to
+/// grayscale (the chroma offsets are the residual), the user RETOUCHES the
+/// grayscale and CROPS the image (deletes rows), and putback re-attaches the
+/// colour to the retouched pixels — edits kept, lost half restored, cropped
+/// pixels stay gone.
+#[test]
+fn putback_carries_edits_back_and_keeps_the_crop() {
+    let (d, path) = db("putback");
+    // px = r*65536 + g*256 + b. forward: luma y = (r+g+b)//3.
+    // rex: the chroma offsets (r-y, g-y, b-y), each shifted +255 into 0..511
+    // and packed base-512 — exact recovery, so x ↦ (y, rex) is injective.
+    // Domain guards (`1 // 0` = a deterministic refusal in PySpell): a pixel
+    // is 1..=0xFFFFFF. Every guard here was DEMANDED by the verifier over the
+    // probe corpus, one refusal at a time: i64-sized ints overflow the
+    // base-512 chroma packing (GetPut fails, value named); fractional floats
+    // break exact recovery (`px % 1 != 0`); and the lower bound is 1, not 0,
+    // because Float(0.0) and Float(-0.0) produce IDENTICAL (y, chroma) — a
+    // GENUINE collision the verifier refused — so pure black is the one pixel
+    // value outside the pair's domain.
+    let guard = "    if px < 1:\n        return 1 // 0\n    if px > 16777215:\n        return 1 // 0\n    if px % 1 != 0:\n        return 1 // 0\n";
+    def(
+        &d,
+        &format!(
+            "def to_gray(px):\n{guard}    r = px // 65536\n    g = (px // 256) % 256\n    b = px % 256\n    return (r + g + b) // 3\n"
+        ),
+    );
+    def(
+        &d,
+        &format!(
+            "def chroma(px):\n{guard}    r = px // 65536\n    g = (px // 256) % 256\n    b = px % 256\n    y = (r + g + b) // 3\n    return ((r - y + 255) * 512 + (g - y + 255)) * 512 + (b - y + 255)\n"
+        ),
+    );
+    def(
+        &d,
+        "def recolor(y, c):\n    b = c % 512 - 255 + y\n    g = (c // 512) % 512 - 255 + y\n    r = (c // 512 // 512) - 255 + y\n    return r * 65536 + g * 256 + b\n",
+    );
+    d.create_residual_lens("gray", "to_gray", "chroma", "recolor", ColumnType::Any)
+        .unwrap();
+
+    // Four pixels: red-ish, green-ish, blue-ish, gray.
+    let px = |r: i64, g: i64, b: i64| r * 65536 + g * 256 + b;
+    let original = [px(200, 40, 40), px(30, 180, 60), px(20, 60, 200), px(90, 90, 90)];
+    let mut s = d.begin().unwrap();
+    for (i, p) in original.iter().enumerate() {
+        s.query(
+            "INSERT INTO t (id, v, w) VALUES ($1, $2, $3)",
+            &[Value::Int(i as i64), Value::Int(*p), Value::Int(0)],
+        )
+        .unwrap();
+    }
+    s.commit().unwrap();
+
+    let report = d.etl_apply("gray", "t", "v").unwrap();
+    let gray = col_v(&d);
+    assert_eq!(gray, vec![93, 90, 93, 90], "luma only — colour is gone from the column");
+
+    // The user works in grayscale: darken pixel 0 by 20, brighten pixel 1 by
+    // 10, and CROP pixel 3 away entirely.
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE t SET v = $1 WHERE id = 0", &[Value::Int(93 - 20)]).unwrap();
+    s.query("UPDATE t SET v = $1 WHERE id = 1", &[Value::Int(90 + 10)]).unwrap();
+    s.query("DELETE FROM t WHERE id = 3", &[]).unwrap();
+    s.commit().unwrap();
+
+    // revert must REFUSE this column — it changed outside the pipeline —
+    // and putback is exactly the operation that accepts it.
+    let e = d.etl_revert(report.run_id).unwrap_err().to_string();
+    assert!(e.contains("changed outside the pipeline"), "{e}");
+
+    let back = d.etl_putback(report.run_id).unwrap();
+    assert_eq!(back.rows, 3, "the cropped pixel is not resurrected");
+
+    let after = col_v(&d);
+    // Pixel 0: same chroma offsets re-attached to luma 73 — the whole pixel
+    // darkened by 20 per channel, colour preserved.
+    assert_eq!(after[0], px(200 - 20, 40 - 20, 40 - 20), "darkened WITH its colour back");
+    // Pixel 1: brightened by 10 per channel.
+    assert_eq!(after[1], px(30 + 10, 180 + 10, 60 + 10), "brightened WITH its colour back");
+    // Pixel 2: untouched in gray, so putback restores it exactly.
+    assert_eq!(after[2], original[2], "unedited pixel round-trips exactly");
+
+    // The run is consumed: residuals gone, outcome recorded, second putback refused.
+    let res = rows(
+        d.query(
+            "SELECT count(*) FROM etl_residual WHERE run_id = $1",
+            &[Value::Int(report.run_id)],
+        )
+        .unwrap(),
+    );
+    assert_eq!(res[0][0], Value::Int(0));
+    assert_eq!(d.etl_log().unwrap()[0].outcome, "putback");
+    let e = d.etl_putback(report.run_id).unwrap_err().to_string();
+    assert!(e.contains("putback"), "{e}");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A row INSERTED after the apply has no residual: for a residual pair,
+/// inverting it is the refused creation path (§4) — named, with the fix.
+#[test]
+fn putback_refuses_rows_inserted_after_the_apply() {
+    let (d, path) = db("putback-new");
+    define_abs_pair(&d);
+    seed(&d, &[-5, 3]);
+    let report = d.etl_apply("mag", "t", "v").unwrap();
+
+    let mut s = d.begin().unwrap();
+    s.query("INSERT INTO t (id, v, w) VALUES (99, 7, 0)", &[]).unwrap();
+    s.commit().unwrap();
+
+    let e = d.etl_putback(report.run_id).unwrap_err().to_string();
+    assert!(e.contains("no residual"), "{e}");
+    assert!(e.contains("inserted after the apply"), "{e}");
+    // Nothing half-inverted:
+    let vals = rows(d.query("SELECT v FROM t ORDER BY id", &[]).unwrap());
+    assert_eq!(vals[0][0], Value::Int(5), "aborted atomically");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An edit the pair cannot carry back — outside forward's image — fails the
+/// per-row PutRes check with the row named. abs/sign: a NEGATIVE value edited
+/// into the magnitude column has no preimage under (|x|, sign).
+#[test]
+fn putback_refuses_an_edit_outside_the_pairs_image() {
+    let (d, path) = db("putback-bad");
+    define_abs_pair(&d);
+    seed(&d, &[-5, 3]);
+    let report = d.etl_apply("mag", "t", "v").unwrap();
+
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE t SET v = $1 WHERE id = 0", &[Value::Int(-9)]).unwrap();
+    s.commit().unwrap();
+
+    let e = d.etl_putback(report.run_id).unwrap_err().to_string();
+    assert!(e.contains("outside the pair's image"), "{e}");
+    assert!(e.contains("Int(-9)"), "the offending edit is named: {e}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Bijective putback: the creation path is total by construction, so rows
+/// inserted after the apply invert like every other row — and edits flow back
+/// through the inverse.
+#[test]
+fn bijective_putback_carries_edits_and_new_rows() {
+    let (d, path) = db("putback-bij");
+    def(&d, "def flip(x):\n    return -x\n");
+    d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
+    seed(&d, &[1, -2]);
+    let report = d.etl_apply("flip", "t", "v").unwrap();
+    assert_eq!(col_v(&d), vec![-1, 2]);
+
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE t SET v = $1 WHERE id = 0", &[Value::Int(-100)]).unwrap();
+    s.query("INSERT INTO t (id, v, w) VALUES (9, 50, 0)", &[]).unwrap();
+    s.commit().unwrap();
+
+    let back = d.etl_putback(report.run_id).unwrap();
+    assert_eq!(back.rows, 3);
+    assert_eq!(col_v(&d), vec![100, -2, -50], "edit and new row both inverted");
+    let _ = std::fs::remove_file(&path);
+}

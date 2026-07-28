@@ -228,6 +228,45 @@ impl crate::Database {
         }
     }
 
+    /// Invert run `run_id` while KEEPING edits made to the transformed column —
+    /// the lens putback, and the half of "reversible" that `revert` refuses.
+    ///
+    /// Where `revert` hash-gates the column (any edit = refusal), `putback`
+    /// exists FOR the edited column: each surviving row's current value `y'` is
+    /// combined with the run's stored residual — `x' = inverse(y', r)` — so the
+    /// edit flows back into the source domain and what was lost is still
+    /// re-attached. Deleted rows stay deleted (their residuals are discarded:
+    /// the deletion IS an edit, and it survives). The image story: apply strips
+    /// colour, the user retouches and crops the grayscale, putback re-attaches
+    /// the colour to the retouched pixels and the cropped ones stay gone.
+    ///
+    /// Verification cannot compare against `source_hash` — edits are the point.
+    /// The operative law is PutRes, per row, before commit:
+    /// `forward(x') == y'` and (for residual pairs) `rex(x') == r`. At
+    /// registration that law was a corpus tautology and deliberately not run
+    /// (§4); here the source is no longer the oracle, and PutRes is the ONLY
+    /// thing that can hold. A `y'` outside the pair's image for `r` — an edit
+    /// the pair cannot carry back — fails it and aborts with the row named.
+    ///
+    /// New rows (no residual): refused for residual pairs — that is the
+    /// creation path `inverse(y, ∅)`, refused by design (§4). For bijective
+    /// pairs the creation path is total by construction, so new rows simply
+    /// invert like every other row.
+    pub fn etl_putback(&self, run_id: i64) -> Result<EtlReport> {
+        let mut s = self.begin()?;
+        let out = putback_in(self, &mut s, run_id);
+        match out {
+            Ok(report) => {
+                s.commit()?;
+                Ok(report)
+            }
+            Err(e) => {
+                s.rollback();
+                Err(e)
+            }
+        }
+    }
+
     /// Every lineage row, oldest first.
     pub fn etl_log(&self) -> Result<Vec<EtlLogRow>> {
         let bundle = self.engine.schema();
@@ -652,4 +691,143 @@ fn revert_in(
         &[Value::Int(run_id)],
     )?;
     Ok(EtlReport { run_id, rows: rows.len() as u64, residuals: 0 })
+}
+
+/// The putback body — see [`crate::Database::etl_putback`] for the contract.
+fn putback_in(
+    db: &crate::Database,
+    s: &mut WriteSession<'_>,
+    run_id: i64,
+) -> Result<EtlReport> {
+    let bundle = db.engine.schema();
+    if !bundle.schema.tables.iter().any(|t| t.name == T_LINEAGE && !t.dead) {
+        return Err(Error::Unsupported("no etl lineage in this database".into()));
+    }
+    let lin = rows_of(s.query(
+        "SELECT lens, tbl, col, outcome FROM etl_lineage \
+         WHERE run_id = $1 AND step_no = 1",
+        &[Value::Int(run_id)],
+    )?)?;
+    let Some(lin) = lin.into_iter().next() else {
+        return Err(Error::Unsupported(format!(
+            "no etl run {run_id} in the lineage — without its lineage row the residuals \
+             are uninterpretable, and guessing is refused"
+        )));
+    };
+    let (pair, table, column, outcome) =
+        (as_text(&lin[0]), as_text(&lin[1]), as_text(&lin[2]), as_text(&lin[3]));
+    match outcome.as_str() {
+        "applied" => {}
+        other => {
+            return Err(Error::Unsupported(format!(
+                "etl run {run_id} has outcome `{other}`; only an applied run can be \
+                 putback-inverted"
+            )))
+        }
+    }
+
+    let lens = db.load_lens_for_etl(&pair)?;
+    let target = db.resolve_target(&table, &column)?;
+    let pk_col = &target.pk_col;
+
+    // Deliberately NO output-hash gate here — an edited column is the entire
+    // point of putback. What replaces it: the per-row PutRes check below, and
+    // the residual-set bookkeeping (a residual whose row is gone = a kept
+    // deletion; a row without a residual = the refused creation path).
+    let rows = rows_of(s.query(
+        &format!("SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" ORDER BY \"{pk_col}\""),
+        &[],
+    )?)?;
+
+    let update = format!("UPDATE \"{table}\" SET \"{column}\" = $1 WHERE \"{pk_col}\" = $2");
+    let mut consumed = 0u64;
+    for row in &rows {
+        let (pk, y) = (&row[0], &row[1]);
+        let x = match &lens.rex {
+            Some(rex) => {
+                let res = rows_of(s.query(
+                    "SELECT residual FROM etl_residual WHERE run_id = $1 AND pk_enc = $2",
+                    &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
+                )?)?;
+                let Some(r) = res.into_iter().next().and_then(|mut r| {
+                    if r.is_empty() { None } else { Some(r.remove(0)) }
+                }) else {
+                    // A row with no residual was INSERTED after the apply:
+                    // inverting it would be the creation path inverse(y, ∅),
+                    // which the design refuses (§4) — there is nothing true to
+                    // re-attach. Named, with the fix.
+                    return Err(Error::Unsupported(format!(
+                        "row {pk:?} of `{table}.{column}` has no residual in run {run_id} — \
+                         it was inserted after the apply, and inverting it without a \
+                         residual would fabricate what was never lost; delete the row or \
+                         revert it by hand, then retry"
+                    )));
+                };
+                let x = crate::spellfn::call_spell_fn(&lens.inverse, &[y.clone(), r.clone()])
+                    .map_err(|e| {
+                        Error::Unsupported(format!(
+                            "putback: inverse refuses row {pk:?} (edited value {y:?}: {e}); \
+                             the run is aborted"
+                        ))
+                    })?;
+                // PutRes, both halves, on the EDITED value. rex(x') == r is not
+                // decoration: a pair whose residual does not survive the edit
+                // would silently re-attach the WRONG lost half next time.
+                let fwd = call1(&lens.forward, &x).map_err(|e| putres_err(pk, y, &e))?;
+                if !crate::lens::same_value(&fwd, y) {
+                    return Err(Error::Unsupported(format!(
+                        "putback verification FAILED on row {pk:?}: the edit {y:?} is \
+                         outside the pair's image — forward(inverse({y:?}, r)) = {fwd:?}, \
+                         not {y:?}; the pair cannot carry this edit back, rolled back"
+                    )));
+                }
+                let rx = call1(rex, &x).map_err(|e| putres_err(pk, y, &e))?;
+                if !crate::lens::same_value(&rx, &r) {
+                    return Err(Error::Unsupported(format!(
+                        "putback verification FAILED on row {pk:?}: the residual does not \
+                         survive the edit {y:?} — rex(x') = {rx:?} but the stored residual \
+                         is {r:?}; rolled back"
+                    )));
+                }
+                consumed += 1;
+                x
+            }
+            None => {
+                // Bijective: the creation path is total by construction (§4),
+                // so a row inserted after the apply inverts like any other.
+                let x = call1(&lens.inverse, y).map_err(|e| {
+                    Error::Unsupported(format!(
+                        "putback: inverse refuses row {pk:?} (edited value {y:?}: {e}); \
+                         the run is aborted"
+                    ))
+                })?;
+                let fwd = call1(&lens.forward, &x).map_err(|e| putres_err(pk, y, &e))?;
+                if !crate::lens::same_value(&fwd, y) {
+                    return Err(Error::Unsupported(format!(
+                        "putback verification FAILED on row {pk:?}: \
+                         forward(inverse({y:?})) = {fwd:?}, not {y:?}; rolled back"
+                    )));
+                }
+                x
+            }
+        };
+        s.query(&update, &[x, pk.clone()])?;
+    }
+
+    // Residuals not consumed belong to rows deleted after the apply. The
+    // deletion is an edit, and it survives: the residuals are discarded with
+    // the rows they described. (The image story's crop.)
+    s.query("DELETE FROM etl_residual WHERE run_id = $1", &[Value::Int(run_id)])?;
+    s.query(
+        "UPDATE etl_lineage SET outcome = 'putback' WHERE run_id = $1 AND step_no = 1",
+        &[Value::Int(run_id)],
+    )?;
+    Ok(EtlReport { run_id, rows: rows.len() as u64, residuals: consumed })
+}
+
+fn putres_err(pk: &Value, y: &Value, e: &Error) -> Error {
+    Error::Unsupported(format!(
+        "putback verification could not run on row {pk:?} (edited value {y:?}): {e}; \
+         rolled back"
+    ))
 }

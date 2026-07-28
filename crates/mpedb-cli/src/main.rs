@@ -90,6 +90,10 @@ usage: mpedb <command> [args]
                                            100% of rows verify against the source
                                            hash BEFORE the destroying commit
   etl revert <target> <run_id>             put it back exactly (hash-gated)
+  etl putback <target> <run_id>            invert KEEPING edits made to the
+                                           transformed column (lens putback,
+                                           PutRes-verified per row); deleted
+                                           rows stay deleted
   etl log <target>                         every run, failed runs included
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
@@ -595,6 +599,18 @@ fn cmd_etl(args: &[String]) -> CliResult {
             println!("etl run {run_id} reverted: {} row(s) restored exactly", r.rows);
             Ok(())
         }
+        [sub, config, run] if sub == "putback" => {
+            let run_id: i64 = run
+                .parse()
+                .map_err(|_| Failure::Usage(format!("etl putback needs a run id, got `{run}`")))?;
+            let db = crate::util::open_target(config)?;
+            let r = db.etl_putback(run_id)?;
+            println!(
+                "etl run {run_id} putback: {} row(s) inverted WITH their edits kept,                  {} residual(s) re-attached; deleted rows stayed deleted",
+                r.rows, r.residuals
+            );
+            Ok(())
+        }
         [sub, config] if sub == "log" => {
             let db = crate::util::open_target(config)?;
             let log = db.etl_log()?;
@@ -616,7 +632,7 @@ fn cmd_etl(args: &[String]) -> CliResult {
         }
         _ => usage(
             "etl needs: apply <target> <pair> <table>.<column> | revert <target> <run_id> \
-             | log <target>",
+             | putback <target> <run_id> | log <target>",
         ),
     }
 }
