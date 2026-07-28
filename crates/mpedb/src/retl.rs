@@ -72,7 +72,7 @@ pub struct RetlLogRow {
     pub error: String,
 }
 
-fn now_micros() -> i64 {
+pub(crate) fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -81,23 +81,23 @@ fn now_micros() -> i64 {
 
 /// Length-framed canonical hash chain — the RETL sibling of the lens layer's
 /// joint collision key, and framed for the same reason.
-struct CanonChain(blake3::Hasher);
+pub(crate) struct CanonChain(pub(crate) blake3::Hasher);
 
 impl CanonChain {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(blake3::Hasher::new())
     }
-    fn push(&mut self, v: &Value) {
+    pub(crate) fn push(&mut self, v: &Value) {
         let bits = crate::lens::value_bits(v);
         self.0.update(&(bits.len() as u64).to_le_bytes());
         self.0.update(&bits);
     }
-    fn hex(self) -> String {
+    pub(crate) fn hex(self) -> String {
         self.0.finalize().to_hex().to_string()
     }
 }
 
-fn rows_of(r: ExecResult) -> Result<Vec<Vec<Value>>> {
+pub(crate) fn rows_of(r: ExecResult) -> Result<Vec<Vec<Value>>> {
     match r {
         ExecResult::Rows { rows, .. } => Ok(rows),
         other => Err(Error::Unsupported(format!("expected rows, got {other:?}"))),
@@ -112,7 +112,9 @@ struct Target {
 
 impl crate::Database {
     fn resolve_target(&self, table: &str, column: &str) -> Result<Target> {
-        if table == T_LINEAGE || table == T_RESIDUAL {
+        if [T_LINEAGE, T_RESIDUAL, crate::retl_store::T_VERSIONS, crate::retl_store::T_ARCHIVES, crate::retl_store::T_MEMBERS]
+            .contains(&table)
+        {
             return Err(Error::Unsupported(format!(
                 "`{table}` is RETL bookkeeping; transforming it is refused"
             )));
@@ -167,7 +169,7 @@ impl crate::Database {
         }
         let target = self.resolve_target(table, column)?;
 
-        let have = self.committed_tables();
+        let have = self.committed_tables()?;
         let mut s = self.begin()?;
         let out = apply_in(&mut s, pair, &lens, table, column, &target, &have);
         match out {
@@ -189,7 +191,7 @@ impl crate::Database {
 
     fn record_failed_run(&self, pair: &str, table: &str, column: &str, e: &Error) -> Result<()> {
         let mut s = self.begin()?;
-        let have = self.committed_tables();
+        let have = self.committed_tables()?;
         ensure_tables_from(&mut s, &have)?;
         let run_id = next_run_id(&mut s)?;
         LineageRow {
@@ -356,6 +358,7 @@ impl crate::Database {
                 }
             }
         }
+        crate::retl_store::fsck_stores(self, &mut findings)?;
         Ok(findings)
     }
 
@@ -386,14 +389,14 @@ impl crate::Database {
     }
 }
 
-fn as_int(v: &Value) -> Result<i64> {
+pub(crate) fn as_int(v: &Value) -> Result<i64> {
     match v {
         Value::Int(i) => Ok(*i),
         other => Err(Error::Corrupt(format!("lineage: expected int, got {other:?}"))),
     }
 }
 
-fn as_text(v: &Value) -> String {
+pub(crate) fn as_text(v: &Value) -> String {
     match v {
         Value::Text(s) => s.clone(),
         other => format!("{other:?}"),
@@ -418,7 +421,7 @@ const LINEAGE_SHAPE: [&str; 15] = [
 ];
 const RESIDUAL_SHAPE: [&str; 3] = ["run_id", "pk_enc", "residual"];
 
-fn shape_gate(have: &[(String, Vec<String>)], name: &str, want: &[&str]) -> Result<bool> {
+pub(crate) fn shape_gate(have: &[(String, Vec<String>)], name: &str, want: &[&str]) -> Result<bool> {
     match have.iter().find(|(n, _)| n == name) {
         None => Ok(false),
         Some((_, cols)) => {
@@ -433,6 +436,13 @@ fn shape_gate(have: &[(String, Vec<String>)], name: &str, want: &[&str]) -> Resu
             }
         }
     }
+}
+
+pub(crate) fn ensure_lineage_tables(
+    s: &mut WriteSession<'_>,
+    have: &[(String, Vec<String>)],
+) -> Result<()> {
+    ensure_tables_from(s, have)
 }
 
 fn ensure_tables_from(
@@ -465,8 +475,14 @@ fn ensure_tables_from(
 
 
 impl crate::Database {
-    fn committed_tables(&self) -> Vec<(String, Vec<String>)> {
-        self.engine
+    pub(crate) fn committed_tables(&self) -> Result<Vec<(String, Vec<String>)>> {
+        // The cached bundle refreshes on SQL compilation and txn begin, but
+        // NEITHER has happened yet when a run starts by asking what exists —
+        // a snapshot from before this handle's own last DDL commit would
+        // re-CREATE the bookkeeping tables. Refresh explicitly.
+        self.engine.refresh_schema_if_stale()?;
+        Ok(self
+            .engine
             .schema()
             .schema
             .tables
@@ -475,14 +491,14 @@ impl crate::Database {
             .map(|t| {
                 (t.name.clone(), t.columns.iter().map(|c| c.name.clone()).collect())
             })
-            .collect()
+            .collect())
     }
 }
 
 /// `max(run_id) + 1` inside the transaction — a counter, deliberately NOT a
 /// content hash: two runs can produce identical bytes and must still be
 /// distinguishable (§7).
-fn next_run_id(s: &mut WriteSession<'_>) -> Result<i64> {
+pub(crate) fn next_run_id(s: &mut WriteSession<'_>) -> Result<i64> {
     let rows = rows_of(s.query("SELECT max(run_id) FROM retl_lineage", &[])?)?;
     Ok(match rows.first().and_then(|r| r.first()) {
         Some(Value::Int(m)) => m + 1,
@@ -490,23 +506,23 @@ fn next_run_id(s: &mut WriteSession<'_>) -> Result<i64> {
     })
 }
 
-struct LineageRow {
-    run_id: i64,
-    lens: String,
-    forward_hash: String,
-    rex_hash: String,
-    inverse_hash: String,
-    table: String,
-    column: String,
-    source_hash: String,
-    output_hash: String,
-    rows: i64,
-    outcome: &'static str,
-    error: String,
+pub(crate) struct LineageRow {
+    pub(crate) run_id: i64,
+    pub(crate) lens: String,
+    pub(crate) forward_hash: String,
+    pub(crate) rex_hash: String,
+    pub(crate) inverse_hash: String,
+    pub(crate) table: String,
+    pub(crate) column: String,
+    pub(crate) source_hash: String,
+    pub(crate) output_hash: String,
+    pub(crate) rows: i64,
+    pub(crate) outcome: &'static str,
+    pub(crate) error: String,
 }
 
 impl LineageRow {
-    fn insert(&self, s: &mut WriteSession<'_>) -> Result<()> {
+    pub(crate) fn insert(&self, s: &mut WriteSession<'_>) -> Result<()> {
         s.query(
             "INSERT INTO retl_lineage (run_id, step_no, lens, forward_hash, rex_hash, \
              inverse_hash, tbl, col, source_hash, output_hash, rows, verified, outcome, \

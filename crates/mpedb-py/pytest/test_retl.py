@@ -180,6 +180,68 @@ def main(workdir):
     print("retl: all assertions passed")
 
 
+def stage3(workdir):
+    """Blob versioning + zip splice (stage 3), on the SIMPLE setup: a config
+    with no tables at all — RETL creates its bookkeeping via live DDL, and so
+    can the user (CREATE TABLE)."""
+    dbpath = os.path.join(workdir, "store.mpedb")
+    cfg = os.path.join(workdir, "store.toml")
+    with open(cfg, "w") as f:
+        f.write(f'[database]\npath = "{dbpath}"\nsize_mb = 32\nmax_readers = 8\n'
+                'durability = "none"\n')
+    db = mpedb.Database(cfg)
+
+    # A zero-table seed still takes ordinary DDL — the simple way to work.
+    db.query("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+    db.query("INSERT INTO notes (id, body) VALUES (1, 'works')", [])
+
+    # Versioning: every version comes back byte-identical; older versions are
+    # reverse deltas, every 8th and the newest stay full.
+    doc = bytearray(b"# report\n" + b"the same paragraph, repeated\n" * 40)
+    history = []
+    for i in range(10):
+        doc.extend(f"edit {i}\n".encode())
+        ver = db.retl_put_version("report.md", bytes(doc))
+        history.append((ver, bytes(doc)))
+    for ver, want in history:
+        assert db.retl_get_version("report.md", ver) == want, f"version {ver}"
+    stored = {v["ver"]: v["stored_as"] for v in db.retl_versions("report.md")}
+    assert stored[10] == "full" and stored[8] == "full" and stored[9] == "delta", stored
+
+    # Zip splice: a REAL producer's archive (zipfile, STORE) round-trips
+    # byte-identically through member rows.
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("a.txt", "alpha contents")
+        z.writestr("dir/b.bin", bytes(range(256)))
+        z.writestr("empty", "")
+    original = buf.getvalue()
+    aid = db.retl_pack_in("bundle.zip", original)
+    assert db.retl_pack_out(aid) == original, "byte-identical reconstruction"
+    arch = db.retl_archives()
+    assert arch[0]["members"] == 3, arch
+
+    # Members are ordinary rows; tampering with one is a NAMED refusal.
+    with db.begin() as tx:
+        tx.query(
+            "UPDATE retl_archive_members SET data = $1 WHERE archive_id = $2 "
+            "AND member_no = $3",
+            [b"ALPHA CONTENTS", aid, 0],  # same length: only the HASH can catch it
+        )
+    try:
+        db.retl_pack_out(aid)
+        raise AssertionError("tampered member must refuse pack_out")
+    except mpedb.Error as e:
+        assert "WRONG bytes" in str(e), e
+    findings = db.retl_fsck()
+    assert any(f"archive {aid}" in f for f in findings), findings
+
+    print("retl stage 3: all assertions passed")
+
+
 if __name__ == "__main__":
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-etl-")
     main(workdir)
+    stage3(workdir)

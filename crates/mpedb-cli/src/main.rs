@@ -95,6 +95,19 @@ usage: mpedb <command> [args]
                                            PutRes-verified per row); deleted
                                            rows stay deleted
   retl log <target>                         every run, failed runs included
+  retl put <target> <obj> <file>            store the next VERSION of a blob:
+                                           newest stays full, the previous one
+                                           is rewritten as a reverse delta
+                                           (verified byte-identical before the
+                                           commit); every 8th stays full
+  retl get <target> <obj> <ver> <out>       materialize any version, every step
+                                           hash-verified — never silent rot
+  retl versions <target> <obj>              list versions and how each is stored
+  retl pack-in <target> <name> <zip>        splice a zip into rows + residual;
+                                           reconstruction verified byte-identical
+                                           BEFORE the ingest commits
+  retl pack-out <target> <id> <out>         rebuild the zip, hash-gated
+  retl archives <target>                    list spliced archives
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
   tune set <target> name=value | show      stored engine switches (ndv_discount,
@@ -646,9 +659,78 @@ fn cmd_retl(args: &[String]) -> CliResult {
             }
             Ok(())
         }
+        [sub, config, obj, file] if sub == "put" => {
+            let bytes = std::fs::read(file)
+                .map_err(|e| Failure::Runtime(format!("cannot read `{file}`: {e}")))?;
+            let db = crate::util::open_target(config)?;
+            let ver = db.retl_put_version(obj, &bytes)?;
+            println!("retl put: `{obj}` is now at version {ver} ({} bytes)", bytes.len());
+            Ok(())
+        }
+        [sub, config, obj, ver, out] if sub == "get" => {
+            let ver: i64 = ver
+                .parse()
+                .map_err(|_| Failure::Usage(format!("retl get needs a version, got `{ver}`")))?;
+            let db = crate::util::open_target(config)?;
+            let bytes = db.retl_get_version(obj, ver)?;
+            std::fs::write(out, &bytes)
+                .map_err(|e| Failure::Runtime(format!("cannot write `{out}`: {e}")))?;
+            println!("retl get: `{obj}` version {ver} → {out} ({} bytes, hash-verified)", bytes.len());
+            Ok(())
+        }
+        [sub, config, obj] if sub == "versions" => {
+            let db = crate::util::open_target(config)?;
+            let vers = db.retl_versions(obj)?;
+            if vers.is_empty() {
+                println!("no versions of `{obj}`");
+            }
+            for v in vers {
+                println!("ver {}  {}  {} byte(s)  {}", v.ver, v.stored_as, v.bytes, v.content_hash);
+            }
+            Ok(())
+        }
+        [sub, config, name, file] if sub == "pack-in" => {
+            let bytes = std::fs::read(file)
+                .map_err(|e| Failure::Runtime(format!("cannot read `{file}`: {e}")))?;
+            let db = crate::util::open_target(config)?;
+            let id = db.retl_pack_in(name, &bytes)?;
+            println!(
+                "retl pack-in: `{name}` is archive {id}; reconstruction verified \
+                 byte-identical before commit"
+            );
+            Ok(())
+        }
+        [sub, config, id, out] if sub == "pack-out" => {
+            let id: i64 = id
+                .parse()
+                .map_err(|_| Failure::Usage(format!("retl pack-out needs an archive id, got `{id}`")))?;
+            let db = crate::util::open_target(config)?;
+            let bytes = db.retl_pack_out(id)?;
+            std::fs::write(out, &bytes)
+                .map_err(|e| Failure::Runtime(format!("cannot write `{out}`: {e}")))?;
+            println!("retl pack-out: archive {id} → {out} ({} bytes, hash-verified)", bytes.len());
+            Ok(())
+        }
+        [sub, config] if sub == "archives" => {
+            let db = crate::util::open_target(config)?;
+            let arches = db.retl_archives()?;
+            if arches.is_empty() {
+                println!("no archives");
+            }
+            for a in arches {
+                println!(
+                    "archive {}  {}  {} member(s)  {}",
+                    a.archive_id, a.name, a.members, a.content_hash
+                );
+            }
+            Ok(())
+        }
         _ => usage(
             "retl needs: apply <target> <pair> <table>.<column> | revert <target> <run_id> \
-             | putback <target> <run_id> | fsck <target> | log <target>",
+             | putback <target> <run_id> | fsck <target> | log <target> \
+             | put <target> <obj> <file> | get <target> <obj> <ver> <out-file> \
+             | versions <target> <obj> | pack-in <target> <name> <zip-file> \
+             | pack-out <target> <archive_id> <out-file> | archives <target>",
         ),
     }
 }

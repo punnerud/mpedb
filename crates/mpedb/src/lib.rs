@@ -66,6 +66,8 @@ pub mod opdef;
 pub mod spellfn;
 pub mod lens;
 pub mod retl;
+pub mod retl_codec;
+pub mod retl_store;
 pub mod model;
 pub mod stats;
 mod stream;

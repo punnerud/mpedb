@@ -1253,3 +1253,52 @@ fn fsck_reports_tampering_and_missing_residuals_and_nothing_else() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// The guide's SIMPLE setup, executed verbatim (PYSPELL-RETL.md §1): a config
+/// with NO `[[table]]` blocks, the working table created live with
+/// `CREATE TABLE … ANY`, then the full apply → edit → putback loop on it.
+#[test]
+fn the_guides_zero_table_setup_carries_a_full_retl_loop() {
+    let path = format!(
+        "{}/retl-simple-{}.mpedb",
+        mpedb_testkit::scratch_base_str(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 32\nmax_readers = 8\n\
+         durability = \"none\"\n"
+    );
+    let d = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+
+    d.query("CREATE TABLE pixels (id INTEGER PRIMARY KEY, px ANY)", &[]).unwrap();
+    let mut s = d.begin().unwrap();
+    for (i, v) in [-7i64, 4, -1].iter().enumerate() {
+        s.query(
+            "INSERT INTO pixels (id, px) VALUES ($1, $2)",
+            &[Value::Int(i as i64), Value::Int(*v)],
+        )
+        .unwrap();
+    }
+    s.commit().unwrap();
+
+    define_abs_pair(&d);
+    let run = d.retl_apply("mag", "pixels", "px").unwrap();
+    assert_eq!(run.residuals, 3);
+
+    // Edit one magnitude, then putback: the edit rides the stored sign home.
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE pixels SET px = 9 WHERE id = 0", &[]).unwrap();
+    s.commit().unwrap();
+    d.retl_putback(run.run_id).unwrap();
+
+    let got: Vec<i64> = rows(d.query("SELECT px FROM pixels ORDER BY id", &[]).unwrap())
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Int(i) => *i,
+            other => panic!("expected int, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec![-9, 4, -1], "edit carried back through the sign residual");
+    let _ = std::fs::remove_file(&path);
+}

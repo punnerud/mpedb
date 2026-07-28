@@ -860,6 +860,77 @@ impl PyDatabase {
         py.detach(|| db.retl_fsck()).map_err(map_err)
     }
 
+    /// Store `data` as the next VERSION of `obj` (stage 3): the new version
+    /// is kept full, the previous newest is rewritten as a reverse delta —
+    /// verified byte-identical, as persisted, before the commit — and every
+    /// 8th version stays full forever. Returns the version number.
+    fn retl_put_version(&self, py: Python<'_>, obj: &str, data: &[u8]) -> PyResult<i64> {
+        self.refuse_if_txn_open("retl_put_version", "Commit or roll back first.")?;
+        let db = &self.db;
+        py.detach(|| db.retl_put_version(obj, data)).map_err(map_err)
+    }
+
+    /// Materialize version `ver` of `obj` as bytes. Every reconstruction
+    /// step is hash-verified; corruption is a named error, never wrong bytes.
+    fn retl_get_version(&self, py: Python<'_>, obj: &str, ver: i64) -> PyResult<Py<PyAny>> {
+        let db = &self.db;
+        let bytes = py.detach(|| db.retl_get_version(obj, ver)).map_err(map_err)?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes).into_any().unbind())
+    }
+
+    /// Every version of `obj`, oldest first, as dicts:
+    /// `{"ver", "stored_as", "bytes", "content_hash"}`.
+    fn retl_versions(&self, py: Python<'_>, obj: &str) -> PyResult<Vec<Py<PyAny>>> {
+        let db = &self.db;
+        let vers = py.detach(|| db.retl_versions(obj)).map_err(map_err)?;
+        vers.into_iter()
+            .map(|v| {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item("ver", v.ver)?;
+                d.set_item("stored_as", v.stored_as)?;
+                d.set_item("bytes", v.bytes)?;
+                d.set_item("content_hash", v.content_hash)?;
+                Ok(d.into_any().unbind())
+            })
+            .collect()
+    }
+
+    /// Splice a zip archive into the database: members become rows in
+    /// `retl_archive_members`, the residual keeps every non-data byte, and
+    /// the reconstruction is verified byte-identical BEFORE the ingest
+    /// commits. Returns the archive id.
+    fn retl_pack_in(&self, py: Python<'_>, name: &str, data: &[u8]) -> PyResult<i64> {
+        self.refuse_if_txn_open("retl_pack_in", "Commit or roll back first.")?;
+        let db = &self.db;
+        py.detach(|| db.retl_pack_in(name, data)).map_err(map_err)
+    }
+
+    /// Rebuild archive `archive_id` byte-identically, hash-gated against the
+    /// original: a member row changed outside the pipeline is a named error.
+    fn retl_pack_out(&self, py: Python<'_>, archive_id: i64) -> PyResult<Py<PyAny>> {
+        let db = &self.db;
+        let bytes = py.detach(|| db.retl_pack_out(archive_id)).map_err(map_err)?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes).into_any().unbind())
+    }
+
+    /// Every spliced archive, oldest first, as dicts:
+    /// `{"archive_id", "name", "members", "content_hash"}`.
+    fn retl_archives(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let db = &self.db;
+        let arches = py.detach(|| db.retl_archives()).map_err(map_err)?;
+        arches
+            .into_iter()
+            .map(|a| {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item("archive_id", a.archive_id)?;
+                d.set_item("name", a.name)?;
+                d.set_item("members", a.members)?;
+                d.set_item("content_hash", a.content_hash)?;
+                Ok(d.into_any().unbind())
+            })
+            .collect()
+    }
+
     /// Every RETL run, oldest first, failed runs included, as dicts.
     fn retl_log(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let db = &self.db;
