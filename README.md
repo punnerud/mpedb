@@ -395,6 +395,21 @@ PySpell functions (shared across processes, unlike C-API UDFs) and `:sym:`
 custom operator macros, both living in the database file and resolved by the
 workload model's roles.
 
+**[INGEST-GUIDE.md](INGEST-GUIDE.md)** — pulling an external system IN
+without hammering it. You write the code that talks to the API; mpedb decides
+what to fetch and when, works out exactly what changed, VERIFIES the cursor
+you nominated (and names the rows a lying `updated_at` would have lost), and
+carries the parameters for calls whose input is another call's output. The
+theory and the named pitfalls are in
+[design/DESIGN-INGEST.md](design/DESIGN-INGEST.md); the measured comparison
+against "dump everything" and against uniform polling is
+[workbench/ingest-lab](workbench/ingest-lab/README.md).
+
+**[PYSPELL-RRETL.md](PYSPELL-RRETL.md)** — reversible transforms once the
+data is in: lens pairs verified against a probe corpus, in-place column
+transforms that can be reverted or put back onto edits, and table-set maps
+that keep two shapes in sync both ways.
+
 **[GUIDE.md](GUIDE.md)** is the practical guide: quickstart, the schema config,
 queries, transactions, upsert, joins, durability, a side-by-side for people
 coming from sqlite3, and migrating a real sqlite3 database. Every Rust snippet
