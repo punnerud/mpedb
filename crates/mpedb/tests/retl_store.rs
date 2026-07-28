@@ -9,7 +9,17 @@
 
 use mpedb::{Config, Database, Value};
 
-fn db(tag: &str) -> Database {
+/// Removes the scratch file when the test ends, pass or panic — two full
+/// suite runs left 1.4 GB in /dev/shm today, and tmpfs pressure is what
+/// SIGBUS-kills linkers (#137).
+struct Scratch(String);
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn db(tag: &str) -> (Database, Scratch) {
     let path = format!(
         "{}/retl-store-{tag}-{}.mpedb",
         mpedb_testkit::scratch_base_str(),
@@ -25,7 +35,10 @@ max_readers = 8
 durability = "none"
 "#
     );
-    Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap()
+    (
+        Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap(),
+        Scratch(path),
+    )
 }
 
 struct Rng(u64);
@@ -49,7 +62,7 @@ impl Rng {
 /// K-th anchors full, everything else delta.
 #[test]
 fn twenty_versions_all_materialize_and_anchors_stay_full() {
-    let d = db("chain");
+    let (d, _scratch) = db("chain");
     let mut rng = Rng(0x52b2);
     let mut doc = rng.bytes(4096);
     let mut history = Vec::new();
@@ -104,7 +117,7 @@ fn twenty_versions_all_materialize_and_anchors_stay_full() {
 /// to compression.
 #[test]
 fn incompressible_versions_keep_fulls_and_still_ingest() {
-    let d = db("bloat");
+    let (d, _scratch) = db("bloat");
     let mut rng = Rng(0xb10a7);
     let mut history = Vec::new();
     for _ in 0..3 {
@@ -132,7 +145,7 @@ fn incompressible_versions_keep_fulls_and_still_ingest() {
 /// error — rewriting would delete the last full copy of already-bad data.
 #[test]
 fn a_rotted_full_refuses_the_next_put_by_name() {
-    let d = db("launder");
+    let (d, _scratch) = db("launder");
     d.retl_put_version("doc", b"first version, pristine").unwrap();
 
     // Rot the stored payload directly (still a well-formed raw envelope, so
@@ -167,7 +180,7 @@ fn a_rotted_full_refuses_the_next_put_by_name() {
 /// and fsck must find it — while versions above the tamper stay readable.
 #[test]
 fn a_tampered_delta_is_named_by_get_and_fsck() {
-    let d = db("tamper");
+    let (d, _scratch) = db("tamper");
     let mut doc = b"the quick brown fox jumps over the lazy dog, at length, \
                     repeated enough that a delta is actually smaller than raw"
         .to_vec();
@@ -217,7 +230,7 @@ fn a_tampered_delta_is_named_by_get_and_fsck() {
 /// chains never interleave.
 #[test]
 fn versions_are_per_object_and_missing_ones_are_named() {
-    let d = db("objs");
+    let (d, _scratch) = db("objs");
     d.retl_put_version("a", b"alpha").unwrap();
     d.retl_put_version("b", b"beta").unwrap();
     d.retl_put_version("a", b"alpha two").unwrap();
@@ -281,7 +294,7 @@ fn store_zip(members: &[(&[u8], &[u8])]) -> Vec<u8> {
 /// name, and an empty member.
 #[test]
 fn a_zip_round_trips_through_the_database() {
-    let d = db("zip");
+    let (d, _scratch) = db("zip");
     let inner = store_zip(&[
         (b"readme.txt", b"hello from inside the archive"),
         (&[0xC0, 0xFF, 0x80], b"non-utf8 name, binary data \x00\x01\x02"),
@@ -335,7 +348,7 @@ fn a_zip_round_trips_through_the_database() {
 /// original. The escape hatch is deliberate: re-ingest, don't mutate.
 #[test]
 fn tampering_with_a_member_row_is_refused_by_name() {
-    let d = db("ziptamper");
+    let (d, _scratch) = db("ziptamper");
     let file = store_zip(&[(b"a.txt", b"original contents")]);
     let id = d.retl_pack_in("a.zip", &file).unwrap();
 
@@ -359,7 +372,7 @@ fn tampering_with_a_member_row_is_refused_by_name() {
 /// A deleted member row is a NAMED hole, not a silent shrink.
 #[test]
 fn a_missing_member_row_is_a_named_hole() {
-    let d = db("ziphole");
+    let (d, _scratch) = db("ziphole");
     let file = store_zip(&[(b"a.txt", b"one"), (b"b.txt", b"two")]);
     let id = d.retl_pack_in("ab.zip", &file).unwrap();
     let mut s = d.begin().unwrap();
@@ -377,7 +390,7 @@ fn a_missing_member_row_is_a_named_hole() {
 /// sentinel refuses ingest, and nothing is left behind.
 #[test]
 fn refused_zips_leave_nothing_behind() {
-    let d = db("zipnope");
+    let (d, _scratch) = db("zipnope");
     let mut file = store_zip(&[(b"a.txt", b"data")]);
     // Stamp the EOCD's entry counts to the zip64 sentinel.
     let eocd = file.len() - 22;
@@ -395,7 +408,7 @@ fn refused_zips_leave_nothing_behind() {
 /// the two stores; both bookkeeping families coexist in one database.
 #[test]
 fn versions_and_archives_coexist() {
-    let d = db("coexist");
+    let (d, _scratch) = db("coexist");
     let file = store_zip(&[(b"payload.bin", b"shared bytes")]);
     d.retl_put_version("f", &file).unwrap();
     let id = d.retl_pack_in("f.zip", &file).unwrap();
