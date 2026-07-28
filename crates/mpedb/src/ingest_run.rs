@@ -315,6 +315,14 @@ impl crate::Database {
                 )
             }));
         }
+        if mode == Mode::Delta && edge.spec.presents_whole_table() {
+            return Err(Error::Unsupported(format!(
+                "ingest `{source}`: edge `{}` presents the WHOLE table, so a delta receipt \
+                 through it would record a partial read as a complete one. Name the delta \
+                 edge for `{}`, or take this one as a dump",
+                edge.spec.name, edge.table
+            )));
+        }
         let have = self.committed_tables()?;
         let mut s = self.begin()?;
         let out = (|| -> Result<i64> {
@@ -453,26 +461,26 @@ impl crate::Database {
             if rep.changed() > 0 {
                 st.changed_receipts += 1;
             }
-            if run.mode == Mode::Dump {
-                st.caught += run.caught;
-                st.missed += run.missed;
-                st.cursor_state = if st.missed > 0 {
-                    "unsafe".into()
-                } else if st.caught > 0 {
-                    "safe".into()
-                } else {
-                    "unknown".into()
-                };
-            }
+            // The verdict and the watermark belong to the edge that OWNS the
+            // cursor. A dump has none — it is the JUDGE, and the values it
+            // tried came from the delta's column, so recording them here would
+            // give a cursorless edge a position and a verdict about a column
+            // it never asks for. Its tally goes to the edge it judged, below.
             if let Some(c) = edge.cursor_col() {
                 st.cursor_col = c;
-            }
-            if cursor_gt(&run.watermark, &st.watermark) {
-                st.watermark = run.watermark.clone();
+                if run.mode == Mode::Dump {
+                    st.caught += run.caught;
+                    st.missed += run.missed;
+                    st.cursor_state = verdict_of(st.caught, st.missed);
+                }
+                if cursor_gt(&run.watermark, &st.watermark) {
+                    st.watermark = run.watermark.clone();
+                }
             }
             write_state(&mut s, &run.source, &edge.spec.name, &fp, &st)?;
             // A DELTA edge's watermark is the thing a dump verifies against,
             // so a dump that advanced the high-water mark shares it.
+            let mut judged: Option<String> = None;
             if run.mode == Mode::Dump {
                 for other in resolved.iter().filter(|o| {
                     o.table.eq_ignore_ascii_case(&edge.table)
@@ -482,17 +490,14 @@ impl crate::Database {
                     let mut ost = read_state_in(&mut s, &run.source, &other.spec.name, &ofp)?;
                     ost.caught += run.caught;
                     ost.missed += run.missed;
-                    ost.cursor_state = if ost.missed > 0 {
-                        "unsafe".into()
-                    } else if ost.caught > 0 {
-                        "safe".into()
-                    } else {
-                        "unknown".into()
-                    };
+                    ost.cursor_state = verdict_of(ost.caught, ost.missed);
                     if let Some(c) = other.cursor_col() {
                         ost.cursor_col = c;
                     }
                     write_state(&mut s, &run.source, &other.spec.name, &ofp, &ost)?;
+                    // The receipt reports the verdict it just produced, which
+                    // is the JUDGED edge's, not this cursorless dump's.
+                    judged = Some(ost.cursor_state.clone());
                 }
             }
             s.query(
@@ -504,8 +509,13 @@ impl crate::Database {
             // caught/missed stay THIS receipt's count; the verdict is the
             // accumulated one, because one clean dump does not clear a
             // cursor that has already been caught lying.
-            rep.cursor_state = st.cursor_state.clone();
-            rep.watermark = st.watermark.clone();
+            rep.cursor_state = judged.unwrap_or_else(|| st.cursor_state.clone());
+            // A cursorless dump reports the high-water it SAW in the column
+            // it tried — useful, and not a position it may resume from. Only
+            // an edge that owns a cursor reports its stored one.
+            if edge.cursor_col().is_some() {
+                rep.watermark = st.watermark.clone();
+            }
             Ok(rep)
         })();
         match out {
@@ -581,6 +591,18 @@ impl crate::Database {
     }
 }
 
+/// One clean dump does not clear a cursor already caught lying, so the
+/// verdict is a function of the ACCUMULATED tally, never of one receipt.
+fn verdict_of(caught: i64, missed: i64) -> String {
+    if missed > 0 {
+        "unsafe".into()
+    } else if caught > 0 {
+        "safe".into()
+    } else {
+        "unknown".into()
+    }
+}
+
 fn report_of(run_id: i64, run: &OpenRun, edge: &ResolvedEdge) -> IngestReport {
     IngestReport {
         run_id,
@@ -599,7 +621,7 @@ fn report_of(run_id: i64, run: &OpenRun, edge: &ResolvedEdge) -> IngestReport {
         caught: run.caught,
         missed: run.missed,
         watermark: run.watermark.clone(),
-        complete: edge.spec.presents_whole_table(),
+        complete: run.mode == Mode::Dump && edge.spec.presents_whole_table(),
     }
 }
 

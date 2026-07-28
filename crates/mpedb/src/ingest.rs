@@ -458,9 +458,12 @@ impl IngestSpec {
                     e.name, e.weight
                 )));
             }
-            if e.strategy == Strategy::Delta && e.cursor.is_none() {
+            // Only a SCHEDULED edge needs a cursor. A derived or writeback
+            // edge does not ask "what changed since X" — it asks for the keys
+            // its parent handed it, so a cursor would be a field nobody reads.
+            if e.kind == EdgeKind::Root && e.strategy == Strategy::Delta && e.cursor.is_none() {
                 return Err(Error::Unsupported(format!(
-                    "ingest spec: edge `{}` is a delta but declares no cursor candidate — \
+                    "ingest spec: root edge `{}` is a delta but declares no cursor candidate — \
                      a delta without a cursor cannot say what it asked for",
                     e.name
                 )));

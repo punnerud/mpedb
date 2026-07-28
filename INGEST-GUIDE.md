@@ -25,9 +25,17 @@ pip install mpedb          # Linux x86-64/aarch64, macOS arm64, Windows x86-64;
 
 A database is a four-line TOML; you create tables with ordinary SQL.
 
+```toml
+# app.toml
+[database]
+path = "app.mpedb"
+size_mb = 256
+max_readers = 8
+```
+
 ```python
 import mpedb
-db = mpedb.Database("app.toml")
+db = mpedb.Database("app.toml")      # the path to the TOML, not the TOML
 db.query("CREATE TABLE cases (id TEXT PRIMARY KEY, subject ANY, status ANY, updated_at ANY)")
 ```
 
@@ -90,8 +98,14 @@ r = db.ingest_delta("salesforce", "cases", rows, calls=1, bytes=51234)
 r["inserted"], r["updated"], r["unchanged"]
 ```
 
-Rows are dicts keyed by column name (lists in declared column order also
-work). Unknown keys are refused by name rather than silently dropped.
+Rows are dicts keyed by column name. Unknown keys are refused by name
+rather than silently dropped. Lists work too, but then you must name the
+columns yourself — there is nothing else to read the names from:
+
+```python
+db.ingest_delta("salesforce", "cases", [[1, "printer", 30]],
+                columns=["id", "subject", "updated_at"], calls=1, bytes=99)
+```
 
 For a large dump, stream it — memory stays flat no matter how big the dump
 is:
@@ -107,6 +121,18 @@ r["deleted"]        # rows the dump did NOT contain — the only way deletes app
 **`calls` and `bytes` are what the call actually cost you.** mpedb cannot
 see the wire, so it trusts your numbers; they are what the next plan is
 computed against. Report them and the budget works.
+
+**The budget window is WALL-CLOCK.** `window_secs = 300` means the last 300
+seconds of real time, measured from receipt timestamps. A test loop that
+runs a hundred simulated ticks in two seconds puts every receipt in one
+window, and `ingest_next` (§7) will hand out nothing after the first few
+calls. That is the budget working correctly on a clock you compressed —
+make the loop wait, or widen the window.
+
+**Argument 2 is an EDGE name.** A table name is accepted and resolves to
+that table's edge of the matching mode — convenient with one delta and one
+dump per table, ambiguous the moment there are two, so name the edge when
+it matters. The receipt tells you which edge it used in `r["edge"]`.
 
 ### What `mode` means
 
@@ -136,10 +162,16 @@ The watermark lives here too, and it is what your next delta should ask
 from — never a timestamp your fetcher remembered, which a crash loses:
 
 ```python
-wm = db.ingest_state("salesforce")["cases_changed"]["watermark"]
-since = 0 if wm is None else wm - OVERLAP        # the overlap is mandatory (§9)
+st = db.ingest_state("salesforce")["cases_changed"]
+wm = st["watermark"]                             # None until a delta has run
+since = 0 if wm is None else max(0, wm - st["overlap_secs"])
 rows = client.query(f"... WHERE LastModifiedDate >= {since}")
 ```
+
+The verdict and the watermark live on the edge that OWNS the cursor — the
+delta. The dump is the judge: its receipt reports the verdict it just
+produced, but its own state row stays empty, because an edge that never
+asks "what changed since X" has no position to resume from.
 
 The first time a dump finds a row whose `updated_at` did not move, the
 verdict flips to `unsafe` **and names the row**. That is the common case in
@@ -178,6 +210,22 @@ puts keys in the queue (§7). The plan still reports what they will cost —
 
 Your script does the fetching and calls `ingest_delta`/`ingest_dump`. The
 plan says when to run it and what to ask for.
+
+**When cron is too coarse, drive the loop from the plan itself.** Cron
+cannot go below one minute, and the plan says so in the edge's `reason`
+("at cron's one-minute floor — the plan wants it faster, so run a loop
+instead"). Everything you need is in the structure:
+
+```python
+for profile in plan["profiles"]:
+    profile["budget_calls"], profile["used_calls"]      # the window
+    profile["uniform_staleness"], profile["solved_staleness"], profile["verdict"]
+    for e in profile["edges"]:
+        e["edge"], e["table"], e["kind"], e["strategy"]
+        e["interval_secs"]        # <- what a loop sleeps between calls
+        e["rate_per_window"]      # <- calls per budget window
+        e["fanout"], e["cron"], e["reason"]
+```
 
 The report also tells you what it could **not** plan and why — a table with
 no observations yet, an edge whose parent never ran, a budget too small for
@@ -219,6 +267,30 @@ db.ingest_resolve("salesforce", take="source")   # or take="local"
 
 That is the whole conflict story on purpose: mpedb will not guess. Newest-
 wins is deliberately not offered — it depends on a clock you do not control.
+
+---
+
+### `local` is not a merge
+
+`policy = "local"` does NOT mean "merge, preferring mine". mpedb keeps no
+last-synced snapshot, so it can only compare the incoming row against the
+row you have **now**. Under `local`, every row that differs is a conflict
+and **no source-side change is ever applied** — including rows you never
+touched. A database left on `local` stops tracking the source and the
+divergence piles up in `ingest_conflicts` for you to drain by hand.
+
+Use `source` for anything that must follow the external system. Use `local`
+only for a table you own and want protected, and then read the conflicts.
+
+### ingest does not track YOUR edits
+
+The other half of that coin: nothing in ingest records that *you* changed a
+row. Under `policy = "source"` a local edit is simply overwritten by the
+next receipt that covers it, and the receipt reports `conflicts: 0` —
+because from ingest's side nothing was in dispute. If your application
+writes to an ingested table, keep your own record of what it wrote (a dirty
+flag, an outbox table, a rRETL map — §8) and push it before the next delta
+touches those rows.
 
 ---
 
@@ -298,6 +370,27 @@ This is what lets you migrate gradually: run the old system and the new one
 side by side, both live, both written to, with the sets kept in sync — and
 move user groups over when they are ready instead of on a cutover night.
 
+### Writing back without an echo
+
+A `writeback` edge is a derived edge whose call PUSHES instead of fetching:
+declare it with `"kind": "writeback"` and a `parent`, queue keys onto it
+with `ingest_derive` exactly like a derived edge, and drain it with
+`ingest_next` / `ingest_done`. mpedb carries the keys; your code does the
+PUT.
+
+The trap is the echo. A write that stamps a new `updated_at` in the source
+comes back through the next delta as an update — of your own change:
+
+```python
+row = client.update_case(cid, state="escalated")     # the source stamps it
+db.query("UPDATE cases SET state=$1, updated_at=$2 WHERE id=$3",
+         [row["state"], row["updated_at"], cid])     # apply what it RETURNED
+```
+
+Apply whatever the write call returns — the timestamp included — to your
+local row. Skip that and every writeback registers as a source change
+forever, because the value matches but the timestamp does not.
+
 **One rule when starting a two-way pair**: load one direction fully while
 the other side is frozen, note the watermark at the instant you unfreeze
 writes, and start the reverse direction from exactly there. Otherwise the
@@ -333,11 +426,12 @@ reverse direction has a gap the width of your initial load.
 | `db.ingest_sources()` / `ingest_show(name)` / `ingest_drop(name)` | names / TOML / bool | manage sources |
 | `db.ingest_dump(src, tbl, rows, calls=, bytes=)` | dict | full-table receipt in one call: finds inserts, updates AND deletes |
 | `db.ingest_delta(src, tbl, rows, calls=, bytes=)` | dict | changed-rows receipt: inserts and updates |
-| `db.ingest_begin(src, tbl, mode=)` | run | start a streamed receipt |
+| `db.ingest_begin(src, tbl, mode=)` | int run id | start a streamed receipt |
 | `db.ingest_rows(run, rows, calls=, bytes=)` | dict | push one chunk |
 | `db.ingest_finish(run)` | dict | close it; for `dump`, this is where deletes are found |
+| `db.ingest_abandon(run)` | `None` | give up on an open receipt — the rows already pushed stay (they were real), the run closes, and a dump's presented-key set is cleared so the next dump starts honest |
 | `db.ingest_state(src)` | dict per edge | watermark, cursor verdict (`safe`/`unsafe`/`unknown`), caught/missed, observed change rate and fan-out |
-| `db.ingest_advise(src)` | dict incl. `cron` | the plan: which edge, how often, in which profile, plus what could not be planned |
+| `db.ingest_advise(src)` | dict incl. `cron` and `profiles` | the plan (see below) |
 | `db.ingest_conflicts(src)` / `ingest_resolve(src, take=)` | list / count | what could not be decided, and deciding it |
 | `db.ingest_derive(run, edge, keys)` | int | queue derived calls from this receipt's keys, atomically with it |
 | `db.ingest_next(src)` | `{lease, edge, table, keys}` \| `None` | the next batch the budget allows; `None` = window spent |

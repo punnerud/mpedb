@@ -176,14 +176,20 @@ fn the_dump_catches_a_lying_updated_at() {
     assert_eq!(r.cursor_state, "unsafe");
     assert!(r.cursor_note().contains("UNSAFE"), "{}", r.cursor_note());
 
-    // The verdict is recorded against BOTH the dump edge and the delta edge
-    // it judges — the delta is the one that would have done the losing.
+    // The verdict is recorded against the edge that OWNS the cursor — the
+    // delta, which is the one that would have done the losing. The dump has
+    // no cursor of its own, so it carries neither a verdict nor a position:
+    // giving the judge the accused's record is how a reader ends up reading
+    // a watermark off an edge that never asks for one.
     let st = d.ingest_state("crm").unwrap();
-    for name in ["cases_delta", "cases_full"] {
-        let e = st.iter().find(|(n, _, _)| n == name).unwrap();
-        assert_eq!(e.1.cursor_state, "unsafe", "{name}");
-        assert_eq!(e.1.missed, 1, "{name}");
-    }
+    let delta = &st.iter().find(|(n, _, _)| n == "cases_delta").unwrap().1;
+    assert_eq!((delta.cursor_state.as_str(), delta.missed), ("unsafe", 1));
+    let dump = &st.iter().find(|(n, _, _)| n == "cases_full").unwrap().1;
+    assert_eq!(
+        (dump.cursor_state.as_str(), dump.missed, &dump.cursor_col, &dump.watermark),
+        ("unknown", 0, &String::new(), &Value::Null),
+        "the judge keeps no record of its own"
+    );
 }
 
 /// A cursor that behaves earns `safe` — and keeps earning it, because
