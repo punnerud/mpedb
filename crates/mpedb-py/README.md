@@ -41,6 +41,16 @@ import mpedb.mpedb  as db    # force the NATIVE engine for any path
 - **Multi-process for real.** sqlite's operational model (no server, attach by
   path) with lock-free MVCC readers: readers never block the writer, the
   writer never blocks readers, and a crash mid-write never corrupts the file.
+- **Crash-safe on every platform this ships a wheel for**, and by the same
+  standard on each: Linux (x86-64, aarch64, armv7l), macOS/Apple Silicon and
+  Windows x86-64 all run **all six multi-process crash harnesses** in CI —
+  `crash`, `stress`, `powerloss`, `collide`, `queue-collide`, `mirror-collide`
+  — with processes SIGKILLed mid-write and the file verified afterwards.
+  Windows is not a port that merely compiles: shared `CreateFileMapping`
+  views, a `LockFileEx` writer lock with owner-death release, `GetProcessTimes`
+  reader identity, `FlushViewOfFile` + `FlushFileBuffers` durability. The first
+  thing those harnesses found on Windows was a corruption bug that turned out
+  to be ours on *every* platform.
 - **Compiled plans.** SQL compiles once to a content-hashed plan shared across
   processes; repeated parameterised statements execute with zero parsing.
 - **Keep your `.db` files.** The sqlite-backed mode means adopting mpedb does
