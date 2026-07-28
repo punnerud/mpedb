@@ -204,6 +204,16 @@ record so a re-verification is reproducible. Deterministic xorshift, no `rand`
 dependency — the project's existing convention. It must contain the edges that
 break naive "bijections":
 
+> **User probes** (`create_lens_with_probes` / the `probes=` kwarg): the
+> corpus cannot know a DOMAIN's edge values, and "corpus verification is not
+> proof" is exactly the gap where that bites — a pair whose hole the 232
+> values cannot see registers cleanly and aborts the first apply that meets
+> the hole (fail-safe, but late). Handing the domain's own values over at
+> registration moves the refusal to registration time, counter-example named
+> as always. Probes harden REGISTRATION only: the record does not carry
+> them, so `lens verify` re-checks the built-in corpus — re-register to
+> re-check probes.
+
 - `int64`: `0`, `±1`, `i64::MIN`, `i64::MAX`, powers of two either side of a
   magnitude boundary
 - `float64`: `±0.0` (distinct bit patterns, equal under `==`), NaN, ±∞,
@@ -652,7 +662,14 @@ base+diff: `rretl put/get/versions` (`rretl_store.rs`) — the newest version
 stored FULL, the previous newest rewritten as a reverse delta whose base is
 exactly the version above, verified byte-identical AS PERSISTED before the
 commit, every `FULL_EVERY = 8`th version a permanent full anchor (the Bennett
-knob, §11 finding 11), nothing ever deleted. Its three failure disciplines:
+knob, §11 finding 11), and nothing deleted except by EXPLICIT prune:
+`rretl prune <obj> <keep>` deletes the oldest versions keeping the newest
+`keep`, chain-safe BY CONSTRUCTION (every delta bases on the version ABOVE
+it and get walks downward from an anchor at-or-above the target, so a
+deleted prefix orphans nothing; the dangerous prune — an anchor from the
+middle — stays impossible because only a contiguous oldest-first prefix
+ever goes). The prune is first-class lineage (outcome `pruned`, deleted
+range in the note), and `keep = 0` is refused: keeping nothing is a drop. Its three failure disciplines:
 a stored full that fails its recorded hash HARD-errors the put (rewriting
 would launder corruption and delete the last good copy — finding 12); a
 delta that bloats or fails its own round trip keeps the full and the put

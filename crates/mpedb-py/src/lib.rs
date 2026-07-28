@@ -753,7 +753,10 @@ impl PyDatabase {
     /// one (`residual` class goes through `create_residual_lens`). The
     /// declaration is VERIFIED against the probe corpus and refused with a
     /// named counter-example if it does not hold. Returns the sample count.
-    #[pyo3(signature = (name, forward, inverse, r#class="bijective"))]
+    /// `probes` extends the built-in verification corpus with YOUR domain's
+    /// edge values — a pair that breaks on one is refused AT REGISTRATION,
+    /// value named, instead of aborting the first apply that meets it.
+    #[pyo3(signature = (name, forward, inverse, r#class="bijective", probes=None))]
     fn create_lens(
         &self,
         py: Python<'_>,
@@ -761,16 +764,25 @@ impl PyDatabase {
         forward: &str,
         inverse: &str,
         r#class: &str,
+        probes: Option<Vec<Bound<'_, PyAny>>>,
     ) -> PyResult<u32> {
         self.refuse_if_txn_open("create_lens", "Commit or roll back first.")?;
         let class = mpedb::lens::LensClass::parse(r#class).map_err(map_err)?;
+        let probes = probes
+            .unwrap_or_default()
+            .iter()
+            .map(py_to_value)
+            .collect::<PyResult<Vec<_>>>()?;
         let db = &self.db;
-        py.detach(|| db.create_lens(name, forward, inverse, class)).map_err(map_err)
+        py.detach(|| db.create_lens_with_probes(name, forward, inverse, class, &probes))
+            .map_err(map_err)
     }
 
     /// Register a RESIDUAL lens triple: forward/1, rex/1 (the residual
     /// extractor — what forward loses), inverse/2. The declared residual type
     /// is verified against actual rex outputs. Returns the sample count.
+    #[pyo3(signature = (name, forward, rex, inverse, residual_type, probes=None))]
+    #[allow(clippy::too_many_arguments)]
     fn create_residual_lens(
         &self,
         py: Python<'_>,
@@ -779,6 +791,7 @@ impl PyDatabase {
         rex: &str,
         inverse: &str,
         residual_type: &str,
+        probes: Option<Vec<Bound<'_, PyAny>>>,
     ) -> PyResult<u32> {
         self.refuse_if_txn_open("create_residual_lens", "Commit or roll back first.")?;
         let rt = mpedb::ColumnType::parse(residual_type).ok_or_else(|| {
@@ -787,9 +800,16 @@ impl PyDatabase {
                  text, blob, timestamp or any"
             ))
         })?;
+        let probes = probes
+            .unwrap_or_default()
+            .iter()
+            .map(py_to_value)
+            .collect::<PyResult<Vec<_>>>()?;
         let db = &self.db;
-        py.detach(|| db.create_residual_lens(name, forward, rex, inverse, rt))
-            .map_err(map_err)
+        py.detach(|| {
+            db.create_residual_lens_with_probes(name, forward, rex, inverse, rt, &probes)
+        })
+        .map_err(map_err)
     }
 
     /// Every registered lens pair, as dicts.
@@ -893,6 +913,15 @@ impl PyDatabase {
                 Ok(d.into_any().unbind())
             })
             .collect()
+    }
+
+    /// Delete the OLDEST versions of `obj`, keeping the newest `keep` —
+    /// chain-safe by construction (deltas base upward), recorded as lineage
+    /// outcome `pruned`. Returns how many were deleted; `keep = 0` refused.
+    fn rretl_prune_versions(&self, py: Python<'_>, obj: &str, keep: u64) -> PyResult<u64> {
+        self.refuse_if_txn_open("rretl_prune_versions", "Commit or roll back first.")?;
+        let db = &self.db;
+        py.detach(|| db.rretl_prune_versions(obj, keep)).map_err(map_err)
     }
 
     /// Splice a zip archive into the database: members become rows in

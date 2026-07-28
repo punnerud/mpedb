@@ -134,6 +134,7 @@ fn hash_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn builtin_lineage(
     run_id: i64,
     lens: &str,
@@ -141,6 +142,9 @@ fn builtin_lineage(
     table: &'static str,
     content_hash: &str,
     rows: i64,
+    // Never "applied": revert/putback/stacking all key on that outcome, and
+    // neither a version put nor a prune is a column run they could unwind.
+    outcome: &'static str,
     error: String,
 ) -> LineageRow {
     LineageRow {
@@ -158,9 +162,7 @@ fn builtin_lineage(
         output_hash: content_hash.into(),
         residual_hash: String::new(),
         rows,
-        // Never "applied": revert/putback/stacking all key on that outcome,
-        // and a version put is not a column run they could unwind.
-        outcome: "versioned",
+        outcome,
         error,
     }
 }
@@ -186,6 +188,33 @@ impl crate::Database {
             Ok(ver) => {
                 s.commit()?;
                 Ok(ver)
+            }
+            Err(e) => {
+                s.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Delete the OLDEST versions of `obj`, keeping the newest `keep`.
+    /// Returns how many were deleted. Chain-safe by construction (deltas
+    /// base upward; see `prune_in`); recorded as lineage outcome `pruned`.
+    /// `keep = 0` is refused — keeping nothing is a drop, not a prune.
+    pub fn rretl_prune_versions(&self, obj: &str, keep: u64) -> Result<u64> {
+        if keep == 0 {
+            return Err(Error::Unsupported(
+                "keeping ZERO versions is a drop, not a prune — refused; if you mean \
+                 it, delete the rows from rretl_versions yourself"
+                    .into(),
+            ));
+        }
+        let have = self.committed_tables()?;
+        let mut s = self.begin()?;
+        let out = prune_in(&mut s, &have, obj, keep);
+        match out {
+            Ok(n) => {
+                s.commit()?;
+                Ok(n)
             }
             Err(e) => {
                 s.rollback();
@@ -433,10 +462,67 @@ fn put_version_in(
         T_VERSIONS,
         &content_hash,
         1,
+        "versioned",
         note,
     )
     .insert(s)?;
     Ok(new_ver)
+}
+
+/// Delete the OLDEST versions of `obj`, keeping the newest `keep` — the
+/// retention story "nothing is ever deleted" deliberately left open. It is
+/// chain-safe BY CONSTRUCTION: every delta bases on the version ABOVE it and
+/// `retl_get_version` walks downward from an anchor at or above the target,
+/// so deleting a prefix of history can never orphan anything that remains.
+/// (The dangerous prune — an anchor from the MIDDLE — stays impossible: only
+/// a contiguous oldest-first prefix ever goes.) The prune itself is
+/// first-class lineage (outcome `pruned`, the deleted range in the note).
+fn prune_in(
+    s: &mut WriteSession<'_>,
+    have: &[(String, Vec<String>)],
+    obj: &str,
+    keep: u64,
+) -> Result<u64> {
+    if !shape_gate(have, T_VERSIONS, &VERSIONS_SHAPE)? {
+        return Err(Error::Unsupported(format!(
+            "no versions of `{obj}` — nothing to prune"
+        )));
+    }
+    crate::rretl::ensure_lineage_tables(s, have)?;
+    let bounds = rows_of(s.query(
+        "SELECT min(ver), max(ver) FROM rretl_versions WHERE obj = $1",
+        &[Value::Text(obj.into())],
+    )?)?;
+    let (minv, maxv) = match bounds.first().map(|r| (&r[0], &r[1])) {
+        Some((Value::Int(lo), Value::Int(hi))) => (*lo, *hi),
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "no versions of `{obj}` — nothing to prune"
+            )))
+        }
+    };
+    let cutoff = maxv.saturating_sub(keep as i64);
+    if cutoff < minv {
+        return Ok(0);
+    }
+    s.query(
+        "DELETE FROM rretl_versions WHERE obj = $1 AND ver <= $2",
+        &[Value::Text(obj.into()), Value::Int(cutoff)],
+    )?;
+    let pruned = (cutoff - minv + 1) as u64;
+    let run_id = next_run_id(s)?;
+    builtin_lineage(
+        run_id,
+        "builtin:prune",
+        obj,
+        T_VERSIONS,
+        "",
+        pruned as i64,
+        "pruned",
+        format!("versions {minv}..={cutoff} deleted, newest {keep} kept"),
+    )
+    .insert(s)?;
+    Ok(pruned)
 }
 
 /// Rewrite the previous newest (`cv`) as a reverse delta against the bytes

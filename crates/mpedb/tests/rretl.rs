@@ -1468,3 +1468,55 @@ fn text_pks_that_prefix_each_other_survive_chunked_scans() {
     std::env::remove_var("MPEDB_RRETL_CHUNK");
     let _ = std::fs::remove_file(&path);
 }
+
+/// An implicit-rowid table (no declared PK) is a legal rRETL target: the
+/// hidden rowid is the row identity — queryable, point-updatable and
+/// range-scannable exactly like a declared INTEGER PK. Composite PKs stay a
+/// named refusal.
+#[test]
+fn an_implicit_rowid_table_applies_and_puts_back() {
+    let path = format!(
+        "{}/rretl-rowid-{}.mpedb",
+        mpedb_testkit::scratch_base_str(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 32\nmax_readers = 8\n\
+         durability = \"none\"\n"
+    );
+    let d = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    d.query("CREATE TABLE notes (v ANY)", &[]).unwrap();
+    let mut s = d.begin().unwrap();
+    for v in [-7i64, 4, -1] {
+        s.query("INSERT INTO notes (v) VALUES ($1)", &[Value::Int(v)]).unwrap();
+    }
+    s.commit().unwrap();
+    define_abs_pair(&d);
+
+    let run = d.rretl_apply("mag", "notes", "v").unwrap();
+    assert_eq!(run.rows, 3);
+    assert_eq!(run.residuals, 3);
+
+    // Edit magnitude of the first row BY ROWID, putback: the sign rides home.
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE notes SET v = 9 WHERE rowid = 1", &[]).unwrap();
+    s.commit().unwrap();
+    d.rretl_putback(run.run_id).unwrap();
+    let got: Vec<i64> = rows(d.query("SELECT v FROM notes ORDER BY rowid", &[]).unwrap())
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Int(i) => *i,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec![-9, 4, -1], "edit carried back through the sign residual");
+    assert!(d.rretl_fsck().unwrap().is_empty());
+
+    // A composite PK is still refused, with the shape named.
+    d.query("CREATE TABLE pair (a INTEGER, b INTEGER, v ANY, PRIMARY KEY (a, b))", &[])
+        .unwrap();
+    let e = d.rretl_apply("mag", "pair", "v").unwrap_err().to_string();
+    assert!(e.contains("2-column primary key"), "{e}");
+    let _ = std::fs::remove_file(&path);
+}

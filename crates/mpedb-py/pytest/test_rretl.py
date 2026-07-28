@@ -208,6 +208,30 @@ def stage3(workdir):
     stored = {v["ver"]: v["stored_as"] for v in db.rretl_versions("report.md")}
     assert stored[10] == "full" and stored[8] == "full" and stored[9] == "delta", stored
 
+    # Prune: keep the newest 3, the rest go — and what remains still reads.
+    assert db.rretl_prune_versions("report.md", 3) == 7
+    left = [v["ver"] for v in db.rretl_versions("report.md")]
+    assert left == [8, 9, 10], left
+    for ver, want in history[7:]:
+        assert db.rretl_get_version("report.md", ver) == want
+    try:
+        db.rretl_get_version("report.md", 7)
+        raise AssertionError("pruned version must be a named refusal")
+    except mpedb.Error as e:
+        assert "no version 7" in str(e), e
+    assert any(r["outcome"] == "pruned" for r in db.rretl_log())
+
+    # User probes: a fake bijection whose hole the corpus cannot see is
+    # accepted plain, refused BY NAME with the domain's own value as a probe.
+    db.define_function("def hole(x):\n    if x == 777777:\n        return 0\n    return x\n")
+    db.define_function("def ident(x):\n    return x\n")
+    db.create_lens("holey", "hole", "ident")
+    try:
+        db.create_lens("holey2", "hole", "ident", probes=[777777])
+        raise AssertionError("the probe must refuse the fake bijection")
+    except mpedb.Error as e:
+        assert "777777" in str(e), e
+
     # Zip splice: a REAL producer's archive (zipfile, STORE) round-trips
     # byte-identically through member rows.
     import io

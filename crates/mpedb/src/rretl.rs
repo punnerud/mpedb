@@ -151,18 +151,35 @@ impl crate::Database {
             .iter()
             .find(|t| t.name == table && !t.dead)
             .ok_or_else(|| Error::Unsupported(format!("no table named `{table}`")))?;
-        // v1: a declared single-column PK. Composite PKs need a composite
-        // pk_enc (representable — value_bits framing — but untested territory),
-        // and implicit-rowid tables expose no stable column to key residuals
-        // on. Both are named refusals, not silent narrowing.
-        if t.primary_key.len() != 1 {
+        // Row identity: a declared single-column PK, or the hidden rowid of
+        // an implicit-rowid table — `rowid` is queryable, point-updatable and
+        // range-scannable exactly like a declared INTEGER PK (probed:
+        // PkRange + elided sort + PkPoint), and it is stable for the life of
+        // the row. Identity semantics are the PK contract either way: delete
+        // a row and re-use its identity (an explicit pk value, or a re-issued
+        // rowid) and putback treats the newcomer as an EDIT of that row,
+        // PutRes-gated like any other. Composite PKs stay a named refusal —
+        // their chunk resume needs a tuple comparison the planner does not
+        // have.
+        let pk_col = if t.primary_key.len() == 1 {
+            t.columns[t.primary_key[0] as usize].name.clone()
+        } else if t.primary_key.is_empty()
+            && t.implicit_rowid
+            && !t.columns.iter().any(|c| c.name.eq_ignore_ascii_case("rowid"))
+        {
+            "rowid".to_string()
+        } else if t.primary_key.len() > 1 {
             return Err(Error::Unsupported(format!(
-                "`{table}` has a {}-column primary key; rretl apply supports a declared \
-                 single-column PK in stage 2",
+                "`{table}` has a {}-column primary key; rretl needs a single row \
+                 identity — a one-column PK or an implicit rowid",
                 t.primary_key.len()
             )));
-        }
-        let pk_col = t.columns[t.primary_key[0] as usize].name.clone();
+        } else {
+            return Err(Error::Unsupported(format!(
+                "`{table}` exposes no stable row identity rretl can key residuals on \
+                 (a declared column shadows `rowid`, or the table has no rowid)"
+            )));
+        };
         let col = t
             .columns
             .iter()

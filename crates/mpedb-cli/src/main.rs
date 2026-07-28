@@ -103,6 +103,9 @@ usage: mpedb <command> [args]
   rretl get <target> <obj> <ver> <out>       materialize any version, every step
                                            hash-verified — never silent rot
   rretl versions <target> <obj>              list versions and how each is stored
+  rretl prune <target> <obj> <keep>          delete the OLDEST versions, keep the
+                                           newest <keep> — chain-safe (deltas
+                                           base upward), recorded as lineage
   rretl pack-in <target> <name> <zip>        splice a zip into rows + residual;
                                            reconstruction verified byte-identical
                                            BEFORE the ingest commits
@@ -678,6 +681,18 @@ fn cmd_rretl(args: &[String]) -> CliResult {
             println!("rretl get: `{obj}` version {ver} → {out} ({} bytes, hash-verified)", bytes.len());
             Ok(())
         }
+        [sub, config, obj, keep] if sub == "prune" => {
+            let keep: u64 = keep.parse().map_err(|_| {
+                Failure::Usage(format!("rretl prune needs a keep-count, got `{keep}`"))
+            })?;
+            let db = crate::util::open_target(config)?;
+            let n = db.rretl_prune_versions(obj, keep)?;
+            println!(
+                "rretl prune: {n} old version(s) of `{obj}` deleted, newest {keep} kept \
+                 (recorded in the lineage)"
+            );
+            Ok(())
+        }
         [sub, config, obj] if sub == "versions" => {
             let db = crate::util::open_target(config)?;
             let vers = db.rretl_versions(obj)?;
@@ -729,7 +744,8 @@ fn cmd_rretl(args: &[String]) -> CliResult {
             "rretl needs: apply <target> <pair> <table>.<column> | revert <target> <run_id> \
              | putback <target> <run_id> | fsck <target> | log <target> \
              | put <target> <obj> <file> | get <target> <obj> <ver> <out-file> \
-             | versions <target> <obj> | pack-in <target> <name> <zip-file> \
+             | versions <target> <obj> | prune <target> <obj> <keep> \
+             | pack-in <target> <name> <zip-file> \
              | pack-out <target> <archive_id> <out-file> | archives <target>",
         ),
     }

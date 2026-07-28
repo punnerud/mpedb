@@ -10,7 +10,7 @@
 
 use mpedb::lens::LensClass;
 use mpedb::spellfn::SpellLang;
-use mpedb::{Config, Database};
+use mpedb::{Config, Database, Value};
 
 fn db(tag: &str) -> (Database, String) {
     let path = format!(
@@ -307,5 +307,41 @@ fn a_pair_that_refuses_the_whole_corpus_proves_nothing_and_is_refused() {
     def(&d, "def bad(x):\n    return x[0]\n");
     let e = d.create_lens("b", "bad", "bad", LensClass::Bijective).unwrap_err().to_string();
     assert!(e.contains("nothing was verified"), "{e}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// User probes close the corpus-is-not-proof gap where it actually bites:
+/// a pair whose hole the 232-value corpus cannot see. `hole` collapses
+/// exactly one value (777777 -> 0) — identity everywhere the corpus looks,
+/// so the plain registration ACCEPTS it; handing the domain's own edge value
+/// over as a probe gets it REFUSED at registration, value named, instead of
+/// aborting the first apply that meets a 777777.
+#[test]
+fn a_user_probe_catches_the_hole_the_corpus_cannot_see() {
+    let (d, path) = db("probes");
+    d.create_function(
+        SpellLang::Python,
+        "def hole(x):\n    if x == 777777:\n        return 0\n    return x\n",
+    )
+    .unwrap();
+    d.create_function(SpellLang::Python, "def ident(x):\n    return x\n")
+        .unwrap();
+
+    // The corpus never contains 777777, so the fake bijection registers.
+    d.create_lens("holey", "hole", "ident", LensClass::Bijective).unwrap();
+    d.drop_lens("holey").unwrap();
+
+    // With the domain's edge value as a probe, it is refused BY NAME.
+    let e = d
+        .create_lens_with_probes(
+            "holey",
+            "hole",
+            "ident",
+            LensClass::Bijective,
+            &[Value::Int(777_777)],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("777777"), "the probe value is named: {e}");
     let _ = std::fs::remove_file(&path);
 }

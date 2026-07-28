@@ -92,12 +92,14 @@ db = mpedb.Database("pixels.toml")
 db.query("CREATE TABLE pixels (id INTEGER PRIMARY KEY, px ANY)")
 ```
 
-Two rules for a table rRETL will transform: it needs a **declared
-single-column primary key**, and a column that will receive type-changing
-transforms (int→float etc.) must be `ANY` — `ANY` accepts every scalar type,
-while rigid types (`INTEGER`, `TEXT`, …) refuse type-changing pairs early,
-with the pair named. (Declaring tables in the TOML with `[[table]]` blocks
-still works and gives the same result; it is just more to write.)
+Two rules for a table rRETL will transform: it needs a **single row
+identity** — a declared one-column primary key, or no primary key at all
+(the hidden `rowid` is then the identity; composite PKs are refused by
+name) — and a column that will receive type-changing transforms
+(int→float etc.) must be `ANY`. `ANY` accepts every scalar type, while
+rigid types (`INTEGER`, `TEXT`, …) refuse type-changing pairs early, with
+the pair named. (Declaring tables in the TOML with `[[table]]` blocks still
+works and gives the same result; it is just more to write.)
 
 ---
 
@@ -380,8 +382,8 @@ scale as its own apply with the full source as the residual).
 | call | returns | notes |
 |---|---|---|
 | `db.define_function(source)` | `(name, hash)` | PySpell subset (§2); name/arity from the `def` itself; redefining a name re-binds it, but registered pairs keep the hash they were verified against |
-| `db.create_lens(name, fwd, inv, class="bijective")` | sample count | `bijective` or `lossy`; verified, refusals name a counter-example |
-| `db.create_residual_lens(name, fwd, rex, inv, residual_type)` | sample count | the triple; residual type is declared AND verified |
+| `db.create_lens(name, fwd, inv, class="bijective", probes=None)` | sample count | `bijective` or `lossy`; verified, refusals name a counter-example. `probes` = YOUR domain's edge values, appended to the built-in corpus — a pair that breaks on one is refused at registration instead of aborting the first apply that meets it |
+| `db.create_residual_lens(name, fwd, rex, inv, residual_type, probes=None)` | sample count | the triple; residual type is declared AND verified; `probes` as above |
 | `db.lenses()` | list of dicts | `name, class, forward_hash, inverse_hash, rex_hash, residual_type, samples, healthy` |
 | `db.rretl_apply(pair, table, column)` | `{"run_id", "rows", "residuals"}` | one txn; 100% verified before the source-destroying commit |
 | `db.rretl_revert(run_id)` | same dict | exact undo; hash-gated |
@@ -391,6 +393,7 @@ scale as its own apply with the full source as the residual).
 | `db.rretl_put_version(obj, data)` | version number | blob versioning: newest kept full, the previous newest rewritten as a reverse delta (verified byte-identical before commit), every 8th version stays full |
 | `db.rretl_get_version(obj, ver)` | `bytes` | materialize ANY version; every reconstruction step hash-verified — corruption is a named error, never wrong bytes |
 | `db.rretl_versions(obj)` | list of dicts | `ver, stored_as ("full"/"delta"), bytes, content_hash` |
+| `db.rretl_prune_versions(obj, keep)` | deleted count | delete the OLDEST versions, keep the newest `keep`. Chain-safe by construction (every delta bases on the version above it, so a deleted prefix orphans nothing); recorded in the lineage as outcome `pruned`; `keep=0` refused |
 | `db.rretl_pack_in(name, data)` | archive id | splice a zip: members become rows in `rretl_archive_members` (queryable!), the residual keeps every other byte; reconstruction verified byte-identical BEFORE the ingest commits. zip64, encrypted and overlapping archives are refused by name |
 | `db.rretl_pack_out(archive_id)` | `bytes` | rebuild the zip byte-identically, hash-gated — a member row edited outside the pipeline is a named refusal (re-ingest instead of mutating) |
 | `db.rretl_archives()` | list of dicts | `archive_id, name, members, content_hash` |

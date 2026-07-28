@@ -416,3 +416,56 @@ fn versions_and_archives_coexist() {
     assert_eq!(d.rretl_pack_out(id).unwrap(), file);
     assert!(d.rretl_fsck().unwrap().is_empty());
 }
+
+/// Prune keeps the newest N and deletes the oldest prefix — chain-safe by
+/// construction (deltas base UPWARD), first-class lineage (outcome
+/// `pruned`), and keep = 0 is a named refusal, not an empty store.
+#[test]
+fn prune_deletes_the_oldest_prefix_and_the_rest_still_materializes() {
+    let (d, _scratch) = db("prune");
+    let mut doc = b"a paragraph that repeats, a paragraph that repeats, yes".to_vec();
+    let mut history = Vec::new();
+    for i in 0..20 {
+        doc.extend_from_slice(format!(" edit {i}").as_bytes());
+        let ver = d.rretl_put_version("doc", &doc).unwrap();
+        history.push((ver, doc.clone()));
+    }
+
+    assert_eq!(d.rretl_prune_versions("doc", 5).unwrap(), 15);
+    let infos = d.rretl_versions("doc").unwrap();
+    assert_eq!(infos.iter().map(|v| v.ver).collect::<Vec<_>>(), vec![16, 17, 18, 19, 20]);
+    for (ver, bytes) in history.iter().filter(|(v, _)| *v >= 16) {
+        assert_eq!(&d.rretl_get_version("doc", *ver).unwrap(), bytes);
+    }
+    let e = d.rretl_get_version("doc", 15).unwrap_err().to_string();
+    assert!(e.contains("no version 15"), "{e}");
+    assert!(d.rretl_fsck().unwrap().is_empty(), "pruned store is clean");
+
+    // Idempotent-ish: nothing more to prune at keep 5; keep > count is a no-op.
+    assert_eq!(d.rretl_prune_versions("doc", 5).unwrap(), 0);
+    assert_eq!(d.rretl_prune_versions("doc", 99).unwrap(), 0);
+    // keep 0 refused by name; unknown object refused by name.
+    let e = d.rretl_prune_versions("doc", 0).unwrap_err().to_string();
+    assert!(e.contains("drop, not a prune"), "{e}");
+    let e = d.rretl_prune_versions("nope", 3).unwrap_err().to_string();
+    assert!(e.contains("nope"), "{e}");
+
+    // The prune is lineage: outcome `pruned`, range in the note, and it is
+    // not unwindable.
+    let log = d.rretl_log().unwrap();
+    let pr: Vec<_> = log.iter().filter(|r| r.outcome == "pruned").collect();
+    assert_eq!(pr.len(), 1);
+    assert!(pr[0].error.contains("1..=15"), "{}", pr[0].error);
+    let e = d.rretl_revert(pr[0].run_id).unwrap_err().to_string();
+    assert!(e.contains("pruned"), "{e}");
+
+    // New puts continue above; a later prune moves the floor again.
+    doc.extend_from_slice(b" after prune");
+    assert_eq!(d.rretl_put_version("doc", &doc).unwrap(), 21);
+    assert_eq!(d.rretl_prune_versions("doc", 2).unwrap(), 4);
+    assert_eq!(
+        d.rretl_versions("doc").unwrap().iter().map(|v| v.ver).collect::<Vec<_>>(),
+        vec![20, 21]
+    );
+    assert!(d.rretl_fsck().unwrap().is_empty());
+}

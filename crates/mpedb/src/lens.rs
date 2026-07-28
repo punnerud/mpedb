@@ -572,6 +572,25 @@ impl crate::Database {
         inverse: &str,
         class: LensClass,
     ) -> Result<u32> {
+        self.create_lens_with_probes(name, forward, inverse, class, &[])
+    }
+
+    /// [`create_lens`](Self::create_lens) with EXTRA probe values appended to
+    /// the built-in corpus — the honest answer to "corpus verification is not
+    /// proof": the corpus cannot know YOUR domain's edge values, but you can
+    /// hand them over, and a pair that breaks on one is refused AT
+    /// REGISTRATION with the value named, instead of aborting the first
+    /// apply that meets it. Probes harden registration; `lens verify`
+    /// re-checks the built-in corpus only (the record does not carry them) —
+    /// re-register to re-check probes.
+    pub fn create_lens_with_probes(
+        &self,
+        name: &str,
+        forward: &str,
+        inverse: &str,
+        class: LensClass,
+        probes: &[Value],
+    ) -> Result<u32> {
         if class == LensClass::Residual {
             return Err(Error::Unsupported(
                 "a residual pair binds THREE functions and a declared residual type — \
@@ -579,7 +598,7 @@ impl crate::Database {
                     .into(),
             ));
         }
-        self.register_lens(name, class, forward, None, inverse, None)
+        self.register_lens(name, class, forward, None, inverse, None, probes)
     }
 
     /// Register a `Residual` pair: the triple `forward/1`, `rex/1` (the
@@ -598,9 +617,32 @@ impl crate::Database {
         inverse: &str,
         residual_type: mpedb_types::ColumnType,
     ) -> Result<u32> {
-        self.register_lens(name, LensClass::Residual, forward, Some(rex), inverse, Some(residual_type))
+        self.create_residual_lens_with_probes(name, forward, rex, inverse, residual_type, &[])
     }
 
+    /// [`create_residual_lens`](Self::create_residual_lens) with extra probe
+    /// values — see [`create_lens_with_probes`](Self::create_lens_with_probes).
+    pub fn create_residual_lens_with_probes(
+        &self,
+        name: &str,
+        forward: &str,
+        rex: &str,
+        inverse: &str,
+        residual_type: mpedb_types::ColumnType,
+        probes: &[Value],
+    ) -> Result<u32> {
+        self.register_lens(
+            name,
+            LensClass::Residual,
+            forward,
+            Some(rex),
+            inverse,
+            Some(residual_type),
+            probes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn register_lens(
         &self,
         name: &str,
@@ -609,6 +651,7 @@ impl crate::Database {
         rex: Option<&str>,
         inverse: &str,
         residual_type: Option<mpedb_types::ColumnType>,
+        probes: &[Value],
     ) -> Result<u32> {
         let key = crate::sys_record_subkey(NS_LENS, name.as_bytes())?;
 
@@ -671,7 +714,8 @@ impl crate::Database {
                             "`{inverse}` names a definition blob that is missing"
                         ))
                     })?;
-                    let corpus = probe_corpus(PROBE_CORPUS_V1)?;
+                    let mut corpus = probe_corpus(PROBE_CORPUS_V1)?;
+                    corpus.extend_from_slice(probes);
                     verify_bijective(&fwd, &inv, &corpus).map_err(|fault| {
                         Error::Unsupported(format!("`{name}` was declared bijective but {fault}"))
                     })
@@ -692,7 +736,8 @@ impl crate::Database {
                             "`{inverse}` names a definition blob that is missing"
                         ))
                     })?;
-                    let corpus = probe_corpus(PROBE_CORPUS_V1)?;
+                    let mut corpus = probe_corpus(PROBE_CORPUS_V1)?;
+                    corpus.extend_from_slice(probes);
                     verify_residual(&fwd, &rx, &inv, &corpus, declared).map_err(|fault| {
                         Error::Unsupported(format!("`{name}` was declared residual but {fault}"))
                     })
