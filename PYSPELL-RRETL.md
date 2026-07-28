@@ -296,6 +296,52 @@ re-ingest the edited data as a new archive instead. Both transforms appear in
 `rretl_log()` (outcomes `versioned` / `packed`) and are re-verified by
 `rretl_fsck()`.
 
+### Table-SET maps: migration mirrored both ways
+
+The migration/sync shape: your tables mirrored into a DIFFERENT schema
+(renamed tables, renamed columns, converted values) — for feeding another
+system — with edits on either side flowing back through the pairs. You own
+getting data in and out of the external system (delta-since-timestamp, full
+dump + diff, whatever it supports), applied to the target tables with plain
+SQL; the map owns the transformation, both directions, and the loop safety
+of repeating it.
+
+```python
+db.rretl_map_define("""
+[map]
+name = "crm"
+[[map.table]]
+source = "customers"
+target = "crm_customers"       # auto-created at first sync if missing
+  [[map.table.column]]
+  source = "name"
+  target = "full_name"          # no pair = identity copy
+  [[map.table.column]]
+  source = "temp_c"
+  target = "temp_f"
+  pair = "celsius"              # a registered lens pair, both directions
+""")
+db.rretl_map_sync("crm")   # materializes; later calls sync BOTH ways
+```
+
+The rules, each a named refusal when broken:
+
+- **Repeating a sync is a no-op.** After every push the database records
+  both sides' hashes (`rretl_map_state`), so a change that arrived BY sync
+  never bounces back — no epochs, no origin flags, no loops, regardless of
+  how often or from where you call sync.
+- **Both sides moved since the last sync = a CONFLICT.** The sync aborts
+  whole (one transaction — the set moves together or not at all), the row is
+  named. Fix one side, re-sync.
+- Residual pairs work both ways WITHOUT stored residuals: the source still
+  exists, so `rex(source_value)` is computed live and the target edit comes
+  home through `inverse(edit, rex(x))`, PutRes-gated per row.
+- Lossy pairs flow forward only; a target-side edit to a lossy column is
+  refused by name. Rows created on the target side invert home only when
+  every mapped column is bijective (there is no residual to attach
+  otherwise), and never when the source identity is a hidden rowid.
+- Deletes propagate both ways; delete-vs-edit is a conflict.
+
 ---
 
 ## 5. The complete worked example (runnable as-is)
@@ -397,6 +443,9 @@ scale as its own apply with the full source as the residual).
 | `db.rretl_pack_in(name, data)` | archive id | splice a zip: members become rows in `rretl_archive_members` (queryable!), the residual keeps every other byte; reconstruction verified byte-identical BEFORE the ingest commits. zip64, encrypted and overlapping archives are refused by name |
 | `db.rretl_pack_out(archive_id)` | `bytes` | rebuild the zip byte-identically, hash-gated — a member row edited outside the pipeline is a named refusal (re-ingest instead of mutating) |
 | `db.rretl_archives()` | list of dicts | `archive_id, name, members, content_hash` |
+| `db.rretl_map_define(toml)` | `None` | store a table-SET map; sources, identities and pairs validated NOW |
+| `db.rretl_map_sync(name)` | dict of counts | both directions, one txn; echo-guarded repeats; conflicts abort whole, named |
+| `db.rretl_maps()` / `rretl_map_show(name)` / `rretl_map_drop(name)` | names / TOML / bool | manage stored maps |
 
 Everything raises `mpedb.Error` subclasses (`ProgrammingError` for refusals,
 `OperationalError` for engine trouble) with the engine's full message. These

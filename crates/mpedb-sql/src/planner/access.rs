@@ -197,29 +197,37 @@ pub(super) fn extract_access(
     let mut lo = None;
     let mut hi = None;
     if table.primary_key.len() > 1 && !unbounded(first_pk) {
-        // Equality on the first PK column of a multi-column PK when full
-        // pinning failed: inclusive point-range lo = hi.
+        // #55 phase 2: when full pinning failed, pin the LONGEST equality
+        // prefix of the PK (`map = $1 AND tbl = $2 …`), then let a range on
+        // the NEXT column extend the corresponding bound by one key part —
+        // instead of degrading everything past the first column to a
+        // residual filter over the whole prefix. That is the difference
+        // between O(hits) and O(prefix) per fetch, which is what rRETL's
+        // `pk_enc > $last` chunk resume lives on. The executor's
+        // prefix-successor construction gives the exact SQL semantics for
+        // every appended part (see `range_bounds`); the `unbounded` rule
+        // guards each pinned column, because its bound is keycode-encoded
+        // raw too.
         if let Some((i, _, atom)) = find(&consumed, first_pk, &[BinOp::Eq]) {
             consumed[i] = true;
-            let part = atom.to_key_part(consts)?;
-            let bound = KeyBound {
-                parts: vec![part],
-                inclusive: true,
-            };
+            let mut parts = vec![atom.to_key_part(consts)?];
+            let mut k = 1;
+            while k < table.primary_key.len() && !unbounded(table.primary_key[k]) {
+                match find(&consumed, table.primary_key[k], &[BinOp::Eq]) {
+                    Some((i, _, atom)) => {
+                        consumed[i] = true;
+                        parts.push(atom.to_key_part(consts)?);
+                        k += 1;
+                    }
+                    None => break,
+                }
+            }
+            let bound = KeyBound { parts, inclusive: true };
             lo = Some(bound.clone());
             hi = Some(bound);
-            // #55 phase 2: with the first column equality-pinned, a range on
-            // the SECOND PK column extends the corresponding bound by one
-            // key part instead of degrading to a residual filter over the
-            // whole prefix — the difference between O(hits) and O(prefix)
-            // per fetch, which is what rRETL's `pk_enc > $last` chunk resume
-            // lives on. The executor's prefix-successor construction gives
-            // the exact SQL semantics for the appended part (see
-            // `range_bounds`); the same `unbounded` rule guards the second
-            // column, because its bound is keycode-encoded raw too.
-            let second = table.primary_key[1];
-            if !unbounded(second) {
-                if let Some((i, op, atom)) = find(&consumed, second, &[BinOp::Gt, BinOp::Ge]) {
+            if k < table.primary_key.len() && !unbounded(table.primary_key[k]) {
+                let next = table.primary_key[k];
+                if let Some((i, op, atom)) = find(&consumed, next, &[BinOp::Gt, BinOp::Ge]) {
                     consumed[i] = true;
                     let mut b = lo.take().ok_or_else(|| {
                         Error::Internal("pk range lo vanished".into())
@@ -228,7 +236,7 @@ pub(super) fn extract_access(
                     b.inclusive = op == BinOp::Ge;
                     lo = Some(b);
                 }
-                if let Some((i, op, atom)) = find(&consumed, second, &[BinOp::Lt, BinOp::Le]) {
+                if let Some((i, op, atom)) = find(&consumed, next, &[BinOp::Lt, BinOp::Le]) {
                     consumed[i] = true;
                     let mut b = hi.take().ok_or_else(|| {
                         Error::Internal("pk range hi vanished".into())

@@ -40,6 +40,18 @@ use crate::{ExecResult, WriteSession};
 pub const T_LINEAGE: &str = "rretl_lineage";
 pub const T_RESIDUAL: &str = "rretl_residual";
 
+/// Every table name rRETL owns — refused as a transform or map target.
+pub(crate) fn rretl_bookkeeping_names() -> [&'static str; 6] {
+    [
+        T_LINEAGE,
+        T_RESIDUAL,
+        crate::rretl_store::T_VERSIONS,
+        crate::rretl_store::T_ARCHIVES,
+        crate::rretl_store::T_MEMBERS,
+        crate::rretl_map::T_MAP_STATE,
+    ]
+}
+
 /// Verification levels, as recorded in `rretl_lineage.verified` (§5: report what
 /// was verified, never a bare "verified"). Apply always runs `total`.
 const VERIFIED_TOTAL: i64 = 2;
@@ -58,7 +70,7 @@ const VERIFIED_TOTAL: i64 = 2;
 /// exercised without million-row fixtures.
 const RRETL_CHUNK_DEFAULT: usize = 4096;
 
-fn chunk_rows() -> usize {
+pub(crate) fn chunk_rows() -> usize {
     std::env::var("MPEDB_RRETL_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -137,9 +149,7 @@ impl crate::Database {
         // compilation or txn begin has refreshed the cached bundle, and a
         // stale read here would miss a table this very handle just created.
         self.engine.refresh_schema_if_stale()?;
-        if [T_LINEAGE, T_RESIDUAL, crate::rretl_store::T_VERSIONS, crate::rretl_store::T_ARCHIVES, crate::rretl_store::T_MEMBERS]
-            .contains(&table)
-        {
+        if rretl_bookkeeping_names().contains(&table) {
             return Err(Error::Unsupported(format!(
                 "`{table}` is rRETL bookkeeping; transforming it is refused"
             )));
@@ -161,23 +171,16 @@ impl crate::Database {
         // PutRes-gated like any other. Composite PKs stay a named refusal —
         // their chunk resume needs a tuple comparison the planner does not
         // have.
+        // #94's implicit rowid materializes IN the schema as a real column
+        // named `rowid` carrying the single-column PK — so the one-column
+        // branch covers it, and there is nothing special to detect here.
         let pk_col = if t.primary_key.len() == 1 {
             t.columns[t.primary_key[0] as usize].name.clone()
-        } else if t.primary_key.is_empty()
-            && t.implicit_rowid
-            && !t.columns.iter().any(|c| c.name.eq_ignore_ascii_case("rowid"))
-        {
-            "rowid".to_string()
-        } else if t.primary_key.len() > 1 {
+        } else {
             return Err(Error::Unsupported(format!(
                 "`{table}` has a {}-column primary key; rretl needs a single row \
                  identity — a one-column PK or an implicit rowid",
                 t.primary_key.len()
-            )));
-        } else {
-            return Err(Error::Unsupported(format!(
-                "`{table}` exposes no stable row identity rretl can key residuals on \
-                 (a declared column shadows `rowid`, or the table has no rowid)"
             )));
         };
         let col = t
@@ -231,7 +234,7 @@ impl crate::Database {
         }
     }
 
-    fn record_failed_run(&self, pair: &str, table: &str, column: &str, e: &Error) -> Result<()> {
+    pub(crate) fn record_failed_run(&self, pair: &str, table: &str, column: &str, e: &Error) -> Result<()> {
         let mut s = self.begin()?;
         let have = self.committed_tables()?;
         ensure_tables_from(&mut s, &have)?;

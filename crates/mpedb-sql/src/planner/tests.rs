@@ -630,3 +630,50 @@ fn second_pk_column_order_by_elides_under_a_pinned_first_column() {
     // A lone second-column ORDER BY with no predicate stays too.
     assert!(!order("SELECT * FROM orders ORDER BY item_no").is_empty());
 }
+
+/// The eq-prefix generalization: two pinned equalities + a range on the
+/// THIRD pk column all ride the bound (rretl_map_state's resume shape).
+#[test]
+fn a_three_column_pk_pins_two_equalities_and_ranges_the_third() {
+    use mpedb_types::{ColumnDef, TableDef};
+    let mk = |name: &str, ty: ColumnType| ColumnDef {
+        generated: None,
+        nullable: false,
+        ..col(name, ty)
+    };
+    let t = TableDef {
+        id: 0,
+        name: "st".into(),
+        columns: vec![
+            mk("m", ColumnType::Text),
+            mk("t", ColumnType::Text),
+            mk("k", ColumnType::Blob),
+            mk("v", ColumnType::Text),
+        ],
+        primary_key: vec![0, 1, 2],
+        indexes: vec![],
+        dead: false,
+        implicit_rowid: false,
+        kind: mpedb_types::TableKind::Standard,
+    };
+    let s = Schema::new(vec![t]).unwrap();
+    let p = prepare(
+        "SELECT k, v FROM st WHERE m = 'a' AND t = 'b' AND k > $1 ORDER BY k LIMIT 5",
+        &s,
+    )
+    .unwrap();
+    match &p.stmt {
+        PlanStmt::Select(SelectPlan { access, order_by, .. }) => {
+            match access {
+                AccessPath::PkRange { lo: Some(l), hi: Some(h) } => {
+                    assert_eq!(l.parts.len(), 3, "{l:?}");
+                    assert!(!l.inclusive);
+                    assert_eq!(h.parts.len(), 2, "{h:?}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(order_by.is_empty(), "third-column sort is scan order");
+        }
+        other => panic!("{other:?}"),
+    }
+}

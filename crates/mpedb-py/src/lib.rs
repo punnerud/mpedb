@@ -960,6 +960,53 @@ impl PyDatabase {
             .collect()
     }
 
+    /// Store (or replace) a table-SET map (stage 4, §13): source tables
+    /// mirrored into a different target shape through lens pairs, synced
+    /// both ways. The spec is validated NOW — sources, identities, pairs.
+    fn rretl_map_define(&self, py: Python<'_>, toml_text: &str) -> PyResult<()> {
+        self.refuse_if_txn_open("rretl_map_define", "Commit or roll back first.")?;
+        let db = &self.db;
+        py.detach(|| db.rretl_map_define(toml_text)).map_err(map_err)
+    }
+
+    /// Sync a map, BOTH directions, in one transaction. Repeating a sync is
+    /// a no-op (the state-hash echo guard); both sides moved = a named
+    /// conflict that aborts whole. Returns the per-direction counts.
+    fn rretl_map_sync(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("rretl_map_sync", "Commit or roll back first.")?;
+        let db = &self.db;
+        let r = py.detach(|| db.rretl_map_sync(name)).map_err(map_err)?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("run_id", r.run_id)?;
+        d.set_item("a_to_b", r.a_to_b)?;
+        d.set_item("b_to_a", r.b_to_a)?;
+        d.set_item("created_b", r.created_b)?;
+        d.set_item("created_a", r.created_a)?;
+        d.set_item("deleted_a", r.deleted_a)?;
+        d.set_item("deleted_b", r.deleted_b)?;
+        d.set_item("unchanged", r.unchanged)?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// Every stored map name.
+    fn rretl_maps(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let db = &self.db;
+        py.detach(|| db.rretl_maps()).map_err(map_err)
+    }
+
+    /// The stored mapping TOML, verbatim.
+    fn rretl_map_show(&self, py: Python<'_>, name: &str) -> PyResult<String> {
+        let db = &self.db;
+        py.detach(|| db.rretl_map_show(name)).map_err(map_err)
+    }
+
+    /// Drop a map (its sync state rows remain). True when it existed.
+    fn rretl_map_drop(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        self.refuse_if_txn_open("rretl_map_drop", "Commit or roll back first.")?;
+        let db = &self.db;
+        py.detach(|| db.rretl_map_drop(name)).map_err(map_err)
+    }
+
     /// Every rRETL run, oldest first, failed runs included, as dicts.
     fn rretl_log(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let db = &self.db;

@@ -265,7 +265,60 @@ def stage3(workdir):
     print("rretl stage 3: all assertions passed")
 
 
+def stage4(workdir):
+    """Table-SET maps (§13): mirror into another shape, edit both ways,
+    repeat syncs as no-ops, and get a named conflict when both sides move."""
+    dbpath = os.path.join(workdir, "map.mpedb")
+    cfg = os.path.join(workdir, "map.toml")
+    with open(cfg, "w") as f:
+        f.write(f'[database]\npath = "{dbpath}"\nsize_mb = 32\nmax_readers = 8\n'
+                'durability = "none"\n')
+    db = mpedb.Database(cfg)
+    db.query("CREATE TABLE src (id INTEGER PRIMARY KEY, v ANY)")
+    with db.begin() as tx:
+        tx.query("INSERT INTO src (id, v) VALUES (1, -4), (2, 9)", [])
+    db.define_function("def mag(x):\n    if x < 0:\n        return 0 - x\n    return x\n")
+    db.define_function("def sgn(x):\n    if x < 0:\n        return 1\n    return 0\n")
+    db.define_function("def unmag(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n")
+    db.create_residual_lens("mag", "mag", "sgn", "unmag", "int64")
+
+    db.rretl_map_define(
+        '[map]\nname = "m"\n[[map.table]]\nsource = "src"\ntarget = "ext"\n'
+        '  [[map.table.column]]\n  source = "v"\n  target = "absv"\n  pair = "mag"\n'
+    )
+    assert db.rretl_maps() == ["m"]
+    r = db.rretl_map_sync("m")
+    assert r["created_b"] == 2, r
+    rows = db.query("SELECT absv FROM ext ORDER BY id")
+    assert [x[0] for x in rows] == [4, 9], rows
+
+    # Echo guard: a repeated sync moves nothing.
+    r = db.rretl_map_sync("m")
+    assert r["unchanged"] == 2 and r["a_to_b"] == 0 and r["b_to_a"] == 0, r
+
+    # Edit the target's magnitude; the sign comes home via the LIVE rex.
+    with db.begin() as tx:
+        tx.query("UPDATE ext SET absv = 7 WHERE id = 1", [])
+    r = db.rretl_map_sync("m")
+    assert r["b_to_a"] == 1, r
+    rows = db.query("SELECT v FROM src ORDER BY id")
+    assert [x[0] for x in rows] == [-7, 9], rows
+
+    # Both sides move: named conflict, rolled back whole.
+    with db.begin() as tx:
+        tx.query("UPDATE src SET v = 100 WHERE id = 2", [])
+        tx.query("UPDATE ext SET absv = 55 WHERE id = 2", [])
+    try:
+        db.rretl_map_sync("m")
+        raise AssertionError("both-sides-moved must conflict")
+    except mpedb.Error as e:
+        assert "CONFLICT" in str(e), e
+
+    print("rretl stage 4: all assertions passed")
+
+
 if __name__ == "__main__":
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-etl-")
     main(workdir)
     stage3(workdir)
+    stage4(workdir)

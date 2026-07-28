@@ -111,6 +111,16 @@ usage: mpedb <command> [args]
                                            BEFORE the ingest commits
   rretl pack-out <target> <id> <out>         rebuild the zip, hash-gated
   rretl archives <target>                    list spliced archives
+  rretl map define <target> <map.toml>       store a table-SET map: source
+                                           tables mirrored into a different
+                                           target shape through lens pairs
+                                           (design/DESIGN-RRETL.md §13)
+  rretl map sync <target> <name>             sync BOTH directions in one txn:
+                                           edits flow through the pairs,
+                                           repeating is a no-op (state-hash
+                                           echo guard), both-sides-moved is
+                                           a named CONFLICT that aborts whole
+  rretl map show|list|drop <target> [name]   manage stored maps
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
   tune set <target> name=value | show      stored engine switches (ndv_discount,
@@ -724,6 +734,56 @@ fn cmd_rretl(args: &[String]) -> CliResult {
             std::fs::write(out, &bytes)
                 .map_err(|e| Failure::Runtime(format!("cannot write `{out}`: {e}")))?;
             println!("rretl pack-out: archive {id} → {out} ({} bytes, hash-verified)", bytes.len());
+            Ok(())
+        }
+        [m, sub, config, file] if m == "map" && sub == "define" => {
+            let toml_text = std::fs::read_to_string(file)
+                .map_err(|e| Failure::Runtime(format!("cannot read `{file}`: {e}")))?;
+            let db = crate::util::open_target(config)?;
+            db.rretl_map_define(&toml_text)?;
+            println!("rretl map defined (sources, identities and pairs all validated)");
+            Ok(())
+        }
+        [m, sub, config, name] if m == "map" && sub == "sync" => {
+            let db = crate::util::open_target(config)?;
+            let r = db.rretl_map_sync(name)?;
+            println!(
+                "rretl map `{name}` synced (run {}): a→b {}, b→a {}, +b {}, +a {}, \
+                 -a {}, -b {}, clean {}",
+                r.run_id,
+                r.a_to_b,
+                r.b_to_a,
+                r.created_b,
+                r.created_a,
+                r.deleted_a,
+                r.deleted_b,
+                r.unchanged
+            );
+            Ok(())
+        }
+        [m, sub, config, name] if m == "map" && sub == "show" => {
+            let db = crate::util::open_target(config)?;
+            print!("{}", db.rretl_map_show(name)?);
+            Ok(())
+        }
+        [m, sub, config, name] if m == "map" && sub == "drop" => {
+            let db = crate::util::open_target(config)?;
+            if db.rretl_map_drop(name)? {
+                println!("rretl map `{name}` dropped (its sync state rows remain)");
+            } else {
+                println!("no rretl map named `{name}`");
+            }
+            Ok(())
+        }
+        [m, sub, config] if m == "map" && sub == "list" => {
+            let db = crate::util::open_target(config)?;
+            let maps = db.rretl_maps()?;
+            if maps.is_empty() {
+                println!("no rretl maps");
+            }
+            for m in maps {
+                println!("{m}");
+            }
             Ok(())
         }
         [sub, config] if sub == "archives" => {

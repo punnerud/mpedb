@@ -797,3 +797,108 @@ these are the residual risks each stage-2 test must discharge:
    the proof, not the argument.
 8. **The suites moved.** Same as stage 1: nothing here touches the SQL surface;
    corpus/Django/CPython numbers must not move.
+
+## 13. Stage 4 — table-SET maps: migration mirrored both ways **[BUILT 2026-07-29]**
+
+The migration/sync shape: table set A (this system's schema) is mirrored
+into table set B (another system's schema — renamed tables, renamed columns,
+converted values), and edits on EITHER side flow to the other through the
+registered lens pairs. The division of labour is deliberate: getting data
+in and out of the EXTERNAL system (delta-since-timestamp with overlap, full
+dump + diff — whatever that system supports) is the caller's logic, applied
+to table set B with plain SQL; **rRETL owns the transformation between the
+sets, in both directions, and the loop safety of repeating it.**
+
+### 13.1 The insight that collapses the design: both sides exist
+
+`rretl apply` destroys its source, which is why it must store residuals and
+verify totally before commit. A map does NOT: A stays. So for a residual
+pair the residual never needs storing — at sync time, `rex(x_current)` IS
+the residual, computed live from the A side, and the B→A direction is
+exactly putback with a live residual:
+
+```
+A→B:  y  = forward(x)                          (per mapped column)
+B→A:  x' = inverse(y', rex(x))                 (x = A's current value)
+      gated per row by PutRes, both halves:
+      forward(x') == y'  ∧  rex(x') == rex(x)
+```
+
+Class rules follow: `bijective` flows both ways anywhere; `residual` flows
+both ways wherever the A row exists (a row CREATED on the B side has no x to
+rex — the §4 creation-path refusal, named); `lossy` is forward-only — a
+B-side edit to a lossy-mapped column is refused by name, because nothing can
+say what it means on the A side.
+
+### 13.2 Loop safety and conflicts: the state table is the third copy
+
+```
+rretl_map_state (map TEXT, tbl TEXT, pk_enc BLOB)
+              → a_hash TEXT, b_hash TEXT, ts_micros INTEGER
+```
+
+(rigid types from specs, like every bookkeeping table; `tbl` is the TARGET
+table name, unique per map entry; hashes are length-framed CanonChains over
+the mapped columns in mapping order.) After every successful push, BOTH
+sides' current hashes are recorded. `map sync` then classifies each row by
+two bits — (A moved since last sync, B moved since last sync):
+
+- (false, false): skip. **This is the echo guard**: a change that arrived BY
+  sync leaves both recorded hashes current, so the next sync — either
+  direction, any schedule — sees a clean row and does nothing. No epochs, no
+  origin tags, no loop.
+- (true, false): push A→B (forward per column; lossy allowed).
+- (false, true): push B→A (inverse per column; PutRes per row; lossy column
+  moved = named refusal).
+- (true, true): CONFLICT. The sync ABORTS whole (one txn — the SET moves
+  together or not at all), naming the first conflicting (table, pk) and the
+  total count. v1 has no resolution flags: fix a side, re-sync. (Mirror's
+  conflicts/resolve vocabulary is the eventual home if policy is wanted.)
+
+Creations and deletions ride the same two bits with absence as a state:
+new in A → forward-insert into B; new in B → inverse-insert into A only if
+every mapped column is bijective (else the creation-path refusal); deleted
+in A with B clean → delete B (and vice versa); deleted on one side while
+the OTHER side moved → conflict; deleted on both → state row cleared. First
+sync against an empty B is just "every row is new in A" — materialization
+and sync are one verb.
+
+### 13.3 The map record
+
+`map/<name>` in the sys keyspace (bounded, like lens records — #124 is
+about unbounded logs): one version byte, then the mapping TOML verbatim.
+Text-as-format with a version-byte dispatch is the same eternity stance as
+the envelope; validation happens on every load, hard.
+
+```toml
+[map]
+name = "crm"
+
+[[map.table]]
+source = "customers"          # must exist, single-col PK or implicit rowid
+target = "crm_customers"      # auto-created at first sync if missing:
+                              # key column copies the source type, mapped
+                              # value columns are ANY
+  [[map.table.column]]
+  source = "name"
+  target = "full_name"        # no pair = identity copy
+  [[map.table.column]]
+  source = "temp_c"
+  target = "temp_f"
+  pair = "celsius"            # a registered lens pair, resolved and
+                              # health-checked at every sync
+```
+
+Row identity maps VERBATIM: the source row's PK (or rowid) value is the
+target row's key. Every sync is one lineage row (`lens = map:<name>`,
+outcome `mapped`, rows = pushed count) — never `applied`, so revert and
+stacking ignore maps entirely.
+
+### 13.4 What v1 refuses, by name
+
+Composite source PKs (same rule as apply); a target table whose shape does
+not match the mapping; a pair that fails its health check; B-side inserts
+into non-bijective mappings; B-side edits to lossy columns; conflicts. The
+external system's clock skew, delta overlap and dump-diff strategies are
+the CALLER's, on purpose — they act on table set B with ordinary SQL, and
+the map keeps A honest.
