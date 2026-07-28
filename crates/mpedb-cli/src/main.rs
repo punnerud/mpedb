@@ -140,6 +140,19 @@ usage: mpedb <command> [args]
   rretl map status <target> <name>           round, runner, live lease, and
                                            which tables are mid-round
   rretl map show|list|drop <target> [name]   manage stored maps
+  ingest define <target> <source.toml>     declare an external source: the CALL
+                                           GRAPH, the budget vector and the
+                                           conflict policy (DESIGN-INGEST.md)
+  ingest show|list|drop <target> [name]    manage declared sources
+  ingest state <target> <source>           per edge: watermark, CURSOR VERDICT
+                                           (safe/unsafe — a dump verifies it and
+                                           names it when it lies), change rate
+  ingest advise <target> <source>          the plan: which call, how often, in
+         [--emit-cron] [--cmd <script>]    which profile — plus what it could
+                                           NOT plan and why
+  ingest conflicts <target> <source>       what the policy would not decide;
+                                           exit 1 when non-empty (cron mails it)
+  ingest resolve <target> <source> --take local   clear them, having decided
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
   tune set <target> name=value | show      stored engine switches (ndv_discount,
@@ -247,6 +260,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "fn" => cmd_fn(rest),
         "lens" => cmd_lens(rest),
         "rretl" => cmd_rretl(rest),
+        "ingest" => cmd_ingest(rest),
         "op" => cmd_op(rest),
         "tune" => cmd_tune(rest),
         "trigger" => cmd_trigger(rest),
@@ -1249,5 +1263,116 @@ fn cmd_call(args: &[String]) -> CliResult {
              prepare it first: mpedb prepare <config.toml> '<SQL>'"
         ))),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// `mpedb ingest …` — declare an external source, see what the receipts
+/// learned about it, and get the plan. The FETCHING is the user's code;
+/// mpedb plans, receives and verifies.
+fn cmd_ingest(args: &[String]) -> CliResult {
+    match args {
+        [sub, config, file] if sub == "define" => {
+            let toml_text = std::fs::read_to_string(file)
+                .map_err(|e| Failure::Runtime(format!("cannot read `{file}`: {e}")))?;
+            let db = crate::util::open_target(config)?;
+            db.ingest_define(&toml_text)?;
+            println!("ingest source defined (tables, edges, parents and budgets all validated)");
+            Ok(())
+        }
+        [sub, config, name] if sub == "show" => {
+            let db = crate::util::open_target(config)?;
+            print!("{}", db.ingest_show(name)?);
+            Ok(())
+        }
+        [sub, config] if sub == "list" => {
+            let db = crate::util::open_target(config)?;
+            let names = db.ingest_sources()?;
+            if names.is_empty() {
+                println!("no ingest sources");
+            }
+            for n in names {
+                println!("{n}");
+            }
+            Ok(())
+        }
+        [sub, config, name] if sub == "drop" => {
+            let db = crate::util::open_target(config)?;
+            if db.ingest_drop(name)? {
+                println!("ingest source `{name}` dropped, with its observations");
+            } else {
+                println!("no ingest source `{name}`");
+            }
+            Ok(())
+        }
+        [sub, config, name] if sub == "state" => {
+            let db = crate::util::open_target(config)?;
+            for (edge, st, overlap) in db.ingest_state(name)? {
+                println!(
+                    "{edge:<20} cursor {:<8} {:<7} caught {:<5} missed {:<5} receipts {}/{} \
+                     fan-out {:.1} overlap {overlap}s",
+                    if st.cursor_col.is_empty() { "-" } else { &st.cursor_col },
+                    st.cursor_state,
+                    st.caught,
+                    st.missed,
+                    st.changed_receipts,
+                    st.receipts,
+                    st.fanout_per_call(),
+                );
+                if st.missed > 0 {
+                    println!(
+                        "  ^ that cursor would have LOST {} changed row(s) — the dump is \
+                         carrying this table",
+                        st.missed
+                    );
+                }
+            }
+            Ok(())
+        }
+        [sub, config, name, rest @ ..] if sub == "advise" => {
+            let emit = rest.iter().any(|a| a == "--emit-cron");
+            let flags: Vec<String> =
+                rest.iter().filter(|a| *a != "--emit-cron").cloned().collect();
+            let p = crate::args::parse(&flags, &["cmd"], &[])?;
+            let db = crate::util::open_target(config)?;
+            let plan = db.ingest_advise(name)?;
+            if emit {
+                for line in plan.cron(p.value("cmd").unwrap_or("./fetch.py")) {
+                    println!("{line}");
+                }
+            } else {
+                for line in mpedb::ingest_plan::render(&plan) {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        [sub, config, name] if sub == "conflicts" => {
+            let db = crate::util::open_target(config)?;
+            let cs = db.ingest_conflicts(name)?;
+            for c in &cs {
+                println!("{:<16} {:?}  {}  {}", c.table, c.key, c.kind, c.detail);
+            }
+            if cs.is_empty() {
+                println!("no ingest conflicts");
+                return Ok(());
+            }
+            Err(Failure::Runtime(format!(
+                "ingest `{name}`: {} unresolved conflict(s) — the policy would not decide them",
+                cs.len()
+            )))
+        }
+        [sub, config, name, rest @ ..] if sub == "resolve" => {
+            let p = crate::args::parse(rest, &["take"], &[])?;
+            let db = crate::util::open_target(config)?;
+            let n = db.ingest_resolve(name, p.require("take")?)?;
+            println!("ingest `{name}`: {n} conflict(s) cleared");
+            Ok(())
+        }
+        _ => usage(
+            "ingest needs: define <target> <source.toml> | show|drop <target> <name> \
+             | list <target> | state <target> <source> \
+             | advise <target> <source> [--emit-cron] [--cmd <script>] \
+             | conflicts <target> <source> | resolve <target> <source> --take local",
+        ),
     }
 }

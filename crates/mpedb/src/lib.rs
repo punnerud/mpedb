@@ -69,6 +69,7 @@ pub mod rretl;
 pub mod rretl_codec;
 pub mod rretl_store;
 pub mod ingest;
+pub mod ingest_plan;
 pub mod ingest_run;
 pub mod rretl_map;
 pub mod rretl_map_run;

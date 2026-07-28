@@ -14,6 +14,9 @@
 //!   `Database.prepare` / `Database.verify` / an uncached `Database.query`
 //!   while a `Transaction` from the same handle is open on the same thread.
 
+mod pyingest;
+mod pyrretl;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -92,7 +95,7 @@ fn closed_err() -> PyErr {
 
 /// Python -> Value. Checked in order; `bool` MUST precede `int` because
 /// Python's bool is a subclass of int.
-fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+pub(crate) fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         return Ok(Value::Null);
     }
@@ -141,7 +144,7 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 
 /// Value -> Python. Timestamps come back as timezone-aware
 /// `datetime.datetime` in UTC.
-fn value_to_py<'py>(py: Python<'py>, v: Value) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn value_to_py<'py>(py: Python<'py>, v: Value) -> PyResult<Bound<'py, PyAny>> {
     match v {
         Value::Null => Ok(py.None().into_bound(py)),
         Value::Int(x) => x.into_bound_py_any(py),
@@ -833,223 +836,60 @@ impl PyDatabase {
             .collect()
     }
 
-    /// Transform `table.column` IN PLACE with a registered pair, in ONE
-    /// transaction: per-row residuals are kept in `rretl_residual`, the run in
-    /// `rretl_lineage`, and 100% of rows verify against the source hash BEFORE
-    /// the commit that destroys the source. Returns
-    /// `{"run_id", "rows", "residuals"}`.
-    fn rretl_apply(
-        &self,
-        py: Python<'_>,
-        pair: &str,
-        table: &str,
-        column: &str,
-    ) -> PyResult<Py<PyAny>> {
-        self.refuse_if_txn_open("rretl_apply", "Commit or roll back first.")?;
-        let db = &self.db;
-        let r = py.detach(|| db.rretl_apply(pair, table, column)).map_err(map_err)?;
-        rretl_report_to_py(py, r)
-    }
+    // ------------------------------------------------------------- rRETL
+    // Bodies live in `pyrretl.rs` (the house's 2000-line rule); pyo3
+    // allows one `#[pymethods]` block per type, so these delegate.
 
-    /// Undo run `run_id` EXACTLY. Hash-gated: refused if the column changed
-    /// outside the pipeline — for a column you have edited, use
-    /// `rretl_putback`, which exists for exactly that.
+    fn rretl_apply(&self, py: Python<'_>, pair: &str, table: &str, column: &str) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("rretl_apply", "Commit or roll back first.")?;
+        pyrretl::rretl_apply(&self.db, py, pair, table, column)
+    }
     fn rretl_revert(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
         self.refuse_if_txn_open("rretl_revert", "Commit or roll back first.")?;
-        let db = &self.db;
-        let r = py.detach(|| db.rretl_revert(run_id)).map_err(map_err)?;
-        rretl_report_to_py(py, r)
+        pyrretl::rretl_revert(&self.db, py, run_id)
     }
-
-    /// Invert run `run_id` while KEEPING edits made to the transformed
-    /// column — the lens putback. Edited values flow back through
-    /// `inverse(edited, residual)`; deleted rows stay deleted; every row is
-    /// PutRes-verified (`forward(x') == y'`, `rex(x') == r`) before commit.
     fn rretl_putback(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
         self.refuse_if_txn_open("rretl_putback", "Commit or roll back first.")?;
-        let db = &self.db;
-        let r = py.detach(|| db.rretl_putback(run_id)).map_err(map_err)?;
-        rretl_report_to_py(py, r)
+        pyrretl::rretl_putback(&self.db, py, run_id)
     }
-
-    /// Verify-at-rest: re-check every standing run (top-run hash, residual
-    /// coverage, pair loadability). Returns a list of finding strings —
-    /// empty means clean. Reports, never repairs.
     fn rretl_fsck(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        let db = &self.db;
-        py.detach(|| db.rretl_fsck()).map_err(map_err)
+        pyrretl::rretl_fsck(&self.db, py)
     }
-
-    /// Store `data` as the next VERSION of `obj` (stage 3): the new version
-    /// is kept full, the previous newest is rewritten as a reverse delta —
-    /// verified byte-identical, as persisted, before the commit — and every
-    /// 8th version stays full forever. Returns the version number.
     fn rretl_put_version(&self, py: Python<'_>, obj: &str, data: &[u8]) -> PyResult<i64> {
         self.refuse_if_txn_open("rretl_put_version", "Commit or roll back first.")?;
-        let db = &self.db;
-        py.detach(|| db.rretl_put_version(obj, data)).map_err(map_err)
+        pyrretl::rretl_put_version(&self.db, py, obj, data)
     }
-
-    /// Materialize version `ver` of `obj` as bytes. Every reconstruction
-    /// step is hash-verified; corruption is a named error, never wrong bytes.
     fn rretl_get_version(&self, py: Python<'_>, obj: &str, ver: i64) -> PyResult<Py<PyAny>> {
-        let db = &self.db;
-        let bytes = py.detach(|| db.rretl_get_version(obj, ver)).map_err(map_err)?;
-        Ok(pyo3::types::PyBytes::new(py, &bytes).into_any().unbind())
+        pyrretl::rretl_get_version(&self.db, py, obj, ver)
     }
-
-    /// Every version of `obj`, oldest first, as dicts:
-    /// `{"ver", "stored_as", "bytes", "content_hash"}`.
     fn rretl_versions(&self, py: Python<'_>, obj: &str) -> PyResult<Vec<Py<PyAny>>> {
-        let db = &self.db;
-        let vers = py.detach(|| db.rretl_versions(obj)).map_err(map_err)?;
-        vers.into_iter()
-            .map(|v| {
-                let d = pyo3::types::PyDict::new(py);
-                d.set_item("ver", v.ver)?;
-                d.set_item("stored_as", v.stored_as)?;
-                d.set_item("bytes", v.bytes)?;
-                d.set_item("content_hash", v.content_hash)?;
-                Ok(d.into_any().unbind())
-            })
-            .collect()
+        pyrretl::rretl_versions(&self.db, py, obj)
     }
-
-    /// Delete the OLDEST versions of `obj`, keeping the newest `keep` —
-    /// chain-safe by construction (deltas base upward), recorded as lineage
-    /// outcome `pruned`. Returns how many were deleted; `keep = 0` refused.
     fn rretl_prune_versions(&self, py: Python<'_>, obj: &str, keep: u64) -> PyResult<u64> {
         self.refuse_if_txn_open("rretl_prune_versions", "Commit or roll back first.")?;
-        let db = &self.db;
-        py.detach(|| db.rretl_prune_versions(obj, keep)).map_err(map_err)
+        pyrretl::rretl_prune_versions(&self.db, py, obj, keep)
     }
-
-    /// Splice a zip archive into the database: members become rows in
-    /// `rretl_archive_members`, the residual keeps every non-data byte, and
-    /// the reconstruction is verified byte-identical BEFORE the ingest
-    /// commits. Returns the archive id.
     fn rretl_pack_in(&self, py: Python<'_>, name: &str, data: &[u8]) -> PyResult<i64> {
         self.refuse_if_txn_open("rretl_pack_in", "Commit or roll back first.")?;
-        let db = &self.db;
-        py.detach(|| db.rretl_pack_in(name, data)).map_err(map_err)
+        pyrretl::rretl_pack_in(&self.db, py, name, data)
     }
-
-    /// Rebuild archive `archive_id` byte-identically, hash-gated against the
-    /// original: a member row changed outside the pipeline is a named error.
     fn rretl_pack_out(&self, py: Python<'_>, archive_id: i64) -> PyResult<Py<PyAny>> {
-        let db = &self.db;
-        let bytes = py.detach(|| db.rretl_pack_out(archive_id)).map_err(map_err)?;
-        Ok(pyo3::types::PyBytes::new(py, &bytes).into_any().unbind())
+        pyrretl::rretl_pack_out(&self.db, py, archive_id)
     }
-
-    /// Every spliced archive, oldest first, as dicts:
-    /// `{"archive_id", "name", "members", "content_hash"}`.
     fn rretl_archives(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
-        let db = &self.db;
-        let arches = py.detach(|| db.rretl_archives()).map_err(map_err)?;
-        arches
-            .into_iter()
-            .map(|a| {
-                let d = pyo3::types::PyDict::new(py);
-                d.set_item("archive_id", a.archive_id)?;
-                d.set_item("name", a.name)?;
-                d.set_item("members", a.members)?;
-                d.set_item("content_hash", a.content_hash)?;
-                Ok(d.into_any().unbind())
-            })
-            .collect()
+        pyrretl::rretl_archives(&self.db, py)
     }
-
-    /// Store (or replace) a table-SET map (stage 4, §13): source tables
-    /// mirrored into a different target shape through lens pairs, synced
-    /// both ways. Takes either the mapping TOML as a string, or — the
-    /// Python-native form — a dict:
-    ///
-    /// ```python
-    /// db.rretl_map_define({
-    ///     "name": "crm",
-    ///     "tables": [{
-    ///         "source": "customers",
-    ///         "target": "crm_customers",       # "target_key" optional
-    ///         "columns": [
-    ///             {"source": "name",   "target": "full_name"},
-    ///             {"source": "temp_c", "target": "temp_f", "pair": "celsius"},
-    ///         ],
-    ///     }],
-    /// })
-    /// ```
-    ///
-    /// Both forms store the same canonical record; the spec is validated
-    /// NOW — sources, identities, pairs.
     fn rretl_map_define(&self, py: Python<'_>, spec: &Bound<'_, PyAny>) -> PyResult<()> {
         self.refuse_if_txn_open("rretl_map_define", "Commit or roll back first.")?;
-        if let Ok(text) = spec.extract::<String>() {
-            let db = &self.db;
-            return py.detach(|| db.rretl_map_define(&text)).map_err(map_err);
-        }
-        let ms = map_spec_from_py(spec)?;
-        let db = &self.db;
-        py.detach(|| db.rretl_map_define_spec(&ms)).map_err(map_err)
+        pyrretl::rretl_map_define(&self.db, py, spec)
     }
-
-    /// Sync a map, BOTH directions, in one transaction. Repeating a sync is
-    /// a no-op (the state-hash echo guard); both sides moved = a named
-    /// conflict that aborts whole. Returns the per-direction counts.
     fn rretl_map_sync(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         self.refuse_if_txn_open("rretl_map_sync", "Commit or roll back first.")?;
-        let db = &self.db;
-        let r = py.detach(|| db.rretl_map_sync(name)).map_err(map_err)?;
-        let d = pyo3::types::PyDict::new(py);
-        d.set_item("run_id", r.run_id)?;
-        d.set_item("a_to_b", r.a_to_b)?;
-        d.set_item("b_to_a", r.b_to_a)?;
-        d.set_item("created_b", r.created_b)?;
-        d.set_item("created_a", r.created_a)?;
-        d.set_item("deleted_a", r.deleted_a)?;
-        d.set_item("deleted_b", r.deleted_b)?;
-        d.set_item("unchanged", r.unchanged)?;
-        Ok(d.into_any().unbind())
+        pyrretl::rretl_map_sync(&self.db, py, name)
     }
-
-    /// Read-only dry run of a map sync: one dict per table pair with the
-    /// would-move counts, EVERY named conflict (a sync aborts on the
-    /// first), and `diverged` — rows whose state says both sides are clean
-    /// while forward(source) != target, the silent breach the echo guard
-    /// cannot see. `clean` on the report level = nothing to do, nothing
-    /// wrong.
     fn rretl_map_check(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
-        let db = &self.db;
-        let r = py.detach(|| db.rretl_map_check(name)).map_err(map_err)?;
-        let top = pyo3::types::PyDict::new(py);
-        top.set_item("clean", r.is_clean())?;
-        top.set_item("pending_total", r.pending_total())?;
-        let tables = pyo3::types::PyList::empty(py);
-        for t in &r.tables {
-            let d = pyo3::types::PyDict::new(py);
-            d.set_item("source", &t.src)?;
-            d.set_item("target", &t.dst)?;
-            d.set_item("pending_a2b", t.pending_a2b)?;
-            d.set_item("pending_b2a", t.pending_b2a)?;
-            d.set_item("would_create_b", t.would_create_b)?;
-            d.set_item("would_create_a", t.would_create_a)?;
-            d.set_item("would_delete_a", t.would_delete_a)?;
-            d.set_item("would_delete_b", t.would_delete_b)?;
-            d.set_item("would_adopt", t.would_adopt)?;
-            d.set_item("unchanged", t.unchanged)?;
-            d.set_item("orphan_state", t.orphan_state)?;
-            d.set_item("conflicts", t.conflicts.clone())?;
-            d.set_item("diverged", t.diverged.clone())?;
-            tables.append(d)?;
-        }
-        top.set_item("tables", tables)?;
-        Ok(top.into_any().unbind())
+        pyrretl::rretl_map_check(&self.db, py, name)
     }
-
-    /// One bounded, resumable pass of the map daemon (#53) — the cron
-    /// form. Commits as it goes, so a run that hits its budget has still
-    /// moved what it moved and the NEXT run resumes from the cursor;
-    /// every commit advances the whole set (a chunk from each table).
-    /// Conflicts are counted and skipped, never fatal. Returns a dict.
     #[pyo3(signature = (name, max_secs=None, max_rows=None, runner=None, lease_secs=None))]
     fn rretl_map_run(
         &self,
@@ -1061,85 +901,112 @@ impl PyDatabase {
         lease_secs: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
         self.refuse_if_txn_open("rretl_map_run", "Commit or roll back first.")?;
-        let opts = mpedb::rretl_map_run::RunOptions { max_secs, max_rows, runner, lease_secs };
-        let db = &self.db;
-        let r = py.detach(|| db.rretl_map_run(name, &opts)).map_err(map_err)?;
-        let d = pyo3::types::PyDict::new(py);
-        d.set_item("round", r.round)?;
-        d.set_item("rows", r.rows)?;
-        d.set_item("commits", r.commits)?;
-        d.set_item("conflicts", r.conflicts)?;
-        d.set_item("conflict_notes", r.conflict_notes.clone())?;
-        d.set_item(
-            "stopped_by",
-            match r.stopped_by {
-                Some(mpedb::rretl_map_run::RunStop::RoundComplete) => "round_complete",
-                Some(mpedb::rretl_map_run::RunStop::Budget) => "budget",
-                None => "nothing",
-            },
-        )?;
-        d.set_item("round_complete",
-            r.stopped_by == Some(mpedb::rretl_map_run::RunStop::RoundComplete))?;
-        d.set_item("a_to_b", r.moved.a_to_b)?;
-        d.set_item("b_to_a", r.moved.b_to_a)?;
-        d.set_item("created_b", r.moved.created_b)?;
-        d.set_item("created_a", r.moved.created_a)?;
-        d.set_item("deleted_a", r.moved.deleted_a)?;
-        d.set_item("deleted_b", r.moved.deleted_b)?;
-        d.set_item("unchanged", r.moved.unchanged)?;
-        d.set_item("note", r.note())?;
-        Ok(d.into_any().unbind())
+        pyrretl::rretl_map_run(&self.db, py, name, max_secs, max_rows, runner, lease_secs)
     }
-
-    /// Restrict which runner may `rretl_map_run` this map (empty string
-    /// clears it). A guard against mistakes — a laptop picking up the
-    /// cron job — and NOT an auth boundary: anything that can write the
-    /// file can claim any runner name.
     fn rretl_map_set_runner(&self, py: Python<'_>, name: &str, runner: &str) -> PyResult<()> {
         self.refuse_if_txn_open("rretl_map_set_runner", "Commit or roll back first.")?;
-        let db = &self.db;
-        py.detach(|| db.rretl_map_set_runner(name, runner)).map_err(map_err)
+        pyrretl::rretl_map_set_runner(&self.db, py, name, runner)
     }
-
-    /// The map's daemon status: runner, round, live lease, and which
-    /// tables are mid-round.
     fn rretl_map_status(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
-        let db = &self.db;
-        let st = py.detach(|| db.rretl_map_status(name)).map_err(map_err)?;
-        let d = pyo3::types::PyDict::new(py);
-        d.set_item("runner", &st.runner)?;
-        d.set_item("round", st.round)?;
-        d.set_item("lease_owner", &st.lease_owner)?;
-        d.set_item("lease_until", st.lease_until)?;
-        d.set_item("note", &st.note)?;
-        let ip = pyo3::types::PyList::empty(py);
-        for (tbl, phase) in &st.in_progress {
-            let e = pyo3::types::PyDict::new(py);
-            e.set_item("table", tbl)?;
-            e.set_item("pass", phase)?;
-            ip.append(e)?;
-        }
-        d.set_item("in_progress", ip)?;
-        Ok(d.into_any().unbind())
+        pyrretl::rretl_map_status(&self.db, py, name)
     }
-
-    /// Every stored map name.
     fn rretl_maps(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        let db = &self.db;
-        py.detach(|| db.rretl_maps()).map_err(map_err)
+        pyrretl::rretl_maps(&self.db, py)
     }
-
-    /// The stored mapping TOML, verbatim.
     fn rretl_map_show(&self, py: Python<'_>, name: &str) -> PyResult<String> {
-        let db = &self.db;
-        py.detach(|| db.rretl_map_show(name)).map_err(map_err)
+        pyrretl::rretl_map_show(&self.db, py, name)
     }
-
-    /// Drop a map (its sync state rows remain). True when it existed.
     fn rretl_map_drop(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
         self.refuse_if_txn_open("rretl_map_drop", "Commit or roll back first.")?;
-        let db = &self.db;
-        py.detach(|| db.rretl_map_drop(name)).map_err(map_err)
+        pyrretl::rretl_map_drop(&self.db, py, name)
+    }
+    // ------------------------------------------------------------ ingest
+    // Bodies in `pyingest.rs`; see the rRETL note above for why.
+
+    fn ingest_define(&self, py: Python<'_>, spec: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.refuse_if_txn_open("ingest_define", "Commit or roll back first.")?;
+        pyingest::ingest_define(&self.db, py, spec)
+    }
+    fn ingest_sources(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        pyingest::ingest_sources(&self.db, py)
+    }
+    fn ingest_show(&self, py: Python<'_>, name: &str) -> PyResult<String> {
+        pyingest::ingest_show(&self.db, py, name)
+    }
+    fn ingest_drop(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        self.refuse_if_txn_open("ingest_drop", "Commit or roll back first.")?;
+        pyingest::ingest_drop(&self.db, py, name)
+    }
+    #[pyo3(signature = (source, target, mode="delta"))]
+    fn ingest_begin(&self, py: Python<'_>, source: &str, target: &str, mode: &str) -> PyResult<i64> {
+        self.refuse_if_txn_open("ingest_begin", "Commit or roll back first.")?;
+        pyingest::ingest_begin(&self.db, py, source, target, mode)
+    }
+    #[pyo3(signature = (run_id, rows, columns=None, calls=1, bytes=0))]
+    fn ingest_rows(
+        &self,
+        py: Python<'_>,
+        run_id: i64,
+        rows: &Bound<'_, PyAny>,
+        columns: Option<Vec<String>>,
+        calls: i64,
+        bytes: i64,
+    ) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("ingest_rows", "Commit or roll back first.")?;
+        pyingest::ingest_rows(&self.db, py, run_id, rows, columns, calls, bytes)
+    }
+    fn ingest_finish(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("ingest_finish", "Commit or roll back first.")?;
+        pyingest::ingest_finish(&self.db, py, run_id)
+    }
+    fn ingest_abandon(&self, py: Python<'_>, run_id: i64) -> PyResult<()> {
+        self.refuse_if_txn_open("ingest_abandon", "Commit or roll back first.")?;
+        pyingest::ingest_abandon(&self.db, py, run_id)
+    }
+    #[pyo3(signature = (source, target, rows, columns=None, calls=1, bytes=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_dump(
+        &self,
+        py: Python<'_>,
+        source: &str,
+        target: &str,
+        rows: &Bound<'_, PyAny>,
+        columns: Option<Vec<String>>,
+        calls: i64,
+        bytes: i64,
+    ) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("ingest_dump", "Commit or roll back first.")?;
+        pyingest::ingest_dump(&self.db, py, source, target, rows, columns, calls, bytes)
+    }
+    #[pyo3(signature = (source, target, rows, columns=None, calls=1, bytes=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_delta(
+        &self,
+        py: Python<'_>,
+        source: &str,
+        target: &str,
+        rows: &Bound<'_, PyAny>,
+        columns: Option<Vec<String>>,
+        calls: i64,
+        bytes: i64,
+    ) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("ingest_delta", "Commit or roll back first.")?;
+        pyingest::ingest_delta(&self.db, py, source, target, rows, columns, calls, bytes)
+    }
+    fn ingest_state(&self, py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
+        pyingest::ingest_state(&self.db, py, source)
+    }
+    #[pyo3(signature = (source, cmd="./fetch.py"))]
+    fn ingest_advise(&self, py: Python<'_>, source: &str, cmd: &str) -> PyResult<Py<PyAny>> {
+        pyingest::ingest_advise(&self.db, py, source, cmd)
+    }
+    fn ingest_conflicts(&self, py: Python<'_>, source: &str) -> PyResult<Vec<Py<PyAny>>> {
+        pyingest::ingest_conflicts(&self.db, py, source)
+    }
+    #[pyo3(signature = (source, take="local"))]
+    fn ingest_resolve(&self, py: Python<'_>, source: &str, take: &str) -> PyResult<u64> {
+        self.refuse_if_txn_open("ingest_resolve", "Commit or roll back first.")?;
+        pyingest::ingest_resolve(&self.db, py, source, take)
     }
 
     /// Every rRETL run, oldest first, failed runs included, as dicts.
@@ -1162,74 +1029,8 @@ impl PyDatabase {
     }
 }
 
-/// Build a [`mpedb::rretl_map::MapSpec`] from the Python-native dict form.
-/// Every refusal names the missing/mistyped key; the REAL validation (legal
-/// identifiers, tables exist, pairs load) happens in the engine, identically
-/// for both the dict and the TOML door.
-fn map_spec_from_py(spec: &Bound<'_, PyAny>) -> PyResult<mpedb::rretl_map::MapSpec> {
-    use pyo3::types::PyDict;
-    fn bad(m: String) -> PyErr {
-        ProgrammingError::new_err(m)
-    }
-    fn need_str(d: &Bound<'_, PyDict>, k: &str, ctx: &str) -> PyResult<String> {
-        d.get_item(k)?
-            .ok_or_else(|| bad(format!("map spec: missing `{k}` in {ctx}")))?
-            .extract::<String>()
-            .map_err(|_| bad(format!("map spec: `{k}` in {ctx} must be a string")))
-    }
-    fn opt_str(d: &Bound<'_, PyDict>, k: &str, ctx: &str) -> PyResult<Option<String>> {
-        match d.get_item(k)? {
-            None => Ok(None),
-            Some(v) if v.is_none() => Ok(None),
-            Some(v) => v
-                .extract::<String>()
-                .map(Some)
-                .map_err(|_| bad(format!("map spec: `{k}` in {ctx} must be a string"))),
-        }
-    }
-    let d = spec.cast::<PyDict>().map_err(|_| {
-        bad("rretl_map_define takes a TOML string or a dict {name, tables: [{source, \
-             target, target_key?, columns: [{source, target, pair?}]}]}"
-            .into())
-    })?;
-    let name = need_str(d, "name", "the map dict")?;
-    let tables_any = d
-        .get_item("tables")?
-        .ok_or_else(|| bad("map spec: missing `tables`".into()))?;
-    let tables_list = tables_any
-        .cast::<PyList>()
-        .map_err(|_| bad("map spec: `tables` must be a list of dicts".into()))?;
-    let mut tables = Vec::new();
-    for t in tables_list.iter() {
-        let td = t
-            .cast::<PyDict>()
-            .map_err(|_| bad("map spec: each table must be a dict".into()))?;
-        let source = need_str(td, "source", "a table")?;
-        let target = need_str(td, "target", "a table")?;
-        let target_key = opt_str(td, "target_key", "a table")?;
-        let cols_any = td
-            .get_item("columns")?
-            .ok_or_else(|| bad(format!("map spec: table `{source}` has no `columns`")))?;
-        let cols_list = cols_any
-            .cast::<PyList>()
-            .map_err(|_| bad("map spec: `columns` must be a list of dicts".into()))?;
-        let mut columns = Vec::new();
-        for c in cols_list.iter() {
-            let cd = c
-                .cast::<PyDict>()
-                .map_err(|_| bad("map spec: each column must be a dict".into()))?;
-            columns.push(mpedb::rretl_map::MapColumn {
-                source: need_str(cd, "source", "a column")?,
-                target: need_str(cd, "target", "a column")?,
-                pair: opt_str(cd, "pair", "a column")?,
-            });
-        }
-        tables.push(mpedb::rretl_map::MapTable { source, target, target_key, columns });
-    }
-    Ok(mpedb::rretl_map::MapSpec { name, tables })
-}
 
-fn rretl_report_to_py(py: Python<'_>, r: mpedb::rretl::RretlReport) -> PyResult<Py<PyAny>> {
+pub(crate) fn rretl_report_to_py(py: Python<'_>, r: mpedb::rretl::RretlReport) -> PyResult<Py<PyAny>> {
     let d = pyo3::types::PyDict::new(py);
     d.set_item("run_id", r.run_id)?;
     d.set_item("rows", r.rows)?;

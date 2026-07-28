@@ -432,3 +432,203 @@ fn both_declaration_doors_store_one_form() {
     assert!(d.ingest_drop("crm").unwrap());
     assert!(d.ingest_sources().unwrap().is_empty());
 }
+
+// ---------------------------------------------------------------- planner
+
+/// The planner is clock-free to test: feed it a synthetic receipt history
+/// and assert the allocation's PROPERTIES, not a golden number.
+fn history(d: &Database, source: &str, edge: &str, tbl: &str, n: i64, changed_every: i64) {
+    // Receipts spaced one minute apart, so the observed interval is exact.
+    // The run-id base is derived from the edge name so two histories in one
+    // database cannot collide on the primary key.
+    let base = 100_000
+        + (edge.bytes().map(i64::from).sum::<i64>() * 1000) % 800_000;
+    let mut w = d.begin().unwrap();
+    // Clear any real receipt for this edge first: its wall-clock timestamp
+    // sits ~50 years from the synthetic ones, and the observed interval —
+    // (last - first) / (n-1) — would come out in the millions of seconds.
+    w.query(
+        "DELETE FROM ingest_stats WHERE source = $1 AND edge = $2",
+        &[Value::Text(source.into()), Value::Text(edge.into())],
+    )
+    .unwrap();
+    for i in 0..n {
+        let changed = i64::from(changed_every > 0 && i % changed_every == 0);
+        w.query(
+            "INSERT INTO ingest_stats (run_id, source, edge, tbl, mode, ts_micros, rows_in, \
+             inserted, updated, deleted, unchanged, conflicts, calls, bytes, changed, caught, \
+             missed, watermark, verdict, state, note) VALUES ($1, $2, $3, $4, 'delta', $5, 0, \
+             $6, 0, 0, 0, 0, 1, 100, $6, 0, 0, NULL, '', 'closed', '')",
+            &[
+                Value::Int(base + i),
+                Value::Text(source.into()),
+                Value::Text(edge.into()),
+                Value::Text(tbl.into()),
+                Value::Int(1_000_000_000 + i * 60_000_000),
+                Value::Int(changed),
+            ],
+        )
+        .unwrap();
+    }
+    w.commit().unwrap();
+    // And the accumulated model the estimator reads.
+    let hits: i64 = (0..n).filter(|i| changed_every > 0 && i % changed_every == 0).count() as i64;
+    let mut w = d.begin().unwrap();
+    w.query(
+        "INSERT OR REPLACE INTO ingest_state (source, edge, fingerprint, watermark, cursor_col, \
+         cursor_state, caught, missed, fanout, receipts, changed_receipts, parent_calls, \
+         ts_micros) VALUES ($1, $2, $3, NULL, '', 'unknown', 0, 0, 0, $4, $5, 0, 0)",
+        &[
+            Value::Text(source.into()),
+            Value::Text(edge.into()),
+            Value::Text(fingerprint_of(d, source, edge)),
+            Value::Int(n),
+            Value::Int(hits),
+        ],
+    )
+    .unwrap();
+    w.commit().unwrap();
+}
+
+fn fingerprint_of(d: &Database, source: &str, edge: &str) -> String {
+    let spec = IngestSpec::from_toml_str(&d.ingest_show(source).unwrap()).unwrap();
+    spec.edge(edge).unwrap().fingerprint()
+}
+
+/// The allocation respects the budget, starves nothing that changes, and
+/// keeps the reconcile above its floor — the three properties the harmonic
+/// objective was chosen for.
+#[test]
+fn the_plan_fits_the_budget_and_starves_nothing() {
+    let (d, _s) = seeded("plan");
+    // Make the tables exist so `resolve` passes, then hand the planner a
+    // history: the delta edge changes on every receipt (very busy), the
+    // dump edge rarely.
+    d.ingest_delta("crm", "cases", &cols(), &[], 1, 10).unwrap();
+    history(&d, "crm", "cases_delta", "cases", 20, 1);
+    history(&d, "crm", "cases_full", "cases", 20, 10);
+
+    let plan = d.ingest_advise("crm").unwrap();
+    assert_eq!(plan.profiles.len(), 1, "{:?}", plan.skipped);
+    let p = &plan.profiles[0];
+    assert!(
+        p.used_calls <= p.budget_calls as f64 * 1.001,
+        "budget {} but {} used",
+        p.budget_calls,
+        p.used_calls
+    );
+
+    let roots: Vec<_> = p.edges.iter().filter(|e| e.kind == "root").collect();
+    assert_eq!(roots.len(), 2);
+    for e in &roots {
+        assert!(
+            e.rate_per_window > 0.0,
+            "`{}` was starved — the harmonic objective must never do that: {e:?}",
+            e.edge
+        );
+    }
+    // The BUSY edge gets more calls than the quiet one — but only because
+    // the objective says so, not because we allocated proportionally.
+    let busy = roots.iter().find(|e| e.edge == "cases_delta").unwrap();
+    let quiet = roots.iter().find(|e| e.edge == "cases_full").unwrap();
+    assert!(busy.rate_per_window > quiet.rate_per_window, "{busy:?} vs {quiet:?}");
+    // …and the expensive dump is not starved below its reconcile floor.
+    assert!(quiet.cron.contains('*'), "{quiet:?}");
+    assert!(!plan.cron("fetch.py").is_empty());
+}
+
+/// A dump is never scheduled at zero, however quiet its table: deletes and
+/// the cursor trial both depend on it happening.
+#[test]
+fn the_reconcile_has_a_floor() {
+    let (d, _s) = seeded("floor");
+    d.ingest_delta("crm", "cases", &cols(), &[], 1, 10).unwrap();
+    // A table that has never changed at all.
+    history(&d, "crm", "cases_delta", "cases", 30, 0);
+    history(&d, "crm", "cases_full", "cases", 30, 0);
+    let plan = d.ingest_advise("crm").unwrap();
+    let dump = plan.profiles[0]
+        .edges
+        .iter()
+        .find(|e| e.edge == "cases_full")
+        .unwrap();
+    assert!(dump.rate_per_window > 0.0, "the reconcile was starved: {dump:?}");
+    assert!(dump.reason.contains("reconcile floor"), "{}", dump.reason);
+}
+
+/// A never-observed edge is priced at a floor rather than at zero — that
+/// is what earns it the observations the next plan can price properly.
+/// And the census names it instead of dropping it.
+#[test]
+fn the_plan_names_what_it_could_not_price() {
+    let (d, _s) = seeded("census");
+    let plan = d.ingest_advise("crm").unwrap();
+    assert!(
+        plan.skipped.iter().any(|s| s.contains("receipt(s)")),
+        "{:?}",
+        plan.skipped
+    );
+    for e in plan.profiles[0].edges.iter().filter(|e| e.kind == "root") {
+        assert!(e.rate_per_window > 0.0, "{e:?}");
+    }
+}
+
+/// A derived edge is never scheduled — its rate IS the parent's rate times
+/// the observed fan-out, and the report says where the budget goes.
+#[test]
+fn derived_edges_are_driven_not_scheduled() {
+    let (d, _s) = db("derived");
+    for t in ["cases", "details"] {
+        d.query(
+            &format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY, subject ANY, updated_at ANY)"),
+            &[],
+        )
+        .unwrap();
+    }
+    let spec = format!(
+        "{}\n[[source.edge]]\nname = \"case_detail\"\nkind = \"derived\"\nparent = \
+         \"cases_delta\"\ntable = \"details\"\nstrategy = \"dump\"\nbatch = 10\n\
+         cost_calls = 1\n",
+        SPEC
+    );
+    d.ingest_define(&spec).unwrap();
+    d.ingest_delta("crm", "cases", &cols(), &[], 1, 10).unwrap();
+    history(&d, "crm", "cases_delta", "cases", 20, 2);
+
+    let plan = d.ingest_advise("crm").unwrap();
+    let kid = plan.profiles[0]
+        .edges
+        .iter()
+        .find(|e| e.edge == "case_detail")
+        .unwrap();
+    assert_eq!(kid.kind, "derived");
+    assert_eq!(kid.rate_per_window, 0.0, "a derived edge is not scheduled");
+    assert!(kid.cron.is_empty());
+    assert!(kid.reason.contains("driven by `cases_delta`"), "{}", kid.reason);
+    assert!(
+        plan.skipped.iter().any(|s| s.contains("fan-out has never been observed")),
+        "{:?}",
+        plan.skipped
+    );
+}
+
+/// Uniform is computed alongside as the control arm, and the verdict says
+/// which won. (Proportional-to-change-rate loses to uniform under every
+/// distribution — the trap the objective section exists to avoid.)
+#[test]
+fn the_plan_reports_against_the_uniform_control_arm() {
+    let (d, _s) = seeded("control");
+    d.ingest_delta("crm", "cases", &cols(), &[], 1, 10).unwrap();
+    history(&d, "crm", "cases_delta", "cases", 20, 1);
+    history(&d, "crm", "cases_full", "cases", 20, 5);
+    let plan = d.ingest_advise("crm").unwrap();
+    let p = &plan.profiles[0];
+    assert!(p.uniform_staleness.is_finite(), "{p:?}");
+    assert!(p.solved_staleness.is_finite());
+    assert!(
+        p.solved_staleness <= p.uniform_staleness * 1.001,
+        "the solver must not lose to its own control arm: {}",
+        p.verdict()
+    );
+    assert!(p.verdict().contains("uniform"));
+}
