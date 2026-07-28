@@ -917,13 +917,13 @@ fn engine_bug_freelist_double_free_under_concurrent_readers() {
     }
 }
 
-/// #52 A3, §12.2 attack 7: SIGKILL mid-`retl apply` must be invisible. One run
+/// #52 A3, §12.2 attack 7: SIGKILL mid-`rretl apply` must be invisible. One run
 /// is ONE transaction, so at every kill instant the column is either fully
 /// original or fully transformed — never mixed — and the bookkeeping agrees
 /// with whichever it is. FLD-2 recovers the dead writer's lock, and the next
 /// process reads a consistent file.
 #[test]
-fn retl_apply_sigkilled_at_any_instant_is_all_or_nothing() {
+fn rretl_apply_sigkilled_at_any_instant_is_all_or_nothing() {
     let td = TestDir::new("etl-sigkill");
     let dbf = td.path().join("etl.mpedb");
     let dbs = dbf.to_str().unwrap();
@@ -971,7 +971,7 @@ fn retl_apply_sigkilled_at_any_instant_is_all_or_nothing() {
 
     for delay_ms in [0u64, 3, 8, 15, 30, 60] {
         let mut child = Command::new(bin())
-            .args(["retl", "apply", dbs, "mag", "t.v"])
+            .args(["rretl", "apply", dbs, "mag", "t.v"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -994,7 +994,7 @@ fn retl_apply_sigkilled_at_any_instant_is_all_or_nothing() {
             // The commit that transformed also carries the residuals and the
             // lineage row — same transaction, so they must all be present.
             let residuals = count_where("1 = 1"); // row count of t, for the message
-            let o = run(&[dbs, "SELECT count(*) FROM retl_residual"]);
+            let o = run(&[dbs, "SELECT count(*) FROM rretl_residual"]);
             assert_ok(&o);
             let res: i64 = String::from_utf8_lossy(&o.stdout)
                 .lines()
@@ -1005,7 +1005,7 @@ fn retl_apply_sigkilled_at_any_instant_is_all_or_nothing() {
                 .unwrap();
             assert_eq!(res, n, "transformed ({residuals} rows) but residuals incomplete");
             // Reset for the next kill point — revert is itself exercised.
-            let o = run(&[dbs, "SELECT run_id FROM retl_lineage WHERE outcome = 'applied'"]);
+            let o = run(&[dbs, "SELECT run_id FROM rretl_lineage WHERE outcome = 'applied'"]);
             assert_ok(&o);
             let run_id = String::from_utf8_lossy(&o.stdout)
                 .lines()
@@ -1013,12 +1013,12 @@ fn retl_apply_sigkilled_at_any_instant_is_all_or_nothing() {
                 .unwrap()
                 .trim()
                 .to_string();
-            assert_ok(&run(&["retl", "revert", dbs, &run_id]));
+            assert_ok(&run(&["rretl", "revert", dbs, &run_id]));
             assert_eq!(count_where("v < 0"), n, "revert must restore the seed");
         } else {
             // Untouched: no applied lineage row may exist (a failed-run row is
             // fine — the kill may have landed after the rollback bookkeeper).
-            let o = run(&[dbs, "SELECT count(*) FROM retl_lineage WHERE outcome = 'applied'"]);
+            let o = run(&[dbs, "SELECT count(*) FROM rretl_lineage WHERE outcome = 'applied'"]);
             if o.status.success() {
                 let applied_rows: i64 = String::from_utf8_lossy(&o.stdout)
                     .lines()
@@ -1040,23 +1040,23 @@ fn retl_apply_sigkilled_at_any_instant_is_all_or_nothing() {
     // kill may land pre-commit and the applied branch never runs. One
     // UNINTERRUPTED wave closes that gap deterministically (no silent
     // coverage caps): apply to completion, verify through the CLI, revert.
-    let o = run(&["retl", "apply", dbs, "mag", "t.v"]);
+    let o = run(&["rretl", "apply", dbs, "mag", "t.v"]);
     assert_ok(&o);
     assert_eq!(count_where("v < 0"), 0, "uninterrupted apply transforms everything");
     assert_eq!(count_where("v > 0"), n);
-    let o = run(&[dbs, "SELECT run_id FROM retl_lineage WHERE outcome = 'applied'"]);
+    let o = run(&[dbs, "SELECT run_id FROM rretl_lineage WHERE outcome = 'applied'"]);
     assert_ok(&o);
     let run_id = String::from_utf8_lossy(&o.stdout).lines().last().unwrap().trim().to_string();
-    assert_ok(&run(&["retl", "revert", dbs, &run_id]));
+    assert_ok(&run(&["rretl", "revert", dbs, &run_id]));
     assert_eq!(count_where("v < 0"), n, "and the revert restores the seed exactly");
 }
 
-/// SIGKILL mid-`retl putback` — the write path the apply-kill test does not
+/// SIGKILL mid-`rretl putback` — the write path the apply-kill test does not
 /// cover. Same all-or-nothing contract: at every kill instant the column is
 /// either fully transformed (putback never committed) or fully source-domain
 /// (it did), never mixed — and the run's outcome agrees with the data.
 #[test]
-fn retl_putback_sigkilled_at_any_instant_is_all_or_nothing() {
+fn rretl_putback_sigkilled_at_any_instant_is_all_or_nothing() {
     let td = TestDir::new("etl-putback-sigkill");
     let dbf = td.path().join("etl.mpedb");
     let dbs = dbf.to_str().unwrap();
@@ -1094,14 +1094,14 @@ fn retl_putback_sigkilled_at_any_instant_is_all_or_nothing() {
     let run_id_of = |outcome: &str| -> String {
         let o = run(&[
             dbs,
-            &format!("SELECT max(run_id) FROM retl_lineage WHERE outcome = '{outcome}'"),
+            &format!("SELECT max(run_id) FROM rretl_lineage WHERE outcome = '{outcome}'"),
         ]);
         assert_ok(&o);
         String::from_utf8_lossy(&o.stdout).lines().last().unwrap().trim().to_string()
     };
 
     for delay_ms in [0u64, 5, 12, 25, 50] {
-        assert_ok(&run(&["retl", "apply", dbs, "mag", "t.v"]));
+        assert_ok(&run(&["rretl", "apply", dbs, "mag", "t.v"]));
         assert_eq!(count_where("v < 0"), 0, "applied: all magnitudes");
         let applied_run = run_id_of("applied");
         // An edit, so the interrupted operation is genuinely a PUTBACK
@@ -1109,7 +1109,7 @@ fn retl_putback_sigkilled_at_any_instant_is_all_or_nothing() {
         assert_ok(&run(&[dbs, "UPDATE t SET v = 999999 WHERE id = 0"]));
 
         let mut child = Command::new(bin())
-            .args(["retl", "putback", dbs, &applied_run])
+            .args(["rretl", "putback", dbs, &applied_run])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1133,7 +1133,7 @@ fn retl_putback_sigkilled_at_any_instant_is_all_or_nothing() {
             // residuals still complete, and the run still 'applied' — so the
             // putback is simply retried to completion.
             assert_eq!(count_where("v >= 0"), n, "mixed column at {delay_ms}ms");
-            assert_ok(&run(&["retl", "putback", dbs, &applied_run]));
+            assert_ok(&run(&["rretl", "putback", dbs, &applied_run]));
             assert_eq!(count_where("v < 0"), n);
             assert_ok(&run(&[dbs, "UPDATE t SET v = 0 - 1 WHERE id = 0"]));
         }

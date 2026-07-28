@@ -1,4 +1,4 @@
-//! Lens pairs, stage 1 (design/DESIGN-RETL.md §11) — reversible PySpell ETL.
+//! Lens pairs, stage 1 (design/DESIGN-RRETL.md §11) — reversible PySpell ETL.
 //!
 //! The headline test is a REFUSAL. `celsius ⇄ fahrenheit` is the pair everyone's
 //! intuition calls reversible, and it is not: float64 loses the round trip, and
@@ -80,7 +80,7 @@ fn a_real_bijection_is_accepted_and_reports_its_sample_count() {
     let samples = d.create_lens("ident", "keep", "keep", LensClass::Bijective).unwrap();
     // Identity round-trips every probe input, so the sample count is the corpus
     // size — and it is REPORTED, not summarised as "verified". The evidence is
-    // statistical (DESIGN-RETL §5).
+    // statistical (DESIGN-RRETL §5).
     assert!(samples > 100, "identity should clear the whole corpus, got {samples}");
 
     let listed = d.list_lenses().unwrap();
@@ -145,7 +145,7 @@ fn the_two_function_api_points_residual_pairs_at_the_triple() {
 /// THE stage-2 flagship: `abs ⇄ sign`. The forward is genuinely non-injective —
 /// 5 and -5 both map to 5 — which is exactly the "several possible reversals"
 /// case the residual class exists for. The residual is the BRANCH CHOICE
-/// itself (DESIGN-RETL §6: branch choice is residual data), one bit stored as
+/// itself (DESIGN-RRETL §6: branch choice is residual data), one bit stored as
 /// an int. Declared bijective it must be REFUSED as a collision; declared
 /// residual with the sign extractor it must register, because x ↦ (|x|, sign)
 /// is injective even though x ↦ |x| is not.

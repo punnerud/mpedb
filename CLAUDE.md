@@ -52,14 +52,14 @@ log-based engine), and the hardware published when the hardware is the answer.
   `ring_exec` (Phase-2 group-commit leader; active when durability = commit or wal).
 - `crates/mpedb-cli` — `mpedb` binary: repl/exec/prepare/call/dump/stress/crash/
   powerloss/bench + `tier` (drain hot→cold + SIGKILL harness, #78)
-  + `lens` (reversible ETL pairs over stored functions, DESIGN-RETL: every
+  + `lens` (reversible ETL pairs over stored functions, DESIGN-RRETL: every
   class declaration is VERIFIED against a probe corpus and refused with a
   named counter-example — `celsius ⇄ fahrenheit` is the canonical bijective
   refusal; a `residual` pair is the triple fwd/1 rex/1 inv/2 with a DECLARED
   residual type, and its collision check keys on (y, r) jointly)
-  + `retl apply|revert|putback|log` (in-place column transform in ONE txn:
-  per-row residuals in `retl_residual (run_id, pk)`, runs — failed ones
-  included — in `retl_lineage`, and 100% of rows verified against the source
+  + `rretl apply|revert|putback|log` (in-place column transform in ONE txn:
+  per-row residuals in `rretl_residual (run_id, pk)`, runs — failed ones
+  included — in `rretl_lineage`, and 100% of rows verified against the source
   hash BEFORE the commit that destroys the source; revert is hash-gated,
   `putback` inverts KEEPING edits — PutRes per row replaces the hash gate,
   deleted rows stay deleted. Every pass STREAMS in `pk > last` chunks — no
@@ -70,13 +70,13 @@ log-based engine), and the hardware published when the hardware is the answer.
   TABLES with RIGID column types built from specs, never SQL text — DDL
   `BLOB` means TYPELESS, and a typeless `pk_enc` would turn every residual
   lookup into a filter over the run. Never sys-keyspace — #124 is why. The
-  Python surface + agent guide is PYSPELL-RETL.md)
-  + `retl put|get|versions` (blob versioning, retl_store.rs: newest FULL,
+  Python surface + agent guide is PYSPELL-RRETL.md)
+  + `rretl put|get|versions` (blob versioning, rretl_store.rs: newest FULL,
   previous rewritten as reverse-delta verified byte-identical AS PERSISTED
   before commit, every 8th a permanent full anchor; a stored full failing its
   recorded hash HARD-errors the put — rewriting would launder corruption; a
   bloating delta keeps the full and the put succeeds; get hash-verifies every
-  walk step) + `retl pack-in|pack-out|archives` (zip SPLICE per DESIGN-RETL
+  walk step) + `rretl pack-in|pack-out|archives` (zip SPLICE per DESIGN-RRETL
   §8.4: members as rows, residual keeps every other byte, byte-identical
   verify BEFORE ingest commits, pack-out hash-gated; zip64/encrypted/
   overlapping refused by name. Both are lineage with outcomes

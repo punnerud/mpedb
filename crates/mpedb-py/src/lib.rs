@@ -737,10 +737,10 @@ impl PyDatabase {
             .collect())
     }
 
-    // ------------------------------------------------------ RETL (Reversible ETL)
+    // ------------------------------------------------------ rRETL (Reversible ETL)
 
     /// Store a PySpell function from PYTHON SOURCE (a `def name(args): ...`
-    /// in the deterministic subset — see PYSPELL-RETL.md). The function's name
+    /// in the deterministic subset — see PYSPELL-RRETL.md). The function's name
     /// and arity come from the definition itself. Returns (name, hex hash).
     fn define_function(&self, py: Python<'_>, source: &str) -> PyResult<(String, String)> {
         self.refuse_if_txn_open("define_function", "Commit or roll back first.")?;
@@ -814,75 +814,75 @@ impl PyDatabase {
     }
 
     /// Transform `table.column` IN PLACE with a registered pair, in ONE
-    /// transaction: per-row residuals are kept in `retl_residual`, the run in
-    /// `retl_lineage`, and 100% of rows verify against the source hash BEFORE
+    /// transaction: per-row residuals are kept in `rretl_residual`, the run in
+    /// `rretl_lineage`, and 100% of rows verify against the source hash BEFORE
     /// the commit that destroys the source. Returns
     /// `{"run_id", "rows", "residuals"}`.
-    fn retl_apply(
+    fn rretl_apply(
         &self,
         py: Python<'_>,
         pair: &str,
         table: &str,
         column: &str,
     ) -> PyResult<Py<PyAny>> {
-        self.refuse_if_txn_open("retl_apply", "Commit or roll back first.")?;
+        self.refuse_if_txn_open("rretl_apply", "Commit or roll back first.")?;
         let db = &self.db;
-        let r = py.detach(|| db.retl_apply(pair, table, column)).map_err(map_err)?;
-        retl_report_to_py(py, r)
+        let r = py.detach(|| db.rretl_apply(pair, table, column)).map_err(map_err)?;
+        rretl_report_to_py(py, r)
     }
 
     /// Undo run `run_id` EXACTLY. Hash-gated: refused if the column changed
     /// outside the pipeline — for a column you have edited, use
-    /// `retl_putback`, which exists for exactly that.
-    fn retl_revert(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
-        self.refuse_if_txn_open("retl_revert", "Commit or roll back first.")?;
+    /// `rretl_putback`, which exists for exactly that.
+    fn rretl_revert(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("rretl_revert", "Commit or roll back first.")?;
         let db = &self.db;
-        let r = py.detach(|| db.retl_revert(run_id)).map_err(map_err)?;
-        retl_report_to_py(py, r)
+        let r = py.detach(|| db.rretl_revert(run_id)).map_err(map_err)?;
+        rretl_report_to_py(py, r)
     }
 
     /// Invert run `run_id` while KEEPING edits made to the transformed
     /// column — the lens putback. Edited values flow back through
     /// `inverse(edited, residual)`; deleted rows stay deleted; every row is
     /// PutRes-verified (`forward(x') == y'`, `rex(x') == r`) before commit.
-    fn retl_putback(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
-        self.refuse_if_txn_open("retl_putback", "Commit or roll back first.")?;
+    fn rretl_putback(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("rretl_putback", "Commit or roll back first.")?;
         let db = &self.db;
-        let r = py.detach(|| db.retl_putback(run_id)).map_err(map_err)?;
-        retl_report_to_py(py, r)
+        let r = py.detach(|| db.rretl_putback(run_id)).map_err(map_err)?;
+        rretl_report_to_py(py, r)
     }
 
     /// Verify-at-rest: re-check every standing run (top-run hash, residual
     /// coverage, pair loadability). Returns a list of finding strings —
     /// empty means clean. Reports, never repairs.
-    fn retl_fsck(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+    fn rretl_fsck(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let db = &self.db;
-        py.detach(|| db.retl_fsck()).map_err(map_err)
+        py.detach(|| db.rretl_fsck()).map_err(map_err)
     }
 
     /// Store `data` as the next VERSION of `obj` (stage 3): the new version
     /// is kept full, the previous newest is rewritten as a reverse delta —
     /// verified byte-identical, as persisted, before the commit — and every
     /// 8th version stays full forever. Returns the version number.
-    fn retl_put_version(&self, py: Python<'_>, obj: &str, data: &[u8]) -> PyResult<i64> {
-        self.refuse_if_txn_open("retl_put_version", "Commit or roll back first.")?;
+    fn rretl_put_version(&self, py: Python<'_>, obj: &str, data: &[u8]) -> PyResult<i64> {
+        self.refuse_if_txn_open("rretl_put_version", "Commit or roll back first.")?;
         let db = &self.db;
-        py.detach(|| db.retl_put_version(obj, data)).map_err(map_err)
+        py.detach(|| db.rretl_put_version(obj, data)).map_err(map_err)
     }
 
     /// Materialize version `ver` of `obj` as bytes. Every reconstruction
     /// step is hash-verified; corruption is a named error, never wrong bytes.
-    fn retl_get_version(&self, py: Python<'_>, obj: &str, ver: i64) -> PyResult<Py<PyAny>> {
+    fn rretl_get_version(&self, py: Python<'_>, obj: &str, ver: i64) -> PyResult<Py<PyAny>> {
         let db = &self.db;
-        let bytes = py.detach(|| db.retl_get_version(obj, ver)).map_err(map_err)?;
+        let bytes = py.detach(|| db.rretl_get_version(obj, ver)).map_err(map_err)?;
         Ok(pyo3::types::PyBytes::new(py, &bytes).into_any().unbind())
     }
 
     /// Every version of `obj`, oldest first, as dicts:
     /// `{"ver", "stored_as", "bytes", "content_hash"}`.
-    fn retl_versions(&self, py: Python<'_>, obj: &str) -> PyResult<Vec<Py<PyAny>>> {
+    fn rretl_versions(&self, py: Python<'_>, obj: &str) -> PyResult<Vec<Py<PyAny>>> {
         let db = &self.db;
-        let vers = py.detach(|| db.retl_versions(obj)).map_err(map_err)?;
+        let vers = py.detach(|| db.rretl_versions(obj)).map_err(map_err)?;
         vers.into_iter()
             .map(|v| {
                 let d = pyo3::types::PyDict::new(py);
@@ -896,28 +896,28 @@ impl PyDatabase {
     }
 
     /// Splice a zip archive into the database: members become rows in
-    /// `retl_archive_members`, the residual keeps every non-data byte, and
+    /// `rretl_archive_members`, the residual keeps every non-data byte, and
     /// the reconstruction is verified byte-identical BEFORE the ingest
     /// commits. Returns the archive id.
-    fn retl_pack_in(&self, py: Python<'_>, name: &str, data: &[u8]) -> PyResult<i64> {
-        self.refuse_if_txn_open("retl_pack_in", "Commit or roll back first.")?;
+    fn rretl_pack_in(&self, py: Python<'_>, name: &str, data: &[u8]) -> PyResult<i64> {
+        self.refuse_if_txn_open("rretl_pack_in", "Commit or roll back first.")?;
         let db = &self.db;
-        py.detach(|| db.retl_pack_in(name, data)).map_err(map_err)
+        py.detach(|| db.rretl_pack_in(name, data)).map_err(map_err)
     }
 
     /// Rebuild archive `archive_id` byte-identically, hash-gated against the
     /// original: a member row changed outside the pipeline is a named error.
-    fn retl_pack_out(&self, py: Python<'_>, archive_id: i64) -> PyResult<Py<PyAny>> {
+    fn rretl_pack_out(&self, py: Python<'_>, archive_id: i64) -> PyResult<Py<PyAny>> {
         let db = &self.db;
-        let bytes = py.detach(|| db.retl_pack_out(archive_id)).map_err(map_err)?;
+        let bytes = py.detach(|| db.rretl_pack_out(archive_id)).map_err(map_err)?;
         Ok(pyo3::types::PyBytes::new(py, &bytes).into_any().unbind())
     }
 
     /// Every spliced archive, oldest first, as dicts:
     /// `{"archive_id", "name", "members", "content_hash"}`.
-    fn retl_archives(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+    fn rretl_archives(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let db = &self.db;
-        let arches = py.detach(|| db.retl_archives()).map_err(map_err)?;
+        let arches = py.detach(|| db.rretl_archives()).map_err(map_err)?;
         arches
             .into_iter()
             .map(|a| {
@@ -931,10 +931,10 @@ impl PyDatabase {
             .collect()
     }
 
-    /// Every RETL run, oldest first, failed runs included, as dicts.
-    fn retl_log(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+    /// Every rRETL run, oldest first, failed runs included, as dicts.
+    fn rretl_log(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let db = &self.db;
-        let log = py.detach(|| db.retl_log()).map_err(map_err)?;
+        let log = py.detach(|| db.rretl_log()).map_err(map_err)?;
         log.into_iter()
             .map(|l| {
                 let d = pyo3::types::PyDict::new(py);
@@ -951,7 +951,7 @@ impl PyDatabase {
     }
 }
 
-fn retl_report_to_py(py: Python<'_>, r: mpedb::retl::RetlReport) -> PyResult<Py<PyAny>> {
+fn rretl_report_to_py(py: Python<'_>, r: mpedb::rretl::RretlReport) -> PyResult<Py<PyAny>> {
     let d = pyo3::types::PyDict::new(py);
     d.set_item("run_id", r.run_id)?;
     d.set_item("rows", r.rows)?;

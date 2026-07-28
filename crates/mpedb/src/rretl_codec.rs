@@ -1,5 +1,5 @@
-//! RETL stage-3 codecs: the composite-residual envelope, the delta engine,
-//! and the zip-splice parser (design/DESIGN-RETL.md §8.2–8.4).
+//! rRETL stage-3 codecs: the composite-residual envelope, the delta engine,
+//! and the zip-splice parser (design/DESIGN-RRETL.md §8.2–8.4).
 //!
 //! Everything here is PURE — bytes in, bytes out, no database — so the
 //! eternity promises live in one reviewable file. The split of obligations is
@@ -310,7 +310,7 @@ fn rd_u32(b: &[u8], at: usize) -> Result<u32> {
 }
 
 /// Parse a zip archive by the ONE hard rule practice converged on
-/// (DESIGN-RETL §8.4): enumerate from the central directory ONLY, apply the
+/// (DESIGN-RRETL §8.4): enumerate from the central directory ONLY, apply the
 /// SFX base-offset correction, verify `PK\x03\x04` at each corrected offset,
 /// compute the data start from the LOCAL header's name/extra lengths (the
 /// CD's copies legally differ — using them is the classic splicer bug), and

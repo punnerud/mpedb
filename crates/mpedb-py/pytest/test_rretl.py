@@ -1,11 +1,11 @@
 #!/usr/bin/env python3.12
-"""Reversible ETL through the Python surface — the PYSPELL-RETL.md contract.
+"""Reversible ETL through the Python surface — the PYSPELL-RRETL.md contract.
 
 Plain Python, no pytest. Run with the built module on PYTHONPATH:
 
     cargo build --release -p mpedb-py
     mkdir -p /tmp/mpedb-pymod && cp target/release/libmpedb_py.so /tmp/mpedb-pymod/mpedb.so
-    PYTHONPATH=/tmp/mpedb-pymod python3.12 crates/mpedb-py/pytest/test_retl.py
+    PYTHONPATH=/tmp/mpedb-pymod python3.12 crates/mpedb-py/pytest/test_rretl.py
 
 This is the guide's image walkthrough, executed: strip colour from packed-RGB
 pixels (the chroma offsets are the residual), let the "user" retouch and crop
@@ -41,7 +41,7 @@ primary_key = ["id"]
   type = "any"
 """
 
-# The grayscale pair from PYSPELL-RETL.md, verbatim. The domain guards are the
+# The grayscale pair from PYSPELL-RRETL.md, verbatim. The domain guards are the
 # verifier's demands, one refusal at a time: huge ints overflow the chroma
 # packing, fractional floats break exact recovery, and 0 is excluded because
 # +0.0 and -0.0 collide there (a GENUINE non-injectivity the verifier found).
@@ -124,9 +124,9 @@ def main(workdir):
     with db.begin() as tx:
         for i, p in enumerate(original):
             tx.query("INSERT INTO pixels (id, px) VALUES ($1, $2)", [i, p])
-    report = db.retl_apply("gray", "pixels", "px")
+    report = db.rretl_apply("gray", "pixels", "px")
     assert report["rows"] == 4 and report["residuals"] == 4, report
-    assert column(db) == [93, 90, 93, 90], "luma only — the colour is in retl_residual now"
+    assert column(db) == [93, 90, 93, 90], "luma only — the colour is in rretl_residual now"
 
     # 5. The user works in grayscale: darken pixel 0, brighten pixel 1, CROP
     # pixel 3.
@@ -137,12 +137,12 @@ def main(workdir):
 
     # 6. revert refuses the edited column — putback is the operation for it.
     try:
-        db.retl_revert(report["run_id"])
+        db.rretl_revert(report["run_id"])
         raise AssertionError("revert must refuse a column edited outside the pipeline")
     except mpedb.Error as e:
         assert "changed outside the pipeline" in str(e), e
 
-    back = db.retl_putback(report["run_id"])
+    back = db.rretl_putback(report["run_id"])
     assert back["rows"] == 3, back
     after = column(db)
     assert after[0] == px(180, 20, 20), "darkened by 20 per channel WITH its colour back"
@@ -150,7 +150,7 @@ def main(workdir):
     assert after[2] == original[2], "the unedited pixel round-trips exactly"
     assert len(after) == 3, "the cropped pixel stays gone"
 
-    outcomes = [l["outcome"] for l in db.retl_log()]
+    outcomes = [l["outcome"] for l in db.rretl_log()]
     assert outcomes == ["putback"], outcomes
 
     # 7. An edit the pair cannot carry back is refused with the row named.
@@ -159,12 +159,12 @@ def main(workdir):
     # packing cannot represent. PutRes catches BOTH bad edits: the fractional
     # luma 12.5 (no integer pixel) and the integer luma 12 (channel
     # underflow: forward(inverse(12, r)) comes back 182, not 12).
-    report2 = db.retl_apply("gray", "pixels", "px")
+    report2 = db.rretl_apply("gray", "pixels", "px")
     for bad in (12.5, 12):
         with db.begin() as tx:
             tx.query("UPDATE pixels SET px = $1 WHERE id = 0", [bad])
         try:
-            db.retl_putback(report2["run_id"])
+            db.rretl_putback(report2["run_id"])
             raise AssertionError(f"luma {bad} has no pixel preimage and must be refused")
         except mpedb.Error as e:
             assert "putback" in str(e), e
@@ -172,17 +172,17 @@ def main(workdir):
     # inside 53..=148) carries back.
     with db.begin() as tx:
         tx.query("UPDATE pixels SET px = $1 WHERE id = 0", [60])
-    db.retl_putback(report2["run_id"])
+    db.rretl_putback(report2["run_id"])
     after2 = column(db)
     assert after2[0] == px(60 + 107, 60 - 53, 60 - 53), "legal edit carried back"
     assert len(after2) == 3
 
-    print("retl: all assertions passed")
+    print("rretl: all assertions passed")
 
 
 def stage3(workdir):
     """Blob versioning + zip splice (stage 3), on the SIMPLE setup: a config
-    with no tables at all — RETL creates its bookkeeping via live DDL, and so
+    with no tables at all — rRETL creates its bookkeeping via live DDL, and so
     can the user (CREATE TABLE)."""
     dbpath = os.path.join(workdir, "store.mpedb")
     cfg = os.path.join(workdir, "store.toml")
@@ -201,11 +201,11 @@ def stage3(workdir):
     history = []
     for i in range(10):
         doc.extend(f"edit {i}\n".encode())
-        ver = db.retl_put_version("report.md", bytes(doc))
+        ver = db.rretl_put_version("report.md", bytes(doc))
         history.append((ver, bytes(doc)))
     for ver, want in history:
-        assert db.retl_get_version("report.md", ver) == want, f"version {ver}"
-    stored = {v["ver"]: v["stored_as"] for v in db.retl_versions("report.md")}
+        assert db.rretl_get_version("report.md", ver) == want, f"version {ver}"
+    stored = {v["ver"]: v["stored_as"] for v in db.rretl_versions("report.md")}
     assert stored[10] == "full" and stored[8] == "full" and stored[9] == "delta", stored
 
     # Zip splice: a REAL producer's archive (zipfile, STORE) round-trips
@@ -218,27 +218,27 @@ def stage3(workdir):
         z.writestr("dir/b.bin", bytes(range(256)))
         z.writestr("empty", "")
     original = buf.getvalue()
-    aid = db.retl_pack_in("bundle.zip", original)
-    assert db.retl_pack_out(aid) == original, "byte-identical reconstruction"
-    arch = db.retl_archives()
+    aid = db.rretl_pack_in("bundle.zip", original)
+    assert db.rretl_pack_out(aid) == original, "byte-identical reconstruction"
+    arch = db.rretl_archives()
     assert arch[0]["members"] == 3, arch
 
     # Members are ordinary rows; tampering with one is a NAMED refusal.
     with db.begin() as tx:
         tx.query(
-            "UPDATE retl_archive_members SET data = $1 WHERE archive_id = $2 "
+            "UPDATE rretl_archive_members SET data = $1 WHERE archive_id = $2 "
             "AND member_no = $3",
             [b"ALPHA CONTENTS", aid, 0],  # same length: only the HASH can catch it
         )
     try:
-        db.retl_pack_out(aid)
+        db.rretl_pack_out(aid)
         raise AssertionError("tampered member must refuse pack_out")
     except mpedb.Error as e:
         assert "WRONG bytes" in str(e), e
-    findings = db.retl_fsck()
+    findings = db.rretl_fsck()
     assert any(f"archive {aid}" in f for f in findings), findings
 
-    print("retl stage 3: all assertions passed")
+    print("rretl stage 3: all assertions passed")
 
 
 if __name__ == "__main__":

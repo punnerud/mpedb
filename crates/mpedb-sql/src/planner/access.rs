@@ -212,7 +212,7 @@ pub(super) fn extract_access(
             // the SECOND PK column extends the corresponding bound by one
             // key part instead of degrading to a residual filter over the
             // whole prefix — the difference between O(hits) and O(prefix)
-            // per fetch, which is what RETL's `pk_enc > $last` chunk resume
+            // per fetch, which is what rRETL's `pk_enc > $last` chunk resume
             // lives on. The executor's prefix-successor construction gives
             // the exact SQL semantics for the appended part (see
             // `range_bounds`); the same `unbounded` rule guards the second

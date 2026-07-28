@@ -1,5 +1,5 @@
-//! `mpedb retl` — apply a lens pair to a column IN PLACE, keep what was lost,
-//! and be able to put it back (design/DESIGN-RETL.md §7/§11, #52 stage 2).
+//! `mpedb rretl` — apply a lens pair to a column IN PLACE, keep what was lost,
+//! and be able to put it back (design/DESIGN-RRETL.md §7/§11, #52 stage 2).
 //!
 //! One run is ONE WriteSession: read, transform, persist residuals, verify,
 //! commit — atomically. In-place transformation IS source deletion, so the
@@ -10,12 +10,12 @@
 //! hash chain over canonical bytes is the comparison.
 //!
 //! What the database keeps, and how it is found again:
-//! - `retl_residual (run_id, pk_enc) → residual` — what was lost, per row, per
+//! - `rretl_residual (run_id, pk_enc) → residual` — what was lost, per row, per
 //!   run. Keyed by run so two runs can never collide, `pk_enc` is the row's
 //!   PK in canonical bytes. A residual VALUE of NULL is legal; a MISSING row
 //!   is a hard error — confusing them would smuggle the refused creation path
 //!   `inverse(y, ∅)` back in as a silent wrong answer.
-//! - `retl_lineage (run_id, step_no) → …` — which pair (by CONTENT HASH, all
+//! - `rretl_lineage (run_id, step_no) → …` — which pair (by CONTENT HASH, all
 //!   three functions), which table.column, the source and output hashes, how
 //!   many rows, which verification level ran, and the outcome. Failed runs are
 //!   first-class lineage: an aborted apply leaves an `outcome='failed'` row
@@ -37,10 +37,10 @@ use mpedb_types::{ColumnType, Error, Result, Value};
 use crate::lens::LensClass;
 use crate::{ExecResult, WriteSession};
 
-pub const T_LINEAGE: &str = "retl_lineage";
-pub const T_RESIDUAL: &str = "retl_residual";
+pub const T_LINEAGE: &str = "rretl_lineage";
+pub const T_RESIDUAL: &str = "rretl_residual";
 
-/// Verification levels, as recorded in `retl_lineage.verified` (§5: report what
+/// Verification levels, as recorded in `rretl_lineage.verified` (§5: report what
 /// was verified, never a bare "verified"). Apply always runs `total`.
 const VERIFIED_TOTAL: i64 = 2;
 
@@ -56,14 +56,14 @@ const VERIFIED_TOTAL: i64 = 2;
 ///
 /// The env override is a TEST hook: chunk-boundary resume logic must be
 /// exercised without million-row fixtures.
-const RETL_CHUNK_DEFAULT: usize = 4096;
+const RRETL_CHUNK_DEFAULT: usize = 4096;
 
 fn chunk_rows() -> usize {
-    std::env::var("MPEDB_RETL_CHUNK")
+    std::env::var("MPEDB_RRETL_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(RETL_CHUNK_DEFAULT)
+        .unwrap_or(RRETL_CHUNK_DEFAULT)
 }
 
 /// The collision DIAGNOSTIC is bounded: past this many distinct images the
@@ -72,18 +72,18 @@ fn chunk_rows() -> usize {
 /// quality for bounded memory on huge tables).
 const COLLISION_DIAG_CAP: usize = 1 << 20;
 
-/// What a run did, as `retl apply`/`retl revert` report it.
+/// What a run did, as `rretl apply`/`rretl revert` report it.
 #[derive(Debug)]
-pub struct RetlReport {
+pub struct RretlReport {
     pub run_id: i64,
     pub rows: u64,
     /// Residual rows written (0 for a bijective pair).
     pub residuals: u64,
 }
 
-/// One lineage row, as `retl log` reports it.
+/// One lineage row, as `rretl log` reports it.
 #[derive(Debug)]
-pub struct RetlLogRow {
+pub struct RretlLogRow {
     pub run_id: i64,
     pub lens: String,
     pub table: String,
@@ -100,7 +100,7 @@ pub(crate) fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-/// Length-framed canonical hash chain — the RETL sibling of the lens layer's
+/// Length-framed canonical hash chain — the rRETL sibling of the lens layer's
 /// joint collision key, and framed for the same reason.
 pub(crate) struct CanonChain(pub(crate) blake3::Hasher);
 
@@ -137,11 +137,11 @@ impl crate::Database {
         // compilation or txn begin has refreshed the cached bundle, and a
         // stale read here would miss a table this very handle just created.
         self.engine.refresh_schema_if_stale()?;
-        if [T_LINEAGE, T_RESIDUAL, crate::retl_store::T_VERSIONS, crate::retl_store::T_ARCHIVES, crate::retl_store::T_MEMBERS]
+        if [T_LINEAGE, T_RESIDUAL, crate::rretl_store::T_VERSIONS, crate::rretl_store::T_ARCHIVES, crate::rretl_store::T_MEMBERS]
             .contains(&table)
         {
             return Err(Error::Unsupported(format!(
-                "`{table}` is RETL bookkeeping; transforming it is refused"
+                "`{table}` is rRETL bookkeeping; transforming it is refused"
             )));
         }
         let bundle = self.engine.schema();
@@ -157,7 +157,7 @@ impl crate::Database {
         // on. Both are named refusals, not silent narrowing.
         if t.primary_key.len() != 1 {
             return Err(Error::Unsupported(format!(
-                "`{table}` has a {}-column primary key; retl apply supports a declared \
+                "`{table}` has a {}-column primary key; rretl apply supports a declared \
                  single-column PK in stage 2",
                 t.primary_key.len()
             )));
@@ -181,8 +181,8 @@ impl crate::Database {
 
     /// Apply `pair` to every value of `table.column`, in place, in one
     /// transaction. See the module doc for the contract.
-    pub fn retl_apply(&self, pair: &str, table: &str, column: &str) -> Result<RetlReport> {
-        let lens = self.load_lens_for_retl(pair)?;
+    pub fn rretl_apply(&self, pair: &str, table: &str, column: &str) -> Result<RretlReport> {
+        let lens = self.load_lens_for_rretl(pair)?;
         // Class gate (commitment 2): in-place transformation deletes the
         // source, and a Lossy pair declares exactly that it cannot bring it
         // back. Refused by name; the fallback IS keeping the source.
@@ -241,7 +241,7 @@ impl crate::Database {
     /// Undo run `run_id`: hash-gate the column against the run's output hash,
     /// invert every row with its stored residual, verify against the source
     /// hash, drop the run's residuals, and mark the lineage row reverted.
-    pub fn retl_revert(&self, run_id: i64) -> Result<RetlReport> {
+    pub fn rretl_revert(&self, run_id: i64) -> Result<RretlReport> {
         let mut s = self.begin()?;
         let out = revert_in(self, &mut s, run_id);
         match out {
@@ -280,7 +280,7 @@ impl crate::Database {
     /// creation path `inverse(y, ∅)`, refused by design (§4). For bijective
     /// pairs the creation path is total by construction, so new rows simply
     /// invert like every other row.
-    pub fn retl_putback(&self, run_id: i64) -> Result<RetlReport> {
+    pub fn rretl_putback(&self, run_id: i64) -> Result<RretlReport> {
         let mut s = self.begin()?;
         let out = putback_in(self, &mut s, run_id);
         match out {
@@ -306,14 +306,14 @@ impl crate::Database {
     /// loads. Returns findings, one string per problem, empty = clean. It
     /// reports and never repairs — a repair would need to know which side is
     /// right, and fsck does not.
-    pub fn retl_fsck(&self) -> Result<Vec<String>> {
+    pub fn rretl_fsck(&self) -> Result<Vec<String>> {
         let bundle = self.engine.schema();
         if !bundle.schema.tables.iter().any(|t| t.name == T_LINEAGE && !t.dead) {
             return Ok(Vec::new());
         }
         let mut findings = Vec::new();
         let runs = rows_of(self.query(
-            "SELECT run_id, lens, tbl, col, output_hash, residual_hash FROM retl_lineage \
+            "SELECT run_id, lens, tbl, col, output_hash, residual_hash FROM rretl_lineage \
              WHERE outcome = 'applied' ORDER BY run_id",
             &[],
         )?)?;
@@ -337,7 +337,7 @@ impl crate::Database {
                      wrote — tampered or deleted at rest; unwinding would fabricate data"
                 ));
             }
-            let lens = match self.load_lens_for_retl(&pair) {
+            let lens = match self.load_lens_for_rretl(&pair) {
                 Ok(l) => Some(l),
                 Err(e) => {
                     findings.push(format!(
@@ -374,7 +374,7 @@ impl crate::Database {
             if lens.as_ref().map(|l| l.rex.is_some()).unwrap_or(false) {
                 scan_pairs_ro(self, &table, pk_col, &column, |pk, _| {
                     let res = rows_of(self.query(
-                        "SELECT count(*) FROM retl_residual \
+                        "SELECT count(*) FROM rretl_residual \
                          WHERE run_id = $1 AND pk_enc = $2",
                         &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
                     )?)?;
@@ -389,24 +389,24 @@ impl crate::Database {
                 })?;
             }
         }
-        crate::retl_store::fsck_stores(self, &mut findings)?;
+        crate::rretl_store::fsck_stores(self, &mut findings)?;
         Ok(findings)
     }
 
     /// Every lineage row, oldest first.
-    pub fn retl_log(&self) -> Result<Vec<RetlLogRow>> {
+    pub fn rretl_log(&self) -> Result<Vec<RretlLogRow>> {
         let bundle = self.engine.schema();
         if !bundle.schema.tables.iter().any(|t| t.name == T_LINEAGE && !t.dead) {
             return Ok(Vec::new());
         }
         let rows = rows_of(self.query(
-            "SELECT run_id, lens, tbl, col, rows, outcome, error FROM retl_lineage \
+            "SELECT run_id, lens, tbl, col, rows, outcome, error FROM rretl_lineage \
              ORDER BY run_id",
             &[],
         )?)?;
         rows.into_iter()
             .map(|r| {
-                Ok(RetlLogRow {
+                Ok(RretlLogRow {
                     run_id: as_int(&r[0])?,
                     lens: as_text(&r[1]),
                     table: as_text(&r[2]),
@@ -461,9 +461,9 @@ pub(crate) fn shape_gate(have: &[(String, Vec<String>)], name: &str, want: &[&st
                 Ok(true)
             } else {
                 Err(Error::Unsupported(format!(
-                    "a table named `{name}` already exists but is NOT retl's bookkeeping \
+                    "a table named `{name}` already exists but is NOT rretl's bookkeeping \
                      table (columns {cols:?}, expected {want:?}) — rename or drop it; \
-                     retl will not write into a shape it does not own"
+                     rretl will not write into a shape it does not own"
                 )))
             }
         }
@@ -588,7 +588,7 @@ impl crate::Database {
 /// content hash: two runs can produce identical bytes and must still be
 /// distinguishable (§7).
 pub(crate) fn next_run_id(s: &mut WriteSession<'_>) -> Result<i64> {
-    let rows = rows_of(s.query("SELECT max(run_id) FROM retl_lineage", &[])?)?;
+    let rows = rows_of(s.query("SELECT max(run_id) FROM rretl_lineage", &[])?)?;
     Ok(match rows.first().and_then(|r| r.first()) {
         Some(Value::Int(m)) => m + 1,
         _ => 1,
@@ -618,7 +618,7 @@ pub(crate) struct LineageRow {
 impl LineageRow {
     pub(crate) fn insert(&self, s: &mut WriteSession<'_>) -> Result<()> {
         s.query(
-            "INSERT INTO retl_lineage (run_id, step_no, lens, forward_hash, rex_hash, \
+            "INSERT INTO rretl_lineage (run_id, step_no, lens, forward_hash, rex_hash, \
              inverse_hash, tbl, col, source_hash, output_hash, residual_hash, rows, \
              verified, outcome, error, ts_micros) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, \
              $8, $9, $10, $11, $12, $13, $14, $15)",
@@ -689,7 +689,7 @@ fn scan_pairs(
     }
 }
 
-/// Stream `(pk_enc, residual)` for one run out of `retl_residual`, in
+/// Stream `(pk_enc, residual)` for one run out of `rretl_residual`, in
 /// `pk_enc` (memcmp) order — the table's OWN key order, which is what the
 /// lineage `residual_hash` chain is defined over. `pk_enc` order and pk
 /// VALUE order genuinely differ (value_bits are not keycode), which is why
@@ -701,11 +701,11 @@ fn scan_residuals(
 ) -> Result<u64> {
     let chunk = chunk_rows();
     let first = format!(
-        "SELECT pk_enc, residual FROM retl_residual WHERE run_id = $1 \
+        "SELECT pk_enc, residual FROM rretl_residual WHERE run_id = $1 \
          ORDER BY pk_enc LIMIT {chunk}"
     );
     let next = format!(
-        "SELECT pk_enc, residual FROM retl_residual WHERE run_id = $1 AND pk_enc > $2 \
+        "SELECT pk_enc, residual FROM rretl_residual WHERE run_id = $1 AND pk_enc > $2 \
          ORDER BY pk_enc LIMIT {chunk}"
     );
     let mut last: Option<Value> = None;
@@ -786,11 +786,11 @@ fn scan_pairs_ro(
 fn residual_chain_ro(db: &crate::Database, run_id: i64) -> Result<(String, u64)> {
     let chunk = chunk_rows();
     let first = format!(
-        "SELECT pk_enc, residual FROM retl_residual WHERE run_id = $1 \
+        "SELECT pk_enc, residual FROM rretl_residual WHERE run_id = $1 \
          ORDER BY pk_enc LIMIT {chunk}"
     );
     let next = format!(
-        "SELECT pk_enc, residual FROM retl_residual WHERE run_id = $1 AND pk_enc > $2 \
+        "SELECT pk_enc, residual FROM rretl_residual WHERE run_id = $1 AND pk_enc > $2 \
          ORDER BY pk_enc LIMIT {chunk}"
     );
     let mut chain = CanonChain::new();
@@ -839,12 +839,12 @@ fn residual_gate(s: &mut WriteSession<'_>, run_id: i64, want: &str, verb: &str) 
 fn apply_in(
     s: &mut WriteSession<'_>,
     pair: &str,
-    lens: &crate::lens::RetlLens,
+    lens: &crate::lens::RretlLens,
     table: &str,
     column: &str,
     target: &Target,
     committed_tables: &[(String, Vec<String>)],
-) -> Result<(RetlReport, LineageRow)> {
+) -> Result<(RretlReport, LineageRow)> {
     ensure_tables_from(s, committed_tables)?;
 
     // Runs STACK: applying pair B on top of pair A's output is the chained
@@ -935,7 +935,7 @@ fn apply_in(
         s.query(&update, &[y, pk.clone()])?;
         if let Some(r) = r {
             s.query(
-                "INSERT INTO retl_residual (run_id, pk_enc, residual) VALUES ($1, $2, $3)",
+                "INSERT INTO rretl_residual (run_id, pk_enc, residual) VALUES ($1, $2, $3)",
                 &[
                     Value::Int(run_id),
                     Value::Blob(crate::lens::value_bits(pk)),
@@ -961,7 +961,7 @@ fn apply_in(
         let x = match &lens.rex {
             Some(_) => {
                 let res = rows_of(s.query(
-                    "SELECT residual FROM retl_residual WHERE run_id = $1 AND pk_enc = $2",
+                    "SELECT residual FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
                     &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
                 )?)?;
                 let Some(r) = res.into_iter().next().and_then(|mut r| {
@@ -1001,7 +1001,7 @@ fn apply_in(
     let (residual_hash, _) = residual_chain(s, run_id)?;
 
     Ok((
-        RetlReport { run_id, rows: n_rows, residuals },
+        RretlReport { run_id, rows: n_rows, residuals },
         LineageRow {
             run_id,
             lens: pair.into(),
@@ -1032,18 +1032,18 @@ fn lifo_gate(
     column: &str,
 ) -> Result<()> {
     let top = rows_of(s.query(
-        "SELECT max(run_id) FROM retl_lineage WHERE tbl = $1 AND col = $2 \
+        "SELECT max(run_id) FROM rretl_lineage WHERE tbl = $1 AND col = $2 \
          AND outcome = 'applied'",
         &[Value::Text(table.into()), Value::Text(column.into())],
     )?)?;
     match top.first().and_then(|r| r.first()) {
         Some(Value::Int(t)) if *t == run_id => Ok(()),
         Some(Value::Int(t)) => Err(Error::Unsupported(format!(
-            "retl run {run_id} is buried under run {t} on `{table}.{column}` — runs \
+            "rretl run {run_id} is buried under run {t} on `{table}.{column}` — runs \
              unwind LIFO; revert or putback run {t} first"
         ))),
         _ => Err(Error::Corrupt(format!(
-            "retl run {run_id} claims outcome 'applied' but no applied run tops \
+            "rretl run {run_id} claims outcome 'applied' but no applied run tops \
              `{table}.{column}`"
         ))),
     }
@@ -1053,21 +1053,21 @@ fn revert_in(
     db: &crate::Database,
     s: &mut WriteSession<'_>,
     run_id: i64,
-) -> Result<RetlReport> {
+) -> Result<RretlReport> {
     let bundle = db.engine.schema();
     if !bundle.schema.tables.iter().any(|t| t.name == T_LINEAGE && !t.dead) {
-        return Err(Error::Unsupported("no retl lineage in this database".into()));
+        return Err(Error::Unsupported("no rretl lineage in this database".into()));
     }
     // The lineage row is the residuals' meaning (§8.2): missing row = hard
     // error, never a NULL read.
     let lin = rows_of(s.query(
         "SELECT lens, tbl, col, source_hash, output_hash, outcome, residual_hash \
-         FROM retl_lineage WHERE run_id = $1 AND step_no = 1",
+         FROM rretl_lineage WHERE run_id = $1 AND step_no = 1",
         &[Value::Int(run_id)],
     )?)?;
     let Some(lin) = lin.into_iter().next() else {
         return Err(Error::Unsupported(format!(
-            "no retl run {run_id} in the lineage — without its lineage row the residuals \
+            "no rretl run {run_id} in the lineage — without its lineage row the residuals \
              are uninterpretable, and guessing is refused"
         )));
     };
@@ -1078,17 +1078,17 @@ fn revert_in(
     match outcome.as_str() {
         "applied" => {}
         "reverted" => {
-            return Err(Error::Unsupported(format!("retl run {run_id} is already reverted")))
+            return Err(Error::Unsupported(format!("rretl run {run_id} is already reverted")))
         }
         other => {
             return Err(Error::Unsupported(format!(
-                "retl run {run_id} has outcome `{other}`; only an applied run can be reverted"
+                "rretl run {run_id} has outcome `{other}`; only an applied run can be reverted"
             )))
         }
     }
 
     lifo_gate(s, run_id, &table, &column)?;
-    let lens = db.load_lens_for_retl(&pair)?;
+    let lens = db.load_lens_for_rretl(&pair)?;
     let target = db.resolve_target(&table, &column)?;
     let pk_col = &target.pk_col;
 
@@ -1118,7 +1118,7 @@ fn revert_in(
         let x = match &lens.rex {
             Some(_) => {
                 let res = rows_of(s.query(
-                    "SELECT residual FROM retl_residual WHERE run_id = $1 AND pk_enc = $2",
+                    "SELECT residual FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
                     &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
                 )?)?;
                 // NULL as a residual VALUE would arrive here as Value::Null in
@@ -1147,32 +1147,32 @@ fn revert_in(
         )));
     }
 
-    s.query("DELETE FROM retl_residual WHERE run_id = $1", &[Value::Int(run_id)])?;
+    s.query("DELETE FROM rretl_residual WHERE run_id = $1", &[Value::Int(run_id)])?;
     s.query(
-        "UPDATE retl_lineage SET outcome = 'reverted' WHERE run_id = $1 AND step_no = 1",
+        "UPDATE rretl_lineage SET outcome = 'reverted' WHERE run_id = $1 AND step_no = 1",
         &[Value::Int(run_id)],
     )?;
-    Ok(RetlReport { run_id, rows: n_rows, residuals: 0 })
+    Ok(RretlReport { run_id, rows: n_rows, residuals: 0 })
 }
 
-/// The putback body — see [`crate::Database::retl_putback`] for the contract.
+/// The putback body — see [`crate::Database::rretl_putback`] for the contract.
 fn putback_in(
     db: &crate::Database,
     s: &mut WriteSession<'_>,
     run_id: i64,
-) -> Result<RetlReport> {
+) -> Result<RretlReport> {
     let bundle = db.engine.schema();
     if !bundle.schema.tables.iter().any(|t| t.name == T_LINEAGE && !t.dead) {
-        return Err(Error::Unsupported("no retl lineage in this database".into()));
+        return Err(Error::Unsupported("no rretl lineage in this database".into()));
     }
     let lin = rows_of(s.query(
-        "SELECT lens, tbl, col, outcome, residual_hash FROM retl_lineage \
+        "SELECT lens, tbl, col, outcome, residual_hash FROM rretl_lineage \
          WHERE run_id = $1 AND step_no = 1",
         &[Value::Int(run_id)],
     )?)?;
     let Some(lin) = lin.into_iter().next() else {
         return Err(Error::Unsupported(format!(
-            "no retl run {run_id} in the lineage — without its lineage row the residuals \
+            "no rretl run {run_id} in the lineage — without its lineage row the residuals \
              are uninterpretable, and guessing is refused"
         )));
     };
@@ -1183,14 +1183,14 @@ fn putback_in(
         "applied" => {}
         other => {
             return Err(Error::Unsupported(format!(
-                "retl run {run_id} has outcome `{other}`; only an applied run can be \
+                "rretl run {run_id} has outcome `{other}`; only an applied run can be \
                  putback-inverted"
             )))
         }
     }
 
     lifo_gate(s, run_id, &table, &column)?;
-    let lens = db.load_lens_for_retl(&pair)?;
+    let lens = db.load_lens_for_rretl(&pair)?;
     let target = db.resolve_target(&table, &column)?;
     let pk_col = &target.pk_col;
 
@@ -1209,7 +1209,7 @@ fn putback_in(
         let x = match &lens.rex {
             Some(rex) => {
                 let res = rows_of(s.query(
-                    "SELECT residual FROM retl_residual WHERE run_id = $1 AND pk_enc = $2",
+                    "SELECT residual FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
                     &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
                 )?)?;
                 let Some(r) = res.into_iter().next().and_then(|mut r| {
@@ -1281,12 +1281,12 @@ fn putback_in(
     // Residuals not consumed belong to rows deleted after the apply. The
     // deletion is an edit, and it survives: the residuals are discarded with
     // the rows they described. (The image story's crop.)
-    s.query("DELETE FROM retl_residual WHERE run_id = $1", &[Value::Int(run_id)])?;
+    s.query("DELETE FROM rretl_residual WHERE run_id = $1", &[Value::Int(run_id)])?;
     s.query(
-        "UPDATE retl_lineage SET outcome = 'putback' WHERE run_id = $1 AND step_no = 1",
+        "UPDATE rretl_lineage SET outcome = 'putback' WHERE run_id = $1 AND step_no = 1",
         &[Value::Int(run_id)],
     )?;
-    Ok(RetlReport { run_id, rows: n_rows, residuals: consumed })
+    Ok(RretlReport { run_id, rows: n_rows, residuals: consumed })
 }
 
 fn putres_err(pk: &Value, y: &Value, e: &Error) -> Error {

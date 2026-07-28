@@ -57,7 +57,7 @@ This is LSM cold tiers / S3-backed pages / Snowflake's warm-cold split, applied 
   substrate — this design gives #22 a concrete consumer.
 - A cold read that fails (store unreachable, hash mismatch) is an **explicit error**
   ("tiered unit unavailable / changed"), never a silent wrong/empty value — the mirror's
-  hash-mismatch rule (§8 of RETL-BIDI's artefact-correlation lessons: fail loud, never wrong input).
+  hash-mismatch rule (§8 of RRETL-BIDI's artefact-correlation lessons: fail loud, never wrong input).
 
 ## 4. The Django-blob use case, concretely
 
@@ -86,7 +86,7 @@ The expensive server gets its disk back without changing application code.
   S3-backed page stores (Neon, ClickHouse `MergeTree` `TTL ... TO DISK/VOLUME`), and Django's own
   `FileField` + remote storage backends. The twist: the cold store is *the same engine's file
   format*, so read-back is a real query, not an opaque blob get, and the mirror gives verification +
-  bidirectional flow for free. pristine-tar/DVC-style content-hash correlation (RETL-BIDI's lessons)
+  bidirectional flow for free. pristine-tar/DVC-style content-hash correlation (RRETL-BIDI's lessons)
   is the identity model — hash + lineage, never path.
 
 ## 7. Staging

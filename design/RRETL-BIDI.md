@@ -1,4 +1,4 @@
-# RETL-BIDI — reversibel ETL for PySpell (design-forarbeid)
+# RRETL-BIDI — reversibel ETL for PySpell (design-forarbeid)
 
 **Status: prior-art-research (2026-07-16). Selve designet er ikke skrevet — dette dokumentet er
 forarbeidet oppgave #52 krever før design + adversarial review, samme disiplin som DESIGN-DDL.**
@@ -185,7 +185,7 @@ suksess i kapitlene under.
 
 **Adopsjon.** Prototype-interpreter ([github.com/kztk-m/sparcl](https://github.com/kztk-m/sparcl)), Agda-formalisering; motivert av serializers, Huffman/aritmetisk koding, LZ77, tre-rekonstruksjon. Forskningsspråk uten industriell bruk.
 
-**Lessons for mpedb.** (1) Sparcls kjerneobservasjon er vår: **"partial-invertibility is the norm and bijectivity is a special case"** — realistiske pipelines har invertible deler parametrisert av irreversible deler (modellen i adaptiv kompresjon bygges likt begge veier). mpedb-design bør la stages ta statiske parametre som ikke inngår i residual-regnskapet. (2) pin-regelen er den viktige grensedisiplinen: en verdi som krysser fra reversibel til irreversibel kode må enten være statisk eller **bevares i output/residual** — formuler dette som en regel i RETL-BIDI: "alt en lossy stage leser av pipeline-data skal gjenfinnes i (output, residual)". (3) Sparcls lift er identisk med mpedbs brukerdeklarerte forward/inverse-par, og Sparcl kan heller ikke verifisere paret statisk — de *stoler*; mpedb property-tester i stedet, som operasjonelt er sterkere. Selv Sparcl valgte runtime-assertions (with-eksklusivitet) fremfor refinement types "for å holde typene enkle" — runtime-deklarerte residualer + property-testing er altså et legitimt designpunkt, ikke en fattigmannsløsning; prisen er at feil oppdages ved kjøring/test, ikke ved kompilering. (4) Typenivå-tilnærmingen kjøpte dem én ting testing ikke gir: *totalitet* av garantien (alle input, ikke bare testede) — vær ærlig i dokumentet på at property-testing gir statistisk, ikke universell, evidens.
+**Lessons for mpedb.** (1) Sparcls kjerneobservasjon er vår: **"partial-invertibility is the norm and bijectivity is a special case"** — realistiske pipelines har invertible deler parametrisert av irreversible deler (modellen i adaptiv kompresjon bygges likt begge veier). mpedb-design bør la stages ta statiske parametre som ikke inngår i residual-regnskapet. (2) pin-regelen er den viktige grensedisiplinen: en verdi som krysser fra reversibel til irreversibel kode må enten være statisk eller **bevares i output/residual** — formuler dette som en regel i RRETL-BIDI: "alt en lossy stage leser av pipeline-data skal gjenfinnes i (output, residual)". (3) Sparcls lift er identisk med mpedbs brukerdeklarerte forward/inverse-par, og Sparcl kan heller ikke verifisere paret statisk — de *stoler*; mpedb property-tester i stedet, som operasjonelt er sterkere. Selv Sparcl valgte runtime-assertions (with-eksklusivitet) fremfor refinement types "for å holde typene enkle" — runtime-deklarerte residualer + property-testing er altså et legitimt designpunkt, ikke en fattigmannsløsning; prisen er at feil oppdages ved kjøring/test, ikke ved kompilering. (4) Typenivå-tilnærmingen kjøpte dem én ting testing ikke gir: *totalitet* av garantien (alle input, ikke bare testede) — vær ærlig i dokumentet på at property-testing gir statistisk, ikke universell, evidens.
 
 ### 4. Bennett — teoriens grenser for residualen
 
@@ -369,7 +369,7 @@ Tre shipped/reelle systemer markerer hva som faktisk er oppnåelig, sortert ette
 
 **Smerte/suksess.** Embedded-økosystemets svar på «hvem eier bakgrunnsarbeid» er altså tredelt og mapper nøyaktig på våre opsjoner: **in-commit** (sqlite-triggere, cr-sqlite-capture — funker fordi capture er billig og deterministisk), **eksplisitt daemon** (litestream, mpedbs `mirror pull` — operasjonelt bevist, men fremdrift krever at daemonen kjører), og **kooperativt-på-commit** (WAL-checkpoint — krever ingen ekstra prosess, men stjeler latens fra en tilfeldig writer og sulter under kontinuerlig last).
 
-**Lærdommer for mpedb.** (1) I en no-server-modell kan ikke hooks bære kryssprosess-ETL — **den durable CDC-loggen i delt lager er den eneste pålitelige kanalen**; mpedb har den allerede. (2) cr-sqlite-splitten er riktig: in-commit gjør kun billig, deterministisk capture (CDC-entry); transformen deferres. (3) Velges daemon: håndhev single-instance med lease/lock i shm (litestreams korrupsjons-advarsel; mpedb har robust-mutex + pid-identitet fra før) og **fuzz to daemons som racer**. (4) Spawn-on-attach er skjørt (uklart eierskap, dør med prosessen); en eksplisitt kommando à la `mpedb retl run` — samme modell som `mirror pull` og litestream — er den normaliserte operasjonsmodellen. Kooperativt-på-commit kan i høyden være opportunistisk «top-up», aldri primær fremdriftsmekanisme (starvation-presedensen).
+**Lærdommer for mpedb.** (1) I en no-server-modell kan ikke hooks bære kryssprosess-ETL — **den durable CDC-loggen i delt lager er den eneste pålitelige kanalen**; mpedb har den allerede. (2) cr-sqlite-splitten er riktig: in-commit gjør kun billig, deterministisk capture (CDC-entry); transformen deferres. (3) Velges daemon: håndhev single-instance med lease/lock i shm (litestreams korrupsjons-advarsel; mpedb har robust-mutex + pid-identitet fra før) og **fuzz to daemons som racer**. (4) Spawn-on-attach er skjørt (uklart eierskap, dør med prosessen); en eksplisitt kommando à la `mpedb rretl run` — samme modell som `mirror pull` og litestream — er den normaliserte operasjonsmodellen. Kooperativt-på-commit kan i høyden være opportunistisk «top-up», aldri primær fremdriftsmekanisme (starvation-presedensen).
 
 ### 4. Cursor/watermark + idempotens: Kafka, Debezium, Flink
 
@@ -438,7 +438,7 @@ Tre shipped/reelle systemer markerer hva som faktisk er oppnåelig, sortert ette
 
 **Lærdommer for mpedb.**
 - Minimalt metadatasett per versjon, immutabelt og lagret ved siden av hashen: `author, timestamp, comment, prev_hash`. `prev_hash`-lenken gjør historikken til en kjede som kan diffes og auditeres — det er nøyaktig feltsettet Flyway/Liquibase konvergerte på, pluss lenken som content-addressering gjør gratis.
-- Diff-flaten er kilde-mot-kilde, ikke hash-mot-hash: `mpedb retl diff <navn>@v1 <navn>@v2` må vise PySpell-tekstdiff. Smalltalk-changesets feilet fordi endringsloggen ikke var lesbar som diff.
+- Diff-flaten er kilde-mot-kilde, ikke hash-mot-hash: `mpedb rretl diff <navn>@v1 <navn>@v2` må vise PySpell-tekstdiff. Smalltalk-changesets feilet fordi endringsloggen ikke var lesbar som diff.
 - DB-historikk er bekvemmelighet, git er sannhet: både Smalltalk og Databricks endte der. Behold in-DB-versjonskjeden for audit og rollback, men gjør tekst-eksport til git førsteklasses (jf. lærdom 1).
 - Redigering av andres funksjon bør være forslag, ikke overskriving: siden en edit uansett skaper ny hash, er "suggest" bare *ny hash + notat + prev_hash-peker uten å flytte navnebindingen* — eieren flytter bindingen ved aksept. Observable viser at dette + et kommentarfelt er hele mekanismen brukere faktisk trenger.
 
@@ -494,7 +494,7 @@ Reversible Intermediate Language — «Concurrent», ikke «Clean») viser
 advarselens form: med delt mutérbar tilstand må en kausalitets-DAG over
 oppdateringer akkumuleres ved kjøretid — SELVE KJØREPLANEN blir residual-data.
 Per-rad-residualer forblir ordningsfrie KUN når spells er raduavhengige; PySpell
-uten delt tilstand mellom kall gir oss det gratis i dag, og `retl apply` må aldri
+uten delt tilstand mellom kall gir oss det gratis i dag, og `rretl apply` må aldri
 introdusere en delt akkumulator uten å vite at planen da må inn i residualen.
 
 ### RC 2023–2025 for øvrig

@@ -1,4 +1,4 @@
-//! `retl apply`/`revert` — stage 2 of #52 (design/DESIGN-RETL.md §11, §12.2).
+//! `rretl apply`/`revert` — stage 2 of #52 (design/DESIGN-RRETL.md §11, §12.2).
 //!
 //! The contract under test: an in-place column transform keeps what was lost
 //! (per-row residuals, keyed by run), verifies 100% of rows against the source
@@ -92,7 +92,7 @@ fn apply_then_revert_round_trips_exactly() {
     let original = vec![-5i64, 3, 0, -700, 42, -1];
     seed(&d, &original);
 
-    let report = d.retl_apply("mag", "t", "v").unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
     assert_eq!(report.rows, 6);
     assert_eq!(report.residuals, 6, "one residual per row, keyed (run_id, pk)");
     assert_eq!(col_v(&d), vec![5, 3, 0, 700, 42, 1], "signs destroyed in place");
@@ -100,26 +100,26 @@ fn apply_then_revert_round_trips_exactly() {
     // What was lost is IN the database, addressable by run:
     let res = rows(
         d.query(
-            "SELECT count(*) FROM retl_residual WHERE run_id = $1",
+            "SELECT count(*) FROM rretl_residual WHERE run_id = $1",
             &[Value::Int(report.run_id)],
         )
         .unwrap(),
     );
     assert_eq!(res[0][0], Value::Int(6));
 
-    let log = d.retl_log().unwrap();
+    let log = d.rretl_log().unwrap();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].outcome, "applied");
 
-    let back = d.retl_revert(report.run_id).unwrap();
+    let back = d.rretl_revert(report.run_id).unwrap();
     assert_eq!(back.rows, 6);
     assert_eq!(col_v(&d), original, "revert restores the column exactly");
-    assert_eq!(d.retl_log().unwrap()[0].outcome, "reverted");
+    assert_eq!(d.rretl_log().unwrap()[0].outcome, "reverted");
 
     // And the run's residuals are gone — consumed, not leaked.
     let res = rows(
         d.query(
-            "SELECT count(*) FROM retl_residual WHERE run_id = $1",
+            "SELECT count(*) FROM rretl_residual WHERE run_id = $1",
             &[Value::Int(report.run_id)],
         )
         .unwrap(),
@@ -141,11 +141,11 @@ fn a_bijective_apply_keeps_no_residuals_and_still_reverts() {
     d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
     seed(&d, &[1, -2, 3]);
 
-    let report = d.retl_apply("flip", "t", "v").unwrap();
+    let report = d.rretl_apply("flip", "t", "v").unwrap();
     assert_eq!(report.residuals, 0, "bijective = residual-free, enforced");
     assert_eq!(col_v(&d), vec![-1, 2, -3]);
 
-    d.retl_revert(report.run_id).unwrap();
+    d.rretl_revert(report.run_id).unwrap();
     assert_eq!(col_v(&d), vec![1, -2, 3]);
     let _ = std::fs::remove_file(&path);
 }
@@ -160,7 +160,7 @@ fn a_lossy_pair_is_refused_by_name() {
     d.create_lens("crush", "crush", "uncrush", LensClass::Lossy).unwrap();
     seed(&d, &[1, 2]);
 
-    let e = d.retl_apply("crush", "t", "v").unwrap_err().to_string();
+    let e = d.rretl_apply("crush", "t", "v").unwrap_err().to_string();
     assert!(e.contains("lossy"), "{e}");
     assert!(e.contains("keep the source"), "{e}");
     assert_eq!(col_v(&d), vec![1, 2], "nothing was touched");
@@ -179,7 +179,7 @@ fn a_refused_row_aborts_the_whole_run_and_is_lineage() {
     s.query("INSERT INTO t (id, v, w) VALUES (99, NULL, 0)", &[]).unwrap();
     s.commit().unwrap();
 
-    let e = d.retl_apply("mag", "t", "v").unwrap_err().to_string();
+    let e = d.rretl_apply("mag", "t", "v").unwrap_err().to_string();
     assert!(e.contains("refuses row"), "{e}");
     assert!(e.contains("aborted"), "{e}");
 
@@ -190,7 +190,7 @@ fn a_refused_row_aborts_the_whole_run_and_is_lineage() {
     assert_eq!(vals[2][0], Value::Null);
 
     // Failed runs are first-class lineage (§7), in their own transaction.
-    let log = d.retl_log().unwrap();
+    let log = d.rretl_log().unwrap();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].outcome, "failed");
     assert!(log[0].error.contains("refuses row"), "{}", log[0].error);
@@ -216,17 +216,17 @@ fn a_type_changing_pair_needs_an_any_column() {
         .unwrap();
     seed(&d, &[0, 100, -40]);
 
-    let e = d.retl_apply("promote", "t", "v").unwrap_err().to_string();
+    let e = d.rretl_apply("promote", "t", "v").unwrap_err().to_string();
     assert!(e.contains("does not fit"), "{e}");
     assert!(e.contains("any"), "the refusal should say what WOULD work: {e}");
     assert_eq!(col_v(&d), vec![0, 100, -40], "refused early, nothing touched");
 
     // The Any column takes it — and revert brings back the exact ints.
-    let report = d.retl_apply("promote", "t", "w").unwrap();
+    let report = d.rretl_apply("promote", "t", "w").unwrap();
     let w = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
     assert_eq!(w[0][0], Value::Float(0.0));
     assert_eq!(w[2][0], Value::Float(-40.0));
-    d.retl_revert(report.run_id).unwrap();
+    d.rretl_revert(report.run_id).unwrap();
     let w = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
     assert_eq!(w[0][0], Value::Int(0), "revert restores the VALUE AND THE TYPE");
     assert_eq!(w[1][0], Value::Int(100));
@@ -245,21 +245,21 @@ fn stacked_runs_unwind_lifo_only() {
     d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
     seed(&d, &[-1, 2]);
 
-    let first = d.retl_apply("mag", "t", "v").unwrap(); // [1, 2]
-    let second = d.retl_apply("flip", "t", "v").unwrap(); // [-1, -2]
+    let first = d.rretl_apply("mag", "t", "v").unwrap(); // [1, 2]
+    let second = d.rretl_apply("flip", "t", "v").unwrap(); // [-1, -2]
     assert!(second.run_id > first.run_id, "run ids are a counter, never reused");
     assert_eq!(col_v(&d), vec![-1, -2]);
 
     // The buried run is refused BY NAME, for both unwind operations.
-    for res in [d.retl_revert(first.run_id), d.retl_putback(first.run_id)] {
+    for res in [d.rretl_revert(first.run_id), d.rretl_putback(first.run_id)] {
         let e = res.unwrap_err().to_string();
         assert!(e.contains("buried under"), "{e}");
         assert!(e.contains(&second.run_id.to_string()), "the blocker is named: {e}");
     }
 
     // LIFO order unwinds cleanly to the original.
-    d.retl_revert(second.run_id).unwrap();
-    d.retl_revert(first.run_id).unwrap();
+    d.rretl_revert(second.run_id).unwrap();
+    d.rretl_revert(first.run_id).unwrap();
     assert_eq!(col_v(&d), vec![-1, 2]);
     let _ = std::fs::remove_file(&path);
 }
@@ -272,13 +272,13 @@ fn revert_refuses_a_column_changed_outside_the_pipeline() {
     let (d, path) = db("tamper");
     define_abs_pair(&d);
     seed(&d, &[-5, 3]);
-    let report = d.retl_apply("mag", "t", "v").unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
 
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = 999 WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
 
-    let e = d.retl_revert(report.run_id).unwrap_err().to_string();
+    let e = d.rretl_revert(report.run_id).unwrap_err().to_string();
     assert!(e.contains("changed outside the pipeline"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
@@ -295,11 +295,11 @@ fn a_missing_residual_row_is_a_hard_error() {
     let (d, path) = db("gone");
     define_abs_pair(&d);
     seed(&d, &[-5, 3]);
-    let report = d.retl_apply("mag", "t", "v").unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
 
     let mut s = d.begin().unwrap();
     s.query(
-        "DELETE FROM retl_residual WHERE run_id = $1 AND pk_enc = $2",
+        "DELETE FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
         &[Value::Int(report.run_id), Value::Blob(vec![2, 0, 0, 0, 0, 0, 0, 0, 0])],
     )
     .unwrap();
@@ -309,7 +309,7 @@ fn a_missing_residual_row_is_a_hard_error() {
     // stored set no longer hashes to what the apply recorded. (The per-row
     // missing-row check still stands behind it, for invariant breaks inside
     // the writing transaction itself.)
-    let e = d.retl_revert(report.run_id).unwrap_err().to_string();
+    let e = d.rretl_revert(report.run_id).unwrap_err().to_string();
     assert!(e.contains("no longer hash"), "{e}");
     assert!(e.contains("fabricate"), "{e}");
     // And nothing was half-reverted: the abort rolled the whole txn back.
@@ -324,8 +324,8 @@ fn reverting_an_unknown_run_is_refused() {
     let (d, path) = db("norun");
     define_abs_pair(&d);
     seed(&d, &[1]);
-    let e = d.retl_revert(42).unwrap_err().to_string();
-    assert!(e.contains("no retl"), "{e}");
+    let e = d.rretl_revert(42).unwrap_err().to_string();
+    assert!(e.contains("no rretl"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -335,9 +335,9 @@ fn double_revert_is_refused_by_outcome() {
     let (d, path) = db("double");
     define_abs_pair(&d);
     seed(&d, &[-1]);
-    let report = d.retl_apply("mag", "t", "v").unwrap();
-    d.retl_revert(report.run_id).unwrap();
-    let e = d.retl_revert(report.run_id).unwrap_err().to_string();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
+    d.rretl_revert(report.run_id).unwrap();
+    let e = d.rretl_revert(report.run_id).unwrap_err().to_string();
     assert!(e.contains("already reverted"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
@@ -348,8 +348,8 @@ fn the_bookkeeping_tables_are_refused_as_targets() {
     let (d, path) = db("meta");
     define_abs_pair(&d);
     seed(&d, &[1]);
-    let _ = d.retl_apply("mag", "t", "v").unwrap(); // creates the tables
-    let e = d.retl_apply("mag", "retl_lineage", "rows").unwrap_err().to_string();
+    let _ = d.rretl_apply("mag", "t", "v").unwrap(); // creates the tables
+    let e = d.rretl_apply("mag", "rretl_lineage", "rows").unwrap_err().to_string();
     assert!(e.contains("bookkeeping"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
@@ -407,7 +407,7 @@ fn putback_carries_edits_back_and_keeps_the_crop() {
     }
     s.commit().unwrap();
 
-    let report = d.retl_apply("gray", "t", "v").unwrap();
+    let report = d.rretl_apply("gray", "t", "v").unwrap();
     let gray = col_v(&d);
     assert_eq!(gray, vec![93, 90, 93, 90], "luma only — colour is gone from the column");
 
@@ -421,10 +421,10 @@ fn putback_carries_edits_back_and_keeps_the_crop() {
 
     // revert must REFUSE this column — it changed outside the pipeline —
     // and putback is exactly the operation that accepts it.
-    let e = d.retl_revert(report.run_id).unwrap_err().to_string();
+    let e = d.rretl_revert(report.run_id).unwrap_err().to_string();
     assert!(e.contains("changed outside the pipeline"), "{e}");
 
-    let back = d.retl_putback(report.run_id).unwrap();
+    let back = d.rretl_putback(report.run_id).unwrap();
     assert_eq!(back.rows, 3, "the cropped pixel is not resurrected");
 
     let after = col_v(&d);
@@ -439,14 +439,14 @@ fn putback_carries_edits_back_and_keeps_the_crop() {
     // The run is consumed: residuals gone, outcome recorded, second putback refused.
     let res = rows(
         d.query(
-            "SELECT count(*) FROM retl_residual WHERE run_id = $1",
+            "SELECT count(*) FROM rretl_residual WHERE run_id = $1",
             &[Value::Int(report.run_id)],
         )
         .unwrap(),
     );
     assert_eq!(res[0][0], Value::Int(0));
-    assert_eq!(d.retl_log().unwrap()[0].outcome, "putback");
-    let e = d.retl_putback(report.run_id).unwrap_err().to_string();
+    assert_eq!(d.rretl_log().unwrap()[0].outcome, "putback");
+    let e = d.rretl_putback(report.run_id).unwrap_err().to_string();
     assert!(e.contains("putback"), "{e}");
 
     let _ = std::fs::remove_file(&path);
@@ -459,13 +459,13 @@ fn putback_refuses_rows_inserted_after_the_apply() {
     let (d, path) = db("putback-new");
     define_abs_pair(&d);
     seed(&d, &[-5, 3]);
-    let report = d.retl_apply("mag", "t", "v").unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
 
     let mut s = d.begin().unwrap();
     s.query("INSERT INTO t (id, v, w) VALUES (99, 7, 0)", &[]).unwrap();
     s.commit().unwrap();
 
-    let e = d.retl_putback(report.run_id).unwrap_err().to_string();
+    let e = d.rretl_putback(report.run_id).unwrap_err().to_string();
     assert!(e.contains("no residual"), "{e}");
     assert!(e.contains("inserted after the apply"), "{e}");
     // Nothing half-inverted:
@@ -482,13 +482,13 @@ fn putback_refuses_an_edit_outside_the_pairs_image() {
     let (d, path) = db("putback-bad");
     define_abs_pair(&d);
     seed(&d, &[-5, 3]);
-    let report = d.retl_apply("mag", "t", "v").unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
 
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = $1 WHERE id = 0", &[Value::Int(-9)]).unwrap();
     s.commit().unwrap();
 
-    let e = d.retl_putback(report.run_id).unwrap_err().to_string();
+    let e = d.rretl_putback(report.run_id).unwrap_err().to_string();
     assert!(e.contains("outside the pair's image"), "{e}");
     assert!(e.contains("Int(-9)"), "the offending edit is named: {e}");
     let _ = std::fs::remove_file(&path);
@@ -503,7 +503,7 @@ fn bijective_putback_carries_edits_and_new_rows() {
     def(&d, "def flip(x):\n    return -x\n");
     d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
     seed(&d, &[1, -2]);
-    let report = d.retl_apply("flip", "t", "v").unwrap();
+    let report = d.rretl_apply("flip", "t", "v").unwrap();
     assert_eq!(col_v(&d), vec![-1, 2]);
 
     let mut s = d.begin().unwrap();
@@ -511,7 +511,7 @@ fn bijective_putback_carries_edits_and_new_rows() {
     s.query("INSERT INTO t (id, v, w) VALUES (9, 50, 0)", &[]).unwrap();
     s.commit().unwrap();
 
-    let back = d.retl_putback(report.run_id).unwrap();
+    let back = d.rretl_putback(report.run_id).unwrap();
     assert_eq!(back.rows, 3);
     assert_eq!(col_v(&d), vec![100, -2, -50], "edit and new row both inverted");
     let _ = std::fs::remove_file(&path);
@@ -543,12 +543,12 @@ fn a_null_residual_value_round_trips_and_is_distinct_from_missing() {
 
     let original = vec![5i64, 250, 100, 101];
     seed(&d, &original);
-    let report = d.retl_apply("clamp", "t", "v").unwrap();
+    let report = d.rretl_apply("clamp", "t", "v").unwrap();
     assert_eq!(col_v(&d), vec![5, 100, 100, 100], "clamped in place");
     // Every row has a residual ROW; two of them hold the VALUE NULL.
     let nulls = rows(
         d.query(
-            "SELECT count(*) FROM retl_residual WHERE run_id = $1 AND residual IS NULL",
+            "SELECT count(*) FROM rretl_residual WHERE run_id = $1 AND residual IS NULL",
             &[Value::Int(report.run_id)],
         )
         .unwrap(),
@@ -560,7 +560,7 @@ fn a_null_residual_value_round_trips_and_is_distinct_from_missing() {
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = 7 WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
-    d.retl_putback(report.run_id).unwrap();
+    d.rretl_putback(report.run_id).unwrap();
     assert_eq!(col_v(&d), vec![7, 250, 100, 101], "edit kept; clamped values restored");
 
     let _ = std::fs::remove_file(&path);
@@ -591,7 +591,7 @@ fn text_redaction_applies_and_reverts_exactly() {
     }
     s.commit().unwrap();
 
-    let report = d.retl_apply("redact", "t", "w").unwrap();
+    let report = d.rretl_apply("redact", "t", "w").unwrap();
     let redacted = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
     for r in &redacted {
         assert_eq!(r[0], Value::Text("[REDACTED]".into()));
@@ -601,14 +601,14 @@ fn text_redaction_applies_and_reverts_exactly() {
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET w = 'peek' WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
-    let e = d.retl_putback(report.run_id).unwrap_err().to_string();
+    let e = d.rretl_putback(report.run_id).unwrap_err().to_string();
     assert!(e.contains("outside the pair's image"), "{e}");
 
     // Restore the redaction text and revert exactly.
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET w = '[REDACTED]' WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
-    let back = d.retl_revert(report.run_id).unwrap();
+    let back = d.rretl_revert(report.run_id).unwrap();
     assert_eq!(back.rows, 3);
     let after = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
     for (r, want) in after.iter().zip(originals.iter()) {
@@ -624,9 +624,9 @@ fn text_redaction_applies_and_reverts_exactly() {
 fn an_empty_table_applies_and_reverts_without_drama() {
     let (d, path) = db("empty-tbl");
     define_abs_pair(&d);
-    let report = d.retl_apply("mag", "t", "v").unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
     assert_eq!((report.rows, report.residuals), (0, 0));
-    d.retl_revert(report.run_id).unwrap();
+    d.rretl_revert(report.run_id).unwrap();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -638,7 +638,7 @@ fn a_run_survives_reopen_and_puts_back_from_a_fresh_handle() {
     let (d, path) = db("reopen");
     define_abs_pair(&d);
     seed(&d, &[-5, 3, -700]);
-    let report = d.retl_apply("mag", "t", "v").unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
     let run_id = report.run_id;
     drop(d);
 
@@ -646,7 +646,7 @@ fn a_run_survives_reopen_and_puts_back_from_a_fresh_handle() {
     let mut s = d2.begin().unwrap();
     s.query("UPDATE t SET v = 9 WHERE id = 1", &[]).unwrap();
     s.commit().unwrap();
-    d2.retl_putback(run_id).unwrap();
+    d2.rretl_putback(run_id).unwrap();
     assert_eq!(
         rows(d2.query("SELECT v FROM t ORDER BY id", &[]).unwrap())
             .into_iter()
@@ -703,9 +703,9 @@ primary_key = ["k"]
     }
     s.commit().unwrap();
 
-    let report = d.retl_apply("mag", "t", "v").unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
     assert_eq!(report.residuals, 3);
-    d.retl_revert(report.run_id).unwrap();
+    d.rretl_revert(report.run_id).unwrap();
     let vals = rows(d.query("SELECT v FROM t ORDER BY k", &[]).unwrap());
     assert_eq!(
         vals.into_iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
@@ -759,8 +759,8 @@ primary_key = ["id"]
         .unwrap();
     }
     s.commit().unwrap();
-    let report = d.retl_apply("mag", "t", "v").unwrap();
-    d.retl_revert(report.run_id).unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
+    d.rretl_revert(report.run_id).unwrap();
     let neg = rows(d.query("SELECT count(*) FROM t WHERE v < 0", &[]).unwrap());
     assert_eq!(neg[0][0], Value::Int(49), "restored under wal durability");
     let _ = std::fs::remove_file(&path);
@@ -785,19 +785,19 @@ fn five_thousand_rows_apply_and_put_back() {
         .unwrap();
     }
     s.commit().unwrap();
-    let report = d.retl_apply("mag", "t", "v").unwrap();
+    let report = d.rretl_apply("mag", "t", "v").unwrap();
     assert_eq!(report.rows, 5000);
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = 12345 WHERE id = 100", &[]).unwrap();
     s.commit().unwrap();
-    d.retl_putback(report.run_id).unwrap();
+    d.rretl_putback(report.run_id).unwrap();
     let v100 = rows(d.query("SELECT v FROM t WHERE id = 100", &[]).unwrap());
     assert_eq!(v100[0][0], Value::Int(-12345), "edit carried back with its sign");
     let _ = std::fs::remove_file(&path);
 }
 
 // ---------------------------------------------------------------------------
-// The randomized chain — RETL's gold, model-checked
+// The randomized chain — rRETL's gold, model-checked
 // ---------------------------------------------------------------------------
 
 /// One pool pair: the PySpell functions plus a RUST MIRROR — the test's
@@ -1088,7 +1088,7 @@ fn a_random_chain_of_twelve_transforms_unwinds_with_edits_carried() {
         let p = &pool[pick];
         used.insert(pick);
         let before = col_v(&d);
-        let report = d.retl_apply(p.name, "t", "v").unwrap();
+        let report = d.rretl_apply(p.name, "t", "v").unwrap();
         let residuals: Vec<Option<i64>> = model.iter().map(|x| (p.rex)(*x)).collect();
         for x in model.iter_mut() {
             *x = (p.fwd)(*x);
@@ -1162,7 +1162,7 @@ fn a_random_chain_of_twelve_transforms_unwinds_with_edits_carried() {
                 edits_made += 1;
             }
         }
-        d.retl_putback(run_id).unwrap();
+        d.rretl_putback(run_id).unwrap();
         for (x, r) in model.iter_mut().zip(residuals.iter()) {
             *x = (p.inv)(*x, *r);
         }
@@ -1196,20 +1196,20 @@ fn a_user_table_named_like_the_bookkeeping_is_refused() {
     define_abs_pair(&d);
     seed(&d, &[-1]);
     let mut s = d.begin().unwrap();
-    s.query("CREATE TABLE retl_lineage (whatever INTEGER PRIMARY KEY, x TEXT)", &[])
+    s.query("CREATE TABLE rretl_lineage (whatever INTEGER PRIMARY KEY, x TEXT)", &[])
         .unwrap();
     s.commit().unwrap();
 
-    let e = d.retl_apply("mag", "t", "v").unwrap_err().to_string();
-    assert!(e.contains("NOT retl's bookkeeping table"), "{e}");
+    let e = d.rretl_apply("mag", "t", "v").unwrap_err().to_string();
+    assert!(e.contains("NOT rretl's bookkeeping table"), "{e}");
     assert!(e.contains("whatever"), "the imposter's columns are named: {e}");
     // And nothing was written into the imposter:
-    let rows_in = rows(d.query("SELECT count(*) FROM retl_lineage", &[]).unwrap());
+    let rows_in = rows(d.query("SELECT count(*) FROM rretl_lineage", &[]).unwrap());
     assert_eq!(rows_in[0][0], Value::Int(0));
     let _ = std::fs::remove_file(&path);
 }
 
-/// `retl_fsck` — verify-at-rest. Clean after an apply; a tampered top-run
+/// `rretl_fsck` — verify-at-rest. Clean after an apply; a tampered top-run
 /// column and a deleted residual row are each reported (not repaired); a
 /// buried run's non-matching column hash is NOT a finding (later runs
 /// legitimately transformed it); after revert everything is clean again.
@@ -1221,35 +1221,35 @@ fn fsck_reports_tampering_and_missing_residuals_and_nothing_else() {
     d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
     seed(&d, &[-5, 3]);
 
-    let run1 = d.retl_apply("mag", "t", "v").unwrap();
-    assert!(d.retl_fsck().unwrap().is_empty(), "clean after apply");
+    let run1 = d.rretl_apply("mag", "t", "v").unwrap();
+    assert!(d.rretl_fsck().unwrap().is_empty(), "clean after apply");
 
     // Stack a second run: run1 is now buried, and its column-hash mismatch
     // must NOT be reported.
-    let run2 = d.retl_apply("flip", "t", "v").unwrap();
-    assert!(d.retl_fsck().unwrap().is_empty(), "a buried run is not a finding");
+    let run2 = d.rretl_apply("flip", "t", "v").unwrap();
+    assert!(d.rretl_fsck().unwrap().is_empty(), "a buried run is not a finding");
 
     // Tamper with the live column: the TOP run (run2) is flagged.
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = 999 WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
-    let findings = d.retl_fsck().unwrap();
+    let findings = d.rretl_fsck().unwrap();
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert!(findings[0].contains("edited outside the pipeline"), "{}", findings[0]);
     assert!(findings[0].contains(&format!("run {}", run2.run_id)), "{}", findings[0]);
 
     // Un-tamper (putback run2 accepts the edit; that empties the stack top).
-    d.retl_putback(run2.run_id).unwrap();
+    d.rretl_putback(run2.run_id).unwrap();
 
     // Now delete one of run1's residual rows: fsck names the row.
     let mut s = d.begin().unwrap();
     s.query(
-        "DELETE FROM retl_residual WHERE run_id = $1 AND pk_enc = $2",
+        "DELETE FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
         &[Value::Int(run1.run_id), Value::Blob(vec![2, 1, 0, 0, 0, 0, 0, 0, 0])],
     )
     .unwrap();
     s.commit().unwrap();
-    let findings = d.retl_fsck().unwrap();
+    let findings = d.rretl_fsck().unwrap();
     assert!(
         findings.iter().any(|f| f.contains("NO residual")),
         "the missing residual is reported: {findings:?}"
@@ -1258,13 +1258,13 @@ fn fsck_reports_tampering_and_missing_residuals_and_nothing_else() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The guide's SIMPLE setup, executed verbatim (PYSPELL-RETL.md §1): a config
+/// The guide's SIMPLE setup, executed verbatim (PYSPELL-RRETL.md §1): a config
 /// with NO `[[table]]` blocks, the working table created live with
 /// `CREATE TABLE … ANY`, then the full apply → edit → putback loop on it.
 #[test]
-fn the_guides_zero_table_setup_carries_a_full_retl_loop() {
+fn the_guides_zero_table_setup_carries_a_full_rretl_loop() {
     let path = format!(
-        "{}/retl-simple-{}.mpedb",
+        "{}/rretl-simple-{}.mpedb",
         mpedb_testkit::scratch_base_str(),
         std::process::id()
     );
@@ -1287,14 +1287,14 @@ fn the_guides_zero_table_setup_carries_a_full_retl_loop() {
     s.commit().unwrap();
 
     define_abs_pair(&d);
-    let run = d.retl_apply("mag", "pixels", "px").unwrap();
+    let run = d.rretl_apply("mag", "pixels", "px").unwrap();
     assert_eq!(run.residuals, 3);
 
     // Edit one magnitude, then putback: the edit rides the stored sign home.
     let mut s = d.begin().unwrap();
     s.query("UPDATE pixels SET px = 9 WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
-    d.retl_putback(run.run_id).unwrap();
+    d.rretl_putback(run.run_id).unwrap();
 
     let got: Vec<i64> = rows(d.query("SELECT px FROM pixels ORDER BY id", &[]).unwrap())
         .into_iter()
@@ -1317,23 +1317,23 @@ fn a_tampered_residual_is_refused_by_revert_putback_and_named_by_fsck() {
     let (d, path) = db("resgate");
     define_abs_pair(&d);
     seed(&d, &[-5, 3]);
-    let run = d.retl_apply("mag", "t", "v").unwrap();
-    assert!(d.retl_fsck().unwrap().is_empty());
+    let run = d.rretl_apply("mag", "t", "v").unwrap();
+    assert!(d.rretl_fsck().unwrap().is_empty());
 
     // Flip every stored sign to 0 — row 0's residual changes 1 -> 0.
     let mut s = d.begin().unwrap();
     s.query(
-        "UPDATE retl_residual SET residual = $1 WHERE run_id = $2",
+        "UPDATE rretl_residual SET residual = $1 WHERE run_id = $2",
         &[Value::Int(0), Value::Int(run.run_id)],
     )
     .unwrap();
     s.commit().unwrap();
 
-    let e = d.retl_putback(run.run_id).unwrap_err().to_string();
+    let e = d.rretl_putback(run.run_id).unwrap_err().to_string();
     assert!(e.contains("no longer hash") && e.contains("putback"), "{e}");
-    let e = d.retl_revert(run.run_id).unwrap_err().to_string();
+    let e = d.rretl_revert(run.run_id).unwrap_err().to_string();
     assert!(e.contains("no longer hash") && e.contains("reverting"), "{e}");
-    let findings = d.retl_fsck().unwrap();
+    let findings = d.rretl_fsck().unwrap();
     assert!(
         findings.iter().any(|f| f.contains(&format!("run {}", run.run_id))
             && f.contains("no longer hash")),
@@ -1356,27 +1356,27 @@ fn fsck_names_a_buried_runs_tampered_residuals() {
     d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
     seed(&d, &[-5, 3]);
 
-    let run1 = d.retl_apply("mag", "t", "v").unwrap();
-    let run2 = d.retl_apply("flip", "t", "v").unwrap();
-    assert!(d.retl_fsck().unwrap().is_empty(), "buried but untampered = clean");
+    let run1 = d.rretl_apply("mag", "t", "v").unwrap();
+    let run2 = d.rretl_apply("flip", "t", "v").unwrap();
+    assert!(d.rretl_fsck().unwrap().is_empty(), "buried but untampered = clean");
 
     let mut s = d.begin().unwrap();
     s.query(
-        "UPDATE retl_residual SET residual = $1 WHERE run_id = $2",
+        "UPDATE rretl_residual SET residual = $1 WHERE run_id = $2",
         &[Value::Int(0), Value::Int(run1.run_id)],
     )
     .unwrap();
     s.commit().unwrap();
 
-    let findings = d.retl_fsck().unwrap();
+    let findings = d.rretl_fsck().unwrap();
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert!(findings[0].contains(&format!("run {}", run1.run_id)), "{}", findings[0]);
     assert!(findings[0].contains("no longer hash"), "{}", findings[0]);
 
     // The LIFO unwind hits the gate at the right moment too: run2 (bijective,
     // no residuals) reverts fine; run1 then refuses.
-    d.retl_revert(run2.run_id).unwrap();
-    let e = d.retl_revert(run1.run_id).unwrap_err().to_string();
+    d.rretl_revert(run2.run_id).unwrap();
+    let e = d.rretl_revert(run1.run_id).unwrap_err().to_string();
     assert!(e.contains("no longer hash"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
@@ -1390,13 +1390,13 @@ fn scans_cross_chunk_boundaries_exactly() {
     // Chunk 7 makes every pass straddle many uneven boundaries. The variable
     // is read per call, and a different chunk size never changes RESULTS for
     // any concurrently running test — only how many rows each fetch carries.
-    std::env::set_var("MPEDB_RETL_CHUNK", "7");
+    std::env::set_var("MPEDB_RRETL_CHUNK", "7");
     let (d, path) = db("chunky");
     define_abs_pair(&d);
     let vals: Vec<i64> = (0..100).map(|i| ((i % 13) - 6) * (1 + (i % 3))).collect();
     seed(&d, &vals);
 
-    let run = d.retl_apply("mag", "t", "v").unwrap();
+    let run = d.rretl_apply("mag", "t", "v").unwrap();
     let want: Vec<i64> = vals.iter().map(|v| v.abs()).collect();
     assert_eq!(col_v(&d), want, "forward across boundaries");
 
@@ -1404,17 +1404,17 @@ fn scans_cross_chunk_boundaries_exactly() {
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = 99 WHERE id = 50", &[]).unwrap();
     s.commit().unwrap();
-    d.retl_putback(run.run_id).unwrap();
+    d.rretl_putback(run.run_id).unwrap();
     let mut expect = vals.clone();
     expect[50] = if vals[50] < 0 { -99 } else { 99 };
     assert_eq!(col_v(&d), expect, "putback across boundaries, edit carried");
 
     // A fresh apply + exact revert over the same tiny chunks.
-    let run2 = d.retl_apply("mag", "t", "v").unwrap();
-    d.retl_revert(run2.run_id).unwrap();
+    let run2 = d.rretl_apply("mag", "t", "v").unwrap();
+    d.rretl_revert(run2.run_id).unwrap();
     assert_eq!(col_v(&d), expect, "revert across boundaries is exact");
-    assert!(d.retl_fsck().unwrap().is_empty());
-    std::env::remove_var("MPEDB_RETL_CHUNK");
+    assert!(d.rretl_fsck().unwrap().is_empty());
+    std::env::remove_var("MPEDB_RRETL_CHUNK");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1424,9 +1424,9 @@ fn scans_cross_chunk_boundaries_exactly() {
 /// tiny chunk, a full apply → putback → revert loop must stay byte-exact.
 #[test]
 fn text_pks_that_prefix_each_other_survive_chunked_scans() {
-    std::env::set_var("MPEDB_RETL_CHUNK", "2");
+    std::env::set_var("MPEDB_RRETL_CHUNK", "2");
     let path = format!(
-        "{}/retl-textpk-{}.mpedb",
+        "{}/rretl-textpk-{}.mpedb",
         mpedb_testkit::scratch_base_str(),
         std::process::id()
     );
@@ -1450,7 +1450,7 @@ fn text_pks_that_prefix_each_other_survive_chunked_scans() {
     s.commit().unwrap();
     define_abs_pair(&d);
 
-    let run = d.retl_apply("mag", "t2", "v").unwrap();
+    let run = d.rretl_apply("mag", "t2", "v").unwrap();
     let got = |d: &Database| -> Vec<i64> {
         rows(d.query("SELECT v FROM t2 ORDER BY k", &[]).unwrap())
             .into_iter()
@@ -1462,9 +1462,9 @@ fn text_pks_that_prefix_each_other_survive_chunked_scans() {
     };
     // ORDER BY k: a, aa, aaa, ab, b, ba -> |v| in that key order.
     assert_eq!(got(&d), vec![3, 4, 7, 1, 9, 2]);
-    d.retl_revert(run.run_id).unwrap();
+    d.rretl_revert(run.run_id).unwrap();
     assert_eq!(got(&d), vec![-3, 4, 7, -1, -9, 2]);
-    assert!(d.retl_fsck().unwrap().is_empty());
-    std::env::remove_var("MPEDB_RETL_CHUNK");
+    assert!(d.rretl_fsck().unwrap().is_empty());
+    std::env::remove_var("MPEDB_RRETL_CHUNK");
     let _ = std::fs::remove_file(&path);
 }

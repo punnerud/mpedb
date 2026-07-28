@@ -84,30 +84,30 @@ usage: mpedb <command> [args]
                                            and refused with a counter-example;
                                            residual = the triple fwd/1 rex/1 inv/2
   lens verify|list|drop <target> [name]    re-run a pair's round trip, or manage
-  retl apply <target> <pair> <tbl>.<col>    transform a column IN PLACE; what was
-                                           lost is kept per row (retl_residual),
-                                           the run is lineage (retl_lineage), and
+  rretl apply <target> <pair> <tbl>.<col>    transform a column IN PLACE; what was
+                                           lost is kept per row (rretl_residual),
+                                           the run is lineage (rretl_lineage), and
                                            100% of rows verify against the source
                                            hash BEFORE the destroying commit
-  retl revert <target> <run_id>             put it back exactly (hash-gated)
-  retl putback <target> <run_id>            invert KEEPING edits made to the
+  rretl revert <target> <run_id>             put it back exactly (hash-gated)
+  rretl putback <target> <run_id>            invert KEEPING edits made to the
                                            transformed column (lens putback,
                                            PutRes-verified per row); deleted
                                            rows stay deleted
-  retl log <target>                         every run, failed runs included
-  retl put <target> <obj> <file>            store the next VERSION of a blob:
+  rretl log <target>                         every run, failed runs included
+  rretl put <target> <obj> <file>            store the next VERSION of a blob:
                                            newest stays full, the previous one
                                            is rewritten as a reverse delta
                                            (verified byte-identical before the
                                            commit); every 8th stays full
-  retl get <target> <obj> <ver> <out>       materialize any version, every step
+  rretl get <target> <obj> <ver> <out>       materialize any version, every step
                                            hash-verified — never silent rot
-  retl versions <target> <obj>              list versions and how each is stored
-  retl pack-in <target> <name> <zip>        splice a zip into rows + residual;
+  rretl versions <target> <obj>              list versions and how each is stored
+  rretl pack-in <target> <name> <zip>        splice a zip into rows + residual;
                                            reconstruction verified byte-identical
                                            BEFORE the ingest commits
-  retl pack-out <target> <id> <out>         rebuild the zip, hash-gated
-  retl archives <target>                    list spliced archives
+  rretl pack-out <target> <id> <out>         rebuild the zip, hash-gated
+  rretl archives <target>                    list spliced archives
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
   tune set <target> name=value | show      stored engine switches (ndv_discount,
@@ -206,7 +206,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "model" => cmd_model(rest),
         "fn" => cmd_fn(rest),
         "lens" => cmd_lens(rest),
-        "retl" => cmd_retl(rest),
+        "rretl" => cmd_rretl(rest),
         "op" => cmd_op(rest),
         "tune" => cmd_tune(rest),
         "trigger" => cmd_trigger(rest),
@@ -455,7 +455,7 @@ fn cmd_fn(args: &[String]) -> CliResult {
     }
 }
 
-/// `mpedb lens …` — reversible pairs over stored functions (DESIGN-RETL, #52).
+/// `mpedb lens …` — reversible pairs over stored functions (DESIGN-RRETL, #52).
 /// `define` VERIFIES a `bijective` declaration against the probe corpus before
 /// anything is written, and refuses it with a named counter-example otherwise;
 /// that refusal is the feature. The sample count is reported rather than a bare
@@ -583,20 +583,20 @@ fn cmd_lens(args: &[String]) -> CliResult {
     }
 }
 
-/// `mpedb retl …` — apply a lens pair to a column in place, with the residuals
-/// and lineage kept in the database (DESIGN-RETL §7/§11). Apply verifies 100%
+/// `mpedb rretl …` — apply a lens pair to a column in place, with the residuals
+/// and lineage kept in the database (DESIGN-RRETL §7/§11). Apply verifies 100%
 /// of rows against the source hash BEFORE the commit that destroys the source,
 /// holds the writer lock for the whole run, and is an offline operation.
-fn cmd_retl(args: &[String]) -> CliResult {
+fn cmd_rretl(args: &[String]) -> CliResult {
     match args {
         [sub, config, pair, target] if sub == "apply" => {
             let Some((table, column)) = target.split_once('.') else {
-                return usage("retl apply needs <table>.<column>");
+                return usage("rretl apply needs <table>.<column>");
             };
             let db = crate::util::open_target(config)?;
-            let r = db.retl_apply(pair, table, column)?;
+            let r = db.rretl_apply(pair, table, column)?;
             println!(
-                "retl run {}: {} row(s) of {table}.{column} transformed in place, \
+                "rretl run {}: {} row(s) of {table}.{column} transformed in place, \
                  {} residual row(s) kept, 100% verified against the source hash \
                  before commit",
                 r.run_id, r.rows, r.residuals
@@ -606,35 +606,35 @@ fn cmd_retl(args: &[String]) -> CliResult {
         [sub, config, run] if sub == "revert" => {
             let run_id: i64 = run
                 .parse()
-                .map_err(|_| Failure::Usage(format!("retl revert needs a run id, got `{run}`")))?;
+                .map_err(|_| Failure::Usage(format!("rretl revert needs a run id, got `{run}`")))?;
             let db = crate::util::open_target(config)?;
-            let r = db.retl_revert(run_id)?;
-            println!("retl run {run_id} reverted: {} row(s) restored exactly", r.rows);
+            let r = db.rretl_revert(run_id)?;
+            println!("rretl run {run_id} reverted: {} row(s) restored exactly", r.rows);
             Ok(())
         }
         [sub, config, run] if sub == "putback" => {
             let run_id: i64 = run
                 .parse()
-                .map_err(|_| Failure::Usage(format!("retl putback needs a run id, got `{run}`")))?;
+                .map_err(|_| Failure::Usage(format!("rretl putback needs a run id, got `{run}`")))?;
             let db = crate::util::open_target(config)?;
-            let r = db.retl_putback(run_id)?;
+            let r = db.rretl_putback(run_id)?;
             println!(
-                "retl run {run_id} putback: {} row(s) inverted WITH their edits kept,                  {} residual(s) re-attached; deleted rows stayed deleted",
+                "rretl run {run_id} putback: {} row(s) inverted WITH their edits kept,                  {} residual(s) re-attached; deleted rows stayed deleted",
                 r.rows, r.residuals
             );
             Ok(())
         }
         [sub, config] if sub == "fsck" => {
             let db = crate::util::open_target(config)?;
-            let findings = db.retl_fsck()?;
+            let findings = db.rretl_fsck()?;
             if findings.is_empty() {
-                println!("retl fsck: clean — every standing run verifies");
+                println!("rretl fsck: clean — every standing run verifies");
             } else {
                 for f in &findings {
                     println!("FINDING: {f}");
                 }
                 return Err(Failure::Runtime(format!(
-                    "retl fsck: {} finding(s)",
+                    "rretl fsck: {} finding(s)",
                     findings.len()
                 )));
             }
@@ -642,9 +642,9 @@ fn cmd_retl(args: &[String]) -> CliResult {
         }
         [sub, config] if sub == "log" => {
             let db = crate::util::open_target(config)?;
-            let log = db.retl_log()?;
+            let log = db.rretl_log()?;
             if log.is_empty() {
-                println!("no retl runs");
+                println!("no rretl runs");
             }
             for l in log {
                 let err = if l.error.is_empty() {
@@ -663,24 +663,24 @@ fn cmd_retl(args: &[String]) -> CliResult {
             let bytes = std::fs::read(file)
                 .map_err(|e| Failure::Runtime(format!("cannot read `{file}`: {e}")))?;
             let db = crate::util::open_target(config)?;
-            let ver = db.retl_put_version(obj, &bytes)?;
-            println!("retl put: `{obj}` is now at version {ver} ({} bytes)", bytes.len());
+            let ver = db.rretl_put_version(obj, &bytes)?;
+            println!("rretl put: `{obj}` is now at version {ver} ({} bytes)", bytes.len());
             Ok(())
         }
         [sub, config, obj, ver, out] if sub == "get" => {
             let ver: i64 = ver
                 .parse()
-                .map_err(|_| Failure::Usage(format!("retl get needs a version, got `{ver}`")))?;
+                .map_err(|_| Failure::Usage(format!("rretl get needs a version, got `{ver}`")))?;
             let db = crate::util::open_target(config)?;
-            let bytes = db.retl_get_version(obj, ver)?;
+            let bytes = db.rretl_get_version(obj, ver)?;
             std::fs::write(out, &bytes)
                 .map_err(|e| Failure::Runtime(format!("cannot write `{out}`: {e}")))?;
-            println!("retl get: `{obj}` version {ver} → {out} ({} bytes, hash-verified)", bytes.len());
+            println!("rretl get: `{obj}` version {ver} → {out} ({} bytes, hash-verified)", bytes.len());
             Ok(())
         }
         [sub, config, obj] if sub == "versions" => {
             let db = crate::util::open_target(config)?;
-            let vers = db.retl_versions(obj)?;
+            let vers = db.rretl_versions(obj)?;
             if vers.is_empty() {
                 println!("no versions of `{obj}`");
             }
@@ -693,9 +693,9 @@ fn cmd_retl(args: &[String]) -> CliResult {
             let bytes = std::fs::read(file)
                 .map_err(|e| Failure::Runtime(format!("cannot read `{file}`: {e}")))?;
             let db = crate::util::open_target(config)?;
-            let id = db.retl_pack_in(name, &bytes)?;
+            let id = db.rretl_pack_in(name, &bytes)?;
             println!(
-                "retl pack-in: `{name}` is archive {id}; reconstruction verified \
+                "rretl pack-in: `{name}` is archive {id}; reconstruction verified \
                  byte-identical before commit"
             );
             Ok(())
@@ -703,17 +703,17 @@ fn cmd_retl(args: &[String]) -> CliResult {
         [sub, config, id, out] if sub == "pack-out" => {
             let id: i64 = id
                 .parse()
-                .map_err(|_| Failure::Usage(format!("retl pack-out needs an archive id, got `{id}`")))?;
+                .map_err(|_| Failure::Usage(format!("rretl pack-out needs an archive id, got `{id}`")))?;
             let db = crate::util::open_target(config)?;
-            let bytes = db.retl_pack_out(id)?;
+            let bytes = db.rretl_pack_out(id)?;
             std::fs::write(out, &bytes)
                 .map_err(|e| Failure::Runtime(format!("cannot write `{out}`: {e}")))?;
-            println!("retl pack-out: archive {id} → {out} ({} bytes, hash-verified)", bytes.len());
+            println!("rretl pack-out: archive {id} → {out} ({} bytes, hash-verified)", bytes.len());
             Ok(())
         }
         [sub, config] if sub == "archives" => {
             let db = crate::util::open_target(config)?;
-            let arches = db.retl_archives()?;
+            let arches = db.rretl_archives()?;
             if arches.is_empty() {
                 println!("no archives");
             }
@@ -726,7 +726,7 @@ fn cmd_retl(args: &[String]) -> CliResult {
             Ok(())
         }
         _ => usage(
-            "retl needs: apply <target> <pair> <table>.<column> | revert <target> <run_id> \
+            "rretl needs: apply <target> <pair> <table>.<column> | revert <target> <run_id> \
              | putback <target> <run_id> | fsck <target> | log <target> \
              | put <target> <obj> <file> | get <target> <obj> <ver> <out-file> \
              | versions <target> <obj> | pack-in <target> <name> <zip-file> \

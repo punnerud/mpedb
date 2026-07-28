@@ -1,13 +1,19 @@
-# DESIGN-RETL — reversible PySpell ETL: lens pairs, residuals, round-trip verification
+# DESIGN-RRETL — reversible PySpell ETL: lens pairs, residuals, round-trip verification
+
+> **Naming**: the feature is **rRETL** (doubled R), because "RETL"/"rETL" is
+> taken twice over — *Reverse ETL* (warehouse→SaaS sync) in modern data
+> engineering, and Oracle's *Retail Extract, Transform, and Load*. rRETL is
+> neither; the name collision is why the 2026-07-28 rename happened
+> (day-old feature, free break).
 
 **Status: DESIGNED; stage 1 (the bijective corner), stage 2 (residual
-pairs + `retl apply|revert|putback|log` + lineage) and stage 3's storage
-domains (blob versioning `retl put|get|versions`, zip splice
-`retl pack-in|pack-out|archives` — §8.2–8.4 codecs + `retl_store`)
+pairs + `rretl apply|revert|putback|log` + lineage) and stage 3's storage
+domains (blob versioning `rretl put|get|versions`, zip splice
+`rretl pack-in|pack-out|archives` — §8.2–8.4 codecs + `rretl_store`)
 IMPLEMENTED 2026-07-28** —
-user-facing contract: `PYSPELL-RETL.md` (the self-contained Python guide) —
-`crates/mpedb/src/{lens,retl,retl_codec,retl_store}.rs`, `mpedb lens`/`mpedb
-retl` in the CLI, tests in `crates/mpedb/tests/{lens,retl,retl_store}.rs`. The prior-art groundwork is `design/RETL-BIDI.md`
+user-facing contract: `PYSPELL-RRETL.md` (the self-contained Python guide) —
+`crates/mpedb/src/{lens,rretl,rretl_codec,rretl_store}.rs`, `mpedb lens`/`mpedb
+rretl` in the CLI, tests in `crates/mpedb/tests/{lens,rretl,rretl_store}.rs`. The prior-art groundwork is `design/RRETL-BIDI.md`
 (including the 2026-07-28 addendum: Jeopardy, Hermes, CRIL, RC 2023–2025,
 Sparcl JFP 2024, wire-format practice, lineage practice), whose eleven design
 commitments bind this document; every section below names the commitment it
@@ -267,12 +273,12 @@ Two ordinary tables, created through the normal DDL path inside the first ETL
 run's own transaction:
 
 ```
-retl_lineage   (run_id, step_no) →
+rretl_lineage   (run_id, step_no) →
               lens_name, forward_hash, rex_hash, inverse_hash,
               tbl, col, source_hash, output_hash, residual_hash, rows,
               verified, outcome, error, ts_micros
 
-retl_residual  (run_id, pk_enc BLOB) → residual   -- residual column type Any
+rretl_residual  (run_id, pk_enc BLOB) → residual   -- residual column type Any
 ```
 
 Both tables are created from SPECS with RIGID column types, never from SQL
@@ -284,7 +290,7 @@ lookup a PkPoint and the chunked resume a composite PkRange (#55 phase 2).
 
 One stable run id per pipeline run (Pachyderm's global-id move) makes multi-step
 lineage a single lookup. blake3 already exists in mpedb. Field decisions, each
-paid for by the 2026-07-28 survey (RETL-BIDI addendum):
+paid for by the 2026-07-28 survey (RRETL-BIDI addendum):
 
 - **`step_no` is a constant 1 in stage 2** — it exists so stage-3 pipelines
   extend the data, not the shape.
@@ -396,7 +402,7 @@ worthless.
 ### 8.2 Residual persistence: scalars ride the row codec; the envelope is stage 3
 
 **Amended in stage 2.** Stage 2's residuals are scalars in an `Any` column of an
-ordinary table (`retl_residual`, §7), and they deliberately do NOT get the
+ordinary table (`rretl_residual`, §7), and they deliberately do NOT get the
 envelope below: the row codec already tags the value's type, it inherits exactly
 the durability contract of every other row in the file, and the standing rule
 that format breaks fund a free migration of the project's own files means the
@@ -412,9 +418,9 @@ residual whose lineage row was deleted is an uninterpretable scalar, and an
 equally explicit error, never a NULL read.
 
 The envelope, stage 3's composite-residual carrier — designed 2026-07-28,
-**BUILT the same day** as `crates/mpedb/src/retl_codec.rs` (envelope + both
+**BUILT the same day** as `crates/mpedb/src/rretl_codec.rs` (envelope + both
 payload codecs; the 23-finding adversarial check of the build sketch is
-folded in below), with the storage half in `crates/mpedb/src/retl_store.rs`:
+folded in below), with the storage half in `crates/mpedb/src/rretl_store.rs`:
 
 ```
 kind      u8      ONE dispatch byte — the value IS both the version and the
@@ -616,7 +622,7 @@ length framing is load-bearing because unframed concatenation makes
 `Bijective` pairs, every forward run asserts the residual is empty — cheap
 defence in depth against corpus-blind non-bijectivity.
 
-`mpedb retl apply <target> <pair> <table>.<col>` transforms a column IN PLACE in
+`mpedb rretl apply <target> <pair> <table>.<col>` transforms a column IN PLACE in
 ONE WriteSession: class-gated (`Lossy` refused by name — in-place is source
 deletion, commitment 2; `Bijective` writes lineage only), a row the pair refuses
 ABORTS the run with the row named (silently skipping would reintroduce Cambria's
@@ -642,7 +648,7 @@ transaction and an offline operation — it holds the writer lock for the
 duration, and says so.
 
 **Stage 3 — the domains. [BUILT 2026-07-28, B-block]** Version storage as
-base+diff: `retl put/get/versions` (`retl_store.rs`) — the newest version
+base+diff: `rretl put/get/versions` (`rretl_store.rs`) — the newest version
 stored FULL, the previous newest rewritten as a reverse delta whose base is
 exactly the version above, verified byte-identical AS PERSISTED before the
 commit, every `FULL_EVERY = 8`th version a permanent full anchor (the Bennett
@@ -652,12 +658,12 @@ would launder corruption and delete the last good copy — finding 12); a
 delta that bloats or fails its own round trip keeps the full and the put
 still succeeds (finding 13); verification re-reads the persisted rows in the
 same txn, so the row codec is inside the trust boundary (finding 14).
-Container round-trip: `retl pack-in/pack-out/archives` — zip SPLICE per
+Container round-trip: `rretl pack-in/pack-out/archives` — zip SPLICE per
 §8.4, members as queryable rows, reconstruction verified byte-identically
 before the ingest commits and hash-gated on every pack-out. Both are lineage
 (`lens = builtin:delta-v1` / `builtin:zip-splice-v1`, outcomes `versioned` /
 `packed` — never `applied`, so revert/putback/stacking ignore them), and
-`retl fsck` re-materializes every version and re-splices every archive.
+`rretl fsck` re-materializes every version and re-splices every archive.
 Still not built from the stage-3 slate: mpedbfs presentation (#54).
 Composite PySpell residuals in the envelope remain future work — the
 envelope and codecs exist; the pipeline composition does not.

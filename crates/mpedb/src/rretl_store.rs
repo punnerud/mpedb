@@ -1,9 +1,9 @@
-//! RETL stage 3, the storage half: blob VERSIONING (reverse-delta chains with
+//! rRETL stage 3, the storage half: blob VERSIONING (reverse-delta chains with
 //! full anchors — the Bennett knob made concrete) and zip ROUND-TRIP by
-//! splice. The codecs live in [`crate::retl_codec`]; this module owns the
+//! splice. The codecs live in [`crate::rretl_codec`]; this module owns the
 //! tables, the transactions, and the verification discipline.
 //!
-//! Versioning (design/DESIGN-RETL §11 stage 3, chain algebra per the
+//! Versioning (design/DESIGN-RRETL §11 stage 3, chain algebra per the
 //! adversarial check's finding 11): the NEWEST version is always stored FULL;
 //! when a new version arrives, the previous newest is REWRITTEN as a delta
 //! whose base is EXACTLY the version above it — except every K-th version,
@@ -22,17 +22,17 @@
 
 use mpedb_types::{Error, Result, Value};
 
-use crate::retl::{
+use crate::rretl::{
     as_int, as_text, next_run_id, now_micros, rows_of, shape_gate, LineageRow,
 };
-use crate::retl_codec::{
+use crate::rretl_codec::{
     delta_apply, delta_encode, envelope, open_envelope, zip_join, zip_split, Kind,
 };
 use crate::WriteSession;
 
-pub const T_VERSIONS: &str = "retl_versions";
-pub const T_ARCHIVES: &str = "retl_archives";
-pub const T_MEMBERS: &str = "retl_archive_members";
+pub const T_VERSIONS: &str = "rretl_versions";
+pub const T_ARCHIVES: &str = "rretl_archives";
+pub const T_MEMBERS: &str = "rretl_archive_members";
 
 /// Every K-th version stays full forever — the Bennett pebbling knob
 /// (commitment 6): residual space traded against recomputation depth, and
@@ -43,7 +43,7 @@ const VERSIONS_SHAPE: [&str; 5] = ["obj", "ver", "payload", "content_hash", "ts_
 const ARCHIVES_SHAPE: [&str; 5] = ["archive_id", "name", "residual", "content_hash", "ts_micros"];
 const MEMBERS_SHAPE: [&str; 5] = ["archive_id", "member_no", "name", "data", "method"];
 
-/// One version, as `retl versions` lists it.
+/// One version, as `rretl versions` lists it.
 #[derive(Debug)]
 pub struct VersionInfo {
     pub ver: i64,
@@ -53,7 +53,7 @@ pub struct VersionInfo {
     pub content_hash: String,
 }
 
-/// One archive, as `retl archives`/fsck sees it.
+/// One archive, as `rretl archives`/fsck sees it.
 #[derive(Debug)]
 pub struct ArchiveInfo {
     pub archive_id: i64,
@@ -63,7 +63,7 @@ pub struct ArchiveInfo {
 }
 
 // Bookkeeping tables come from SPECS with rigid types, not SQL text — see
-// `retl::spec_col` for why (`BLOB` in DDL means the TYPELESS column, which
+// `rretl::spec_col` for why (`BLOB` in DDL means the TYPELESS column, which
 // takes neither point probes nor range bounds).
 fn ensure_version_table(
     s: &mut WriteSession<'_>,
@@ -71,15 +71,15 @@ fn ensure_version_table(
 ) -> Result<()> {
     use mpedb_types::ColumnType::{Blob, Int64, Text};
     if !shape_gate(have, T_VERSIONS, &VERSIONS_SHAPE)? {
-        crate::retl::create_bookkeeping(
+        crate::rretl::create_bookkeeping(
             s,
             T_VERSIONS,
             vec![
-                crate::retl::spec_col("obj", Text),
-                crate::retl::spec_col("ver", Int64),
-                crate::retl::spec_col("payload", Blob),
-                crate::retl::spec_col("content_hash", Text),
-                crate::retl::spec_col("ts_micros", Int64),
+                crate::rretl::spec_col("obj", Text),
+                crate::rretl::spec_col("ver", Int64),
+                crate::rretl::spec_col("payload", Blob),
+                crate::rretl::spec_col("content_hash", Text),
+                crate::rretl::spec_col("ts_micros", Int64),
             ],
             &["obj", "ver"],
         )?;
@@ -93,29 +93,29 @@ fn ensure_archive_tables(
 ) -> Result<()> {
     use mpedb_types::ColumnType::{Blob, Int64, Text};
     if !shape_gate(have, T_ARCHIVES, &ARCHIVES_SHAPE)? {
-        crate::retl::create_bookkeeping(
+        crate::rretl::create_bookkeeping(
             s,
             T_ARCHIVES,
             vec![
-                crate::retl::spec_col("archive_id", Int64),
-                crate::retl::spec_col("name", Text),
-                crate::retl::spec_col("residual", Blob),
-                crate::retl::spec_col("content_hash", Text),
-                crate::retl::spec_col("ts_micros", Int64),
+                crate::rretl::spec_col("archive_id", Int64),
+                crate::rretl::spec_col("name", Text),
+                crate::rretl::spec_col("residual", Blob),
+                crate::rretl::spec_col("content_hash", Text),
+                crate::rretl::spec_col("ts_micros", Int64),
             ],
             &["archive_id"],
         )?;
     }
     if !shape_gate(have, T_MEMBERS, &MEMBERS_SHAPE)? {
-        crate::retl::create_bookkeeping(
+        crate::rretl::create_bookkeeping(
             s,
             T_MEMBERS,
             vec![
-                crate::retl::spec_col("archive_id", Int64),
-                crate::retl::spec_col("member_no", Int64),
-                crate::retl::spec_col("name", Blob),
-                crate::retl::spec_col("data", Blob),
-                crate::retl::spec_col("method", Int64),
+                crate::rretl::spec_col("archive_id", Int64),
+                crate::rretl::spec_col("member_no", Int64),
+                crate::rretl::spec_col("name", Blob),
+                crate::rretl::spec_col("data", Blob),
+                crate::rretl::spec_col("method", Int64),
             ],
             &["archive_id", "member_no"],
         )?;
@@ -126,7 +126,7 @@ fn ensure_archive_tables(
 fn as_blob(v: &Value) -> Result<Vec<u8>> {
     match v {
         Value::Blob(b) => Ok(b.clone()),
-        other => Err(Error::Corrupt(format!("retl store: expected blob, got {other:?}"))),
+        other => Err(Error::Corrupt(format!("rretl store: expected blob, got {other:?}"))),
     }
 }
 
@@ -171,12 +171,12 @@ impl crate::Database {
     /// verified AS PERSISTED, byte-identically, before the commit — unless it
     /// is a K-th anchor (kept full) or the delta would not be smaller (kept
     /// full; ingest is never hostage to compression). Returns the version.
-    pub fn retl_put_version(&self, obj: &str, bytes: &[u8]) -> Result<i64> {
-        if bytes.len() > crate::retl_codec::MAX_PAYLOAD {
+    pub fn rretl_put_version(&self, obj: &str, bytes: &[u8]) -> Result<i64> {
+        if bytes.len() > crate::rretl_codec::MAX_PAYLOAD {
             return Err(Error::Unsupported(format!(
                 "{} bytes exceeds the {}-byte envelope cap",
                 bytes.len(),
-                crate::retl_codec::MAX_PAYLOAD
+                crate::rretl_codec::MAX_PAYLOAD
             )));
         }
         let have = self.committed_tables()?;
@@ -198,7 +198,7 @@ impl crate::Database {
     /// applying reverse deltas, blake3-verifying EVERY intermediate against
     /// its recorded hash — a hash mismatch anywhere is a hard error naming
     /// the version, never silently wrong bytes.
-    pub fn retl_get_version(&self, obj: &str, ver: i64) -> Result<Vec<u8>> {
+    pub fn rretl_get_version(&self, obj: &str, ver: i64) -> Result<Vec<u8>> {
         // The nearest full at-or-above `ver` sits at the next FULL_EVERY
         // anchor or at the newest version, whichever comes first — both are
         // full BY INVARIANT (anchors are never rewritten; only the newest is,
@@ -207,21 +207,21 @@ impl crate::Database {
         // long history. A corrupted anchor inside the window is an error
         // either way: any later full's delta walk would cross it too.
         let maxv = rows_of(self.query(
-            "SELECT max(ver) FROM retl_versions WHERE obj = $1",
+            "SELECT max(ver) FROM rretl_versions WHERE obj = $1",
             &[Value::Text(obj.into())],
         )?)?;
         let maxv = match maxv.first().and_then(|r| r.first()) {
             Some(Value::Int(m)) => *m,
             _ => {
                 return Err(Error::Unsupported(format!(
-                    "no version {ver} of `{obj}` — `retl versions` lists what exists"
+                    "no version {ver} of `{obj}` — `rretl versions` lists what exists"
                 )))
             }
         };
         let anchor = ver + (FULL_EVERY - ver.rem_euclid(FULL_EVERY)) % FULL_EVERY;
         let bound = anchor.min(maxv);
         let rows = rows_of(self.query(
-            "SELECT ver, payload, content_hash FROM retl_versions WHERE obj = $1 \
+            "SELECT ver, payload, content_hash FROM rretl_versions WHERE obj = $1 \
              AND ver >= $2 AND ver <= $3 ORDER BY ver",
             &[Value::Text(obj.into()), Value::Int(ver), Value::Int(bound)],
         )?)?;
@@ -275,13 +275,13 @@ impl crate::Database {
     }
 
     /// Every version of `obj`, oldest first, with how each is stored.
-    pub fn retl_versions(&self, obj: &str) -> Result<Vec<VersionInfo>> {
+    pub fn rretl_versions(&self, obj: &str) -> Result<Vec<VersionInfo>> {
         let bundle = self.engine.schema();
         if !bundle.schema.tables.iter().any(|t| t.name == T_VERSIONS && !t.dead) {
             return Ok(Vec::new());
         }
         let rows = rows_of(self.query(
-            "SELECT ver, payload, content_hash FROM retl_versions WHERE obj = $1 ORDER BY ver",
+            "SELECT ver, payload, content_hash FROM rretl_versions WHERE obj = $1 ORDER BY ver",
             &[Value::Text(obj.into())],
         )?)?;
         rows.into_iter()
@@ -302,7 +302,7 @@ impl crate::Database {
     /// residual keeps every non-data byte, and the reconstruction is verified
     /// byte-identically — from the PERSISTED rows, inside the ingest
     /// transaction — before the commit. Returns the archive id.
-    pub fn retl_pack_in(&self, name: &str, file: &[u8]) -> Result<i64> {
+    pub fn rretl_pack_in(&self, name: &str, file: &[u8]) -> Result<i64> {
         let have = self.committed_tables()?;
         let mut s = self.begin()?;
         let out = pack_in_in(&mut s, &have, name, file);
@@ -321,9 +321,9 @@ impl crate::Database {
     /// Reconstruct archive `archive_id` byte-identically, hash-gated against
     /// the stored original hash — a mismatch is "changed outside the
     /// pipeline", named, never silently wrong bytes.
-    pub fn retl_pack_out(&self, archive_id: i64) -> Result<Vec<u8>> {
+    pub fn rretl_pack_out(&self, archive_id: i64) -> Result<Vec<u8>> {
         let arch = rows_of(self.query(
-            "SELECT residual, content_hash FROM retl_archives WHERE archive_id = $1",
+            "SELECT residual, content_hash FROM rretl_archives WHERE archive_id = $1",
             &[Value::Int(archive_id)],
         )?)?;
         let Some(arch) = arch.into_iter().next() else {
@@ -339,7 +339,7 @@ impl crate::Database {
         }
         let file = zip_join(payload, &|member_no| {
             let d = rows_of(self.query(
-                "SELECT data FROM retl_archive_members WHERE archive_id = $1 \
+                "SELECT data FROM rretl_archive_members WHERE archive_id = $1 \
                  AND member_no = $2",
                 &[Value::Int(archive_id), Value::Int(member_no as i64)],
             )?)?;
@@ -361,16 +361,16 @@ impl crate::Database {
     }
 
     /// Every archive, oldest first.
-    pub fn retl_archives(&self) -> Result<Vec<ArchiveInfo>> {
+    pub fn rretl_archives(&self) -> Result<Vec<ArchiveInfo>> {
         let bundle = self.engine.schema();
         if !bundle.schema.tables.iter().any(|t| t.name == T_ARCHIVES && !t.dead) {
             return Ok(Vec::new());
         }
         let rows = rows_of(self.query(
             "SELECT a.archive_id, a.name, a.content_hash, \
-             (SELECT count(*) FROM retl_archive_members m \
+             (SELECT count(*) FROM rretl_archive_members m \
               WHERE m.archive_id = a.archive_id) \
-             FROM retl_archives a ORDER BY a.archive_id",
+             FROM rretl_archives a ORDER BY a.archive_id",
             &[],
         )?)?;
         rows.into_iter()
@@ -393,10 +393,10 @@ fn put_version_in(
     bytes: &[u8],
 ) -> Result<i64> {
     ensure_version_table(s, have)?;
-    crate::retl::ensure_lineage_tables(s, have)?;
+    crate::rretl::ensure_lineage_tables(s, have)?;
 
     let cur = rows_of(s.query(
-        "SELECT max(ver) FROM retl_versions WHERE obj = $1",
+        "SELECT max(ver) FROM rretl_versions WHERE obj = $1",
         &[Value::Text(obj.into())],
     )?)?;
     let cur_ver = match cur.first().and_then(|r| r.first()) {
@@ -407,7 +407,7 @@ fn put_version_in(
     let content_hash = hash_hex(bytes);
 
     s.query(
-        "INSERT INTO retl_versions (obj, ver, payload, content_hash, ts_micros) \
+        "INSERT INTO rretl_versions (obj, ver, payload, content_hash, ts_micros) \
          VALUES ($1, $2, $3, $4, $5)",
         &[
             Value::Text(obj.into()),
@@ -459,7 +459,7 @@ fn rewrite_as_delta(
     new_bytes: &[u8],
 ) -> Result<String> {
     let old = rows_of(s.query(
-        "SELECT payload, content_hash FROM retl_versions WHERE obj = $1 AND ver = $2",
+        "SELECT payload, content_hash FROM rretl_versions WHERE obj = $1 AND ver = $2",
         &[Value::Text(obj.into()), Value::Int(cv)],
     )?)?;
     let old = old.into_iter().next().ok_or_else(|| {
@@ -493,7 +493,7 @@ fn rewrite_as_delta(
         ));
     }
     s.query(
-        "UPDATE retl_versions SET payload = $1 WHERE obj = $2 AND ver = $3",
+        "UPDATE rretl_versions SET payload = $1 WHERE obj = $2 AND ver = $3",
         &[Value::Blob(delta_env), Value::Text(obj.into()), Value::Int(cv)],
     )?;
 
@@ -502,7 +502,7 @@ fn rewrite_as_delta(
     // trusted, so it is part of what is verified.
     let mut reread = |ver: i64| -> Result<Vec<u8>> {
         let r = rows_of(s.query(
-            "SELECT payload FROM retl_versions WHERE obj = $1 AND ver = $2",
+            "SELECT payload FROM rretl_versions WHERE obj = $1 AND ver = $2",
             &[Value::Text(obj.into()), Value::Int(ver)],
         )?)?;
         as_blob(&r[0][0])
@@ -515,7 +515,7 @@ fn rewrite_as_delta(
     if back != old_bytes {
         // Keep the full: put back the original payload and carry on.
         s.query(
-            "UPDATE retl_versions SET payload = $1 WHERE obj = $2 AND ver = $3",
+            "UPDATE rretl_versions SET payload = $1 WHERE obj = $2 AND ver = $3",
             &[Value::Blob(old_payload), Value::Text(obj.into()), Value::Int(cv)],
         )?;
         return Ok(format!(
@@ -533,18 +533,18 @@ fn pack_in_in(
     file: &[u8],
 ) -> Result<i64> {
     ensure_archive_tables(s, have)?;
-    crate::retl::ensure_lineage_tables(s, have)?;
+    crate::rretl::ensure_lineage_tables(s, have)?;
 
     let parts = zip_split(file)?;
     let content_hash = hash_hex(file);
 
-    let prev = rows_of(s.query("SELECT max(archive_id) FROM retl_archives", &[])?)?;
+    let prev = rows_of(s.query("SELECT max(archive_id) FROM rretl_archives", &[])?)?;
     let archive_id = match prev.first().and_then(|r| r.first()) {
         Some(Value::Int(m)) => m + 1,
         _ => 1,
     };
     s.query(
-        "INSERT INTO retl_archives (archive_id, name, residual, content_hash, ts_micros) \
+        "INSERT INTO rretl_archives (archive_id, name, residual, content_hash, ts_micros) \
          VALUES ($1, $2, $3, $4, $5)",
         &[
             Value::Int(archive_id),
@@ -557,7 +557,7 @@ fn pack_in_in(
     let n_members = parts.members.len() as i64;
     for m in &parts.members {
         s.query(
-            "INSERT INTO retl_archive_members (archive_id, member_no, name, data, method) \
+            "INSERT INTO rretl_archive_members (archive_id, member_no, name, data, method) \
              VALUES ($1, $2, $3, $4, $5)",
             &[
                 Value::Int(archive_id),
@@ -573,14 +573,14 @@ fn pack_in_in(
     // member row inside this transaction, re-splice, and byte-compare against
     // the original. "By construction" is an argument; this is the check.
     let stored = rows_of(s.query(
-        "SELECT residual FROM retl_archives WHERE archive_id = $1",
+        "SELECT residual FROM rretl_archives WHERE archive_id = $1",
         &[Value::Int(archive_id)],
     )?)?;
     let residual = as_blob(&stored[0][0])?;
     let (_, payload) = open_envelope(&residual)?;
     let mut member_data = std::collections::HashMap::new();
     let mrows = rows_of(s.query(
-        "SELECT member_no, data FROM retl_archive_members WHERE archive_id = $1",
+        "SELECT member_no, data FROM rretl_archive_members WHERE archive_id = $1",
         &[Value::Int(archive_id)],
     )?)?;
     for r in mrows {
@@ -628,18 +628,18 @@ pub(crate) fn fsck_stores(db: &crate::Database, findings: &mut Vec<String>) -> R
     let has = |n: &str| bundle.schema.tables.iter().any(|t| t.name == n && !t.dead);
     if has(T_VERSIONS) {
         let objs = rows_of(db.query(
-            "SELECT DISTINCT obj FROM retl_versions ORDER BY obj",
+            "SELECT DISTINCT obj FROM rretl_versions ORDER BY obj",
             &[],
         )?)?;
         for o in objs {
             let obj = as_text(&o[0]);
             let vers = rows_of(db.query(
-                "SELECT ver FROM retl_versions WHERE obj = $1 ORDER BY ver",
+                "SELECT ver FROM rretl_versions WHERE obj = $1 ORDER BY ver",
                 &[Value::Text(obj.clone())],
             )?)?;
             for v in vers {
                 let ver = as_int(&v[0])?;
-                if let Err(e) = db.retl_get_version(&obj, ver) {
+                if let Err(e) = db.rretl_get_version(&obj, ver) {
                     findings.push(format!("version {ver} of `{obj}`: {e}"));
                 }
             }
@@ -647,12 +647,12 @@ pub(crate) fn fsck_stores(db: &crate::Database, findings: &mut Vec<String>) -> R
     }
     if has(T_ARCHIVES) {
         let ids = rows_of(db.query(
-            "SELECT archive_id FROM retl_archives ORDER BY archive_id",
+            "SELECT archive_id FROM rretl_archives ORDER BY archive_id",
             &[],
         )?)?;
         for r in ids {
             let id = as_int(&r[0])?;
-            if let Err(e) = db.retl_pack_out(id) {
+            if let Err(e) = db.rretl_pack_out(id) {
                 findings.push(format!("archive {id}: {e}"));
             }
         }

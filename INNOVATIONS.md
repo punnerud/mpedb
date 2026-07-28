@@ -599,7 +599,7 @@ Every distance cell costs something to look up. Rather than buying the whole
 matrix and searching it, guess optimistically low, find the best route under that
 guess, then buy only the cells *that route's cost rests on*. If the winner's own
 cells are all paid for, its cost is exact while every rejected route was scored
-with an underestimate — so no rejected route can secretly be better. Stop.
+with an underestimate — so no rejected route can secrretly be better. Stop.
 
 Soundness: every cost term is monotone non-decreasing in a table's bucket, so an
 unbought table priced at a lower bound makes *every* candidate a lower bound.

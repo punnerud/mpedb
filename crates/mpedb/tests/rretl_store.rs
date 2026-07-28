@@ -1,4 +1,4 @@
-//! RETL stage 3, the storage half (#52 B2/B3): blob versioning by
+//! rRETL stage 3, the storage half (#52 B2/B3): blob versioning by
 //! reverse-delta chains, and zip round-trip by splice.
 //!
 //! The contract under test: every version ever put materializes to EXACTLY
@@ -21,7 +21,7 @@ impl Drop for Scratch {
 
 fn db(tag: &str) -> (Database, Scratch) {
     let path = format!(
-        "{}/retl-store-{tag}-{}.mpedb",
+        "{}/rretl-store-{tag}-{}.mpedb",
         mpedb_testkit::scratch_base_str(),
         std::process::id()
     );
@@ -72,7 +72,7 @@ fn twenty_versions_all_materialize_and_anchors_stay_full() {
         let patch = rng.bytes(48);
         doc[at..at + 48].copy_from_slice(&patch);
         doc.extend_from_slice(&rng.bytes(16));
-        let ver = d.retl_put_version("doc", &doc).unwrap();
+        let ver = d.rretl_put_version("doc", &doc).unwrap();
         history.push((ver, doc.clone()));
     }
     assert_eq!(history.len(), 20);
@@ -80,16 +80,16 @@ fn twenty_versions_all_materialize_and_anchors_stay_full() {
 
     for (ver, bytes) in &history {
         assert_eq!(
-            &d.retl_get_version("doc", *ver).unwrap(),
+            &d.rretl_get_version("doc", *ver).unwrap(),
             bytes,
             "version {ver} did not materialize byte-identically"
         );
     }
 
-    let infos = d.retl_versions("doc").unwrap();
+    let infos = d.rretl_versions("doc").unwrap();
     assert_eq!(infos.len(), 20);
     for info in &infos {
-        let want = if info.ver == 20 || info.ver % mpedb::retl_store::FULL_EVERY == 0 {
+        let want = if info.ver == 20 || info.ver % mpedb::rretl_store::FULL_EVERY == 0 {
             "full"
         } else {
             "delta"
@@ -102,13 +102,13 @@ fn twenty_versions_all_materialize_and_anchors_stay_full() {
     }
 
     // Every put left a lineage row, and none of them is unwindable.
-    let log = d.retl_log().unwrap();
+    let log = d.rretl_log().unwrap();
     let versioned: Vec<_> = log.iter().filter(|r| r.outcome == "versioned").collect();
     assert_eq!(versioned.len(), 20);
-    let err = d.retl_revert(versioned[0].run_id).unwrap_err().to_string();
+    let err = d.rretl_revert(versioned[0].run_id).unwrap_err().to_string();
     assert!(err.contains("versioned"), "revert must name the outcome: {err}");
 
-    assert!(d.retl_fsck().unwrap().is_empty());
+    assert!(d.rretl_fsck().unwrap().is_empty());
 }
 
 /// Incompressible versions: completely fresh random bytes each time. The
@@ -122,17 +122,17 @@ fn incompressible_versions_keep_fulls_and_still_ingest() {
     let mut history = Vec::new();
     for _ in 0..3 {
         let doc = rng.bytes(2048);
-        let ver = d.retl_put_version("noise", &doc).unwrap();
+        let ver = d.rretl_put_version("noise", &doc).unwrap();
         history.push((ver, doc));
     }
-    for info in d.retl_versions("noise").unwrap() {
+    for info in d.rretl_versions("noise").unwrap() {
         assert_eq!(info.stored_as, "full", "version {} should have kept full", info.ver);
     }
     for (ver, bytes) in &history {
-        assert_eq!(&d.retl_get_version("noise", *ver).unwrap(), bytes);
+        assert_eq!(&d.rretl_get_version("noise", *ver).unwrap(), bytes);
     }
     let noted: Vec<_> = d
-        .retl_log()
+        .rretl_log()
         .unwrap()
         .into_iter()
         .filter(|r| r.outcome == "versioned" && r.error.contains("kept full"))
@@ -146,7 +146,7 @@ fn incompressible_versions_keep_fulls_and_still_ingest() {
 #[test]
 fn a_rotted_full_refuses_the_next_put_by_name() {
     let (d, _scratch) = db("launder");
-    d.retl_put_version("doc", b"first version, pristine").unwrap();
+    d.rretl_put_version("doc", b"first version, pristine").unwrap();
 
     // Rot the stored payload directly (still a well-formed raw envelope, so
     // only the hash check can catch it — that is the point).
@@ -155,20 +155,20 @@ fn a_rotted_full_refuses_the_next_put_by_name() {
     rotted.extend_from_slice(&(4u32).to_le_bytes());
     rotted.extend_from_slice(b"rot!");
     s.query(
-        "UPDATE retl_versions SET payload = $1 WHERE obj = $2 AND ver = $3",
+        "UPDATE rretl_versions SET payload = $1 WHERE obj = $2 AND ver = $3",
         &[Value::Blob(rotted), Value::Text("doc".into()), Value::Int(1)],
     )
     .unwrap();
     s.commit().unwrap();
 
-    let err = d.retl_put_version("doc", b"second version").unwrap_err().to_string();
+    let err = d.rretl_put_version("doc", b"second version").unwrap_err().to_string();
     assert!(
         err.contains("version 1") && err.contains("hash"),
         "must name the rotted version and the hash mismatch: {err}"
     );
     // The failed put aborted whole: no version 2, and fsck names version 1.
-    assert_eq!(d.retl_versions("doc").unwrap().len(), 1);
-    let findings = d.retl_fsck().unwrap();
+    assert_eq!(d.rretl_versions("doc").unwrap().len(), 1);
+    let findings = d.rretl_fsck().unwrap();
     assert!(
         findings.iter().any(|f| f.contains("version 1") && f.contains("doc")),
         "fsck must surface the rot: {findings:?}"
@@ -184,19 +184,19 @@ fn a_tampered_delta_is_named_by_get_and_fsck() {
     let mut doc = b"the quick brown fox jumps over the lazy dog, at length, \
                     repeated enough that a delta is actually smaller than raw"
         .to_vec();
-    d.retl_put_version("doc", &doc).unwrap();
+    d.rretl_put_version("doc", &doc).unwrap();
     doc.extend_from_slice(b" -- v2");
-    d.retl_put_version("doc", &doc).unwrap();
+    d.rretl_put_version("doc", &doc).unwrap();
     doc.extend_from_slice(b" -- v3");
-    d.retl_put_version("doc", &doc).unwrap();
-    assert_eq!(d.retl_versions("doc").unwrap()[0].stored_as, "delta");
+    d.rretl_put_version("doc", &doc).unwrap();
+    assert_eq!(d.rretl_versions("doc").unwrap()[0].stored_as, "delta");
 
     // Corrupt version 1's delta INSERT bytes without breaking the framing:
     // flip one byte near the end of the stored payload.
     let mut s = d.begin().unwrap();
     let row = &mut s
         .query(
-            "SELECT payload FROM retl_versions WHERE obj = $1 AND ver = $2",
+            "SELECT payload FROM rretl_versions WHERE obj = $1 AND ver = $2",
             &[Value::Text("doc".into()), Value::Int(1)],
         )
         .unwrap();
@@ -210,18 +210,18 @@ fn a_tampered_delta_is_named_by_get_and_fsck() {
     let mut bent = payload.clone();
     *bent.last_mut().unwrap() ^= 0xff;
     s.query(
-        "UPDATE retl_versions SET payload = $1 WHERE obj = $2 AND ver = $3",
+        "UPDATE rretl_versions SET payload = $1 WHERE obj = $2 AND ver = $3",
         &[Value::Blob(bent), Value::Text("doc".into()), Value::Int(1)],
     )
     .unwrap();
     s.commit().unwrap();
 
-    let err = d.retl_get_version("doc", 1).unwrap_err().to_string();
+    let err = d.rretl_get_version("doc", 1).unwrap_err().to_string();
     assert!(err.contains("version 1") || err.contains("delta"), "named refusal: {err}");
     // Versions 2 and 3 do not depend on version 1's payload.
-    assert!(d.retl_get_version("doc", 3).is_ok());
-    assert!(d.retl_get_version("doc", 2).is_ok());
-    let findings = d.retl_fsck().unwrap();
+    assert!(d.rretl_get_version("doc", 3).is_ok());
+    assert!(d.rretl_get_version("doc", 2).is_ok());
+    let findings = d.rretl_fsck().unwrap();
     assert_eq!(findings.len(), 1, "exactly the tampered version: {findings:?}");
     assert!(findings[0].contains("version 1"));
 }
@@ -231,17 +231,17 @@ fn a_tampered_delta_is_named_by_get_and_fsck() {
 #[test]
 fn versions_are_per_object_and_missing_ones_are_named() {
     let (d, _scratch) = db("objs");
-    d.retl_put_version("a", b"alpha").unwrap();
-    d.retl_put_version("b", b"beta").unwrap();
-    d.retl_put_version("a", b"alpha two").unwrap();
-    assert_eq!(d.retl_versions("a").unwrap().len(), 2);
-    assert_eq!(d.retl_versions("b").unwrap().len(), 1);
-    assert_eq!(d.retl_get_version("b", 1).unwrap(), b"beta");
-    let err = d.retl_get_version("a", 3).unwrap_err().to_string();
+    d.rretl_put_version("a", b"alpha").unwrap();
+    d.rretl_put_version("b", b"beta").unwrap();
+    d.rretl_put_version("a", b"alpha two").unwrap();
+    assert_eq!(d.rretl_versions("a").unwrap().len(), 2);
+    assert_eq!(d.rretl_versions("b").unwrap().len(), 1);
+    assert_eq!(d.rretl_get_version("b", 1).unwrap(), b"beta");
+    let err = d.rretl_get_version("a", 3).unwrap_err().to_string();
     assert!(err.contains("no version 3"), "{err}");
-    let err = d.retl_get_version("nope", 1).unwrap_err().to_string();
+    let err = d.rretl_get_version("nope", 1).unwrap_err().to_string();
     assert!(err.contains("nope"), "{err}");
-    assert_eq!(d.retl_versions("nope").unwrap().len(), 0);
+    assert_eq!(d.rretl_versions("nope").unwrap().len(), 0);
 }
 
 // ---------------------------------------------------------------- archives
@@ -304,13 +304,13 @@ fn a_zip_round_trips_through_the_database() {
     let mut file = b"#!/bin/sh\necho self-extracting stub\n".to_vec();
     file.extend_from_slice(&inner);
 
-    let id = d.retl_pack_in("bundle.zip", &file).unwrap();
-    assert_eq!(d.retl_pack_out(id).unwrap(), file);
+    let id = d.rretl_pack_in("bundle.zip", &file).unwrap();
+    assert_eq!(d.rretl_pack_out(id).unwrap(), file);
 
     // Members are ordinary rows.
     let n = match d
         .query(
-            "SELECT count(*) FROM retl_archive_members WHERE archive_id = $1",
+            "SELECT count(*) FROM rretl_archive_members WHERE archive_id = $1",
             &[Value::Int(id)],
         )
         .unwrap()
@@ -323,23 +323,23 @@ fn a_zip_round_trips_through_the_database() {
     };
     assert_eq!(n, 3);
 
-    let arches = d.retl_archives().unwrap();
+    let arches = d.rretl_archives().unwrap();
     assert_eq!(arches.len(), 1);
     assert_eq!(arches[0].members, 3);
     assert_eq!(arches[0].name, "bundle.zip");
 
     // The ingest is lineage, and not unwindable as a column run.
     let packed: Vec<_> = d
-        .retl_log()
+        .rretl_log()
         .unwrap()
         .into_iter()
         .filter(|r| r.outcome == "packed")
         .collect();
     assert_eq!(packed.len(), 1);
-    let err = d.retl_revert(packed[0].run_id).unwrap_err().to_string();
+    let err = d.rretl_revert(packed[0].run_id).unwrap_err().to_string();
     assert!(err.contains("packed"), "{err}");
 
-    assert!(d.retl_fsck().unwrap().is_empty());
+    assert!(d.rretl_fsck().unwrap().is_empty());
 }
 
 /// Edit-then-pack-out is the POINT of splice: change a member's data row
@@ -350,19 +350,19 @@ fn a_zip_round_trips_through_the_database() {
 fn tampering_with_a_member_row_is_refused_by_name() {
     let (d, _scratch) = db("ziptamper");
     let file = store_zip(&[(b"a.txt", b"original contents")]);
-    let id = d.retl_pack_in("a.zip", &file).unwrap();
+    let id = d.rretl_pack_in("a.zip", &file).unwrap();
 
     let mut s = d.begin().unwrap();
     s.query(
-        "UPDATE retl_archive_members SET data = $1 WHERE archive_id = $2 AND member_no = $3",
+        "UPDATE rretl_archive_members SET data = $1 WHERE archive_id = $2 AND member_no = $3",
         &[Value::Blob(b"EDITED contents!!".to_vec()), Value::Int(id), Value::Int(0)],
     )
     .unwrap();
     s.commit().unwrap();
 
-    let err = d.retl_pack_out(id).unwrap_err().to_string();
+    let err = d.rretl_pack_out(id).unwrap_err().to_string();
     assert!(err.contains("WRONG bytes"), "named refusal: {err}");
-    let findings = d.retl_fsck().unwrap();
+    let findings = d.rretl_fsck().unwrap();
     assert!(
         findings.iter().any(|f| f.contains(&format!("archive {id}"))),
         "fsck must surface it: {findings:?}"
@@ -374,15 +374,15 @@ fn tampering_with_a_member_row_is_refused_by_name() {
 fn a_missing_member_row_is_a_named_hole() {
     let (d, _scratch) = db("ziphole");
     let file = store_zip(&[(b"a.txt", b"one"), (b"b.txt", b"two")]);
-    let id = d.retl_pack_in("ab.zip", &file).unwrap();
+    let id = d.rretl_pack_in("ab.zip", &file).unwrap();
     let mut s = d.begin().unwrap();
     s.query(
-        "DELETE FROM retl_archive_members WHERE archive_id = $1 AND member_no = $2",
+        "DELETE FROM rretl_archive_members WHERE archive_id = $1 AND member_no = $2",
         &[Value::Int(id), Value::Int(1)],
     )
     .unwrap();
     s.commit().unwrap();
-    let err = d.retl_pack_out(id).unwrap_err().to_string();
+    let err = d.rretl_pack_out(id).unwrap_err().to_string();
     assert!(err.contains("member 1") && err.contains("MISSING"), "{err}");
 }
 
@@ -398,10 +398,10 @@ fn refused_zips_leave_nothing_behind() {
     file[eocd + 9] = 0xff;
     file[eocd + 10] = 0xff;
     file[eocd + 11] = 0xff;
-    let err = d.retl_pack_in("big.zip", &file).unwrap_err().to_string();
+    let err = d.rretl_pack_in("big.zip", &file).unwrap_err().to_string();
     assert!(err.contains("zip64"), "named: {err}");
-    assert_eq!(d.retl_archives().unwrap().len(), 0);
-    assert!(d.retl_log().unwrap().is_empty());
+    assert_eq!(d.rretl_archives().unwrap().len(), 0);
+    assert!(d.rretl_log().unwrap().is_empty());
 }
 
 /// Versioning the SAME bytes that live in an archive member does not tangle
@@ -410,9 +410,9 @@ fn refused_zips_leave_nothing_behind() {
 fn versions_and_archives_coexist() {
     let (d, _scratch) = db("coexist");
     let file = store_zip(&[(b"payload.bin", b"shared bytes")]);
-    d.retl_put_version("f", &file).unwrap();
-    let id = d.retl_pack_in("f.zip", &file).unwrap();
-    assert_eq!(d.retl_get_version("f", 1).unwrap(), file);
-    assert_eq!(d.retl_pack_out(id).unwrap(), file);
-    assert!(d.retl_fsck().unwrap().is_empty());
+    d.rretl_put_version("f", &file).unwrap();
+    let id = d.rretl_pack_in("f.zip", &file).unwrap();
+    assert_eq!(d.rretl_get_version("f", 1).unwrap(), file);
+    assert_eq!(d.rretl_pack_out(id).unwrap(), file);
+    assert!(d.rretl_fsck().unwrap().is_empty());
 }
