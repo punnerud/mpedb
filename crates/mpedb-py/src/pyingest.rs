@@ -420,7 +420,7 @@ pub(crate) fn ingest_pending(db: &mpedb::Database, py: Python<'_>, source: &str)
 pub(crate) fn ingest_budget_left(db: &mpedb::Database, py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
     let b = py.detach(|| db.ingest_budget_left(source)).map_err(map_err)?;
     let d = pyo3::types::PyDict::new(py);
-    d.set_item("profile", b.profile)?;
+    d.set_item("profile", &b.profile)?;
     d.set_item("calls", b.calls)?;
     d.set_item("bytes", b.bytes)?;
     d.set_item("window_secs", b.window_secs)?;

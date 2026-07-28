@@ -121,6 +121,26 @@ log-based engine), and the hardware published when the hardware is the answer.
   push + state row share one txn. classify_p1/classify_p2 in rretl_map.rs
   are the ONE decision function sync, check and run all use — three
   copies would drift, which is exactly the bug class the duel found)
+  + `ingest define|show|state|advise|conflicts|resolve` +
+  `next|pending|done|release|reap` (#52 stage B, DESIGN-INGEST: getting
+  data IN, which is the half rRETL does not own. A source is a call
+  GRAPH, not a list of tables — a cheap root call returns keys that DRIVE
+  per-key calls, and fan-out is measured, never declared. mpedb never
+  makes a call: it plans, receives, diffs, verifies, and carries the
+  parameters. Three things carry their weight: the DUMP is the judge —
+  it tries the delta's cursor candidate against where that delta stood
+  and names the rows a lying `updated_at` would have lost (empty
+  watermark = NO verdict, since everything beats nothing); the objective
+  is HARMONIC staleness, because binary freshness's optimum polls the
+  fastest-changing table ZERO times (Cho & Garcia-Molina TODS'03 Thm
+  5.5) and uniform is the control arm it must beat (Thm 5.1/5.2); and a
+  DERIVED edge is SCOPED — it presents only the keys that drove it, so a
+  dump receipt through it is refused by name (`presents_whole_table()`
+  is the one place that decides). `ingest_derive` queues follow-ups in
+  the SAME txn as the receipt that found the keys. Bookkeeping is
+  ordinary rigid tables — ingest_stats/state/conflicts/task + the
+  in-dump ingest_seen — never sys-keyspace, #124 is why. Guide:
+  INGEST-GUIDE.md; the measured lab is workbench/ingest-lab)
   + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
   and `mirror-collide` (SIGKILL fuzz: source writers + a mirror daemon killed at every
   instant → final drain must converge mpedb exactly to the source)

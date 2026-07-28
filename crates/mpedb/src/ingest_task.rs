@@ -44,9 +44,11 @@ pub struct IngestTask {
 }
 
 /// What is left of this window's budget.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BudgetLeft {
-    pub profile: &'static str,
+    /// The DECLARED profile name, not a normalised one — a source whose
+    /// profiles are `eu-hours`/`us-hours` must see those words back.
+    pub profile: String,
     pub calls: i64,
     pub bytes: i64,
     pub window_secs: i64,
@@ -180,7 +182,12 @@ impl crate::Database {
         // guessing a timezone it cannot know.
         let hour = (now / 1_000_000 / 3600) % 24;
         let Some(b) = spec.budget_for(hour) else {
-            return Ok(BudgetLeft { profile: "none", calls: 0, bytes: 0, window_secs: 0 });
+            return Ok(BudgetLeft {
+                profile: "none".into(),
+                calls: 0,
+                bytes: 0,
+                window_secs: 0,
+            });
         };
         let have = self.committed_tables()?;
         let (mut used_c, mut used_b) = (0i64, 0i64);
@@ -197,7 +204,7 @@ impl crate::Database {
             }
         }
         Ok(BudgetLeft {
-            profile: if b.profile == "work" { "work" } else { "off" },
+            profile: b.profile.clone(),
             calls: (b.calls - used_c).max(0),
             bytes: if b.bytes > 0 { (b.bytes - used_b).max(0) } else { i64::MAX },
             window_secs: b.window_secs,

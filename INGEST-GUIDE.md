@@ -132,6 +132,15 @@ st["cases_changed"]["cursor_state"]   # "unknown" | "safe" | "unsafe"
 st["cases_changed"]["missed"]         # rows the cursor would have LOST
 ```
 
+The watermark lives here too, and it is what your next delta should ask
+from — never a timestamp your fetcher remembered, which a crash loses:
+
+```python
+wm = db.ingest_state("salesforce")["cases_changed"]["watermark"]
+since = 0 if wm is None else wm - OVERLAP        # the overlap is mandatory (§9)
+rows = client.query(f"... WHERE LastModifiedDate >= {since}")
+```
+
 The first time a dump finds a row whose `updated_at` did not move, the
 verdict flips to `unsafe` **and names the row**. That is the common case in
 the wild: the application sets the timestamp on insert and forgets it on
@@ -160,8 +169,12 @@ mpedb ingest advise app.toml salesforce --emit-cron
 # salesforce — plan under 200 calls / 300s (work), 20 / 300s (off)
 */5  8-16 * * 1-5  myfetch.py salesforce cases_changed   # delta, overlap 300s
 17   3    * * *    myfetch.py salesforce cases_full      # dump, reconcile
-*/20 8-16 * * 1-5  myfetch.py salesforce case_detail     # derived, fan-out ~34
 ```
+
+**Derived edges get no cron line.** They are not scheduled: their rate IS
+the parent's rate times the observed fan-out, so they run when the parent
+puts keys in the queue (§7). The plan still reports what they will cost —
+`ingest advise` shows the fan-out and the calls per window it implies.
 
 Your script does the fetching and calls `ingest_delta`/`ingest_dump`. The
 plan says when to run it and what to ask for.

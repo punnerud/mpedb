@@ -480,10 +480,10 @@ Rules the design must not lose. Each is a real, documented failure.
 | stage | contents | status |
 |---|---|---|
 | B1 | this document + `INGEST-GUIDE.md`; formats frozen | **BUILT** |
-| B2 | `ingest.rs`: declaration, dump/delta protocol, diff-apply, cursor verification, conflicts | |
-| B3 | `ingest advise`: uniform control arm, harmonic solver, caps, profiles, cron emission | |
-| B4 | cascade: queue-driven derived calls, budget accounting per edge | |
-| B5 | `workbench/ingest-lab` + the agent trial against the GUIDE | |
+| B2 | `ingest.rs` + `ingest_run.rs`: declaration, dump/delta protocol, diff-apply, cursor verification, conflicts | **BUILT** |
+| B3 | `ingest_plan.rs`: uniform control arm, harmonic solver, caps, profiles, cron emission | **BUILT** |
+| B4 | `ingest_task.rs`: queue-driven derived calls, leases, fan-out measured per edge | **BUILT** |
+| B5 | `workbench/ingest-lab` + the agent trial against the GUIDE | **BUILT** |
 
 Out of scope, deliberately: an HTTP client; new SQL syntax; changes to
 `mpee.rs`/`CostSource` (contracts borrowed, code untouched); Merkle /
