@@ -90,6 +90,7 @@ fn receipt_dict(py: Python<'_>, r: &mpedb::ingest_run::IngestReport) -> PyResult
     d.set_item("cursor_state", &r.cursor_state)?;
     d.set_item("caught", r.caught)?;
     d.set_item("missed", r.missed)?;
+    d.set_item("missed_example", value_to_py(py, r.missed_example.clone())?)?;
     d.set_item("watermark", value_to_py(py, r.watermark.clone())?)?;
     d.set_item("complete", r.complete)?;
     d.set_item("note", r.note())?;
@@ -100,11 +101,30 @@ fn receipt_dict(py: Python<'_>, r: &mpedb::ingest_run::IngestReport) -> PyResult
 /// A source declaration from the Python-native dict form. Every refusal
 /// names the offending key; the REAL validation (tables exist, parents
 /// resolve, deltas have a reconciling dump) happens in the engine.
+/// The dict door must not be a FILTER. A key it quietly drops is a setting
+/// the caller believes is in force — and unlike a bad row, nothing ever
+/// reports it. Same discipline as the TOML door, same message shape.
+fn only_keys(d: &pyo3::Bound<'_, pyo3::types::PyDict>, allowed: &[&str], what: &str)
+    -> PyResult<()>
+{
+    for k in d.keys().iter() {
+        let k: String = k.extract()?;
+        if !allowed.contains(&k.as_str()) {
+            return Err(ProgrammingError::new_err(format!(
+                "ingest spec: `{k}` is not a known {what} key. Known: {}",
+                allowed.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn ingest_spec_toml(spec: &Bound<'_, PyAny>) -> PyResult<String> {
     use pyo3::types::{PyDict, PyList};
     let d = spec
         .cast::<PyDict>()
         .map_err(|_| ProgrammingError::new_err("ingest spec: expected a dict or a TOML string"))?;
+    only_keys(d, &["name", "policy", "work_from", "work_to", "budget", "edges"], "spec")?;
     let get = |k: &str| d.get_item(k).ok().flatten();
     let name = get("name")
         .and_then(|v| v.extract::<String>().ok())
@@ -123,6 +143,7 @@ fn ingest_spec_toml(spec: &Bound<'_, PyAny>) -> PyResult<String> {
             let bd = b.cast::<PyDict>().map_err(|_| {
                 ProgrammingError::new_err("ingest spec: each budget must be a dict")
             })?;
+            only_keys(bd, &["profile", "window_secs", "calls", "bytes"], "budget")?;
             out.push_str("\n[[source.budget]]\n");
             for k in ["profile"] {
                 if let Some(v) = bd.get_item(k)?.and_then(|v| v.extract::<String>().ok()) {
@@ -143,6 +164,14 @@ fn ingest_spec_toml(spec: &Bound<'_, PyAny>) -> PyResult<String> {
         let ed = e
             .cast::<PyDict>()
             .map_err(|_| ProgrammingError::new_err("ingest spec: each edge must be a dict"))?;
+        only_keys(
+            ed,
+            &[
+                "name", "kind", "parent", "table", "strategy", "cursor",
+                "overlap_secs", "batch", "cost_calls", "cost_bytes", "weight",
+            ],
+            "edge",
+        )?;
         out.push_str("\n[[source.edge]]\n");
         for k in ["name", "kind", "parent", "table", "strategy", "cursor"] {
             if let Some(v) = ed.get_item(k)?.and_then(|v| v.extract::<String>().ok()) {
@@ -274,6 +303,7 @@ pub(crate) fn ingest_state(db: &mpedb::Database, py: Python<'_>, source: &str) -
         d.set_item("fanout", s.fanout_per_call())?;
         d.set_item("lambda_per_poll", s.lambda_per_poll())?;
         d.set_item("overlap_secs", overlap)?;
+        d.set_item("last_receipt_micros", s.last_micros)?;
         out.set_item(edge, d)?;
     }
     Ok(out.into_any().unbind())

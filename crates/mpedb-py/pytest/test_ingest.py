@@ -66,10 +66,11 @@ SOURCE = """
 [source]
 name = "sf"
 policy = "source"
+work_from = 6
+work_to = 18
 
 [[source.budget]]
 profile = "work"
-hours = "6-18"
 window_secs = 300
 calls = 50
 
@@ -104,6 +105,17 @@ strategy = "dump"
 batch = 2
 cost_calls = 1
 cost_bytes = 3000
+
+# A derived edge is scoped to its keys, so nothing here presents the whole
+# of `contracts` without this one — and a table nothing presents whole has
+# deletes nobody can see.
+[[source.edge]]
+name = "contracts_full"
+kind = "root"
+table = "contracts"
+strategy = "dump"
+cost_calls = 4
+cost_bytes = 40000
 """
 
 # The "external system". `bumped` is what its API would show as updated_at —

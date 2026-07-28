@@ -75,12 +75,21 @@ db.ingest_define({
         {"name": "case_detail", "kind": "derived", "parent": "cases_changed",
          "table": "case_details", "batch": 200,
          "cost_calls": 1, "cost_bytes": 100_000},
+
+        # And its table needs a reconcile of its own. A derived edge is
+        # SCOPED to the keys that drove it, so it never presents the whole
+        # table — which means nothing here would ever see a deleted detail.
+        {"name": "details_full", "kind": "root", "table": "case_details",
+         "strategy": "dump", "cost_calls": 40, "cost_bytes": 4_000_000},
     ],
 })
 ```
 
 **Profiles** are time-of-day budgets. `work` is 08–17 on weekdays, `off` is
-everything else, and you can set the hours per source. Cheap at night, busy
+everything else; set your own with `"work_from": 6, "work_to": 18` on the
+SOURCE (not on the budget entry). Any key mpedb does not know is refused by
+name — a setting it silently dropped would be a setting you believe is in
+force. Cheap at night, busy
 in office hours — declare it once, the plan respects it.
 
 `mpedb ingest show <config> salesforce` prints back the canonical form.
@@ -112,15 +121,37 @@ is:
 
 ```python
 run = db.ingest_begin("salesforce", "cases", mode="dump")
-for page in client.pages():
-    db.ingest_rows(run, page, calls=1, bytes=len(page_bytes))
-r = db.ingest_finish(run)
+try:
+    for page in client.pages():
+        db.ingest_rows(run, page, calls=1, bytes=len(page_bytes))
+    r = db.ingest_finish(run)
+except Exception:
+    db.ingest_abandon(run)      # NOT finish — see below
+    raise
 r["deleted"]        # rows the dump did NOT contain — the only way deletes appear
 ```
+
+**A dump you could not finish must be ABANDONED, not finished.** `finish`
+reads every key you did not present as a delete, so a fetch that died on
+page 3 of 40 deletes the rest of the table. `ingest_abandon` closes the run
+and keeps what you already pushed — those rows were real observations.
+
+**A partial row is a row.** Send `{"id": 3, "subject": "c"}` to a
+four-column table and it inserts with the other two columns NULL. An
+endpoint that omits fields on some rows will blank them, and the next dump
+then reads those rows as changed. Send the whole row, or only the columns
+you mean to set on an UPDATE.
 
 **`calls` and `bytes` are what the call actually cost you.** mpedb cannot
 see the wire, so it trusts your numbers; they are what the next plan is
 computed against. Report them and the budget works.
+
+**Your budget is not the API's rate limit — you declare one FROM the
+other.** mpedb's budget is a promise you make to yourself; the upstream
+limiter is a wall you hit. Read the real numbers off successful responses
+(`X-RateLimit-Limit` / `X-RateLimit-Remaining`), declare a little under them
+so a burst does not run you into a 429, and honour `Retry-After` when one
+comes anyway. Discovering the limit by being refused is the expensive way.
 
 **The budget window is WALL-CLOCK.** `window_secs = 300` means the last 300
 seconds of real time, measured from receipt timestamps. A test loop that
@@ -185,6 +216,21 @@ mpedb ingest state app.toml salesforce
 
 ---
 
+`ingest_state` also carries `last_receipt_micros` — when this edge last
+reported. A script that cron runs has no memory of its own, so that is how
+it answers "am I due?" without keeping a file beside the database.
+
+### Reading it back
+
+Ordinary SQL, and the row shape is tuples:
+
+```python
+rows = db.query("SELECT id, subject FROM cases ORDER BY id")   # [(1, 'printer'), …]
+cols, rows = db.query_full("SELECT * FROM cases")              # names too
+```
+
+---
+
 ## 5. Get the plan, put it in cron
 
 ```python
@@ -231,9 +277,20 @@ The report also tells you what it could **not** plan and why — a table with
 no observations yet, an edge whose parent never ran, a budget too small for
 the declared dump. Nothing is silently dropped.
 
-**Run it a while before trusting the plan.** The first plan is uniform
-(every edge the same rate), because with no history that is provably as good
-as anything cleverer. As receipts accumulate, the rates separate.
+**Run it a while before trusting the plan.** With no receipts, every edge
+is priced at the same unobserved floor and the census says so by name — so
+the first plan reflects your DECLARED costs, not the source's behaviour.
+As receipts accumulate the rates separate. Two things skew the estimate if
+you fight it:
+
+- **Space the calls.** The plan gives a rate per window; making all of them
+  back to back inside one window teaches the estimator that the source
+  rarely changes between polls, and it lowers the rate. One call per edge
+  per window, evenly spaced, is what the theory assumes and what the plan
+  means.
+- **Receipts closer together than a second are not a sample.** The plan
+  ignores them and prices the edge at the unobserved floor rather than
+  extrapolating a change rate from a loop you happened to run.
 
 ---
 
@@ -262,7 +319,7 @@ mpedb ingest conflicts app.toml salesforce   # exits 1 when non-empty → cron m
 Resolve in bulk when you have decided:
 
 ```python
-db.ingest_resolve("salesforce", take="source")   # or take="local"
+db.ingest_resolve("salesforce", take="local")    # the only value there is
 ```
 
 That is the whole conflict story on purpose: mpedb will not guess. Newest-
@@ -324,11 +381,15 @@ while (task := db.ingest_next("salesforce")):
 
 Three things to know about that loop:
 
-- **`ingest_next` returns `None` when this window's budget is spent.** That
-  is the budget working, not an error — the loop ends, cron fires again
-  later, and the queue is still there. `db.ingest_pending(source)` shows how
-  much is waiting; a number that only grows means the budget cannot keep up
-  with the fan-out.
+- **`None` means one of two things**: this window's budget is spent, or the
+  queue is empty. Ask `db.ingest_pending(source)` to tell them apart — it is
+  also how you see a queue that only grows.
+- **Drain the cascade BEFORE you fetch roots.** Only `ingest_next` checks
+  the budget; `ingest_begin`/`ingest_rows` do not, because mpedb cannot
+  refuse a call you have already made. So a fetcher that dumps first can
+  spend the whole window on itself and then find `ingest_next` handing out
+  nothing — the queue grows, and the diagnostic will look like fan-out when
+  the cause was your own roots. Drain first, or hold back calls for it.
 - **A derived receipt goes through the `delta` door**, always. It presents
   only the keys it was asked about, so it upserts and never infers a delete
   — a `dump` receipt on a derived edge is refused for exactly that reason.
@@ -341,6 +402,13 @@ Three things to know about that loop:
 **Fan-out is measured here, not declared.** Every `ingest_derive` records
 how many keys one parent call produced; that is the cardinality the planner
 (§5) needs to price the graph, and you never have to estimate it yourself.
+It is stored on the CHILD edge — `ingest_state(src)["case_detail"]["fanout"]`
+— because that is whose cost it is. The parent's `fanout` stays 0.
+
+**`ingest_derive` queues every key you hand it, not the changed ones.** The
+receipt tells you HOW MANY rows changed, not which; if you only want
+follow-ups for rows that actually moved, compare against your table before
+you push, and derive that subset.
 
 ---
 
@@ -410,6 +478,15 @@ reverse direction has a gap the width of your initial load.
   a choice; make it knowingly.
 - **A bulk update in the source touches every row's timestamp** and your
   next delta pulls the whole table. Budget for it.
+- **A dump does not move the delta's watermark.** The dump saw everything,
+  but a row committed late with an older stamp would be skipped if the delta
+  jumped ahead — so it does not. Practical consequence: the first delta
+  after a seeding dump has no watermark and asks for everything once.
+- **A PAGED dump against a moving source can lose a row.** Delete something
+  on page 1 and every later row shifts back one; the row that crossed the
+  boundary while you were reading is never presented, and `finish` reads
+  that as a delete. Page by a stable key (`WHERE id > :last`) rather than by
+  offset, or take the reconcile in one big page.
 - **A dump commits as it goes**, so a reader during a dump sees a partly
   updated table. If that matters, read from the rRETL working set instead —
   it moves in its own transactions.
@@ -432,7 +509,7 @@ reverse direction has a gap the width of your initial load.
 | `db.ingest_abandon(run)` | `None` | give up on an open receipt — the rows already pushed stay (they were real), the run closes, and a dump's presented-key set is cleared so the next dump starts honest |
 | `db.ingest_state(src)` | dict per edge | watermark, cursor verdict (`safe`/`unsafe`/`unknown`), caught/missed, observed change rate and fan-out |
 | `db.ingest_advise(src)` | dict incl. `cron` and `profiles` | the plan (see below) |
-| `db.ingest_conflicts(src)` / `ingest_resolve(src, take=)` | list / count | what could not be decided, and deciding it |
+| `db.ingest_conflicts(src)` / `ingest_resolve(src, take="local")` | list / count | what could not be decided, and clearing it. `take` accepts only `"local"` — taking the source's version means fetching it, which is a call, so run a dump under `policy = "source"` instead |
 | `db.ingest_derive(run, edge, keys)` | int | queue derived calls from this receipt's keys, atomically with it |
 | `db.ingest_next(src)` | `{lease, edge, table, keys}` \| `None` | the next batch the budget allows; `None` = window spent |
 | `db.ingest_done(src, lease)` / `ingest_release(src, lease)` | int | retire a leased batch / give it back after a failed fetch |

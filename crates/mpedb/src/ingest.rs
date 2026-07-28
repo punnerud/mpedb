@@ -262,6 +262,22 @@ fn tint(v: &toml::Value, what: &str) -> Result<i64> {
 
 impl IngestSpec {
     pub fn from_toml_str(text: &str) -> Result<IngestSpec> {
+        /// A key nobody reads is a setting the operator thinks is in force.
+        /// Rows are already refused this way (§3); the declaration is where
+        /// it matters more, because a dropped `work_from` is silent forever.
+        fn only(v: &toml::Value, allowed: &[&str], what: &str) -> Result<()> {
+            let Some(t) = v.as_table() else { return Ok(()) };
+            for k in t.keys() {
+                if !allowed.contains(&k.as_str()) {
+                    return Err(Error::Unsupported(format!(
+                        "ingest spec: `{k}` is not a known {what} key. Known: {}",
+                        allowed.join(", ")
+                    )));
+                }
+            }
+            Ok(())
+        }
+
         let doc: toml::Value = text
             .parse()
             .map_err(|e| Error::Unsupported(format!("ingest spec parse error: {e}")))?;
@@ -277,12 +293,14 @@ impl IngestSpec {
             Some(v) => Policy::parse(&tstr(v, "source.policy")?)?,
             None => Policy::Source,
         };
+        only(src, &["name", "policy", "work_from", "work_to", "budget", "edge"], "source")?;
         let work_from = src.get("work_from").map(|v| tint(v, "work_from")).transpose()?.unwrap_or(8);
         let work_to = src.get("work_to").map(|v| tint(v, "work_to")).transpose()?.unwrap_or(17);
 
         let mut budget = Vec::new();
         if let Some(arr) = src.get("budget").and_then(|b| b.as_array()) {
             for b in arr {
+                only(b, &["profile", "window_secs", "calls", "bytes"], "budget")?;
                 budget.push(BudgetSpec {
                     profile: b
                         .get("profile")
@@ -306,6 +324,14 @@ impl IngestSpec {
             .ok_or_else(|| Error::Unsupported("ingest spec: at least one [[source.edge]]".into()))?;
         let mut edges = Vec::with_capacity(raw.len());
         for e in raw {
+            only(
+                e,
+                &[
+                    "name", "kind", "table", "strategy", "parent", "cursor",
+                    "overlap_secs", "batch", "cost_calls", "cost_bytes", "weight",
+                ],
+                "edge",
+            )?;
             let ename = tstr(
                 e.get("name")
                     .ok_or_else(|| Error::Unsupported("ingest spec: edge without `name`".into()))?,
@@ -519,20 +545,27 @@ impl IngestSpec {
         // §4: deletes are visible through nothing else, and nothing else
         // re-verifies a cursor. A table pulled only by delta is a table
         // whose deletes never arrive.
+        // The requirement is per TABLE, not per edge: whatever pulls it, a
+        // table no edge presents WHOLE has deletes nobody can see and a
+        // cursor nobody re-verifies. Stating it per edge missed the case
+        // where the only edge on a table is a derived one (which is scoped,
+        // so it never presents the whole thing however its strategy reads).
         for e in &self.edges {
-            if e.strategy == Strategy::Delta || e.strategy == Strategy::Webhook {
-                let reconciled = self.edges.iter().any(|o| {
-                    o.table.eq_ignore_ascii_case(&e.table) && o.presents_whole_table()
-                });
-                if !reconciled {
-                    return Err(Error::Unsupported(format!(
-                        "ingest spec: `{}` is pulled by `{}` only — declare a dump edge for \
-                         it too. Deletes are visible through nothing else, and nothing else \
-                         re-verifies the cursor (DESIGN-INGEST §4)",
-                        e.table,
-                        e.strategy.as_str()
-                    )));
-                }
+            let reconciled = self
+                .edges
+                .iter()
+                .any(|o| o.table.eq_ignore_ascii_case(&e.table) && o.presents_whole_table());
+            if !reconciled {
+                return Err(Error::Unsupported(format!(
+                    "ingest spec: nothing presents the whole of `{}` — declare a root dump \
+                     edge for it. `{}` is a {} {} edge, and deletes are visible through \
+                     nothing but a dump, which is also the only thing that re-verifies a \
+                     cursor (DESIGN-INGEST §4)",
+                    e.table,
+                    e.name,
+                    e.kind.as_str(),
+                    e.strategy.as_str()
+                )));
             }
         }
         Ok(())
@@ -873,6 +906,9 @@ impl ResolvedEdge {
 /// One edge's observed model, as `ingest_state` records it.
 #[derive(Debug, Clone)]
 pub struct EdgeState {
+    /// When this edge last reported a receipt. A cron-style fetcher has no
+    /// memory of its own; without this it cannot tell whether it is due.
+    pub last_micros: i64,
     pub watermark: Value,
     pub cursor_col: String,
     pub cursor_state: String,
@@ -887,6 +923,7 @@ pub struct EdgeState {
 impl Default for EdgeState {
     fn default() -> EdgeState {
         EdgeState {
+            last_micros: 0,
             watermark: Value::Null,
             cursor_col: String::new(),
             cursor_state: "unknown".into(),
@@ -936,7 +973,7 @@ impl EdgeState {
 
 const STATE_GET: &str =
     "SELECT fingerprint, watermark, cursor_col, cursor_state, caught, missed, fanout, \
-     receipts, changed_receipts, parent_calls FROM ingest_state \
+     receipts, changed_receipts, parent_calls, ts_micros FROM ingest_state \
      WHERE source = $1 AND edge = $2";
 
 /// Decode a state row, or "never observed". **Fails SOFT on a stale
@@ -960,6 +997,7 @@ fn decode_state(rows: &[Vec<Value>], fingerprint: &str) -> Result<EdgeState> {
         receipts: crate::rretl::as_int(&r[7])?,
         changed_receipts: crate::rretl::as_int(&r[8])?,
         parent_calls: crate::rretl::as_int(&r[9])?,
+        last_micros: r.get(10).and_then(|v| crate::rretl::as_int(v).ok()).unwrap_or(0),
     })
 }
 

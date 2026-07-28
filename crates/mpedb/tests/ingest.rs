@@ -303,8 +303,8 @@ strategy = "delta"
 cursor = "updated_at"
 "#;
     let e = d.ingest_define(only_delta).unwrap_err().to_string();
-    assert!(e.contains("declare a dump edge"), "{e}");
-    assert!(e.contains("Deletes are visible through nothing else"), "{e}");
+    assert!(e.contains("nothing presents the whole of"), "{e}");
+    assert!(e.contains("deletes are visible through nothing but a dump"), "{e}");
 
     let no_cursor = r#"
 [source]
@@ -594,7 +594,9 @@ fn derived_edges_are_driven_not_scheduled() {
     let spec = format!(
         "{}\n[[source.edge]]\nname = \"case_detail\"\nkind = \"derived\"\nparent = \
          \"cases_delta\"\ntable = \"details\"\nstrategy = \"dump\"\nbatch = 10\n\
-         cost_calls = 1\n",
+         cost_calls = 1\n\
+         [[source.edge]]\nname = \"details_full\"\nkind = \"root\"\ntable = \
+         \"details\"\nstrategy = \"dump\"\ncost_calls = 4\n",
         SPEC
     );
     d.ingest_define(&spec).unwrap();
@@ -679,6 +681,16 @@ table = "details"
 strategy = "dump"
 batch = 2
 cost_calls = 1
+
+# A derived edge is SCOPED, so it never presents the whole of `details` —
+# and a table nothing presents whole has deletes nobody can see. The
+# declaration refuses the source without this one.
+[[source.edge]]
+name = "details_full"
+kind = "root"
+table = "details"
+strategy = "dump"
+cost_calls = 4
 "#;
 
 fn cascaded(tag: &str) -> (Database, Scratch) {

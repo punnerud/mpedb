@@ -105,13 +105,29 @@ impl IngestPlan {
                 p.verdict()
             ));
             for e in &p.edges {
-                if e.rate_per_window <= 0.0 {
+                // A driven edge has a rate but no line: it runs when its
+                // parent queues keys, not when the clock says so.
+                if e.rate_per_window <= 0.0 || e.cron.is_empty() {
                     continue;
                 }
                 out.push(format!(
                     "{}  {command} {} {}   # {}",
                     e.cron, self.source, e.edge, e.reason
                 ));
+                // cron cannot say "weekday evenings OR the weekend" in one
+                // line, so the quiet profile takes a second one. Without it
+                // the plan simply does not run on Saturday.
+                if p.profile != "work" {
+                    let f: Vec<&str> = e.cron.split_whitespace().collect();
+                    if f.len() == 5 {
+                        // The whole weekend is quiet, so the hour field goes
+                        // back to `*` — the weekday complement does not apply.
+                        out.push(format!(
+                            "{} * {} {} 0,6  {command} {} {}   # {} (weekend)",
+                            f[0], f[2], f[3], self.source, e.edge, e.reason
+                        ));
+                    }
+                }
             }
         }
         for s in &self.skipped {
@@ -129,6 +145,9 @@ const DUMP_FLOOR_PER_DAY: f64 = 1.0;
 /// scheduled at all, which is what earns it the observations that let the
 /// next plan price it properly.
 const UNOBSERVED_LAMBDA_PER_WINDOW: f64 = 0.5;
+/// Receipts closer together than this are not a sample of the source's
+/// change rate; see `observed_interval_secs`.
+const MIN_OBSERVED_INTERVAL_SECS: f64 = 1.0;
 
 /// Everything the solver needs about one root edge, with its children's
 /// cost already folded in.
@@ -248,11 +267,33 @@ fn solve_rates(roots: &[Root], budget: f64) -> Vec<f64> {
 /// Seconds between calls → a crontab schedule. Cron's floor is one minute;
 /// anything faster is emitted as every-minute WITH a note, because
 /// pretending otherwise would silently under-deliver the plan.
+/// The hours a `work` window of [from, to) does NOT cover, as a cron field.
+/// An empty complement (a 24-hour work window) yields `*` for a source that
+/// declared no quiet hours at all.
+fn off_hours(from: i64, to: i64) -> String {
+    let mut parts = Vec::new();
+    if from > 0 {
+        parts.push(if from == 1 { "0".to_string() } else { format!("0-{}", from - 1) });
+    }
+    if to <= 23 {
+        parts.push(if to == 23 { "23".to_string() } else { format!("{to}-23") });
+    }
+    if parts.is_empty() {
+        return "*".into();
+    }
+    parts.join(",")
+}
+
 fn cron_line(interval_secs: f64, profile: &str, work_from: i64, work_to: i64) -> (String, String) {
+    // The two profiles have to be pasteable TOGETHER. An `off` line of
+    // `* * * * *` fires during work hours as well, so the operator silently
+    // runs both rates at once — which is why `off` is emitted as the
+    // COMPLEMENT: the hours outside the window on weekdays, and the whole
+    // of the weekend as its own line (cron cannot say "or" across fields).
     let (hours, days) = if profile == "work" {
         (format!("{}-{}", work_from, (work_to - 1).max(work_from)), "1-5".to_string())
     } else {
-        ("*".to_string(), "*".to_string())
+        (off_hours(work_from, work_to), "1-5".to_string())
     };
     if interval_secs <= 60.0 {
         return (
@@ -283,7 +324,15 @@ impl crate::Database {
     pub fn ingest_advise(&self, source: &str) -> Result<IngestPlan> {
         let spec = self.load_ingest(source)?;
         self.resolve_ingest(&spec)?; // the plan must describe a live source
-        let mut skipped = Vec::new();
+        // One census for the whole plan: the same edge is unplannable for the
+    // same reason in every profile, and reporting it per profile makes a
+    // reader count the problems twice.
+    let mut skipped: Vec<String> = Vec::new();
+    let note = |skipped: &mut Vec<String>, msg: String| {
+        if !skipped.contains(&msg) {
+            skipped.push(msg);
+        }
+    };
 
         // Observed model per edge, and the average interval each edge has
         // actually been called at — the estimator counts receipts, and a
@@ -298,7 +347,7 @@ impl crate::Database {
         let mut profiles = Vec::new();
         for b in &spec.budget {
             if b.calls <= 0 {
-                skipped.push(format!(
+                note(&mut skipped, format!(
                     "profile `{}` has no call budget — nothing can be scheduled in it",
                     b.profile
                 ));
@@ -314,7 +363,7 @@ impl crate::Database {
                 // Δ per window: the LLN estimate is per receipt, so it is
                 // scaled by how often receipts actually happened.
                 let lambda = if st.receipts < 2 || *interval <= 0.0 {
-                    skipped.push(format!(
+                    note(&mut skipped, format!(
                         "edge `{}` has {} receipt(s) — priced at the unobserved floor until \
                          it has a history to estimate from",
                         e.name, st.receipts
@@ -339,7 +388,7 @@ impl crate::Database {
                 });
             }
             if roots.is_empty() {
-                skipped.push(format!("profile `{}` has no root edges to schedule", b.profile));
+                note(&mut skipped, format!("profile `{}` has no root edges to schedule", b.profile));
                 continue;
             }
             let budget = b.calls as f64;
@@ -392,8 +441,13 @@ impl crate::Database {
                     table: e.table.clone(),
                     strategy: e.strategy.as_str().into(),
                     kind: e.kind.as_str().into(),
-                    rate_per_window: 0.0,
-                    interval_secs: f64::INFINITY,
+                    // Not scheduled — but "not scheduled" is not "free". The
+                    // rate it WILL run at is the parent's times the observed
+                    // fan-out, and a scheduler reading the numbers rather
+                    // than the prose has to see that. `interval_secs` is 0:
+                    // there is no interval to wait, and INFINITY is not JSON.
+                    rate_per_window: per_window,
+                    interval_secs: 0.0,
                     cron: String::new(),
                     effective_calls: e.cost_calls as f64,
                     effective_bytes: e.cost_bytes as f64,
@@ -409,7 +463,7 @@ impl crate::Database {
                     ),
                 });
                 if fan <= 0.0 {
-                    skipped.push(format!(
+                    note(&mut skipped, format!(
                         "edge `{}`'s fan-out has never been observed — its cost is priced at \
                          zero until a receipt reports keys for it",
                         e.name
@@ -428,7 +482,7 @@ impl crate::Database {
                 solved_staleness: staleness(&roots, &rates),
             });
             if b.bytes > 0 && used_bytes > b.bytes as f64 {
-                skipped.push(format!(
+                note(&mut skipped, format!(
                     "profile `{}` fits the CALL budget but wants {:.0} bytes/window against a \
                      {} byte budget — raise the byte budget or lower the dump cadence",
                     b.profile, used_bytes, b.bytes
@@ -464,7 +518,17 @@ impl crate::Database {
         if n < 2 || hi <= lo {
             return Ok(0.0);
         }
-        Ok((hi - lo) as f64 / 1e6 / (n - 1) as f64)
+        // Receipts landing within a second of each other say nothing about
+        // how fast the SOURCE changes — they say the operator ran a loop.
+        // Dividing by that interval turns a handful of changes into millions
+        // per window and the plan then asks for a rate no budget can hold.
+        // Below the floor there is no measurement, so the edge is priced at
+        // the unobserved floor and the census says why.
+        let secs = (hi - lo) as f64 / 1e6 / (n - 1) as f64;
+        if secs < MIN_OBSERVED_INTERVAL_SECS {
+            return Ok(0.0);
+        }
+        Ok(secs)
     }
 }
 

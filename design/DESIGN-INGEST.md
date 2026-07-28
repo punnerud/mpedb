@@ -455,6 +455,28 @@ Rules the design must not lose. Each is a real, documented failure.
   ([Jira](https://developer.atlassian.com/cloud/jira/platform/rate-limiting/),
   [Salesforce rolling limits](https://help.salesforce.com/s/articleView?id=002888831))
 
+**P13 — a paged dump against a moving source can skip a row.** Delete a row
+on an early page and every later row shifts back one; the row that crosses
+the page boundary during the read is never presented, and `finish` reads
+absence as deletion. Page by a stable key (`WHERE id > :last`), not by
+offset. (Same failure MySQL's `pt-online-schema-change` documents for
+chunked copies.)
+
+**P14 — receipts closer together than the estimator's floor are not a
+sample.** Δ̂ divides by the observed interval between receipts; a loop that
+polls twice in the same second turns a handful of changes into millions per
+window, and the solver then asks for a rate no budget can hold. Below
+`MIN_OBSERVED_INTERVAL_SECS` the history is treated as unobserved and the
+census says so. Related: the plan's rate is per WINDOW and assumes even
+spacing (§7.2) — bunching the calls inside one window lowers the measured
+change probability per poll and the plan responds by lowering the rate.
+
+**P15 — the two profiles must be pasteable together.** A quiet-hours cron
+line of `* * * * *` also fires during work hours, so the operator silently
+runs both rates at once. The `off` profile is emitted as the COMPLEMENT of
+the work window on weekdays plus a second line for the whole weekend, since
+cron cannot express that disjunction in one line.
+
 ## 14. Theory sources
 
 - Cho & García-Molina, *Effective Page Refresh Policies for Web Crawlers*,

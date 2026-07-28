@@ -46,6 +46,9 @@ pub struct IngestReport {
     pub cursor_state: String,
     pub caught: i64,
     pub missed: i64,
+    /// The key of one row this receipt found changed that the cursor would
+    /// NOT have caught — so the verdict can be chased down, not just counted.
+    pub missed_example: Value,
     pub watermark: Value,
     /// True when this receipt could see deletes at all.
     pub complete: bool,
@@ -69,6 +72,7 @@ impl Default for IngestReport {
             cursor_state: "unknown".into(),
             caught: 0,
             missed: 0,
+            missed_example: Value::Null,
             watermark: Value::Null,
             complete: false,
         }
@@ -101,9 +105,13 @@ impl IngestReport {
     pub fn cursor_note(&self) -> String {
         match self.cursor_state.as_str() {
             "unsafe" => format!(
-                "cursor UNSAFE: {} of {} changed rows would NOT have been caught by it",
+                "cursor UNSAFE: {} of {} changed rows would NOT have been caught by it{}",
                 self.missed,
-                self.caught + self.missed
+                self.caught + self.missed,
+                match &self.missed_example {
+                    Value::Null => String::new(),
+                    v => format!(" (e.g. the row keyed {v:?})"),
+                }
             ),
             "safe" => format!(
                 "cursor safe so far: {} changed rows all carried a moved cursor",
@@ -162,6 +170,9 @@ struct OpenRun {
     caught: i64,
     missed: i64,
     watermark: Value,
+    /// Not persisted: one example key for THIS receipt's verdict. A run that
+    /// resumes after a crash has no verdict of its own to name yet.
+    missed_example: Value,
 }
 
 fn read_open(s: &mut WriteSession<'_>, run_id: i64) -> Result<OpenRun> {
@@ -195,6 +206,7 @@ fn read_open(s: &mut WriteSession<'_>, run_id: i64) -> Result<OpenRun> {
         caught: crate::rretl::as_int(&r[12])?,
         missed: crate::rretl::as_int(&r[13])?,
         watermark: r[14].clone(),
+        missed_example: Value::Null,
     })
 }
 
@@ -620,6 +632,7 @@ fn report_of(run_id: i64, run: &OpenRun, edge: &ResolvedEdge) -> IngestReport {
         cursor_state: String::new(),
         caught: run.caught,
         missed: run.missed,
+        missed_example: run.missed_example.clone(),
         watermark: run.watermark.clone(),
         complete: run.mode == Mode::Dump && edge.spec.presents_whole_table(),
     }
@@ -783,6 +796,12 @@ fn apply_chunk(
                         run.caught += 1;
                     } else {
                         run.missed += 1;
+                        if matches!(run.missed_example, Value::Null) {
+                            // The guide promises the verdict NAMES a row, and
+                            // a count alone cannot be chased down in the
+                            // source. One example is enough to go looking.
+                            run.missed_example = row[pk_at].clone();
+                        }
                     }
                 }
             }

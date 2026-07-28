@@ -938,10 +938,14 @@ impl PyDatabase {
         pyingest::ingest_drop(&self.db, py, name)
     }
     #[pyo3(signature = (source, target, mode="delta"))]
+    /// Open a streamed receipt; returns an integer run id. `mode` is
+    /// `"dump"` (the whole table — the only receipt that sees deletes) or
+    /// `"delta"`.
     fn ingest_begin(&self, py: Python<'_>, source: &str, target: &str, mode: &str) -> PyResult<i64> {
         self.refuse_if_txn_open("ingest_begin", "Commit or roll back first.")?;
         pyingest::ingest_begin(&self.db, py, source, target, mode)
     }
+    /// Push one chunk of a streamed receipt.
     #[pyo3(signature = (run_id, rows, columns=None, calls=1, bytes=0))]
     fn ingest_rows(
         &self,
@@ -955,14 +959,22 @@ impl PyDatabase {
         self.refuse_if_txn_open("ingest_rows", "Commit or roll back first.")?;
         pyingest::ingest_rows(&self.db, py, run_id, rows, columns, calls, bytes)
     }
+    /// Close a receipt. For a dump, this is where deletes are found.
     fn ingest_finish(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
         self.refuse_if_txn_open("ingest_finish", "Commit or roll back first.")?;
         pyingest::ingest_finish(&self.db, py, run_id)
     }
+    /// Give up on an open receipt — a fetch that failed halfway. The rows
+    /// already pushed stay; the delete sweep does NOT run. Finishing a
+    /// half-fed dump instead would read everything you never reached as
+    /// deleted.
     fn ingest_abandon(&self, py: Python<'_>, run_id: i64) -> PyResult<()> {
         self.refuse_if_txn_open("ingest_abandon", "Commit or roll back first.")?;
         pyingest::ingest_abandon(&self.db, py, run_id)
     }
+    /// A whole small dump in one call: finds inserts, updates AND deletes.
+    /// `rows` are dicts keyed by column name, or lists plus `columns=[...]`.
+    /// `calls`/`bytes` are what the fetch actually cost you.
     #[pyo3(signature = (source, target, rows, columns=None, calls=1, bytes=0))]
     #[allow(clippy::too_many_arguments)]
     fn ingest_dump(
@@ -978,6 +990,7 @@ impl PyDatabase {
         self.refuse_if_txn_open("ingest_dump", "Commit or roll back first.")?;
         pyingest::ingest_dump(&self.db, py, source, target, rows, columns, calls, bytes)
     }
+    /// A whole small delta in one call. Cannot see deletes, by definition.
     #[pyo3(signature = (source, target, rows, columns=None, calls=1, bytes=0))]
     #[allow(clippy::too_many_arguments)]
     fn ingest_delta(
@@ -993,6 +1006,8 @@ impl PyDatabase {
         self.refuse_if_txn_open("ingest_delta", "Commit or roll back first.")?;
         pyingest::ingest_delta(&self.db, py, source, target, rows, columns, calls, bytes)
     }
+    /// The observed model per edge: watermark, cursor verdict, caught and
+    /// missed, change rate, fan-out, and when it last reported.
     fn ingest_state(&self, py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
         pyingest::ingest_state(&self.db, py, source)
     }
@@ -1009,6 +1024,8 @@ impl PyDatabase {
         pyingest::ingest_resolve(&self.db, py, source, take)
     }
 
+    /// Queue derived calls from this receipt's keys, in the SAME
+    /// transaction as the rows that produced them.
     fn ingest_derive(
         &self,
         py: Python<'_>,
@@ -1019,6 +1036,9 @@ impl PyDatabase {
         self.refuse_if_txn_open("ingest_derive", "Commit or roll back first.")?;
         pyingest::ingest_derive(&self.db, py, run_id, edge, keys)
     }
+    /// The next batch of derived calls this window's budget allows, or None
+    /// — which means EITHER the budget is spent or the queue is empty; ask
+    /// `ingest_pending` to tell those apart.
     fn ingest_next(&self, py: Python<'_>, source: &str) -> PyResult<Option<Py<PyAny>>> {
         self.refuse_if_txn_open("ingest_next", "Commit or roll back first.")?;
         pyingest::ingest_next(&self.db, py, source)
