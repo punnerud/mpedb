@@ -736,6 +736,148 @@ impl PyDatabase {
             })
             .collect())
     }
+
+    // ------------------------------------------------------ reversible ETL
+
+    /// Store a PySpell function from PYTHON SOURCE (a `def name(args): ...`
+    /// in the deterministic subset — see PYSPELL-ETL.md). The function's name
+    /// and arity come from the definition itself. Returns (name, hex hash).
+    fn define_function(&self, py: Python<'_>, source: &str) -> PyResult<(String, String)> {
+        self.refuse_if_txn_open("define_function", "Commit or roll back first.")?;
+        let db = &self.db;
+        py.detach(|| db.create_function(mpedb::spellfn::SpellLang::Python, source))
+            .map_err(map_err)
+    }
+
+    /// Register a BIJECTIVE lens pair over two stored functions, or a LOSSY
+    /// one (`residual` class goes through `create_residual_lens`). The
+    /// declaration is VERIFIED against the probe corpus and refused with a
+    /// named counter-example if it does not hold. Returns the sample count.
+    #[pyo3(signature = (name, forward, inverse, r#class="bijective"))]
+    fn create_lens(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        forward: &str,
+        inverse: &str,
+        r#class: &str,
+    ) -> PyResult<u32> {
+        self.refuse_if_txn_open("create_lens", "Commit or roll back first.")?;
+        let class = mpedb::lens::LensClass::parse(r#class).map_err(map_err)?;
+        let db = &self.db;
+        py.detach(|| db.create_lens(name, forward, inverse, class)).map_err(map_err)
+    }
+
+    /// Register a RESIDUAL lens triple: forward/1, rex/1 (the residual
+    /// extractor — what forward loses), inverse/2. The declared residual type
+    /// is verified against actual rex outputs. Returns the sample count.
+    fn create_residual_lens(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        forward: &str,
+        rex: &str,
+        inverse: &str,
+        residual_type: &str,
+    ) -> PyResult<u32> {
+        self.refuse_if_txn_open("create_residual_lens", "Commit or roll back first.")?;
+        let rt = mpedb::ColumnType::parse(residual_type).ok_or_else(|| {
+            ProgrammingError::new_err(format!(
+                "unknown residual type {residual_type:?} — expected int64, float64, bool, \
+                 text, blob, timestamp or any"
+            ))
+        })?;
+        let db = &self.db;
+        py.detach(|| db.create_residual_lens(name, forward, rex, inverse, rt))
+            .map_err(map_err)
+    }
+
+    /// Every registered lens pair, as dicts.
+    fn lenses(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let db = &self.db;
+        let infos = py.detach(|| db.list_lenses()).map_err(map_err)?;
+        infos
+            .into_iter()
+            .map(|l| {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item("name", l.name)?;
+                d.set_item("class", l.class.as_str())?;
+                d.set_item("forward_hash", l.forward_hash)?;
+                d.set_item("inverse_hash", l.inverse_hash)?;
+                d.set_item("rex_hash", l.rex_hash)?;
+                d.set_item("residual_type", l.residual_type)?;
+                d.set_item("samples", l.samples)?;
+                d.set_item("healthy", l.healthy)?;
+                Ok(d.into_any().unbind())
+            })
+            .collect()
+    }
+
+    /// Transform `table.column` IN PLACE with a registered pair, in ONE
+    /// transaction: per-row residuals are kept in `etl_residual`, the run in
+    /// `etl_lineage`, and 100% of rows verify against the source hash BEFORE
+    /// the commit that destroys the source. Returns
+    /// `{"run_id", "rows", "residuals"}`.
+    fn etl_apply(
+        &self,
+        py: Python<'_>,
+        pair: &str,
+        table: &str,
+        column: &str,
+    ) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("etl_apply", "Commit or roll back first.")?;
+        let db = &self.db;
+        let r = py.detach(|| db.etl_apply(pair, table, column)).map_err(map_err)?;
+        etl_report_to_py(py, r)
+    }
+
+    /// Undo run `run_id` EXACTLY. Hash-gated: refused if the column changed
+    /// outside the pipeline — for a column you have edited, use
+    /// `etl_putback`, which exists for exactly that.
+    fn etl_revert(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("etl_revert", "Commit or roll back first.")?;
+        let db = &self.db;
+        let r = py.detach(|| db.etl_revert(run_id)).map_err(map_err)?;
+        etl_report_to_py(py, r)
+    }
+
+    /// Invert run `run_id` while KEEPING edits made to the transformed
+    /// column — the lens putback. Edited values flow back through
+    /// `inverse(edited, residual)`; deleted rows stay deleted; every row is
+    /// PutRes-verified (`forward(x') == y'`, `rex(x') == r`) before commit.
+    fn etl_putback(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("etl_putback", "Commit or roll back first.")?;
+        let db = &self.db;
+        let r = py.detach(|| db.etl_putback(run_id)).map_err(map_err)?;
+        etl_report_to_py(py, r)
+    }
+
+    /// Every ETL run, oldest first, failed runs included, as dicts.
+    fn etl_log(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let db = &self.db;
+        let log = py.detach(|| db.etl_log()).map_err(map_err)?;
+        log.into_iter()
+            .map(|l| {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item("run_id", l.run_id)?;
+                d.set_item("lens", l.lens)?;
+                d.set_item("table", l.table)?;
+                d.set_item("column", l.column)?;
+                d.set_item("rows", l.rows)?;
+                d.set_item("outcome", l.outcome)?;
+                d.set_item("error", l.error)?;
+                Ok(d.into_any().unbind())
+            })
+            .collect()
+    }
+}
+
+fn etl_report_to_py(py: Python<'_>, r: mpedb::etl::EtlReport) -> PyResult<Py<PyAny>> {
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("run_id", r.run_id)?;
+    d.set_item("rows", r.rows)?;
+    d.set_item("residuals", r.residuals)?;
+    Ok(d.into_any().unbind())
 }
 
 // --------------------------------------------------------------- Transaction
