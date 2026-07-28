@@ -78,8 +78,8 @@ SQLITE_LIMIT_WORKER_THREADS = 11
 
 sqlite_version = "3.45.0-mpedb"
 sqlite_version_info = (3, 45, 0)
-version = "0.1.3"
-version_info = (0, 1, 3)
+version = "0.1.5"
+version_info = (0, 1, 5)
 
 # ---------------------------------------------------------------------------
 # The PEP 249 type layer, as sqlite3 defines it. Adapters/converters are
