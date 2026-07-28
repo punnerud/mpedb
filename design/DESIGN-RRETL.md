@@ -834,11 +834,13 @@ say what it means on the A side.
 
 ```
 rretl_map_state (map TEXT, tbl TEXT, pk_enc BLOB)
-              → a_hash TEXT, b_hash TEXT, ts_micros INTEGER
+              → k ANY, a_hash TEXT, b_hash TEXT, ts_micros INTEGER
 ```
 
 (rigid types from specs, like every bookkeeping table; `tbl` is the TARGET
-table name, unique per map entry; hashes are length-framed CanonChains over
+table name, unique per map entry; `k` carries the key VALUE — canonical
+bits are one-way, and the both-deleted cleanup needs the value to ask both
+sides "are you still there?"; hashes are length-framed CanonChains over
 the mapped columns in mapping order.) After every successful push, BOTH
 sides' current hashes are recorded. `map sync` then classifies each row by
 two bits — (A moved since last sync, B moved since last sync):
@@ -902,3 +904,58 @@ into non-bijective mappings; B-side edits to lossy columns; conflicts. The
 external system's clock skew, delta overlap and dump-diff strategies are
 the CALLER's, on purpose — they act on table set B with ordinary SQL, and
 the map keeps A honest.
+
+### 13.5 `map check` — the audit the echo guard structurally cannot do **[hardening round, 2026-07-29]**
+
+The echo guard's whole mechanism is NOT looking: a row whose recorded
+hashes match both sides is skipped untouched — `forward(A) == B` is never
+re-verified there, by design, because re-verifying is what an echo IS.
+The price is that a tampered state row, a definition change that dodged
+re-baselining, or an engine bug leaves a STANDING, SILENT divergence that
+no number of syncs will ever surface. Two mechanisms close this:
+
+- **`rretl_map_check <name>`** — the read-only twin of the sync: the same
+  (state, target-row) classification, nothing written, no abort-on-first.
+  It reports what a sync WOULD do (pending both directions, creations,
+  deletions, adoptions), EVERY conflict by name, `orphan_state` (state
+  rows both of whose sides are gone — pending pass-3 cleanup, not a
+  breach), and the one thing the sync never computes: **`diverged`** —
+  rows where state says both sides are clean yet `forward(A) != B`.
+  Post-sync steady state ≡ `is_clean()`: nothing pending, nothing wrong.
+  CLI exits 1 on breaches (conflicts/diverged), so it crons like fsck.
+- **fsck coverage**: `rretl fsck` walks every STORED map — before the
+  lineage early-return, so a defined-but-never-synced map is covered —
+  and reports records that no longer parse, specs that no longer resolve,
+  pairs that no longer load, and every diverged row. Pending work,
+  conflicts and orphans are user state, not integrity findings; they
+  belong to check, not fsck.
+
+**Redefinition re-baselines.** `map define` over an existing name with a
+CHANGED spec deletes that map's state rows in the same transaction as the
+record write. The state hashes were recorded under the old spec; against
+a new one they misclassify — the sharpest case being a swapped pair over
+the same columns, where every chain is untouched, every row reads "both
+clean", and the target keeps the OLD pair's forward forever. Cleared
+state forces the next sync through the no-state paths: adopt-on-agree
+re-arbitrates, disagreement is a named conflict. An UNCHANGED redefine
+keeps state, so a dropped map's history stays adoptable (`map drop`
+still keeps state rows for exactly that reason). A tamper probe is part
+of the test suite: two target rows fully swapped WITH their b_hashes —
+sync reports zero moved, check reports both rows diverged, fsck names
+them.
+
+### 13.6 `map-collide` — the sync under SIGKILL, or it did not happen
+
+`mpedb map-collide` is the stage-4 member of the collide family
+(mirror-collide's shape): N writers churn the SOURCE side with
+domain-legal values, N churn the TARGET side with in-image values, and a
+syncer process loops `map sync` while the parent SIGKILLs it on a tight
+cadence — kills land mid-classification, mid-push, mid-commit. Named
+CONFLICTs are the syncer's expected diet (the sync aborts whole, so the
+next round sees the same world); anything else it hits fails the run.
+The final drain is the contract: quiesce, resolve standing conflicts
+deterministically (source wins; the row's state entry dropped so
+adopt-on-agree re-arbitrates), then hard-assert `changed_total == 0` on
+one more sync, `map check` clean, `rretl fsck` empty, row counts 1:1.
+Divergence after any number of kills = a row lost, duplicated or
+half-applied, and the run fails with the evidence.

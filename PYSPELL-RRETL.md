@@ -344,6 +344,22 @@ The rules, each a named refusal when broken:
   every mapped column is bijective (there is no residual to attach
   otherwise), and never when the source identity is a hidden rowid.
 - Deletes propagate both ways; delete-vs-edit is a conflict.
+- **Redefining a map with a CHANGED spec re-baselines it**: the map's sync
+  state is cleared in the same transaction, so the next sync re-arbitrates
+  every row (agreement is adopted, disagreement is a named conflict)
+  instead of trusting hashes recorded under the old spec. An unchanged
+  redefine keeps state, and `rretl_map_drop` keeps it too — history a
+  same-spec redefine picks up.
+
+**Auditing a map** — `rretl_map_check(name)` is the read-only dry run of a
+sync: what WOULD move in each direction, every conflict named (a sync
+aborts on the first; the check lists them all), and `diverged` — rows the
+echo guard structurally cannot see, where the state says both sides are
+clean yet `forward(source) != target` (tampered state, an old redefine, or
+an engine bug). `chk["clean"]` is the post-sync steady state: nothing
+pending, nothing wrong. `rretl_fsck()` also walks every stored map at
+rest (records parse, specs resolve, pairs load, no diverged rows), so the
+same cron that guards residuals guards maps.
 
 ---
 
@@ -438,7 +454,7 @@ scale as its own apply with the full source as the residual).
 | `db.rretl_revert(run_id)` | same dict | exact undo; hash-gated |
 | `db.rretl_putback(run_id)` | same dict | undo through edits; PutRes-verified per row |
 | `db.rretl_log()` | list of dicts | all runs, oldest first, failures included |
-| `db.rretl_fsck()` | list of finding strings | verify-at-rest: every standing run re-checked (top-run column hash, residual coverage, pair loadability, and the residual SET re-hashed against what the apply wrote — buried runs included) AND every stored version/archive re-materialized against its hash; empty = clean; reports, never repairs |
+| `db.rretl_fsck()` | list of finding strings | verify-at-rest: every standing run re-checked (top-run column hash, residual coverage, pair loadability, and the residual SET re-hashed against what the apply wrote — buried runs included), every stored version/archive re-materialized against its hash, AND every stored map (record parses, spec resolves, pairs load, no diverged rows); empty = clean; reports, never repairs |
 | `db.rretl_put_version(obj, data)` | version number | blob versioning: newest kept full, the previous newest rewritten as a reverse delta (verified byte-identical before commit), every 8th version stays full |
 | `db.rretl_get_version(obj, ver)` | `bytes` | materialize ANY version; every reconstruction step hash-verified — corruption is a named error, never wrong bytes |
 | `db.rretl_versions(obj)` | list of dicts | `ver, stored_as ("full"/"delta"), bytes, content_hash` |
@@ -448,7 +464,8 @@ scale as its own apply with the full source as the residual).
 | `db.rretl_archives()` | list of dicts | `archive_id, name, members, content_hash` |
 | `db.rretl_map_define(spec)` | `None` | store a table-SET map from a Python dict (or a mapping-TOML string); sources, identities and pairs validated NOW |
 | `db.rretl_map_sync(name)` | dict of counts | both directions, one txn; echo-guarded repeats; conflicts abort whole, named |
-| `db.rretl_maps()` / `rretl_map_show(name)` / `rretl_map_drop(name)` | names / TOML / bool | manage stored maps |
+| `db.rretl_map_check(name)` | dict (`clean`, `pending_total`, `tables`) | READ-ONLY dry run: would-move counts, EVERY conflict named, `diverged` = state-clean rows where forward(source) != target — the audit the echo guard cannot do |
+| `db.rretl_maps()` / `rretl_map_show(name)` / `rretl_map_drop(name)` | names / TOML / bool | manage stored maps; drop keeps state, a CHANGED redefine clears it (re-baseline) |
 
 Everything raises `mpedb.Error` subclasses (`ProgrammingError` for refusals,
 `OperationalError` for engine trouble) with the engine's full message. These

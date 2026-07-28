@@ -81,19 +81,31 @@ log-based engine), and the hardware published when the hardware is the answer.
   verify BEFORE ingest commits, pack-out hash-gated; zip64/encrypted/
   overlapping refused by name. Both are lineage with outcomes
   versioned/packed — never `applied`, so revert/stacking ignore them)
-  + `rretl map define|sync|show|list|drop` (stage 4, DESIGN-RRETL §13:
+  + `rretl map define|sync|check|show|list|drop` (stage 4, DESIGN-RRETL §13:
   table-SET maps — source tables mirrored into a different shape through
   lens pairs, synced BOTH ways in one txn. Key insight: both sides exist,
   so residual pairs need no stored residual — `rex(x_current)` is computed
   LIVE and B→A is putback with it, PutRes-gated. `rretl_map_state` records
   both sides' hashes after every push: unchanged-since-recorded = skip,
   which IS the echo guard (no epochs/origin tags); both-moved = named
-  CONFLICT, whole sync aborts. Map records are versioned TOML in
-  sys-keyspace `rrmap/<name>`; #94's implicit rowid is a REAL column named
-  rowid carrying the pk — detect it via the flag, not via empty pk)
+  CONFLICT, whole sync aborts. `map check` (§13.5) is the read-only twin of
+  the sync — its `diverged` list is the audit the echo guard structurally
+  cannot do (state clean, forward(A) != B), fsck walks every stored map,
+  and a CHANGED redefine deletes the map's state in the same txn
+  (re-baseline — same columns + swapped pair leaves every chain untouched,
+  so stale state reads "both clean" forever). check_table and sync_table
+  are twin matches: edit one, mirror the other. Map records are versioned
+  TOML in sys-keyspace `rrmap/<name>`; #94's implicit rowid is a REAL
+  column named rowid carrying the pk — detect it via the flag, not via
+  empty pk)
   + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
   and `mirror-collide` (SIGKILL fuzz: source writers + a mirror daemon killed at every
-  instant → final drain must converge mpedb exactly to the source). stress/crash take
+  instant → final drain must converge mpedb exactly to the source)
+  + `map-collide` (the stage-4 member: writers churn BOTH sides of a live
+  map while the syncer is SIGKILLed every kill-ms; conflicts are the
+  syncer's expected diet, anything else fails the run; final drain =
+  source-wins resolution → echo 0, map check clean, fsck clean, counts
+  1:1). stress/crash take
   `--durability commit|wal` to exercise the intent ring on real disk; `powerloss` is the
   WAL torn-tail power-loss simulation.
 - `crates/mpedb-py` — PyO3 module `mpedb` (abi3-py312, GIL released around engine calls);
