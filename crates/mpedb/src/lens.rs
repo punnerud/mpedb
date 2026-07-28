@@ -196,7 +196,10 @@ pub struct LensInfo {
 // Canonical value bytes — the comparison the round-trip test actually uses
 // ---------------------------------------------------------------------------
 
-/// Canonical bytes for round-trip comparison AND for collision detection.
+/// Canonical bytes for round-trip comparison AND for collision detection —
+/// also the encoding the ETL layer's `source_hash`/`output_hash` chains and
+/// `pk_enc` keys are built from (§12.2 attack 2: hashing RAW storage bits would
+/// turn legal NaN canonicalisation into a false "artifact changed").
 ///
 /// Floats compare on **bits**, not `==`: `-0.0 == 0.0` is true while their
 /// representations differ, so a pair can pass a naive equality check and still
@@ -207,7 +210,7 @@ pub struct LensInfo {
 /// between x86 and ARM; making payload part of the contract would make a pair
 /// verify on Linux and fail on the M3, which is a worse outcome than the
 /// sliver of strictness it buys.
-fn value_bits(v: &Value) -> Vec<u8> {
+pub(crate) fn value_bits(v: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     match v {
         Value::Null => out.push(0),
@@ -246,7 +249,7 @@ fn value_bits(v: &Value) -> Vec<u8> {
     out
 }
 
-fn same_value(a: &Value, b: &Value) -> bool {
+pub(crate) fn same_value(a: &Value, b: &Value) -> bool {
     value_bits(a) == value_bits(b)
 }
 
@@ -542,6 +545,17 @@ struct Resolved {
     argc: u16,
 }
 
+/// What `etl apply`/`etl revert` need from a registered pair (crate::etl).
+pub(crate) struct EtlLens {
+    pub class: LensClass,
+    pub forward: std::sync::Arc<Proc>,
+    pub rex: Option<std::sync::Arc<Proc>>,
+    pub inverse: std::sync::Arc<Proc>,
+    pub forward_hash: String,
+    pub rex_hash: Option<String>,
+    pub inverse_hash: String,
+}
+
 impl crate::Database {
     /// Register a lens pair over two functions that already exist
     /// (`mpedb fn define`). There is deliberately no new compilation path here.
@@ -798,6 +812,47 @@ impl crate::Database {
                 });
             }
             Ok(out)
+        })();
+        r.finish()?;
+        out
+    }
+
+    /// The ETL layer's view of a registered pair: class, declared residual
+    /// type, and the three decoded procedures — pinned by the hashes the
+    /// VERIFICATION ran against, exactly as stored.
+    pub(crate) fn load_lens_for_etl(&self, name: &str) -> Result<EtlLens> {
+        let key = crate::sys_record_subkey(NS_LENS, name.as_bytes())?;
+        let r = self.engine.begin_read()?;
+        let out = (|| -> Result<EtlLens> {
+            let rec = r
+                .sys_get(&key)?
+                .as_deref()
+                .and_then(decode_lens_record)
+                .ok_or_else(|| Error::Unsupported(format!("no lens pair named `{name}`")))?;
+            let forward = self
+                .load_proc_by_hash(&r, &rec.forward)?
+                .ok_or_else(|| Error::Corrupt("forward definition blob is missing".into()))?;
+            let inverse = self
+                .load_proc_by_hash(&r, &rec.inverse)?
+                .ok_or_else(|| Error::Corrupt("inverse definition blob is missing".into()))?;
+            let rex = if rec.class == LensClass::Residual {
+                Some(
+                    self.load_proc_by_hash(&r, &rec.rex)?
+                        .ok_or_else(|| Error::Corrupt("rex definition blob is missing".into()))?,
+                )
+            } else {
+                None
+            };
+            Ok(EtlLens {
+                class: rec.class,
+                forward,
+                rex,
+                inverse,
+                forward_hash: mpedb_spell::ProcHash(rec.forward).to_string(),
+                rex_hash: (rec.class == LensClass::Residual)
+                    .then(|| mpedb_spell::ProcHash(rec.rex).to_string()),
+                inverse_hash: mpedb_spell::ProcHash(rec.inverse).to_string(),
+            })
         })();
         r.finish()?;
         out

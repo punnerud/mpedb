@@ -916,3 +916,137 @@ fn engine_bug_freelist_double_free_under_concurrent_readers() {
         }
     }
 }
+
+/// #52 A3, §12.2 attack 7: SIGKILL mid-`etl apply` must be invisible. One run
+/// is ONE transaction, so at every kill instant the column is either fully
+/// original or fully transformed — never mixed — and the bookkeeping agrees
+/// with whichever it is. FLD-2 recovers the dead writer's lock, and the next
+/// process reads a consistent file.
+#[test]
+fn etl_apply_sigkilled_at_any_instant_is_all_or_nothing() {
+    let td = TestDir::new("etl-sigkill");
+    let dbf = td.path().join("etl.mpedb");
+    let dbs = dbf.to_str().unwrap();
+
+    assert_ok(&run(&[dbs, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"]));
+    // All-negative seed: "any positive value" then witnesses the transform,
+    // so a mixed column is detectable with two aggregates.
+    let n = 1500i64;
+    for chunk in (0..n).collect::<Vec<_>>().chunks(250) {
+        let tuples: Vec<String> =
+            chunk.iter().map(|i| format!("({}, {})", i, -(i + 1))).collect();
+        assert_ok(&run(&[
+            dbs,
+            &format!("INSERT INTO t (id, v) VALUES {}", tuples.join(", ")),
+        ]));
+    }
+
+    // The abs ⇄ sign triple, via the CLI like a user would.
+    let fns = [
+        ("mag.py", "def mag(x):\n    if x < 0:\n        return 0 - x\n    return x\n"),
+        ("sgn.py", "def sgn(x):\n    if x < 0:\n        return 1\n    return 0\n"),
+        ("unmag.py", "def unmag(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n"),
+    ];
+    for (name, src) in fns {
+        let p = td.path().join(name);
+        std::fs::write(&p, src).unwrap();
+        assert_ok(&run(&["fn", "define", dbs, p.to_str().unwrap()]));
+    }
+    assert_ok(&run(&[
+        "lens", "define", dbs, "mag", "mag", "unmag", "--class", "residual", "--rex", "sgn",
+        "--residual-type", "int64",
+    ]));
+
+    let count_where = |pred: &str| -> i64 {
+        let o = run(&[dbs, &format!("SELECT count(*) FROM t WHERE {pred}")]);
+        assert_ok(&o);
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .last()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+
+    for delay_ms in [0u64, 3, 8, 15, 30, 60] {
+        let mut child = Command::new(bin())
+            .args(["etl", "apply", dbs, "mag", "t.v"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let _ = child.kill(); // SIGKILL
+        let _ = child.wait();
+
+        // Whatever instant the kill hit: all-or-nothing, and internally consistent.
+        let neg = count_where("v < 0");
+        let pos = count_where("v > 0");
+        assert!(
+            (neg == n && pos == 0) || (neg == 0 && pos == n),
+            "MIXED column after SIGKILL at {delay_ms}ms: {neg} negative, {pos} positive \
+             — the single-txn atomicity is broken"
+        );
+        let applied = neg == 0;
+
+        if applied {
+            // The commit that transformed also carries the residuals and the
+            // lineage row — same transaction, so they must all be present.
+            let residuals = count_where("1 = 1"); // row count of t, for the message
+            let o = run(&[dbs, "SELECT count(*) FROM etl_residual"]);
+            assert_ok(&o);
+            let res: i64 = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .last()
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(res, n, "transformed ({residuals} rows) but residuals incomplete");
+            // Reset for the next kill point — revert is itself exercised.
+            let o = run(&[dbs, "SELECT run_id FROM etl_lineage WHERE outcome = 'applied'"]);
+            assert_ok(&o);
+            let run_id = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .last()
+                .unwrap()
+                .trim()
+                .to_string();
+            assert_ok(&run(&["etl", "revert", dbs, &run_id]));
+            assert_eq!(count_where("v < 0"), n, "revert must restore the seed");
+        } else {
+            // Untouched: no applied lineage row may exist (a failed-run row is
+            // fine — the kill may have landed after the rollback bookkeeper).
+            let o = run(&[dbs, "SELECT count(*) FROM etl_lineage WHERE outcome = 'applied'"]);
+            if o.status.success() {
+                let applied_rows: i64 = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .last()
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert_eq!(
+                    applied_rows, 0,
+                    "column untouched but an applied lineage row exists — bookkeeping split \
+                     from the data it books"
+                );
+            } // else: first kill landed before the tables were ever created — fine.
+        }
+    }
+
+    // The kill points above are timing-dependent — on a fast machine every
+    // kill may land pre-commit and the applied branch never runs. One
+    // UNINTERRUPTED wave closes that gap deterministically (no silent
+    // coverage caps): apply to completion, verify through the CLI, revert.
+    let o = run(&["etl", "apply", dbs, "mag", "t.v"]);
+    assert_ok(&o);
+    assert_eq!(count_where("v < 0"), 0, "uninterrupted apply transforms everything");
+    assert_eq!(count_where("v > 0"), n);
+    let o = run(&[dbs, "SELECT run_id FROM etl_lineage WHERE outcome = 'applied'"]);
+    assert_ok(&o);
+    let run_id = String::from_utf8_lossy(&o.stdout).lines().last().unwrap().trim().to_string();
+    assert_ok(&run(&["etl", "revert", dbs, &run_id]));
+    assert_eq!(count_where("v < 0"), n, "and the revert restores the seed exactly");
+}

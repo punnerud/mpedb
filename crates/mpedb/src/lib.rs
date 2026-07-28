@@ -65,6 +65,7 @@ pub mod costlayer;
 pub mod opdef;
 pub mod spellfn;
 pub mod lens;
+pub mod etl;
 pub mod model;
 pub mod stats;
 mod stream;

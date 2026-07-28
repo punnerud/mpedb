@@ -84,6 +84,13 @@ usage: mpedb <command> [args]
                                            and refused with a counter-example;
                                            residual = the triple fwd/1 rex/1 inv/2
   lens verify|list|drop <target> [name]    re-run a pair's round trip, or manage
+  etl apply <target> <pair> <tbl>.<col>    transform a column IN PLACE; what was
+                                           lost is kept per row (etl_residual),
+                                           the run is lineage (etl_lineage), and
+                                           100% of rows verify against the source
+                                           hash BEFORE the destroying commit
+  etl revert <target> <run_id>             put it back exactly (hash-gated)
+  etl log <target>                         every run, failed runs included
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
   tune set <target> name=value | show      stored engine switches (ndv_discount,
@@ -182,6 +189,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "model" => cmd_model(rest),
         "fn" => cmd_fn(rest),
         "lens" => cmd_lens(rest),
+        "etl" => cmd_etl(rest),
         "op" => cmd_op(rest),
         "tune" => cmd_tune(rest),
         "trigger" => cmd_trigger(rest),
@@ -554,6 +562,61 @@ fn cmd_lens(args: &[String]) -> CliResult {
         _ => usage(
             "lens needs: define <target> <name> <forward> <inverse> [--class bijective|lossy] \
              | verify <target> <name> | drop <target> <name> | list <target>",
+        ),
+    }
+}
+
+/// `mpedb etl …` — apply a lens pair to a column in place, with the residuals
+/// and lineage kept in the database (DESIGN-ETL §7/§11). Apply verifies 100%
+/// of rows against the source hash BEFORE the commit that destroys the source,
+/// holds the writer lock for the whole run, and is an offline operation.
+fn cmd_etl(args: &[String]) -> CliResult {
+    match args {
+        [sub, config, pair, target] if sub == "apply" => {
+            let Some((table, column)) = target.split_once('.') else {
+                return usage("etl apply needs <table>.<column>");
+            };
+            let db = crate::util::open_target(config)?;
+            let r = db.etl_apply(pair, table, column)?;
+            println!(
+                "etl run {}: {} row(s) of {table}.{column} transformed in place, \
+                 {} residual row(s) kept, 100% verified against the source hash \
+                 before commit",
+                r.run_id, r.rows, r.residuals
+            );
+            Ok(())
+        }
+        [sub, config, run] if sub == "revert" => {
+            let run_id: i64 = run
+                .parse()
+                .map_err(|_| Failure::Usage(format!("etl revert needs a run id, got `{run}`")))?;
+            let db = crate::util::open_target(config)?;
+            let r = db.etl_revert(run_id)?;
+            println!("etl run {run_id} reverted: {} row(s) restored exactly", r.rows);
+            Ok(())
+        }
+        [sub, config] if sub == "log" => {
+            let db = crate::util::open_target(config)?;
+            let log = db.etl_log()?;
+            if log.is_empty() {
+                println!("no etl runs");
+            }
+            for l in log {
+                let err = if l.error.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", l.error)
+                };
+                println!(
+                    "run {}  {}  {}.{}  {} row(s)  {}{err}",
+                    l.run_id, l.lens, l.table, l.column, l.rows, l.outcome
+                );
+            }
+            Ok(())
+        }
+        _ => usage(
+            "etl needs: apply <target> <pair> <table>.<column> | revert <target> <run_id> \
+             | log <target>",
         ),
     }
 }
