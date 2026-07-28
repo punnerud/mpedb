@@ -90,14 +90,22 @@ log-based engine), and the hardware published when the hardware is the answer.
   which IS the echo guard (no epochs/origin tags); both-moved = named
   CONFLICT, whole sync aborts. `map check` (§13.5) is the read-only twin of
   the sync — its `diverged` list is the audit the echo guard structurally
-  cannot do (state clean, forward(A) != B), fsck walks every stored map,
-  and a CHANGED redefine deletes the map's state in the same txn
-  (re-baseline — same columns + swapped pair leaves every chain untouched,
-  so stale state reads "both clean" forever). check_table and sync_table
-  are twin matches: edit one, mirror the other. Map records are versioned
-  TOML in sys-keyspace `rrmap/<name>`; #94's implicit rowid is a REAL
-  column named rowid carrying the pk — detect it via the flag, not via
-  empty pk)
+  cannot do (state clean, forward(A) != B — a pair REBOUND under the map
+  is the realistic cause), fsck walks every stored map. check_table and
+  sync_table are twin matches: edit one, mirror the other. The duel's
+  standing rules: only a byte-identical redefine keeps state (changed spec,
+  first define, define-after-drop all re-baseline; drop clears state); a
+  table is a map source or a map target, NEVER both and never a target
+  twice (shared targets merge masters, reverse maps deadlock on conflicts,
+  chains break check/sync twin-ness); a target that is GONE while state
+  exists is a named refusal, because reading it as a target-side delete
+  emptied the SOURCE. All rRETL bookkeeping keys on `pk_ref` (blake3 of
+  the pk's canonical bits, fixed 32 B) — raw bits inside a composite key
+  made a legal ~970-char TEXT pk unsyncable, with the ceiling depending on
+  how long the MAP was named. State hashes chain in (map, tbl, key) so
+  they are not portable between rows. Map records are versioned TOML in
+  sys-keyspace `rrmap/<name>`; #94's implicit rowid is a REAL column named
+  rowid carrying the pk — detect it via the flag, not via empty pk)
   + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
   and `mirror-collide` (SIGKILL fuzz: source writers + a mirror daemon killed at every
   instant → final drain must converge mpedb exactly to the source)

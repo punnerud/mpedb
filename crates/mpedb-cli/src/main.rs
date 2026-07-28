@@ -858,7 +858,9 @@ fn cmd_rretl(args: &[String]) -> CliResult {
              | put <target> <obj> <file> | get <target> <obj> <ver> <out-file> \
              | versions <target> <obj> | prune <target> <obj> <keep> \
              | pack-in <target> <name> <zip-file> \
-             | pack-out <target> <archive_id> <out-file> | archives <target>",
+             | pack-out <target> <archive_id> <out-file> | archives <target> \
+             | map define <target> <map.toml> | map sync|check|show|drop <target> <name> \
+             | map list <target>",
         ),
     }
 }
