@@ -1,7 +1,8 @@
 # DESIGN-ETL — reversible PySpell ETL: lens pairs, residuals, round-trip verification
 
 **Status: DESIGNED; stage 1 (the bijective corner) and stage 2 (residual
-pairs + `etl apply|revert|log` + lineage) IMPLEMENTED 2026-07-28** —
+pairs + `etl apply|revert|putback|log` + lineage) IMPLEMENTED 2026-07-28** —
+user-facing contract: `PYSPELL-ETL.md` (the self-contained Python guide) —
 `crates/mpedb/src/lens.rs`, `mpedb lens` in the CLI, tests in
 `crates/mpedb/tests/lens.rs`. The prior-art groundwork is `design/ETL-BIDI.md`
 (including the 2026-07-28 addendum: Jeopardy, Hermes, CRIL, RC 2023–2025,
@@ -388,22 +389,108 @@ addressing), so **`revert` refuses hard when the lineage row is missing**. A
 residual whose lineage row was deleted is an uninterpretable scalar, and an
 equally explicit error, never a NULL read.
 
-The envelope, reserved for stage-3 COMPOSITE residuals (pipelines, containers,
-base+diff), where a residual is no longer one scalar:
+The envelope, stage 3's composite-residual carrier — **designed 2026-07-28,
+NOT BUILT** (it lands as `crates/mpedb/src/etl_codec.rs` when stage 3 does;
+the 23-finding adversarial check of the build sketch is folded in below):
 
 ```
-version   u8      version-as-dispatch: the value selects the inverse algorithm,
-                  and a newer version is refused WITH ITS NUMBER NAMED
-                  (pristine-tar's rule: "delta is version N, newer than
-                  maximum supported M")
-kind      u8      what the residual is (typed per pair)
-len       u32     byte length of the payload
+kind      u8      ONE dispatch byte — the value IS both the version and the
+                  algorithm (version-as-dispatch taken literally, pristine-tar's
+                  model: their version number selects the delta program).
+                  1 = raw (payload is the full bytes)
+                  2 = delta-v1 (payload: §8.3)
+                  3 = zip-splice-v1 (payload: §8.4)
+                  An unknown kind is refused WITH ITS NUMBER NAMED. The first
+                  draft had separate version and kind bytes — two dispatch
+                  channels that could disagree, with the refusal rule defined
+                  for only one of them; collapsed on review.
+len       u32     byte length of the payload (hard 4 GiB ceiling; oversize
+                  inputs are refused at put/pack-in with the number named)
 payload   [u8; len]
 ```
 
-Structured fields with hard-bounded ranges plus ONE opaque payload — the
-jbrd/Lepton split — and composition by nesting (pristine-tar's `wrapper`
-member): stacked transforms get stacked, self-describing residuals.
+Envelopes NEST — the outer transform wraps the inner (pristine-tar's `wrapper`
+member), never envelopes smuggled inside an algorithm payload — with a hard
+depth cap of 4: a recursive decoder without one turns an adversarial blob of
+nested envelopes into a stack overflow, which is a panic, which the decoder
+rule forbids.
+
+### 8.3 delta-v1 — the payload of kind 2
+
+Git's packfile delta, simplified: the same two instructions (COPY from the
+base ONLY, INSERT literals) that have been frozen in git for ~20 years, with
+fixed-width fields instead of flag-packing — a few bytes of bloat per
+instruction is the entire cost, and bloat is the only failure mode the
+verification stance leaves open.
+
+```
+base_len    u64   length the base MUST have (fail-fast identity check)
+target_len  u64   exact output length; the decoder pre-walks the instruction
+                  stream, checks Σ lengths == target_len and every
+                  base_off+len ≤ base_len, and only then allocates ONCE —
+                  a corrupt delta claiming a 2^63 copy must die on a bounds
+                  check, not in the allocator
+instructions:
+  0x01  COPY   { base_off u64, len u64 }     from the base, never the target
+  0x00  INSERT { len u32, bytes [u8; len] }
+```
+
+Base-only COPY is deliberate (VCDIFF's self-referential COPY plus address
+caches and code tables is the complexity that makes its decoders nontrivial;
+git dropped it all and never needed it back). No RUN instruction: repeated
+bytes absent from the base cost literals, and re-adding self-referential copy
+to get RLE back would break the trivial-decoder property.
+
+**Only the DECODER is the eternity promise.** The encoder (greedy first-match
+over a 16-byte-block index of the base, fixed multiplicative hash into
+array-backed chains — never a HashMap, whose seeded iteration order would make
+output nondeterministic — chain cap 64 against adversarial repetitive input,
+capped match extension, lowest-offset tie-break) may improve freely: every
+delta is verified `apply(base, delta) == target` BYTE-IDENTICALLY before
+commit, so an encoder bug can bloat, never corrupt. Tests therefore assert
+apply-equality and NEVER delta bytes — a byte-asserting test would silently
+revoke the encoder's freedom to improve. **If the encoded delta is not smaller
+than the full payload, the full payload is stored** — a pathological-case cap,
+not a minimality promise (commitment 6: the lower bound is H(X|Y) and no
+encoding beats it; CLI output reports actual bytes, never "savings").
+
+### 8.4 zip-splice-v1 — the payload of kind 3
+
+The archive with its member data segments CUT OUT, plus the ordered splice
+list — reconstruction re-inserts the stored member bytes, and byte-identity is
+a PARTITION INVARIANT rather than a hope: if the cut ranges are disjoint,
+in-bounds, and `residual_len + Σ cut_len == file_len`, re-splicing reproduces
+the original by construction, whatever the zip contains. (No known system does
+this — pristine-tar stores a heuristic delta against a regenerated artifact
+and "hopes one of six strategies works"; the splice is deterministic.)
+
+```
+file_len   u64    original archive length
+count      u32    splice entries
+entries    count × { member_no u32, offset u64, len u64 }
+                  sorted by OFFSET; member_no is the CENTRAL-DIRECTORY order
+                  (the two orders legally differ — appended or name-sorted
+                  archives — and conflating them breaks the offset arithmetic)
+gap_bytes  [u8]   the original minus the cut segments, verbatim: local headers,
+                  data descriptors, inter-member junk, SFX stubs, the central
+                  directory — everything that is not member data
+```
+
+Member location follows the one hard rule practice converged on: enumerate
+from the central directory ONLY (with the SFX base-offset correction), verify
+`PK\x03\x04` at each corrected offset, compute the data start from the LOCAL
+header's name/extra lengths — the CD's copies legally differ, and using them
+is the classic splicer bug — and take the length from the CD's
+`compressed_size`. Named refusals, each the point where data location becomes
+ambiguous or the partition breaks: overlapping segments (the zip-bomb shape —
+covered-span check over data ranges, headers and the CD region), segments out
+of bounds, a zip64 sentinel (0xFFFFFFFF/0xFFFF), multi-disk archives,
+masked/central-directory-encrypted headers, and a missing local-header
+signature at a CD-claimed offset. Traditionally- or AES-encrypted MEMBERS are
+fine — their crypto lives inside `compressed_size`, opaque bytes splice like
+any others (the fail-safe-per-consumer distinction: locatable-but-unreadable
+is safe for round-trip, useless for content indexing, and those are different
+consumers).
 
 The decoder is minimal, bounds-checked, `Corrupt`-never-panic (the mpedb rule
 applies double here). **A new version of a pair that cannot consume old
@@ -470,7 +557,24 @@ in stage 1, since pairs are not a compilation input yet. It is taken anyway: it
 becomes required the moment they are, and the alternative is a silent staleness
 bug on that day. This is a rare admin operation.
 
-**Stage 2 — residual pairs + apply/revert + lineage. IN PROGRESS (A1–A4).**
+**Stage 2 — residual pairs + apply/revert + lineage + PUTBACK. Built.**
+
+**Putback is the design change stage 2 grew after shipping**, and it is the
+half of "reversible" that `revert` deliberately refuses: inverting a run whose
+transformed column has been EDITED, carrying the edits back. Each surviving
+row's current value `y'` becomes `x' = inverse(y', r)` with the run's stored
+residual; deleted rows stay deleted (their residuals are discarded — the
+deletion IS an edit); rows inserted after the apply are refused for residual
+pairs (the creation path `inverse(y, ∅)`, §4) and simply inverted for
+bijective ones (their creation path is total by construction, §4). The
+verification flips with the oracle: `source_hash` cannot arbitrate an edited
+column, so **PutRes becomes the operative law, per row, before commit** —
+`forward(x') == y'` and `rex(x') == r`. At registration PutRes was a corpus
+tautology and deliberately not run (§4); at putback the source is gone as an
+oracle and PutRes is the ONLY thing that can hold. An edit outside the pair's
+image fails it with the row and both values named, and the run rolls back.
+This is GetPut/PutGet operating as the lens literature intended — the putback
+function finally earns the name.
 
 The Residual class becomes real as a TRIPLE of stored functions —
 `forward/1`, `rex/1` (the residual extractor: Sparcl's complement as a plain

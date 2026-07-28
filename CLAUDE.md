@@ -57,11 +57,13 @@ log-based engine), and the hardware published when the hardware is the answer.
   named counter-example — `celsius ⇄ fahrenheit` is the canonical bijective
   refusal; a `residual` pair is the triple fwd/1 rex/1 inv/2 with a DECLARED
   residual type, and its collision check keys on (y, r) jointly)
-  + `etl apply|revert|log` (in-place column transform in ONE txn: per-row
-  residuals in `etl_residual (run_id, pk)`, runs — failed ones included — in
-  `etl_lineage`, and 100% of rows verified against the source hash BEFORE the
-  commit that destroys the source; revert is hash-gated. Lineage is ordinary
-  TABLES, never sys-keyspace — #124 is why)
+  + `etl apply|revert|putback|log` (in-place column transform in ONE txn:
+  per-row residuals in `etl_residual (run_id, pk)`, runs — failed ones
+  included — in `etl_lineage`, and 100% of rows verified against the source
+  hash BEFORE the commit that destroys the source; revert is hash-gated,
+  `putback` inverts KEEPING edits — PutRes per row replaces the hash gate,
+  deleted rows stay deleted. Lineage is ordinary TABLES, never sys-keyspace —
+  #124 is why. The Python surface + agent guide is PYSPELL-ETL.md)
   + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
   and `mirror-collide` (SIGKILL fuzz: source writers + a mirror daemon killed at every
   instant → final drain must converge mpedb exactly to the source). stress/crash take
