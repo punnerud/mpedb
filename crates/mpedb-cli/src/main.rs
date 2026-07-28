@@ -611,6 +611,22 @@ fn cmd_retl(args: &[String]) -> CliResult {
             );
             Ok(())
         }
+        [sub, config] if sub == "fsck" => {
+            let db = crate::util::open_target(config)?;
+            let findings = db.retl_fsck()?;
+            if findings.is_empty() {
+                println!("retl fsck: clean — every standing run verifies");
+            } else {
+                for f in &findings {
+                    println!("FINDING: {f}");
+                }
+                return Err(Failure::Runtime(format!(
+                    "retl fsck: {} finding(s)",
+                    findings.len()
+                )));
+            }
+            Ok(())
+        }
         [sub, config] if sub == "log" => {
             let db = crate::util::open_target(config)?;
             let log = db.retl_log()?;
@@ -632,7 +648,7 @@ fn cmd_retl(args: &[String]) -> CliResult {
         }
         _ => usage(
             "retl needs: apply <target> <pair> <table>.<column> | revert <target> <run_id> \
-             | putback <target> <run_id> | log <target>",
+             | putback <target> <run_id> | fsck <target> | log <target>",
         ),
     }
 }

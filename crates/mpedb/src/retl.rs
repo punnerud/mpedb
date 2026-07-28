@@ -49,7 +49,7 @@ const VERIFIED_TOTAL: i64 = 2;
 /// deterministically, on every retry (§12.2 attack 4). A named refusal with
 /// numbers beats an un-completable loop; chunked commits are NOT the fix
 /// (they break verify-before-source-deletion).
-const MAX_ETL_ROWS: u64 = 1_000_000;
+const MAX_RETL_ROWS: u64 = 1_000_000;
 
 /// What a run did, as `retl apply`/`retl revert` report it.
 #[derive(Debug)]
@@ -79,7 +79,7 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-/// Length-framed canonical hash chain — the ETL sibling of the lens layer's
+/// Length-framed canonical hash chain — the RETL sibling of the lens layer's
 /// joint collision key, and framed for the same reason.
 struct CanonChain(blake3::Hasher);
 
@@ -114,7 +114,7 @@ impl crate::Database {
     fn resolve_target(&self, table: &str, column: &str) -> Result<Target> {
         if table == T_LINEAGE || table == T_RESIDUAL {
             return Err(Error::Unsupported(format!(
-                "`{table}` is ETL bookkeeping; transforming it is refused"
+                "`{table}` is RETL bookkeeping; transforming it is refused"
             )));
         }
         let bundle = self.engine.schema();
@@ -267,6 +267,98 @@ impl crate::Database {
         }
     }
 
+    /// Verify-at-rest, the second half of the Lepton discipline: the write
+    /// side verified once, but nothing re-checks between apply and unwind —
+    /// and for a tampered column, unwind time is exactly too late to want
+    /// the news. Re-verifies every STANDING (`outcome = 'applied'`) run,
+    /// read-only: the TOP run per column re-hashes against its recorded
+    /// output (buried runs' outputs were legitimately transformed away by
+    /// later runs — that is the designed state, not a finding), every row of
+    /// a residual run still has its residual, and the run's pair still
+    /// loads. Returns findings, one string per problem, empty = clean. It
+    /// reports and never repairs — a repair would need to know which side is
+    /// right, and fsck does not.
+    pub fn retl_fsck(&self) -> Result<Vec<String>> {
+        let bundle = self.engine.schema();
+        if !bundle.schema.tables.iter().any(|t| t.name == T_LINEAGE && !t.dead) {
+            return Ok(Vec::new());
+        }
+        let mut findings = Vec::new();
+        let runs = rows_of(self.query(
+            "SELECT run_id, lens, tbl, col, output_hash FROM retl_lineage \
+             WHERE outcome = 'applied' ORDER BY run_id",
+            &[],
+        )?)?;
+        let mut top_for: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        for r in &runs {
+            top_for.insert((as_text(&r[2]), as_text(&r[3])), as_int(&r[0])?);
+        }
+        for r in &runs {
+            let (run_id, pair) = (as_int(&r[0])?, as_text(&r[1]));
+            let (table, column, want_hash) =
+                (as_text(&r[2]), as_text(&r[3]), as_text(&r[4]));
+            let lens = match self.load_lens_for_retl(&pair) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    findings.push(format!(
+                        "run {run_id}: its pair `{pair}` cannot be loaded ({e}) — \
+                         unwinding this run is currently impossible"
+                    ));
+                    None
+                }
+            };
+            let target = match self.resolve_target(&table, &column) {
+                Ok(t) => t,
+                Err(e) => {
+                    findings.push(format!(
+                        "run {run_id}: its target `{table}.{column}` is gone ({e})"
+                    ));
+                    continue;
+                }
+            };
+            let pk_col = &target.pk_col;
+            let rows = rows_of(self.query(
+                &format!(
+                    "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" \
+                     ORDER BY \"{pk_col}\""
+                ),
+                &[],
+            )?)?;
+            if top_for.get(&(table.clone(), column.clone())) == Some(&run_id) {
+                let mut c = CanonChain::new();
+                for row in &rows {
+                    c.push(&row[1]);
+                }
+                if c.hex() != want_hash {
+                    findings.push(format!(
+                        "run {run_id}: `{table}.{column}` no longer hashes to the run's \
+                         output — edited outside the pipeline (revert will refuse; \
+                         putback remains available)"
+                    ));
+                }
+            }
+            if lens.as_ref().map(|l| l.rex.is_some()).unwrap_or(false) {
+                for row in &rows {
+                    let pk = &row[0];
+                    let res = rows_of(self.query(
+                        "SELECT count(*) FROM retl_residual \
+                         WHERE run_id = $1 AND pk_enc = $2",
+                        &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
+                    )?)?;
+                    if res[0][0] == Value::Int(0) {
+                        findings.push(format!(
+                            "run {run_id}: row {pk:?} of `{table}.{column}` has NO \
+                             residual — what was lost is gone, and unwinding that row \
+                             is impossible"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(findings)
+    }
+
     /// Every lineage row, oldest first.
     pub fn retl_log(&self) -> Result<Vec<RetlLogRow>> {
         let bundle = self.engine.schema();
@@ -316,8 +408,38 @@ fn as_text(v: &Value) -> String {
 /// `sqlite_master` is a shim-side view, not a native table, and each caller
 /// opens a fresh transaction, so the committed view is the correct one at
 /// every call site (this runs at most once per transaction, before any DDL).
-fn ensure_tables_from(s: &mut WriteSession<'_>, have: &[String]) -> Result<()> {
-    if !have.iter().any(|n| n == T_LINEAGE) {
+/// The column lists the bookkeeping tables MUST have. A pre-existing user
+/// table that merely shares the NAME is refused by name here, up front —
+/// the alternative (adversarial-check finding 20) is a mid-run bind error at
+/// best and inserts into compatible-but-wrong columns at worst.
+const LINEAGE_SHAPE: [&str; 15] = [
+    "run_id", "step_no", "lens", "forward_hash", "rex_hash", "inverse_hash", "tbl", "col",
+    "source_hash", "output_hash", "rows", "verified", "outcome", "error", "ts_micros",
+];
+const RESIDUAL_SHAPE: [&str; 3] = ["run_id", "pk_enc", "residual"];
+
+fn shape_gate(have: &[(String, Vec<String>)], name: &str, want: &[&str]) -> Result<bool> {
+    match have.iter().find(|(n, _)| n == name) {
+        None => Ok(false),
+        Some((_, cols)) => {
+            if cols.iter().map(String::as_str).eq(want.iter().copied()) {
+                Ok(true)
+            } else {
+                Err(Error::Unsupported(format!(
+                    "a table named `{name}` already exists but is NOT retl's bookkeeping \
+                     table (columns {cols:?}, expected {want:?}) — rename or drop it; \
+                     retl will not write into a shape it does not own"
+                )))
+            }
+        }
+    }
+}
+
+fn ensure_tables_from(
+    s: &mut WriteSession<'_>,
+    have: &[(String, Vec<String>)],
+) -> Result<()> {
+    if !shape_gate(have, T_LINEAGE, &LINEAGE_SHAPE)? {
         s.query(
             "CREATE TABLE retl_lineage (
                run_id INTEGER, step_no INTEGER,
@@ -330,7 +452,7 @@ fn ensure_tables_from(s: &mut WriteSession<'_>, have: &[String]) -> Result<()> {
             &[],
         )?;
     }
-    if !have.iter().any(|n| n == T_RESIDUAL) {
+    if !shape_gate(have, T_RESIDUAL, &RESIDUAL_SHAPE)? {
         s.query(
             "CREATE TABLE retl_residual (
                run_id INTEGER, pk_enc BLOB, residual,
@@ -343,14 +465,16 @@ fn ensure_tables_from(s: &mut WriteSession<'_>, have: &[String]) -> Result<()> {
 
 
 impl crate::Database {
-    fn committed_tables(&self) -> Vec<String> {
+    fn committed_tables(&self) -> Vec<(String, Vec<String>)> {
         self.engine
             .schema()
             .schema
             .tables
             .iter()
             .filter(|t| !t.dead)
-            .map(|t| t.name.clone())
+            .map(|t| {
+                (t.name.clone(), t.columns.iter().map(|c| c.name.clone()).collect())
+            })
             .collect()
     }
 }
@@ -422,7 +546,7 @@ fn apply_in(
     table: &str,
     column: &str,
     target: &Target,
-    committed_tables: &[String],
+    committed_tables: &[(String, Vec<String>)],
 ) -> Result<(RetlReport, LineageRow)> {
     ensure_tables_from(s, committed_tables)?;
 
@@ -435,10 +559,10 @@ fn apply_in(
     // Pre-flight size guard BEFORE materialising anything (§12.2 attack 4).
     let count = rows_of(s.query(&format!("SELECT count(*) FROM \"{table}\""), &[])?)?;
     let n = as_int(&count[0][0])? as u64;
-    if n > MAX_ETL_ROWS {
+    if n > MAX_RETL_ROWS {
         return Err(Error::Unsupported(format!(
             "`{table}` has {n} rows; retl apply is one transaction by design (total \
-             verification before the source is destroyed) and caps at {MAX_ETL_ROWS} \
+             verification before the source is destroyed) and caps at {MAX_RETL_ROWS} \
              rows — an over-sized run would be OOM-killed deterministically on every retry"
         )));
     }

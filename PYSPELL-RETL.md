@@ -347,6 +347,7 @@ scale as its own apply with the full source as the residual).
 | `db.retl_revert(run_id)` | same dict | exact undo; hash-gated |
 | `db.retl_putback(run_id)` | same dict | undo through edits; PutRes-verified per row |
 | `db.retl_log()` | list of dicts | all runs, oldest first, failures included |
+| `db.retl_fsck()` | list of finding strings | verify-at-rest: every standing run re-checked (top-run hash, residual coverage, pair loadability); empty = clean; reports, never repairs |
 
 Everything raises `mpedb.Error` subclasses (`ProgrammingError` for refusals,
 `OperationalError` for engine trouble) with the engine's full message. These
@@ -356,7 +357,8 @@ is open on the same thread (you get a named refusal, not a hang).
 CLI equivalents (same engine, same rules): `mpedb fn define <target> <f.py>`,
 `mpedb lens define <target> <name> <fwd> <inv> --class residual --rex <fn>
 --residual-type <ty>`, `mpedb retl apply <target> <pair> <table>.<col>`,
-`mpedb retl revert|putback <target> <run_id>`, `mpedb retl log <target>`.
+`mpedb retl revert|putback <target> <run_id>`, `mpedb retl fsck <target>`
+(exit 1 on findings — cron-able), `mpedb retl log <target>`.
 
 ---
 

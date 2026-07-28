@@ -1182,3 +1182,74 @@ fn a_random_chain_of_twelve_transforms_unwinds_with_edits_carried() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// Adversarial-check finding 20, closed: a pre-existing user table that
+/// merely SHARES a bookkeeping table's name is refused by name, up front —
+/// never written into. Both bookkeeping names are guarded.
+#[test]
+fn a_user_table_named_like_the_bookkeeping_is_refused() {
+    let (d, path) = db("shape");
+    define_abs_pair(&d);
+    seed(&d, &[-1]);
+    let mut s = d.begin().unwrap();
+    s.query("CREATE TABLE retl_lineage (whatever INTEGER PRIMARY KEY, x TEXT)", &[])
+        .unwrap();
+    s.commit().unwrap();
+
+    let e = d.retl_apply("mag", "t", "v").unwrap_err().to_string();
+    assert!(e.contains("NOT retl's bookkeeping table"), "{e}");
+    assert!(e.contains("whatever"), "the imposter's columns are named: {e}");
+    // And nothing was written into the imposter:
+    let rows_in = rows(d.query("SELECT count(*) FROM retl_lineage", &[]).unwrap());
+    assert_eq!(rows_in[0][0], Value::Int(0));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `retl_fsck` — verify-at-rest. Clean after an apply; a tampered top-run
+/// column and a deleted residual row are each reported (not repaired); a
+/// buried run's non-matching column hash is NOT a finding (later runs
+/// legitimately transformed it); after revert everything is clean again.
+#[test]
+fn fsck_reports_tampering_and_missing_residuals_and_nothing_else() {
+    let (d, path) = db("fsck");
+    define_abs_pair(&d);
+    def(&d, "def flip(x):\n    return -x\n");
+    d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
+    seed(&d, &[-5, 3]);
+
+    let run1 = d.retl_apply("mag", "t", "v").unwrap();
+    assert!(d.retl_fsck().unwrap().is_empty(), "clean after apply");
+
+    // Stack a second run: run1 is now buried, and its column-hash mismatch
+    // must NOT be reported.
+    let run2 = d.retl_apply("flip", "t", "v").unwrap();
+    assert!(d.retl_fsck().unwrap().is_empty(), "a buried run is not a finding");
+
+    // Tamper with the live column: the TOP run (run2) is flagged.
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE t SET v = 999 WHERE id = 0", &[]).unwrap();
+    s.commit().unwrap();
+    let findings = d.retl_fsck().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].contains("edited outside the pipeline"), "{}", findings[0]);
+    assert!(findings[0].contains(&format!("run {}", run2.run_id)), "{}", findings[0]);
+
+    // Un-tamper (putback run2 accepts the edit; that empties the stack top).
+    d.retl_putback(run2.run_id).unwrap();
+
+    // Now delete one of run1's residual rows: fsck names the row.
+    let mut s = d.begin().unwrap();
+    s.query(
+        "DELETE FROM retl_residual WHERE run_id = $1 AND pk_enc = $2",
+        &[Value::Int(run1.run_id), Value::Blob(vec![2, 1, 0, 0, 0, 0, 0, 0, 0])],
+    )
+    .unwrap();
+    s.commit().unwrap();
+    let findings = d.retl_fsck().unwrap();
+    assert!(
+        findings.iter().any(|f| f.contains("NO residual")),
+        "the missing residual is reported: {findings:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}

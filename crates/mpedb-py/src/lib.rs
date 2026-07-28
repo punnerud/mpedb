@@ -737,7 +737,7 @@ impl PyDatabase {
             .collect())
     }
 
-    // ------------------------------------------------------ reversible ETL
+    // ------------------------------------------------------ RETL (Reversible ETL)
 
     /// Store a PySpell function from PYTHON SOURCE (a `def name(args): ...`
     /// in the deterministic subset — see PYSPELL-RETL.md). The function's name
@@ -852,7 +852,15 @@ impl PyDatabase {
         retl_report_to_py(py, r)
     }
 
-    /// Every ETL run, oldest first, failed runs included, as dicts.
+    /// Verify-at-rest: re-check every standing run (top-run hash, residual
+    /// coverage, pair loadability). Returns a list of finding strings —
+    /// empty means clean. Reports, never repairs.
+    fn retl_fsck(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let db = &self.db;
+        py.detach(|| db.retl_fsck()).map_err(map_err)
+    }
+
+    /// Every RETL run, oldest first, failed runs included, as dicts.
     fn retl_log(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let db = &self.db;
         let log = py.detach(|| db.retl_log()).map_err(map_err)?;
