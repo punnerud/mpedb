@@ -68,11 +68,8 @@ fn rows_from_py(
             out.push(seq.iter().map(|v| py_to_value(&v)).collect::<PyResult<_>>()?);
         }
     }
-    if cols.is_empty() {
-        return Err(ProgrammingError::new_err(
-            "ingest: an empty batch must still name its columns (columns=[...])",
-        ));
-    }
+    // No rows and no column names is the natural last page of a paged
+    // fetch, not a mistake: it places nothing and still charges the call.
     Ok((cols, out))
 }
 
@@ -341,3 +338,91 @@ pub(crate) fn ingest_resolve(db: &mpedb::Database, py: Python<'_>, source: &str,
         py.detach(|| db.ingest_resolve(source, take)).map_err(map_err)
 }
 
+
+// ------------------------------------------------------------- the cascade
+
+/// Queue derived calls from a receipt's keys, in the SAME transaction as
+/// the rows that produced them. Returns how many were queued — a key
+/// already waiting is not queued twice.
+pub(crate) fn ingest_derive(
+    db: &mpedb::Database,
+    py: Python<'_>,
+    run_id: i64,
+    edge: &str,
+    keys: &Bound<'_, PyAny>,
+) -> PyResult<u64> {
+    let mut ks = Vec::new();
+    for k in keys.try_iter()? {
+        ks.push(py_to_value(&k?)?);
+    }
+    py.detach(|| db.ingest_derive(run_id, edge, &ks)).map_err(map_err)
+}
+
+/// The next batch of derived calls this window's budget allows, or `None`
+/// when it is spent — which is the budget working, not an error.
+pub(crate) fn ingest_next(
+    db: &mpedb::Database,
+    py: Python<'_>,
+    source: &str,
+) -> PyResult<Option<Py<PyAny>>> {
+    let Some(t) = py.detach(|| db.ingest_next(source)).map_err(map_err)? else {
+        return Ok(None);
+    };
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("lease", t.lease)?;
+    d.set_item("edge", &t.edge)?;
+    d.set_item("table", &t.table)?;
+    let ks = pyo3::types::PyList::empty(py);
+    for k in &t.keys {
+        ks.append(value_to_py(py, k.clone())?)?;
+    }
+    d.set_item("keys", ks)?;
+    Ok(Some(d.into_any().unbind()))
+}
+
+/// Retire a leased batch. What it FETCHED went in through an ordinary
+/// receipt; this only says the keys are handled.
+pub(crate) fn ingest_done(db: &mpedb::Database, py: Python<'_>, source: &str, lease: i64) -> PyResult<u64> {
+    py.detach(|| db.ingest_done(source, lease)).map_err(map_err)
+}
+
+/// Give a leased batch back — a fetch that failed. Nothing is lost.
+pub(crate) fn ingest_release(db: &mpedb::Database, py: Python<'_>, source: &str, lease: i64) -> PyResult<u64> {
+    py.detach(|| db.ingest_release(source, lease)).map_err(map_err)
+}
+
+/// Reclaim leases held by workers that never came back.
+pub(crate) fn ingest_reap(
+    db: &mpedb::Database,
+    py: Python<'_>,
+    source: &str,
+    older_than_secs: i64,
+) -> PyResult<u64> {
+    py.detach(|| mpedb::ingest_task::reap_leases(db, source, older_than_secs))
+        .map_err(map_err)
+}
+
+/// How much derived work waits, per edge. A queue that only grows means
+/// the budget cannot keep up with the fan-out.
+pub(crate) fn ingest_pending(db: &mpedb::Database, py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
+    let ps = py.detach(|| db.ingest_pending(source)).map_err(map_err)?;
+    let out = pyo3::types::PyDict::new(py);
+    for (edge, n, leased) in ps {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("waiting", n)?;
+        d.set_item("leased", leased > 0)?;
+        out.set_item(edge, d)?;
+    }
+    Ok(out.into_any().unbind())
+}
+
+/// What is left of this window's budget, from what the receipts reported.
+pub(crate) fn ingest_budget_left(db: &mpedb::Database, py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
+    let b = py.detach(|| db.ingest_budget_left(source)).map_err(map_err)?;
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("profile", b.profile)?;
+    d.set_item("calls", b.calls)?;
+    d.set_item("bytes", b.bytes)?;
+    d.set_item("window_secs", b.window_secs)?;
+    Ok(d.into_any().unbind())
+}

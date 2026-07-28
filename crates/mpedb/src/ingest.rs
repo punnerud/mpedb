@@ -46,8 +46,14 @@ const CONFLICTS_SHAPE: [&str; 6] = ["source", "tbl", "pk_ref", "k", "kind", "det
 const SEEN_SHAPE: [&str; 4] = ["source", "tbl", "pk_ref", "run_id"];
 
 /// Every table ingest owns — refused as a source table or an rRETL target.
-pub(crate) fn ingest_bookkeeping_names() -> [&'static str; 4] {
-    [T_STATS, T_STATE, T_CONFLICTS, T_SEEN]
+pub(crate) fn ingest_bookkeeping_names() -> [&'static str; 5] {
+    [
+        T_STATS,
+        T_STATE,
+        T_CONFLICTS,
+        T_SEEN,
+        crate::ingest_task::T_TASK,
+    ]
 }
 
 // ------------------------------------------------------------------ spec
@@ -189,6 +195,15 @@ impl EdgeSpec {
     /// of these and past observations describe a different call, so they
     /// must decode to "never observed" rather than to a lie (the
     /// `stats.rs` discipline).
+    /// Does a receipt through this edge present the WHOLE table? Only then
+    /// can absence be read as deletion. A DERIVED edge never does, whatever
+    /// its strategy says about the per-key call: it is scoped to the keys
+    /// that drove it, and the rows it was not asked about are not gone
+    /// (DESIGN-INGEST §2).
+    pub fn presents_whole_table(&self) -> bool {
+        self.kind == EdgeKind::Root && self.strategy.is_complete()
+    }
+
     pub fn fingerprint(&self) -> String {
         let mut h = blake3::Hasher::new();
         for part in [
@@ -504,7 +519,7 @@ impl IngestSpec {
         for e in &self.edges {
             if e.strategy == Strategy::Delta || e.strategy == Strategy::Webhook {
                 let reconciled = self.edges.iter().any(|o| {
-                    o.table.eq_ignore_ascii_case(&e.table) && o.strategy.is_complete()
+                    o.table.eq_ignore_ascii_case(&e.table) && o.presents_whole_table()
                 });
                 if !reconciled {
                     return Err(Error::Unsupported(format!(

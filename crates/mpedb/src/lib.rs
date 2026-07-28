@@ -71,6 +71,7 @@ pub mod rretl_store;
 pub mod ingest;
 pub mod ingest_plan;
 pub mod ingest_run;
+pub mod ingest_task;
 pub mod rretl_map;
 pub mod rretl_map_run;
 pub mod model;

@@ -20,8 +20,8 @@
 use mpedb_types::{Error, Result, Value};
 
 use crate::ingest::{
-    ensure_ingest_tables, read_state, read_state_in, write_state, EdgeState, IngestSpec, Policy,
-    ResolvedEdge, Strategy,
+    ensure_ingest_tables, read_state, read_state_in, write_state, EdgeKind, EdgeState, IngestSpec,
+    Policy, ResolvedEdge, Strategy,
 };
 use crate::rretl::{chunk_rows, now_micros, pk_ref, rows_of};
 use crate::WriteSession;
@@ -264,7 +264,7 @@ fn pick_edge<'a>(
         .iter()
         .filter(|e| {
             e.table.eq_ignore_ascii_case(target)
-                && e.spec.strategy.is_complete() == want_complete
+                && e.spec.presents_whole_table() == want_complete
         })
         .collect::<Vec<_>>();
     match hits.len() {
@@ -296,13 +296,24 @@ impl crate::Database {
         let spec = self.load_ingest(source)?;
         let resolved = self.resolve_ingest(&spec)?;
         let edge = pick_edge(&spec, &resolved, target, mode)?;
-        if mode == Mode::Dump && !edge.spec.strategy.is_complete() {
-            return Err(Error::Unsupported(format!(
-                "ingest `{source}`: edge `{}` is a {}, which does not present the whole \
-                 table — a dump receipt through it would read every absent row as a delete",
-                edge.spec.name,
-                edge.spec.strategy.as_str()
-            )));
+        if mode == Mode::Dump && !edge.spec.presents_whole_table() {
+            return Err(Error::Unsupported(if edge.spec.kind == EdgeKind::Root {
+                format!(
+                    "ingest `{source}`: edge `{}` is a {}, which does not present the whole \
+                     table — a dump receipt through it would read every absent row as a delete",
+                    edge.spec.name,
+                    edge.spec.strategy.as_str()
+                )
+            } else {
+                format!(
+                    "ingest `{source}`: edge `{}` is {}, so it is SCOPED to the keys that drove \
+                     it — a dump receipt through it would read every row it was never asked \
+                     about as a delete. Take it as a delta: a derived receipt upserts what it \
+                     fetched and never infers a delete (DESIGN-INGEST §2)",
+                    edge.spec.name,
+                    edge.spec.kind.as_str()
+                )
+            }));
         }
         let have = self.committed_tables()?;
         let mut s = self.begin()?;
@@ -383,7 +394,13 @@ impl crate::Database {
                         run.edge
                     ))
                 })?;
-            apply_chunk(&mut s, &spec, edge, &mut run, cols, rows)?;
+            // An empty chunk is not an error: a paged fetch whose row count
+            // is an exact multiple of the page size ends with one, and the
+            // call it cost is real even though it placed nothing. Charging
+            // it and placing nothing is the only honest answer.
+            if !rows.is_empty() {
+                apply_chunk(&mut s, &spec, edge, &mut run, cols, rows)?;
+            }
             run.calls += calls;
             run.bytes += bytes;
             write_open(&mut s, run_id, &run, "open")?;
@@ -582,7 +599,7 @@ fn report_of(run_id: i64, run: &OpenRun, edge: &ResolvedEdge) -> IngestReport {
         caught: run.caught,
         missed: run.missed,
         watermark: run.watermark.clone(),
-        complete: edge.spec.strategy.is_complete(),
+        complete: edge.spec.presents_whole_table(),
     }
 }
 
@@ -629,7 +646,7 @@ fn apply_chunk(
     // watermark stood before this dump. A row the dump found changed whose
     // candidate did not move past that mark is a row the delta would have
     // lost.
-    let complete = edge.spec.strategy.is_complete();
+    let complete = edge.spec.presents_whole_table();
     let (trial_col, judge_against) = if complete {
         match spec
             .edges

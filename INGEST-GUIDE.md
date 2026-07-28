@@ -217,25 +217,45 @@ system. Declare those as `derived`/`writeback` edges (§2) and let mpedb
 carry the parameters:
 
 ```python
-run = db.ingest_begin("salesforce", "cases", mode="delta")
+run = db.ingest_begin("salesforce", "cases_delta", mode="delta")
 db.ingest_rows(run, page, calls=1, bytes=n)
 db.ingest_derive(run, "case_detail", [r["id"] for r in page])   # queue the follow-ups
 db.ingest_finish(run)
 ```
 
+`ingest_derive` queues the follow-ups **in the same transaction as the rows
+that produced them**, so a crash between "I have the keys" and "the
+follow-ups are recorded" cannot happen. Queueing a key that is already
+waiting is a no-op, so re-reading with overlap (§9) costs nothing here.
+
 Then, in the worker your cron runs:
 
 ```python
 while (task := db.ingest_next("salesforce")):
-    data = client.get_detail(task["keys"])          # task["keys"] is batched for you
-    db.ingest_rows(task["run"], data, calls=1, bytes=n)
-    db.ingest_done(task["id"])
+    rows = client.get_details(task["keys"])          # keys come batched for you
+    db.ingest_delta("salesforce", task["edge"], rows, calls=1, bytes=n)
+    db.ingest_done("salesforce", task["lease"])
 ```
 
-`ingest_next` returns nothing when the budget for this window is spent —
-that is the budget working, not an error. The follow-ups are queued
-atomically with the rows that produced them, so a crash between the two is
-impossible.
+Three things to know about that loop:
+
+- **`ingest_next` returns `None` when this window's budget is spent.** That
+  is the budget working, not an error — the loop ends, cron fires again
+  later, and the queue is still there. `db.ingest_pending(source)` shows how
+  much is waiting; a number that only grows means the budget cannot keep up
+  with the fan-out.
+- **A derived receipt goes through the `delta` door**, always. It presents
+  only the keys it was asked about, so it upserts and never infers a delete
+  — a `dump` receipt on a derived edge is refused for exactly that reason.
+- **Keys are handed out under a lease** so two workers cannot fetch the
+  same ones. If a fetch fails, `db.ingest_release(source, lease)` puts them
+  back. If a worker dies holding them, `db.ingest_reap(source,
+  older_than_secs=900)` reclaims them — safe to run any time, since the
+  worst case is one duplicate fetch.
+
+**Fan-out is measured here, not declared.** Every `ingest_derive` records
+how many keys one parent call produced; that is the cardinality the planner
+(§5) needs to price the graph, and you never have to estimate it yourself.
 
 ---
 
@@ -307,6 +327,13 @@ reverse direction has a gap the width of your initial load.
 | `db.ingest_advise(src)` | dict incl. `cron` | the plan: which edge, how often, in which profile, plus what could not be planned |
 | `db.ingest_conflicts(src)` / `ingest_resolve(src, take=)` | list / count | what could not be decided, and deciding it |
 | `db.ingest_derive(run, edge, keys)` | int | queue derived calls from this receipt's keys, atomically with it |
-| `db.ingest_next(src)` / `ingest_done(id)` | task \| `None` / `None` | pull the next call the budget allows; mark it done |
+| `db.ingest_next(src)` | `{lease, edge, table, keys}` \| `None` | the next batch the budget allows; `None` = window spent |
+| `db.ingest_done(src, lease)` / `ingest_release(src, lease)` | int | retire a leased batch / give it back after a failed fetch |
+| `db.ingest_reap(src, older_than_secs=900)` | int | reclaim leases held by workers that died |
+| `db.ingest_pending(src)` | dict per edge | how much derived work is waiting, and whether any is leased |
+| `db.ingest_budget_left(src)` | `{profile, calls, bytes, window_secs}` | what is left of this window |
 
-CLI mirrors all of it: `mpedb ingest define|show|list|drop|state|advise|conflicts|resolve|next <config> …`.
+CLI mirrors all of it: `mpedb ingest define|show|list|drop|state|advise|conflicts|resolve <config> …`
+plus the worker side, `next|pending|done|release|reap`, so a shell fetcher
+(curl + jq in cron) needs no Python at all. `ingest next` prints one
+tab-separated `lease  edge  table  key` line per key.

@@ -67,6 +67,24 @@ child's parameters). An edge carries:
 | `cost_calls`, `cost_bytes` | the cost vector for one invocation |
 | `weight` | importance μ; default 1 |
 
+**A derived edge is SCOPED, and therefore never complete.** Whatever its
+`strategy` says about the per-key call, a derived receipt presents only the
+keys that drove it — so absence proves nothing and a delete can never be
+inferred from it. A `dump` receipt through a derived edge is refused by
+name; the rows go in through the delta door, which upserts. (A derived
+table whose rows can vanish independently of its parent therefore needs its
+own root dump edge, exactly like any other table.)
+
+**The queue is what carries the parameters.** `ingest_derive` writes one
+task row per key IN THE SAME TRANSACTION as the receipt that produced it,
+so the window between "I have the keys" and "the follow-ups are recorded"
+does not exist. Tasks are handed out under a lease (`ingest_next`), retired
+by `ingest_done`, returned by `ingest_release`, and reclaimed after a
+worker dies by `reap_leases` — a duplicate fetch is the worst case, and it
+is harmless because every receipt is idempotent. Re-deriving a key that is
+already waiting is a no-op, which is what makes the mandatory overlap (P2)
+free on this path.
+
 **Fan-out is data-dependent and therefore observed, never declared.** The
 number of `case_detail` calls is the number of keys `cases_changed`
 returned, which is a function of the change rate. That is a cardinality
@@ -272,7 +290,7 @@ three contracts (`design/DESIGN-MPEE-GENERAL.md` §1–3):
 3. **Quantise with log2 buckets** (`mpedb_sql::magnitude`, the solver's own
    function, reused so the two cannot drift) for stability against noise.
 
-## 9. Bookkeeping — three tables, rigid types, never sys-keyspace
+## 9. Bookkeeping — four tables, rigid types, never sys-keyspace
 
 Like rRETL: ordinary TABLES built from `CreateTableSpec` with rigid column
 types (#124 measured compilation as O(bytes in the sys keyspace), and these
@@ -299,6 +317,15 @@ ingest_state (source, edge)
 ingest_conflicts (source, tbl, pk_ref)
     → k, kind, detail, ts_micros
         -- everything the policy would not decide, queryable = the alert
+```
+
+ingest_task (source, edge, pk_ref)
+    → k, state, lease, ts_micros
+        -- the cascade's queue (§2). `k` is the key VALUE, because the
+           worker needs it to make the call and a digest is one-way; the
+           pk_ref digest is what keys it, because raw values do not fit a
+           bounded composite key. `state` is pending|claimed, `lease` the
+           claim stamp a worker passes back to `ingest_done`.
 ```
 
 Plus one internal set used only inside a dump:

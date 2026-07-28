@@ -324,7 +324,7 @@ impl crate::Database {
                     (st.lambda_per_poll() / interval) * window
                 };
                 let (calls, bytes) = effective_cost(&spec, &states, e);
-                let floor = if e.strategy.is_complete() {
+                let floor = if e.presents_whole_table() {
                     DUMP_FLOOR_PER_DAY * window / 86400.0
                 } else {
                     0.0
@@ -506,7 +506,7 @@ fn effective_cost(spec: &IngestSpec, states: &[(EdgeState, f64)], root: &EdgeSpe
 
 fn plan_reason(e: &EdgeSpec, st: &EdgeState, r: &Root, rho: f64, when: &str) -> String {
     let mut why = format!("{}, {when}", e.strategy.as_str());
-    if e.strategy.is_complete() && rho <= r.floor * 1.001 {
+    if e.presents_whole_table() && rho <= r.floor * 1.001 {
         why.push_str(" — at the reconcile floor: deletes and the cursor trial depend on it");
     }
     match st.cursor_state.as_str() {

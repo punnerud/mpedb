@@ -632,3 +632,210 @@ fn the_plan_reports_against_the_uniform_control_arm() {
     );
     assert!(p.verdict().contains("uniform"));
 }
+
+// --------------------------------------------------------------- cascade
+
+const CASCADE: &str = r#"
+[source]
+name = "sf"
+policy = "source"
+
+[[source.budget]]
+profile = "work"
+window_secs = 300
+calls = 6
+
+[[source.budget]]
+profile = "off"
+window_secs = 300
+calls = 6
+
+[[source.edge]]
+name = "cases_delta"
+kind = "root"
+table = "cases"
+strategy = "delta"
+cursor = "updated_at"
+cost_calls = 1
+
+[[source.edge]]
+name = "cases_full"
+kind = "root"
+table = "cases"
+strategy = "dump"
+cost_calls = 1
+
+[[source.edge]]
+name = "case_detail"
+kind = "derived"
+parent = "cases_delta"
+table = "details"
+strategy = "dump"
+batch = 2
+cost_calls = 1
+"#;
+
+fn cascaded(tag: &str) -> (Database, Scratch) {
+    let (d, s) = db(tag);
+    for t in ["cases", "details"] {
+        d.query(
+            &format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY, subject ANY, updated_at ANY)"),
+            &[],
+        )
+        .unwrap();
+    }
+    d.ingest_define(CASCADE).unwrap();
+    (d, s)
+}
+
+/// The Salesforce shape: a root call returns keys, each key needs its own
+/// call, and the budget decides how many happen now. Fan-out is MEASURED
+/// by the derive, not declared.
+#[test]
+fn derived_calls_queue_atomically_and_batch_by_the_budget() {
+    let (d, _s) = cascaded("cascade");
+    let c = cols();
+
+    // A delta receipt that found five changed cases, each needing a detail.
+    let run = d.ingest_begin("sf", "cases_delta", Mode::Delta).unwrap();
+    let batch: Vec<Vec<Value>> = (1..=5).map(|i| row(i, "x", i * 10)).collect();
+    d.ingest_rows(run, &c, &batch, 1, 500).unwrap();
+    let queued = d
+        .ingest_derive(run, "case_detail", &(1..=5).map(Value::Int).collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(queued, 5);
+    d.ingest_finish(run).unwrap();
+
+    // Fan-out is now an observation: five keys from one parent call.
+    let st = d.ingest_state("sf").unwrap();
+    let det = &st.iter().find(|(n, _, _)| n == "case_detail").unwrap().1;
+    assert_eq!((det.fanout, det.parent_calls), (5, 1));
+    assert!((det.fanout_per_call() - 5.0).abs() < 1e-9);
+
+    // The worker gets keys in batches of the edge's batch factor.
+    let t = d.ingest_next("sf").unwrap().expect("work is waiting");
+    assert_eq!(t.edge, "case_detail");
+    assert_eq!(t.table, "details");
+    assert_eq!(t.keys.len(), 2, "the edge declares batch = 2");
+    assert_eq!(d.ingest_pending("sf").unwrap()[0].1, 5, "still queued until done");
+
+    // Doing the work is an ordinary receipt — the DELTA door, because a
+    // derived edge presents only the keys it was asked about.
+    let detail: Vec<Vec<Value>> = t
+        .keys
+        .iter()
+        .map(|k| vec![k.clone(), Value::Text("d".into()), Value::Int(1)])
+        .collect();
+    let e = d
+        .ingest_dump("sf", "case_detail", &c, &detail, 1, 100)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("SCOPED to the keys that drove it"), "{e}");
+    d.ingest_delta("sf", "case_detail", &c, &detail, 1, 100).unwrap();
+    assert_eq!(d.ingest_done("sf", t.lease).unwrap(), 2);
+    assert_eq!(d.ingest_pending("sf").unwrap()[0].1, 3);
+
+    // Queueing the same keys again is idempotent — which is what makes a
+    // re-read with overlap free.
+    let run2 = d.ingest_begin("sf", "cases_delta", Mode::Delta).unwrap();
+    d.ingest_rows(run2, &c, &[], 1, 0).unwrap();
+    let again = d
+        .ingest_derive(run2, "case_detail", &(3..=5).map(Value::Int).collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(again, 0, "already pending, so not queued twice");
+    d.ingest_finish(run2).unwrap();
+}
+
+/// The budget stops the cascade. `ingest_next` returning None is the
+/// budget working, not an error — and the next window resumes it.
+#[test]
+fn the_budget_stops_the_cascade_rather_than_an_error() {
+    let (d, _s) = cascaded("budget");
+    let c = cols();
+    let run = d.ingest_begin("sf", "cases_delta", Mode::Delta).unwrap();
+    d.ingest_rows(run, &c, &[row(1, "x", 10)], 1, 0).unwrap();
+    d.ingest_derive(run, "case_detail", &(1..=20).map(Value::Int).collect::<Vec<_>>())
+        .unwrap();
+    d.ingest_finish(run).unwrap();
+
+    let left = d.ingest_budget_left("sf").unwrap();
+    assert_eq!(left.calls, 5, "6 budgeted, 1 spent by the delta: {left:?}");
+
+    // Spend the rest in receipts of one call each.
+    let mut handed = 0;
+    while let Some(t) = d.ingest_next("sf").unwrap() {
+        handed += t.keys.len();
+        let rows: Vec<Vec<Value>> = t
+            .keys
+            .iter()
+            .map(|k| vec![k.clone(), Value::Text("d".into()), Value::Int(1)])
+            .collect();
+        d.ingest_delta("sf", "case_detail", &c, &rows, 1, 0).unwrap();
+        d.ingest_done("sf", t.lease).unwrap();
+        assert!(handed <= 20, "handed more work than was queued");
+    }
+    // 6 calls budgeted, 1 spent by the delta, batch 2 → five batches of two.
+    assert_eq!(handed, 10, "the budget bound the cascade");
+    assert_eq!(d.ingest_budget_left("sf").unwrap().calls, 0);
+    // The rest is still queued, waiting for the next window.
+    assert!(d.ingest_pending("sf").unwrap()[0].1 > 0);
+}
+
+/// A lease that dies with its worker comes back: release explicitly, or
+/// let the reaper take it. Nothing is lost either way.
+#[test]
+fn a_dead_worker_releases_its_keys() {
+    let (d, _s) = cascaded("lease");
+    let c = cols();
+    let run = d.ingest_begin("sf", "cases_delta", Mode::Delta).unwrap();
+    d.ingest_rows(run, &c, &[row(1, "x", 10)], 1, 0).unwrap();
+    d.ingest_derive(run, "case_detail", &[Value::Int(1), Value::Int(2)]).unwrap();
+    d.ingest_finish(run).unwrap();
+
+    let t = d.ingest_next("sf").unwrap().unwrap();
+    assert!(d.ingest_next("sf").unwrap().is_none(), "leased keys are not handed out twice");
+    assert_eq!(d.ingest_release("sf", t.lease).unwrap(), 2);
+    let again = d.ingest_next("sf").unwrap().unwrap();
+    assert_eq!(again.keys.len(), 2);
+
+    // And the reaper covers the worker that never came back at all.
+    assert_eq!(mpedb::ingest_task::reap_leases(&d, "sf", 0).unwrap(), 2);
+    assert!(d.ingest_next("sf").unwrap().is_some());
+}
+
+/// A derived edge may only be driven by the parent it declared, and a root
+/// may not be driven at all — both refused by name.
+#[test]
+fn the_cascade_refuses_the_wrong_parent() {
+    let (d, _s) = cascaded("parent");
+    let c = cols();
+    let run = d.ingest_begin("sf", "cases_full", Mode::Dump).unwrap();
+    d.ingest_rows(run, &c, &[row(1, "x", 10)], 1, 0).unwrap();
+    // `case_detail` declares `cases_delta` as its parent, not `cases_full`.
+    let e = d
+        .ingest_derive(run, "case_detail", &[Value::Int(1)])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("parent is `cases_delta`"), "{e}");
+    let e = d
+        .ingest_derive(run, "cases_delta", &[Value::Int(1)])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("roots are SCHEDULED"), "{e}");
+    d.ingest_abandon(run).unwrap();
+}
+
+/// A paged dump whose row count is an exact multiple of the page size ends
+/// with an empty page. That page cost a call, and it must not be an error.
+#[test]
+fn an_empty_last_page_still_charges_its_call() {
+    let (d, _s) = seeded("emptypage");
+    let c = cols();
+    let run = d.ingest_begin("crm", "cases_full", Mode::Dump).unwrap();
+    d.ingest_rows(run, &c, &[row(1, "a", 10), row(2, "b", 11)], 1, 200).unwrap();
+    let r = d.ingest_rows(run, &[], &[], 1, 40).unwrap();
+    assert_eq!((r.calls, r.bytes), (2, 240), "the empty page cost a call");
+    let r = d.ingest_finish(run).unwrap();
+    assert_eq!((r.inserted, r.deleted), (2, 0), "{r:?}");
+    assert_eq!(ints(&d, "SELECT id FROM cases ORDER BY id"), vec![1, 2]);
+}

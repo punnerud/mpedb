@@ -1009,6 +1009,40 @@ impl PyDatabase {
         pyingest::ingest_resolve(&self.db, py, source, take)
     }
 
+    fn ingest_derive(
+        &self,
+        py: Python<'_>,
+        run_id: i64,
+        edge: &str,
+        keys: &Bound<'_, PyAny>,
+    ) -> PyResult<u64> {
+        self.refuse_if_txn_open("ingest_derive", "Commit or roll back first.")?;
+        pyingest::ingest_derive(&self.db, py, run_id, edge, keys)
+    }
+    fn ingest_next(&self, py: Python<'_>, source: &str) -> PyResult<Option<Py<PyAny>>> {
+        self.refuse_if_txn_open("ingest_next", "Commit or roll back first.")?;
+        pyingest::ingest_next(&self.db, py, source)
+    }
+    fn ingest_done(&self, py: Python<'_>, source: &str, lease: i64) -> PyResult<u64> {
+        self.refuse_if_txn_open("ingest_done", "Commit or roll back first.")?;
+        pyingest::ingest_done(&self.db, py, source, lease)
+    }
+    fn ingest_release(&self, py: Python<'_>, source: &str, lease: i64) -> PyResult<u64> {
+        self.refuse_if_txn_open("ingest_release", "Commit or roll back first.")?;
+        pyingest::ingest_release(&self.db, py, source, lease)
+    }
+    #[pyo3(signature = (source, older_than_secs=900))]
+    fn ingest_reap(&self, py: Python<'_>, source: &str, older_than_secs: i64) -> PyResult<u64> {
+        self.refuse_if_txn_open("ingest_reap", "Commit or roll back first.")?;
+        pyingest::ingest_reap(&self.db, py, source, older_than_secs)
+    }
+    fn ingest_pending(&self, py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
+        pyingest::ingest_pending(&self.db, py, source)
+    }
+    fn ingest_budget_left(&self, py: Python<'_>, source: &str) -> PyResult<Py<PyAny>> {
+        pyingest::ingest_budget_left(&self.db, py, source)
+    }
+
     /// Every rRETL run, oldest first, failed runs included, as dicts.
     fn rretl_log(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let db = &self.db;

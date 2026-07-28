@@ -1346,6 +1346,66 @@ fn cmd_ingest(args: &[String]) -> CliResult {
             }
             Ok(())
         }
+        [sub, config, name] if sub == "next" => {
+            let db = crate::util::open_target(config)?;
+            match db.ingest_next(name)? {
+                // One line per key, lease first: a shell fetcher can cut it.
+                Some(t) => {
+                    for k in &t.keys {
+                        println!("{}\t{}\t{}\t{}", t.lease, t.edge, t.table, crate::render::value_str(k));
+                    }
+                }
+                None => {
+                    let b = db.ingest_budget_left(name)?;
+                    println!(
+                        "no derived call to make: {} call(s) left in profile `{}` over {} s",
+                        b.calls, b.profile, b.window_secs
+                    );
+                }
+            }
+            Ok(())
+        }
+        [sub, config, name, rest @ ..] if sub == "done" || sub == "release" => {
+            let p = crate::args::parse(rest, &["lease"], &[])?;
+            let lease: i64 = p
+                .require("lease")?
+                .parse()
+                .map_err(|_| Failure::Usage("--lease takes the number `ingest next` printed".into()))?;
+            let db = crate::util::open_target(config)?;
+            let n = if sub == "done" {
+                db.ingest_done(name, lease)?
+            } else {
+                db.ingest_release(name, lease)?
+            };
+            println!("ingest `{name}`: {n} key(s) {}", if sub == "done" { "retired" } else { "returned to the queue" });
+            Ok(())
+        }
+        [sub, config, name, rest @ ..] if sub == "reap" => {
+            let p = crate::args::parse(rest, &["older-than"], &[])?;
+            let secs: i64 = p.value("older-than").unwrap_or("900").parse().map_err(|_| {
+                Failure::Usage("--older-than takes seconds".into())
+            })?;
+            let db = crate::util::open_target(config)?;
+            let n = mpedb::ingest_task::reap_leases(&db, name, secs)?;
+            println!("ingest `{name}`: {n} lease(s) reclaimed");
+            Ok(())
+        }
+        [sub, config, name] if sub == "pending" => {
+            let db = crate::util::open_target(config)?;
+            let ps = db.ingest_pending(name)?;
+            if ps.is_empty() {
+                println!("no derived work waiting");
+            }
+            for (edge, n, leased) in ps {
+                println!("{edge:<20} {n:>6} waiting{}", if leased > 0 { ", some leased" } else { "" });
+            }
+            let b = db.ingest_budget_left(name)?;
+            println!(
+                "budget: {} call(s) left in profile `{}` over {} s",
+                b.calls, b.profile, b.window_secs
+            );
+            Ok(())
+        }
         [sub, config, name] if sub == "conflicts" => {
             let db = crate::util::open_target(config)?;
             let cs = db.ingest_conflicts(name)?;
@@ -1372,7 +1432,9 @@ fn cmd_ingest(args: &[String]) -> CliResult {
             "ingest needs: define <target> <source.toml> | show|drop <target> <name> \
              | list <target> | state <target> <source> \
              | advise <target> <source> [--emit-cron] [--cmd <script>] \
-             | conflicts <target> <source> | resolve <target> <source> --take local",
+             | conflicts <target> <source> | resolve <target> <source> --take local \
+             | next|pending <target> <source> | done|release <target> <source> --lease <n> \
+             | reap <target> <source> [--older-than 900]",
         ),
     }
 }
