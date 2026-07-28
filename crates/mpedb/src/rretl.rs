@@ -130,6 +130,20 @@ impl CanonChain {
     }
 }
 
+/// Bookkeeping key for a row identity: blake3 over the pk's canonical
+/// bits, FIXED 32 bytes. The raw bits used to ride inside composite
+/// bookkeeping keys (`(run_id, pk_enc)`, `(map, tbl, pk_enc)`) whose
+/// OTHER parts eat into the engine's encoded-key cap — a legal ~970-char
+/// TEXT pk then wedged apply and map sync behind an unnamed engine
+/// refusal, and how long you named your map decided which keys were
+/// syncable (the value saboteur's finding). A digest is injective at the
+/// same trust level as every other content hash here, and every consumer
+/// has the ROW in hand (or, for maps, the `k` value column), so nothing
+/// ever needs to invert it.
+pub(crate) fn pk_ref(v: &Value) -> Vec<u8> {
+    blake3::hash(&crate::lens::value_bits(v)).as_bytes().to_vec()
+}
+
 pub(crate) fn rows_of(r: ExecResult) -> Result<Vec<Vec<Value>>> {
     match r {
         ExecResult::Rows { rows, .. } => Ok(rows),
@@ -400,7 +414,7 @@ impl crate::Database {
                     let res = rows_of(self.query(
                         "SELECT count(*) FROM rretl_residual \
                          WHERE run_id = $1 AND pk_enc = $2",
-                        &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
+                        &[Value::Int(run_id), Value::Blob(pk_ref(pk))],
                     )?)?;
                     if res[0][0] == Value::Int(0) {
                         findings.push(format!(
@@ -962,7 +976,7 @@ fn apply_in(
                 "INSERT INTO rretl_residual (run_id, pk_enc, residual) VALUES ($1, $2, $3)",
                 &[
                     Value::Int(run_id),
-                    Value::Blob(crate::lens::value_bits(pk)),
+                    Value::Blob(pk_ref(pk)),
                     r,
                 ],
             )?;
@@ -986,7 +1000,7 @@ fn apply_in(
             Some(_) => {
                 let res = rows_of(s.query(
                     "SELECT residual FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
-                    &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
+                    &[Value::Int(run_id), Value::Blob(pk_ref(pk))],
                 )?)?;
                 let Some(r) = res.into_iter().next().and_then(|mut r| {
                     if r.is_empty() { None } else { Some(r.remove(0)) }
@@ -1143,7 +1157,7 @@ fn revert_in(
             Some(_) => {
                 let res = rows_of(s.query(
                     "SELECT residual FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
-                    &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
+                    &[Value::Int(run_id), Value::Blob(pk_ref(pk))],
                 )?)?;
                 // NULL as a residual VALUE would arrive here as Value::Null in
                 // a present row and feed inverse(y, NULL); an ABSENT row is
@@ -1234,7 +1248,7 @@ fn putback_in(
             Some(rex) => {
                 let res = rows_of(s.query(
                     "SELECT residual FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
-                    &[Value::Int(run_id), Value::Blob(crate::lens::value_bits(pk))],
+                    &[Value::Int(run_id), Value::Blob(pk_ref(pk))],
                 )?)?;
                 let Some(r) = res.into_iter().next().and_then(|mut r| {
                     if r.is_empty() { None } else { Some(r.remove(0)) }

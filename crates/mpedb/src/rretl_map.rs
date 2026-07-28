@@ -185,27 +185,50 @@ impl MapSpec {
                 self.name
             )));
         }
+        // The dict/`define_spec` door validates HERE while every load parses
+        // TOML, so anything the parser requires must be required here too —
+        // otherwise a stored record exists that the engine's own reader
+        // rejects (the schema saboteur's finding).
+        if self.tables.is_empty() {
+            return Err(Error::Unsupported(
+                "map spec: at least one table mapping is required".into(),
+            ));
+        }
         let mut seen_dst = std::collections::HashSet::new();
+        let mut seen_src = std::collections::HashSet::new();
         for t in &self.tables {
+            if t.columns.is_empty() {
+                return Err(Error::Unsupported(format!(
+                    "map spec: table `{}` needs at least one column mapping",
+                    t.source
+                )));
+            }
             for (n, what) in [(&t.source, "source table"), (&t.target, "target table")] {
                 if !ident_ok(n) {
                     return Err(Error::Unsupported(format!(
                         "map spec: `{n}` is not a legal {what} name"
                     )));
                 }
-                if crate::rretl::rretl_bookkeeping_names().contains(&n.as_str()) {
+                // Case-INSENSITIVELY: SQL identifiers are, so a target named
+                // `RRETL_MAP_STATE` would otherwise walk past this guard and
+                // die later on a raw duplicate-name error.
+                if crate::rretl::rretl_bookkeeping_names()
+                    .iter()
+                    .any(|b| n.eq_ignore_ascii_case(b))
+                {
                     return Err(Error::Unsupported(format!(
                         "map spec: `{n}` is rRETL bookkeeping; mapping it is refused"
                     )));
                 }
             }
+            seen_src.insert(t.source.to_ascii_lowercase());
             if t.source == t.target {
                 return Err(Error::Unsupported(format!(
                     "map spec: `{}` maps onto itself — source and target must differ",
                     t.source
                 )));
             }
-            if !seen_dst.insert(t.target.clone()) {
+            if !seen_dst.insert(t.target.to_ascii_lowercase()) {
                 return Err(Error::Unsupported(format!(
                     "map spec: target `{}` appears twice",
                     t.target
@@ -238,12 +261,29 @@ impl MapSpec {
                         c.source, t.source
                     )));
                 }
-                if !dst_cols.insert(c.target.clone()) {
+                if !dst_cols.insert(c.target.to_ascii_lowercase()) {
                     return Err(Error::Unsupported(format!(
                         "map spec: target column `{}` of `{}` is written twice",
                         c.target, t.target
                     )));
                 }
+            }
+        }
+        // CHAINED entries (one entry's target is another's source) break the
+        // twin-ness of check and sync: sync applies entry 1's writes before
+        // classifying entry 2, while a read-only check classifies both
+        // against the same committed state — so check under-counts and can
+        // miss conflicts entirely (the schema saboteur's finding). A staging
+        // chain is two maps, synced in the order you choose, not one map
+        // whose entries feed each other.
+        for t in &self.tables {
+            if seen_src.contains(&t.target.to_ascii_lowercase()) {
+                return Err(Error::Unsupported(format!(
+                    "map spec: `{}` is both a target and a source in this map — chained \
+                     entries are refused (one entry's writes would be invisible to the \
+                     other's classification); use two maps",
+                    t.target
+                )));
             }
         }
         Ok(())
@@ -382,7 +422,52 @@ impl crate::Database {
     pub fn rretl_map_define(&self, toml_text: &str) -> Result<()> {
         let spec = MapSpec::from_toml_str(toml_text)?;
         self.resolve_map(&spec)?;
+        self.refuse_overlap_with_other_maps(&spec)?;
         self.store_map_record(&spec.name, toml_text)
+    }
+
+    /// A table may be a map SOURCE or a map TARGET, never both, and never a
+    /// target twice. One rule, three real failures behind it: two maps
+    /// sharing a target silently merge two unrelated masters into each
+    /// other; a reverse map (`a→b` plus `b→a`) makes every ordinary edit an
+    /// unresolvable conflict, because each map sees the other's push as
+    /// "the other side moved too"; and a cross-map chain has the same
+    /// check-vs-sync blindness as a chain inside one map. Loop safety is
+    /// per map — this keeps the topology inside what that guarantee covers.
+    fn refuse_overlap_with_other_maps(&self, spec: &MapSpec) -> Result<()> {
+        for other in self.rretl_maps()? {
+            if other == spec.name {
+                continue;
+            }
+            let o = match self.load_map(&other) {
+                Ok(o) => o,
+                Err(_) => continue, // unreadable records are fsck's business
+            };
+            let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+            for t in &spec.tables {
+                for ot in &o.tables {
+                    let clash = if same(&t.target, &ot.target) {
+                        Some(("target", t.target.as_str(), "target"))
+                    } else if same(&t.target, &ot.source) {
+                        Some(("target", t.target.as_str(), "source"))
+                    } else if same(&t.source, &ot.target) {
+                        Some(("source", t.source.as_str(), "target"))
+                    } else {
+                        None
+                    };
+                    if let Some((mine, table, theirs)) = clash {
+                        return Err(Error::Unsupported(format!(
+                            "map `{}`: `{table}` is its {mine}, but map `{other}` already \
+                             uses that table as its {theirs} — a table may be a map source \
+                             or a map target, never both, and never a target twice (loop \
+                             safety is per map)",
+                            spec.name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// [`rretl_map_define`](Self::rretl_map_define) from a CONSTRUCTED spec —
@@ -393,6 +478,7 @@ impl crate::Database {
     pub fn rretl_map_define_spec(&self, spec: &MapSpec) -> Result<()> {
         spec.validate()?;
         self.resolve_map(spec)?;
+        self.refuse_overlap_with_other_maps(spec)?;
         self.store_map_record(&spec.name, &spec.to_toml())
     }
 
@@ -413,7 +499,17 @@ impl crate::Database {
         let mut s = self.begin()?;
         let res = (|| -> Result<()> {
             let prior = s.sys_record_get(NS_MAP, name.as_bytes())?;
-            if has_state && prior.is_some() && prior.as_deref() != Some(record.as_slice()) {
+            // ONLY a byte-identical re-define keeps state. Anything else —
+            // a changed spec, a FIRST define, a define after `map drop` —
+            // starts from nothing. The two openings that "keep state unless
+            // the record changed" left were both real: a drop plus a changed
+            // redefine kept the old spec's hashes (the re-baseline it needed
+            // was skipped because there was no prior record), and state
+            // planted under an undefined name was ADOPTED by that name's
+            // first define, whose first sync then deleted source rows. State
+            // is a baseline, never evidence; re-arbitrating from scratch is
+            // always safe (agreement adopts, disagreement is a conflict).
+            if has_state && prior.as_deref() != Some(record.as_slice()) {
                 s.query(
                     "DELETE FROM rretl_map_state WHERE map = $1",
                     &[Value::Text(name.into())],
@@ -469,29 +565,36 @@ impl crate::Database {
             .collect())
     }
 
-    /// Drop a mapping. Its state rows stay — history that a re-define of
-    /// the same name with the SAME spec picks up unchanged (a CHANGED spec
-    /// re-baselines: [`store_map_record`](Self::rretl_map_define) deletes
-    /// them). `true` when it existed.
+    /// Drop a mapping AND its sync state, in one transaction. State that
+    /// outlives its map is state no oracle scans and no sync re-baselines —
+    /// a later map of the same name would inherit a baseline it never
+    /// wrote. `true` when the mapping existed.
     pub fn rretl_map_drop(&self, name: &str) -> Result<bool> {
-        let key = crate::sys_record_subkey(NS_MAP, name.as_bytes())?;
-        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        let existed = match w.sys_get(&key) {
+        let have = self.committed_tables()?;
+        let has_state = have.iter().any(|(n, _)| n == T_MAP_STATE);
+        let mut s = self.begin()?;
+        let existed = match s.sys_record_get(NS_MAP, name.as_bytes()) {
             Ok(v) => v.is_some(),
             Err(e) => {
-                w.abort();
+                s.rollback();
                 return Err(e);
             }
         };
-        let res = (|| {
-            w.sys_delete(&key)?;
-            w.bump_schema_gen();
+        let res = (|| -> Result<()> {
+            if has_state {
+                s.query(
+                    "DELETE FROM rretl_map_state WHERE map = $1",
+                    &[Value::Text(name.into())],
+                )?;
+            }
+            s.sys_record_delete(NS_MAP, name.as_bytes())?;
+            s.bump_schema_gen();
             Ok(())
         })();
         match res {
-            Ok(()) => w.commit()?,
+            Ok(()) => s.commit()?,
             Err(e) => {
-                w.abort();
+                s.rollback();
                 return Err(e);
             }
         }
@@ -571,6 +674,23 @@ impl crate::Database {
                             "map `{}`: existing target `{}` must have `{dst_key}` as its \
                              single-column PRIMARY KEY",
                             spec.name, t.target
+                        )));
+                    }
+                    // Row identity maps VERBATIM, so a rigid target key of a
+                    // different type refuses every point lookup the sync
+                    // makes — turning a definition mistake into an
+                    // engine-level type error at sync/check/fsck time, which
+                    // then took the whole fsck down with it.
+                    let dk_ty = d.columns[d.primary_key[0] as usize].ty;
+                    if dk_ty != ColumnType::Any
+                        && src_key_ty != ColumnType::Any
+                        && dk_ty != src_key_ty
+                    {
+                        return Err(Error::Unsupported(format!(
+                            "map `{}`: `{}`.`{dst_key}` is {dk_ty:?} but the row identity \
+                             `{}`.`{src_key}` is {src_key_ty:?} — identity maps verbatim, \
+                             so the key types must match (or be typeless)",
+                            spec.name, t.target, t.source
                         )));
                     }
                     for c in &t.columns {
@@ -714,6 +834,22 @@ fn map_sync_in(
     crate::rretl::ensure_lineage_tables(s, have)?;
     for rt in tables {
         if rt.create_dst && !have.iter().any(|(n, _)| n == &rt.dst) {
+            // A missing target is "materialize it" ONLY the first time. Once
+            // the map has state for that target, missing means the table was
+            // DROPPED or renamed away — and reading that as "every row was
+            // deleted on the target side" propagates the drop into the
+            // source and empties the master (the schema saboteur's finding).
+            // One missing-table condition cannot mean two opposite things.
+            if state_rows_for(s, name, &rt.dst)? > 0 {
+                return Err(Error::Unsupported(format!(
+                    "map sync `{name}`: the target table `{}` is GONE but the map has \
+                     sync state for it — it was dropped or renamed away. Refusing: \
+                     treating this as a target-side delete would empty `{}`. Restore \
+                     the table, or `map drop` + define again (which clears the state) \
+                     to re-materialize it",
+                    rt.dst, rt.src
+                )));
+            }
             let mut cols = vec![spec_col(&rt.dst_key, rt.src_key_ty)];
             for c in &rt.cols {
                 cols.push(spec_col(&c.dst, ColumnType::Any));
@@ -728,6 +864,22 @@ fn map_sync_in(
     Ok(report)
 }
 
+/// Does this state row's `k` (the key VALUE) still hash to its `pk_enc`
+/// (the key's bookkeeping reference)? Nothing but tampering or corruption
+/// can break it — the sync writes both from one value.
+fn state_row_is_consistent(pk_enc: &Value, k: &Value) -> bool {
+    matches!(pk_enc, Value::Blob(b) if *b == crate::rretl::pk_ref(k))
+}
+
+/// How many state rows this map holds for one target table.
+fn state_rows_for(s: &mut WriteSession<'_>, name: &str, dst: &str) -> Result<i64> {
+    let r = rows_of(s.query(
+        "SELECT count(*) FROM rretl_map_state WHERE map = $1 AND tbl = $2",
+        &[Value::Text(name.into()), Value::Text(dst.into())],
+    )?)?;
+    crate::rretl::as_int(&r[0][0])
+}
+
 fn quoted(cols: &[String]) -> String {
     cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ")
 }
@@ -736,8 +888,19 @@ fn call1(p: &std::sync::Arc<mpedb_spell::ir::Proc>, x: &Value) -> Result<Value> 
     crate::spellfn::call_spell_fn(p, std::slice::from_ref(x))
 }
 
-fn chain(vals: &[Value]) -> String {
+/// A state hash. The map name, the TARGET table and the row KEY are
+/// chained in ahead of the values, so a recorded hash is meaningless
+/// anywhere but the row it was written for. Without the binding the hash
+/// covered the mapped values alone, which made it PORTABLE: identical
+/// values anywhere — a decoy row, a decoy map over the same columns —
+/// produced a byte-identical hash, so state could be forged with two
+/// ordinary SQL statements and no hashing at all (the bookkeeping
+/// saboteur's enabler finding).
+fn chain(name: &str, dst: &str, key: &Value, vals: &[Value]) -> String {
     let mut c = CanonChain::new();
+    c.push(&Value::Text(name.to_string()));
+    c.push(&Value::Text(dst.to_string()));
+    c.push(key);
     for v in vals {
         c.push(v);
     }
@@ -745,7 +908,10 @@ fn chain(vals: &[Value]) -> String {
 }
 
 /// forward per column; lossy is legal here (A→B only ever goes forward).
-fn forward_all(rt: &ResolvedTable, xs: &[Value]) -> Result<Vec<Value>> {
+/// The row is named in the refusal — in a chunked batch the offending
+/// value alone does not locate the row (the value saboteur's finding:
+/// inverse refusals named the row, forward refusals did not).
+fn forward_all(rt: &ResolvedTable, key: &Value, xs: &[Value]) -> Result<Vec<Value>> {
     rt.cols
         .iter()
         .zip(xs)
@@ -753,7 +919,8 @@ fn forward_all(rt: &ResolvedTable, xs: &[Value]) -> Result<Vec<Value>> {
             None => Ok(x.clone()),
             Some(l) => call1(&l.forward, x).map_err(|e| {
                 Error::Unsupported(format!(
-                    "map sync: `{}`.`{}` value {x:?} refused by the pair's forward: {e}",
+                    "map sync: `{}`.`{}` value {x:?} (row {key:?}) refused by the \
+                     pair's forward: {e}",
                     rt.src, c.src
                 ))
             }),
@@ -925,6 +1092,7 @@ fn sync_table(
     // Re-read a just-written row and verify its chain: the state hash is the
     // FUTURE oracle for this row, so it records what is persisted, never
     // what was intended (the stage-3 finding-14 discipline).
+    let dst = &rt.dst;
     let verify_persisted = |s: &mut WriteSession<'_>,
                             get: &str,
                             key: &Value,
@@ -934,7 +1102,7 @@ fn sync_table(
         let rows = rows_of(s.query(get, std::slice::from_ref(key))?)?;
         let got = rows
             .first()
-            .map(|r| chain(r))
+            .map(|r| chain(name, dst, key, r))
             .ok_or_else(|| Error::Corrupt(format!("map sync: {side} row {key:?} vanished")))?;
         if got != want {
             return Err(Error::Corrupt(format!(
@@ -968,8 +1136,8 @@ fn sync_table(
         for row in &rows {
             let key = &row[0];
             let xs = &row[1..];
-            let pk_enc = crate::lens::value_bits(key);
-            let a_now = chain(xs);
+            let pk_enc = crate::rretl::pk_ref(key);
+            let a_now = chain(name, &rt.dst, key, xs);
             let st = rows_of(s.query(state_get, &state_key(pk_enc.clone()))?)?;
             let st = st.first().map(|r| {
                 (
@@ -983,9 +1151,9 @@ fn sync_table(
             match (st, b) {
                 (None, None) => {
                     // New in A: forward-materialize.
-                    let ys = forward_all(rt, xs)?;
+                    let ys = forward_all(rt, key, xs)?;
                     s.query(&dst_ins, &with(vec![key.clone()], &ys))?;
-                    let b_now = chain(&ys);
+                    let b_now = chain(name, &rt.dst, key, &ys);
                     verify_persisted(s, &dst_get, key, &b_now, "target")?;
                     s.query(
                         state_put,
@@ -998,7 +1166,7 @@ fn sync_table(
                 }
                 (None, Some(ybs)) => {
                     // Both exist with no recorded sync: adopt only agreement.
-                    let ys = forward_all(rt, xs)?;
+                    let ys = forward_all(rt, key, xs)?;
                     let agree = ys
                         .iter()
                         .zip(&ybs)
@@ -1012,7 +1180,7 @@ fn sync_table(
                              can arbitrate",
                         ));
                     }
-                    let b_now = chain(&ybs);
+                    let b_now = chain(name, &rt.dst, key, &ybs);
                     s.query(
                         state_put,
                         &with(
@@ -1040,13 +1208,13 @@ fn sync_table(
                     report.deleted_a += 1;
                 }
                 (Some((st_a, st_b)), Some(ybs)) => {
-                    let b_now = chain(&ybs);
+                    let b_now = chain(name, &rt.dst, key, &ybs);
                     match (a_now != st_a, b_now != st_b) {
                         (false, false) => report.unchanged += 1,
                         (true, false) => {
-                            let ys = forward_all(rt, xs)?;
+                            let ys = forward_all(rt, key, xs)?;
                             s.query(&dst_upd, &with(vec![key.clone()], &ys))?;
-                            let b_new = chain(&ys);
+                            let b_new = chain(name, &rt.dst, key, &ys);
                             verify_persisted(s, &dst_get, key, &b_new, "target")?;
                             s.query(
                                 state_set,
@@ -1060,7 +1228,7 @@ fn sync_table(
                         (false, true) => {
                             let xs2 = inverse_all(rt, key, xs, &ybs)?;
                             s.query(&src_upd, &with(vec![key.clone()], &xs2))?;
-                            let a_new = chain(&xs2);
+                            let a_new = chain(name, &rt.dst, key, &xs2);
                             verify_persisted(s, &src_get, key, &a_new, "source")?;
                             s.query(
                                 state_set,
@@ -1116,14 +1284,14 @@ fn sync_table(
             if !rows_of(s.query(&src_exists, std::slice::from_ref(key))?)?.is_empty() {
                 continue; // handled in pass 1
             }
-            let pk_enc = crate::lens::value_bits(key);
+            let pk_enc = crate::rretl::pk_ref(key);
             let st = rows_of(s.query(state_get, &state_key(pk_enc.clone()))?)?;
             let ts = Value::Int(now_micros());
             match st.first() {
                 Some(r) => {
                     // Deleted on A.
                     let st_b = crate::rretl::as_text(&r[1]);
-                    if chain(ybs) != st_b {
+                    if chain(name, &rt.dst, key, ybs) != st_b {
                         return Err(conflict(
                             name,
                             &rt.dst,
@@ -1184,13 +1352,13 @@ fn sync_table(
                         })
                         .collect::<Result<_>>()?;
                     s.query(&src_ins, &with(vec![key.clone()], &xs2))?;
-                    let a_now = chain(&xs2);
+                    let a_now = chain(name, &rt.dst, key, &xs2);
                     verify_persisted(s, &src_get, key, &a_now, "source")?;
                     s.query(
                         state_put,
                         &with(
                             state_key(pk_enc),
-                            &[key.clone(), Value::Text(a_now), Value::Text(chain(ybs)), ts],
+                            &[key.clone(), Value::Text(a_now), Value::Text(chain(name, &rt.dst, key, ybs)), ts],
                         ),
                     )?;
                     report.created_a += 1;
@@ -1231,6 +1399,18 @@ fn sync_table(
         }
         for row in &rows {
             let key = &row[1];
+            // `k` and `pk_enc` are two copies of one identity, and pass 3 is
+            // the only place that trusts `k`. An unverified `k` is either a
+            // tampered pointer at a LIVE key (which would delete a row that
+            // is not this state row's) or a wrongly-typed value that the
+            // rigid point lookup below refuses — bricking sync, check and
+            // fsck alike (the bookkeeping saboteur's minimal blind tamper
+            // and its oracle DoS). Verify, then use; a row that fails is
+            // left alone for fsck/check to name — it can identify nothing,
+            // so it can neither be acted on nor safely cleaned.
+            if !state_row_is_consistent(&row[0], key) {
+                continue;
+            }
             let in_src = !rows_of(s.query(&src_exists, std::slice::from_ref(key))?)?.is_empty();
             let in_dst = !rows_of(s.query(&dst_exists, std::slice::from_ref(key))?)?.is_empty();
             if !in_src && !in_dst {
@@ -1278,6 +1458,38 @@ fn check_table(
     let src_cols: Vec<String> = rt.cols.iter().map(|c| c.src.clone()).collect();
     let dst_cols: Vec<String> = rt.cols.iter().map(|c| c.dst.clone()).collect();
     let (sk, dk) = (&rt.src_key, &rt.dst_key);
+
+    if !has_dst && has_state {
+        let n = rows_of(db.query(
+            "SELECT count(*) FROM rretl_map_state WHERE map = $1 AND tbl = $2",
+            &[Value::Text(name.into()), Value::Text(rt.dst.clone())],
+        )?)?;
+        if crate::rretl::as_int(&n[0][0])? > 0 {
+            out.conflicts.push(format!(
+                "map sync `{name}`: the target table `{}` is GONE but the map has sync \
+                 state for it — dropped or renamed away; a sync refuses rather than \
+                 read it as a target-side delete of every row",
+                rt.dst
+            ));
+            return Ok(out);
+        }
+    }
+
+    if !has_dst && has_state {
+        let n = rows_of(db.query(
+            "SELECT count(*) FROM rretl_map_state WHERE map = $1 AND tbl = $2",
+            &[Value::Text(name.into()), Value::Text(rt.dst.clone())],
+        )?)?;
+        if crate::rretl::as_int(&n[0][0])? > 0 {
+            out.conflicts.push(format!(
+                "map sync `{name}`: the target table `{}` is GONE but the map has sync \
+                 state for it — dropped or renamed away; a sync refuses rather than \
+                 read it as a target-side delete of every row",
+                rt.dst
+            ));
+            return Ok(out);
+        }
+    }
 
     let state_get = "SELECT a_hash, b_hash FROM rretl_map_state \
                      WHERE map = $1 AND tbl = $2 AND pk_enc = $3";
@@ -1333,8 +1545,8 @@ fn check_table(
         for row in &rows {
             let key = &row[0];
             let xs = &row[1..];
-            let a_now = chain(xs);
-            let st = state_of(crate::lens::value_bits(key))?;
+            let a_now = chain(name, &rt.dst, key, xs);
+            let st = state_of(crate::rretl::pk_ref(key))?;
             let b = if has_dst {
                 rows_of(db.query(&dst_get, std::slice::from_ref(key))?)?
                     .into_iter()
@@ -1343,11 +1555,11 @@ fn check_table(
                 None
             };
             match (st, b) {
-                (None, None) => match forward_all(rt, xs) {
+                (None, None) => match forward_all(rt, key, xs) {
                     Ok(_) => out.would_create_b += 1,
                     Err(e) => out.conflicts.push(e.to_string()),
                 },
-                (None, Some(ybs)) => match forward_all(rt, xs) {
+                (None, Some(ybs)) => match forward_all(rt, key, xs) {
                     Ok(ys) if agree(&ys, &ybs) => out.would_adopt += 1,
                     Ok(_) => out.conflicts.push(
                         conflict(
@@ -1377,9 +1589,9 @@ fn check_table(
                     }
                 }
                 (Some((st_a, st_b)), Some(ybs)) => {
-                    let b_now = chain(&ybs);
+                    let b_now = chain(name, &rt.dst, key, &ybs);
                     match (a_now != st_a, b_now != st_b) {
-                        (false, false) => match forward_all(rt, xs) {
+                        (false, false) => match forward_all(rt, key, xs) {
                             Ok(ys) if agree(&ys, &ybs) => out.unchanged += 1,
                             Ok(_) => out.diverged.push(format!(
                                 "`{}` row {key:?}: state records both sides clean, but \
@@ -1393,7 +1605,7 @@ fn check_table(
                                 rt.dst
                             )),
                         },
-                        (true, false) => match forward_all(rt, xs) {
+                        (true, false) => match forward_all(rt, key, xs) {
                             Ok(_) => out.pending_a2b += 1,
                             Err(e) => out.conflicts.push(e.to_string()),
                         },
@@ -1449,9 +1661,9 @@ fn check_table(
                 if !rows_of(db.query(&src_exists, std::slice::from_ref(key))?)?.is_empty() {
                     continue; // classified in pass 1
                 }
-                match state_of(crate::lens::value_bits(key))? {
+                match state_of(crate::rretl::pk_ref(key))? {
                     Some((_, st_b)) => {
-                        if chain(ybs) == st_b {
+                        if chain(name, &rt.dst, key, ybs) == st_b {
                             out.would_delete_b += 1;
                         } else {
                             out.conflicts.push(
@@ -1547,6 +1759,15 @@ fn check_table(
             }
             for row in &rows {
                 let key = &row[1];
+                if !state_row_is_consistent(&row[0], key) {
+                    out.diverged.push(format!(
+                        "`{}`: a sync-state row's key value {key:?} does not match its \
+                         recorded key reference — tampered or corrupt; it identifies no \
+                         row and no sync will ever clean it",
+                        rt.dst
+                    ));
+                    continue;
+                }
                 let in_src =
                     !rows_of(db.query(&src_exists, std::slice::from_ref(key))?)?.is_empty();
                 let in_dst = has_dst
@@ -1573,11 +1794,10 @@ fn check_table(
 /// findings; they belong to [`Database::rretl_map_check`], not to fsck.
 pub(crate) fn fsck_maps(db: &crate::Database, findings: &mut Vec<String>) -> Result<()> {
     let names = db.rretl_maps()?;
-    if names.is_empty() {
-        return Ok(());
-    }
     let have = db.committed_tables()?;
     let has_state = have.iter().any(|(n, _)| n == T_MAP_STATE);
+    let mut known: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for name in names {
         let spec = match db.load_map(&name) {
             Ok(s) => s,
@@ -1598,9 +1818,46 @@ pub(crate) fn fsck_maps(db: &crate::Database, findings: &mut Vec<String>) -> Res
         };
         for rt in &resolved {
             let has_dst = have.iter().any(|(n, _)| n == &rt.dst);
-            let t = check_table(db, &name, rt, has_state, has_dst)?;
-            for d in t.diverged {
-                findings.push(format!("map `{name}`: {d}"));
+            // One unexecutable map must not take the whole fsck down with
+            // it: before this, a query-time error here replaced the entire
+            // finding list — residual tampering, archive corruption, other
+            // maps — with one exception naming nothing.
+            match check_table(db, &name, rt, has_state, has_dst) {
+                Ok(t) => {
+                    for d in t.diverged {
+                        findings.push(format!("map `{name}`: {d}"));
+                    }
+                    for c in t.conflicts {
+                        if c.contains("is GONE") {
+                            findings.push(format!("map `{name}`: {c}"));
+                        }
+                    }
+                }
+                Err(e) => findings.push(format!(
+                    "map `{name}`: `{}` → `{}` cannot be checked ({e})",
+                    rt.src, rt.dst
+                )),
+            }
+        }
+        for rt in &resolved {
+            known.insert((name.clone(), rt.dst.clone()));
+        }
+    }
+    // State rows for a (map, target) no defined map claims are scanned by
+    // nothing and cleaned by nothing — invisible forever without this.
+    if has_state {
+        let rows = rows_of(db.query(
+            "SELECT DISTINCT map, tbl FROM rretl_map_state ORDER BY map, tbl",
+            &[],
+        )?)?;
+        for r in rows {
+            let pair = (crate::rretl::as_text(&r[0]), crate::rretl::as_text(&r[1]));
+            if !known.contains(&pair) {
+                findings.push(format!(
+                    "sync state for map `{}` target `{}` belongs to no defined mapping — \
+                     left over from a dropped or redefined map; no sync will clean it",
+                    pair.0, pair.1
+                ));
             }
         }
     }

@@ -503,68 +503,100 @@ fn check_is_the_dry_run_twin_of_sync() {
     assert!(d.rretl_map_check("crm").unwrap().is_clean());
 }
 
-/// Hull 1 made visible: a state row doctored so BOTH sides read clean while
-/// forward(source) != target. The echo guard skips it by design — sync
-/// reports nothing moved — and exactly `map check`/`rretl fsck` see it.
+/// The blind spot made visible. The echo guard's mechanism is NOT looking:
+/// a row whose recorded hashes match both sides is skipped, so
+/// `forward(A) == B` is never re-checked. Its realistic breaker needs no
+/// tampering at all — `create_lens` REBINDS an existing pair name, and a
+/// map resolves its pairs BY NAME at every sync, so the meaning of a
+/// mapped column can change under a map whose state is entirely current.
+/// The sync then reports nothing moved, forever, while every row's target
+/// is the old pair's output; only `map check` and `rretl fsck` see it.
 #[test]
-fn a_tampered_state_row_stands_diverged_and_only_check_and_fsck_see_it() {
+fn a_rebound_pair_stands_diverged_and_only_check_and_fsck_see_it() {
     let (d, _s) = seeded("diverged");
     d.rretl_map_sync("crm").unwrap();
+    assert!(d.rretl_map_check("crm").unwrap().is_clean());
 
-    // Swap the FULL mapped column set of target rows 1 and 3, and swap
-    // their recorded b_hashes to match: state now agrees with both sides.
-    let b = |id: i64| {
-        rows(d
-            .query(
-                "SELECT full_label, neg_score, abs_balance FROM crm_customers WHERE id = $1",
-                &[Value::Int(id)],
-            )
-            .unwrap())
-        .remove(0)
-    };
-    let (r1, r3) = (b(1), b(3));
-    let put = |id: i64, v: &[Value]| {
-        let mut p = vec![Value::Int(id)];
-        p.extend(v.iter().cloned());
-        d.query(
-            "UPDATE crm_customers SET full_label = $2, neg_score = $3, abs_balance = $4 \
-             WHERE id = $1",
-            &p,
-        )
+    // Rebind `neg` to a DIFFERENT function under the same name. Nothing in
+    // the map, the data or the state changed — only the meaning did.
+    let def = |src: &str| d.create_function(SpellLang::Python, src).unwrap();
+    def("def inc(x):\n    if x % 1 != 0:\n        return 1 // 0\n    if x == 0:\n        return 1 // 0\n    if x > 4000000000:\n        return 1 // 0\n    if x < 0 - 4000000000:\n        return 1 // 0\n    return x + 1\n");
+    def("def dec(y):\n    if y % 1 != 0:\n        return 1 // 0\n    if y > 4000000000:\n        return 1 // 0\n    if y < 0 - 4000000000:\n        return 1 // 0\n    return y - 1\n");
+    d.create_lens("neg", "inc", "dec", mpedb::lens::LensClass::Bijective)
         .unwrap();
-    };
-    put(1, &r3);
-    put(3, &r1);
-    let st = rows(d
-        .query(
-            "SELECT pk_enc, b_hash FROM rretl_map_state ORDER BY pk_enc",
-            &[],
-        )
-        .unwrap());
-    assert_eq!(st.len(), 3);
-    let swap = |pk: &Value, hash: &Value| {
-        d.query(
-            "UPDATE rretl_map_state SET b_hash = $2 WHERE map = $1 AND pk_enc = $3",
-            &[Value::Text("crm".into()), hash.clone(), pk.clone()],
-        )
-        .unwrap();
-    };
-    swap(&st[0][0], &st[2][1]);
-    swap(&st[2][0], &st[0][1]);
 
     // The sync is structurally blind to this — that is the price of the
     // echo guard, and the reason the check exists.
     assert_eq!(d.rretl_map_sync("crm").unwrap().changed_total(), 0);
 
     let r = d.rretl_map_check("crm").unwrap();
-    assert_eq!(r.tables[0].diverged.len(), 2, "{:?}", r.tables[0].diverged);
-    assert_eq!(r.tables[0].unchanged, 1);
+    assert_eq!(r.tables[0].diverged.len(), 3, "{:?}", r.tables[0].diverged);
+    assert_eq!(r.tables[0].unchanged, 0);
     assert_eq!(r.pending_total(), 0);
     assert!(!r.is_clean());
 
     let findings = d.rretl_fsck().unwrap();
     let map_findings: Vec<_> = findings.iter().filter(|f| f.contains("map `crm`")).collect();
-    assert_eq!(map_findings.len(), 2, "{findings:?}");
+    assert_eq!(map_findings.len(), 3, "{findings:?}");
+}
+
+/// A state row whose key VALUE no longer matches its key REFERENCE can
+/// identify nothing: pass 3 must not act on it (it would delete a row
+/// belonging to a different key) and must not feed it to a rigid point
+/// lookup (a wrongly-typed value took sync, check AND fsck down with one
+/// bind error). It stands as a named breach until someone clears it.
+#[test]
+fn a_state_row_whose_key_does_not_match_its_reference_is_named_not_obeyed() {
+    let (d, _s) = seeded("badkey");
+    d.rretl_map_sync("crm").unwrap();
+    d.query("UPDATE rretl_map_state SET k = 'not even an int' WHERE k = 2", &[])
+        .unwrap();
+
+    // Everything still works, and the breach is named rather than fatal.
+    let r = d.rretl_map_sync("crm").unwrap();
+    assert_eq!(r.changed_total(), 0);
+    let chk = d.rretl_map_check("crm").unwrap();
+    assert_eq!(chk.tables[0].diverged.len(), 1, "{:?}", chk.tables[0].diverged);
+    assert!(chk.tables[0].diverged[0].contains("does not match"));
+    let findings = d.rretl_fsck().unwrap();
+    assert!(
+        findings.iter().any(|f| f.contains("does not match")),
+        "{findings:?}"
+    );
+    // The other two rows still sync normally.
+    d.query("UPDATE customers SET score = 6 WHERE id = 1", &[]).unwrap();
+    assert_eq!(d.rretl_map_sync("crm").unwrap().a_to_b, 1);
+}
+
+/// The map's target table is DROPPED (an external reset, a migration) and
+/// its state rows outlive it. One missing-table condition cannot mean both
+/// "materialize it" and "the target deleted every row" — the second
+/// reading emptied the master. Refused by name; check and fsck say the
+/// same; re-defining the map re-baselines and re-materializes.
+#[test]
+fn a_dropped_target_is_refused_not_read_as_a_mass_delete() {
+    let (d, _s) = seeded("droptarget");
+    d.rretl_map_sync("crm").unwrap();
+    d.query("DROP TABLE crm_customers", &[]).unwrap();
+
+    let e = d.rretl_map_sync("crm").unwrap_err().to_string();
+    assert!(e.contains("is GONE"), "{e}");
+    assert!(e.contains("would empty"), "{e}");
+    assert_eq!(ints(&d, "SELECT count(*) FROM customers")[0], 3);
+
+    let chk = d.rretl_map_check("crm").unwrap();
+    assert!(!chk.is_clean());
+    assert!(chk.tables[0].conflicts[0].contains("is GONE"));
+    assert!(d.rretl_fsck().unwrap().iter().any(|f| f.contains("is GONE")));
+
+    // The documented recovery: drop (which clears state) and define again.
+    // An IDENTICAL re-define is idempotent by design and keeps state, so it
+    // is NOT the escape — the refusal names the one that is.
+    assert!(d.rretl_map_drop("crm").unwrap());
+    d.rretl_map_define(MAP).unwrap();
+    assert_eq!(d.rretl_map_sync("crm").unwrap().created_b, 3);
+    assert_eq!(ints(&d, "SELECT count(*) FROM customers")[0], 3);
+    assert!(d.rretl_map_check("crm").unwrap().is_clean());
 }
 
 /// Hull 2 closed: redefining a map with a CHANGED spec re-baselines (its
@@ -608,4 +640,74 @@ fn redefining_a_changed_map_re_baselines_its_state() {
     assert!(err.contains("no recorded sync can arbitrate"), "{err}");
     let r = d.rretl_map_check("crm").unwrap();
     assert_eq!(r.tables[0].conflicts.len(), 3, "{:?}", r.tables[0].conflicts);
+}
+
+/// The value saboteur's finding: state keys are (map ‖ tbl ‖ pk_enc), so a
+/// legal long TEXT pk — with the ceiling shrinking as the MAP and TARGET
+/// NAMES grew — overflowed the engine's encoded-key cap mid-sync, wedging
+/// the map behind an unnamed refusal while `map check` claimed a sync
+/// would run through. State now keys on a fixed 32-byte digest of the pk;
+/// the only key limit left is the source table's own.
+#[test]
+fn long_text_keys_and_long_names_sync_and_check_clean() {
+    let (d, _s) = db("longkey");
+    define_pairs(&d);
+    d.query(
+        "CREATE TABLE src_with_a_deliberately_long_name (k TEXT PRIMARY KEY, v ANY)",
+        &[],
+    )
+    .unwrap();
+    let (k1, k2) = ("K".repeat(974), format!("{}Z", "K".repeat(973)));
+    let mut w = d.begin().unwrap();
+    for (k, v) in [(&k1, 7i64), (&k2, 4)] {
+        w.query(
+            "INSERT INTO src_with_a_deliberately_long_name (k, v) VALUES ($1, $2)",
+            &[Value::Text(k.clone()), Value::Int(v)],
+        )
+        .unwrap();
+    }
+    w.commit().unwrap();
+    d.rretl_map_define(
+        r#"
+[map]
+name = "a_map_name_that_is_quite_long_indeed"
+
+[[map.table]]
+source = "src_with_a_deliberately_long_name"
+target = "ext_with_an_equally_long_target_name"
+  [[map.table.column]]
+  source = "v"
+  target = "nv"
+  pair = "neg"
+"#,
+    )
+    .unwrap();
+
+    let name = "a_map_name_that_is_quite_long_indeed";
+    let r = d.rretl_map_sync(name).unwrap();
+    assert_eq!(r.created_b, 2);
+    assert!(d.rretl_map_check(name).unwrap().is_clean());
+
+    // Both directions and a delete, all on the long keys.
+    d.query(
+        "UPDATE src_with_a_deliberately_long_name SET v = 9 WHERE k = $1",
+        &[Value::Text(k1.clone())],
+    )
+    .unwrap();
+    d.query(
+        "UPDATE ext_with_an_equally_long_target_name SET nv = 0 - 5 WHERE k = $1",
+        &[Value::Text(k2.clone())],
+    )
+    .unwrap();
+    let r = d.rretl_map_sync(name).unwrap();
+    assert_eq!((r.a_to_b, r.b_to_a), (1, 1));
+    d.query(
+        "DELETE FROM src_with_a_deliberately_long_name WHERE k = $1",
+        &[Value::Text(k1)],
+    )
+    .unwrap();
+    let r = d.rretl_map_sync(name).unwrap();
+    assert_eq!(r.deleted_b, 1);
+    assert!(d.rretl_map_check(name).unwrap().is_clean());
+    assert!(d.rretl_fsck().unwrap().is_empty());
 }

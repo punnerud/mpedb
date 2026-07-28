@@ -297,10 +297,21 @@ fn a_missing_residual_row_is_a_hard_error() {
     seed(&d, &[-5, 3]);
     let report = d.rretl_apply("mag", "t", "v").unwrap();
 
+    // (the bookkeeping key is an opaque digest of the pk — read one back
+    // rather than reconstructing it, which is the whole point of a digest)
+    let victim = rows(
+        d.query(
+            "SELECT pk_enc FROM rretl_residual WHERE run_id = $1 ORDER BY pk_enc LIMIT 1",
+            &[Value::Int(report.run_id)],
+        )
+        .unwrap(),
+    )
+    .remove(0)
+    .remove(0);
     let mut s = d.begin().unwrap();
     s.query(
         "DELETE FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
-        &[Value::Int(report.run_id), Value::Blob(vec![2, 0, 0, 0, 0, 0, 0, 0, 0])],
+        &[Value::Int(report.run_id), victim],
     )
     .unwrap();
     s.commit().unwrap();
@@ -1242,10 +1253,19 @@ fn fsck_reports_tampering_and_missing_residuals_and_nothing_else() {
     d.rretl_putback(run2.run_id).unwrap();
 
     // Now delete one of run1's residual rows: fsck names the row.
+    let victim = rows(
+        d.query(
+            "SELECT pk_enc FROM rretl_residual WHERE run_id = $1 ORDER BY pk_enc LIMIT 1",
+            &[Value::Int(run1.run_id)],
+        )
+        .unwrap(),
+    )
+    .remove(0)
+    .remove(0);
     let mut s = d.begin().unwrap();
     s.query(
         "DELETE FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
-        &[Value::Int(run1.run_id), Value::Blob(vec![2, 1, 0, 0, 0, 0, 0, 0, 0])],
+        &[Value::Int(run1.run_id), victim],
     )
     .unwrap();
     s.commit().unwrap();
@@ -1519,4 +1539,35 @@ fn an_implicit_rowid_table_applies_and_puts_back() {
     let e = d.rretl_apply("mag", "pair", "v").unwrap_err().to_string();
     assert!(e.contains("2-column primary key"), "{e}");
     let _ = std::fs::remove_file(&path);
+}
+
+/// The value saboteur's finding: a legal ~970-char TEXT pk overflowed the
+/// residual table's composite key (run_id ‖ pk_enc) and wedged apply
+/// behind an unnamed engine refusal. Bookkeeping now keys on a fixed
+/// 32-byte digest of the pk (`pk_ref`), so the source table's own key cap
+/// is the only limit left. Apply, verify-at-rest and revert all walk the
+/// digest-keyed residuals.
+#[test]
+fn long_text_pks_apply_verify_and_revert() {
+    let (d, _p) = db("longkey");
+    define_abs_pair(&d);
+    d.query("CREATE TABLE lk (k TEXT PRIMARY KEY, v ANY)", &[]).unwrap();
+    let (k1, k2) = ("K".repeat(974), format!("{}Z", "K".repeat(973)));
+    let mut w = d.begin().unwrap();
+    for (k, v) in [(&k1, -7i64), (&k2, 4)] {
+        w.query(
+            "INSERT INTO lk (k, v) VALUES ($1, $2)",
+            &[Value::Text(k.clone()), Value::Int(v)],
+        )
+        .unwrap();
+    }
+    w.commit().unwrap();
+
+    let report = d.rretl_apply("mag", "lk", "v").unwrap();
+    assert_eq!(report.rows, 2);
+    assert!(d.rretl_fsck().unwrap().is_empty());
+    d.rretl_revert(report.run_id).unwrap();
+    let got = rows(d.query("SELECT v FROM lk ORDER BY k", &[]).unwrap());
+    assert_eq!(got[0][0], Value::Int(-7));
+    assert_eq!(got[1][0], Value::Int(4));
 }
