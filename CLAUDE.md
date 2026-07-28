@@ -106,11 +106,27 @@ log-based engine), and the hardware published when the hardware is the answer.
   they are not portable between rows. Map records are versioned TOML in
   sys-keyspace `rrmap/<name>`; #94's implicit rowid is a REAL column named
   rowid carrying the pk — detect it via the flag, not via empty pk)
+  + `rretl map run|runner|status` (#53, DESIGN-RRETL §14: the DAEMON form
+  for cron — a SEPARATE verb from `map sync` because it trades atomicity
+  across chunks for progress that survives a kill. Commits as it goes and
+  EVERY commit advances the whole set (a chunk from each table, never
+  table 1 finished before table 2 starts); `rretl_map_cursor` per (map,
+  tbl) is where it resumes, a ROUND is passes 1→2→3 over everything, and
+  rows changed behind the cursor wait for the next round. Bounds:
+  max-secs (between txns), max-rows (clock-free, so tests are exact),
+  runner (policy guard, NOT auth — the fence is the OS), lease (buys
+  wasted work, not correctness). Conflicts are counted and SKIPPED —
+  aborting would let one row block every other forever. Safe here in a
+  way it would not be for `apply`: nothing is destroyed, and each row's
+  push + state row share one txn. classify_p1/classify_p2 in rretl_map.rs
+  are the ONE decision function sync, check and run all use — three
+  copies would drift, which is exactly the bug class the duel found)
   + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
   and `mirror-collide` (SIGKILL fuzz: source writers + a mirror daemon killed at every
   instant → final drain must converge mpedb exactly to the source)
-  + `map-collide` (the stage-4 member: writers churn BOTH sides of a live
-  map while the syncer is SIGKILLed every kill-ms; conflicts are the
+  + `map-collide [--mode sync|run]` (the stage-4 member: writers churn
+  BOTH sides of a live map while the syncer is SIGKILLed every kill-ms —
+  `run` aims it at the daemon's chunk commits; conflicts are the
   syncer's expected diet, anything else fails the run; final drain =
   source-wins resolution → echo 0, map check clean, fsck clean, counts
   1:1). stress/crash take

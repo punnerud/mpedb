@@ -27,7 +27,7 @@ use mpedb_types::{Error, Value};
 
 use crate::args;
 use crate::mirror_collide::{check_bad_exits, kill_loop, reap};
-use crate::util::{open_target, runtime, CliResult, Failure, Rng, Watchdog};
+use crate::util::{open_target, runtime, usage, CliResult, Failure, Rng, Watchdog};
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
@@ -103,6 +103,12 @@ fn setup(dir: &Path, secs: u64, keyspace: u64) -> Result<(String, PathBuf, u128)
         )?;
     }
     db.rretl_map_sync("m")?;
+    // Do the daemon's FIRST run here too: it creates the cursor/run tables,
+    // and that DDL invalidates every other process's prepared plans. Real
+    // deployments take that hit once, at whatever moment the cron line
+    // first fires; the harness takes it before the writers exist so the
+    // fuzz measures the sync path and not one DDL bump.
+    db.rretl_map_run("m", &mpedb::rretl_map_run::RunOptions::default())?;
     Ok((cfg, std::env::current_exe()?, now_ms() + secs as u128 * 1000))
 }
 
@@ -120,12 +126,21 @@ fn legal_v(rng: &mut Rng) -> i64 {
 // ------------------------------------------------------------------- parent
 
 pub fn run_parent(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["dir", "writers", "secs", "kill-ms", "keyspace"], &[])?;
+    let p = args::parse(argv, &["dir", "writers", "secs", "kill-ms", "keyspace", "mode"], &[])?;
     let dir = PathBuf::from(p.require("dir")?);
     let writers = p.u64_or("writers", 2)?.max(1);
     let secs = p.u64_or("secs", 5)?.max(1);
     let kill_ms = p.u64_or("kill-ms", 40)?.max(1);
     let keyspace = p.u64_or("keyspace", 24)?.max(2);
+    // `sync` kills a ONE-TRANSACTION sync; `run` kills the daemon, whose
+    // chunk commits are the newer risk — a kill between two commits must
+    // leave the cursor and the rows it covers agreeing, because they are
+    // written in the same transaction.
+    let daemon = match p.value("mode").unwrap_or("sync") {
+        "sync" => false,
+        "run" => true,
+        other => return usage(format!("--mode must be sync or run, got `{other}`")),
+    };
 
     let (cfg, exe, deadline) = setup(&dir, secs, keyspace)?;
     let _wd = Watchdog::arm(secs + 60, "map-collide");
@@ -153,6 +168,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
             .arg("map-collide-syncer")
             .args(["--config", &cfg])
             .args(["--deadline", &deadline_s])
+            .args(["--daemon", if daemon { "1" } else { "0" }])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -214,9 +230,10 @@ pub fn run_parent(argv: &[String]) -> CliResult {
     }
     check_bad_exits(bad_exits)?;
     println!(
-        "map-collide: writers={writers}x2 secs={secs} syncer-kills={kills} \
+        "map-collide({}): writers={writers}x2 secs={secs} syncer-kills={kills} \
          conflict-fixes={fixes} rows={n_src} check=clean fsck=clean — no row lost, \
-         duplicated or half-synced across kills"
+         duplicated or half-synced across kills",
+        if daemon { "run" } else { "sync" }
     );
     Ok(())
 }
@@ -308,7 +325,13 @@ fn parse_child(argv: &[String]) -> Result<(String, u128, u64, u64), Failure> {
 fn tolerable(e: &Error) -> bool {
     matches!(
         e,
-        Error::Busy | Error::PrimaryKeyViolation { .. } | Error::UniqueViolation { .. }
+        Error::Busy
+            | Error::PrimaryKeyViolation { .. }
+            | Error::UniqueViolation { .. }
+            // Any DDL in the file invalidates prepared plans; re-preparing
+            // is the caller's job, and the writers do it by re-running the
+            // statement next iteration.
+            | Error::PlanInvalidated
     )
 }
 
@@ -316,15 +339,17 @@ fn tolerable(e: &Error) -> bool {
 pub fn run_awriter(argv: &[String]) -> CliResult {
     let (cfg, deadline, keyspace, id) = parse_child(argv)?;
     let db = open_target(&cfg)?;
-    let upd = db.prepare("UPDATE src SET v = $2, q = $3, w = $4 WHERE id = $1")?;
-    let ins = db.prepare("INSERT INTO src (id, v, q, w) VALUES ($1, $2, $3, $4)")?;
-    let del = db.prepare("DELETE FROM src WHERE id = $1")?;
+    let (upd, ins, del) = (
+        "UPDATE src SET v = $2, q = $3, w = $4 WHERE id = $1",
+        "INSERT INTO src (id, v, q, w) VALUES ($1, $2, $3, $4)",
+        "DELETE FROM src WHERE id = $1",
+    );
     let mut rng = Rng::seeded(&[0x00a1_1ce5, id, keyspace]);
     while now_ms() < deadline {
         for _ in 0..8 {
             let key = Value::Int(rng.below(keyspace) as i64);
             let r = if rng.below(6) == 0 {
-                db.execute(&del, std::slice::from_ref(&key)).map(|_| ())
+                db.query(del, std::slice::from_ref(&key)).map(|_| ())
             } else {
                 let params = [
                     key.clone(),
@@ -332,9 +357,9 @@ pub fn run_awriter(argv: &[String]) -> CliResult {
                     Value::Int(1 + rng.below(1_000_000) as i64),
                     Value::Int(rng.below(1_000_000) as i64),
                 ];
-                match db.execute(&upd, &params) {
+                match db.query(upd, &params) {
                     Ok(ExecResult::Affected(n)) if n > 0 => Ok(()),
-                    Ok(_) => db.execute(&ins, &params).map(|_| ()),
+                    Ok(_) => db.query(ins, &params).map(|_| ()),
                     Err(e) => Err(e),
                 }
             };
@@ -357,17 +382,19 @@ pub fn run_awriter(argv: &[String]) -> CliResult {
 pub fn run_bwriter(argv: &[String]) -> CliResult {
     let (cfg, deadline, keyspace, id) = parse_child(argv)?;
     let db = open_target(&cfg)?;
-    let upd = db.prepare("UPDATE ext SET vneg = $2, qabs = $3, wc = $4 WHERE id = $1")?;
-    let del = db.prepare("DELETE FROM ext WHERE id = $1")?;
+    let (upd, del) = (
+        "UPDATE ext SET vneg = $2, qabs = $3, wc = $4 WHERE id = $1",
+        "DELETE FROM ext WHERE id = $1",
+    );
     let mut rng = Rng::seeded(&[0xb0b_cafe, id, keyspace]);
     while now_ms() < deadline {
         for _ in 0..8 {
             let key = Value::Int(rng.below(keyspace) as i64);
             let r = if rng.below(8) == 0 {
-                db.execute(&del, std::slice::from_ref(&key)).map(|_| ())
+                db.query(del, std::slice::from_ref(&key)).map(|_| ())
             } else {
-                db.execute(
-                    &upd,
+                db.query(
+                    upd,
                     &[
                         key,
                         Value::Int(legal_v(&mut rng)),
@@ -393,16 +420,28 @@ pub fn run_bwriter(argv: &[String]) -> CliResult {
 /// storm. Every other error is a bug this harness exists to catch, and
 /// self-exiting with it is what the parent counts as a failure.
 pub fn run_syncer(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["config", "deadline"], &[])?;
+    let p = args::parse(argv, &["config", "deadline", "daemon"], &[])?;
     let cfg = p.require("config")?.to_string();
     let deadline: u128 = p
         .require("deadline")?
         .parse()
         .map_err(|_| Failure::Usage("--deadline must be an integer".into()))?;
+    let daemon = p.value("daemon") == Some("1");
     let db = open_target(&cfg)?;
+    // The daemon swallows conflicts itself (counted, skipped), so only the
+    // one-txn sync needs the CONFLICT arm here.
+    let opts = mpedb::rretl_map_run::RunOptions {
+        max_secs: Some(1),
+        ..Default::default()
+    };
     while now_ms() < deadline {
-        match db.rretl_map_sync("m") {
-            Ok(_) => {}
+        let r = if daemon {
+            db.rretl_map_run("m", &opts).map(|_| ())
+        } else {
+            db.rretl_map_sync("m").map(|_| ())
+        };
+        match r {
+            Ok(()) => {}
             Err(Error::Busy) => {}
             Err(e) if e.to_string().contains("CONFLICT") => {}
             Err(e) => return Err(e.into()),

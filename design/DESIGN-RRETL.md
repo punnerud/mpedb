@@ -1038,3 +1038,77 @@ adopt-on-agree re-arbitrates), then hard-assert `changed_total == 0` on
 one more sync, `map check` clean, `rretl fsck` empty, row counts 1:1.
 Divergence after any number of kills = a row lost, duplicated or
 half-applied, and the run fails with the evidence.
+
+## 14. #53 — the daemon form: `map run`, bounded and resumable **[BUILT 2026-07-29]**
+
+`map sync` is ONE transaction: the set moves together or not at all. That
+is the right contract for "migrate this set now" and the wrong one for a
+cron line — a set larger than one budget can never make progress, and a
+killed run leaves nothing to resume from. `map run` is the other trade,
+and it is a SEPARATE VERB precisely so no existing guarantee changes
+quietly.
+
+**Commits as it goes, and every commit advances the WHOLE set.** One pass
+over the map's tables per transaction — a chunk from each table that
+still has work — rather than finishing table 1 before table 2 starts. So
+an interrupted run leaves the tables at comparable positions, never
+"customers fully mirrored, orders untouched", and a reader between two
+commits sees one step of the whole map rather than one table racing
+ahead. What is given up is atomicity ACROSS chunks; what is bought is
+progress that survives a kill. It is safe for maps in a way it would not
+be for `apply`: nothing is destroyed, both sides exist throughout, and
+each row's push and its state row are written in one transaction, so
+every commit is per-row consistent and the classification is idempotent.
+
+**Where it left off.** `rretl_map_cursor (map, tbl) → phase, k, pk_enc`.
+A ROUND is passes 1→2→3 over the whole set; finishing pass 3 everywhere
+completes the round, clears the cursors and bumps `round` in
+`rretl_map_run`. Rows that change BEHIND the cursor are picked up by the
+next round — "eventually consistent per round", which is the honest
+description of any incremental mirror, stated rather than implied.
+
+**Four bounds, because a cron line needs all four:**
+
+| bound | what it does |
+|---|---|
+| `--max-secs` | wall clock, checked BETWEEN transactions — the overshoot is one chunk |
+| `--max-rows` | rows classified; clock-free, so tests are exact |
+| `--runner` | must match the map's recorded runner (`map runner <name> <id>`) |
+| `--lease-secs` | how long this run's lease holds; default `max_secs + 60` |
+
+**Conflicts are counted and SKIPPED, not fatal.** `map sync` aborts whole
+on the first, because a migration wants all-or-nothing. A daemon that did
+that would let one unresolvable row block every other row's sync forever.
+The report carries the count and the first few verbatim (a cron mail
+should say something useful); `map check` remains the place to see them
+all by name.
+
+**The runner restriction is a policy guard, not a fence.** It stops a
+laptop from picking up the server's cron job by accident. It does not
+stop anything: mpedb has no auth layer, and whatever can write the file
+can claim any runner name. The real boundary is the OS — only the server
+has the file and the crontab entry. Said plainly here for the same reason
+§13.6's trust boundary is.
+
+**The lease buys wasted work, not correctness.** Two runners at once is
+harmless — the work is idempotent, and the second classifies the first's
+pushes as clean — so a stale lease EXPIRES rather than wedging the map.
+
+**One operational note.** The daemon's FIRST run creates its two
+bookkeeping tables, and that DDL invalidates every other process's
+prepared plans (as all DDL does). Deployments take that once; the
+`map-collide` harness does it in setup so the fuzz measures the sync path
+and not one schema bump.
+
+A crontab line, then, is the whole deployment:
+
+```
+* * * * * mpedb rretl map run /etc/app/db.toml crm --max-secs 45 --runner server-1
+```
+
+`map-collide --mode run` is the crash evidence: writers churn both sides
+while the daemon is SIGKILLed every few milliseconds, and the final drain
+must still converge to a clean `map check` and `rretl fsck`. Measured at
+473 kills on Linux, converged clean — the cursor and the rows it covers
+are written in one transaction, so a kill between commits cannot separate
+them.

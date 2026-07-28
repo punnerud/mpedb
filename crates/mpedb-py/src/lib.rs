@@ -1045,6 +1045,84 @@ impl PyDatabase {
         Ok(top.into_any().unbind())
     }
 
+    /// One bounded, resumable pass of the map daemon (#53) — the cron
+    /// form. Commits as it goes, so a run that hits its budget has still
+    /// moved what it moved and the NEXT run resumes from the cursor;
+    /// every commit advances the whole set (a chunk from each table).
+    /// Conflicts are counted and skipped, never fatal. Returns a dict.
+    #[pyo3(signature = (name, max_secs=None, max_rows=None, runner=None, lease_secs=None))]
+    fn rretl_map_run(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        max_secs: Option<u64>,
+        max_rows: Option<u64>,
+        runner: Option<String>,
+        lease_secs: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("rretl_map_run", "Commit or roll back first.")?;
+        let opts = mpedb::rretl_map_run::RunOptions { max_secs, max_rows, runner, lease_secs };
+        let db = &self.db;
+        let r = py.detach(|| db.rretl_map_run(name, &opts)).map_err(map_err)?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("round", r.round)?;
+        d.set_item("rows", r.rows)?;
+        d.set_item("commits", r.commits)?;
+        d.set_item("conflicts", r.conflicts)?;
+        d.set_item("conflict_notes", r.conflict_notes.clone())?;
+        d.set_item(
+            "stopped_by",
+            match r.stopped_by {
+                Some(mpedb::rretl_map_run::RunStop::RoundComplete) => "round_complete",
+                Some(mpedb::rretl_map_run::RunStop::Budget) => "budget",
+                None => "nothing",
+            },
+        )?;
+        d.set_item("round_complete",
+            r.stopped_by == Some(mpedb::rretl_map_run::RunStop::RoundComplete))?;
+        d.set_item("a_to_b", r.moved.a_to_b)?;
+        d.set_item("b_to_a", r.moved.b_to_a)?;
+        d.set_item("created_b", r.moved.created_b)?;
+        d.set_item("created_a", r.moved.created_a)?;
+        d.set_item("deleted_a", r.moved.deleted_a)?;
+        d.set_item("deleted_b", r.moved.deleted_b)?;
+        d.set_item("unchanged", r.moved.unchanged)?;
+        d.set_item("note", r.note())?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// Restrict which runner may `rretl_map_run` this map (empty string
+    /// clears it). A guard against mistakes — a laptop picking up the
+    /// cron job — and NOT an auth boundary: anything that can write the
+    /// file can claim any runner name.
+    fn rretl_map_set_runner(&self, py: Python<'_>, name: &str, runner: &str) -> PyResult<()> {
+        self.refuse_if_txn_open("rretl_map_set_runner", "Commit or roll back first.")?;
+        let db = &self.db;
+        py.detach(|| db.rretl_map_set_runner(name, runner)).map_err(map_err)
+    }
+
+    /// The map's daemon status: runner, round, live lease, and which
+    /// tables are mid-round.
+    fn rretl_map_status(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+        let db = &self.db;
+        let st = py.detach(|| db.rretl_map_status(name)).map_err(map_err)?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("runner", &st.runner)?;
+        d.set_item("round", st.round)?;
+        d.set_item("lease_owner", &st.lease_owner)?;
+        d.set_item("lease_until", st.lease_until)?;
+        d.set_item("note", &st.note)?;
+        let ip = pyo3::types::PyList::empty(py);
+        for (tbl, phase) in &st.in_progress {
+            let e = pyo3::types::PyDict::new(py);
+            e.set_item("table", tbl)?;
+            e.set_item("pass", phase)?;
+            ip.append(e)?;
+        }
+        d.set_item("in_progress", ip)?;
+        Ok(d.into_any().unbind())
+    }
+
     /// Every stored map name.
     fn rretl_maps(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let db = &self.db;

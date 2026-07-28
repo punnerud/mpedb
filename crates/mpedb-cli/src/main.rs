@@ -126,6 +126,19 @@ usage: mpedb <command> [args]
                                            plus the audit the echo guard
                                            cannot do (state says clean but
                                            forward(A) != B); exit 1 on breach
+  rretl map run <target> <name>              the DAEMON form (cron): commits as
+         [--max-secs S] [--max-rows N]       it goes, so a bounded run makes
+         [--runner ID] [--lease-secs S]      real progress and the next one
+                                           RESUMES where it stopped. Every
+                                           commit advances the WHOLE set (a
+                                           chunk from each table), conflicts
+                                           are counted and skipped, and a
+                                           recorded runner may be required
+  rretl map runner <target> <name> <id>      restrict who may `map run` it
+                                           (empty clears) — a guard against
+                                           mistakes, not an auth boundary
+  rretl map status <target> <name>           round, runner, live lease, and
+                                           which tables are mid-round
   rretl map show|list|drop <target> [name]   manage stored maps
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
@@ -172,7 +185,8 @@ usage: mpedb <command> [args]
            definition. Read back: ATTACH '<cold>' AS cold; SELECT ... UNION ALL
            SELECT ... FROM cold.<T>)
           crash --dir <dir> --waves W [--batch N]   (SIGKILL fuzz on the drain)
-  map-collide --dir <dir> [--writers N] [--secs S] [--kill-ms M] [--keyspace K]
+  map-collide --dir <dir> [--mode sync|run] [--writers N] [--secs S]
+              [--kill-ms M] [--keyspace K]
                                            SIGKILL fuzz for `rretl map sync`:
                                            writers churn BOTH sides while the
                                            syncer is killed at every instant;
@@ -778,6 +792,58 @@ fn cmd_rretl(args: &[String]) -> CliResult {
             );
             Ok(())
         }
+        [m, sub, config, name, rest @ ..] if m == "map" && sub == "run" => {
+            let p = crate::args::parse(rest, &["max-secs", "max-rows", "runner", "lease-secs"], &[])?;
+            let opts = mpedb::rretl_map_run::RunOptions {
+                max_secs: p.u64_opt("max-secs")?,
+                max_rows: p.u64_opt("max-rows")?,
+                runner: p.value("runner").map(str::to_string),
+                lease_secs: p.u64_opt("lease-secs")?,
+            };
+            let db = crate::util::open_target(config)?;
+            let r = db.rretl_map_run(name, &opts)?;
+            println!("rretl map `{name}` run: {}", r.note());
+            for c in &r.conflict_notes {
+                println!("blocker: {c}");
+            }
+            if r.conflicts as usize > r.conflict_notes.len() {
+                println!(
+                    "…and {} more conflict(s) — `map check` names them all",
+                    r.conflicts as usize - r.conflict_notes.len()
+                );
+            }
+            Ok(())
+        }
+        [m, sub, config, name, runner] if m == "map" && sub == "runner" => {
+            let db = crate::util::open_target(config)?;
+            db.rretl_map_set_runner(name, runner)?;
+            if runner.is_empty() {
+                println!("rretl map `{name}`: runner restriction cleared — any process may run it");
+            } else {
+                println!("rretl map `{name}`: only runner `{runner}` may run it from now on");
+            }
+            Ok(())
+        }
+        [m, sub, config, name] if m == "map" && sub == "status" => {
+            let db = crate::util::open_target(config)?;
+            let st = db.rretl_map_status(name)?;
+            println!(
+                "round {}  runner {}  {}",
+                st.round,
+                if st.runner.is_empty() { "<any>" } else { &st.runner },
+                if st.note.is_empty() { "-" } else { &st.note }
+            );
+            if !st.lease_owner.is_empty() {
+                println!("lease held by `{}` until {} (micros)", st.lease_owner, st.lease_until);
+            }
+            for (tbl, phase) in &st.in_progress {
+                println!("mid-round: {tbl} in pass {phase}");
+            }
+            if st.in_progress.is_empty() {
+                println!("no round in progress — the next run starts a fresh one");
+            }
+            Ok(())
+        }
         [m, sub, config, name] if m == "map" && sub == "check" => {
             let db = crate::util::open_target(config)?;
             let r = db.rretl_map_check(name)?;
@@ -865,6 +931,8 @@ fn cmd_rretl(args: &[String]) -> CliResult {
              | pack-in <target> <name> <zip-file> \
              | pack-out <target> <archive_id> <out-file> | archives <target> \
              | map define <target> <map.toml> | map sync|check|show|drop <target> <name> \
+             | map run <target> <name> [--max-secs S] [--max-rows N] [--runner ID] \
+             | map runner <target> <name> <id> | map status <target> <name> \
              | map list <target>",
         ),
     }

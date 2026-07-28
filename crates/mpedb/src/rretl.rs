@@ -41,7 +41,7 @@ pub const T_LINEAGE: &str = "rretl_lineage";
 pub const T_RESIDUAL: &str = "rretl_residual";
 
 /// Every table name rRETL owns — refused as a transform or map target.
-pub(crate) fn rretl_bookkeeping_names() -> [&'static str; 6] {
+pub(crate) fn rretl_bookkeeping_names() -> [&'static str; 8] {
     [
         T_LINEAGE,
         T_RESIDUAL,
@@ -49,6 +49,8 @@ pub(crate) fn rretl_bookkeeping_names() -> [&'static str; 6] {
         crate::rretl_store::T_ARCHIVES,
         crate::rretl_store::T_MEMBERS,
         crate::rretl_map::T_MAP_STATE,
+        crate::rretl_map_run::T_MAP_CURSOR,
+        crate::rretl_map_run::T_MAP_RUN,
     ]
 }
 

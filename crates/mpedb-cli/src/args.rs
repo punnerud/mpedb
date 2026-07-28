@@ -108,6 +108,18 @@ impl Parsed {
             .map_err(|_| Failure::Usage(format!("--{name} must be an unsigned integer")))
     }
 
+    /// An OPTIONAL unsigned flag: absent stays absent (an unbounded
+    /// budget), present must parse.
+    pub fn u64_opt(&self, name: &str) -> Result<Option<u64>, Failure> {
+        match self.value(name) {
+            None => Ok(None),
+            Some(v) => v
+                .parse()
+                .map(Some)
+                .map_err(|_| Failure::Usage(format!("--{name} must be an unsigned integer"))),
+        }
+    }
+
     pub fn u64_or(&self, name: &str, default: u64) -> Result<u64, Failure> {
         match self.value(name) {
             None => Ok(default),

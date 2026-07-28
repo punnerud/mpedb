@@ -376,6 +376,37 @@ The rules, each a named refusal when broken:
   every target row holds the old pair's output. This is the standing
   reason to run `rretl_map_check`: `diverged` is what sees it.
 
+**Running it from cron** — `rretl_map_sync` is one transaction (the set
+moves together or not at all), which is right for a migration and wrong
+for a scheduled job on a large set. `rretl_map_run(name, ...)` is the
+daemon form: it commits as it goes, so a bounded run makes real progress
+and the next one RESUMES from where it stopped.
+
+```python
+db.rretl_map_set_runner("crm", "server-1")     # only this runner may run it
+r = db.rretl_map_run("crm", max_secs=45, runner="server-1")
+r["round_complete"]   # False = budget spent; call again to continue
+r["conflicts"]        # counted and skipped, never fatal — see map_check
+```
+
+```
+* * * * * mpedb rretl map run /etc/app/db.toml crm --max-secs 45 --runner server-1
+```
+
+Four things to know:
+
+- **Every commit advances the whole set** — a chunk from EACH table per
+  transaction, so an interrupted run never leaves one table mirrored and
+  another untouched.
+- **A round is a full pass**; rows that change behind the cursor are
+  picked up by the next round. `rretl_map_status(name)` shows the round
+  and which tables are mid-pass.
+- **Conflicts do not stop it.** A daemon that aborted on the first would
+  let one unresolvable row block every other row forever.
+- **The runner restriction is a guard against mistakes, not auth.**
+  Anything that can write the file can claim any runner name; the real
+  fence is that only the server has the file and the crontab line.
+
 **Auditing a map** — `rretl_map_check(name)` is the read-only dry run of a
 sync: what WOULD move in each direction, every conflict named (a sync
 aborts on the first; the check lists them all), and `diverged` — rows the
@@ -489,6 +520,9 @@ scale as its own apply with the full source as the residual).
 | `db.rretl_archives()` | list of dicts | `archive_id, name, members, content_hash` |
 | `db.rretl_map_define(spec)` | `None` | store a table-SET map from a Python dict (or a mapping-TOML string); sources, identities and pairs validated NOW |
 | `db.rretl_map_sync(name)` | dict of counts | both directions, one txn; echo-guarded repeats; conflicts abort whole, named |
+| `db.rretl_map_run(name, max_secs=, max_rows=, runner=, lease_secs=)` | dict | the CRON form: commits as it goes, bounded, resumable; every commit advances the whole set; conflicts counted and skipped |
+| `db.rretl_map_set_runner(name, runner)` | `None` | restrict who may run it ("" clears) — a mistake guard, not auth |
+| `db.rretl_map_status(name)` | dict | runner, round, live lease, tables mid-round |
 | `db.rretl_map_check(name)` | dict (`clean`, `pending_total`, `tables`) | READ-ONLY dry run: would-move counts, EVERY conflict named, `diverged` = state-clean rows where forward(source) != target — the audit the echo guard cannot do |
 | `db.rretl_maps()` / `rretl_map_show(name)` / `rretl_map_drop(name)` | names / TOML / bool | manage stored maps; drop keeps state, a CHANGED redefine clears it (re-baseline) |
 

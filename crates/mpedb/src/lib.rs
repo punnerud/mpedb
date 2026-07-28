@@ -69,6 +69,7 @@ pub mod rretl;
 pub mod rretl_codec;
 pub mod rretl_store;
 pub mod rretl_map;
+pub mod rretl_map_run;
 pub mod model;
 pub mod stats;
 mod stream;

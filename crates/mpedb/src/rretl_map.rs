@@ -292,15 +292,15 @@ impl MapSpec {
 
 // --------------------------------------------------------------- resolved
 
-struct ResolvedCol {
-    src: String,
-    dst: String,
+pub(crate) struct ResolvedCol {
+    pub(crate) src: String,
+    pub(crate) dst: String,
     lens: Option<crate::lens::RretlLens>,
 }
 
-struct ResolvedTable {
-    src: String,
-    dst: String,
+pub(crate) struct ResolvedTable {
+    pub(crate) src: String,
+    pub(crate) dst: String,
     /// Source row identity: a declared single-column PK, or `rowid`.
     src_key: String,
     src_key_ty: ColumnType,
@@ -603,7 +603,7 @@ impl crate::Database {
         Ok(existed)
     }
 
-    fn load_map(&self, name: &str) -> Result<MapSpec> {
+    pub(crate) fn load_map(&self, name: &str) -> Result<MapSpec> {
         let text = self.rretl_map_show(name)?;
         let spec = MapSpec::from_toml_str(&text)?;
         if spec.name != name {
@@ -615,7 +615,7 @@ impl crate::Database {
         Ok(spec)
     }
 
-    fn resolve_map(&self, spec: &MapSpec) -> Result<Vec<ResolvedTable>> {
+    pub(crate) fn resolve_map(&self, spec: &MapSpec) -> Result<Vec<ResolvedTable>> {
         self.engine.refresh_schema_if_stale()?;
         let bundle = self.engine.schema();
         // SQL identifiers are case-INSENSITIVE, so a spec must resolve the
@@ -881,6 +881,23 @@ fn map_sync_in(
     tables: &[ResolvedTable],
     have: &[(String, Vec<String>)],
 ) -> Result<MapSyncReport> {
+    prepare_map_tables(s, name, tables, have)?;
+    let mut report = MapSyncReport::default();
+    for rt in tables {
+        sync_table(s, name, rt, &mut report)?;
+    }
+    Ok(report)
+}
+
+/// What both `map sync` and the daemon must do before touching a row:
+/// the bookkeeping exists, and a target that is legitimately missing is
+/// materialized — while one that VANISHED under standing state is refused.
+pub(crate) fn prepare_map_tables(
+    s: &mut WriteSession<'_>,
+    name: &str,
+    tables: &[ResolvedTable],
+    have: &[(String, Vec<String>)],
+) -> Result<()> {
     ensure_state_table(s, have)?;
     crate::rretl::ensure_lineage_tables(s, have)?;
     for rt in tables {
@@ -908,17 +925,13 @@ fn map_sync_in(
             crate::rretl::create_bookkeeping(s, &rt.dst, cols, &[&rt.dst_key])?;
         }
     }
-    let mut report = MapSyncReport::default();
-    for rt in tables {
-        sync_table(s, name, rt, &mut report)?;
-    }
-    Ok(report)
+    Ok(())
 }
 
 /// Does this state row's `k` (the key VALUE) still hash to its `pk_enc`
 /// (the key's bookkeeping reference)? Nothing but tampering or corruption
 /// can break it — the sync writes both from one value.
-fn state_row_is_consistent(pk_enc: &Value, k: &Value) -> bool {
+pub(crate) fn state_row_is_consistent(pk_enc: &Value, k: &Value) -> bool {
     matches!(pk_enc, Value::Blob(b) if *b == crate::rretl::pk_ref(k))
 }
 
@@ -1065,6 +1078,300 @@ fn conflict(name_ctx: &str, dst: &str, key: &Value, why: &str) -> Error {
     ))
 }
 
+// ------------------------------------------------------- classification
+//
+// ONE decision function, three consumers: `sync_table` (writes, one txn),
+// `check_table` (writes nothing, counts and audits) and the daemon's
+// `run_table` (writes, commits per chunk). It performs no I/O — the caller
+// hands it what it read and carries out what comes back — so the three can
+// never drift apart on what a row MEANS. They differ only in what they do
+// about it.
+
+/// What a source-side row (pass 1) means, given its state row and the
+/// target row that shares its key.
+pub(crate) enum P1 {
+    /// New in A: materialize on B.
+    CreateB { ys: Vec<Value>, a_hash: String },
+    /// Both sides hold it with no recorded sync, and they AGREE: adopt.
+    AdoptB { a_hash: String, b_hash: String },
+    /// Gone from B while A stood still: delete A.
+    DeleteA,
+    /// Both sides clean. `diverged` is set only when the caller asked for
+    /// the audit (`verify_clean`) and `forward(A) != B` — the breach the
+    /// echo guard structurally cannot see.
+    Clean { diverged: Option<String> },
+    AToB { ys: Vec<Value>, a_hash: String },
+    BToA { xs2: Vec<Value>, b_hash: String },
+    /// Named, and never acted on. `map sync` aborts the whole run on it;
+    /// the daemon counts it, skips the row and keeps going.
+    Conflict(String),
+}
+
+/// Classify one source row. `st` is its state row (a_hash, b_hash) and `b`
+/// its target row's mapped values, both as READ by the caller.
+pub(crate) fn classify_p1(
+    rt: &ResolvedTable,
+    name: &str,
+    key: &Value,
+    xs: &[Value],
+    st: Option<(String, String)>,
+    b: Option<Vec<Value>>,
+    verify_clean: bool,
+) -> Result<P1> {
+    let a_now = chain(name, &rt.dst, key, xs);
+    let agree = |ys: &[Value], ybs: &[Value]| {
+        ys.iter().zip(ybs).all(|(a, b)| crate::lens::same_value(a, b))
+    };
+    Ok(match (st, b) {
+        (None, None) => match forward_all(rt, key, xs) {
+            Ok(ys) => P1::CreateB { ys, a_hash: a_now },
+            Err(e) => P1::Conflict(e.to_string()),
+        },
+        (None, Some(ybs)) => match forward_all(rt, key, xs) {
+            Ok(ys) if agree(&ys, &ybs) => P1::AdoptB {
+                a_hash: a_now,
+                b_hash: chain(name, &rt.dst, key, &ybs),
+            },
+            Ok(_) => P1::Conflict(
+                conflict(
+                    name,
+                    &rt.dst,
+                    key,
+                    "both sides hold the row and disagree, and no recorded sync can arbitrate",
+                )
+                .to_string(),
+            ),
+            Err(e) => P1::Conflict(e.to_string()),
+        },
+        (Some((st_a, _)), None) => {
+            if a_now == st_a {
+                P1::DeleteA
+            } else {
+                P1::Conflict(
+                    conflict(
+                        name,
+                        &rt.dst,
+                        key,
+                        "deleted on the target side while the source row changed",
+                    )
+                    .to_string(),
+                )
+            }
+        }
+        (Some((st_a, st_b)), Some(ybs)) => {
+            let b_now = chain(name, &rt.dst, key, &ybs);
+            match (a_now != st_a, b_now != st_b) {
+                (false, false) => {
+                    let diverged = if !verify_clean {
+                        None
+                    } else {
+                        match forward_all(rt, key, xs) {
+                            Ok(ys) if agree(&ys, &ybs) => None,
+                            Ok(_) => Some(format!(
+                                "`{}` row {key:?}: state records both sides clean, but \
+                                 forward(source) != target — a standing divergence the \
+                                 echo guard cannot see",
+                                rt.dst
+                            )),
+                            Err(e) => Some(format!(
+                                "`{}` row {key:?}: state records both sides clean, but the \
+                                 pair's forward refuses the source value ({e})",
+                                rt.dst
+                            )),
+                        }
+                    };
+                    P1::Clean { diverged }
+                }
+                (true, false) => match forward_all(rt, key, xs) {
+                    Ok(ys) => P1::AToB { ys, a_hash: a_now },
+                    Err(e) => P1::Conflict(e.to_string()),
+                },
+                (false, true) => match inverse_all(rt, key, xs, &ybs) {
+                    Ok(xs2) => P1::BToA { xs2, b_hash: b_now },
+                    Err(e) => P1::Conflict(e.to_string()),
+                },
+                (true, true) => P1::Conflict(
+                    conflict(name, &rt.dst, key, "both sides changed since the last sync")
+                        .to_string(),
+                ),
+            }
+        }
+    })
+}
+
+/// What a target-side row with NO source row (pass 2) means.
+pub(crate) enum P2 {
+    /// Gone from A while B stood still: delete B.
+    DeleteB,
+    /// New in B: the creation path, already checked against §4's rules.
+    CreateA { xs2: Vec<Value>, b_hash: String },
+    Conflict(String),
+}
+
+pub(crate) fn classify_p2(
+    rt: &ResolvedTable,
+    name: &str,
+    key: &Value,
+    ybs: &[Value],
+    st: Option<(String, String)>,
+) -> Result<P2> {
+    let b_now = chain(name, &rt.dst, key, ybs);
+    if let Some((_, st_b)) = st {
+        return Ok(if b_now == st_b {
+            P2::DeleteB
+        } else {
+            P2::Conflict(
+                conflict(
+                    name,
+                    &rt.dst,
+                    key,
+                    "deleted on the source side while the target row changed",
+                )
+                .to_string(),
+            )
+        });
+    }
+    // The creation path: only when the identity is real (not a
+    // source-assigned rowid) and every column inverts without a residual.
+    if rt.rowid_identity {
+        return Ok(P2::Conflict(format!(
+            "map sync `{name}`: row {key:?} was created on `{}` but the source identity is \
+             `{}`'s hidden rowid, which only the source can assign — create the row on the \
+             source side",
+            rt.dst, rt.src
+        )));
+    }
+    if let Some(c) = rt
+        .cols
+        .iter()
+        .find(|c| c.lens.as_ref().is_some_and(|l| l.class != LensClass::Bijective))
+    {
+        return Ok(P2::Conflict(format!(
+            "map sync `{name}`: row {key:?} was created on `{}`, but column `{}` maps through \
+             a non-bijective pair — there is no residual to attach (§4's creation path); \
+             create the row on `{}` instead",
+            rt.dst, c.dst, rt.src
+        )));
+    }
+    let xs2 = rt
+        .cols
+        .iter()
+        .zip(ybs)
+        .map(|(c, y)| match &c.lens {
+            None => Ok(y.clone()),
+            Some(l) => {
+                let x = call1(&l.inverse, y)?;
+                let fwd = call1(&l.forward, &x)?;
+                if !crate::lens::same_value(&fwd, y) {
+                    return Err(Error::Unsupported(format!(
+                        "map sync `{name}`: created row {key:?} on `{}` has `{}` = {y:?}, \
+                         outside its pair's image",
+                        rt.dst, c.dst
+                    )));
+                }
+                Ok(x)
+            }
+        })
+        .collect::<Result<Vec<_>>>();
+    Ok(match xs2 {
+        Ok(xs2) => P2::CreateA { xs2, b_hash: b_now },
+        Err(e) => P2::Conflict(e.to_string()),
+    })
+}
+
+/// The per-table SQL a map's passes need, built once.
+pub(crate) struct MapSql {
+    pub(crate) src_exists: String,
+    pub(crate) dst_exists: String,
+    pub(crate) src_get: String,
+    pub(crate) dst_get: String,
+    pub(crate) src_ins: String,
+    pub(crate) dst_ins: String,
+    pub(crate) src_upd: String,
+    pub(crate) dst_upd: String,
+    pub(crate) src_del: String,
+    pub(crate) dst_del: String,
+    pub(crate) p1_first: String,
+    pub(crate) p1_next: String,
+    pub(crate) p2_first: String,
+    pub(crate) p2_next: String,
+    pub(crate) p3_first: String,
+    pub(crate) p3_next: String,
+}
+
+pub(crate) const STATE_GET: &str = "SELECT a_hash, b_hash FROM rretl_map_state \
+                                    WHERE map = $1 AND tbl = $2 AND pk_enc = $3";
+pub(crate) const STATE_PUT: &str =
+    "INSERT INTO rretl_map_state (map, tbl, pk_enc, k, a_hash, b_hash, ts_micros) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7)";
+pub(crate) const STATE_SET: &str =
+    "UPDATE rretl_map_state SET a_hash = $4, b_hash = $5, ts_micros = $6 \
+     WHERE map = $1 AND tbl = $2 AND pk_enc = $3";
+pub(crate) const STATE_DEL: &str =
+    "DELETE FROM rretl_map_state WHERE map = $1 AND tbl = $2 AND pk_enc = $3";
+
+impl MapSql {
+    pub(crate) fn new(rt: &ResolvedTable, chunk: usize) -> MapSql {
+        let src_cols = quoted(&rt.cols.iter().map(|c| c.src.clone()).collect::<Vec<_>>());
+        let dst_cols = quoted(&rt.cols.iter().map(|c| c.dst.clone()).collect::<Vec<_>>());
+        let (sk, dk, src, dst) = (&rt.src_key, &rt.dst_key, &rt.src, &rt.dst);
+        let sets = |cols: &[ResolvedCol], pick: fn(&ResolvedCol) -> &String| {
+            cols.iter()
+                .enumerate()
+                .map(|(i, c)| format!("\"{}\" = ${}", pick(c), i + 2))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let holes = |n: usize| (0..n).map(|i| format!(", ${}", i + 2)).collect::<String>();
+        MapSql {
+            src_exists: format!("SELECT \"{sk}\" FROM \"{src}\" WHERE \"{sk}\" = $1"),
+            dst_exists: format!("SELECT \"{dk}\" FROM \"{dst}\" WHERE \"{dk}\" = $1"),
+            src_get: format!("SELECT {src_cols} FROM \"{src}\" WHERE \"{sk}\" = $1"),
+            dst_get: format!("SELECT {dst_cols} FROM \"{dst}\" WHERE \"{dk}\" = $1"),
+            src_ins: format!(
+                "INSERT INTO \"{src}\" (\"{sk}\", {src_cols}) VALUES ($1{})",
+                holes(rt.cols.len())
+            ),
+            dst_ins: format!(
+                "INSERT INTO \"{dst}\" (\"{dk}\", {dst_cols}) VALUES ($1{})",
+                holes(rt.cols.len())
+            ),
+            src_upd: format!(
+                "UPDATE \"{src}\" SET {} WHERE \"{sk}\" = $1",
+                sets(&rt.cols, |c| &c.src)
+            ),
+            dst_upd: format!(
+                "UPDATE \"{dst}\" SET {} WHERE \"{dk}\" = $1",
+                sets(&rt.cols, |c| &c.dst)
+            ),
+            src_del: format!("DELETE FROM \"{src}\" WHERE \"{sk}\" = $1"),
+            dst_del: format!("DELETE FROM \"{dst}\" WHERE \"{dk}\" = $1"),
+            p1_first: format!(
+                "SELECT \"{sk}\", {src_cols} FROM \"{src}\" ORDER BY \"{sk}\" LIMIT {chunk}"
+            ),
+            p1_next: format!(
+                "SELECT \"{sk}\", {src_cols} FROM \"{src}\" WHERE \"{sk}\" > $1 \
+                 ORDER BY \"{sk}\" LIMIT {chunk}"
+            ),
+            p2_first: format!(
+                "SELECT \"{dk}\", {dst_cols} FROM \"{dst}\" ORDER BY \"{dk}\" LIMIT {chunk}"
+            ),
+            p2_next: format!(
+                "SELECT \"{dk}\", {dst_cols} FROM \"{dst}\" WHERE \"{dk}\" > $1 \
+                 ORDER BY \"{dk}\" LIMIT {chunk}"
+            ),
+            p3_first: format!(
+                "SELECT pk_enc, k FROM rretl_map_state WHERE map = $1 AND tbl = $2 \
+                 ORDER BY pk_enc LIMIT {chunk}"
+            ),
+            p3_next: format!(
+                "SELECT pk_enc, k FROM rretl_map_state WHERE map = $1 AND tbl = $2 \
+                 AND pk_enc > $3 ORDER BY pk_enc LIMIT {chunk}"
+            ),
+        }
+    }
+}
+
 fn sync_table(
     s: &mut WriteSession<'_>,
     name: &str,
@@ -1072,234 +1379,27 @@ fn sync_table(
     report: &mut MapSyncReport,
 ) -> Result<()> {
     let chunk = chunk_rows();
-    let src_cols: Vec<String> = rt.cols.iter().map(|c| c.src.clone()).collect();
-    let dst_cols: Vec<String> = rt.cols.iter().map(|c| c.dst.clone()).collect();
-    let (sk, dk) = (&rt.src_key, &rt.dst_key);
-
-    let state_get = "SELECT a_hash, b_hash FROM rretl_map_state \
-                     WHERE map = $1 AND tbl = $2 AND pk_enc = $3";
-    let state_put = "INSERT INTO rretl_map_state (map, tbl, pk_enc, k, a_hash, b_hash, \
-                     ts_micros) VALUES ($1, $2, $3, $4, $5, $6, $7)";
-    let state_set = "UPDATE rretl_map_state SET a_hash = $4, b_hash = $5, ts_micros = $6 \
-                     WHERE map = $1 AND tbl = $2 AND pk_enc = $3";
-    let state_del = "DELETE FROM rretl_map_state WHERE map = $1 AND tbl = $2 AND pk_enc = $3";
-    let src_exists = format!("SELECT \"{sk}\" FROM \"{}\" WHERE \"{sk}\" = $1", rt.src);
-    let dst_get = format!(
-        "SELECT {} FROM \"{}\" WHERE \"{dk}\" = $1",
-        quoted(&dst_cols),
-        rt.dst
-    );
-    let src_get = format!(
-        "SELECT {} FROM \"{}\" WHERE \"{sk}\" = $1",
-        quoted(&src_cols),
-        rt.src
-    );
-    let dst_ins = format!(
-        "INSERT INTO \"{}\" (\"{dk}\", {}) VALUES ($1{})",
-        rt.dst,
-        quoted(&dst_cols),
-        (0..dst_cols.len()).map(|i| format!(", ${}", i + 2)).collect::<String>()
-    );
-    let src_ins = format!(
-        "INSERT INTO \"{}\" (\"{sk}\", {}) VALUES ($1{})",
-        rt.src,
-        quoted(&src_cols),
-        (0..src_cols.len()).map(|i| format!(", ${}", i + 2)).collect::<String>()
-    );
-    let dst_upd = format!(
-        "UPDATE \"{}\" SET {} WHERE \"{dk}\" = $1",
-        rt.dst,
-        dst_cols
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("\"{c}\" = ${}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let src_upd = format!(
-        "UPDATE \"{}\" SET {} WHERE \"{sk}\" = $1",
-        rt.src,
-        src_cols
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("\"{c}\" = ${}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    let state_key = |pk_enc: Vec<u8>| {
-        vec![
-            Value::Text(name.into()),
-            Value::Text(rt.dst.clone()),
-            Value::Blob(pk_enc),
-        ]
-    };
-    let with =
-        |mut base: Vec<Value>, rest: &[Value]| {
-            base.extend(rest.iter().cloned());
-            base
-        };
-
-    // Re-read a just-written row and verify its chain: the state hash is the
-    // FUTURE oracle for this row, so it records what is persisted, never
-    // what was intended (the stage-3 finding-14 discipline).
-    let dst = &rt.dst;
-    let verify_persisted = |s: &mut WriteSession<'_>,
-                            get: &str,
-                            key: &Value,
-                            want: &str,
-                            side: &str|
-     -> Result<()> {
-        let rows = rows_of(s.query(get, std::slice::from_ref(key))?)?;
-        let got = rows
-            .first()
-            .map(|r| chain(name, dst, key, r))
-            .ok_or_else(|| Error::Corrupt(format!("map sync: {side} row {key:?} vanished")))?;
-        if got != want {
-            return Err(Error::Corrupt(format!(
-                "map sync: persisted {side} row {key:?} does not hash to what was written"
-            )));
-        }
-        Ok(())
-    };
+    let sql = MapSql::new(rt, chunk);
+    let mut w = MapWriter::new(name, rt, &sql);
+    let mut last: Option<Value> = None;
 
     // ---- pass 1: every source row -----------------------------------------
-    let first = format!(
-        "SELECT \"{sk}\", {} FROM \"{}\" ORDER BY \"{sk}\" LIMIT {chunk}",
-        quoted(&src_cols),
-        rt.src
-    );
-    let next = format!(
-        "SELECT \"{sk}\", {} FROM \"{}\" WHERE \"{sk}\" > $1 ORDER BY \"{sk}\" LIMIT {chunk}",
-        quoted(&src_cols),
-        rt.src
-    );
-    let mut last: Option<Value> = None;
     loop {
         let rows = match &last {
-            None => rows_of(s.query(&first, &[])?)?,
-            Some(k) => rows_of(s.query(&next, std::slice::from_ref(k))?)?,
+            None => rows_of(s.query(&sql.p1_first, &[])?)?,
+            Some(k) => rows_of(s.query(&sql.p1_next, std::slice::from_ref(k))?)?,
         };
         let got = rows.len();
         if got == 0 {
             break;
         }
         for row in &rows {
-            let key = &row[0];
-            let xs = &row[1..];
-            let pk_enc = crate::rretl::pk_ref(key);
-            let a_now = chain(name, &rt.dst, key, xs);
-            let st = rows_of(s.query(state_get, &state_key(pk_enc.clone()))?)?;
-            let st = st.first().map(|r| {
-                (
-                    crate::rretl::as_text(&r[0]),
-                    crate::rretl::as_text(&r[1]),
-                )
-            });
-            let b = rows_of(s.query(&dst_get, std::slice::from_ref(key))?)?;
-            let b = b.into_iter().next();
-            let ts = Value::Int(now_micros());
-            match (st, b) {
-                (None, None) => {
-                    // New in A: forward-materialize.
-                    let ys = forward_all(rt, key, xs)?;
-                    s.query(&dst_ins, &with(vec![key.clone()], &ys))?;
-                    let b_now = chain(name, &rt.dst, key, &ys);
-                    verify_persisted(s, &dst_get, key, &b_now, "target")?;
-                    s.query(
-                        state_put,
-                        &with(
-                            state_key(pk_enc),
-                            &[key.clone(), Value::Text(a_now), Value::Text(b_now), ts],
-                        ),
-                    )?;
-                    report.created_b += 1;
-                }
-                (None, Some(ybs)) => {
-                    // Both exist with no recorded sync: adopt only agreement.
-                    let ys = forward_all(rt, key, xs)?;
-                    let agree = ys
-                        .iter()
-                        .zip(&ybs)
-                        .all(|(a, b)| crate::lens::same_value(a, b));
-                    if !agree {
-                        return Err(conflict(
-                            name,
-                            &rt.dst,
-                            key,
-                            "both sides hold the row and disagree, and no recorded sync \
-                             can arbitrate",
-                        ));
-                    }
-                    let b_now = chain(name, &rt.dst, key, &ybs);
-                    s.query(
-                        state_put,
-                        &with(
-                            state_key(pk_enc),
-                            &[key.clone(), Value::Text(a_now), Value::Text(b_now), ts],
-                        ),
-                    )?;
-                    report.unchanged += 1;
-                }
-                (Some((st_a, _)), None) => {
-                    // Deleted on B.
-                    if a_now != st_a {
-                        return Err(conflict(
-                            name,
-                            &rt.dst,
-                            key,
-                            "deleted on the target side while the source row changed",
-                        ));
-                    }
-                    s.query(
-                        &format!("DELETE FROM \"{}\" WHERE \"{sk}\" = $1", rt.src),
-                        std::slice::from_ref(key),
-                    )?;
-                    s.query(state_del, &state_key(pk_enc))?;
-                    report.deleted_a += 1;
-                }
-                (Some((st_a, st_b)), Some(ybs)) => {
-                    let b_now = chain(name, &rt.dst, key, &ybs);
-                    match (a_now != st_a, b_now != st_b) {
-                        (false, false) => report.unchanged += 1,
-                        (true, false) => {
-                            let ys = forward_all(rt, key, xs)?;
-                            s.query(&dst_upd, &with(vec![key.clone()], &ys))?;
-                            let b_new = chain(name, &rt.dst, key, &ys);
-                            verify_persisted(s, &dst_get, key, &b_new, "target")?;
-                            s.query(
-                                state_set,
-                                &with(
-                                    state_key(pk_enc),
-                                    &[Value::Text(a_now), Value::Text(b_new), ts],
-                                ),
-                            )?;
-                            report.a_to_b += 1;
-                        }
-                        (false, true) => {
-                            let xs2 = inverse_all(rt, key, xs, &ybs)?;
-                            s.query(&src_upd, &with(vec![key.clone()], &xs2))?;
-                            let a_new = chain(name, &rt.dst, key, &xs2);
-                            verify_persisted(s, &src_get, key, &a_new, "source")?;
-                            s.query(
-                                state_set,
-                                &with(
-                                    state_key(pk_enc),
-                                    &[Value::Text(a_new), Value::Text(b_now), ts],
-                                ),
-                            )?;
-                            report.b_to_a += 1;
-                        }
-                        (true, true) => {
-                            return Err(conflict(
-                                name,
-                                &rt.dst,
-                                key,
-                                "both sides changed since the last sync",
-                            ));
-                        }
-                    }
-                }
+            let (key, xs) = (&row[0], &row[1..]);
+            let st = w.state_of(s, key)?;
+            let b = w.target_row(s, key)?;
+            match classify_p1(rt, name, key, xs, st, b, false)? {
+                P1::Conflict(msg) => return Err(Error::Unsupported(msg)),
+                action => w.apply_p1(s, key, action, report)?,
             }
         }
         last = Some(rows[got - 1][0].clone());
@@ -1309,111 +1409,25 @@ fn sync_table(
     }
 
     // ---- pass 2: target rows with no source row ---------------------------
-    let first = format!(
-        "SELECT \"{dk}\", {} FROM \"{}\" ORDER BY \"{dk}\" LIMIT {chunk}",
-        quoted(&dst_cols),
-        rt.dst
-    );
-    let next = format!(
-        "SELECT \"{dk}\", {} FROM \"{}\" WHERE \"{dk}\" > $1 ORDER BY \"{dk}\" LIMIT {chunk}",
-        quoted(&dst_cols),
-        rt.dst
-    );
     let mut last: Option<Value> = None;
     loop {
         let rows = match &last {
-            None => rows_of(s.query(&first, &[])?)?,
-            Some(k) => rows_of(s.query(&next, std::slice::from_ref(k))?)?,
+            None => rows_of(s.query(&sql.p2_first, &[])?)?,
+            Some(k) => rows_of(s.query(&sql.p2_next, std::slice::from_ref(k))?)?,
         };
         let got = rows.len();
         if got == 0 {
             break;
         }
         for row in &rows {
-            let key = &row[0];
-            let ybs = &row[1..];
-            if !rows_of(s.query(&src_exists, std::slice::from_ref(key))?)?.is_empty() {
+            let (key, ybs) = (&row[0], &row[1..]);
+            if !rows_of(s.query(&sql.src_exists, std::slice::from_ref(key))?)?.is_empty() {
                 continue; // handled in pass 1
             }
-            let pk_enc = crate::rretl::pk_ref(key);
-            let st = rows_of(s.query(state_get, &state_key(pk_enc.clone()))?)?;
-            let ts = Value::Int(now_micros());
-            match st.first() {
-                Some(r) => {
-                    // Deleted on A.
-                    let st_b = crate::rretl::as_text(&r[1]);
-                    if chain(name, &rt.dst, key, ybs) != st_b {
-                        return Err(conflict(
-                            name,
-                            &rt.dst,
-                            key,
-                            "deleted on the source side while the target row changed",
-                        ));
-                    }
-                    s.query(
-                        &format!("DELETE FROM \"{}\" WHERE \"{dk}\" = $1", rt.dst),
-                        std::slice::from_ref(key),
-                    )?;
-                    s.query(state_del, &state_key(pk_enc))?;
-                    report.deleted_b += 1;
-                }
-                None => {
-                    // New in B: the creation path. Only when the identity is
-                    // real (not a source-assigned rowid) and every column
-                    // inverts without a residual.
-                    if rt.rowid_identity {
-                        return Err(Error::Unsupported(format!(
-                            "map sync `{name}`: row {key:?} was created on `{}` but the \
-                             source identity is `{}`'s hidden rowid, which only the \
-                             source can assign — create the row on the source side",
-                            rt.dst, rt.src
-                        )));
-                    }
-                    if let Some(c) = rt.cols.iter().find(|c| {
-                        c.lens
-                            .as_ref()
-                            .is_some_and(|l| l.class != LensClass::Bijective)
-                    }) {
-                        return Err(Error::Unsupported(format!(
-                            "map sync `{name}`: row {key:?} was created on `{}`, but \
-                             column `{}` maps through a non-bijective pair — there is no \
-                             residual to attach (§4's creation path); create the row on \
-                             `{}` instead",
-                            rt.dst, c.dst, rt.src
-                        )));
-                    }
-                    let xs2: Vec<Value> = rt
-                        .cols
-                        .iter()
-                        .zip(ybs)
-                        .map(|(c, y)| match &c.lens {
-                            None => Ok(y.clone()),
-                            Some(l) => {
-                                let x = call1(&l.inverse, y)?;
-                                let fwd = call1(&l.forward, &x)?;
-                                if !crate::lens::same_value(&fwd, y) {
-                                    return Err(Error::Unsupported(format!(
-                                        "map sync `{name}`: created row {key:?} on `{}` has \
-                                         `{}` = {y:?}, outside its pair's image",
-                                        rt.dst, c.dst
-                                    )));
-                                }
-                                Ok(x)
-                            }
-                        })
-                        .collect::<Result<_>>()?;
-                    s.query(&src_ins, &with(vec![key.clone()], &xs2))?;
-                    let a_now = chain(name, &rt.dst, key, &xs2);
-                    verify_persisted(s, &src_get, key, &a_now, "source")?;
-                    s.query(
-                        state_put,
-                        &with(
-                            state_key(pk_enc),
-                            &[key.clone(), Value::Text(a_now), Value::Text(chain(name, &rt.dst, key, ybs)), ts],
-                        ),
-                    )?;
-                    report.created_a += 1;
-                }
+            let st = w.state_of(s, key)?;
+            match classify_p2(rt, name, key, ybs, st)? {
+                P2::Conflict(msg) => return Err(Error::Unsupported(msg)),
+                action => w.apply_p2(s, key, action, report)?,
             }
         }
         last = Some(rows[got - 1][0].clone());
@@ -1428,53 +1442,22 @@ fn sync_table(
     // read as "deleted on the other side while this side changed" — a false
     // conflict. The stored key VALUE makes the check exact: a state row
     // whose key misses BOTH point lookups is cleared.
-    let first = format!(
-        "SELECT pk_enc, k FROM rretl_map_state WHERE map = $1 AND tbl = $2 \
-         ORDER BY pk_enc LIMIT {chunk}"
-    );
-    let next = format!(
-        "SELECT pk_enc, k FROM rretl_map_state WHERE map = $1 AND tbl = $2 AND pk_enc > $3 \
-         ORDER BY pk_enc LIMIT {chunk}"
-    );
-    let dst_exists = format!("SELECT \"{dk}\" FROM \"{}\" WHERE \"{dk}\" = $1", rt.dst);
-    let base = vec![Value::Text(name.into()), Value::Text(rt.dst.clone())];
     let mut last: Option<Value> = None;
     loop {
         let rows = match &last {
-            None => rows_of(s.query(&first, &base)?)?,
-            Some(k) => rows_of(s.query(&next, &with(base.clone(), std::slice::from_ref(k)))?)?,
+            None => rows_of(s.query(&sql.p3_first, &w.map_tbl())?)?,
+            Some(k) => {
+                let mut p = w.map_tbl();
+                p.push(k.clone());
+                rows_of(s.query(&sql.p3_next, &p)?)?
+            }
         };
         let got = rows.len();
         if got == 0 {
             break;
         }
         for row in &rows {
-            let key = &row[1];
-            // `k` and `pk_enc` are two copies of one identity, and pass 3 is
-            // the only place that trusts `k`. An unverified `k` is either a
-            // tampered pointer at a LIVE key (which would delete a row that
-            // is not this state row's) or a wrongly-typed value that the
-            // rigid point lookup below refuses — bricking sync, check and
-            // fsck alike (the bookkeeping saboteur's minimal blind tamper
-            // and its oracle DoS). Verify, then use; a row that fails is
-            // left alone for fsck/check to name — it can identify nothing,
-            // so it can neither be acted on nor safely cleaned.
-            if !state_row_is_consistent(&row[0], key) {
-                continue;
-            }
-            let in_src = !rows_of(s.query(&src_exists, std::slice::from_ref(key))?)?.is_empty();
-            let in_dst = !rows_of(s.query(&dst_exists, std::slice::from_ref(key))?)?.is_empty();
-            if !in_src && !in_dst {
-                let pk_enc = match &row[0] {
-                    Value::Blob(b) => b.clone(),
-                    other => {
-                        return Err(Error::Corrupt(format!(
-                            "map state pk_enc is not a blob: {other:?}"
-                        )))
-                    }
-                };
-                s.query(state_del, &state_key(pk_enc))?;
-            }
+            w.sweep_state_row(s, &row[0], &row[1])?;
         }
         last = Some(rows[got - 1][0].clone());
         if got < chunk {
@@ -1483,6 +1466,206 @@ fn sync_table(
     }
 
     Ok(())
+}
+
+/// Carries out what [`classify_p1`]/[`classify_p2`] decided. Every write
+/// path lives here once, so sync and the daemon differ only in their
+/// chunking and their answer to a conflict — never in what a push does.
+pub(crate) struct MapWriter<'a> {
+    name: &'a str,
+    rt: &'a ResolvedTable,
+    sql: &'a MapSql,
+}
+
+impl<'a> MapWriter<'a> {
+    pub(crate) fn new(name: &'a str, rt: &'a ResolvedTable, sql: &'a MapSql) -> MapWriter<'a> {
+        MapWriter { name, rt, sql }
+    }
+
+    pub(crate) fn map_tbl(&self) -> Vec<Value> {
+        vec![
+            Value::Text(self.name.into()),
+            Value::Text(self.rt.dst.clone()),
+        ]
+    }
+
+    fn state_key(&self, key: &Value) -> Vec<Value> {
+        let mut v = self.map_tbl();
+        v.push(Value::Blob(crate::rretl::pk_ref(key)));
+        v
+    }
+
+    pub(crate) fn state_of(
+        &self,
+        s: &mut WriteSession<'_>,
+        key: &Value,
+    ) -> Result<Option<(String, String)>> {
+        let st = rows_of(s.query(STATE_GET, &self.state_key(key))?)?;
+        Ok(st
+            .first()
+            .map(|r| (crate::rretl::as_text(&r[0]), crate::rretl::as_text(&r[1]))))
+    }
+
+    pub(crate) fn target_row(
+        &self,
+        s: &mut WriteSession<'_>,
+        key: &Value,
+    ) -> Result<Option<Vec<Value>>> {
+        Ok(rows_of(s.query(&self.sql.dst_get, std::slice::from_ref(key))?)?
+            .into_iter()
+            .next())
+    }
+
+    /// Re-read a just-written row and verify its chain: the state hash is
+    /// the FUTURE oracle for this row, so it records what is PERSISTED,
+    /// never what was intended (the stage-3 finding-14 discipline).
+    fn verify_persisted(
+        &self,
+        s: &mut WriteSession<'_>,
+        get: &str,
+        key: &Value,
+        want: &str,
+        side: &str,
+    ) -> Result<()> {
+        let rows = rows_of(s.query(get, std::slice::from_ref(key))?)?;
+        let got = rows
+            .first()
+            .map(|r| chain(self.name, &self.rt.dst, key, r))
+            .ok_or_else(|| Error::Corrupt(format!("map sync: {side} row {key:?} vanished")))?;
+        if got != want {
+            return Err(Error::Corrupt(format!(
+                "map sync: persisted {side} row {key:?} does not hash to what was written"
+            )));
+        }
+        Ok(())
+    }
+
+    fn params(&self, key: &Value, rest: &[Value]) -> Vec<Value> {
+        let mut v = vec![key.clone()];
+        v.extend(rest.iter().cloned());
+        v
+    }
+
+    fn put_state(
+        &self,
+        s: &mut WriteSession<'_>,
+        key: &Value,
+        a: String,
+        b: String,
+    ) -> Result<()> {
+        let mut p = self.state_key(key);
+        p.extend([
+            key.clone(),
+            Value::Text(a),
+            Value::Text(b),
+            Value::Int(now_micros()),
+        ]);
+        s.query(STATE_PUT, &p)?;
+        Ok(())
+    }
+
+    fn set_state(
+        &self,
+        s: &mut WriteSession<'_>,
+        key: &Value,
+        a: String,
+        b: String,
+    ) -> Result<()> {
+        let mut p = self.state_key(key);
+        p.extend([Value::Text(a), Value::Text(b), Value::Int(now_micros())]);
+        s.query(STATE_SET, &p)?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_p1(
+        &mut self,
+        s: &mut WriteSession<'_>,
+        key: &Value,
+        action: P1,
+        report: &mut MapSyncReport,
+    ) -> Result<()> {
+        match action {
+            P1::Conflict(msg) => return Err(Error::Unsupported(msg)),
+            P1::Clean { .. } => report.unchanged += 1,
+            P1::CreateB { ys, a_hash } => {
+                s.query(&self.sql.dst_ins, &self.params(key, &ys))?;
+                let b_now = chain(self.name, &self.rt.dst, key, &ys);
+                self.verify_persisted(s, &self.sql.dst_get, key, &b_now, "target")?;
+                self.put_state(s, key, a_hash, b_now)?;
+                report.created_b += 1;
+            }
+            P1::AdoptB { a_hash, b_hash } => {
+                self.put_state(s, key, a_hash, b_hash)?;
+                report.unchanged += 1;
+            }
+            P1::DeleteA => {
+                s.query(&self.sql.src_del, std::slice::from_ref(key))?;
+                s.query(STATE_DEL, &self.state_key(key))?;
+                report.deleted_a += 1;
+            }
+            P1::AToB { ys, a_hash } => {
+                s.query(&self.sql.dst_upd, &self.params(key, &ys))?;
+                let b_new = chain(self.name, &self.rt.dst, key, &ys);
+                self.verify_persisted(s, &self.sql.dst_get, key, &b_new, "target")?;
+                self.set_state(s, key, a_hash, b_new)?;
+                report.a_to_b += 1;
+            }
+            P1::BToA { xs2, b_hash } => {
+                s.query(&self.sql.src_upd, &self.params(key, &xs2))?;
+                let a_new = chain(self.name, &self.rt.dst, key, &xs2);
+                self.verify_persisted(s, &self.sql.src_get, key, &a_new, "source")?;
+                self.set_state(s, key, a_new, b_hash)?;
+                report.b_to_a += 1;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_p2(
+        &mut self,
+        s: &mut WriteSession<'_>,
+        key: &Value,
+        action: P2,
+        report: &mut MapSyncReport,
+    ) -> Result<()> {
+        match action {
+            P2::Conflict(msg) => return Err(Error::Unsupported(msg)),
+            P2::DeleteB => {
+                s.query(&self.sql.dst_del, std::slice::from_ref(key))?;
+                s.query(STATE_DEL, &self.state_key(key))?;
+                report.deleted_b += 1;
+            }
+            P2::CreateA { xs2, b_hash } => {
+                s.query(&self.sql.src_ins, &self.params(key, &xs2))?;
+                let a_now = chain(self.name, &self.rt.dst, key, &xs2);
+                self.verify_persisted(s, &self.sql.src_get, key, &a_now, "source")?;
+                self.put_state(s, key, a_now, b_hash)?;
+                report.created_a += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pass 3: a state row whose key is gone from BOTH sides is cleared.
+    /// An unverified `k` is left alone — see [`state_row_is_consistent`].
+    pub(crate) fn sweep_state_row(
+        &self,
+        s: &mut WriteSession<'_>,
+        pk_enc: &Value,
+        key: &Value,
+    ) -> Result<()> {
+        if !state_row_is_consistent(pk_enc, key) {
+            return Ok(());
+        }
+        let in_src = !rows_of(s.query(&self.sql.src_exists, std::slice::from_ref(key))?)?.is_empty();
+        let in_dst = !rows_of(s.query(&self.sql.dst_exists, std::slice::from_ref(key))?)?.is_empty();
+        if !in_src && !in_dst {
+            let mut p = self.map_tbl();
+            p.push(pk_enc.clone());
+            s.query(STATE_DEL, &p)?;
+        }
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------ check
@@ -1501,19 +1684,18 @@ fn check_table(
     has_dst: bool,
 ) -> Result<MapCheckTable> {
     let chunk = chunk_rows();
+    let sql = MapSql::new(rt, chunk);
     let mut out = MapCheckTable {
         src: rt.src.clone(),
         dst: rt.dst.clone(),
         ..Default::default()
     };
-    let src_cols: Vec<String> = rt.cols.iter().map(|c| c.src.clone()).collect();
-    let dst_cols: Vec<String> = rt.cols.iter().map(|c| c.dst.clone()).collect();
-    let (sk, dk) = (&rt.src_key, &rt.dst_key);
+    let map_tbl = || vec![Value::Text(name.into()), Value::Text(rt.dst.clone())];
 
     if !has_dst && has_state {
         let n = rows_of(db.query(
             "SELECT count(*) FROM rretl_map_state WHERE map = $1 AND tbl = $2",
-            &[Value::Text(name.into()), Value::Text(rt.dst.clone())],
+            &map_tbl(),
         )?)?;
         if crate::rretl::as_int(&n[0][0])? > 0 {
             out.conflicts.push(format!(
@@ -1526,155 +1708,50 @@ fn check_table(
         }
     }
 
-    if !has_dst && has_state {
-        let n = rows_of(db.query(
-            "SELECT count(*) FROM rretl_map_state WHERE map = $1 AND tbl = $2",
-            &[Value::Text(name.into()), Value::Text(rt.dst.clone())],
-        )?)?;
-        if crate::rretl::as_int(&n[0][0])? > 0 {
-            out.conflicts.push(format!(
-                "map sync `{name}`: the target table `{}` is GONE but the map has sync \
-                 state for it — dropped or renamed away; a sync refuses rather than \
-                 read it as a target-side delete of every row",
-                rt.dst
-            ));
-            return Ok(out);
-        }
-    }
-
-    let state_get = "SELECT a_hash, b_hash FROM rretl_map_state \
-                     WHERE map = $1 AND tbl = $2 AND pk_enc = $3";
-    let dst_get = format!(
-        "SELECT {} FROM \"{}\" WHERE \"{dk}\" = $1",
-        quoted(&dst_cols),
-        rt.dst
-    );
-    let src_exists = format!("SELECT \"{sk}\" FROM \"{}\" WHERE \"{sk}\" = $1", rt.src);
-    let dst_exists = format!("SELECT \"{dk}\" FROM \"{}\" WHERE \"{dk}\" = $1", rt.dst);
-
-    let state_of = |pk_enc: Vec<u8>| -> Result<Option<(String, String)>> {
+    let state_of = |key: &Value| -> Result<Option<(String, String)>> {
         if !has_state {
             return Ok(None);
         }
-        let st = rows_of(db.query(
-            state_get,
-            &[
-                Value::Text(name.into()),
-                Value::Text(rt.dst.clone()),
-                Value::Blob(pk_enc),
-            ],
-        )?)?;
+        let mut p = map_tbl();
+        p.push(Value::Blob(crate::rretl::pk_ref(key)));
+        let st = rows_of(db.query(STATE_GET, &p)?)?;
         Ok(st
             .first()
             .map(|r| (crate::rretl::as_text(&r[0]), crate::rretl::as_text(&r[1]))))
     };
-    let agree = |ys: &[Value], ybs: &[Value]| {
-        ys.iter().zip(ybs).all(|(a, b)| crate::lens::same_value(a, b))
-    };
 
     // ---- pass 1: every source row -----------------------------------------
-    let first = format!(
-        "SELECT \"{sk}\", {} FROM \"{}\" ORDER BY \"{sk}\" LIMIT {chunk}",
-        quoted(&src_cols),
-        rt.src
-    );
-    let next = format!(
-        "SELECT \"{sk}\", {} FROM \"{}\" WHERE \"{sk}\" > $1 ORDER BY \"{sk}\" LIMIT {chunk}",
-        quoted(&src_cols),
-        rt.src
-    );
     let mut last: Option<Value> = None;
     loop {
         let rows = match &last {
-            None => rows_of(db.query(&first, &[])?)?,
-            Some(k) => rows_of(db.query(&next, std::slice::from_ref(k))?)?,
+            None => rows_of(db.query(&sql.p1_first, &[])?)?,
+            Some(k) => rows_of(db.query(&sql.p1_next, std::slice::from_ref(k))?)?,
         };
         let got = rows.len();
         if got == 0 {
             break;
         }
         for row in &rows {
-            let key = &row[0];
-            let xs = &row[1..];
-            let a_now = chain(name, &rt.dst, key, xs);
-            let st = state_of(crate::rretl::pk_ref(key))?;
+            let (key, xs) = (&row[0], &row[1..]);
             let b = if has_dst {
-                rows_of(db.query(&dst_get, std::slice::from_ref(key))?)?
+                rows_of(db.query(&sql.dst_get, std::slice::from_ref(key))?)?
                     .into_iter()
                     .next()
             } else {
                 None
             };
-            match (st, b) {
-                (None, None) => match forward_all(rt, key, xs) {
-                    Ok(_) => out.would_create_b += 1,
-                    Err(e) => out.conflicts.push(e.to_string()),
-                },
-                (None, Some(ybs)) => match forward_all(rt, key, xs) {
-                    Ok(ys) if agree(&ys, &ybs) => out.would_adopt += 1,
-                    Ok(_) => out.conflicts.push(
-                        conflict(
-                            name,
-                            &rt.dst,
-                            key,
-                            "both sides hold the row and disagree, and no recorded sync \
-                             can arbitrate",
-                        )
-                        .to_string(),
-                    ),
-                    Err(e) => out.conflicts.push(e.to_string()),
-                },
-                (Some((st_a, _)), None) => {
-                    if a_now == st_a {
-                        out.would_delete_a += 1;
-                    } else {
-                        out.conflicts.push(
-                            conflict(
-                                name,
-                                &rt.dst,
-                                key,
-                                "deleted on the target side while the source row changed",
-                            )
-                            .to_string(),
-                        );
-                    }
-                }
-                (Some((st_a, st_b)), Some(ybs)) => {
-                    let b_now = chain(name, &rt.dst, key, &ybs);
-                    match (a_now != st_a, b_now != st_b) {
-                        (false, false) => match forward_all(rt, key, xs) {
-                            Ok(ys) if agree(&ys, &ybs) => out.unchanged += 1,
-                            Ok(_) => out.diverged.push(format!(
-                                "`{}` row {key:?}: state records both sides clean, but \
-                                 forward(source) != target — a standing divergence the \
-                                 echo guard cannot see",
-                                rt.dst
-                            )),
-                            Err(e) => out.diverged.push(format!(
-                                "`{}` row {key:?}: state records both sides clean, but \
-                                 the pair's forward refuses the source value ({e})",
-                                rt.dst
-                            )),
-                        },
-                        (true, false) => match forward_all(rt, key, xs) {
-                            Ok(_) => out.pending_a2b += 1,
-                            Err(e) => out.conflicts.push(e.to_string()),
-                        },
-                        (false, true) => match inverse_all(rt, key, xs, &ybs) {
-                            Ok(_) => out.pending_b2a += 1,
-                            Err(e) => out.conflicts.push(e.to_string()),
-                        },
-                        (true, true) => out.conflicts.push(
-                            conflict(
-                                name,
-                                &rt.dst,
-                                key,
-                                "both sides changed since the last sync",
-                            )
-                            .to_string(),
-                        ),
-                    }
-                }
+            // `verify_clean` is what makes this a CHECK and not a rehearsal:
+            // the both-clean arm, which a sync skips untouched by design, is
+            // the one the audit actually looks at.
+            match classify_p1(rt, name, key, xs, state_of(key)?, b, true)? {
+                P1::Clean { diverged: None } => out.unchanged += 1,
+                P1::Clean { diverged: Some(d) } => out.diverged.push(d),
+                P1::CreateB { .. } => out.would_create_b += 1,
+                P1::AdoptB { .. } => out.would_adopt += 1,
+                P1::DeleteA => out.would_delete_a += 1,
+                P1::AToB { .. } => out.pending_a2b += 1,
+                P1::BToA { .. } => out.pending_b2a += 1,
+                P1::Conflict(c) => out.conflicts.push(c),
             }
         }
         last = Some(rows[got - 1][0].clone());
@@ -1685,95 +1762,25 @@ fn check_table(
 
     // ---- pass 2: target rows with no source row ---------------------------
     if has_dst {
-        let first = format!(
-            "SELECT \"{dk}\", {} FROM \"{}\" ORDER BY \"{dk}\" LIMIT {chunk}",
-            quoted(&dst_cols),
-            rt.dst
-        );
-        let next = format!(
-            "SELECT \"{dk}\", {} FROM \"{}\" WHERE \"{dk}\" > $1 ORDER BY \"{dk}\" \
-             LIMIT {chunk}",
-            quoted(&dst_cols),
-            rt.dst
-        );
         let mut last: Option<Value> = None;
         loop {
             let rows = match &last {
-                None => rows_of(db.query(&first, &[])?)?,
-                Some(k) => rows_of(db.query(&next, std::slice::from_ref(k))?)?,
+                None => rows_of(db.query(&sql.p2_first, &[])?)?,
+                Some(k) => rows_of(db.query(&sql.p2_next, std::slice::from_ref(k))?)?,
             };
             let got = rows.len();
             if got == 0 {
                 break;
             }
             for row in &rows {
-                let key = &row[0];
-                let ybs = &row[1..];
-                if !rows_of(db.query(&src_exists, std::slice::from_ref(key))?)?.is_empty() {
+                let (key, ybs) = (&row[0], &row[1..]);
+                if !rows_of(db.query(&sql.src_exists, std::slice::from_ref(key))?)?.is_empty() {
                     continue; // classified in pass 1
                 }
-                match state_of(crate::rretl::pk_ref(key))? {
-                    Some((_, st_b)) => {
-                        if chain(name, &rt.dst, key, ybs) == st_b {
-                            out.would_delete_b += 1;
-                        } else {
-                            out.conflicts.push(
-                                conflict(
-                                    name,
-                                    &rt.dst,
-                                    key,
-                                    "deleted on the source side while the target row changed",
-                                )
-                                .to_string(),
-                            );
-                        }
-                    }
-                    None => {
-                        // The creation-path preconditions, named exactly as
-                        // the sync names them.
-                        if rt.rowid_identity {
-                            out.conflicts.push(format!(
-                                "map sync `{name}`: row {key:?} was created on `{}` but \
-                                 the source identity is `{}`'s hidden rowid, which only \
-                                 the source can assign — create the row on the source side",
-                                rt.dst, rt.src
-                            ));
-                        } else if let Some(c) = rt.cols.iter().find(|c| {
-                            c.lens
-                                .as_ref()
-                                .is_some_and(|l| l.class != LensClass::Bijective)
-                        }) {
-                            out.conflicts.push(format!(
-                                "map sync `{name}`: row {key:?} was created on `{}`, but \
-                                 column `{}` maps through a non-bijective pair — there is \
-                                 no residual to attach (§4's creation path); create the \
-                                 row on `{}` instead",
-                                rt.dst, c.dst, rt.src
-                            ));
-                        } else {
-                            let creatable =
-                                rt.cols.iter().zip(ybs).try_for_each(|(c, y)| match &c.lens {
-                                    None => Ok(()),
-                                    Some(l) => {
-                                        let x = call1(&l.inverse, y)?;
-                                        let fwd = call1(&l.forward, &x)?;
-                                        if !crate::lens::same_value(&fwd, y) {
-                                            return Err(Error::Unsupported(format!(
-                                                "map sync `{name}`: created row {key:?} on \
-                                                 `{}` has `{}` = {y:?}, outside its pair's \
-                                                 image",
-                                                rt.dst, c.dst
-                                            )));
-                                        }
-                                        Ok(())
-                                    }
-                                });
-                            match creatable {
-                                Ok(()) => out.would_create_a += 1,
-                                Err(e) => out.conflicts.push(e.to_string()),
-                            }
-                        }
-                    }
+                match classify_p2(rt, name, key, ybs, state_of(key)?)? {
+                    P2::DeleteB => out.would_delete_b += 1,
+                    P2::CreateA { .. } => out.would_create_a += 1,
+                    P2::Conflict(c) => out.conflicts.push(c),
                 }
             }
             last = Some(rows[got - 1][0].clone());
@@ -1785,23 +1792,14 @@ fn check_table(
 
     // ---- pass 3: state rows with NEITHER side left ------------------------
     if has_state {
-        let first = format!(
-            "SELECT pk_enc, k FROM rretl_map_state WHERE map = $1 AND tbl = $2 \
-             ORDER BY pk_enc LIMIT {chunk}"
-        );
-        let next = format!(
-            "SELECT pk_enc, k FROM rretl_map_state WHERE map = $1 AND tbl = $2 AND \
-             pk_enc > $3 ORDER BY pk_enc LIMIT {chunk}"
-        );
-        let base = vec![Value::Text(name.into()), Value::Text(rt.dst.clone())];
         let mut last: Option<Value> = None;
         loop {
             let rows = match &last {
-                None => rows_of(db.query(&first, &base)?)?,
+                None => rows_of(db.query(&sql.p3_first, &map_tbl())?)?,
                 Some(k) => {
-                    let mut p = base.clone();
+                    let mut p = map_tbl();
                     p.push(k.clone());
-                    rows_of(db.query(&next, &p)?)?
+                    rows_of(db.query(&sql.p3_next, &p)?)?
                 }
             };
             let got = rows.len();
@@ -1820,9 +1818,9 @@ fn check_table(
                     continue;
                 }
                 let in_src =
-                    !rows_of(db.query(&src_exists, std::slice::from_ref(key))?)?.is_empty();
+                    !rows_of(db.query(&sql.src_exists, std::slice::from_ref(key))?)?.is_empty();
                 let in_dst = has_dst
-                    && !rows_of(db.query(&dst_exists, std::slice::from_ref(key))?)?.is_empty();
+                    && !rows_of(db.query(&sql.dst_exists, std::slice::from_ref(key))?)?.is_empty();
                 if !in_src && !in_dst {
                     out.orphan_state += 1;
                 }

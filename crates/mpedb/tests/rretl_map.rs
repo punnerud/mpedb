@@ -745,3 +745,144 @@ fn a_spec_in_the_wrong_case_resolves_like_sql_does() {
     assert_eq!(d.rretl_map_sync("crm").unwrap().b_to_a, 1);
     assert_eq!(ints(&d, "SELECT score FROM customers WHERE id = 1"), vec![12]);
 }
+
+// ------------------------------------------------------------ #53 daemon
+
+/// A map with TWO tables and a chunk of 2: the daemon must commit both
+/// tables together (never finish one before starting the other), stop on
+/// its row budget, and the NEXT run must resume where this one stopped
+/// rather than starting the round over.
+#[test]
+fn the_daemon_advances_both_tables_together_and_resumes() {
+    use mpedb::rretl_map_run::{RunOptions, RunStop};
+    let (d, _s) = db("daemon");
+    define_pairs(&d);
+    for t in ["a1", "a2"] {
+        d.query(
+            &format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY, v ANY)"),
+            &[],
+        )
+        .unwrap();
+    }
+    let mut w = d.begin().unwrap();
+    for t in ["a1", "a2"] {
+        for id in 1..=6i64 {
+            w.query(
+                &format!("INSERT INTO {t} (id, v) VALUES ($1, $2)"),
+                &[Value::Int(id), Value::Int(id * 10)],
+            )
+            .unwrap();
+        }
+    }
+    w.commit().unwrap();
+    d.rretl_map_define(
+        r#"
+[map]
+name = "two"
+
+[[map.table]]
+source = "a1"
+target = "b1"
+  [[map.table.column]]
+  source = "v"
+  target = "nv"
+  pair = "neg"
+
+[[map.table]]
+source = "a2"
+target = "b2"
+  [[map.table.column]]
+  source = "v"
+  target = "nv"
+  pair = "neg"
+"#,
+    )
+    .unwrap();
+
+    // Budget: 4 rows. With chunk 2 that is one commit (2 rows from EACH
+    // table) plus the budget check — so both targets must hold 2 rows,
+    // never 4-and-0.
+    std::env::set_var("MPEDB_RRETL_CHUNK", "2");
+    let opts = RunOptions { max_rows: Some(4), ..Default::default() };
+    let r = d.rretl_map_run("two", &opts).unwrap();
+    assert_eq!(r.stopped_by, Some(RunStop::Budget));
+    assert_eq!(r.rows, 4, "{r:?}");
+    assert_eq!(ints(&d, "SELECT count(*) FROM b1"), vec![2]);
+    assert_eq!(ints(&d, "SELECT count(*) FROM b2"), vec![2]);
+
+    // Resume: the next run continues rather than re-materializing rows 1-2.
+    let r = d.rretl_map_run("two", &opts).unwrap();
+    assert_eq!(r.moved.created_b, 4, "resumed run created rows 3-4: {r:?}");
+    assert_eq!(ints(&d, "SELECT count(*) FROM b1"), vec![4]);
+    assert_eq!(ints(&d, "SELECT count(*) FROM b2"), vec![4]);
+
+    // Keep going until the round completes, then the map is fully synced
+    // and `check` agrees.
+    let mut guard = 0;
+    loop {
+        let r = d.rretl_map_run("two", &opts).unwrap();
+        guard += 1;
+        assert!(guard < 20, "the round never completed");
+        if r.stopped_by == Some(RunStop::RoundComplete) {
+            break;
+        }
+    }
+    assert_eq!(ints(&d, "SELECT count(*) FROM b1"), vec![6]);
+    assert_eq!(ints(&d, "SELECT count(*) FROM b2"), vec![6]);
+    assert!(d.rretl_map_check("two").unwrap().is_clean());
+    assert!(d.rretl_map_status("two").unwrap().round >= 1);
+    std::env::remove_var("MPEDB_RRETL_CHUNK");
+}
+
+/// The runner restriction is a named refusal, and clearing it lifts the
+/// refusal. (A policy guard, not an auth boundary — see the module docs.)
+#[test]
+fn a_map_can_be_restricted_to_one_runner() {
+    use mpedb::rretl_map_run::RunOptions;
+    let (d, _s) = seeded("runner");
+    d.rretl_map_set_runner("crm", "server-1").unwrap();
+
+    let anon = RunOptions::default();
+    let e = d.rretl_map_run("crm", &anon).unwrap_err().to_string();
+    assert!(e.contains("restricted to runner `server-1`"), "{e}");
+    assert!(e.contains("no runner"), "{e}");
+
+    let wrong = RunOptions { runner: Some("laptop".into()), ..Default::default() };
+    let e = d.rretl_map_run("crm", &wrong).unwrap_err().to_string();
+    assert!(e.contains("`laptop`"), "{e}");
+
+    let right = RunOptions { runner: Some("server-1".into()), ..Default::default() };
+    let r = d.rretl_map_run("crm", &right).unwrap();
+    assert_eq!(r.moved.created_b, 3);
+    assert_eq!(d.rretl_map_status("crm").unwrap().runner, "server-1");
+
+    d.rretl_map_set_runner("crm", "").unwrap();
+    d.rretl_map_run("crm", &anon).unwrap();
+}
+
+/// Unlike `map sync`, a conflict does not abort the daemon: it is counted,
+/// named in the report, and the OTHER rows still sync. One unresolvable
+/// row must never block every other row forever.
+#[test]
+fn the_daemon_counts_conflicts_and_keeps_going() {
+    use mpedb::rretl_map_run::RunOptions;
+    let (d, _s) = seeded("conflict");
+    let opts = RunOptions::default();
+    d.rretl_map_run("crm", &opts).unwrap();
+
+    // Row 2 moves on BOTH sides (a conflict), row 1 only on the source.
+    d.query("UPDATE customers SET score = 5 WHERE id = 2", &[]).unwrap();
+    d.query("UPDATE crm_customers SET neg_score = 0 - 9 WHERE id = 2", &[]).unwrap();
+    d.query("UPDATE customers SET score = 4 WHERE id = 1", &[]).unwrap();
+
+    // `map sync` aborts whole; the daemon does not.
+    assert!(d.rretl_map_sync("crm").is_err());
+    let r = d.rretl_map_run("crm", &opts).unwrap();
+    assert_eq!(r.conflicts, 1, "{r:?}");
+    assert!(r.conflict_notes[0].contains("CONFLICT"));
+    assert_eq!(r.moved.a_to_b, 1, "the unrelated row still synced: {r:?}");
+    assert_eq!(ints(&d, "SELECT neg_score FROM crm_customers WHERE id = 1"), vec![-4]);
+    // The conflicted row is untouched and still visible to `check`.
+    assert_eq!(ints(&d, "SELECT neg_score FROM crm_customers WHERE id = 2"), vec![-9]);
+    assert_eq!(d.rretl_map_check("crm").unwrap().tables[0].conflicts.len(), 1);
+}

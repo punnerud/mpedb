@@ -10,9 +10,11 @@ use std::process::Command;
 struct TestDir(PathBuf);
 
 impl TestDir {
-    fn new() -> TestDir {
+    fn new(tag: &str) -> TestDir {
+        // The two fuzz tests run CONCURRENTLY in one process — the tag is
+        // what keeps them out of each other's database.
         let dir = mpedb_testkit::scratch_base()
-            .join(format!("mpedb-map-collide-{}", std::process::id()));
+            .join(format!("mpedb-map-collide-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         TestDir(dir)
@@ -25,12 +27,43 @@ impl Drop for TestDir {
     }
 }
 
+/// The same fuzz against the DAEMON (`map run`), whose chunk commits are
+/// the newer risk: a kill between two commits must leave the cursor and
+/// the rows it covers agreeing, because they are written together.
+#[test]
+fn map_collide_daemon_sigkill_fuzz() {
+    let td = TestDir::new("run");
+    let o = Command::new(env!("CARGO_BIN_EXE_mpedb"))
+        .args([
+            "map-collide",
+            "--dir",
+            td.0.to_str().unwrap(),
+            "--mode",
+            "run",
+            "--writers",
+            "2",
+            "--secs",
+            "4",
+            "--kill-ms",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "stdout: {out}\nstderr: {err}");
+    assert!(
+        out.contains("map-collide(run):") && out.contains("check=clean fsck=clean"),
+        "stdout: {out}\nstderr: {err}"
+    );
+}
+
 /// Writers churn both sides while the syncer is killed at every instant;
 /// the run's own final drain asserts convergence (echo == 0, check clean,
 /// fsck clean, counts equal) and exits nonzero on any divergence.
 #[test]
 fn map_collide_sigkill_fuzz() {
-    let td = TestDir::new();
+    let td = TestDir::new("sync");
     let o = Command::new(env!("CARGO_BIN_EXE_mpedb"))
         .args([
             "map-collide",
@@ -48,7 +81,7 @@ fn map_collide_sigkill_fuzz() {
     let out = String::from_utf8_lossy(&o.stdout);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success(), "stdout: {out}\nstderr: {err}");
-    assert!(out.contains("map-collide:"), "stdout: {out}\nstderr: {err}");
+    assert!(out.contains("map-collide(sync):"), "stdout: {out}\nstderr: {err}");
     assert!(
         out.contains("check=clean fsck=clean"),
         "stdout: {out}\nstderr: {err}"

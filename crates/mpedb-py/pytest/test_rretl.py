@@ -337,6 +337,37 @@ def stage4(workdir):
     assert not chk["clean"] and len(chk["tables"][0]["conflicts"]) == 1, chk
     assert "CONFLICT" in chk["tables"][0]["conflicts"][0], chk
 
+    # --- #53: the cron form -------------------------------------------
+    # Restrict the map to one runner, then drive it in small bounded runs
+    # the way a crontab line would, until the round completes.
+    db.rretl_map_set_runner("m", "server-1")
+    try:
+        db.rretl_map_run("m")
+        raise AssertionError("an unnamed runner must be refused")
+    except mpedb.Error as e:
+        assert "restricted to runner `server-1`" in str(e), e
+
+    with db.begin() as tx:
+        tx.query("INSERT INTO src (id, v) VALUES (3, -30), (4, 40), (5, -50)", [])
+    # Resolve the standing conflict from the block above so the daemon has
+    # clean work to do (source wins).
+    with db.begin() as tx:
+        tx.query("UPDATE ext SET absv = 100 WHERE id = 2", [])
+
+    rounds, guard = 0, 0
+    while True:
+        r = db.rretl_map_run("m", max_rows=2, runner="server-1")
+        guard += 1
+        assert guard < 40, r
+        if r["round_complete"]:
+            rounds += 1
+            break
+    rows = db.query("SELECT absv FROM ext ORDER BY id")
+    assert [x[0] for x in rows] == [7, 100, 30, 40, 50], rows
+    st = db.rretl_map_status("m")
+    assert st["runner"] == "server-1" and st["round"] >= 1, st
+    assert st["in_progress"] == [], st
+
     print("rretl stage 4: all assertions passed")
 
 
