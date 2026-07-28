@@ -101,7 +101,7 @@ fn setup(dir: &Path, secs: u64) -> Result<Setup, Failure> {
 
 /// SIGKILL + respawn `spawn()` every `kill_ms` until the deadline. Returns
 /// (kills, bad self-exits). Kills land at every instant of the daemon's loop.
-fn kill_loop(
+pub(crate) fn kill_loop(
     deadline: u128,
     kill_ms: u64,
     spawn: &dyn Fn() -> std::io::Result<Child>,
@@ -133,7 +133,7 @@ fn kill_loop(
     Ok((kills, bad_exits))
 }
 
-fn reap(writers: Vec<Child>) -> Result<(), Failure> {
+pub(crate) fn reap(writers: Vec<Child>) -> Result<(), Failure> {
     for (id, mut w) in writers.into_iter().enumerate() {
         let status = w.wait()?;
         if !status.success() {
@@ -287,7 +287,7 @@ fn run_push(dir: &Path, writers: u64, secs: u64, kill_ms: u64, keyspace: u64) ->
     Ok(())
 }
 
-fn check_bad_exits(bad_exits: u64) -> Result<(), Failure> {
+pub(crate) fn check_bad_exits(bad_exits: u64) -> Result<(), Failure> {
     if bad_exits > 0 {
         return runtime(format!(
             "the daemon self-exited with an error {bad_exits} time(s) — a real bug, \

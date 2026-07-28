@@ -17,6 +17,7 @@ mod csvload;
 mod dump;
 mod line;
 mod mirror;
+mod map_collide;
 mod mirror_collide;
 mod powerloss;
 mod powerloss_commit;
@@ -171,6 +172,13 @@ usage: mpedb <command> [args]
            definition. Read back: ATTACH '<cold>' AS cold; SELECT ... UNION ALL
            SELECT ... FROM cold.<T>)
           crash --dir <dir> --waves W [--batch N]   (SIGKILL fuzz on the drain)
+  map-collide --dir <dir> [--writers N] [--secs S] [--kill-ms M] [--keyspace K]
+                                           SIGKILL fuzz for `rretl map sync`:
+                                           writers churn BOTH sides while the
+                                           syncer is killed at every instant;
+                                           final drain must converge to a
+                                           clean check/fsck — nothing lost,
+                                           duplicated or half-synced
   mirror-collide --dir <dir> [--mode pull|push] [--writers N] [--secs S]
           [--kill-ms M] [--keyspace K]
           (SIGKILL fuzz: pull = source writers vs. a killed pull daemon (source
@@ -251,6 +259,10 @@ fn dispatch(argv: &[String]) -> CliResult {
         },
         "checkpoint" => openpath::checkpoint(rest),
         "mirror-collide" => mirror_collide::run_parent(rest),
+        "map-collide" => map_collide::run_parent(rest),
+        "map-collide-awriter" => map_collide::run_awriter(rest),
+        "map-collide-bwriter" => map_collide::run_bwriter(rest),
+        "map-collide-syncer" => map_collide::run_syncer(rest),
         "powerloss" => powerloss::run_parent(rest),
         "stress-child" => stress::run_child(rest),
         "crash-child" => crash::run_child(rest),
