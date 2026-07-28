@@ -1,7 +1,7 @@
 # DESIGN-ETL — reversible PySpell ETL: lens pairs, residuals, round-trip verification
 
-**Status: DESIGNED; stage 1 (the bijective corner) IMPLEMENTED 2026-07-28,
-stage 2 (residual pairs + apply/revert + lineage) IN PROGRESS** —
+**Status: DESIGNED; stage 1 (the bijective corner) and stage 2 (residual
+pairs + `etl apply|revert|log` + lineage) IMPLEMENTED 2026-07-28** —
 `crates/mpedb/src/lens.rs`, `mpedb lens` in the CLI, tests in
 `crates/mpedb/tests/lens.rs`. The prior-art groundwork is `design/ETL-BIDI.md`
 (including the 2026-07-28 addendum: Jeopardy, Hermes, CRIL, RC 2023–2025,
@@ -511,7 +511,21 @@ operation — it holds the writer lock for the duration, and says so.
 and #52: `forward(v1, edit) → v2` with the diff as residual, verified
 `apply(v1, diff) == v2` byte-identically at ingest); container round-trip
 (pristine-tar's pattern for .gz/.zip, which has been in Debian infrastructure for
-~20 years); mpedbfs presentation (#54).
+~20 years); mpedbfs presentation (#54). Composite residuals get the §8.2
+envelope there, composed by nesting (the pristine-tar `wrapper` pattern).
+
+Parked stage-3+ ideas from the 2026-07-28 survey, deliberately NOT stage 2:
+
+- **Residual elision, Jeopardy's move made dynamic**: a residual component that
+  is provably derivable from values already present in the output row need not
+  be stored. Jeopardy proves it statically (conservatively, one recursion step
+  deep); mpedb's version would be a CORPUS-VERIFIED elision — same verification
+  stance as everything else here. A size optimisation, never a contract change.
+- **Multi-column / tuple pairs**: `{first, last} ⇄ full` needs either tuple
+  returns unlocked for lens functions or per-column triples composed by the
+  pipeline layer. Wants the envelope.
+- **Stacked runs**: the `(run_id, pk)` key makes them representable; LIFO
+  revert order and cross-run hash chaining are the design work.
 
 **#53 — the daemon model** (pairs driven by triggers / stream ETL) is a separate
 task, designed separately, and gated on stage 2 existing.
