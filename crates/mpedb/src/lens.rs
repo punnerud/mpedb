@@ -1,9 +1,9 @@
-//! Lens pairs — reversible PySpell ETL, stage 1 (design/DESIGN-ETL.md).
+//! Lens pairs — reversible PySpell ETL, stage 1 (design/DESIGN-RETL.md).
 //!
 //! A *lens pair* binds two stored functions declared to be each other's
 //! inverse, plus an explicit CLASS saying how exactly that is meant, plus the
 //! engine's own verification of the claim. The form is the symmetric-lens
-//! complement (DESIGN-ETL §2):
+//! complement (DESIGN-RETL §2):
 //!
 //! ```text
 //! forward(x) → (y, residual)        inverse(y, residual) → x
@@ -14,7 +14,7 @@
 //! return a scalar ([`crate::spellfn::call_spell_fn`]), so `{first, last} →
 //! full` cannot even be expressed without a residual, and the residual format
 //! is an eternity promise that stage 1 deliberately does not write a byte of
-//! (DESIGN-ETL §8.2).
+//! (DESIGN-RETL §8.2).
 //!
 //! What makes the verification mean anything: PySpell has no clock and no
 //! randomness — [`mpedb_spell::ir::Op`] has no instruction that can answer
@@ -34,7 +34,7 @@ use mpedb_types::{Error, Result, Value};
 pub const NS_LENS: &str = "lens";
 
 /// How a pair is meant to be reversible. Declared by the registrant, verified
-/// by the engine — never inferred (DESIGN-ETL §3, commitment 2). Cambria died
+/// by the engine — never inferred (DESIGN-RETL §3, commitment 2). Cambria died
 /// in the undeclared grey zone; JPEG XL refuses input it cannot round-trip
 /// rather than emit a pair that does not invert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +79,14 @@ impl LensClass {
 }
 
 /// The only probe corpus that exists. Stored in the record so a re-verification
-/// runs against the same inputs (DESIGN-ETL §5.1).
+/// runs against the same inputs (DESIGN-RETL §5.1).
 pub const PROBE_CORPUS_V1: u8 = 1;
 /// Byte-for-byte round-trip equality. Other canonizer ids are reserved.
 const CANONIZER_IDENTITY: u8 = 0;
 /// `residual_type` when the class has no residual (Bijective, Lossy). Legal
 /// `ColumnType` tags are 1..=7, so this can never collide with a declaration.
 const RESIDUAL_TYPE_NONE: u8 = 0xff;
-/// `branch_policy` 0: the residual carries the branch tag (DESIGN-ETL §6).
+/// `branch_policy` 0: the residual carries the branch tag (DESIGN-RETL §6).
 /// Policy 1 (verified-disjoint outputs) is reserved — the byte exists so the
 /// format does not move when it becomes expressible.
 const BRANCH_POLICY_TAG: u8 = 0;
@@ -140,7 +140,7 @@ fn encode_lens_record(r: &LensRecord) -> Vec<u8> {
 /// **v1 records decode into v2 shape** (zero rex, no residual type) rather than
 /// as `None`: degradation-to-undefined was designed for CORRUPTION, not for
 /// deliberate retirement, and stage-1 records exist in this project's own dev
-/// and M3 databases (DESIGN-ETL §8.1).
+/// and M3 databases (DESIGN-RETL §8.1).
 fn decode_lens_record(bytes: &[u8]) -> Option<LensRecord> {
     match bytes.first() {
         Some(2) if bytes.len() == LENS_RECORD_LEN => Some(LensRecord {
@@ -183,7 +183,7 @@ pub struct LensInfo {
     /// The DECLARED residual type's name, when the class has one.
     pub residual_type: Option<&'static str>,
     /// How many probe inputs actually round-tripped. Reported rather than a bare
-    /// "verified": the evidence is statistical, not universal (DESIGN-ETL §5).
+    /// "verified": the evidence is statistical, not universal (DESIGN-RETL §5).
     pub samples: u32,
     pub verified_gen: u64,
     /// Every definition blob the pair names is still readable. False means the
@@ -253,7 +253,7 @@ pub(crate) fn same_value(a: &Value, b: &Value) -> bool {
     value_bits(a) == value_bits(b)
 }
 
-/// The v1 probe corpus (DESIGN-ETL §5.1) — the edges that break naive
+/// The v1 probe corpus (DESIGN-RETL §5.1) — the edges that break naive
 /// "bijections", then a deterministic xorshift tail for mantissa coverage.
 /// No `rand` dependency; the project's existing convention.
 pub fn probe_corpus(id: u8) -> Result<Vec<Value>> {
@@ -391,7 +391,7 @@ impl std::fmt::Display for LensFault {
 /// PutRes — `forward(inverse(y)) == y` — is implied here and not run separately:
 /// with `residual = ∅` and a deterministic interpreter, `inverse(forward(x)) ==
 /// x` for all x already forces it. **PutPut is not tested and must never be
-/// added** (DESIGN-ETL §4): every practical system in the literature dropped it,
+/// added** (DESIGN-RETL §4): every practical system in the literature dropped it,
 /// and a version-counter pair that we want to be able to write violates it.
 pub fn verify_bijective(
     forward: &Proc,
@@ -466,7 +466,7 @@ fn joint_key(y: &Value, r: &Value) -> [u8; 32] {
 /// the corpus it can only be tested on image pairs `(forward(x), rex(x))`,
 /// where GetPut plus determinism already force it, and running a tautology and
 /// reporting it as an independently verified law is the bare "verified"
-/// DESIGN-ETL §5 forbids.
+/// DESIGN-RETL §5 forbids.
 ///
 /// The collision check keys on `(y, r)` JOINTLY: multiple preimages of `y`
 /// alone are the entire point of the class — the residual disambiguates them.
@@ -545,8 +545,8 @@ struct Resolved {
     argc: u16,
 }
 
-/// What `etl apply`/`etl revert` need from a registered pair (crate::etl).
-pub(crate) struct EtlLens {
+/// What `retl apply`/`retl revert` need from a registered pair (crate::etl).
+pub(crate) struct RetlLens {
     pub class: LensClass,
     pub forward: std::sync::Arc<Proc>,
     pub rex: Option<std::sync::Arc<Proc>>,
@@ -820,10 +820,10 @@ impl crate::Database {
     /// The ETL layer's view of a registered pair: class, declared residual
     /// type, and the three decoded procedures — pinned by the hashes the
     /// VERIFICATION ran against, exactly as stored.
-    pub(crate) fn load_lens_for_etl(&self, name: &str) -> Result<EtlLens> {
+    pub(crate) fn load_lens_for_retl(&self, name: &str) -> Result<RetlLens> {
         let key = crate::sys_record_subkey(NS_LENS, name.as_bytes())?;
         let r = self.engine.begin_read()?;
-        let out = (|| -> Result<EtlLens> {
+        let out = (|| -> Result<RetlLens> {
             let rec = r
                 .sys_get(&key)?
                 .as_deref()
@@ -843,7 +843,7 @@ impl crate::Database {
             } else {
                 None
             };
-            Ok(EtlLens {
+            Ok(RetlLens {
                 class: rec.class,
                 forward,
                 rex,

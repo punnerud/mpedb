@@ -1,10 +1,18 @@
-# PySpell ETL — reversible data transforms from Python
+# PySpell RETL — Reversible ETL from Python
+
+**RETL — Reversible ETL** — is mpedb's name for transforms that can be run
+backwards: every apply stores exactly what it destroyed (the *residual*, per
+row, in the database), so the reverse is not "hope the transform was
+invertible" but a verified reconstruction — and, crucially, the reverse
+CARRIES EDITS made to the transformed data. The feature is called RETL
+everywhere: `mpedb retl` in the CLI, `retl_*` methods in Python, `retl_lineage`
+and `retl_residual` in the schema.
 
 **This document is self-contained.** An agent that reads only this file can
 connect to mpedb from Python, define a reversible transform, run it over a
 column, let a user edit the transformed data, and then run the reverse — which
 **keeps the edits** and re-attaches what the transform threw away. No other
-document is required; the design rationale lives in `design/DESIGN-ETL.md` if
+document is required; the design rationale lives in `design/DESIGN-RETL.md` if
 you want it, but nothing there is needed to operate.
 
 The mental model, in one example: a table of pixels is stripped to grayscale.
@@ -14,6 +22,21 @@ it (deletes rows). Running the reverse re-attaches the colour **to the edited
 pixels** — the retouch survives, in colour — and the cropped pixels stay gone.
 The same machinery applies to any data: unit conversions, redactions,
 normalisations, format changes. Transform → edit → reverse-with-edits.
+
+A machine-learning example of the pattern: a segmentation **color-mask**
+(one colour per class) is converted to **one polygon per class** — polygons
+are the representation a labeler or an agent can actually work with, no GUI
+needed. The vertices get edited, classes get dropped (the crop), and the
+reverse produces the EDITED color-mask: the polygon edits carried back into
+pixels, the anti-aliasing/edge detail the polygonisation lost re-attached from
+the residual. Same triple as everything else: `forward` = mask→polygon,
+`rex` = what polygonisation loses, `inverse` = polygon+residual→mask.
+
+Transforms also **stack**: apply pair B on top of pair A's output, ten deep if
+needed, then unwind strictly LIFO (last applied, first reversed) — with edits
+injected at any depth, each carried down through every remaining inverse. The
+engine's chain test drives 12 randomly-ordered transforms up and back down
+with edits between every unwind step, model-checked at every depth.
 
 ```
 apply:    x  ──forward──▶  y      (what is lost = rex(x), stored per row)
@@ -131,7 +154,7 @@ counter-example*, never accepted on trust.
 |---|---|---|
 | `bijective` | `inverse(forward(x)) == x`, nothing is lost | `forward/1`, `inverse/1` |
 | `residual` | `forward(x) → y` loses information; `rex(x)` extracts exactly what is lost; `inverse(y, r) → x` | `forward/1`, `rex/1`, `inverse/2` |
-| `lossy` | not invertible — the source must be kept; `etl_apply` refuses it | any |
+| `lossy` | not invertible — the source must be kept; `retl_apply` refuses it | any |
 
 ```python
 db.define_function(SRC_FORWARD)      # -> ("to_gray", "<hex hash>")
@@ -162,17 +185,17 @@ came back — fix the domain guard or the maths, not the declaration.
 ## 4. Running ETL: apply, edit, putback / revert
 
 ```python
-report = db.etl_apply("gray", "pixels", "px")
+report = db.retl_apply("gray", "pixels", "px")
 # -> {"run_id": 1, "rows": 4, "residuals": 4}
 ```
 
-`etl_apply` transforms the column **in place, in one transaction**: it stores
-one residual per row in the `etl_residual` table (keyed `run_id, pk`), records
-the run in `etl_lineage`, and — before the commit that destroys the source —
+`retl_apply` transforms the column **in place, in one transaction**: it stores
+one residual per row in the `retl_residual` table (keyed `run_id, pk`), records
+the run in `retl_lineage`, and — before the commit that destroys the source —
 re-reads every transformed row and verifies that `inverse(y, r)` reproduces
 the source, hash-exactly, for **100% of rows**. Any failure aborts the whole
 transaction; the column is never half-transformed. Failed runs are recorded in
-the lineage too (`outcome = "failed"`), so `etl_log()` answers "why is this
+the lineage too (`outcome = "failed"`), so `retl_log()` answers "why is this
 column stale". Apply holds the single writer lock for the whole run — treat it
 as an offline operation.
 
@@ -187,10 +210,10 @@ with db.begin() as tx:
 Two ways back, and the difference is the whole design:
 
 ```python
-db.etl_revert(report["run_id"])    # EXACT undo. Hash-gated: refuses if the
+db.retl_revert(report["run_id"])    # EXACT undo. Hash-gated: refuses if the
                                    # column changed at all since the apply.
 
-db.etl_putback(report["run_id"])   # Undo THROUGH the edits: each surviving
+db.retl_putback(report["run_id"])   # Undo THROUGH the edits: each surviving
                                    # row becomes inverse(edited_value, residual)
                                    # -> the edit is kept, the loss re-attached.
                                    # Deleted rows STAY deleted (the crop).
@@ -198,9 +221,9 @@ db.etl_putback(report["run_id"])   # Undo THROUGH the edits: each surviving
 
 | situation | use |
 |---|---|
-| nothing was edited; you want the source back exactly | `etl_revert` |
-| the transformed data was edited and the edits must survive the reverse | `etl_putback` |
-| rows were deleted and must stay deleted | `etl_putback` |
+| nothing was edited; you want the source back exactly | `retl_revert` |
+| the transformed data was edited and the edits must survive the reverse | `retl_putback` |
+| rows were deleted and must stay deleted | `retl_putback` |
 | rows were **inserted** after the apply | residual pairs: putback refuses them by name (there is nothing true to re-attach — delete them first); bijective pairs: they invert like any row |
 
 Putback verification: because the source is no longer the oracle, every row is
@@ -212,22 +235,23 @@ putback rolls back. Example from the pixel pair: a pixel with chroma offsets
 negative colour channels, and the refusal says exactly that.
 
 ```python
-db.etl_log()
+db.retl_log()
 # [{"run_id": 1, "lens": "gray", "table": "pixels", "column": "px",
 #   "rows": 4, "outcome": "putback", "error": ""}]
 # outcomes: applied | reverted | putback | failed
 ```
 
 Rules enforced for you (each is a named refusal, not a surprise):
-- `lossy` pairs cannot `etl_apply` — in-place transform deletes the source,
+- `lossy` pairs cannot `retl_apply` — in-place transform deletes the source,
   and a lossy pair declares it cannot bring it back. Keep the source instead.
-- One unreverted run per column: a second apply is refused until the first is
-  reverted or putback. Run ids are a counter and never reused.
+- Runs STACK on a column, and unwind strictly LIFO: reverting or putting back
+  a buried run is refused with the topmost run named. Run ids are a counter
+  and never reused.
 - A row the pair refuses aborts the **whole run** with the row named — a
   half-transformed column is worse than none.
-- `etl_revert`/`etl_putback` of an unknown run id, a double revert, a missing
+- `retl_revert`/`retl_putback` of an unknown run id, a double revert, a missing
   residual row, or a tampered column (revert only) are all named errors.
-- The bookkeeping tables (`etl_lineage`, `etl_residual`) are refused as ETL
+- The bookkeeping tables (`retl_lineage`, `retl_residual`) are refused as ETL
   targets, and they are ordinary tables — query them with SQL freely.
 
 ---
@@ -287,7 +311,7 @@ with db.begin() as tx:
     for i, p in enumerate([px(200,40,40), px(30,180,60), px(20,60,200), px(90,90,90)]):
         tx.query("INSERT INTO pixels (id, px) VALUES ($1, $2)", [i, p])
 
-run = db.etl_apply("gray", "pixels", "px")              # colour -> residuals
+run = db.retl_apply("gray", "pixels", "px")              # colour -> residuals
 # column is now [93, 90, 93, 90] — pure luma
 
 with db.begin() as tx:                                  # the user's edits
@@ -295,7 +319,7 @@ with db.begin() as tx:                                  # the user's edits
     tx.query("UPDATE pixels SET px = $1 WHERE id = 1", [100])  # brighten
     tx.query("DELETE FROM pixels WHERE id = 3")                # crop
 
-db.etl_putback(run["run_id"])                           # colour back ONTO the edits
+db.retl_putback(run["run_id"])                           # colour back ONTO the edits
 # id 0: (180, 20, 20)  — darkened by 20 per channel, in colour
 # id 1: (40, 190, 70)  — brightened by 10 per channel, in colour
 # id 2: (20, 60, 200)  — untouched, restored exactly
@@ -303,7 +327,7 @@ db.etl_putback(run["run_id"])                           # colour back ONTO the e
 ```
 
 The executable version of this walkthrough, with every refusal asserted, is
-`crates/mpedb-py/pytest/test_etl.py`.
+`crates/mpedb-py/pytest/test_retl.py`.
 
 *Scaling* an image (resampling) creates rows that never had residuals — that
 is a `lossy` operation in this model: keep the pre-scale table (or run the
@@ -319,10 +343,10 @@ scale as its own apply with the full source as the residual).
 | `db.create_lens(name, fwd, inv, class="bijective")` | sample count | `bijective` or `lossy`; verified, refusals name a counter-example |
 | `db.create_residual_lens(name, fwd, rex, inv, residual_type)` | sample count | the triple; residual type is declared AND verified |
 | `db.lenses()` | list of dicts | `name, class, forward_hash, inverse_hash, rex_hash, residual_type, samples, healthy` |
-| `db.etl_apply(pair, table, column)` | `{"run_id", "rows", "residuals"}` | one txn; 100% verified before the source-destroying commit |
-| `db.etl_revert(run_id)` | same dict | exact undo; hash-gated |
-| `db.etl_putback(run_id)` | same dict | undo through edits; PutRes-verified per row |
-| `db.etl_log()` | list of dicts | all runs, oldest first, failures included |
+| `db.retl_apply(pair, table, column)` | `{"run_id", "rows", "residuals"}` | one txn; 100% verified before the source-destroying commit |
+| `db.retl_revert(run_id)` | same dict | exact undo; hash-gated |
+| `db.retl_putback(run_id)` | same dict | undo through edits; PutRes-verified per row |
+| `db.retl_log()` | list of dicts | all runs, oldest first, failures included |
 
 Everything raises `mpedb.Error` subclasses (`ProgrammingError` for refusals,
 `OperationalError` for engine trouble) with the engine's full message. These
@@ -331,8 +355,8 @@ is open on the same thread (you get a named refusal, not a hang).
 
 CLI equivalents (same engine, same rules): `mpedb fn define <target> <f.py>`,
 `mpedb lens define <target> <name> <fwd> <inv> --class residual --rex <fn>
---residual-type <ty>`, `mpedb etl apply <target> <pair> <table>.<col>`,
-`mpedb etl revert|putback <target> <run_id>`, `mpedb etl log <target>`.
+--residual-type <ty>`, `mpedb retl apply <target> <pair> <table>.<col>`,
+`mpedb retl revert|putback <target> <run_id>`, `mpedb retl log <target>`.
 
 ---
 
@@ -342,7 +366,7 @@ Guaranteed, enforced by verification rather than promised: registration
 refuses classes that do not hold, with counter-examples; apply verifies 100%
 of rows against the source before the commit that destroys it; revert is
 hash-gated; putback is PutRes-verified per row; every run — including failed
-ones — is in `etl_lineage` with the pair's content hashes; a SIGKILL at any
+ones — is in `retl_lineage` with the pair's content hashes; a SIGKILL at any
 instant leaves the column either fully transformed or fully untouched, never
 mixed (one transaction, crash-safe engine).
 

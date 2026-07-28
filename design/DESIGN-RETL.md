@@ -1,10 +1,10 @@
-# DESIGN-ETL — reversible PySpell ETL: lens pairs, residuals, round-trip verification
+# DESIGN-RETL — reversible PySpell ETL: lens pairs, residuals, round-trip verification
 
 **Status: DESIGNED; stage 1 (the bijective corner) and stage 2 (residual
-pairs + `etl apply|revert|putback|log` + lineage) IMPLEMENTED 2026-07-28** —
-user-facing contract: `PYSPELL-ETL.md` (the self-contained Python guide) —
+pairs + `retl apply|revert|putback|log` + lineage) IMPLEMENTED 2026-07-28** —
+user-facing contract: `PYSPELL-RETL.md` (the self-contained Python guide) —
 `crates/mpedb/src/lens.rs`, `mpedb lens` in the CLI, tests in
-`crates/mpedb/tests/lens.rs`. The prior-art groundwork is `design/ETL-BIDI.md`
+`crates/mpedb/tests/lens.rs`. The prior-art groundwork is `design/RETL-BIDI.md`
 (including the 2026-07-28 addendum: Jeopardy, Hermes, CRIL, RC 2023–2025,
 Sparcl JFP 2024, wire-format practice, lineage practice), whose eleven design
 commitments bind this document; every section below names the commitment it
@@ -264,17 +264,17 @@ Two ordinary tables, created through the normal DDL path inside the first ETL
 run's own transaction:
 
 ```
-etl_lineage   (run_id, step_no) →
+retl_lineage   (run_id, step_no) →
               lens_name, forward_hash, rex_hash, inverse_hash,
               tbl, col, source_hash, output_hash, rows,
               verified, outcome, error, ts_micros
 
-etl_residual  (run_id, pk) → residual        -- column type Any
+retl_residual  (run_id, pk) → residual        -- column type Any
 ```
 
 One stable run id per pipeline run (Pachyderm's global-id move) makes multi-step
 lineage a single lookup. blake3 already exists in mpedb. Field decisions, each
-paid for by the 2026-07-28 survey (ETL-BIDI addendum):
+paid for by the 2026-07-28 survey (RETL-BIDI addendum):
 
 - **`step_no` is a constant 1 in stage 2** — it exists so stage-3 pipelines
   extend the data, not the shape.
@@ -374,7 +374,7 @@ worthless.
 ### 8.2 Residual persistence: scalars ride the row codec; the envelope is stage 3
 
 **Amended in stage 2.** Stage 2's residuals are scalars in an `Any` column of an
-ordinary table (`etl_residual`, §7), and they deliberately do NOT get the
+ordinary table (`retl_residual`, §7), and they deliberately do NOT get the
 envelope below: the row codec already tags the value's type, it inherits exactly
 the durability contract of every other row in the file, and the standing rule
 that format breaks fund a free migration of the project's own files means the
@@ -593,7 +593,7 @@ length framing is load-bearing because unframed concatenation makes
 `Bijective` pairs, every forward run asserts the residual is empty — cheap
 defence in depth against corpus-blind non-bijectivity.
 
-`mpedb etl apply <target> <pair> <table>.<col>` transforms a column IN PLACE in
+`mpedb retl apply <target> <pair> <table>.<col>` transforms a column IN PLACE in
 ONE WriteSession: class-gated (`Lossy` refused by name — in-place is source
 deletion, commitment 2; `Bijective` writes lineage only), a row the pair refuses
 ABORTS the run with the row named (silently skipping would reintroduce Cambria's
@@ -720,9 +720,11 @@ these are the residual risks each stage-2 test must discharge:
 5. **Rows the pair refuses, skipped instead of aborting.** Per-row skipping
    leaves transformed and untransformed values indistinguishable in one column —
    Cambria's grey zone, per-row. Abort with the row named.
-6. **A second apply stacked on an unreverted column.** Refused in v1; the
-   `(run_id, pk)` key makes stacking representable later, but representable is
-   not the same as supported.
+6. **Stacked runs unwinding out of order.** Stacking is SUPPORTED (the
+   chained form the `(run_id, pk)` key was designed for); the discipline is
+   LIFO unwind — reverting or putting back a buried run is refused with the
+   topmost run named, because a buried run's residuals describe a column
+   state later runs transformed away.
 7. **SIGKILL mid-apply.** Single-txn atomicity plus FLD-2 recovery must leave
    the file verifying and the column untouched — the crash harness variant is
    the proof, not the argument.

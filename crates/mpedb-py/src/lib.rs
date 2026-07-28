@@ -740,7 +740,7 @@ impl PyDatabase {
     // ------------------------------------------------------ reversible ETL
 
     /// Store a PySpell function from PYTHON SOURCE (a `def name(args): ...`
-    /// in the deterministic subset — see PYSPELL-ETL.md). The function's name
+    /// in the deterministic subset — see PYSPELL-RETL.md). The function's name
     /// and arity come from the definition itself. Returns (name, hex hash).
     fn define_function(&self, py: Python<'_>, source: &str) -> PyResult<(String, String)> {
         self.refuse_if_txn_open("define_function", "Commit or roll back first.")?;
@@ -814,48 +814,48 @@ impl PyDatabase {
     }
 
     /// Transform `table.column` IN PLACE with a registered pair, in ONE
-    /// transaction: per-row residuals are kept in `etl_residual`, the run in
-    /// `etl_lineage`, and 100% of rows verify against the source hash BEFORE
+    /// transaction: per-row residuals are kept in `retl_residual`, the run in
+    /// `retl_lineage`, and 100% of rows verify against the source hash BEFORE
     /// the commit that destroys the source. Returns
     /// `{"run_id", "rows", "residuals"}`.
-    fn etl_apply(
+    fn retl_apply(
         &self,
         py: Python<'_>,
         pair: &str,
         table: &str,
         column: &str,
     ) -> PyResult<Py<PyAny>> {
-        self.refuse_if_txn_open("etl_apply", "Commit or roll back first.")?;
+        self.refuse_if_txn_open("retl_apply", "Commit or roll back first.")?;
         let db = &self.db;
-        let r = py.detach(|| db.etl_apply(pair, table, column)).map_err(map_err)?;
-        etl_report_to_py(py, r)
+        let r = py.detach(|| db.retl_apply(pair, table, column)).map_err(map_err)?;
+        retl_report_to_py(py, r)
     }
 
     /// Undo run `run_id` EXACTLY. Hash-gated: refused if the column changed
     /// outside the pipeline — for a column you have edited, use
-    /// `etl_putback`, which exists for exactly that.
-    fn etl_revert(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
-        self.refuse_if_txn_open("etl_revert", "Commit or roll back first.")?;
+    /// `retl_putback`, which exists for exactly that.
+    fn retl_revert(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("retl_revert", "Commit or roll back first.")?;
         let db = &self.db;
-        let r = py.detach(|| db.etl_revert(run_id)).map_err(map_err)?;
-        etl_report_to_py(py, r)
+        let r = py.detach(|| db.retl_revert(run_id)).map_err(map_err)?;
+        retl_report_to_py(py, r)
     }
 
     /// Invert run `run_id` while KEEPING edits made to the transformed
     /// column — the lens putback. Edited values flow back through
     /// `inverse(edited, residual)`; deleted rows stay deleted; every row is
     /// PutRes-verified (`forward(x') == y'`, `rex(x') == r`) before commit.
-    fn etl_putback(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
-        self.refuse_if_txn_open("etl_putback", "Commit or roll back first.")?;
+    fn retl_putback(&self, py: Python<'_>, run_id: i64) -> PyResult<Py<PyAny>> {
+        self.refuse_if_txn_open("retl_putback", "Commit or roll back first.")?;
         let db = &self.db;
-        let r = py.detach(|| db.etl_putback(run_id)).map_err(map_err)?;
-        etl_report_to_py(py, r)
+        let r = py.detach(|| db.retl_putback(run_id)).map_err(map_err)?;
+        retl_report_to_py(py, r)
     }
 
     /// Every ETL run, oldest first, failed runs included, as dicts.
-    fn etl_log(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+    fn retl_log(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let db = &self.db;
-        let log = py.detach(|| db.etl_log()).map_err(map_err)?;
+        let log = py.detach(|| db.retl_log()).map_err(map_err)?;
         log.into_iter()
             .map(|l| {
                 let d = pyo3::types::PyDict::new(py);
@@ -872,7 +872,7 @@ impl PyDatabase {
     }
 }
 
-fn etl_report_to_py(py: Python<'_>, r: mpedb::etl::EtlReport) -> PyResult<Py<PyAny>> {
+fn retl_report_to_py(py: Python<'_>, r: mpedb::retl::RetlReport) -> PyResult<Py<PyAny>> {
     let d = pyo3::types::PyDict::new(py);
     d.set_item("run_id", r.run_id)?;
     d.set_item("rows", r.rows)?;

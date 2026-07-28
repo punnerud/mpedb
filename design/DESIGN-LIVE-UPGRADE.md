@@ -68,7 +68,7 @@ a **prepare-time estimate of the whole migration's cost/duration** before you st
 
 - **Reversibility:** a destructive transform keeps the old shape until the new is verified (retain,
   don't delete) — the residual/provenance discipline the mirror and ETL already use (type-provenance
-  #26; the reversible-ETL lessons in [ETL-BIDI.md](ETL-BIDI.md)). A migration that cannot be reversed
+  #26; the reversible-ETL lessons in [RETL-BIDI.md](RETL-BIDI.md)). A migration that cannot be reversed
   is expand-only until contract.
 - **Verification before switch:** the migrated shape must be proven equivalent — row counts, then a
   sampled or full compare (the mirror's roundtrip verification) — BEFORE the lease handoff. Fail →

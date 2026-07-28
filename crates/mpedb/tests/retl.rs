@@ -1,4 +1,4 @@
-//! `etl apply`/`revert` — stage 2 of #52 (design/DESIGN-ETL.md §11, §12.2).
+//! `retl apply`/`revert` — stage 2 of #52 (design/DESIGN-RETL.md §11, §12.2).
 //!
 //! The contract under test: an in-place column transform keeps what was lost
 //! (per-row residuals, keyed by run), verifies 100% of rows against the source
@@ -92,7 +92,7 @@ fn apply_then_revert_round_trips_exactly() {
     let original = vec![-5i64, 3, 0, -700, 42, -1];
     seed(&d, &original);
 
-    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
     assert_eq!(report.rows, 6);
     assert_eq!(report.residuals, 6, "one residual per row, keyed (run_id, pk)");
     assert_eq!(col_v(&d), vec![5, 3, 0, 700, 42, 1], "signs destroyed in place");
@@ -100,26 +100,26 @@ fn apply_then_revert_round_trips_exactly() {
     // What was lost is IN the database, addressable by run:
     let res = rows(
         d.query(
-            "SELECT count(*) FROM etl_residual WHERE run_id = $1",
+            "SELECT count(*) FROM retl_residual WHERE run_id = $1",
             &[Value::Int(report.run_id)],
         )
         .unwrap(),
     );
     assert_eq!(res[0][0], Value::Int(6));
 
-    let log = d.etl_log().unwrap();
+    let log = d.retl_log().unwrap();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].outcome, "applied");
 
-    let back = d.etl_revert(report.run_id).unwrap();
+    let back = d.retl_revert(report.run_id).unwrap();
     assert_eq!(back.rows, 6);
     assert_eq!(col_v(&d), original, "revert restores the column exactly");
-    assert_eq!(d.etl_log().unwrap()[0].outcome, "reverted");
+    assert_eq!(d.retl_log().unwrap()[0].outcome, "reverted");
 
     // And the run's residuals are gone — consumed, not leaked.
     let res = rows(
         d.query(
-            "SELECT count(*) FROM etl_residual WHERE run_id = $1",
+            "SELECT count(*) FROM retl_residual WHERE run_id = $1",
             &[Value::Int(report.run_id)],
         )
         .unwrap(),
@@ -141,11 +141,11 @@ fn a_bijective_apply_keeps_no_residuals_and_still_reverts() {
     d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
     seed(&d, &[1, -2, 3]);
 
-    let report = d.etl_apply("flip", "t", "v").unwrap();
+    let report = d.retl_apply("flip", "t", "v").unwrap();
     assert_eq!(report.residuals, 0, "bijective = residual-free, enforced");
     assert_eq!(col_v(&d), vec![-1, 2, -3]);
 
-    d.etl_revert(report.run_id).unwrap();
+    d.retl_revert(report.run_id).unwrap();
     assert_eq!(col_v(&d), vec![1, -2, 3]);
     let _ = std::fs::remove_file(&path);
 }
@@ -160,7 +160,7 @@ fn a_lossy_pair_is_refused_by_name() {
     d.create_lens("crush", "crush", "uncrush", LensClass::Lossy).unwrap();
     seed(&d, &[1, 2]);
 
-    let e = d.etl_apply("crush", "t", "v").unwrap_err().to_string();
+    let e = d.retl_apply("crush", "t", "v").unwrap_err().to_string();
     assert!(e.contains("lossy"), "{e}");
     assert!(e.contains("keep the source"), "{e}");
     assert_eq!(col_v(&d), vec![1, 2], "nothing was touched");
@@ -179,7 +179,7 @@ fn a_refused_row_aborts_the_whole_run_and_is_lineage() {
     s.query("INSERT INTO t (id, v, w) VALUES (99, NULL, 0)", &[]).unwrap();
     s.commit().unwrap();
 
-    let e = d.etl_apply("mag", "t", "v").unwrap_err().to_string();
+    let e = d.retl_apply("mag", "t", "v").unwrap_err().to_string();
     assert!(e.contains("refuses row"), "{e}");
     assert!(e.contains("aborted"), "{e}");
 
@@ -190,7 +190,7 @@ fn a_refused_row_aborts_the_whole_run_and_is_lineage() {
     assert_eq!(vals[2][0], Value::Null);
 
     // Failed runs are first-class lineage (§7), in their own transaction.
-    let log = d.etl_log().unwrap();
+    let log = d.retl_log().unwrap();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].outcome, "failed");
     assert!(log[0].error.contains("refuses row"), "{}", log[0].error);
@@ -216,17 +216,17 @@ fn a_type_changing_pair_needs_an_any_column() {
         .unwrap();
     seed(&d, &[0, 100, -40]);
 
-    let e = d.etl_apply("promote", "t", "v").unwrap_err().to_string();
+    let e = d.retl_apply("promote", "t", "v").unwrap_err().to_string();
     assert!(e.contains("does not fit"), "{e}");
     assert!(e.contains("any"), "the refusal should say what WOULD work: {e}");
     assert_eq!(col_v(&d), vec![0, 100, -40], "refused early, nothing touched");
 
     // The Any column takes it — and revert brings back the exact ints.
-    let report = d.etl_apply("promote", "t", "w").unwrap();
+    let report = d.retl_apply("promote", "t", "w").unwrap();
     let w = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
     assert_eq!(w[0][0], Value::Float(0.0));
     assert_eq!(w[2][0], Value::Float(-40.0));
-    d.etl_revert(report.run_id).unwrap();
+    d.retl_revert(report.run_id).unwrap();
     let w = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
     assert_eq!(w[0][0], Value::Int(0), "revert restores the VALUE AND THE TYPE");
     assert_eq!(w[1][0], Value::Int(100));
@@ -234,22 +234,33 @@ fn a_type_changing_pair_needs_an_any_column() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// §12.2 attack 6: a second apply on an unreverted column is refused, and the
-/// refusal names the run that blocks it. Revert frees the column.
+/// Runs STACK, and unwind strictly LIFO: reverting a buried run is refused
+/// with the topmost run named; unwinding top-down works, and each layer's
+/// hash gate still holds because run N+1's source IS run N's output.
 #[test]
-fn stacking_is_refused_until_reverted() {
+fn stacked_runs_unwind_lifo_only() {
     let (d, path) = db("stack");
     define_abs_pair(&d);
+    def(&d, "def flip(x):\n    return -x\n");
+    d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
     seed(&d, &[-1, 2]);
 
-    let first = d.etl_apply("mag", "t", "v").unwrap();
-    let e = d.etl_apply("mag", "t", "v").unwrap_err().to_string();
-    assert!(e.contains("unreverted"), "{e}");
-    assert!(e.contains(&first.run_id.to_string()), "the blocking run is named: {e}");
-
-    d.etl_revert(first.run_id).unwrap();
-    let second = d.etl_apply("mag", "t", "v").unwrap();
+    let first = d.retl_apply("mag", "t", "v").unwrap(); // [1, 2]
+    let second = d.retl_apply("flip", "t", "v").unwrap(); // [-1, -2]
     assert!(second.run_id > first.run_id, "run ids are a counter, never reused");
+    assert_eq!(col_v(&d), vec![-1, -2]);
+
+    // The buried run is refused BY NAME, for both unwind operations.
+    for res in [d.retl_revert(first.run_id), d.retl_putback(first.run_id)] {
+        let e = res.unwrap_err().to_string();
+        assert!(e.contains("buried under"), "{e}");
+        assert!(e.contains(&second.run_id.to_string()), "the blocker is named: {e}");
+    }
+
+    // LIFO order unwinds cleanly to the original.
+    d.retl_revert(second.run_id).unwrap();
+    d.retl_revert(first.run_id).unwrap();
+    assert_eq!(col_v(&d), vec![-1, 2]);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -261,13 +272,13 @@ fn revert_refuses_a_column_changed_outside_the_pipeline() {
     let (d, path) = db("tamper");
     define_abs_pair(&d);
     seed(&d, &[-5, 3]);
-    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
 
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = 999 WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
 
-    let e = d.etl_revert(report.run_id).unwrap_err().to_string();
+    let e = d.retl_revert(report.run_id).unwrap_err().to_string();
     assert!(e.contains("changed outside the pipeline"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
@@ -284,17 +295,17 @@ fn a_missing_residual_row_is_a_hard_error() {
     let (d, path) = db("gone");
     define_abs_pair(&d);
     seed(&d, &[-5, 3]);
-    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
 
     let mut s = d.begin().unwrap();
     s.query(
-        "DELETE FROM etl_residual WHERE run_id = $1 AND pk_enc = $2",
+        "DELETE FROM retl_residual WHERE run_id = $1 AND pk_enc = $2",
         &[Value::Int(report.run_id), Value::Blob(vec![2, 0, 0, 0, 0, 0, 0, 0, 0])],
     )
     .unwrap();
     s.commit().unwrap();
 
-    let e = d.etl_revert(report.run_id).unwrap_err().to_string();
+    let e = d.retl_revert(report.run_id).unwrap_err().to_string();
     assert!(e.contains("residual row missing"), "{e}");
     assert!(e.contains("fabricate"), "{e}");
     // And nothing was half-reverted: the abort rolled the whole txn back.
@@ -309,8 +320,8 @@ fn reverting_an_unknown_run_is_refused() {
     let (d, path) = db("norun");
     define_abs_pair(&d);
     seed(&d, &[1]);
-    let e = d.etl_revert(42).unwrap_err().to_string();
-    assert!(e.contains("no etl"), "{e}");
+    let e = d.retl_revert(42).unwrap_err().to_string();
+    assert!(e.contains("no retl"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -320,9 +331,9 @@ fn double_revert_is_refused_by_outcome() {
     let (d, path) = db("double");
     define_abs_pair(&d);
     seed(&d, &[-1]);
-    let report = d.etl_apply("mag", "t", "v").unwrap();
-    d.etl_revert(report.run_id).unwrap();
-    let e = d.etl_revert(report.run_id).unwrap_err().to_string();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
+    d.retl_revert(report.run_id).unwrap();
+    let e = d.retl_revert(report.run_id).unwrap_err().to_string();
     assert!(e.contains("already reverted"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
@@ -333,8 +344,8 @@ fn the_bookkeeping_tables_are_refused_as_targets() {
     let (d, path) = db("meta");
     define_abs_pair(&d);
     seed(&d, &[1]);
-    let _ = d.etl_apply("mag", "t", "v").unwrap(); // creates the tables
-    let e = d.etl_apply("mag", "etl_lineage", "rows").unwrap_err().to_string();
+    let _ = d.retl_apply("mag", "t", "v").unwrap(); // creates the tables
+    let e = d.retl_apply("mag", "retl_lineage", "rows").unwrap_err().to_string();
     assert!(e.contains("bookkeeping"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
@@ -392,7 +403,7 @@ fn putback_carries_edits_back_and_keeps_the_crop() {
     }
     s.commit().unwrap();
 
-    let report = d.etl_apply("gray", "t", "v").unwrap();
+    let report = d.retl_apply("gray", "t", "v").unwrap();
     let gray = col_v(&d);
     assert_eq!(gray, vec![93, 90, 93, 90], "luma only — colour is gone from the column");
 
@@ -406,10 +417,10 @@ fn putback_carries_edits_back_and_keeps_the_crop() {
 
     // revert must REFUSE this column — it changed outside the pipeline —
     // and putback is exactly the operation that accepts it.
-    let e = d.etl_revert(report.run_id).unwrap_err().to_string();
+    let e = d.retl_revert(report.run_id).unwrap_err().to_string();
     assert!(e.contains("changed outside the pipeline"), "{e}");
 
-    let back = d.etl_putback(report.run_id).unwrap();
+    let back = d.retl_putback(report.run_id).unwrap();
     assert_eq!(back.rows, 3, "the cropped pixel is not resurrected");
 
     let after = col_v(&d);
@@ -424,14 +435,14 @@ fn putback_carries_edits_back_and_keeps_the_crop() {
     // The run is consumed: residuals gone, outcome recorded, second putback refused.
     let res = rows(
         d.query(
-            "SELECT count(*) FROM etl_residual WHERE run_id = $1",
+            "SELECT count(*) FROM retl_residual WHERE run_id = $1",
             &[Value::Int(report.run_id)],
         )
         .unwrap(),
     );
     assert_eq!(res[0][0], Value::Int(0));
-    assert_eq!(d.etl_log().unwrap()[0].outcome, "putback");
-    let e = d.etl_putback(report.run_id).unwrap_err().to_string();
+    assert_eq!(d.retl_log().unwrap()[0].outcome, "putback");
+    let e = d.retl_putback(report.run_id).unwrap_err().to_string();
     assert!(e.contains("putback"), "{e}");
 
     let _ = std::fs::remove_file(&path);
@@ -444,13 +455,13 @@ fn putback_refuses_rows_inserted_after_the_apply() {
     let (d, path) = db("putback-new");
     define_abs_pair(&d);
     seed(&d, &[-5, 3]);
-    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
 
     let mut s = d.begin().unwrap();
     s.query("INSERT INTO t (id, v, w) VALUES (99, 7, 0)", &[]).unwrap();
     s.commit().unwrap();
 
-    let e = d.etl_putback(report.run_id).unwrap_err().to_string();
+    let e = d.retl_putback(report.run_id).unwrap_err().to_string();
     assert!(e.contains("no residual"), "{e}");
     assert!(e.contains("inserted after the apply"), "{e}");
     // Nothing half-inverted:
@@ -467,13 +478,13 @@ fn putback_refuses_an_edit_outside_the_pairs_image() {
     let (d, path) = db("putback-bad");
     define_abs_pair(&d);
     seed(&d, &[-5, 3]);
-    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
 
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = $1 WHERE id = 0", &[Value::Int(-9)]).unwrap();
     s.commit().unwrap();
 
-    let e = d.etl_putback(report.run_id).unwrap_err().to_string();
+    let e = d.retl_putback(report.run_id).unwrap_err().to_string();
     assert!(e.contains("outside the pair's image"), "{e}");
     assert!(e.contains("Int(-9)"), "the offending edit is named: {e}");
     let _ = std::fs::remove_file(&path);
@@ -488,7 +499,7 @@ fn bijective_putback_carries_edits_and_new_rows() {
     def(&d, "def flip(x):\n    return -x\n");
     d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
     seed(&d, &[1, -2]);
-    let report = d.etl_apply("flip", "t", "v").unwrap();
+    let report = d.retl_apply("flip", "t", "v").unwrap();
     assert_eq!(col_v(&d), vec![-1, 2]);
 
     let mut s = d.begin().unwrap();
@@ -496,7 +507,7 @@ fn bijective_putback_carries_edits_and_new_rows() {
     s.query("INSERT INTO t (id, v, w) VALUES (9, 50, 0)", &[]).unwrap();
     s.commit().unwrap();
 
-    let back = d.etl_putback(report.run_id).unwrap();
+    let back = d.retl_putback(report.run_id).unwrap();
     assert_eq!(back.rows, 3);
     assert_eq!(col_v(&d), vec![100, -2, -50], "edit and new row both inverted");
     let _ = std::fs::remove_file(&path);
@@ -528,12 +539,12 @@ fn a_null_residual_value_round_trips_and_is_distinct_from_missing() {
 
     let original = vec![5i64, 250, 100, 101];
     seed(&d, &original);
-    let report = d.etl_apply("clamp", "t", "v").unwrap();
+    let report = d.retl_apply("clamp", "t", "v").unwrap();
     assert_eq!(col_v(&d), vec![5, 100, 100, 100], "clamped in place");
     // Every row has a residual ROW; two of them hold the VALUE NULL.
     let nulls = rows(
         d.query(
-            "SELECT count(*) FROM etl_residual WHERE run_id = $1 AND residual IS NULL",
+            "SELECT count(*) FROM retl_residual WHERE run_id = $1 AND residual IS NULL",
             &[Value::Int(report.run_id)],
         )
         .unwrap(),
@@ -545,7 +556,7 @@ fn a_null_residual_value_round_trips_and_is_distinct_from_missing() {
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = 7 WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
-    d.etl_putback(report.run_id).unwrap();
+    d.retl_putback(report.run_id).unwrap();
     assert_eq!(col_v(&d), vec![7, 250, 100, 101], "edit kept; clamped values restored");
 
     let _ = std::fs::remove_file(&path);
@@ -576,7 +587,7 @@ fn text_redaction_applies_and_reverts_exactly() {
     }
     s.commit().unwrap();
 
-    let report = d.etl_apply("redact", "t", "w").unwrap();
+    let report = d.retl_apply("redact", "t", "w").unwrap();
     let redacted = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
     for r in &redacted {
         assert_eq!(r[0], Value::Text("[REDACTED]".into()));
@@ -586,14 +597,14 @@ fn text_redaction_applies_and_reverts_exactly() {
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET w = 'peek' WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
-    let e = d.etl_putback(report.run_id).unwrap_err().to_string();
+    let e = d.retl_putback(report.run_id).unwrap_err().to_string();
     assert!(e.contains("outside the pair's image"), "{e}");
 
     // Restore the redaction text and revert exactly.
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET w = '[REDACTED]' WHERE id = 0", &[]).unwrap();
     s.commit().unwrap();
-    let back = d.etl_revert(report.run_id).unwrap();
+    let back = d.retl_revert(report.run_id).unwrap();
     assert_eq!(back.rows, 3);
     let after = rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap());
     for (r, want) in after.iter().zip(originals.iter()) {
@@ -609,9 +620,9 @@ fn text_redaction_applies_and_reverts_exactly() {
 fn an_empty_table_applies_and_reverts_without_drama() {
     let (d, path) = db("empty-tbl");
     define_abs_pair(&d);
-    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
     assert_eq!((report.rows, report.residuals), (0, 0));
-    d.etl_revert(report.run_id).unwrap();
+    d.retl_revert(report.run_id).unwrap();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -623,7 +634,7 @@ fn a_run_survives_reopen_and_puts_back_from_a_fresh_handle() {
     let (d, path) = db("reopen");
     define_abs_pair(&d);
     seed(&d, &[-5, 3, -700]);
-    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
     let run_id = report.run_id;
     drop(d);
 
@@ -631,7 +642,7 @@ fn a_run_survives_reopen_and_puts_back_from_a_fresh_handle() {
     let mut s = d2.begin().unwrap();
     s.query("UPDATE t SET v = 9 WHERE id = 1", &[]).unwrap();
     s.commit().unwrap();
-    d2.etl_putback(run_id).unwrap();
+    d2.retl_putback(run_id).unwrap();
     assert_eq!(
         rows(d2.query("SELECT v FROM t ORDER BY id", &[]).unwrap())
             .into_iter()
@@ -688,9 +699,9 @@ primary_key = ["k"]
     }
     s.commit().unwrap();
 
-    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
     assert_eq!(report.residuals, 3);
-    d.etl_revert(report.run_id).unwrap();
+    d.retl_revert(report.run_id).unwrap();
     let vals = rows(d.query("SELECT v FROM t ORDER BY k", &[]).unwrap());
     assert_eq!(
         vals.into_iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
@@ -744,8 +755,8 @@ primary_key = ["id"]
         .unwrap();
     }
     s.commit().unwrap();
-    let report = d.etl_apply("mag", "t", "v").unwrap();
-    d.etl_revert(report.run_id).unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
+    d.retl_revert(report.run_id).unwrap();
     let neg = rows(d.query("SELECT count(*) FROM t WHERE v < 0", &[]).unwrap());
     assert_eq!(neg[0][0], Value::Int(49), "restored under wal durability");
     let _ = std::fs::remove_file(&path);
@@ -770,13 +781,404 @@ fn five_thousand_rows_apply_and_put_back() {
         .unwrap();
     }
     s.commit().unwrap();
-    let report = d.etl_apply("mag", "t", "v").unwrap();
+    let report = d.retl_apply("mag", "t", "v").unwrap();
     assert_eq!(report.rows, 5000);
     let mut s = d.begin().unwrap();
     s.query("UPDATE t SET v = 12345 WHERE id = 100", &[]).unwrap();
     s.commit().unwrap();
-    d.etl_putback(report.run_id).unwrap();
+    d.retl_putback(report.run_id).unwrap();
     let v100 = rows(d.query("SELECT v FROM t WHERE id = 100", &[]).unwrap());
     assert_eq!(v100[0][0], Value::Int(-12345), "edit carried back with its sign");
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// The randomized chain — RETL's gold, model-checked
+// ---------------------------------------------------------------------------
+
+/// One pool pair: the PySpell functions plus a RUST MIRROR — the test's
+/// oracle. `domain_ok` mirrors the pair's forward domain; the harness only
+/// applies a pair when EVERY current value is inside it (a refused row aborts
+/// a run by design, and the chain must compose). `edit` yields an in-image
+/// edited value, and the harness additionally probes the edit's full
+/// carry-down against every lower layer's domain before committing it.
+struct PoolPair {
+    name: &'static str,
+    fwd_src: String,
+    rex_src: Option<String>,
+    inv_src: String,
+    fwd: fn(i64) -> i64,
+    rex: fn(i64) -> Option<i64>,
+    inv: fn(i64, Option<i64>) -> i64,
+    domain_ok: fn(i64) -> bool,
+    edit: fn(u64) -> i64,
+}
+
+/// The standard domain guard every pool pair carries, distilled from FOUR
+/// registration refusals the verifier handed this file while it was written:
+/// fractional floats break exact recovery; ±0.0 collide under ordinary
+/// arithmetic (0.0 + k == -0.0 + k); subnormals are ABSORBED (2.2e-308 + 7777
+/// == 7777.0 exactly, and the inverse returns 0.0); and beyond 2^53 integral
+/// floats lose exactness. Integral, nonzero, |x| <= 4e9 kills all four —
+/// integral floats in that range ride every pair's arithmetic exactly.
+const STD_GUARD: &str = "    if x % 1 != 0:\n        return 1 // 0\n    if x == 0:\n        return 1 // 0\n    if x > 4000000000:\n        return 1 // 0\n    if x < 0 - 4000000000:\n        return 1 // 0\n";
+
+fn std_domain(x: i64) -> bool {
+    x != 0 && x.abs() <= 4_000_000_000
+}
+
+fn pool() -> Vec<PoolPair> {
+    // Per-pair EXTRA guards exclude the one input whose output would be 0 —
+    // a zero row would make every later std-guarded pair inadmissible and
+    // deadlock the chain (the harness would panic on "no admissible pair").
+    vec![
+        PoolPair {
+            name: "p_neg",
+            fwd_src: format!("def p_neg_f(x):\n{STD_GUARD}    return -x\n"),
+            rex_src: None,
+            inv_src: "def p_neg_i(y):\n    return -y\n".into(),
+            fwd: |x| -x,
+            rex: |_| None,
+            inv: |y, _| -y,
+            domain_ok: std_domain,
+            edit: |d| nz((d % 100_000) as i64 - 50_000),
+        },
+        PoolPair {
+            name: "p_add7",
+            fwd_src: format!(
+                "def p_add7_f(x):\n{STD_GUARD}    if x == 0 - 7777:\n        return 1 // 0\n    return x + 7777\n"
+            ),
+            rex_src: None,
+            inv_src: "def p_add7_i(y):\n    return y - 7777\n".into(),
+            fwd: |x| x + 7777,
+            rex: |_| None,
+            inv: |y, _| y - 7777,
+            domain_ok: |x| std_domain(x) && x != -7777,
+            edit: |d| match (d % 100_000) as i64 - 50_000 {
+                7777 | 0 => 42,
+                v => v,
+            },
+        },
+        PoolPair {
+            name: "p_mul3",
+            fwd_src: format!("def p_mul3_f(x):\n{STD_GUARD}    return x * 3\n"),
+            rex_src: None,
+            inv_src: "def p_mul3_i(y):\n    return y // 3\n".into(),
+            fwd: |x| x * 3,
+            rex: |_| None,
+            inv: |y, _| y.div_euclid(3),
+            domain_ok: std_domain,
+            edit: |d| nz((d % 60_000) as i64 - 30_000) * 3,
+        },
+        PoolPair {
+            name: "p_inv999",
+            fwd_src: format!(
+                "def p_inv999_f(x):\n{STD_GUARD}    if x == 999999:\n        return 1 // 0\n    return 999999 - x\n"
+            ),
+            rex_src: None,
+            inv_src: "def p_inv999_i(y):\n    return 999999 - y\n".into(),
+            fwd: |x| 999_999 - x,
+            rex: |_| None,
+            inv: |y, _| 999_999 - y,
+            domain_ok: |x| std_domain(x) && x != 999_999,
+            edit: |d| match (d % 100_000) as i64 - 50_000 {
+                999_999 | 0 => 5,
+                v => v,
+            },
+        },
+        PoolPair {
+            name: "p_scale2p1",
+            fwd_src: format!("def p_scale2p1_f(x):\n{STD_GUARD}    return x * 2 + 1\n"),
+            rex_src: None,
+            inv_src: "def p_scale2p1_i(y):\n    return (y - 1) // 2\n".into(),
+            fwd: |x| x * 2 + 1,
+            rex: |_| None,
+            inv: |y, _| (y - 1).div_euclid(2),
+            domain_ok: std_domain,
+            // image = odd numbers; y' = 1 has preimage 0, avoid it
+            edit: |d| {
+                let k = (d % 30_000) as i64 + 1;
+                if d & 1 == 0 { 2 * k + 1 } else { -(2 * k) + 1 }
+            },
+        },
+        PoolPair {
+            name: "p_abs",
+            fwd_src: format!(
+                "def p_abs_f(x):\n{STD_GUARD}    if x < 0:\n        return 0 - x\n    return x\n"
+            ),
+            rex_src: Some(format!(
+                "def p_abs_r(x):\n{STD_GUARD}    if x < 0:\n        return 1\n    return 0\n"
+            )),
+            inv_src:
+                "def p_abs_i(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n"
+                    .into(),
+            fwd: |x| x.abs(),
+            rex: |x| Some(if x < 0 { 1 } else { 0 }),
+            inv: |y, r| if r == Some(1) { -y } else { y },
+            domain_ok: std_domain,
+            edit: |d| (d % 50_000) as i64 + 1,
+        },
+        PoolPair {
+            name: "p_half",
+            fwd_src: format!(
+                "def p_half_f(x):\n{STD_GUARD}    if x < 2:\n        if x > 0 - 2:\n            return 1 // 0\n    if x < 0:\n        return 0 - ((0 - x) // 2)\n    return x // 2\n"
+            ),
+            rex_src: Some(format!(
+                "def p_half_r(x):\n{STD_GUARD}    if x < 2:\n        if x > 0 - 2:\n            return 1 // 0\n    if x < 0:\n        return (0 - x) % 2\n    return x % 2\n"
+            )),
+            inv_src: "def p_half_i(y, r):\n    if y < 0:\n        return 0 - ((0 - y) * 2 + r)\n    return y * 2 + r\n".into(),
+            fwd: |x| if x < 0 { -((-x) / 2) } else { x / 2 },
+            rex: |x| Some(if x < 0 { (-x) % 2 } else { x % 2 }),
+            inv: |y, r| {
+                let r = r.unwrap();
+                if y < 0 { -((-y) * 2 + r) } else { y * 2 + r }
+            },
+            // |x| >= 2 keeps the halved output nonzero
+            domain_ok: |x| std_domain(x) && x.abs() >= 2,
+            edit: |d| (d % 50_000) as i64 + 1,
+        },
+        PoolPair {
+            name: "p_mod1000",
+            fwd_src: format!(
+                "def p_mod1000_f(x):\n{STD_GUARD}    if x < 1:\n        return 1 // 0\n    return x % 1000 + 1\n"
+            ),
+            rex_src: Some(format!(
+                "def p_mod1000_r(x):\n{STD_GUARD}    if x < 1:\n        return 1 // 0\n    return x // 1000\n"
+            )),
+            inv_src: "def p_mod1000_i(y, r):\n    return r * 1000 + y - 1\n".into(),
+            fwd: |x| x % 1000 + 1,
+            rex: |x| Some(x / 1000),
+            inv: |y, r| r.unwrap() * 1000 + y - 1,
+            domain_ok: |x| std_domain(x) && x >= 1,
+            // image = 1..=1000; y' with r=0 giving x' = y'-1 = 0 is probed out
+            edit: |d| (d % 1000) as i64 + 1,
+        },
+        PoolPair {
+            name: "p_clamp",
+            fwd_src: format!(
+                "def p_clamp_f(x):\n{STD_GUARD}    if x > 5000:\n        return 5000\n    return x\n"
+            ),
+            rex_src: Some(format!(
+                "def p_clamp_r(x):\n{STD_GUARD}    if x > 5000:\n        return x\n    return None\n"
+            )),
+            inv_src: "def p_clamp_i(y, r):\n    if r is None:\n        return y\n    return r\n".into(),
+            fwd: |x| x.min(5000),
+            rex: |x| if x > 5000 { Some(x) } else { None },
+            inv: |y, r| r.unwrap_or(y),
+            domain_ok: std_domain,
+            // legal only for r = None rows; the harness edits those only
+            edit: |d| (d % 4999) as i64 + 1,
+        },
+        PoolPair {
+            name: "p_sub_million",
+            fwd_src: format!(
+                "def p_sub_million_f(x):\n{STD_GUARD}    if x == 1000000:\n        return 1 // 0\n    return x - 1000000\n"
+            ),
+            rex_src: None,
+            inv_src: "def p_sub_million_i(y):\n    return y + 1000000\n".into(),
+            fwd: |x| x - 1_000_000,
+            rex: |_| None,
+            inv: |y, _| y + 1_000_000,
+            domain_ok: |x| std_domain(x) && x != 1_000_000,
+            edit: |d| match (d % 100_000) as i64 - 50_000 {
+                -1_000_000 | 0 => 5,
+                v => v,
+            },
+        },
+        PoolPair {
+            name: "p_dblneg",
+            fwd_src: format!("def p_dblneg_f(x):\n{STD_GUARD}    return 0 - x - x\n"),
+            rex_src: None,
+            inv_src: "def p_dblneg_i(y):\n    return 0 - (y // 2)\n".into(),
+            fwd: |x| -2 * x,
+            rex: |_| None,
+            inv: |y, _| -(y.div_euclid(2)),
+            domain_ok: std_domain,
+            // image = nonzero even numbers
+            edit: |d| {
+                let k = (d % 30_000) as i64 + 1;
+                if d & 1 == 0 { 2 * k } else { -2 * k }
+            },
+        },
+    ]
+}
+
+fn nz(v: i64) -> i64 {
+    if v == 0 { 17 } else { v }
+}
+
+fn xorshift(s: &mut u64) -> u64 {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    *s
+}
+
+/// THE chain test, and the reason "reverse that carries edits" is worth more
+/// than a round trip: deterministic random data, 12 randomly-chosen transforms
+/// (from a pool of 11 distinct pairs) applied output-into-input, the column
+/// asserted to CHANGE at every step and to match a Rust-mirror model exactly;
+/// then unwound strictly LIFO with an EDIT injected before every putback —
+/// each edit must survive the remaining unwinds TRANSFORMED by every inverse
+/// below it, and the mirror model is the oracle at every depth. At the bottom:
+/// unedited rows are byte-original, edited rows are exactly the composed
+/// carry-down of their edits.
+#[test]
+fn a_random_chain_of_twelve_transforms_unwinds_with_edits_carried() {
+    let (d, path) = db("chain");
+    let pool = pool();
+    assert!(pool.len() >= 10, "the spec says at least 10 different transforms");
+    for p in &pool {
+        def(&d, &p.fwd_src);
+        if let Some(r) = &p.rex_src {
+            def(&d, r);
+        }
+        def(&d, &p.inv_src);
+        let f = format!("{}_f", p.name);
+        let i = format!("{}_i", p.name);
+        match &p.rex_src {
+            Some(_) => {
+                let r = format!("{}_r", p.name);
+                d.create_residual_lens(p.name, &f, &r, &i, ColumnType::Any).unwrap();
+            }
+            None => {
+                d.create_lens(p.name, &f, &i, LensClass::Bijective).unwrap();
+            }
+        }
+    }
+
+    // Random-but-deterministic data (house rule: xorshift, no rand dep).
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    let n_rows = 64usize;
+    let mut model: Vec<i64> = (0..n_rows)
+        .map(|_| nz((xorshift(&mut rng) % 2000) as i64 - 1000))
+        .collect();
+    let mut s = d.begin().unwrap();
+    for (i, v) in model.iter().enumerate() {
+        s.query(
+            "INSERT INTO t (id, v, w) VALUES ($1, $2, 0)",
+            &[Value::Int(i as i64), Value::Int(*v)],
+        )
+        .unwrap();
+    }
+    s.commit().unwrap();
+    let original = model.clone();
+
+    // UP: 12 applies. The rng proposes a pair; the harness takes the first
+    // ADMISSIBLE one from there (every value in the pair's forward domain,
+    // and the transform actually changes something) — a refused row aborts a
+    // run by design, so the chain must only pick composable steps.
+    let depth = 12usize;
+    let mut stack: Vec<(usize, i64, Vec<Option<i64>>)> = Vec::new();
+    let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for step in 0..depth {
+        let start = (xorshift(&mut rng) as usize) % pool.len();
+        let pick = (0..pool.len())
+            .map(|k| (start + k) % pool.len())
+            .find(|&pi| {
+                let p = &pool[pi];
+                model.iter().all(|x| (p.domain_ok)(*x))
+                    && model.iter().any(|x| (p.fwd)(*x) != *x)
+            })
+            .expect("no admissible pair — the pool should always offer one");
+        let p = &pool[pick];
+        used.insert(pick);
+        let before = col_v(&d);
+        let report = d.retl_apply(p.name, "t", "v").unwrap();
+        let residuals: Vec<Option<i64>> = model.iter().map(|x| (p.rex)(*x)).collect();
+        for x in model.iter_mut() {
+            *x = (p.fwd)(*x);
+        }
+        let after = col_v(&d);
+        assert_eq!(after, model, "step {step}: engine and model disagree after {}", p.name);
+        assert_ne!(after, before, "step {step}: {} must CHANGE the column", p.name);
+        stack.push((pick, report.run_id, residuals));
+    }
+    assert!(used.len() >= 5, "the rng should exercise pair variety, got {}", used.len());
+
+    // DOWN: before every putback, one legal edit — which must survive the
+    // remaining unwinds TRANSFORMED. The model mirrors both. An edit is
+    // skipped when its carry-down would leave any lower layer's domain (the
+    // model predicts that exactly, so no engine refusal is ever provoked).
+    let mut edits_made = 0usize;
+    while let Some((pick, run_id, residuals)) = stack.pop() {
+        let p = &pool[pick];
+        let mut row = (xorshift(&mut rng) as usize) % n_rows;
+        if p.name == "p_clamp" {
+            let mut tries = 0;
+            while residuals[row].is_some() && tries < n_rows {
+                row = (row + 1) % n_rows;
+                tries += 1;
+            }
+            if residuals[row].is_some() {
+                row = usize::MAX;
+            }
+        }
+        if row != usize::MAX {
+            let new_y = (p.edit)(xorshift(&mut rng));
+            // Exact PutRes prediction via the mirrors, at EVERY layer the
+            // edit will pass through on the way down: the carried value must
+            // be in each layer's forward IMAGE for its stored residual
+            // (fwd(inv(y, r)) == y and rex(inv) == r), and inside the domain
+            // guards. Checking only the domain was this probe's first draft,
+            // and an odd value carried into the double-negate layer proved it
+            // insufficient — image membership is the real constraint.
+            let legal = |lp: &PoolPair, y: i64, r: Option<i64>| -> Option<i64> {
+                let x = (lp.inv)(y, r);
+                ((lp.domain_ok)(x) && (lp.fwd)(x) == y && (lp.rex)(x) == r).then_some(x)
+            };
+            let mut ok = true;
+            let mut probe = match legal(p, new_y, residuals[row]) {
+                Some(x) => x,
+                None => {
+                    ok = false;
+                    0
+                }
+            };
+            if ok {
+                for &(lpick, _, ref lres) in stack.iter().rev() {
+                    match legal(&pool[lpick], probe, lres[row]) {
+                        Some(x) => probe = x,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok {
+                let mut s = d.begin().unwrap();
+                s.query(
+                    "UPDATE t SET v = $1 WHERE id = $2",
+                    &[Value::Int(new_y), Value::Int(row as i64)],
+                )
+                .unwrap();
+                s.commit().unwrap();
+                model[row] = new_y;
+                edits_made += 1;
+            }
+        }
+        d.retl_putback(run_id).unwrap();
+        for (x, r) in model.iter_mut().zip(residuals.iter()) {
+            *x = (p.inv)(*x, *r);
+        }
+        assert_eq!(
+            col_v(&d),
+            model,
+            "unwinding {} (run {run_id}): engine and model disagree",
+            p.name
+        );
+    }
+
+    // Fully unwound: unedited rows byte-original, edited rows the composed
+    // carry-down — and at least one of each, so the test cannot silently
+    // degenerate into a pure round trip.
+    let final_col = col_v(&d);
+    assert_eq!(final_col, model, "final state matches the model");
+    assert!(edits_made >= 3, "the run must actually inject edits, got {edits_made}");
+    let changed = final_col.iter().zip(original.iter()).filter(|(a, b)| a != b).count();
+    assert!(changed > 0, "at least one edit must survive all the way down");
+    assert!(changed < n_rows, "unedited rows must be byte-original");
+
     let _ = std::fs::remove_file(&path);
 }
