@@ -1357,39 +1357,52 @@ impl BatchScan {
 
 pub(crate) type RawBound = (Vec<u8>, bool);
 
-/// Raw encoded-key bounds for a Phase-1 PK range (bounds are over the FIRST
-/// PK column only), with prefix semantics for composite PKs:
+/// Raw encoded-key bounds for a PK range, with prefix semantics for
+/// composite PKs. A bound carries a key PREFIX of one or more parts (Phase 1
+/// emitted only one; the #55 phase-2 planner also pins first-column equality
+/// and appends a second-column range — same encoding, one more part):
 ///
-/// - `enc(v)`       = `keycode::encode_key(&[v])` — a strict prefix of every
-///   composite key whose first column equals `v`.
-/// - `prefix_hi(v)` = `enc(v) ++ [0xFF]` — greater than every key whose first
-///   column equals `v` (continuation tags are 0x00/0x01 < 0xFF) and less than
-///   the encoding of any larger first-column value.
+/// - `enc(vs)`       = `keycode::encode_key(vs)` — a strict prefix of every
+///   composite key whose leading columns equal `vs`.
+/// - `prefix_hi(vs)` = `enc(vs) ++ [0xFF]` — greater than every key with
+///   prefix `vs` (continuation tags are 0x00/0x01 < 0xFF) and less than the
+///   encoding of any larger prefix value.
 ///
-/// lo inclusive → (enc(v), true); lo exclusive → (prefix_hi(v), true);
-/// hi inclusive → (prefix_hi(v), false); hi exclusive → (enc(v), false).
-/// Single-column PKs get identical results by the same construction.
+/// lo inclusive → (enc(vs), true); lo exclusive → (prefix_hi(vs), true);
+/// hi inclusive → (prefix_hi(vs), false); hi exclusive → (enc(vs), false).
+/// Exclusive-lo via `prefix_hi` is exactly SQL's meaning for a trailing
+/// range column: `a = v AND b > x` skips EVERY key whose (a, b) equals
+/// (v, x) — including ones extending it with further PK columns.
 ///
-/// Returns `Ok(None)` when a bound resolves to NULL (empty result).
+/// Returns `Ok(None)` when any bound part resolves to NULL (empty result).
 pub(crate) fn range_bounds(
     lo: Option<&KeyBound>,
     hi: Option<&KeyBound>,
     plan: &CompiledPlan,
     params: &[Value],
 ) -> Result<Option<(Option<RawBound>, Option<RawBound>)>> {
-    let resolve = |b: &KeyBound| -> Result<Option<Value>> {
-        let part = b.parts.first().ok_or_else(|| internal("range bound"))?;
-        let v = resolve_part(part, plan, params)?;
-        Ok(if v.is_null() { None } else { Some(v) })
+    let resolve = |b: &KeyBound| -> Result<Option<Vec<Value>>> {
+        if b.parts.is_empty() {
+            return Err(internal("range bound"));
+        }
+        let mut vs = Vec::with_capacity(b.parts.len());
+        for part in &b.parts {
+            let v = resolve_part(part, plan, params)?;
+            if v.is_null() {
+                return Ok(None);
+            }
+            vs.push(v);
+        }
+        Ok(Some(vs))
     };
     let lo_k = match lo {
         None => None,
         Some(b) => match resolve(b)? {
             None => return Ok(None),
-            Some(v) => Some(if b.inclusive {
-                (enc1(&v), true)
+            Some(vs) => Some(if b.inclusive {
+                (keycode::encode_key(&vs), true)
             } else {
-                (prefix_hi(&v), true)
+                (prefix_hi(&vs), true)
             }),
         },
     };
@@ -1397,22 +1410,18 @@ pub(crate) fn range_bounds(
         None => None,
         Some(b) => match resolve(b)? {
             None => return Ok(None),
-            Some(v) => Some(if b.inclusive {
-                (prefix_hi(&v), false)
+            Some(vs) => Some(if b.inclusive {
+                (prefix_hi(&vs), false)
             } else {
-                (enc1(&v), false)
+                (keycode::encode_key(&vs), false)
             }),
         },
     };
     Ok(Some((lo_k, hi_k)))
 }
 
-fn enc1(v: &Value) -> Vec<u8> {
-    keycode::encode_key(std::slice::from_ref(v))
-}
-
-fn prefix_hi(v: &Value) -> Vec<u8> {
-    let mut k = enc1(v);
+fn prefix_hi(vs: &[Value]) -> Vec<u8> {
+    let mut k = keycode::encode_key(vs);
     k.push(0xFF);
     k
 }

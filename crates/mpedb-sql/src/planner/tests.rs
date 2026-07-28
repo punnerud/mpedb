@@ -562,3 +562,71 @@ fn unknown_table_is_bind_error() {
         other => panic!("expected bind error, got {other:?}"),
     }
 }
+
+/// #55 phase 2: first PK column equality-pinned + range on the SECOND PK
+/// column extends the bound by one key part — no residual filter left.
+#[test]
+fn composite_pk_second_column_range_extends_the_bound() {
+    let s = test_schema();
+    let p = prepare(
+        "SELECT * FROM orders WHERE user_id = 7 AND item_no > $1",
+        &s,
+    )
+    .unwrap();
+    assert_eq!(
+        access_of(&p),
+        &AccessPath::PkRange {
+            lo: Some(KeyBound {
+                parts: vec![KeyPart::Const(0), KeyPart::Param(0)],
+                inclusive: false
+            }),
+            hi: Some(KeyBound {
+                parts: vec![KeyPart::Const(0)],
+                inclusive: true
+            }),
+        }
+    );
+    assert!(filter_of(&p).is_none());
+    // The Le side extends hi instead.
+    let p = prepare(
+        "SELECT * FROM orders WHERE user_id = 7 AND item_no <= 3",
+        &s,
+    )
+    .unwrap();
+    assert_eq!(
+        access_of(&p),
+        &AccessPath::PkRange {
+            lo: Some(KeyBound {
+                parts: vec![KeyPart::Const(0)],
+                inclusive: true
+            }),
+            hi: Some(KeyBound {
+                parts: vec![KeyPart::Const(0), KeyPart::Const(1)],
+                inclusive: true
+            }),
+        }
+    );
+    assert!(filter_of(&p).is_none());
+}
+
+/// #55 phase 2, the elision half: with the first PK column equality-pinned
+/// in BOTH bounds, the range holds it constant, so `ORDER BY <second col>`
+/// is scan order and the sort is dropped — while an UNPINNED first column
+/// keeps the sort.
+#[test]
+fn second_pk_column_order_by_elides_under_a_pinned_first_column() {
+    let s = test_schema();
+    let order = |sql: &str| match prepare(sql, &s).unwrap().stmt {
+        PlanStmt::Select(SelectPlan { order_by, .. }) => order_by,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        order("SELECT * FROM orders WHERE user_id = 7 AND item_no > 3 ORDER BY item_no"),
+        vec![]
+    );
+    // No equality pin (a range on the first column): the second-column sort
+    // is NOT scan order and must stay.
+    assert!(!order("SELECT * FROM orders WHERE user_id > 7 ORDER BY item_no").is_empty());
+    // A lone second-column ORDER BY with no predicate stays too.
+    assert!(!order("SELECT * FROM orders ORDER BY item_no").is_empty());
+}

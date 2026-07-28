@@ -636,9 +636,24 @@ pub(super) fn plan_select<'s>(
         access,
         AccessPath::IndexPoint { .. } | AccessPath::IndexRange { .. }
     ) && order_over == OrderOver::BaseRow;
+    // A PkRange whose lo AND hi share the same leading key parts holds those
+    // PK columns CONSTANT across the whole range (both bounds force the
+    // exact prefix; keycode parts are prefix-free per column), so scan order
+    // starts being interesting at the first UNSHARED column — `run_id = $1
+    // AND pk_enc > $2 ORDER BY pk_enc` (#55 phase 2) is satisfied by scan
+    // order exactly like `ORDER BY run_id, pk_enc` would be.
+    let pinned = match &access {
+        AccessPath::PkRange { lo: Some(l), hi: Some(h) } => l
+            .parts
+            .iter()
+            .zip(&h.parts)
+            .take_while(|(a, b)| a == b)
+            .count(),
+        _ => 0,
+    };
     if pk_ordered_access
         && !order_by.is_empty()
-        && order_by.len() <= table.primary_key.len()
+        && order_by.len() <= table.primary_key.len().saturating_sub(pinned)
         && order_by
             .iter()
             .enumerate()
@@ -655,7 +670,7 @@ pub(super) fn plan_select<'s>(
                     // A HOST collation is never satisfied by scan order either —
                     // `native()` is None for one, so this refuses it by shape.
                     && coll.native() == Some(Collation::Binary)
-                    && table.primary_key[k] == *c
+                    && table.primary_key[pinned + k] == *c
             })
     {
         order_by.clear();

@@ -773,18 +773,34 @@ impl CompiledPlan {
                 format!("PkPoint({})", items.join(", "))
             }
             AccessPath::PkRange { lo, hi } => {
-                let first = schema
-                    .table(table)
-                    .and_then(|t| t.primary_key.first().copied())
-                    .unwrap_or(0);
+                // A bound is a key PREFIX: leading parts are equalities, the
+                // LAST part carries the comparison (#55 phase 2: `a = 7 AND
+                // b > $1` is lo = [7, $1] exclusive). Render each part
+                // against ITS pk column, so a two-part bound never reads as
+                // an operator on the first column.
+                let pk_col = |k: usize| {
+                    schema
+                        .table(table)
+                        .and_then(|t| t.primary_key.get(k).copied())
+                        .unwrap_or(0)
+                };
+                let render = |b: &crate::KeyBound, last_op: &str, items: &mut Vec<String>| {
+                    let n = b.parts.len();
+                    for (k, part) in b.parts.iter().enumerate() {
+                        let op = if k + 1 == n { last_op } else { "=" };
+                        items.push(format!(
+                            "{} {op} {}",
+                            col_name(pk_col(k)),
+                            self.render_part_outer(part, outer)
+                        ));
+                    }
+                };
                 let mut items = Vec::new();
                 if let Some(b) = lo {
-                    let op = if b.inclusive { ">=" } else { ">" };
-                    items.push(format!("{} {op} {}", col_name(first), self.render_part_outer(&b.parts[0], outer)));
+                    render(b, if b.inclusive { ">=" } else { ">" }, &mut items);
                 }
                 if let Some(b) = hi {
-                    let op = if b.inclusive { "<=" } else { "<" };
-                    items.push(format!("{} {op} {}", col_name(first), self.render_part_outer(&b.parts[0], outer)));
+                    render(b, if b.inclusive { "<=" } else { "<" }, &mut items);
                 }
                 format!("PkRange({})", items.join(", "))
             }

@@ -208,6 +208,36 @@ pub(super) fn extract_access(
             };
             lo = Some(bound.clone());
             hi = Some(bound);
+            // #55 phase 2: with the first column equality-pinned, a range on
+            // the SECOND PK column extends the corresponding bound by one
+            // key part instead of degrading to a residual filter over the
+            // whole prefix — the difference between O(hits) and O(prefix)
+            // per fetch, which is what RETL's `pk_enc > $last` chunk resume
+            // lives on. The executor's prefix-successor construction gives
+            // the exact SQL semantics for the appended part (see
+            // `range_bounds`); the same `unbounded` rule guards the second
+            // column, because its bound is keycode-encoded raw too.
+            let second = table.primary_key[1];
+            if !unbounded(second) {
+                if let Some((i, op, atom)) = find(&consumed, second, &[BinOp::Gt, BinOp::Ge]) {
+                    consumed[i] = true;
+                    let mut b = lo.take().ok_or_else(|| {
+                        Error::Internal("pk range lo vanished".into())
+                    })?;
+                    b.parts.push(atom.to_key_part(consts)?);
+                    b.inclusive = op == BinOp::Ge;
+                    lo = Some(b);
+                }
+                if let Some((i, op, atom)) = find(&consumed, second, &[BinOp::Lt, BinOp::Le]) {
+                    consumed[i] = true;
+                    let mut b = hi.take().ok_or_else(|| {
+                        Error::Internal("pk range hi vanished".into())
+                    })?;
+                    b.parts.push(atom.to_key_part(consts)?);
+                    b.inclusive = op == BinOp::Le;
+                    hi = Some(b);
+                }
+            }
         }
     }
     if lo.is_none() && hi.is_none() && !unbounded(first_pk) {
