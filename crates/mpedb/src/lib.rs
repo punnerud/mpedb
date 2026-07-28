@@ -3738,7 +3738,7 @@ impl WriteSession<'_> {
     /// VIEW and TRIGGER DDL ride this session's txn (sys-keyspace + schema_gen
     /// in the same COW commit as DML). POLICY / RLS still refuse in-session.
     /// `ANALYZE` / `REINDEX` are accepted no-ops.
-    fn apply_ddl(&mut self, ddl: mpedb_sql::DdlStmt) -> Result<ExecResult> {
+    pub(crate) fn apply_ddl(&mut self, ddl: mpedb_sql::DdlStmt) -> Result<ExecResult> {
         use mpedb_sql::DdlStmt;
         if self.poisoned {
             return Err(poisoned_err());

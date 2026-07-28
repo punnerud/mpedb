@@ -62,8 +62,15 @@ log-based engine), and the hardware published when the hardware is the answer.
   included — in `retl_lineage`, and 100% of rows verified against the source
   hash BEFORE the commit that destroys the source; revert is hash-gated,
   `putback` inverts KEEPING edits — PutRes per row replaces the hash gate,
-  deleted rows stay deleted. Lineage is ordinary TABLES, never sys-keyspace —
-  #124 is why. The Python surface + agent guide is PYSPELL-RETL.md)
+  deleted rows stay deleted. Every pass STREAMS in `pk > last` chunks — no
+  row cap, O(chunk) heap; lineage records a `residual_hash` over the
+  persisted residual set, which fsck re-checks for EVERY standing run
+  (buried included) and revert/putback gate on (a tampered residual survives
+  both PutRes halves — the hash is what catches it). Lineage is ordinary
+  TABLES with RIGID column types built from specs, never SQL text — DDL
+  `BLOB` means TYPELESS, and a typeless `pk_enc` would turn every residual
+  lookup into a filter over the run. Never sys-keyspace — #124 is why. The
+  Python surface + agent guide is PYSPELL-RETL.md)
   + `retl put|get|versions` (blob versioning, retl_store.rs: newest FULL,
   previous rewritten as reverse-delta verified byte-identical AS PERSISTED
   before commit, every 8th a permanent full anchor; a stored full failing its

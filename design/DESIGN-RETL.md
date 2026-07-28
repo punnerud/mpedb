@@ -269,11 +269,18 @@ run's own transaction:
 ```
 retl_lineage   (run_id, step_no) →
               lens_name, forward_hash, rex_hash, inverse_hash,
-              tbl, col, source_hash, output_hash, rows,
+              tbl, col, source_hash, output_hash, residual_hash, rows,
               verified, outcome, error, ts_micros
 
-retl_residual  (run_id, pk) → residual        -- column type Any
+retl_residual  (run_id, pk_enc BLOB) → residual   -- residual column type Any
 ```
+
+Both tables are created from SPECS with RIGID column types, never from SQL
+text: the sqlite-affinity DDL path maps the name `BLOB` to the TYPELESS
+column (correct sqlite semantics), and a typeless key column takes neither
+point probes nor range bounds — every per-row residual lookup would be a
+filter over the whole run. Rigid `Blob` for `pk_enc` is what makes the
+lookup a PkPoint and the chunked resume a composite PkRange (#55 phase 2).
 
 One stable run id per pipeline run (Pachyderm's global-id move) makes multi-step
 lineage a single lookup. blake3 already exists in mpedb. Field decisions, each
@@ -298,6 +305,18 @@ paid for by the 2026-07-28 survey (RETL-BIDI addendum):
   legal and distinct from a MISSING row — reading absence as NULL would smuggle
   the refused creation path `inverse(y, ∅)` (§4) back in as a silent wrong
   answer.
+- **`residual_hash` is the residual set's OWN at-rest identity**: a chain over
+  the persisted `(pk_enc, residual)` rows in `pk_enc` (table-key) order,
+  computed by RE-READING them inside the applying transaction, empty for a
+  run that wrote none. It exists because the residual rows are not
+  user-editable state — edits happen in the column — yet a tampered residual
+  can survive BOTH PutRes halves (mag ⇄ sgn: flip a stored sign and
+  `forward(inverse(y, r')) == y ∧ rex(x') == r'` both hold), which made
+  putback the one door a residual tamper could walk through silently. Now:
+  fsck re-hashes EVERY standing run's residuals against it — buried runs and
+  runs whose table was since dropped included, closing "buried runs are
+  unverifiable at rest" — and revert/putback refuse up front when it no
+  longer matches.
 
 **Positional/path-based correlation is not an option we are weighing.** It was "a
 show-stopper" already in Boomerang, and every mature tool — DVC, Pachyderm,
@@ -603,17 +622,24 @@ deletion, commitment 2; `Bijective` writes lineage only), a row the pair refuses
 ABORTS the run with the row named (silently skipping would reintroduce Cambria's
 grey zone per-row), output type pre-checked against the column's declared type
 (type-changing pairs need an `Any` column; ALTER COLUMN does not exist yet).
-Verification before commit is total (the source is being deleted) at O(1)
+Verification before commit is total (the source is being deleted) at bounded
 memory: `source_hash` = blake3 over PK-ordered `value_bits`-CANONICAL bytes —
 never raw storage bits, or legal NaN canonicalisation produces a false
 "artifact changed" — and the `inverse(y, r)` stream is re-read inside the same
-txn and hashed against it. `revert <run_id>` re-hashes against `output_hash`
-first (mismatch = "artifact changed outside the pipeline", hard error), and a
-new apply on a column with an unreverted run is refused. A pre-flight size
-guard refuses oversized runs with numbers: the single big txn is the design
-(total verification requires it), an OOM-killed apply is deterministic on
-retry, and a named refusal beats an un-completable loop. Apply is an offline
-operation — it holds the writer lock for the duration, and says so.
+txn and hashed against it. `revert <run_id>` gates the residual set against
+`residual_hash`, then re-hashes the column against `output_hash` (mismatch =
+"artifact changed outside the pipeline", hard error); a new apply on a column
+with an unreverted run stacks (LIFO). **Every pass STREAMS in chunks**
+(`pk > last ORDER BY pk LIMIT n` — the same globally-sorted stream the hash
+chains are defined over, resumable because the PK never changes mid-run), so
+heap is O(chunk) whatever the table size and the old 1M-row pre-flight cap is
+gone with the OOM it guarded against; the collision DIAGNOSTIC is bounded
+separately (past the cap, the total verification reports the mismatch with
+degraded naming — fail-safe either way). The remaining bound is file space:
+one txn's COW pages live in the file-backed map, and DbFull is a
+deterministic, named refusal that rolls back whole. Apply is still ONE
+transaction and an offline operation — it holds the writer lock for the
+duration, and says so.
 
 **Stage 3 — the domains. [BUILT 2026-07-28, B-block]** Version storage as
 base+diff: `retl put/get/versions` (`retl_store.rs`) — the newest version

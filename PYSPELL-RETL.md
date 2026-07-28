@@ -187,13 +187,16 @@ report = db.retl_apply("gray", "pixels", "px")
 
 `retl_apply` transforms the column **in place, in one transaction**: it stores
 one residual per row in the `retl_residual` table (keyed `run_id, pk`), records
-the run in `retl_lineage`, and — before the commit that destroys the source —
-re-reads every transformed row and verifies that `inverse(y, r)` reproduces
-the source, hash-exactly, for **100% of rows**. Any failure aborts the whole
-transaction; the column is never half-transformed. Failed runs are recorded in
-the lineage too (`outcome = "failed"`), so `retl_log()` answers "why is this
-column stale". Apply holds the single writer lock for the whole run — treat it
-as an offline operation.
+the run in `retl_lineage` (including a hash of the residual set itself), and —
+before the commit that destroys the source — re-reads every transformed row
+and verifies that `inverse(y, r)` reproduces the source, hash-exactly, for
+**100% of rows**. Any failure aborts the whole transaction; the column is
+never half-transformed. Failed runs are recorded in the lineage too
+(`outcome = "failed"`), so `retl_log()` answers "why is this column stale".
+Every pass streams in bounded chunks, so memory stays flat whatever the table
+size — there is **no row cap**; the practical bound is database file space
+(refused with a named `DbFull`, rolled back whole). Apply holds the single
+writer lock for the whole run — treat it as an offline operation.
 
 Now the data is free to be edited by anyone, with plain SQL:
 
@@ -376,7 +379,7 @@ scale as its own apply with the full source as the residual).
 | `db.retl_revert(run_id)` | same dict | exact undo; hash-gated |
 | `db.retl_putback(run_id)` | same dict | undo through edits; PutRes-verified per row |
 | `db.retl_log()` | list of dicts | all runs, oldest first, failures included |
-| `db.retl_fsck()` | list of finding strings | verify-at-rest: every standing run re-checked (top-run hash, residual coverage, pair loadability) AND every stored version/archive re-materialized against its hash; empty = clean; reports, never repairs |
+| `db.retl_fsck()` | list of finding strings | verify-at-rest: every standing run re-checked (top-run column hash, residual coverage, pair loadability, and the residual SET re-hashed against what the apply wrote — buried runs included) AND every stored version/archive re-materialized against its hash; empty = clean; reports, never repairs |
 | `db.retl_put_version(obj, data)` | version number | blob versioning: newest kept full, the previous newest rewritten as a reverse delta (verified byte-identical before commit), every 8th version stays full |
 | `db.retl_get_version(obj, ver)` | `bytes` | materialize ANY version; every reconstruction step hash-verified — corruption is a named error, never wrong bytes |
 | `db.retl_versions(obj)` | list of dicts | `ver, stored_as ("full"/"delta"), bytes, content_hash` |

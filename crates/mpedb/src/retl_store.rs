@@ -62,16 +62,26 @@ pub struct ArchiveInfo {
     pub content_hash: String,
 }
 
+// Bookkeeping tables come from SPECS with rigid types, not SQL text — see
+// `retl::spec_col` for why (`BLOB` in DDL means the TYPELESS column, which
+// takes neither point probes nor range bounds).
 fn ensure_version_table(
     s: &mut WriteSession<'_>,
     have: &[(String, Vec<String>)],
 ) -> Result<()> {
+    use mpedb_types::ColumnType::{Blob, Int64, Text};
     if !shape_gate(have, T_VERSIONS, &VERSIONS_SHAPE)? {
-        s.query(
-            "CREATE TABLE retl_versions (
-               obj TEXT, ver INTEGER, payload BLOB, content_hash TEXT,
-               ts_micros INTEGER, PRIMARY KEY (obj, ver))",
-            &[],
+        crate::retl::create_bookkeeping(
+            s,
+            T_VERSIONS,
+            vec![
+                crate::retl::spec_col("obj", Text),
+                crate::retl::spec_col("ver", Int64),
+                crate::retl::spec_col("payload", Blob),
+                crate::retl::spec_col("content_hash", Text),
+                crate::retl::spec_col("ts_micros", Int64),
+            ],
+            &["obj", "ver"],
         )?;
     }
     Ok(())
@@ -81,20 +91,33 @@ fn ensure_archive_tables(
     s: &mut WriteSession<'_>,
     have: &[(String, Vec<String>)],
 ) -> Result<()> {
+    use mpedb_types::ColumnType::{Blob, Int64, Text};
     if !shape_gate(have, T_ARCHIVES, &ARCHIVES_SHAPE)? {
-        s.query(
-            "CREATE TABLE retl_archives (
-               archive_id INTEGER PRIMARY KEY, name TEXT, residual BLOB,
-               content_hash TEXT, ts_micros INTEGER)",
-            &[],
+        crate::retl::create_bookkeeping(
+            s,
+            T_ARCHIVES,
+            vec![
+                crate::retl::spec_col("archive_id", Int64),
+                crate::retl::spec_col("name", Text),
+                crate::retl::spec_col("residual", Blob),
+                crate::retl::spec_col("content_hash", Text),
+                crate::retl::spec_col("ts_micros", Int64),
+            ],
+            &["archive_id"],
         )?;
     }
     if !shape_gate(have, T_MEMBERS, &MEMBERS_SHAPE)? {
-        s.query(
-            "CREATE TABLE retl_archive_members (
-               archive_id INTEGER, member_no INTEGER, name BLOB, data BLOB,
-               method INTEGER, PRIMARY KEY (archive_id, member_no))",
-            &[],
+        crate::retl::create_bookkeeping(
+            s,
+            T_MEMBERS,
+            vec![
+                crate::retl::spec_col("archive_id", Int64),
+                crate::retl::spec_col("member_no", Int64),
+                crate::retl::spec_col("name", Blob),
+                crate::retl::spec_col("data", Blob),
+                crate::retl::spec_col("method", Int64),
+            ],
+            &["archive_id", "member_no"],
         )?;
     }
     Ok(())
@@ -133,6 +156,7 @@ fn builtin_lineage(
         column: obj.into(),
         source_hash: content_hash.into(),
         output_hash: content_hash.into(),
+        residual_hash: String::new(),
         rows,
         // Never "applied": revert/putback/stacking all key on that outcome,
         // and a version put is not a column run they could unwind.
@@ -175,17 +199,33 @@ impl crate::Database {
     /// its recorded hash — a hash mismatch anywhere is a hard error naming
     /// the version, never silently wrong bytes.
     pub fn retl_get_version(&self, obj: &str, ver: i64) -> Result<Vec<u8>> {
+        // The nearest full at-or-above `ver` sits at the next FULL_EVERY
+        // anchor or at the newest version, whichever comes first — both are
+        // full BY INVARIANT (anchors are never rewritten; only the newest is,
+        // when it stops being newest). So the fetch is bounded to that window
+        // (≤ FULL_EVERY rows) instead of materialising the whole tail of a
+        // long history. A corrupted anchor inside the window is an error
+        // either way: any later full's delta walk would cross it too.
+        let maxv = rows_of(self.query(
+            "SELECT max(ver) FROM retl_versions WHERE obj = $1",
+            &[Value::Text(obj.into())],
+        )?)?;
+        let maxv = match maxv.first().and_then(|r| r.first()) {
+            Some(Value::Int(m)) => *m,
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "no version {ver} of `{obj}` — `retl versions` lists what exists"
+                )))
+            }
+        };
+        let anchor = ver + (FULL_EVERY - ver.rem_euclid(FULL_EVERY)) % FULL_EVERY;
+        let bound = anchor.min(maxv);
         let rows = rows_of(self.query(
             "SELECT ver, payload, content_hash FROM retl_versions WHERE obj = $1 \
-             AND ver >= $2 ORDER BY ver",
-            &[Value::Text(obj.into()), Value::Int(ver)],
+             AND ver >= $2 AND ver <= $3 ORDER BY ver",
+            &[Value::Text(obj.into()), Value::Int(ver), Value::Int(bound)],
         )?)?;
-        if rows.is_empty() {
-            return Err(Error::Unsupported(format!(
-                "no version {ver} of `{obj}` — `retl versions` lists what exists"
-            )));
-        }
-        if as_int(&rows[0][0])? != ver {
+        if rows.is_empty() || as_int(&rows[0][0])? != ver {
             return Err(Error::Unsupported(format!("no version {ver} of `{obj}`")));
         }
         // Find the nearest full at-or-above `ver`.
@@ -570,6 +610,7 @@ fn pack_in_in(
         column: name.into(),
         source_hash: content_hash.clone(),
         output_hash: content_hash,
+        residual_hash: String::new(),
         rows: n_members,
         outcome: "packed",
         error: String::new(),

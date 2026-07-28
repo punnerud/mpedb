@@ -305,8 +305,12 @@ fn a_missing_residual_row_is_a_hard_error() {
     .unwrap();
     s.commit().unwrap();
 
+    // The residual GATE catches the deletion before any per-row read: the
+    // stored set no longer hashes to what the apply recorded. (The per-row
+    // missing-row check still stands behind it, for invariant breaks inside
+    // the writing transaction itself.)
     let e = d.retl_revert(report.run_id).unwrap_err().to_string();
-    assert!(e.contains("residual row missing"), "{e}");
+    assert!(e.contains("no longer hash"), "{e}");
     assert!(e.contains("fabricate"), "{e}");
     // And nothing was half-reverted: the abort rolled the whole txn back.
     assert_eq!(col_v(&d), vec![5, 3]);
@@ -1300,5 +1304,167 @@ fn the_guides_zero_table_setup_carries_a_full_retl_loop() {
         })
         .collect();
     assert_eq!(got, vec![-9, 4, -1], "edit carried back through the sign residual");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A tampered residual VALUE is the putback attack the residual gate exists
+/// for: with mag ⇄ sgn, flipping a stored sign bit survives BOTH PutRes
+/// halves (forward(inverse(y, r')) == y and rex(x') == r' both hold), so
+/// before the gate, putback would silently restore a sign the user never
+/// flipped. Now the run's residual set must hash to what the apply wrote.
+#[test]
+fn a_tampered_residual_is_refused_by_revert_putback_and_named_by_fsck() {
+    let (d, path) = db("resgate");
+    define_abs_pair(&d);
+    seed(&d, &[-5, 3]);
+    let run = d.retl_apply("mag", "t", "v").unwrap();
+    assert!(d.retl_fsck().unwrap().is_empty());
+
+    // Flip every stored sign to 0 — row 0's residual changes 1 -> 0.
+    let mut s = d.begin().unwrap();
+    s.query(
+        "UPDATE retl_residual SET residual = $1 WHERE run_id = $2",
+        &[Value::Int(0), Value::Int(run.run_id)],
+    )
+    .unwrap();
+    s.commit().unwrap();
+
+    let e = d.retl_putback(run.run_id).unwrap_err().to_string();
+    assert!(e.contains("no longer hash") && e.contains("putback"), "{e}");
+    let e = d.retl_revert(run.run_id).unwrap_err().to_string();
+    assert!(e.contains("no longer hash") && e.contains("reverting"), "{e}");
+    let findings = d.retl_fsck().unwrap();
+    assert!(
+        findings.iter().any(|f| f.contains(&format!("run {}", run.run_id))
+            && f.contains("no longer hash")),
+        "{findings:?}"
+    );
+    // The column itself is untouched by all three refusals.
+    assert_eq!(col_v(&d), vec![5, 3]);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A BURIED run's residuals are now verified at rest: fsck re-hashes every
+/// standing run's residual set against the chain its apply recorded — the
+/// buried run needs no oracle for its (long transformed away) column, but
+/// its residuals are still its own.
+#[test]
+fn fsck_names_a_buried_runs_tampered_residuals() {
+    let (d, path) = db("buried");
+    define_abs_pair(&d);
+    def(&d, "def flip(x):\n    return -x\n");
+    d.create_lens("flip", "flip", "flip", LensClass::Bijective).unwrap();
+    seed(&d, &[-5, 3]);
+
+    let run1 = d.retl_apply("mag", "t", "v").unwrap();
+    let run2 = d.retl_apply("flip", "t", "v").unwrap();
+    assert!(d.retl_fsck().unwrap().is_empty(), "buried but untampered = clean");
+
+    let mut s = d.begin().unwrap();
+    s.query(
+        "UPDATE retl_residual SET residual = $1 WHERE run_id = $2",
+        &[Value::Int(0), Value::Int(run1.run_id)],
+    )
+    .unwrap();
+    s.commit().unwrap();
+
+    let findings = d.retl_fsck().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].contains(&format!("run {}", run1.run_id)), "{}", findings[0]);
+    assert!(findings[0].contains("no longer hash"), "{}", findings[0]);
+
+    // The LIFO unwind hits the gate at the right moment too: run2 (bijective,
+    // no residuals) reverts fine; run1 then refuses.
+    d.retl_revert(run2.run_id).unwrap();
+    let e = d.retl_revert(run1.run_id).unwrap_err().to_string();
+    assert!(e.contains("no longer hash"), "{e}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The streaming scans cross chunk boundaries without skipping, repeating or
+/// reordering a row: with the chunk forced tiny, a 100-row apply → edit →
+/// putback → revert loop must land byte-exact. Duplicates included — resume
+/// is `pk > last` on the PK, not on values.
+#[test]
+fn scans_cross_chunk_boundaries_exactly() {
+    // Chunk 7 makes every pass straddle many uneven boundaries. The variable
+    // is read per call, and a different chunk size never changes RESULTS for
+    // any concurrently running test — only how many rows each fetch carries.
+    std::env::set_var("MPEDB_RETL_CHUNK", "7");
+    let (d, path) = db("chunky");
+    define_abs_pair(&d);
+    let vals: Vec<i64> = (0..100).map(|i| ((i % 13) - 6) * (1 + (i % 3))).collect();
+    seed(&d, &vals);
+
+    let run = d.retl_apply("mag", "t", "v").unwrap();
+    let want: Vec<i64> = vals.iter().map(|v| v.abs()).collect();
+    assert_eq!(col_v(&d), want, "forward across boundaries");
+
+    // Edit one magnitude mid-table, putback: the edit rides the sign home.
+    let mut s = d.begin().unwrap();
+    s.query("UPDATE t SET v = 99 WHERE id = 50", &[]).unwrap();
+    s.commit().unwrap();
+    d.retl_putback(run.run_id).unwrap();
+    let mut expect = vals.clone();
+    expect[50] = if vals[50] < 0 { -99 } else { 99 };
+    assert_eq!(col_v(&d), expect, "putback across boundaries, edit carried");
+
+    // A fresh apply + exact revert over the same tiny chunks.
+    let run2 = d.retl_apply("mag", "t", "v").unwrap();
+    d.retl_revert(run2.run_id).unwrap();
+    assert_eq!(col_v(&d), expect, "revert across boundaries is exact");
+    assert!(d.retl_fsck().unwrap().is_empty());
+    std::env::remove_var("MPEDB_RETL_CHUNK");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Adversarial resume keys: TEXT PKs where one value is a byte-PREFIX of
+/// another (`"a"`, `"aa"`, `"ab"`). The chunk resume (`pk > last`) and the
+/// residual chain both live on keycode's prefix-freedom per column — with a
+/// tiny chunk, a full apply → putback → revert loop must stay byte-exact.
+#[test]
+fn text_pks_that_prefix_each_other_survive_chunked_scans() {
+    std::env::set_var("MPEDB_RETL_CHUNK", "2");
+    let path = format!(
+        "{}/retl-textpk-{}.mpedb",
+        mpedb_testkit::scratch_base_str(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 32\nmax_readers = 8\n\
+         durability = \"none\"\n"
+    );
+    let d = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    d.query("CREATE TABLE t2 (k TEXT PRIMARY KEY, v ANY)", &[]).unwrap();
+    let keys = ["a", "aa", "ab", "aaa", "b", "ba"];
+    let vals = [-3i64, 4, -1, 7, -9, 2];
+    let mut s = d.begin().unwrap();
+    for (k, v) in keys.iter().zip(vals.iter()) {
+        s.query(
+            "INSERT INTO t2 (k, v) VALUES ($1, $2)",
+            &[Value::Text((*k).into()), Value::Int(*v)],
+        )
+        .unwrap();
+    }
+    s.commit().unwrap();
+    define_abs_pair(&d);
+
+    let run = d.retl_apply("mag", "t2", "v").unwrap();
+    let got = |d: &Database| -> Vec<i64> {
+        rows(d.query("SELECT v FROM t2 ORDER BY k", &[]).unwrap())
+            .into_iter()
+            .map(|r| match &r[0] {
+                Value::Int(i) => *i,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    // ORDER BY k: a, aa, aaa, ab, b, ba -> |v| in that key order.
+    assert_eq!(got(&d), vec![3, 4, 7, 1, 9, 2]);
+    d.retl_revert(run.run_id).unwrap();
+    assert_eq!(got(&d), vec![-3, 4, 7, -1, -9, 2]);
+    assert!(d.retl_fsck().unwrap().is_empty());
+    std::env::remove_var("MPEDB_RETL_CHUNK");
     let _ = std::fs::remove_file(&path);
 }

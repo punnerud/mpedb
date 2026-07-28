@@ -44,12 +44,33 @@ pub const T_RESIDUAL: &str = "retl_residual";
 /// was verified, never a bare "verified"). Apply always runs `total`.
 const VERIFIED_TOTAL: i64 = 2;
 
-/// Pre-flight row cap. One run is one transaction BY DESIGN (total
-/// verification requires it), so an oversized apply would be OOM-killed —
-/// deterministically, on every retry (§12.2 attack 4). A named refusal with
-/// numbers beats an un-completable loop; chunked commits are NOT the fix
-/// (they break verify-before-source-deletion).
-const MAX_RETL_ROWS: u64 = 1_000_000;
+/// Rows per streaming chunk. One run is still ONE transaction BY DESIGN
+/// (total verification before the source dies requires it — chunked COMMITS
+/// are not a fix), but no pass materialises more than one chunk: scans
+/// resume with `pk > last ORDER BY pk LIMIT n`, which yields the exact same
+/// globally-sorted stream the hash chains were defined over. Heap is O(chunk)
+/// regardless of table size; the dirtied pages live in the file-backed map,
+/// not the heap. The old 1M-row pre-flight cap (§12.2 attack 4) is GONE with
+/// the OOM it guarded against — the remaining bound is file space, and
+/// DbFull is already a deterministic, named refusal that rolls back whole.
+///
+/// The env override is a TEST hook: chunk-boundary resume logic must be
+/// exercised without million-row fixtures.
+const RETL_CHUNK_DEFAULT: usize = 4096;
+
+fn chunk_rows() -> usize {
+    std::env::var("MPEDB_RETL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(RETL_CHUNK_DEFAULT)
+}
+
+/// The collision DIAGNOSTIC is bounded: past this many distinct images the
+/// map stops growing and a later mismatch is reported by the total
+/// verification instead (fail-safe either way — this only trades message
+/// quality for bounded memory on huge tables).
+const COLLISION_DIAG_CAP: usize = 1 << 20;
 
 /// What a run did, as `retl apply`/`retl revert` report it.
 #[derive(Debug)]
@@ -112,6 +133,10 @@ struct Target {
 
 impl crate::Database {
     fn resolve_target(&self, table: &str, column: &str) -> Result<Target> {
+        // Same freshness rule as committed_tables(): this runs BEFORE any SQL
+        // compilation or txn begin has refreshed the cached bundle, and a
+        // stale read here would miss a table this very handle just created.
+        self.engine.refresh_schema_if_stale()?;
         if [T_LINEAGE, T_RESIDUAL, crate::retl_store::T_VERSIONS, crate::retl_store::T_ARCHIVES, crate::retl_store::T_MEMBERS]
             .contains(&table)
         {
@@ -204,6 +229,7 @@ impl crate::Database {
             column: column.into(),
             source_hash: String::new(),
             output_hash: String::new(),
+            residual_hash: String::new(),
             rows: 0,
             outcome: "failed",
             error: e.to_string(),
@@ -287,7 +313,7 @@ impl crate::Database {
         }
         let mut findings = Vec::new();
         let runs = rows_of(self.query(
-            "SELECT run_id, lens, tbl, col, output_hash FROM retl_lineage \
+            "SELECT run_id, lens, tbl, col, output_hash, residual_hash FROM retl_lineage \
              WHERE outcome = 'applied' ORDER BY run_id",
             &[],
         )?)?;
@@ -298,8 +324,19 @@ impl crate::Database {
         }
         for r in &runs {
             let (run_id, pair) = (as_int(&r[0])?, as_text(&r[1]));
-            let (table, column, want_hash) =
-                (as_text(&r[2]), as_text(&r[3]), as_text(&r[4]));
+            let (table, column, want_hash, want_residuals) =
+                (as_text(&r[2]), as_text(&r[3]), as_text(&r[4]), as_text(&r[5]));
+            // The residual set is checked FIRST and against the run's OWN
+            // recorded chain — it needs neither the pair nor the target, so
+            // BURIED runs and runs whose table was since dropped are covered
+            // at rest, not first at unwind.
+            let (got_residuals, _) = residual_chain_ro(self, run_id)?;
+            if got_residuals != want_residuals {
+                findings.push(format!(
+                    "run {run_id}: its stored residuals no longer hash to what the apply \
+                     wrote — tampered or deleted at rest; unwinding would fabricate data"
+                ));
+            }
             let lens = match self.load_lens_for_retl(&pair) {
                 Ok(l) => Some(l),
                 Err(e) => {
@@ -320,18 +357,12 @@ impl crate::Database {
                 }
             };
             let pk_col = &target.pk_col;
-            let rows = rows_of(self.query(
-                &format!(
-                    "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" \
-                     ORDER BY \"{pk_col}\""
-                ),
-                &[],
-            )?)?;
             if top_for.get(&(table.clone(), column.clone())) == Some(&run_id) {
                 let mut c = CanonChain::new();
-                for row in &rows {
-                    c.push(&row[1]);
-                }
+                scan_pairs_ro(self, &table, pk_col, &column, |_, y| {
+                    c.push(y);
+                    Ok(())
+                })?;
                 if c.hex() != want_hash {
                     findings.push(format!(
                         "run {run_id}: `{table}.{column}` no longer hashes to the run's \
@@ -341,8 +372,7 @@ impl crate::Database {
                 }
             }
             if lens.as_ref().map(|l| l.rex.is_some()).unwrap_or(false) {
-                for row in &rows {
-                    let pk = &row[0];
+                scan_pairs_ro(self, &table, pk_col, &column, |pk, _| {
                     let res = rows_of(self.query(
                         "SELECT count(*) FROM retl_residual \
                          WHERE run_id = $1 AND pk_enc = $2",
@@ -355,7 +385,8 @@ impl crate::Database {
                              is impossible"
                         ));
                     }
-                }
+                    Ok(())
+                })?;
             }
         }
         crate::retl_store::fsck_stores(self, &mut findings)?;
@@ -415,9 +446,10 @@ pub(crate) fn as_text(v: &Value) -> String {
 /// table that merely shares the NAME is refused by name here, up front —
 /// the alternative (adversarial-check finding 20) is a mid-run bind error at
 /// best and inserts into compatible-but-wrong columns at worst.
-const LINEAGE_SHAPE: [&str; 15] = [
+const LINEAGE_SHAPE: [&str; 16] = [
     "run_id", "step_no", "lens", "forward_hash", "rex_hash", "inverse_hash", "tbl", "col",
-    "source_hash", "output_hash", "rows", "verified", "outcome", "error", "ts_micros",
+    "source_hash", "output_hash", "residual_hash", "rows", "verified", "outcome", "error",
+    "ts_micros",
 ];
 const RESIDUAL_SHAPE: [&str; 3] = ["run_id", "pk_enc", "residual"];
 
@@ -445,29 +477,86 @@ pub(crate) fn ensure_lineage_tables(
     ensure_tables_from(s, have)
 }
 
+/// One RIGIDLY-typed column for a bookkeeping table. The tables are created
+/// from SPECS, not SQL text, because the sqlite-affinity DDL path maps the
+/// name `BLOB` to the TYPELESS column (sqlite semantics, correctly) — and a
+/// typeless key column takes neither point probes nor range bounds (the
+/// planner's `typeless` guard, for good reasons that do not apply to a
+/// column only this module ever writes). Rigid `Blob` for `pk_enc` is what
+/// turns every per-row residual lookup into a PkPoint and the chunk resume
+/// into a composite PkRange.
+pub(crate) fn spec_col(name: &str, ty: ColumnType) -> mpedb_sql::CreateColumnSpec {
+    mpedb_sql::CreateColumnSpec {
+        name: name.into(),
+        ty,
+        affinity: mpedb_types::Affinity::implied_by(ty),
+        decl: if ty == ColumnType::Any { None } else { Some(ty.name().into()) },
+        not_null: false,
+        unique: false,
+        pk: false,
+        collation: mpedb_types::Collation::Binary,
+        default: None,
+        check: None,
+        generated: None,
+    }
+}
+
+pub(crate) fn create_bookkeeping(
+    s: &mut WriteSession<'_>,
+    name: &str,
+    columns: Vec<mpedb_sql::CreateColumnSpec>,
+    pk: &[&str],
+) -> Result<()> {
+    s.apply_ddl(mpedb_sql::DdlStmt::CreateTable(mpedb_sql::CreateTableSpec {
+        name: name.into(),
+        columns,
+        table_pk: pk.iter().map(|c| (*c).to_string()).collect(),
+        uniques: Vec::new(),
+        checks: Vec::new(),
+    }))?;
+    Ok(())
+}
+
 fn ensure_tables_from(
     s: &mut WriteSession<'_>,
     have: &[(String, Vec<String>)],
 ) -> Result<()> {
+    use ColumnType::{Any, Int64, Text};
     if !shape_gate(have, T_LINEAGE, &LINEAGE_SHAPE)? {
-        s.query(
-            "CREATE TABLE retl_lineage (
-               run_id INTEGER, step_no INTEGER,
-               lens TEXT, forward_hash TEXT, rex_hash TEXT, inverse_hash TEXT,
-               tbl TEXT, col TEXT,
-               source_hash TEXT, output_hash TEXT,
-               rows INTEGER, verified INTEGER,
-               outcome TEXT, error TEXT, ts_micros INTEGER,
-               PRIMARY KEY (run_id, step_no))",
-            &[],
+        create_bookkeeping(
+            s,
+            T_LINEAGE,
+            vec![
+                spec_col("run_id", Int64),
+                spec_col("step_no", Int64),
+                spec_col("lens", Text),
+                spec_col("forward_hash", Text),
+                spec_col("rex_hash", Text),
+                spec_col("inverse_hash", Text),
+                spec_col("tbl", Text),
+                spec_col("col", Text),
+                spec_col("source_hash", Text),
+                spec_col("output_hash", Text),
+                spec_col("residual_hash", Text),
+                spec_col("rows", Int64),
+                spec_col("verified", Int64),
+                spec_col("outcome", Text),
+                spec_col("error", Text),
+                spec_col("ts_micros", Int64),
+            ],
+            &["run_id", "step_no"],
         )?;
     }
     if !shape_gate(have, T_RESIDUAL, &RESIDUAL_SHAPE)? {
-        s.query(
-            "CREATE TABLE retl_residual (
-               run_id INTEGER, pk_enc BLOB, residual,
-               PRIMARY KEY (run_id, pk_enc))",
-            &[],
+        create_bookkeeping(
+            s,
+            T_RESIDUAL,
+            vec![
+                spec_col("run_id", Int64),
+                spec_col("pk_enc", ColumnType::Blob),
+                spec_col("residual", Any),
+            ],
+            &["run_id", "pk_enc"],
         )?;
     }
     Ok(())
@@ -516,6 +605,11 @@ pub(crate) struct LineageRow {
     pub(crate) column: String,
     pub(crate) source_hash: String,
     pub(crate) output_hash: String,
+    /// Chain over the run's persisted `(pk_enc, residual)` rows in `pk_enc`
+    /// order; empty for runs that wrote none. The at-rest oracle for what
+    /// apply stored — fsck checks it for EVERY standing run, buried included,
+    /// and revert/putback refuse when it no longer matches.
+    pub(crate) residual_hash: String,
     pub(crate) rows: i64,
     pub(crate) outcome: &'static str,
     pub(crate) error: String,
@@ -525,9 +619,9 @@ impl LineageRow {
     pub(crate) fn insert(&self, s: &mut WriteSession<'_>) -> Result<()> {
         s.query(
             "INSERT INTO retl_lineage (run_id, step_no, lens, forward_hash, rex_hash, \
-             inverse_hash, tbl, col, source_hash, output_hash, rows, verified, outcome, \
-             error, ts_micros) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-             $12, $13, $14)",
+             inverse_hash, tbl, col, source_hash, output_hash, residual_hash, rows, \
+             verified, outcome, error, ts_micros) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, \
+             $8, $9, $10, $11, $12, $13, $14, $15)",
             &[
                 Value::Int(self.run_id),
                 Value::Text(self.lens.clone()),
@@ -538,6 +632,7 @@ impl LineageRow {
                 Value::Text(self.column.clone()),
                 Value::Text(self.source_hash.clone()),
                 Value::Text(self.output_hash.clone()),
+                Value::Text(self.residual_hash.clone()),
                 Value::Int(self.rows),
                 Value::Int(VERIFIED_TOTAL),
                 Value::Text(self.outcome.into()),
@@ -551,6 +646,192 @@ impl LineageRow {
 
 fn call1(p: &Arc<Proc>, x: &Value) -> Result<Value> {
     crate::spellfn::call_spell_fn(p, std::slice::from_ref(x))
+}
+
+/// Stream `(pk, column)` over `table` in PK order, one bounded chunk at a
+/// time, calling `f` per row. `f` gets the session back so it can write —
+/// updates land BEHIND the scan position (the PK never changes; transforming
+/// it is refused), so resume-by-`pk > last` never revisits or skips a row.
+fn scan_pairs(
+    s: &mut WriteSession<'_>,
+    table: &str,
+    pk_col: &str,
+    column: &str,
+    mut f: impl FnMut(&mut WriteSession<'_>, &Value, &Value) -> Result<()>,
+) -> Result<u64> {
+    let chunk = chunk_rows();
+    let first = format!(
+        "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" ORDER BY \"{pk_col}\" LIMIT {chunk}"
+    );
+    let next = format!(
+        "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" WHERE \"{pk_col}\" > $1 \
+         ORDER BY \"{pk_col}\" LIMIT {chunk}"
+    );
+    let mut last: Option<Value> = None;
+    let mut n = 0u64;
+    loop {
+        let rows = match &last {
+            None => rows_of(s.query(&first, &[])?)?,
+            Some(pk) => rows_of(s.query(&next, std::slice::from_ref(pk))?)?,
+        };
+        let got = rows.len();
+        if got == 0 {
+            return Ok(n);
+        }
+        for row in &rows {
+            f(s, &row[0], &row[1])?;
+            n += 1;
+        }
+        last = Some(rows[got - 1][0].clone());
+        if got < chunk {
+            return Ok(n);
+        }
+    }
+}
+
+/// Stream `(pk_enc, residual)` for one run out of `retl_residual`, in
+/// `pk_enc` (memcmp) order — the table's OWN key order, which is what the
+/// lineage `residual_hash` chain is defined over. `pk_enc` order and pk
+/// VALUE order genuinely differ (value_bits are not keycode), which is why
+/// every producer and consumer of the chain reads the TABLE, never re-sorts.
+fn scan_residuals(
+    s: &mut WriteSession<'_>,
+    run_id: i64,
+    mut f: impl FnMut(&Value, &Value) -> Result<()>,
+) -> Result<u64> {
+    let chunk = chunk_rows();
+    let first = format!(
+        "SELECT pk_enc, residual FROM retl_residual WHERE run_id = $1 \
+         ORDER BY pk_enc LIMIT {chunk}"
+    );
+    let next = format!(
+        "SELECT pk_enc, residual FROM retl_residual WHERE run_id = $1 AND pk_enc > $2 \
+         ORDER BY pk_enc LIMIT {chunk}"
+    );
+    let mut last: Option<Value> = None;
+    let mut n = 0u64;
+    loop {
+        let rows = match &last {
+            None => rows_of(s.query(&first, &[Value::Int(run_id)])?)?,
+            Some(pk) => rows_of(s.query(&next, &[Value::Int(run_id), pk.clone()])?)?,
+        };
+        let got = rows.len();
+        if got == 0 {
+            return Ok(n);
+        }
+        for row in &rows {
+            f(&row[0], &row[1])?;
+            n += 1;
+        }
+        last = Some(rows[got - 1][0].clone());
+        if got < chunk {
+            return Ok(n);
+        }
+    }
+}
+
+/// The `residual_hash` chain for `run_id`, from the PERSISTED rows (the row
+/// codec is inside the trust boundary, so it is inside the hash). Empty
+/// string when the run wrote no residuals is the bijective convention.
+fn residual_chain(s: &mut WriteSession<'_>, run_id: i64) -> Result<(String, u64)> {
+    let mut chain = CanonChain::new();
+    let n = scan_residuals(s, run_id, |pk_enc, r| {
+        chain.push(pk_enc);
+        chain.push(r);
+        Ok(())
+    })?;
+    Ok(if n == 0 { (String::new(), 0) } else { (chain.hex(), n) })
+}
+
+/// Read-only sibling of [`scan_pairs`] for fsck, which must not take the
+/// writer lock.
+fn scan_pairs_ro(
+    db: &crate::Database,
+    table: &str,
+    pk_col: &str,
+    column: &str,
+    mut f: impl FnMut(&Value, &Value) -> Result<()>,
+) -> Result<u64> {
+    let chunk = chunk_rows();
+    let first = format!(
+        "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" ORDER BY \"{pk_col}\" LIMIT {chunk}"
+    );
+    let next = format!(
+        "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" WHERE \"{pk_col}\" > $1 \
+         ORDER BY \"{pk_col}\" LIMIT {chunk}"
+    );
+    let mut last: Option<Value> = None;
+    let mut n = 0u64;
+    loop {
+        let rows = match &last {
+            None => rows_of(db.query(&first, &[])?)?,
+            Some(pk) => rows_of(db.query(&next, std::slice::from_ref(pk))?)?,
+        };
+        let got = rows.len();
+        if got == 0 {
+            return Ok(n);
+        }
+        for row in &rows {
+            f(&row[0], &row[1])?;
+            n += 1;
+        }
+        last = Some(rows[got - 1][0].clone());
+        if got < chunk {
+            return Ok(n);
+        }
+    }
+}
+
+/// Read-only sibling of [`residual_chain`] for fsck.
+fn residual_chain_ro(db: &crate::Database, run_id: i64) -> Result<(String, u64)> {
+    let chunk = chunk_rows();
+    let first = format!(
+        "SELECT pk_enc, residual FROM retl_residual WHERE run_id = $1 \
+         ORDER BY pk_enc LIMIT {chunk}"
+    );
+    let next = format!(
+        "SELECT pk_enc, residual FROM retl_residual WHERE run_id = $1 AND pk_enc > $2 \
+         ORDER BY pk_enc LIMIT {chunk}"
+    );
+    let mut chain = CanonChain::new();
+    let mut last: Option<Value> = None;
+    let mut n = 0u64;
+    loop {
+        let rows = match &last {
+            None => rows_of(db.query(&first, &[Value::Int(run_id)])?)?,
+            Some(pk) => rows_of(db.query(&next, &[Value::Int(run_id), pk.clone()])?)?,
+        };
+        let got = rows.len();
+        if got == 0 {
+            return Ok(if n == 0 { (String::new(), 0) } else { (chain.hex(), n) });
+        }
+        for row in &rows {
+            chain.push(&row[0]);
+            chain.push(&row[1]);
+            n += 1;
+        }
+        last = Some(rows[got - 1][0].clone());
+        if got < chunk {
+            return Ok((chain.hex(), n));
+        }
+    }
+}
+
+/// The at-rest residual integrity gate shared by revert and putback: the
+/// residual rows are NOT user-editable state — edits happen in the column —
+/// so the set must hash to exactly what the apply wrote. Without this, a
+/// tampered residual can survive BOTH PutRes halves (mag/sgn: flip the
+/// stored sign bit and forward(inverse(y, r')) == y ∧ rex(x') == r' both
+/// hold) and putback silently restores a value the user never had.
+fn residual_gate(s: &mut WriteSession<'_>, run_id: i64, want: &str, verb: &str) -> Result<()> {
+    let (got, _) = residual_chain(s, run_id)?;
+    if got != want {
+        return Err(Error::Corrupt(format!(
+            "run {run_id}'s residuals no longer hash to what the apply wrote — \
+             tampered or deleted at rest; {verb} would fabricate data, refused"
+        )));
+    }
+    Ok(())
 }
 
 /// The apply body, inside the caller's transaction. Returns the report and the
@@ -572,32 +853,21 @@ fn apply_in(
     // The discipline lives on the way DOWN instead: revert/putback unwind
     // strictly LIFO — see `lifo_gate`.
 
-    // Pre-flight size guard BEFORE materialising anything (§12.2 attack 4).
-    let count = rows_of(s.query(&format!("SELECT count(*) FROM \"{table}\""), &[])?)?;
-    let n = as_int(&count[0][0])? as u64;
-    if n > MAX_RETL_ROWS {
-        return Err(Error::Unsupported(format!(
-            "`{table}` has {n} rows; retl apply is one transaction by design (total \
-             verification before the source is destroyed) and caps at {MAX_RETL_ROWS} \
-             rows — an over-sized run would be OOM-killed deterministically on every retry"
-        )));
-    }
-
     let run_id = next_run_id(s)?;
     let pk_col = &target.pk_col;
-    let rows = rows_of(s.query(
-        &format!("SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" ORDER BY \"{pk_col}\""),
-        &[],
-    )?)?;
 
+    // Pass 1, streaming (O(chunk) heap regardless of table size): transform,
+    // persist, and chain — the chains see the same pk-ordered stream a
+    // one-shot scan would produce, because chunk resume is `pk > last` on a
+    // key the run never changes.
     let update = format!("UPDATE \"{table}\" SET \"{column}\" = $1 WHERE \"{pk_col}\" = $2");
     let mut source = CanonChain::new();
     let mut output = CanonChain::new();
-    let mut seen: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(rows.len());
+    let mut seen: std::collections::HashMap<[u8; 32], Vec<u8>> = std::collections::HashMap::new();
+    let mut diag_capped = false;
     let mut residuals = 0u64;
 
-    for row in &rows {
-        let (pk, x) = (&row[0], &row[1]);
+    let n_rows = scan_pairs(s, table, pk_col, column, |s, pk, x| {
         // A row the pair refuses ABORTS the whole run, with the row named.
         // Skipping it would leave transformed and untransformed values
         // indistinguishable in one column — Cambria's grey zone, per-row.
@@ -634,7 +904,9 @@ fn apply_in(
         // DIFFERENT sources land on one image — that is the unrecoverable
         // case. So the key maps to the source bits, and only a source
         // MISMATCH aborts. (Without this, any column with duplicate values
-        // could never be applied at all.)
+        // could never be applied at all.) The map is bounded: past the cap
+        // the DIAGNOSTIC stops growing and the total verification below is
+        // what reports a real collision — fail-safe either way.
         let key = {
             let mut c = CanonChain::new();
             c.push(&y);
@@ -644,7 +916,7 @@ fn apply_in(
             *c.0.finalize().as_bytes()
         };
         let x_bits = crate::lens::value_bits(x);
-        if let Some((_, prev_x)) = seen.iter().find(|(k, _)| *k == key) {
+        if let Some(prev_x) = seen.get(&key) {
             if *prev_x != x_bits {
                 return Err(Error::Unsupported(format!(
                     "`{pair}` maps two DIFFERENT source values of `{table}.{column}` to \
@@ -652,8 +924,10 @@ fn apply_in(
                      run is aborted (row {pk:?})"
                 )));
             }
+        } else if seen.len() < COLLISION_DIAG_CAP {
+            seen.insert(key, x_bits);
         } else {
-            seen.push((key, x_bits));
+            diag_capped = true;
         }
 
         source.push(x);
@@ -670,24 +944,20 @@ fn apply_in(
             )?;
             residuals += 1;
         }
-    }
+        Ok(())
+    })?;
     let source_hash = source.hex();
     let output_hash = output.hex();
 
-    // TOTAL verification before the commit that deletes the source
+    // Pass 2 — TOTAL verification before the commit that deletes the source
     // (commitment 4). Re-read what was PERSISTED — the column and the residual
     // rows — inside the same transaction, and hash the inverse stream against
-    // the source hash. O(1) memory; Lepton's discipline without holding the
-    // originals. This also runs for Bijective pairs: it is the Hermes
+    // the source hash. O(chunk) memory; Lepton's discipline without holding
+    // the originals. This also runs for Bijective pairs: it is the Hermes
     // zero-check in database form — the residual-free claim is asserted on
     // every real row, not only on the probe corpus.
-    let back_rows = rows_of(s.query(
-        &format!("SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" ORDER BY \"{pk_col}\""),
-        &[],
-    )?)?;
     let mut back = CanonChain::new();
-    for row in &back_rows {
-        let (pk, y) = (&row[0], &row[1]);
+    scan_pairs(s, table, pk_col, column, |s, pk, y| {
         let x = match &lens.rex {
             Some(_) => {
                 let res = rows_of(s.query(
@@ -707,17 +977,31 @@ fn apply_in(
             None => call1(&lens.inverse, y)?,
         };
         back.push(&x);
-    }
+        Ok(())
+    })?;
     if back.hex() != source_hash {
+        let hint = if diag_capped {
+            " (the collision diagnostic was capped on this table; a many-to-one \
+             image is one possible cause)"
+        } else {
+            ""
+        };
         return Err(Error::Corrupt(format!(
             "total verification FAILED: inverse of the transformed `{table}.{column}` does \
-             not reproduce the source (run {run_id}); the transaction is rolled back and \
-             the column is untouched"
+             not reproduce the source (run {run_id}){hint}; the transaction is rolled back \
+             and the column is untouched"
         )));
     }
 
+    // Pass 3 — the residual set's OWN identity, from the persisted rows in
+    // pk_enc order (the residual table's key order). It is what fsck verifies
+    // at rest for buried runs, and what revert/putback gate on before
+    // trusting a single residual — see `residual_gate` for the attack it
+    // closes.
+    let (residual_hash, _) = residual_chain(s, run_id)?;
+
     Ok((
-        RetlReport { run_id, rows: rows.len() as u64, residuals },
+        RetlReport { run_id, rows: n_rows, residuals },
         LineageRow {
             run_id,
             lens: pair.into(),
@@ -728,7 +1012,8 @@ fn apply_in(
             column: column.into(),
             source_hash,
             output_hash,
-            rows: rows.len() as i64,
+            residual_hash,
+            rows: n_rows as i64,
             outcome: "applied",
             error: String::new(),
         },
@@ -776,8 +1061,8 @@ fn revert_in(
     // The lineage row is the residuals' meaning (§8.2): missing row = hard
     // error, never a NULL read.
     let lin = rows_of(s.query(
-        "SELECT lens, tbl, col, source_hash, output_hash, outcome FROM retl_lineage \
-         WHERE run_id = $1 AND step_no = 1",
+        "SELECT lens, tbl, col, source_hash, output_hash, outcome, residual_hash \
+         FROM retl_lineage WHERE run_id = $1 AND step_no = 1",
         &[Value::Int(run_id)],
     )?)?;
     let Some(lin) = lin.into_iter().next() else {
@@ -789,6 +1074,7 @@ fn revert_in(
     let (pair, table, column) = (as_text(&lin[0]), as_text(&lin[1]), as_text(&lin[2]));
     let (source_hash, output_hash, outcome) =
         (as_text(&lin[3]), as_text(&lin[4]), as_text(&lin[5]));
+    let residual_hash = as_text(&lin[6]);
     match outcome.as_str() {
         "applied" => {}
         "reverted" => {
@@ -806,17 +1092,19 @@ fn revert_in(
     let target = db.resolve_target(&table, &column)?;
     let pk_col = &target.pk_col;
 
+    // The residuals themselves are gated FIRST (they are not user-editable
+    // state, and the final source-hash check would catch a tampered one only
+    // with a far worse diagnosis).
+    residual_gate(s, run_id, &residual_hash, "reverting")?;
+
     // The hash gate (commitment 8): if the column moved since the apply, the
     // stored residuals belong to values that no longer exist. Explicit error,
     // never silently wrong input.
-    let rows = rows_of(s.query(
-        &format!("SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" ORDER BY \"{pk_col}\""),
-        &[],
-    )?)?;
     let mut current = CanonChain::new();
-    for row in &rows {
-        current.push(&row[1]);
-    }
+    scan_pairs(s, &table, pk_col, &column, |_, _, y| {
+        current.push(y);
+        Ok(())
+    })?;
     if current.hex() != output_hash {
         return Err(Error::Unsupported(format!(
             "`{table}.{column}` changed outside the pipeline since run {run_id} — its hash \
@@ -826,8 +1114,7 @@ fn revert_in(
 
     let update = format!("UPDATE \"{table}\" SET \"{column}\" = $1 WHERE \"{pk_col}\" = $2");
     let mut back = CanonChain::new();
-    for row in &rows {
-        let (pk, y) = (&row[0], &row[1]);
+    let n_rows = scan_pairs(s, &table, pk_col, &column, |s, pk, y| {
         let x = match &lens.rex {
             Some(_) => {
                 let res = rows_of(s.query(
@@ -851,7 +1138,8 @@ fn revert_in(
         };
         back.push(&x);
         s.query(&update, &[x, pk.clone()])?;
-    }
+        Ok(())
+    })?;
     if back.hex() != source_hash {
         return Err(Error::Corrupt(format!(
             "revert verification FAILED for run {run_id}: the inverted stream does not \
@@ -864,7 +1152,7 @@ fn revert_in(
         "UPDATE retl_lineage SET outcome = 'reverted' WHERE run_id = $1 AND step_no = 1",
         &[Value::Int(run_id)],
     )?;
-    Ok(RetlReport { run_id, rows: rows.len() as u64, residuals: 0 })
+    Ok(RetlReport { run_id, rows: n_rows, residuals: 0 })
 }
 
 /// The putback body — see [`crate::Database::retl_putback`] for the contract.
@@ -878,7 +1166,7 @@ fn putback_in(
         return Err(Error::Unsupported("no retl lineage in this database".into()));
     }
     let lin = rows_of(s.query(
-        "SELECT lens, tbl, col, outcome FROM retl_lineage \
+        "SELECT lens, tbl, col, outcome, residual_hash FROM retl_lineage \
          WHERE run_id = $1 AND step_no = 1",
         &[Value::Int(run_id)],
     )?)?;
@@ -890,6 +1178,7 @@ fn putback_in(
     };
     let (pair, table, column, outcome) =
         (as_text(&lin[0]), as_text(&lin[1]), as_text(&lin[2]), as_text(&lin[3]));
+    let residual_hash = as_text(&lin[4]);
     match outcome.as_str() {
         "applied" => {}
         other => {
@@ -906,18 +1195,17 @@ fn putback_in(
     let pk_col = &target.pk_col;
 
     // Deliberately NO output-hash gate here — an edited column is the entire
-    // point of putback. What replaces it: the per-row PutRes check below, and
-    // the residual-set bookkeeping (a residual whose row is gone = a kept
-    // deletion; a row without a residual = the refused creation path).
-    let rows = rows_of(s.query(
-        &format!("SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" ORDER BY \"{pk_col}\""),
-        &[],
-    )?)?;
+    // point of putback. What replaces it: the RESIDUAL gate (the residual
+    // table is not where edits happen, and a tampered residual can survive
+    // both PutRes halves — see `residual_gate`), the per-row PutRes check
+    // below, and the residual-set bookkeeping (a residual whose row is gone
+    // = a kept deletion; a row without a residual = the refused creation
+    // path).
+    residual_gate(s, run_id, &residual_hash, "putback")?;
 
     let update = format!("UPDATE \"{table}\" SET \"{column}\" = $1 WHERE \"{pk_col}\" = $2");
     let mut consumed = 0u64;
-    for row in &rows {
-        let (pk, y) = (&row[0], &row[1]);
+    let n_rows = scan_pairs(s, &table, pk_col, &column, |s, pk, y| {
         let x = match &lens.rex {
             Some(rex) => {
                 let res = rows_of(s.query(
@@ -987,7 +1275,8 @@ fn putback_in(
             }
         };
         s.query(&update, &[x, pk.clone()])?;
-    }
+        Ok(())
+    })?;
 
     // Residuals not consumed belong to rows deleted after the apply. The
     // deletion is an edit, and it survives: the residuals are discarded with
@@ -997,7 +1286,7 @@ fn putback_in(
         "UPDATE retl_lineage SET outcome = 'putback' WHERE run_id = $1 AND step_no = 1",
         &[Value::Int(run_id)],
     )?;
-    Ok(RetlReport { run_id, rows: rows.len() as u64, residuals: consumed })
+    Ok(RetlReport { run_id, rows: n_rows, residuals: consumed })
 }
 
 fn putres_err(pk: &Value, y: &Value, e: &Error) -> Error {
