@@ -177,6 +177,26 @@ fn the_pair_is_pinned_by_hash_so_a_redefinition_cannot_change_what_was_verified(
 }
 
 #[test]
+fn dropping_the_function_name_does_not_break_the_pair() {
+    let (d, path) = db("dropfn");
+    def(&d, "def keep(x):\n    return x\n");
+    d.create_lens("ident", "keep", "keep", LensClass::Bijective).unwrap();
+
+    // `drop_function` removes the NAME binding only; the blob is
+    // content-addressed and stays. The pair names the blob, so it survives —
+    // and it must still VERIFY, not merely still be listed.
+    assert!(d.drop_function("keep").unwrap());
+    assert!(d.list_functions().unwrap().is_empty());
+
+    let after = d.list_lenses().unwrap();
+    assert_eq!(after.len(), 1);
+    assert!(after[0].healthy, "the blob outlives the name binding");
+    assert!(d.verify_lens("ident").unwrap() > 100);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn another_process_sees_the_pair_through_the_generation_bump() {
     let (d, path) = db("crossproc");
     def(&d, "def keep(x):\n    return x\n");

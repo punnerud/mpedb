@@ -21,9 +21,22 @@ ROOT="$(cd "$HERE/../../../.." && pwd)"
 #     _sqlite3 load the shim instead of the system one. DYLD_* survives exec of
 #     a Homebrew python (not SIP-protected); it would be stripped for
 #     /usr/bin/python3, so the venv MUST be built on a Homebrew interpreter.
+# `mpedb-capi` is its OWN cargo workspace (it exports `sqlite3_*` and cannot
+# co-link the bundled sqlite the parent's feature unification pulls in — see
+# CLAUDE.md), so it builds BY MANIFEST PATH and its artifacts land in ITS target
+# dir. This script said `-p mpedb-capi` from the root, which stopped resolving
+# the day that split happened — the same stale invocation `run.sh` was already
+# fixed for, still live in the sibling script, which is why Django's own suite
+# has been unrunnable from here. Ask cargo where the artifact went rather than
+# guessing: a `target-dir` in ~/.cargo/config.toml (this project's dev boxes use
+# one) moves it out of the crate tree entirely.
+CAPI="$ROOT/crates/mpedb-capi"
+CAPI_TARGET="$(cargo metadata --format-version 1 --no-deps \
+                 --manifest-path "$CAPI/Cargo.toml" \
+               | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 case "$(uname -s)" in
-  Darwin) SO="$ROOT/target/release/libmpedb_sqlite3.dylib"; WB_OS=darwin ;;
-  *)      SO="$ROOT/target/release/libmpedb_sqlite3.so";     WB_OS=linux  ;;
+  Darwin) SO="$CAPI_TARGET/release/libmpedb_sqlite3.dylib"; WB_OS=darwin ;;
+  *)      SO="$CAPI_TARGET/release/libmpedb_sqlite3.so";     WB_OS=linux  ;;
 esac
 DJ="${WB_DJANGO:-/mnt/xfs/django-workbench/django}"
 PY="${WB_PY:-/mnt/xfs/django-workbench/venv/bin/python}"
@@ -54,7 +67,7 @@ fi
 
 [ -x "$PY" ] || { echo "no venv python at $PY (set WB_PY)"; exit 1; }
 [ -d "$DJ/tests" ] || { echo "no Django checkout at $DJ (set WB_DJANGO)"; exit 1; }
-( cd "$ROOT" && cargo build --release -p mpedb-capi ) || exit 1
+cargo build --release --manifest-path "$CAPI/Cargo.toml" || exit 1
 [ -f "$SO" ] || { echo "no shim at $SO"; exit 1; }
 mkdir -p "$OUT"
 

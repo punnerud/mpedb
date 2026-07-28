@@ -437,3 +437,20 @@ calibration rule says demands a full pass.
 8. **The residual format was written before it was designed.** Stage 1 writes no
    residual at all. If a stage-1 patch persists a residual byte anywhere, it has
    broken commitment 9 by accident.
+
+Where each is discharged, so the list is a checklist and not a wish: 1, 2 and 3
+in `crates/mpedb/tests/lens.rs` plus the floats-only unit test in `lens.rs`;
+4 and 5 likewise (`another_process_sees_the_pair_through_the_generation_bump`,
+`truncation_at_every_offset_is_none_not_panic`); 6 by reading — every production
+`sys_scan` is a prefix-bounded range, and the only two unbounded `sys_scan()`
+call sites in the tree are both inside `#[cfg(test)]`, so a bounded `lens`
+catalog costs nothing per compile; 7 by running the suites; 8 by the record
+layout in §8.1, whose `residual_ref` byte is reserved and asserted zero.
+
+Attack 3 is worth its own sentence, because the answer is not what the phrasing
+suggests: dropping the *function* leaves the pair perfectly healthy.
+`drop_function` removes a name binding, and the pair does not hold a name — it
+holds the blob's hash, and content-addressed blobs are never deleted. Tested
+(`dropping_the_function_name_does_not_break_the_pair`), and it is the same
+property from the other side as the redefinition test: what the pair points at
+cannot be changed by anything that happens to a name.

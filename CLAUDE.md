@@ -52,6 +52,9 @@ log-based engine), and the hardware published when the hardware is the answer.
   `ring_exec` (Phase-2 group-commit leader; active when durability = commit or wal).
 - `crates/mpedb-cli` — `mpedb` binary: repl/exec/prepare/call/dump/stress/crash/
   powerloss/bench + `tier` (drain hot→cold + SIGKILL harness, #78)
+  + `lens` (reversible ETL pairs over stored functions, DESIGN-ETL stage 1: a
+  `bijective` declaration is VERIFIED against a probe corpus and refused with a
+  named counter-example — `celsius ⇄ fahrenheit` is the canonical refusal)
   + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
   and `mirror-collide` (SIGKILL fuzz: source writers + a mirror daemon killed at every
   instant → final drain must converge mpedb exactly to the source). stress/crash take
