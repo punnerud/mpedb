@@ -282,11 +282,26 @@ def stage4(workdir):
     db.define_function("def unmag(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n")
     db.create_residual_lens("mag", "mag", "sgn", "unmag", "int64")
 
-    db.rretl_map_define(
-        '[map]\nname = "m"\n[[map.table]]\nsource = "src"\ntarget = "ext"\n'
-        '  [[map.table.column]]\n  source = "v"\n  target = "absv"\n  pair = "mag"\n'
-    )
+    # The Python-native door: a plain dict, no TOML authoring. (A TOML
+    # string is accepted too; both store the same canonical record.)
+    db.rretl_map_define({
+        "name": "m",
+        "tables": [{
+            "source": "src",
+            "target": "ext",
+            "columns": [{"source": "v", "target": "absv", "pair": "mag"}],
+        }],
+    })
     assert db.rretl_maps() == ["m"]
+    # `show` returns the canonical TOML the dict was stored as.
+    shown = db.rretl_map_show("m")
+    assert 'target = "ext"' in shown and 'pair = "mag"' in shown, shown
+    # Dict refusals are named too.
+    try:
+        db.rretl_map_define({"name": "m2"})
+        raise AssertionError("missing tables must refuse")
+    except mpedb.Error as e:
+        assert "tables" in str(e), e
     r = db.rretl_map_sync("m")
     assert r["created_b"] == 2, r
     rows = db.query("SELECT absv FROM ext ORDER BY id")

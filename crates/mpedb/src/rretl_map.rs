@@ -150,6 +150,34 @@ impl MapSpec {
         Ok(spec)
     }
 
+    /// Canonical TOML for this spec — what the programmatic define path
+    /// stores, so a dict-built map and a TOML-built map are the same record
+    /// shape. Safe to emit with plain quoting: `validate` gates every name
+    /// through `ident_ok` (ASCII `[A-Za-z_][A-Za-z0-9_]*`), so no value can
+    /// contain a quote, a newline or a backslash.
+    pub fn to_toml(&self) -> String {
+        let mut out = format!("[map]\nname = \"{}\"\n", self.name);
+        for t in &self.tables {
+            out.push_str(&format!(
+                "\n[[map.table]]\nsource = \"{}\"\ntarget = \"{}\"\n",
+                t.source, t.target
+            ));
+            if let Some(k) = &t.target_key {
+                out.push_str(&format!("target_key = \"{k}\"\n"));
+            }
+            for c in &t.columns {
+                out.push_str(&format!(
+                    "  [[map.table.column]]\n  source = \"{}\"\n  target = \"{}\"\n",
+                    c.source, c.target
+                ));
+                if let Some(p) = &c.pair {
+                    out.push_str(&format!("  pair = \"{p}\"\n"));
+                }
+            }
+        }
+        out
+    }
+
     fn validate(&self) -> Result<()> {
         if !ident_ok(&self.name) {
             return Err(Error::Unsupported(format!(
@@ -289,7 +317,22 @@ impl crate::Database {
     pub fn rretl_map_define(&self, toml_text: &str) -> Result<()> {
         let spec = MapSpec::from_toml_str(toml_text)?;
         self.resolve_map(&spec)?;
-        let key = crate::sys_record_subkey(NS_MAP, spec.name.as_bytes())?;
+        self.store_map_record(&spec.name, toml_text)
+    }
+
+    /// [`rretl_map_define`](Self::rretl_map_define) from a CONSTRUCTED spec —
+    /// the programmatic path (Python hands a dict, Rust hands a `MapSpec`),
+    /// same validation, same stored form: the record is the canonical TOML
+    /// the spec emits, so `map show` and re-parsing behave identically
+    /// whichever door the definition came through.
+    pub fn rretl_map_define_spec(&self, spec: &MapSpec) -> Result<()> {
+        spec.validate()?;
+        self.resolve_map(spec)?;
+        self.store_map_record(&spec.name, &spec.to_toml())
+    }
+
+    fn store_map_record(&self, name: &str, toml_text: &str) -> Result<()> {
+        let key = crate::sys_record_subkey(NS_MAP, name.as_bytes())?;
         let mut record = vec![MAP_RECORD_V1];
         record.extend_from_slice(toml_text.as_bytes());
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;

@@ -306,23 +306,26 @@ dump + diff, whatever it supports), applied to the target tables with plain
 SQL; the map owns the transformation, both directions, and the loop safety
 of repeating it.
 
+Defined straight from Python, no files and no TOML authoring — the same
+way you run `CREATE TABLE`:
+
 ```python
-db.rretl_map_define("""
-[map]
-name = "crm"
-[[map.table]]
-source = "customers"
-target = "crm_customers"       # auto-created at first sync if missing
-  [[map.table.column]]
-  source = "name"
-  target = "full_name"          # no pair = identity copy
-  [[map.table.column]]
-  source = "temp_c"
-  target = "temp_f"
-  pair = "celsius"              # a registered lens pair, both directions
-""")
+db.rretl_map_define({
+    "name": "crm",
+    "tables": [{
+        "source": "customers",
+        "target": "crm_customers",   # auto-created at first sync if missing
+        "columns": [
+            {"source": "name",   "target": "full_name"},   # no pair = copy
+            {"source": "temp_c", "target": "temp_f", "pair": "celsius"},
+        ],
+    }],
+})
 db.rretl_map_sync("crm")   # materializes; later calls sync BOTH ways
 ```
+
+(A mapping-TOML string is accepted too — `rretl_map_show` always returns
+the canonical TOML the definition was stored as, whichever form you gave.)
 
 The rules, each a named refusal when broken:
 
@@ -443,7 +446,7 @@ scale as its own apply with the full source as the residual).
 | `db.rretl_pack_in(name, data)` | archive id | splice a zip: members become rows in `rretl_archive_members` (queryable!), the residual keeps every other byte; reconstruction verified byte-identical BEFORE the ingest commits. zip64, encrypted and overlapping archives are refused by name |
 | `db.rretl_pack_out(archive_id)` | `bytes` | rebuild the zip byte-identically, hash-gated — a member row edited outside the pipeline is a named refusal (re-ingest instead of mutating) |
 | `db.rretl_archives()` | list of dicts | `archive_id, name, members, content_hash` |
-| `db.rretl_map_define(toml)` | `None` | store a table-SET map; sources, identities and pairs validated NOW |
+| `db.rretl_map_define(spec)` | `None` | store a table-SET map from a Python dict (or a mapping-TOML string); sources, identities and pairs validated NOW |
 | `db.rretl_map_sync(name)` | dict of counts | both directions, one txn; echo-guarded repeats; conflicts abort whole, named |
 | `db.rretl_maps()` / `rretl_map_show(name)` / `rretl_map_drop(name)` | names / TOML / bool | manage stored maps |
 

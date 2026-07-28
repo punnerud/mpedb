@@ -412,3 +412,43 @@ fn map_definitions_round_trip_and_refuse_by_name() {
     let e = d.rretl_map_sync("crm").unwrap_err().to_string();
     assert!(e.contains("no map named"), "{e}");
 }
+
+/// The programmatic define door: a constructed spec stores the CANONICAL
+/// TOML, `show` returns it, re-parsing it yields the same spec, and syncing
+/// through it behaves identically to the TOML door.
+#[test]
+fn a_constructed_spec_round_trips_through_canonical_toml() {
+    use mpedb::rretl_map::{MapColumn, MapSpec, MapTable};
+    let (d, _s) = seeded("spec");
+    d.rretl_map_drop("crm").unwrap();
+    let spec = MapSpec {
+        name: "crm".into(),
+        tables: vec![MapTable {
+            source: "customers".into(),
+            target: "crm_customers".into(),
+            target_key: None,
+            columns: vec![
+                MapColumn { source: "label".into(), target: "full_label".into(), pair: None },
+                MapColumn {
+                    source: "balance".into(),
+                    target: "abs_balance".into(),
+                    pair: Some("mag".into()),
+                },
+            ],
+        }],
+    };
+    d.rretl_map_define_spec(&spec).unwrap();
+    let shown = d.rretl_map_show("crm").unwrap();
+    let reparsed = MapSpec::from_toml_str(&shown).unwrap();
+    assert_eq!(reparsed.name, "crm");
+    assert_eq!(reparsed.tables[0].columns.len(), 2);
+    assert_eq!(reparsed.tables[0].columns[1].pair.as_deref(), Some("mag"));
+
+    let r = d.rretl_map_sync("crm").unwrap();
+    assert_eq!(r.created_b, 3, "{r:?}");
+    assert_eq!(
+        ints(&d, "SELECT abs_balance FROM crm_customers ORDER BY id"),
+        vec![5, 7, 1]
+    );
+    assert_eq!(d.rretl_map_sync("crm").unwrap().changed_total(), 0);
+}

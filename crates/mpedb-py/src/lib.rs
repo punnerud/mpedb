@@ -962,11 +962,34 @@ impl PyDatabase {
 
     /// Store (or replace) a table-SET map (stage 4, §13): source tables
     /// mirrored into a different target shape through lens pairs, synced
-    /// both ways. The spec is validated NOW — sources, identities, pairs.
-    fn rretl_map_define(&self, py: Python<'_>, toml_text: &str) -> PyResult<()> {
+    /// both ways. Takes either the mapping TOML as a string, or — the
+    /// Python-native form — a dict:
+    ///
+    /// ```python
+    /// db.rretl_map_define({
+    ///     "name": "crm",
+    ///     "tables": [{
+    ///         "source": "customers",
+    ///         "target": "crm_customers",       # "target_key" optional
+    ///         "columns": [
+    ///             {"source": "name",   "target": "full_name"},
+    ///             {"source": "temp_c", "target": "temp_f", "pair": "celsius"},
+    ///         ],
+    ///     }],
+    /// })
+    /// ```
+    ///
+    /// Both forms store the same canonical record; the spec is validated
+    /// NOW — sources, identities, pairs.
+    fn rretl_map_define(&self, py: Python<'_>, spec: &Bound<'_, PyAny>) -> PyResult<()> {
         self.refuse_if_txn_open("rretl_map_define", "Commit or roll back first.")?;
+        if let Ok(text) = spec.extract::<String>() {
+            let db = &self.db;
+            return py.detach(|| db.rretl_map_define(&text)).map_err(map_err);
+        }
+        let ms = map_spec_from_py(spec)?;
         let db = &self.db;
-        py.detach(|| db.rretl_map_define(toml_text)).map_err(map_err)
+        py.detach(|| db.rretl_map_define_spec(&ms)).map_err(map_err)
     }
 
     /// Sync a map, BOTH directions, in one transaction. Repeating a sync is
@@ -1025,6 +1048,73 @@ impl PyDatabase {
             })
             .collect()
     }
+}
+
+/// Build a [`mpedb::rretl_map::MapSpec`] from the Python-native dict form.
+/// Every refusal names the missing/mistyped key; the REAL validation (legal
+/// identifiers, tables exist, pairs load) happens in the engine, identically
+/// for both the dict and the TOML door.
+fn map_spec_from_py(spec: &Bound<'_, PyAny>) -> PyResult<mpedb::rretl_map::MapSpec> {
+    use pyo3::types::PyDict;
+    fn bad(m: String) -> PyErr {
+        ProgrammingError::new_err(m)
+    }
+    fn need_str(d: &Bound<'_, PyDict>, k: &str, ctx: &str) -> PyResult<String> {
+        d.get_item(k)?
+            .ok_or_else(|| bad(format!("map spec: missing `{k}` in {ctx}")))?
+            .extract::<String>()
+            .map_err(|_| bad(format!("map spec: `{k}` in {ctx} must be a string")))
+    }
+    fn opt_str(d: &Bound<'_, PyDict>, k: &str, ctx: &str) -> PyResult<Option<String>> {
+        match d.get_item(k)? {
+            None => Ok(None),
+            Some(v) if v.is_none() => Ok(None),
+            Some(v) => v
+                .extract::<String>()
+                .map(Some)
+                .map_err(|_| bad(format!("map spec: `{k}` in {ctx} must be a string"))),
+        }
+    }
+    let d = spec.cast::<PyDict>().map_err(|_| {
+        bad("rretl_map_define takes a TOML string or a dict {name, tables: [{source, \
+             target, target_key?, columns: [{source, target, pair?}]}]}"
+            .into())
+    })?;
+    let name = need_str(d, "name", "the map dict")?;
+    let tables_any = d
+        .get_item("tables")?
+        .ok_or_else(|| bad("map spec: missing `tables`".into()))?;
+    let tables_list = tables_any
+        .cast::<PyList>()
+        .map_err(|_| bad("map spec: `tables` must be a list of dicts".into()))?;
+    let mut tables = Vec::new();
+    for t in tables_list.iter() {
+        let td = t
+            .cast::<PyDict>()
+            .map_err(|_| bad("map spec: each table must be a dict".into()))?;
+        let source = need_str(td, "source", "a table")?;
+        let target = need_str(td, "target", "a table")?;
+        let target_key = opt_str(td, "target_key", "a table")?;
+        let cols_any = td
+            .get_item("columns")?
+            .ok_or_else(|| bad(format!("map spec: table `{source}` has no `columns`")))?;
+        let cols_list = cols_any
+            .cast::<PyList>()
+            .map_err(|_| bad("map spec: `columns` must be a list of dicts".into()))?;
+        let mut columns = Vec::new();
+        for c in cols_list.iter() {
+            let cd = c
+                .cast::<PyDict>()
+                .map_err(|_| bad("map spec: each column must be a dict".into()))?;
+            columns.push(mpedb::rretl_map::MapColumn {
+                source: need_str(cd, "source", "a column")?,
+                target: need_str(cd, "target", "a column")?,
+                pair: opt_str(cd, "pair", "a column")?,
+            });
+        }
+        tables.push(mpedb::rretl_map::MapTable { source, target, target_key, columns });
+    }
+    Ok(mpedb::rretl_map::MapSpec { name, tables })
 }
 
 fn rretl_report_to_py(py: Python<'_>, r: mpedb::rretl::RretlReport) -> PyResult<Py<PyAny>> {
