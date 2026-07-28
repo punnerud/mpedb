@@ -344,12 +344,37 @@ The rules, each a named refusal when broken:
   every mapped column is bijective (there is no residual to attach
   otherwise), and never when the source identity is a hidden rowid.
 - Deletes propagate both ways; delete-vs-edit is a conflict.
-- **Redefining a map with a CHANGED spec re-baselines it**: the map's sync
-  state is cleared in the same transaction, so the next sync re-arbitrates
-  every row (agreement is adopted, disagreement is a named conflict)
-  instead of trusting hashes recorded under the old spec. An unchanged
-  redefine keeps state, and `rretl_map_drop` keeps it too — history a
-  same-spec redefine picks up.
+- **Only a byte-identical re-define keeps the map's sync state.** A
+  changed spec, a first define, a define after `rretl_map_drop` — all
+  re-baseline: state is cleared in the same transaction, so the next sync
+  re-arbitrates every row (agreement is adopted, disagreement is a named
+  conflict) instead of trusting hashes recorded under another spec. An
+  identical re-define is idempotent and changes nothing.
+- **A table is a map source or a map target — never both, and never a
+  target twice.** Two maps sharing a target would merge two unrelated
+  masters into each other; a reverse map (`a→b` plus `b→a`) makes every
+  ordinary edit a permanent conflict; a chain inside one map breaks the
+  agreement between `rretl_map_check` and the sync. Refused at define
+  time, by name. Staging chains are separate maps, synced in the order
+  you choose.
+- **If the target table is DROPPED, the next sync refuses.** A missing
+  target means "materialize it" only before the map has state; after
+  that it means the table was dropped or renamed away, and treating that
+  as a target-side delete would empty the source. Restore the table, or
+  `rretl_map_drop` + define again to re-materialize.
+- **Do not write to `rretl_map_state` by hand.** It is the sync's sole
+  arbiter — the one thing that decides which side moved. Its hashes are
+  bound to (map, target, key) so they cannot be copied between rows, the
+  key value is cross-checked against its reference on every path that
+  trusts it, and state belonging to no defined map is an fsck finding.
+  But a doctored arbiter can still make a sync do the wrong thing with
+  no oracle able to see it afterwards: fsck verifies data against state,
+  not state against the world.
+- **Re-registering a pair name changes what every map using it means.**
+  `create_lens` rebinds the name, maps resolve pairs by name at each
+  sync, and both sides still read clean — so the sync does nothing while
+  every target row holds the old pair's output. This is the standing
+  reason to run `rretl_map_check`: `diverged` is what sees it.
 
 **Auditing a map** — `rretl_map_check(name)` is the read-only dry run of a
 sync: what WOULD move in each direction, every conflict named (a sync

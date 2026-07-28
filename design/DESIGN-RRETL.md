@@ -944,7 +944,71 @@ of the test suite: two target rows fully swapped WITH their b_hashes —
 sync reports zero moved, check reports both rows diverged, fsck names
 them.
 
-### 13.6 `map-collide` — the sync under SIGKILL, or it did not happen
+### 13.6 What the adversarial duel changed (2026-07-29)
+
+Four saboteur agents ran against the built binary — schema/DDL, values,
+bookkeeping tampering, and concurrency. The concurrency arm came back
+empty (~2100 SIGKILLs of the sync mid-flight, ~3M concurrent writer
+statements, ~10k read-only checks; the one-transaction promise and attach
+recovery held under every schedule), and no hostile VALUE produced wrong
+data. The other two arms did, and the rules below are their residue.
+
+**A table is a map source or a map target — never both, never a target
+twice.** Loop safety is per map, and every topology that reaches across
+that boundary breaks something: two maps sharing a target silently MERGE
+two unrelated masters; a reverse map (`a→b` plus `b→a`) turns every
+ordinary edit into a permanent conflict, because each map reads the
+other's push as "the other side moved too"; and a chain (one entry's
+target is another's source) breaks the twin-ness of check and sync —
+sync applies entry 1's writes before classifying entry 2, a read-only
+check cannot, so check under-counts and misses conflicts while exiting 0.
+Refused at define, inside one map and across maps.
+
+**A vanished target is a refusal, not a mass delete.** A missing target
+table means "materialize it" ONLY when the map has no state for it. Once
+state exists, missing means dropped or renamed away — and reading that as
+"the target deleted every row" propagated the drop into the source and
+emptied the master, unrecoverably (map runs carry outcome `mapped` and
+are not revertible). Recovery is restore-the-table, or `map drop` +
+define again; an identical re-define is idempotent by design and does NOT
+re-baseline.
+
+**Bookkeeping keys on a digest, never on raw canonical bits.** The
+composite keys `(run_id, pk_enc)` and `(map, tbl, pk_enc)` spent their
+budget on the OTHER parts, so a legal ~970-char TEXT pk overflowed the
+engine's encoded-key cap — and the syncable key length depended on how
+long you named your map. `pk_ref` = blake3 over the canonical bits, fixed
+32 bytes; every consumer holds the row (or, for maps, the `k` column), so
+nothing needs to invert it.
+
+**State is a baseline, never evidence, and only an identical re-define
+inherits it.** A changed spec, a first define, a define after `drop` —
+all start from nothing (adopt-on-agree re-arbitrates; disagreement is a
+named conflict). The two openings this closed were both real: drop plus a
+changed redefine kept the old spec's hashes, and state planted under an
+undefined name was adopted by that name's first define.
+
+**The trust boundary, stated plainly.** `rretl_map_state` is ordinary
+SQL-writable state, and it is the sync's sole arbiter. Its hashes are now
+bound to (map, target, key), so they cannot be minted by planting a decoy
+row — but a party that computes a correct hash for a doctored row can
+still make the sync overwrite a real edit with no oracle able to see it
+afterwards, because the sync then re-records perfectly consistent state.
+`k` is cross-checked against `pk_enc` on every path that trusts it, and
+orphaned (map, target) state is an fsck finding, so the cheap and the
+accidental tampers are caught. The expensive one is not, and cannot be
+without signing the arbiter. Writing to rRETL bookkeeping by hand is
+writing to the engine's internals: fsck cannot vouch for a doctored
+oracle.
+
+**Pair rebinding is the realistic divergence.** `create_lens` rebinds an
+existing pair NAME, and a map resolves pairs by name at every sync — so a
+mapped column's meaning can change under a map whose state is entirely
+current. The sync is structurally blind (both sides read clean); §13.5's
+`diverged` is what sees it. This is the canonical reason that check
+exists, and the regression test uses it.
+
+### 13.7 `map-collide` — the sync under SIGKILL, or it did not happen
 
 `mpedb map-collide` is the stage-4 member of the collide family
 (mirror-collide's shape): N writers churn the SOURCE side with
