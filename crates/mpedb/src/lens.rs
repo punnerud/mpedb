@@ -52,11 +52,7 @@ impl LensClass {
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "bijective" => Ok(Self::Bijective),
-            "residual" => Err(Error::Unsupported(
-                "class `residual` needs the residual format, which is designed but not built \
-                 (DESIGN-ETL §8.2, stage 2)"
-                    .into(),
-            )),
+            "residual" => Ok(Self::Residual),
             "lossy" => Ok(Self::Lossy),
             other => Err(Error::Unsupported(format!(
                 "unknown lens class `{other}` — expected bijective, residual or lossy"
@@ -82,21 +78,39 @@ impl LensClass {
     }
 }
 
-/// The only probe corpus that exists in v1. Stored in the record so a
-/// re-verification runs against the same inputs (DESIGN-ETL §5.1).
+/// The only probe corpus that exists. Stored in the record so a re-verification
+/// runs against the same inputs (DESIGN-ETL §5.1).
 pub const PROBE_CORPUS_V1: u8 = 1;
 /// Byte-for-byte round-trip equality. Other canonizer ids are reserved.
 const CANONIZER_IDENTITY: u8 = 0;
+/// `residual_type` when the class has no residual (Bijective, Lossy). Legal
+/// `ColumnType` tags are 1..=7, so this can never collide with a declaration.
+const RESIDUAL_TYPE_NONE: u8 = 0xff;
+/// `branch_policy` 0: the residual carries the branch tag (DESIGN-ETL §6).
+/// Policy 1 (verified-disjoint outputs) is reserved — the byte exists so the
+/// format does not move when it becomes expressible.
+const BRANCH_POLICY_TAG: u8 = 0;
 
-const LENS_RECORD_VERSION: u8 = 1;
-/// version + class + fwd + inv + canonizer + probe + samples + gen + residual_ref
-const LENS_RECORD_LEN: usize = 1 + 1 + 32 + 32 + 1 + 1 + 4 + 8 + 1;
+const LENS_RECORD_VERSION: u8 = 2;
+/// v2: version + class + fwd + inv + rex + residual_type + branch_policy +
+///     canonizer + probe + samples + gen
+const LENS_RECORD_LEN: usize = 1 + 1 + 32 + 32 + 32 + 1 + 1 + 1 + 1 + 4 + 8;
+/// v1 (stage 1): version + class + fwd + inv + canonizer + probe + samples +
+///     gen + residual_ref. Decoded INTO v2 shape — see `decode_lens_record`.
+const LENS_RECORD_V1_LEN: usize = 1 + 1 + 32 + 32 + 1 + 1 + 4 + 8 + 1;
 
 #[derive(Debug, Clone)]
 struct LensRecord {
     class: LensClass,
     forward: [u8; 32],
     inverse: [u8; 32],
+    /// All-zero when the class has no residual extractor.
+    rex: [u8; 32],
+    /// `RESIDUAL_TYPE_NONE`, or a `ColumnType` tag — the DECLARED residual
+    /// type (commitment 5), verified against actual rex outputs at
+    /// registration. `Any` is a legal declaration; it must be said.
+    residual_type: u8,
+    branch_policy: u8,
     canonizer: u8,
     probe_corpus: u8,
     samples: u32,
@@ -109,30 +123,52 @@ fn encode_lens_record(r: &LensRecord) -> Vec<u8> {
     v.push(r.class as u8);
     v.extend_from_slice(&r.forward);
     v.extend_from_slice(&r.inverse);
+    v.extend_from_slice(&r.rex);
+    v.push(r.residual_type);
+    v.push(r.branch_policy);
     v.push(r.canonizer);
     v.push(r.probe_corpus);
     v.extend_from_slice(&r.samples.to_le_bytes());
     v.extend_from_slice(&r.verified_gen.to_le_bytes());
-    v.push(0); // residual_ref — reserved for stage 2, so the shape survives it
     v
 }
 
 /// Bounds-checked, `None` on anything unexpected. An advisory catalog: a corrupt
 /// record degrades to "that pair is not defined", never a panic — the shape of
 /// `decode_func_record` and the project's decoder rule.
+///
+/// **v1 records decode into v2 shape** (zero rex, no residual type) rather than
+/// as `None`: degradation-to-undefined was designed for CORRUPTION, not for
+/// deliberate retirement, and stage-1 records exist in this project's own dev
+/// and M3 databases (DESIGN-ETL §8.1).
 fn decode_lens_record(bytes: &[u8]) -> Option<LensRecord> {
-    if bytes.len() != LENS_RECORD_LEN || bytes[0] != LENS_RECORD_VERSION {
-        return None;
+    match bytes.first() {
+        Some(2) if bytes.len() == LENS_RECORD_LEN => Some(LensRecord {
+            class: LensClass::from_byte(bytes[1])?,
+            forward: bytes[2..34].try_into().ok()?,
+            inverse: bytes[34..66].try_into().ok()?,
+            rex: bytes[66..98].try_into().ok()?,
+            residual_type: bytes[98],
+            branch_policy: bytes[99],
+            canonizer: bytes[100],
+            probe_corpus: bytes[101],
+            samples: u32::from_le_bytes(bytes[102..106].try_into().ok()?),
+            verified_gen: u64::from_le_bytes(bytes[106..114].try_into().ok()?),
+        }),
+        Some(1) if bytes.len() == LENS_RECORD_V1_LEN => Some(LensRecord {
+            class: LensClass::from_byte(bytes[1])?,
+            forward: bytes[2..34].try_into().ok()?,
+            inverse: bytes[34..66].try_into().ok()?,
+            rex: [0; 32],
+            residual_type: RESIDUAL_TYPE_NONE,
+            branch_policy: BRANCH_POLICY_TAG,
+            canonizer: bytes[66],
+            probe_corpus: bytes[67],
+            samples: u32::from_le_bytes(bytes[68..72].try_into().ok()?),
+            verified_gen: u64::from_le_bytes(bytes[72..80].try_into().ok()?),
+        }),
+        _ => None,
     }
-    Some(LensRecord {
-        class: LensClass::from_byte(bytes[1])?,
-        forward: bytes[2..34].try_into().ok()?,
-        inverse: bytes[34..66].try_into().ok()?,
-        canonizer: bytes[66],
-        probe_corpus: bytes[67],
-        samples: u32::from_le_bytes(bytes[68..72].try_into().ok()?),
-        verified_gen: u64::from_le_bytes(bytes[72..80].try_into().ok()?),
-    })
 }
 
 /// One pair, as `list_lenses` reports it.
@@ -142,12 +178,17 @@ pub struct LensInfo {
     pub class: LensClass,
     pub forward_hash: String,
     pub inverse_hash: String,
+    /// The residual extractor, when the class has one.
+    pub rex_hash: Option<String>,
+    /// The DECLARED residual type's name, when the class has one.
+    pub residual_type: Option<&'static str>,
     /// How many probe inputs actually round-tripped. Reported rather than a bare
     /// "verified": the evidence is statistical, not universal (DESIGN-ETL §5).
     pub samples: u32,
     pub verified_gen: u64,
-    /// Both definition blobs are still readable. False means the pair points at
-    /// a blob this database can no longer decode — say so, do not report health.
+    /// Every definition blob the pair names is still readable. False means the
+    /// pair points at a blob this database can no longer decode — say so, do
+    /// not report health.
     pub healthy: bool,
 }
 
@@ -282,12 +323,20 @@ pub fn probe_corpus(id: u8) -> Result<Vec<Value>> {
 /// "not bijective" without one is a rubber stamp.
 #[derive(Debug)]
 pub enum LensFault {
-    /// `inverse(forward(x))` came back as something else.
+    /// The inverse came back with something other than the input.
     RoundTrip { input: Value, forward: Value, back: Value },
-    /// Two distinct inputs forward to the same output, so at most one of them
-    /// can come back. Reported separately because "forward is not injective" is
-    /// a different bug from "forward loses precision".
+    /// Two distinct inputs map to the same output — for a `Bijective` pair the
+    /// same `y`, for a `Residual` pair the same `(y, r)` JOINTLY. Reported
+    /// separately because "forward is not injective" is a different bug from
+    /// "forward loses precision".
     Collision { a: Value, b: Value, shared: Value },
+    /// The inverse refused a `(y, r)` the forward side produced. Not a skip:
+    /// forward defines the domain, so the inverse must cover forward's image —
+    /// an x that forwards but cannot come back has no round trip at all.
+    InverseRefused { input: Value, forward: Value, residual: Option<Value> },
+    /// `rex` produced a value outside the DECLARED residual type
+    /// (commitment 5: declared, then verified — never inferred).
+    ResidualType { input: Value, residual: Value, declared: &'static str },
     /// Every probe input was refused, so nothing was proven.
     NothingProven,
 }
@@ -304,6 +353,23 @@ impl std::fmt::Display for LensFault {
                 f,
                 "not bijective: forward({a:?}) and forward({b:?}) are both {shared:?}, \
                  so at most one of them can be recovered"
+            ),
+            Self::InverseRefused { input, forward, residual } => match residual {
+                Some(r) => write!(
+                    f,
+                    "no round trip: forward({input:?}) = ({forward:?}, residual {r:?}), \
+                     but the inverse refuses that pair"
+                ),
+                None => write!(
+                    f,
+                    "no round trip: forward({input:?}) = {forward:?}, but the inverse \
+                     refuses it"
+                ),
+            },
+            Self::ResidualType { input, residual, declared } => write!(
+                f,
+                "rex({input:?}) = {residual:?}, outside the declared residual type \
+                 `{declared}` — the declaration is verified, not advisory"
             ),
             Self::NothingProven => write!(
                 f,
@@ -335,8 +401,16 @@ pub fn verify_bijective(
         let Ok(y) = crate::spellfn::call_spell_fn(forward, std::slice::from_ref(x)) else {
             continue; // outside the declared domain
         };
+        // NOT a skip: forward defines the domain, so the inverse must cover
+        // forward's image — an x that forwards but cannot come back has no
+        // round trip. (Stage 1 skipped here; tightened in stage 2, and no
+        // shipped pair depended on the leniency.)
         let Ok(back) = crate::spellfn::call_spell_fn(inverse, std::slice::from_ref(&y)) else {
-            continue;
+            return Err(LensFault::InverseRefused {
+                input: x.clone(),
+                forward: y,
+                residual: None,
+            });
         };
         // Collision BEFORE round trip, and the order is load-bearing. With a
         // deterministic inverse a collision always *also* shows up as a failed
@@ -352,6 +426,96 @@ pub fn verify_bijective(
                 shared: y,
             });
         }
+        if !same_value(x, &back) {
+            return Err(LensFault::RoundTrip {
+                input: x.clone(),
+                forward: y,
+                back,
+            });
+        }
+        seen.push((key, x.clone()));
+        samples += 1;
+    }
+    if samples == 0 {
+        return Err(LensFault::NothingProven);
+    }
+    Ok(samples)
+}
+
+/// The JOINT collision key for a `Residual` pair: `blake3(len‖bits(y)‖len‖bits(r))`.
+///
+/// The length framing is load-bearing. `value_bits` has no internal framing, so
+/// naive concatenation makes distinct pairs collide —
+/// `(Text("a\x04"), Text(""))` and `(Text("a"), Text("\x04"))` concatenate to
+/// the same bytes — and a false collision REFUSES a valid pair.
+fn joint_key(y: &Value, r: &Value) -> [u8; 32] {
+    let (yb, rb) = (value_bits(y), value_bits(r));
+    let mut buf = Vec::with_capacity(8 + yb.len() + 8 + rb.len());
+    buf.extend_from_slice(&(yb.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&yb);
+    buf.extend_from_slice(&(rb.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&rb);
+    *blake3::hash(&buf).as_bytes()
+}
+
+/// Verify a `Residual` triple over a corpus. The law is GetPut:
+/// `inverse(forward(x), rex(x)) == x`. PutRes is deliberately NOT run — over
+/// the corpus it can only be tested on image pairs `(forward(x), rex(x))`,
+/// where GetPut plus determinism already force it, and running a tautology and
+/// reporting it as an independently verified law is the bare "verified"
+/// DESIGN-ETL §5 forbids.
+///
+/// The collision check keys on `(y, r)` JOINTLY: multiple preimages of `y`
+/// alone are the entire point of the class — the residual disambiguates them.
+/// Injectivity of `x ↦ (y, r)` is exactly what GetPut needs to be satisfiable.
+///
+/// Every non-NULL `rex` output is checked against the DECLARED residual type
+/// (commitment 5: declared, then verified). NULL is always a legal residual
+/// VALUE — it is the missing residual ROW that is an error, and that
+/// distinction belongs to the apply/revert layer.
+pub fn verify_residual(
+    forward: &Proc,
+    rex: &Proc,
+    inverse: &Proc,
+    corpus: &[Value],
+    declared: mpedb_types::ColumnType,
+) -> std::result::Result<u32, LensFault> {
+    let mut samples = 0u32;
+    let mut seen: Vec<([u8; 32], Value)> = Vec::new();
+    for x in corpus {
+        let Ok(y) = crate::spellfn::call_spell_fn(forward, std::slice::from_ref(x)) else {
+            continue; // outside the declared domain
+        };
+        let Ok(r) = crate::spellfn::call_spell_fn(rex, std::slice::from_ref(x)) else {
+            continue; // rex narrows the domain the same way forward does
+        };
+        if let Some(rt) = r.column_type() {
+            if declared != mpedb_types::ColumnType::Any && rt != declared {
+                return Err(LensFault::ResidualType {
+                    input: x.clone(),
+                    residual: r,
+                    declared: declared.name(),
+                });
+            }
+        }
+        // Collision before round trip — same load-bearing order as the
+        // bijective verifier, on the joint key.
+        let key = joint_key(&y, &r);
+        if let Some((_, prev)) = seen.iter().find(|(k, _)| *k == key) {
+            return Err(LensFault::Collision {
+                a: prev.clone(),
+                b: x.clone(),
+                shared: y,
+            });
+        }
+        let args = [y.clone(), r.clone()];
+        let Ok(back) = crate::spellfn::call_spell_fn(inverse, &args) else {
+            return Err(LensFault::InverseRefused {
+                input: x.clone(),
+                forward: y,
+                residual: Some(r),
+            });
+        };
         if !same_value(x, &back) {
             return Err(LensFault::RoundTrip {
                 input: x.clone(),
@@ -396,15 +560,46 @@ impl crate::Database {
     ) -> Result<u32> {
         if class == LensClass::Residual {
             return Err(Error::Unsupported(
-                "class `residual` needs the residual format, which is designed but not built \
-                 (DESIGN-ETL §8.2, stage 2)"
+                "a residual pair binds THREE functions and a declared residual type — \
+                 use create_residual_lens (CLI: --rex <fn> --residual-type <type>)"
                     .into(),
             ));
         }
+        self.register_lens(name, class, forward, None, inverse, None)
+    }
+
+    /// Register a `Residual` pair: the triple `forward/1`, `rex/1` (the
+    /// residual extractor — Sparcl's complement as a plain stored function),
+    /// `inverse/2`, plus the DECLARED residual type (commitment 5: declared,
+    /// then verified against actual rex outputs — never inferred).
+    ///
+    /// The law verified is GetPut: `inverse(forward(x), rex(x)) == x`. The
+    /// collision check keys on `(y, r)` JOINTLY — multiple preimages of `y`
+    /// alone are the point of the class; the residual disambiguates them.
+    pub fn create_residual_lens(
+        &self,
+        name: &str,
+        forward: &str,
+        rex: &str,
+        inverse: &str,
+        residual_type: mpedb_types::ColumnType,
+    ) -> Result<u32> {
+        self.register_lens(name, LensClass::Residual, forward, Some(rex), inverse, Some(residual_type))
+    }
+
+    fn register_lens(
+        &self,
+        name: &str,
+        class: LensClass,
+        forward: &str,
+        rex: Option<&str>,
+        inverse: &str,
+        residual_type: Option<mpedb_types::ColumnType>,
+    ) -> Result<u32> {
         let key = crate::sys_record_subkey(NS_LENS, name.as_bytes())?;
 
         let r = self.engine.begin_read()?;
-        let resolved = (|| -> Result<(Resolved, Resolved)> {
+        let resolved = (|| -> Result<(Resolved, Option<Resolved>, Resolved)> {
             let fns = self.scan_func_records(&r)?;
             let find = |want: &str| -> Result<Resolved> {
                 fns.iter()
@@ -417,48 +612,89 @@ impl crate::Database {
                         ))
                     })
             };
-            Ok((find(forward)?, find(inverse)?))
+            Ok((find(forward)?, rex.map(&find).transpose()?, find(inverse)?))
         })();
-        let (fwd_fn, inv_fn) = match resolved {
+        let (fwd_fn, rex_fn, inv_fn) = match resolved {
             Ok(v) => v,
             Err(e) => {
                 r.finish()?;
                 return Err(e);
             }
         };
-        let (fwd_hash, fwd_argc) = (fwd_fn.hash, fwd_fn.argc);
-        let (inv_hash, inv_argc) = (inv_fn.hash, inv_fn.argc);
 
         let verify = (|| -> Result<u32> {
-            if fwd_argc != 1 || inv_argc != 1 {
+            let want_inv_argc: u16 = if class == LensClass::Residual { 2 } else { 1 };
+            if fwd_fn.argc != 1 || inv_fn.argc != want_inv_argc {
                 return Err(Error::Unsupported(format!(
-                    "stage 1 registers 1→1 scalar pairs only, got {forward}/{fwd_argc} and \
-                     {inverse}/{inv_argc}; a wider pair needs a residual (DESIGN-ETL §11)"
+                    "a {} pair is forward/1 and inverse/{want_inv_argc}, got \
+                     {forward}/{} and {inverse}/{}",
+                    class.as_str(),
+                    fwd_fn.argc,
+                    inv_fn.argc,
                 )));
             }
-            if class == LensClass::Lossy {
+            if let Some(rx) = &rex_fn {
+                if rx.argc != 1 {
+                    return Err(Error::Unsupported(format!(
+                        "the residual extractor is rex/1, got {}/{}",
+                        rex.unwrap_or("?"),
+                        rx.argc
+                    )));
+                }
+            }
+            match class {
                 // Nothing to verify: the pair declares it does not invert, and
                 // the contract it buys is source retention.
-                return Ok(0);
+                LensClass::Lossy => Ok(0),
+                LensClass::Bijective => {
+                    let fwd = self.load_proc_by_hash(&r, &fwd_fn.hash)?.ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "`{forward}` names a definition blob that is missing"
+                        ))
+                    })?;
+                    let inv = self.load_proc_by_hash(&r, &inv_fn.hash)?.ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "`{inverse}` names a definition blob that is missing"
+                        ))
+                    })?;
+                    let corpus = probe_corpus(PROBE_CORPUS_V1)?;
+                    verify_bijective(&fwd, &inv, &corpus).map_err(|fault| {
+                        Error::Unsupported(format!("`{name}` was declared bijective but {fault}"))
+                    })
+                }
+                LensClass::Residual => {
+                    let rx_fn = rex_fn.as_ref().expect("residual class resolves rex");
+                    let declared = residual_type.expect("residual class declares a type");
+                    let fwd = self.load_proc_by_hash(&r, &fwd_fn.hash)?.ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "`{forward}` names a definition blob that is missing"
+                        ))
+                    })?;
+                    let rx = self.load_proc_by_hash(&r, &rx_fn.hash)?.ok_or_else(|| {
+                        Error::Corrupt("the rex function names a missing definition blob".into())
+                    })?;
+                    let inv = self.load_proc_by_hash(&r, &inv_fn.hash)?.ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "`{inverse}` names a definition blob that is missing"
+                        ))
+                    })?;
+                    let corpus = probe_corpus(PROBE_CORPUS_V1)?;
+                    verify_residual(&fwd, &rx, &inv, &corpus, declared).map_err(|fault| {
+                        Error::Unsupported(format!("`{name}` was declared residual but {fault}"))
+                    })
+                }
             }
-            let fwd = self.load_proc_by_hash(&r, &fwd_hash)?.ok_or_else(|| {
-                Error::Corrupt(format!("`{forward}` names a definition blob that is missing"))
-            })?;
-            let inv = self.load_proc_by_hash(&r, &inv_hash)?.ok_or_else(|| {
-                Error::Corrupt(format!("`{inverse}` names a definition blob that is missing"))
-            })?;
-            let corpus = probe_corpus(PROBE_CORPUS_V1)?;
-            verify_bijective(&fwd, &inv, &corpus).map_err(|fault| {
-                Error::Unsupported(format!("`{name}` was declared bijective but {fault}"))
-            })
         })();
         r.finish()?;
         let samples = verify?;
 
         let record = encode_lens_record(&LensRecord {
             class,
-            forward: fwd_hash,
-            inverse: inv_hash,
+            forward: fwd_fn.hash,
+            inverse: inv_fn.hash,
+            rex: rex_fn.map(|f| f.hash).unwrap_or([0; 32]),
+            residual_type: residual_type.map(|t| t as u8).unwrap_or(RESIDUAL_TYPE_NONE),
+            branch_policy: BRANCH_POLICY_TAG,
             canonizer: CANONIZER_IDENTITY,
             probe_corpus: PROBE_CORPUS_V1,
             samples,
@@ -498,12 +734,6 @@ impl crate::Database {
                 .as_deref()
                 .and_then(decode_lens_record)
                 .ok_or_else(|| Error::Unsupported(format!("no lens pair named `{name}`")))?;
-            if rec.class != LensClass::Bijective {
-                return Err(Error::Unsupported(format!(
-                    "`{name}` is class {}, which stage 1 cannot verify",
-                    rec.class.as_str()
-                )));
-            }
             let fwd = self
                 .load_proc_by_hash(&r, &rec.forward)?
                 .ok_or_else(|| Error::Corrupt("forward definition blob is missing".into()))?;
@@ -511,8 +741,25 @@ impl crate::Database {
                 .load_proc_by_hash(&r, &rec.inverse)?
                 .ok_or_else(|| Error::Corrupt("inverse definition blob is missing".into()))?;
             let corpus = probe_corpus(rec.probe_corpus)?;
-            verify_bijective(&fwd, &inv, &corpus)
-                .map_err(|fault| Error::Unsupported(format!("`{name}` {fault}")))
+            match rec.class {
+                LensClass::Bijective => verify_bijective(&fwd, &inv, &corpus)
+                    .map_err(|fault| Error::Unsupported(format!("`{name}` {fault}"))),
+                LensClass::Residual => {
+                    let rx = self
+                        .load_proc_by_hash(&r, &rec.rex)?
+                        .ok_or_else(|| Error::Corrupt("rex definition blob is missing".into()))?;
+                    let declared = mpedb_types::ColumnType::from_tag(rec.residual_type)
+                        .ok_or_else(|| {
+                            Error::Corrupt("lens record declares no valid residual type".into())
+                        })?;
+                    verify_residual(&fwd, &rx, &inv, &corpus, declared)
+                        .map_err(|fault| Error::Unsupported(format!("`{name}` {fault}")))
+                }
+                LensClass::Lossy => Err(Error::Unsupported(format!(
+                    "`{name}` is lossy: it declares it does not invert, so there is \
+                     nothing to verify — the contract it buys is source retention"
+                ))),
+            }
         })();
         r.finish()?;
         out
@@ -533,13 +780,18 @@ impl crate::Database {
                 let Some(rec) = decode_lens_record(&v) else {
                     continue; // advisory catalog: corrupt reads as "not defined"
                 };
+                let has_rex = rec.class == LensClass::Residual;
                 let healthy = self.load_proc_by_hash(&r, &rec.forward)?.is_some()
-                    && self.load_proc_by_hash(&r, &rec.inverse)?.is_some();
+                    && self.load_proc_by_hash(&r, &rec.inverse)?.is_some()
+                    && (!has_rex || self.load_proc_by_hash(&r, &rec.rex)?.is_some());
                 out.push(LensInfo {
                     name: String::from_utf8_lossy(&k[lo.len()..]).into_owned(),
                     class: rec.class,
                     forward_hash: mpedb_spell::ProcHash(rec.forward).to_string(),
                     inverse_hash: mpedb_spell::ProcHash(rec.inverse).to_string(),
+                    rex_hash: has_rex.then(|| mpedb_spell::ProcHash(rec.rex).to_string()),
+                    residual_type: mpedb_types::ColumnType::from_tag(rec.residual_type)
+                        .map(|t| t.name()),
                     samples: rec.samples,
                     verified_gen: rec.verified_gen,
                     healthy,
@@ -581,9 +833,12 @@ mod tests {
 
     fn rec() -> LensRecord {
         LensRecord {
-            class: LensClass::Bijective,
+            class: LensClass::Residual,
             forward: [7; 32],
             inverse: [9; 32],
+            rex: [11; 32],
+            residual_type: mpedb_types::ColumnType::Int64 as u8,
+            branch_policy: BRANCH_POLICY_TAG,
             canonizer: CANONIZER_IDENTITY,
             probe_corpus: PROBE_CORPUS_V1,
             samples: 123,
@@ -596,13 +851,44 @@ mod tests {
         let bytes = encode_lens_record(&rec());
         assert_eq!(bytes.len(), LENS_RECORD_LEN);
         let back = decode_lens_record(&bytes).expect("decodes");
+        assert_eq!(back.class, LensClass::Residual);
+        assert_eq!(back.forward, [7; 32]);
+        assert_eq!(back.inverse, [9; 32]);
+        assert_eq!(back.rex, [11; 32]);
+        assert_eq!(back.residual_type, mpedb_types::ColumnType::Int64 as u8);
+        assert_eq!(back.samples, 123);
+        assert_eq!(back.verified_gen, 456);
+    }
+
+    #[test]
+    fn a_v1_record_decodes_as_a_bijective_pair_not_as_undefined() {
+        // The stage-1 layout, byte for byte. Degradation-to-undefined was
+        // designed for CORRUPTION; deliberate retirement decodes (§8.1).
+        let mut v1 = Vec::with_capacity(LENS_RECORD_V1_LEN);
+        v1.push(1u8); // version
+        v1.push(LensClass::Bijective as u8);
+        v1.extend_from_slice(&[7; 32]); // forward
+        v1.extend_from_slice(&[9; 32]); // inverse
+        v1.push(CANONIZER_IDENTITY);
+        v1.push(PROBE_CORPUS_V1);
+        v1.extend_from_slice(&123u32.to_le_bytes());
+        v1.extend_from_slice(&456u64.to_le_bytes());
+        v1.push(0); // the reserved residual_ref byte
+        assert_eq!(v1.len(), LENS_RECORD_V1_LEN);
+
+        let back = decode_lens_record(&v1).expect("v1 decodes into v2 shape");
         assert_eq!(back.class, LensClass::Bijective);
         assert_eq!(back.forward, [7; 32]);
         assert_eq!(back.inverse, [9; 32]);
+        assert_eq!(back.rex, [0; 32]);
+        assert_eq!(back.residual_type, RESIDUAL_TYPE_NONE);
         assert_eq!(back.samples, 123);
         assert_eq!(back.verified_gen, 456);
-        // The reserved residual_ref byte is present and zero in v1.
-        assert_eq!(bytes[LENS_RECORD_LEN - 1], 0);
+
+        // And v1 truncation still degrades safely.
+        for n in 0..v1.len() {
+            assert!(decode_lens_record(&v1[..n]).is_none(), "v1 prefix of {n} decoded");
+        }
     }
 
     #[test]
@@ -619,10 +905,14 @@ mod tests {
     #[test]
     fn unknown_version_and_class_are_rejected() {
         let mut bytes = encode_lens_record(&rec());
-        bytes[0] = 2;
+        bytes[0] = 3; // future version: named refusal is the CLI's job; here, undefined
         assert!(decode_lens_record(&bytes).is_none());
         let mut bytes = encode_lens_record(&rec());
         bytes[1] = 9;
+        assert!(decode_lens_record(&bytes).is_none());
+        // A v1 version byte on a v2-length body is a corrupt record, not a v1 record.
+        let mut bytes = encode_lens_record(&rec());
+        bytes[0] = 1;
         assert!(decode_lens_record(&bytes).is_none());
     }
 
@@ -703,11 +993,72 @@ mod tests {
     }
 
     #[test]
-    fn class_parse_refuses_residual_with_a_reason() {
+    fn class_parse_covers_all_three() {
         assert_eq!(LensClass::parse("bijective").unwrap(), LensClass::Bijective);
+        assert_eq!(LensClass::parse("residual").unwrap(), LensClass::Residual);
         assert_eq!(LensClass::parse("lossy").unwrap(), LensClass::Lossy);
-        let e = LensClass::parse("residual").unwrap_err().to_string();
-        assert!(e.contains("stage 2"), "{e}");
         assert!(LensClass::parse("nonsense").is_err());
     }
+
+    #[test]
+    fn the_joint_key_is_length_framed() {
+        // Unframed concatenation makes these two DISTINCT pairs collide —
+        // value_bits(Text("a\x04")) ‖ value_bits(Text("")) equals
+        // value_bits(Text("a")) ‖ value_bits(Text("\x04")) byte for byte —
+        // and a false collision REFUSES a valid pair.
+        let a = joint_key(&Value::Text("a\u{4}".into()), &Value::Text(String::new()));
+        let b = joint_key(&Value::Text("a".into()), &Value::Text("\u{4}".into()));
+        assert_ne!(a, b, "length framing is load-bearing");
+        // Sanity: the trap premise holds — the unframed bytes really are equal.
+        let unframed_a = [
+            value_bits(&Value::Text("a\u{4}".into())),
+            value_bits(&Value::Text(String::new())),
+        ]
+        .concat();
+        let unframed_b =
+            [value_bits(&Value::Text("a".into())), value_bits(&Value::Text("\u{4}".into()))]
+                .concat();
+        assert_eq!(unframed_a, unframed_b, "the trap this guards no longer exists?");
+    }
+
+    /// Stage 1 proved celsius ⇄ fahrenheit is NOT a float64 bijection. This is
+    /// the promised counterpart: with the correction delta as the residual —
+    /// rex(c) = c - inverse_raw(forward(c)) — GetPut holds EXACTLY, by
+    /// Sterbenz (the round-tripped value is within a few ulps of c, so the
+    /// subtraction is exact, and adding the exact difference back reproduces
+    /// c's representable value). The corpus here is curated finite floats:
+    /// near-overflow values (|c| ~ 1e308) push forward to ±inf, and -0.0 dies
+    /// in the residual ADDITION (0.0 + -0.0 = +0.0) — both are domain edges,
+    /// not counter-examples to the mechanism.
+    #[test]
+    fn celsius_with_a_correction_residual_round_trips_floats() {
+        let fwd = compile("def c_to_f(c):\n    return c * 9.0 / 5.0 + 32.0\n");
+        let rex = compile(
+            "def c_rex(c):\n    return c - (c * 9.0 / 5.0 + 32.0 - 32.0) * 5.0 / 9.0\n",
+        );
+        let inv = compile("def f_to_c(f, r):\n    return (f - 32.0) * 5.0 / 9.0 + r\n");
+        let corpus: Vec<Value> = [
+            0.0, 0.1, 37.0, -17.5, 1.0 / 3.0, 1e-8, 12.345, -40.0, 1e100, f64::NAN,
+        ]
+        .iter()
+        .map(|x| Value::Float(*x))
+        .collect();
+        let n = verify_residual(
+            &fwd,
+            &rex,
+            &inv,
+            &corpus,
+            mpedb_types::ColumnType::Float64,
+        )
+        .expect("the residual makes the intuitive pair actually reversible");
+        assert_eq!(n as usize, corpus.len(), "every curated float round-trips");
+
+        // And the SAME functions, declared with the WRONG residual type, are
+        // refused with the declaration named — declared, then verified.
+        let fault = verify_residual(&fwd, &rex, &inv, &corpus, mpedb_types::ColumnType::Text)
+            .expect_err("a float residual is not `text`");
+        let msg = fault.to_string();
+        assert!(msg.contains("declared residual type `text`"), "{msg}");
+    }
 }
+

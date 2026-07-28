@@ -78,9 +78,11 @@ usage: mpedb <command> [args]
   fn define <target> <file.py|file.rs>     store a PySpell SQL function
   fn drop <target> <name>                  drop a stored function
   fn list <target>                         list stored functions
-  lens define <target> <name> <fwd> <inv>  register a reversible pair over two
-         [--class bijective|lossy]         stored functions; `bijective` is
-                                           VERIFIED and refused if it is not
+  lens define <target> <name> <fwd> <inv>  register a reversible pair over stored
+         [--class bijective|residual|lossy]  functions; bijective AND residual are
+         [--rex <fn> --residual-type <ty>]   VERIFIED (GetPut over a probe corpus)
+                                           and refused with a counter-example;
+                                           residual = the triple fwd/1 rex/1 inv/2
   lens verify|list|drop <target> [name]    re-run a pair's round trip, or manage
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
@@ -438,6 +440,8 @@ fn cmd_lens(args: &[String]) -> CliResult {
     match args {
         [sub, config, name, fwd, inv, rest @ ..] if sub == "define" => {
             let mut class = LensClass::Bijective;
+            let mut rex: Option<&str> = None;
+            let mut residual_type: Option<mpedb::ColumnType> = None;
             let mut it = rest.iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -447,20 +451,63 @@ fn cmd_lens(args: &[String]) -> CliResult {
                         })?;
                         class = LensClass::parse(v)?;
                     }
+                    "--rex" => {
+                        rex = Some(it.next().ok_or_else(|| {
+                            Failure::Usage("--rex needs a stored function name".into())
+                        })?);
+                    }
+                    "--residual-type" => {
+                        let v = it.next().ok_or_else(|| {
+                            Failure::Usage(
+                                "--residual-type needs a column type (int64, float64, text, \
+                                 blob, bool, timestamp, any)"
+                                    .into(),
+                            )
+                        })?;
+                        residual_type = Some(mpedb::ColumnType::parse(v).ok_or_else(|| {
+                            Failure::Usage(format!("unknown residual type `{v}`"))
+                        })?);
+                    }
                     other => return usage(format!("lens define: unexpected argument {other}")),
                 }
             }
             let db = crate::util::open_target(config)?;
-            let samples = db.create_lens(name, fwd, inv, class)?;
             match class {
-                LensClass::Lossy => println!(
-                    "lens {name} registered as lossy: NOT invertible, so the source must be kept"
-                ),
-                _ => println!(
-                    "lens {name} registered as {}: {fwd} \u{21c4} {inv}, round trip held on \
-                     {samples} probe inputs",
-                    class.as_str()
-                ),
+                LensClass::Residual => {
+                    let (Some(rex), Some(rt)) = (rex, residual_type) else {
+                        return usage(
+                            "class residual binds a TRIPLE and declares its residual: \
+                             lens define <target> <name> <fwd> <inv> --class residual \
+                             --rex <fn> --residual-type <type>",
+                        );
+                    };
+                    let samples = db.create_residual_lens(name, fwd, rex, inv, rt)?;
+                    println!(
+                        "lens {name} registered as residual ({}): {fwd} \u{21c4} {inv} with \
+                         rex {rex}, round trip held on {samples} probe inputs",
+                        rt.name()
+                    );
+                }
+                other_class => {
+                    if rex.is_some() || residual_type.is_some() {
+                        return usage(format!(
+                            "--rex/--residual-type belong to --class residual, not {}",
+                            other_class.as_str()
+                        ));
+                    }
+                    let samples = db.create_lens(name, fwd, inv, other_class)?;
+                    match other_class {
+                        LensClass::Lossy => println!(
+                            "lens {name} registered as lossy: NOT invertible, so the source \
+                             must be kept"
+                        ),
+                        _ => println!(
+                            "lens {name} registered as {}: {fwd} \u{21c4} {inv}, round trip \
+                             held on {samples} probe inputs",
+                            other_class.as_str()
+                        ),
+                    }
+                }
             }
             Ok(())
         }
@@ -486,15 +533,21 @@ fn cmd_lens(args: &[String]) -> CliResult {
                 println!("no lens pairs");
             }
             for l in lenses {
-                println!(
-                    "{}  {}  {} samples{}\n    forward {}\n    inverse {}",
+                let class = match l.residual_type {
+                    Some(t) => format!("{} ({t})", l.class.as_str()),
+                    None => l.class.as_str().to_string(),
+                };
+                print!(
+                    "{}  {class}  {} samples{}\n    forward {}\n    inverse {}\n",
                     l.name,
-                    l.class.as_str(),
                     l.samples,
                     if l.healthy { "" } else { "  [DEFINITION BLOB MISSING]" },
                     l.forward_hash,
                     l.inverse_hash,
                 );
+                if let Some(rex) = &l.rex_hash {
+                    println!("    rex     {rex}");
+                }
             }
             Ok(())
         }

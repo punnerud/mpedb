@@ -119,29 +119,110 @@ fn a_non_injective_pair_is_refused_as_a_collision() {
 }
 
 #[test]
-fn stage_one_registers_one_to_one_pairs_only() {
+fn bijective_arity_is_enforced() {
     let (d, path) = db("arity");
     def(&d, "def one(x):\n    return x\n");
     def(&d, "def two(x, y):\n    return x + y\n");
     let e = d.create_lens("wide", "two", "one", LensClass::Bijective).unwrap_err();
     let msg = e.to_string();
-    assert!(msg.contains("1\u{2192}1"), "{msg}");
-    assert!(msg.contains("residual"), "the refusal must say what a wider pair needs: {msg}");
+    assert!(msg.contains("forward/1"), "{msg}");
+    assert!(msg.contains("two/2"), "the refusal must name the offending arity: {msg}");
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
-fn residual_is_refused_because_its_format_is_not_written_yet() {
-    // The residual format is an eternity promise (commitment 9). Stage 1 writes
-    // no byte of it, so declaring the class must fail loudly rather than
-    // register a pair whose format does not exist.
-    let e = LensClass::parse("residual").unwrap_err().to_string();
-    assert!(e.contains("stage 2"), "{e}");
-
+fn the_two_function_api_points_residual_pairs_at_the_triple() {
+    // The two-function API cannot express a residual pair — three functions
+    // and a declared type are required, and the refusal says where to go.
     let (d, path) = db("residual");
     def(&d, "def keep(x):\n    return x\n");
     let e = d.create_lens("r", "keep", "keep", LensClass::Residual).unwrap_err().to_string();
-    assert!(e.contains("not built"), "{e}");
+    assert!(e.contains("create_residual_lens"), "{e}");
+    assert!(e.contains("--rex"), "the refusal should name the CLI flags: {e}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// THE stage-2 flagship: `abs ⇄ sign`. The forward is genuinely non-injective —
+/// 5 and -5 both map to 5 — which is exactly the "several possible reversals"
+/// case the residual class exists for. The residual is the BRANCH CHOICE
+/// itself (DESIGN-ETL §6: branch choice is residual data), one bit stored as
+/// an int. Declared bijective it must be REFUSED as a collision; declared
+/// residual with the sign extractor it must register, because x ↦ (|x|, sign)
+/// is injective even though x ↦ |x| is not.
+#[test]
+fn a_non_injective_forward_registers_when_the_residual_disambiguates() {
+    let (d, path) = db("abs");
+    def(&d, "def mag(x):\n    if x < 0:\n        return 0 - x\n    return x\n");
+    def(&d, "def sgn(x):\n    if x < 0:\n        return 1\n    return 0\n");
+    def(&d, "def unmag(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n");
+    // sgn/1 exists but is not part of THIS registration attempt:
+    def(&d, "def unmag1(y):\n    return y\n");
+
+    // Without the residual: a collision, named.
+    let e = d.create_lens("mag", "mag", "unmag1", LensClass::Bijective).unwrap_err();
+    let msg = e.to_string();
+    assert!(msg.contains("are both"), "expected a collision diagnosis: {msg}");
+
+    // With it: registered, and the sample count says what was exercised.
+    let samples = d
+        .create_residual_lens("mag", "mag", "sgn", "unmag", mpedb::ColumnType::Int64)
+        .expect("the residual disambiguates the two preimages");
+    assert!(samples > 50, "ints and floats round-trip, got {samples}");
+
+    let listed = d.list_lenses().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].class, LensClass::Residual);
+    assert_eq!(listed[0].residual_type, Some("int64"));
+    assert!(listed[0].rex_hash.is_some());
+    assert!(listed[0].healthy);
+
+    // Re-verification is read-only and reproducible for residual pairs too.
+    assert_eq!(d.verify_lens("mag").unwrap(), samples);
+
+    // i64::MIN is OUTSIDE the domain, not a counter-example: 0 - i64::MIN
+    // overflows, PySpell arithmetic is checked, and the refusal skips it.
+    // The probe corpus contains it, so registering at all proves the skip.
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The declared residual type is verified, not advisory (commitment 5): the
+/// SAME functions register with the right declaration and are refused with the
+/// wrong one, with the offending value named.
+#[test]
+fn the_declared_residual_type_is_enforced() {
+    let (d, path) = db("rextype");
+    def(&d, "def mag(x):\n    if x < 0:\n        return 0 - x\n    return x\n");
+    def(&d, "def sgn(x):\n    if x < 0:\n        return 1\n    return 0\n");
+    def(&d, "def unmag(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n");
+
+    let e = d
+        .create_residual_lens("mag", "mag", "sgn", "unmag", mpedb::ColumnType::Text)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("declared residual type `text`"), "{e}");
+    assert!(d.list_lenses().unwrap().is_empty(), "a refused pair must not register");
+
+    // `any` is a LEGAL declaration — it just has to be said.
+    let n = d
+        .create_residual_lens("mag", "mag", "sgn", "unmag", mpedb::ColumnType::Any)
+        .expect("Any is a declaration, not a default");
+    assert!(n > 50);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Arity is part of the contract: a residual pair is forward/1, rex/1, inverse/2.
+#[test]
+fn residual_arity_is_enforced() {
+    let (d, path) = db("rexarity");
+    def(&d, "def mag(x):\n    return x\n");
+    def(&d, "def sgn(x):\n    return 0\n");
+    def(&d, "def bad_inv(y):\n    return y\n"); // inverse/1 cannot take the residual
+    let e = d
+        .create_residual_lens("m", "mag", "sgn", "bad_inv", mpedb::ColumnType::Int64)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("inverse/2"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
 
