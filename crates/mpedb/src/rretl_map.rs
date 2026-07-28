@@ -618,7 +618,22 @@ impl crate::Database {
     fn resolve_map(&self, spec: &MapSpec) -> Result<Vec<ResolvedTable>> {
         self.engine.refresh_schema_if_stale()?;
         let bundle = self.engine.schema();
-        let find = |name: &str| bundle.schema.tables.iter().find(|t| t.name == name && !t.dead);
+        // SQL identifiers are case-INSENSITIVE, so a spec must resolve the
+        // same way `SELECT * FROM SRC` does. Everything downstream then uses
+        // the SCHEMA's spelling — interpolated SQL, state keys, messages —
+        // so one table is one table however the spec spelled it. Before
+        // this, a source in the wrong case was refused ("no source table
+        // `SRC`") while a TARGET in the wrong case was accepted and then
+        // auto-created into a raw `duplicate table name` at sync, leaving a
+        // permanently unsyncable map that `check` reported as ordinary
+        // pending creations.
+        let find = |name: &str| {
+            bundle
+                .schema
+                .tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(name) && !t.dead)
+        };
         let mut out = Vec::with_capacity(spec.tables.len());
         for t in &spec.tables {
             let src = find(&t.source).ok_or_else(|| {
@@ -640,14 +655,17 @@ impl crate::Database {
                     spec.name, t.source
                 )));
             };
+            let mut src_col_names = Vec::with_capacity(t.columns.len());
             for c in &t.columns {
-                if !src.columns.iter().any(|sc| sc.name == c.source) {
+                let Some(sc) = src.columns.iter().find(|sc| sc.name.eq_ignore_ascii_case(&c.source))
+                else {
                     return Err(Error::Unsupported(format!(
                         "map `{}`: no column `{}` in `{}`",
                         spec.name, c.source, t.source
                     )));
-                }
-                if c.source == src_key {
+                };
+                src_col_names.push(sc.name.clone());
+                if sc.name.eq_ignore_ascii_case(&src_key) {
                     return Err(Error::Unsupported(format!(
                         "map `{}`: `{}` is the row identity of `{}` — it maps as the \
                          KEY, not as a value column",
@@ -655,27 +673,52 @@ impl crate::Database {
                     )));
                 }
             }
-            let dst_key = t.target_key.clone().unwrap_or_else(|| {
+            let mut dst_key = t.target_key.clone().unwrap_or_else(|| {
                 if rowid_identity { "id".to_string() } else { src_key.clone() }
             });
-            if t.columns.iter().any(|c| c.target == dst_key) {
+            if t.columns.iter().any(|c| c.target.eq_ignore_ascii_case(&dst_key)) {
                 return Err(Error::Unsupported(format!(
                     "map `{}`: target column `{dst_key}` collides with the target key",
                     spec.name
                 )));
             }
+            let mut dst_name = t.target.clone();
+            let mut dst_col_names: Vec<String> =
+                t.columns.iter().map(|c| c.target.clone()).collect();
             let create_dst = match find(&t.target) {
                 None => true,
                 Some(d) => {
+                    dst_name = d.name.clone();
                     let pk_ok = d.primary_key.len() == 1
-                        && d.columns[d.primary_key[0] as usize].name == dst_key;
+                        && d.columns[d.primary_key[0] as usize]
+                            .name
+                            .eq_ignore_ascii_case(&dst_key);
                     if !pk_ok {
+                        let have = d
+                            .primary_key
+                            .iter()
+                            .map(|i| d.columns[*i as usize].name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        // Name where `dst_key` CAME FROM: with no explicit
+                        // `target_key` it is the source's identity, so a
+                        // rename on the SOURCE surfaces here and the old
+                        // message blamed the target for it.
+                        let origin = match &t.target_key {
+                            Some(_) => "the mapping's `target_key`".to_string(),
+                            None => format!(
+                                "the row identity of source `{}` (no `target_key` given)",
+                                t.source
+                            ),
+                        };
                         return Err(Error::Unsupported(format!(
-                            "map `{}`: existing target `{}` must have `{dst_key}` as its \
-                             single-column PRIMARY KEY",
-                            spec.name, t.target
+                            "map `{}`: target `{}` has PRIMARY KEY ({have}), but the \
+                             mapping needs `{dst_key}` — which comes from {origin}. \
+                             Rename one side, or set `target_key`",
+                            spec.name, d.name
                         )));
                     }
+                    dst_key = d.columns[d.primary_key[0] as usize].name.clone();
                     // Row identity maps VERBATIM, so a rigid target key of a
                     // different type refuses every point lookup the sync
                     // makes — turning a definition mistake into an
@@ -693,13 +736,16 @@ impl crate::Database {
                             spec.name, t.target, t.source
                         )));
                     }
-                    for c in &t.columns {
-                        if !d.columns.iter().any(|dc| dc.name == c.target) {
+                    for (i, c) in t.columns.iter().enumerate() {
+                        let Some(dc) =
+                            d.columns.iter().find(|dc| dc.name.eq_ignore_ascii_case(&c.target))
+                        else {
                             return Err(Error::Unsupported(format!(
                                 "map `{}`: existing target `{}` has no column `{}`",
-                                spec.name, t.target, c.target
+                                spec.name, d.name, c.target
                             )));
-                        }
+                        };
+                        dst_col_names[i] = dc.name.clone();
                     }
                     false
                 }
@@ -707,10 +753,11 @@ impl crate::Database {
             let cols = t
                 .columns
                 .iter()
-                .map(|c| {
+                .enumerate()
+                .map(|(i, c)| {
                     Ok(ResolvedCol {
-                        src: c.source.clone(),
-                        dst: c.target.clone(),
+                        src: src_col_names[i].clone(),
+                        dst: dst_col_names[i].clone(),
                         lens: c
                             .pair
                             .as_deref()
@@ -720,8 +767,8 @@ impl crate::Database {
                 })
                 .collect::<Result<Vec<_>>>()?;
             out.push(ResolvedTable {
-                src: t.source.clone(),
-                dst: t.target.clone(),
+                src: src.name.clone(),
+                dst: dst_name,
                 src_key,
                 src_key_ty,
                 rowid_identity,
@@ -779,7 +826,11 @@ impl crate::Database {
     /// aborts on), plus the two audits a sync never performs: `diverged`
     /// (state clean on both sides while `forward(source) != target`) and
     /// `orphan_state`. Like `rretl_fsck` it is not one snapshot across
-    /// chunks — exact when nothing writes concurrently.
+    /// chunks — EXACT WHEN NOTHING WRITES CONCURRENTLY. Under a live sync
+    /// any single finding may be a cross-snapshot artifact (source read
+    /// from one commit, target from the next), so a churning system should
+    /// be quiesced before a finding is believed; the counts stay useful as
+    /// a progress signal either way.
     pub fn rretl_map_check(&self, name: &str) -> Result<MapCheckReport> {
         let spec = self.load_map(name)?;
         let resolved = self.resolve_map(&spec)?;

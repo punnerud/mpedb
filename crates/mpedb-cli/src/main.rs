@@ -806,9 +806,14 @@ fn cmd_rretl(args: &[String]) -> CliResult {
             }
             let breaches = r.breaches().len();
             if breaches > 0 {
+                // The check is not one snapshot across its reads, so under a
+                // live sync a breach can be a cross-snapshot artifact rather
+                // than a standing fact. Say so: at quiesce it is exact, and
+                // that is when the exit code should be believed.
                 return Err(Failure::Runtime(format!(
-                    "rretl map check `{name}`: {breaches} breach(es) — a sync would \
-                     abort or silent divergence is standing"
+                    "rretl map check `{name}`: {breaches} breach(es) — a sync would abort, \
+                     or divergence is standing. Exact when nothing is writing; re-run at \
+                     quiesce before acting on this"
                 )));
             }
             Ok(())

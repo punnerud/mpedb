@@ -1001,6 +1001,21 @@ without signing the arbiter. Writing to rRETL bookkeeping by hand is
 writing to the engine's internals: fsck cannot vouch for a doctored
 oracle.
 
+**Identifiers resolve case-INSENSITIVELY, to the schema's spelling.** SQL
+accepts `SELECT * FROM SRC`, so a spec must too — and everything
+downstream (interpolated SQL, state keys, the messages) then uses the
+schema's spelling, so one table is one table however the spec wrote it.
+Before this the two halves disagreed: a source in the wrong case was
+refused by name, while a TARGET in the wrong case was accepted and
+auto-created into a raw `duplicate table name` at sync — a permanently
+unsyncable map that `check` reported as ordinary pending creations.
+
+**`check` is exact at quiesce, not under churn.** It is not one snapshot
+across its reads, so with a sync running concurrently a single finding
+may be a cross-snapshot artifact (source read from one commit, target
+from the next). The counts remain a useful progress signal; a FINDING
+should be re-run at quiesce before it is acted on, and the CLI says so.
+
 **Pair rebinding is the realistic divergence.** `create_lens` rebinds an
 existing pair NAME, and a map resolves pairs by name at every sync — so a
 mapped column's meaning can change under a map whose state is entirely

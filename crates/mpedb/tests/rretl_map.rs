@@ -711,3 +711,37 @@ target = "ext_with_an_equally_long_target_name"
     assert!(d.rretl_map_check(name).unwrap().is_clean());
     assert!(d.rretl_fsck().unwrap().is_empty());
 }
+
+/// SQL identifiers are case-INSENSITIVE, so a map spec must resolve the
+/// way `SELECT * FROM SRC` does. Before this a source in the wrong case
+/// was refused by name while a TARGET in the wrong case was ACCEPTED —
+/// then auto-created into a raw `duplicate table name` at sync, leaving a
+/// permanently unsyncable map that `check` reported as ordinary pending
+/// creations. Everything downstream now uses the schema's spelling.
+#[test]
+fn a_spec_in_the_wrong_case_resolves_like_sql_does() {
+    let (d, _s) = seeded("case");
+    d.query(
+        "CREATE TABLE crm_customers (id INTEGER PRIMARY KEY, full_label ANY, \
+         neg_score ANY, abs_balance ANY)",
+        &[],
+    )
+    .unwrap();
+    d.rretl_map_define(&MAP.replace("customers", "CUSTOMERS").replace("label", "LABEL"))
+        .unwrap();
+
+    // The report names the SCHEMA's spelling, not the spec's.
+    let chk = d.rretl_map_check("crm").unwrap();
+    assert_eq!(chk.tables[0].src, "customers");
+    assert_eq!(chk.tables[0].dst, "crm_customers");
+    assert_eq!(chk.tables[0].would_create_b, 3);
+
+    let r = d.rretl_map_sync("crm").unwrap();
+    assert_eq!(r.created_b, 3);
+    assert!(d.rretl_map_check("crm").unwrap().is_clean());
+    // And the round trip still works through the mis-cased spec.
+    d.query("UPDATE crm_customers SET neg_score = 0 - 12 WHERE id = 1", &[])
+        .unwrap();
+    assert_eq!(d.rretl_map_sync("crm").unwrap().b_to_a, 1);
+    assert_eq!(ints(&d, "SELECT score FROM customers WHERE id = 1"), vec![12]);
+}
