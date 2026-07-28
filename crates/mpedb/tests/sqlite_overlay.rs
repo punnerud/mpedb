@@ -840,18 +840,22 @@ fn secondary_unique_sees_the_base_after_a_reopen() {
     let mut o = SqliteOverlay::open(&p).unwrap();
 
     // The wrong answer was: this SUCCEEDS and leaves two rows both holding
-    // 'a@x'. It must not. (Full sqlite semantics — replacing the base row —
-    // needs the base's index b-trees walked so the executor can find the
-    // victim; until then the constraint refuses rather than duplicates, which
-    // is the difference between a named error and a corrupt table.)
-    let r = o.query(
+    // 'a@x'. Now it does what sqlite does — deletes the conflicting BASE row
+    // and inserts, so there is still exactly one 'a@x' and it is the new one
+    // (#169: the victim comes from `unique_victims`, since `t.indexes` is
+    // empty on this path by design).
+    o.query(
         "INSERT OR REPLACE INTO acct (id, email, tag) VALUES (2, 'a@x', 'second')",
         &[],
-    );
-    assert!(r.is_err(), "a duplicate 'a@x' was accepted: {r:?}");
+    )
+    .unwrap();
 
-    let all = rows(o.query("SELECT id FROM acct WHERE email = 'a@x'", &[]).unwrap());
-    assert_eq!(all.len(), 1, "the base row must still be the only 'a@x'");
+    let hit = rows(o.query("SELECT id, tag FROM acct WHERE email = 'a@x'", &[]).unwrap());
+    assert_eq!(hit.len(), 1, "exactly one 'a@x' must remain, got {hit:?}");
+    assert_eq!(hit[0][0], Value::Int(2), "the REPLACED row must be the new one");
+    assert_eq!(hit[0][1], Value::Text("second".into()));
+    // The base row it replaced is gone, not merely shadowed.
+    assert!(rows(o.query("SELECT id FROM acct WHERE id = 1", &[]).unwrap()).is_empty());
 
     // A plain INSERT collides the same way, and a non-conflicting one still
     // works — the check must not refuse everything.
@@ -861,4 +865,36 @@ fn secondary_unique_sees_the_base_after_a_reopen() {
     o.query("INSERT INTO acct (id, email, tag) VALUES (4, 'b@x', 'ok')", &[])
         .unwrap();
     assert_eq!(rows(o.query("SELECT id FROM acct", &[]).unwrap()).len(), 2);
+
+
+    // THE ORACLE. The assertions above encode what sqlite is believed to do;
+    // this makes sqlite say it. Same DDL, same statements, on its own file —
+    // if mpedb's overlay and the real library ever disagree about which row
+    // survives an `INSERT OR REPLACE` across a secondary UNIQUE, that is the
+    // wrong answer #133 was, wearing different clothes.
+    let oracle = std::env::temp_dir()
+        .join("mpedb-overlay-tests")
+        .join(format!("oracle-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&oracle);
+    let c = Connection::open(&oracle).unwrap();
+    c.execute_batch(
+        "CREATE TABLE acct (id INTEGER PRIMARY KEY, email TEXT UNIQUE, tag TEXT);
+         INSERT INTO acct VALUES (1, 'a@x', 'first');
+         INSERT OR REPLACE INTO acct (id, email, tag) VALUES (2, 'a@x', 'second');
+         INSERT INTO acct (id, email, tag) VALUES (4, 'b@x', 'ok');",
+    )
+    .unwrap();
+    let got: Vec<(i64, String)> = c
+        .prepare("SELECT id, tag FROM acct ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let _ = std::fs::remove_file(&oracle);
+    assert_eq!(
+        got,
+        vec![(2i64, "second".to_string()), (4, "ok".to_string())],
+        "sqlite itself must agree with what this test asserts of mpedb"
+    );
 }

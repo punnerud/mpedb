@@ -887,6 +887,43 @@ impl TxnCtx for MergeCtx<'_> {
         self.at.base_get_by_pk(table, pk)
     }
 
+    /// #169: `INSERT OR REPLACE`'s secondary-UNIQUE victims, answered from the
+    /// base's constraint list rather than from `t.indexes` — which is empty
+    /// here, because attach deliberately keeps the base's UNIQUE off the
+    /// schema (#133). Without this the executor found no victim and the
+    /// statement refused; with it, the base row is deleted and replaced, which
+    /// is what sqlite does.
+    ///
+    /// Same merged-view walk as [`Self::check_unique`], and the same honest
+    /// cost — one scan per checked write, nothing at all for a table with no
+    /// secondary UNIQUE.
+    fn unique_victims(
+        &mut self,
+        table: u32,
+        _t: &mpedb_types::TableDef,
+        row: &[Value],
+    ) -> Result<Vec<Vec<Value>>> {
+        let sets = self.at.unique_sets(table);
+        if sets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let live: Vec<&Vec<usize>> = sets
+            .iter()
+            .filter(|cols| !cols.iter().any(|&c| row[c].is_null()))
+            .collect();
+        if live.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pk_i = self.pk_idx[table as usize];
+        let mut out = Vec::new();
+        for existing in self.scan_rows_raw(table, None, None)? {
+            if live.iter().any(|cols| cols.iter().all(|&c| existing[c] == row[c])) {
+                out.push(vec![existing[pk_i].clone()]);
+            }
+        }
+        Ok(out)
+    }
+
     fn get_by_index(&mut self, _t: u32, _n: u32, _v: &[Value]) -> Result<Option<Vec<Value>>> {
         Err(Error::Internal("index probe on an overlay (schema has none)".into()))
     }

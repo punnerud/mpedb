@@ -148,6 +148,42 @@ pub(crate) trait TxnCtx {
     fn snapshot_txn(&self) -> Option<&ReadTxn<'_>> {
         None
     }
+    /// The PKs of existing rows the proposed `row` collides with on a
+    /// SECONDARY UNIQUE constraint — `INSERT OR REPLACE`'s victims beyond the
+    /// PK's own (#169).
+    ///
+    /// A method rather than a loop at the call site because WHERE the unique
+    /// constraints live is a property of the store, not of the statement. The
+    /// native one keeps them in the schema as unique `IndexDef`s and probes
+    /// them; the sqlite-backed ones deliberately do NOT (attach keeps the
+    /// base's UNIQUE off the schema, since carrying it would let the planner
+    /// choose index access paths this reader cannot serve — #133), so they
+    /// answer from their own constraint list instead.
+    ///
+    /// The default IS the native behaviour, unchanged: probe every unique
+    /// index, skipping any whose key has a NULL (no index entry, so no
+    /// conflict — UNIQUE and the rowid-alias auto-assign both permit it).
+    fn unique_victims(
+        &mut self,
+        table: u32,
+        t: &mpedb_types::TableDef,
+        row: &[Value],
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut out = Vec::new();
+        for (pos, ix) in t.indexes.iter().enumerate() {
+            if !ix.unique {
+                continue;
+            }
+            let vals: Vec<Value> = ix.columns.iter().map(|&c| row[c as usize].clone()).collect();
+            if vals.iter().any(|v| v.is_null()) {
+                continue;
+            }
+            if let Some(existing) = self.get_by_index(table, (pos + 1) as u32, &vals)? {
+                out.push(t.primary_key.iter().map(|&c| existing[c as usize].clone()).collect());
+            }
+        }
+        Ok(out)
+    }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>>;
     /// Decode only the listed column ordinals from a PK hit (projection order).
     /// Default: full row then project — override when the store can decode
@@ -2721,21 +2757,13 @@ fn exec_stmt_rest(
                             victims.push(pk_of(&existing));
                         }
                     }
-                    for (pos, ix) in t.indexes.iter().enumerate() {
-                        if !ix.unique {
-                            continue;
-                        }
-                        let vals: Vec<Value> =
-                            ix.columns.iter().map(|&c| row[c as usize].clone()).collect();
-                        if vals.iter().any(|v| v.is_null()) {
-                            continue;
-                        }
-                        if let Some(existing) =
-                            ctx.get_by_index(*table, (pos + 1) as u32, &vals)?
-                        {
-                            victims.push(pk_of(&existing));
-                        }
-                    }
+                    // The secondary-UNIQUE victims come from the CONTEXT, not
+                    // from a loop here (#169): the native store keeps those
+                    // constraints in the schema and probes their indexes, the
+                    // sqlite-backed ones keep them off the schema on purpose
+                    // and answer from their own list. Same semantics, one
+                    // question.
+                    victims.extend(ctx.unique_victims(*table, &t, &row)?);
                     let mut deleted: Vec<Vec<Value>> = Vec::new();
                     for v in victims {
                         if deleted.contains(&v) {
