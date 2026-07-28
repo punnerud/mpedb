@@ -402,11 +402,13 @@ impl SqliteAttach {
             defs.push(def);
             tables.push(Attached { src: t, pk, checks });
         }
-        // When EVERY table was skipped, `Schema::new` would report the generic
-        // "schema defines no live tables" — true, but it hides the reasons the
-        // caller actually needs (measured: a one-table base with a CHECK
-        // constraint said "no live tables" instead of naming the CHECK). The
-        // skip list IS the explanation, so lead with it.
+        // When EVERY table was skipped, an empty overlay schema would now
+        // open fine (zero-table seeds are legal) — silently attaching NONE of
+        // the base's tables. The skip list IS the explanation the caller
+        // needs (measured: a one-table base with a CHECK constraint used to
+        // fail with a generic schema error instead of naming the CHECK), so
+        // refuse with it. A base with genuinely zero tables attaches empty,
+        // exactly as sqlite itself opens it.
         if defs.is_empty() && !skipped.is_empty() {
             return Err(Error::Unsupported(format!(
                 "no table in {} is attachable under the v2 shape rules: {:?}",

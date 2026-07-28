@@ -981,13 +981,12 @@ impl Schema {
     }
 
     fn validate(&self) -> Result<()> {
-        // LIVE tables must exist (a schema of only tombstones is meaningless);
-        // the LIVE count carries the system-table headroom guard. The total
-        // (live + dead) is bounded by MAX_TABLES — dead slots hold an id.
+        // ZERO live tables is a legal seed: live DDL (#47) grows the catalog
+        // past the seed, so "open empty, CREATE TABLE as you go" is the
+        // simplest setup a config can express. The LIVE count carries the
+        // system-table headroom guard. The total (live + dead) is bounded by
+        // MAX_TABLES — dead slots hold an id.
         let live = self.tables.iter().filter(|t| !t.dead).count();
-        if live == 0 {
-            return Err(Error::Schema("schema defines no live tables".into()));
-        }
         if live > MAX_TABLES - 8 {
             return Err(Error::Schema(format!(
                 "too many tables ({live} > {})",
@@ -2106,10 +2105,13 @@ mod tests {
         evil.tables[1].name = "ghost".into(); // a dead slot must be empty
         let err = Schema::from_canonical_bytes(&evil.canonical_bytes()).unwrap_err();
         assert!(format!("{err}").contains("tombstone"), "{err}");
-        // An all-tombstone schema (no live table) refuses.
+        // An all-tombstone schema is LEGAL — it is exactly what CREATE+DROP
+        // leaves in a zero-table-seed database — and must round-trip.
         let mut none = Schema::new(vec![tbl("a")]).unwrap();
         none.tables[0] = TableDef::tombstone(0);
-        assert!(Schema::from_canonical_bytes(&none.canonical_bytes()).is_err());
+        let r = Schema::from_canonical_bytes(&none.canonical_bytes()).unwrap();
+        assert_eq!(none.tables.len(), r.tables.len());
+        assert!(r.tables[0].dead);
     }
 
     #[test]

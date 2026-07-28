@@ -39,10 +39,11 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// The seed table every fresh mpedb file is created with: mpedb refuses a
-/// schema with no live tables, but `sqlite3_open("new.db")` carries no schema.
-/// It is otherwise inert; user tables are created live via `CREATE TABLE`.
-/// `pub(crate)` so `introspect` can hide it from `PRAGMA`/`sqlite_master`.
+/// The seed table every fresh mpedb file is created with. mpedb accepts a
+/// zero-table seed nowadays, but existing shim-created files were seeded with
+/// this table and the frozen SEED hash must keep matching on re-attach, so it
+/// stays. It is otherwise inert; user tables are created live via `CREATE
+/// TABLE`. `pub(crate)` so `introspect` hides it from `PRAGMA`/`sqlite_master`.
 pub(crate) const SEED_TABLE: &str = "_mpedb_capi_bootstrap";
 
 static EPHEMERAL_SEQ: AtomicU64 = AtomicU64::new(0);
