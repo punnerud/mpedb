@@ -64,6 +64,16 @@ log-based engine), and the hardware published when the hardware is the answer.
   `putback` inverts KEEPING edits — PutRes per row replaces the hash gate,
   deleted rows stay deleted. Lineage is ordinary TABLES, never sys-keyspace —
   #124 is why. The Python surface + agent guide is PYSPELL-RETL.md)
+  + `retl put|get|versions` (blob versioning, retl_store.rs: newest FULL,
+  previous rewritten as reverse-delta verified byte-identical AS PERSISTED
+  before commit, every 8th a permanent full anchor; a stored full failing its
+  recorded hash HARD-errors the put — rewriting would launder corruption; a
+  bloating delta keeps the full and the put succeeds; get hash-verifies every
+  walk step) + `retl pack-in|pack-out|archives` (zip SPLICE per DESIGN-RETL
+  §8.4: members as rows, residual keeps every other byte, byte-identical
+  verify BEFORE ingest commits, pack-out hash-gated; zip64/encrypted/
+  overlapping refused by name. Both are lineage with outcomes
+  versioned/packed — never `applied`, so revert/stacking ignore them)
   + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
   and `mirror-collide` (SIGKILL fuzz: source writers + a mirror daemon killed at every
   instant → final drain must converge mpedb exactly to the source). stress/crash take
@@ -114,7 +124,8 @@ log-based engine), and the hardware published when the hardware is the answer.
   is validate-enforced; DROP relaxes it after the §6 positional audit). The planner
   exploits single-column indexes only until #55.
 - Schema/geometry are file-authoritative: attach hard-errors on config drift.
-  The config's schema seeds a new file and must hash-match the frozen SEED
+  The config's schema seeds a new file (a ZERO-table seed is legal — tables
+  arrive via live DDL) and must hash-match the frozen SEED
   hash on every attach; the LIVE schema is read from the catalog and may have
   grown past the seed via `CREATE TABLE` (#47). `M_SCHEMA_HASH` = seed forever;
   `schema_gen` in the flipping meta is the DDL staleness signal.

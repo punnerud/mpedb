@@ -50,7 +50,8 @@ revert:   y  ──inverse───▶ x      (EXACT undo; refuses if anything w
 ## 1. Setup
 
 ```sh
-pip install mpedb          # Linux x86-64/aarch64, macOS arm64; CPython 3.12+
+pip install mpedb          # Linux x86-64/aarch64, macOS arm64, Windows x86-64;
+                           # CPython 3.12+
 ```
 
 or from a checkout:
@@ -66,34 +67,29 @@ cp target/release/libmpedb_py.so /tmp/pymod/mpedb/_native.so   # .dylib on macOS
 export PYTHONPATH=/tmp/pymod
 ```
 
-A database is opened from a TOML config that declares the schema. ETL targets
-need a **declared single-column primary key**, and a column that will receive
-type-changing transforms (int→float etc.) must be declared `any`:
+A database is opened from a TOML config. The config does not need to declare
+any tables — the simplest setup is four lines, and you create the tables you
+work against with ordinary `CREATE TABLE`:
 
 ```toml
 [database]
 path = "pixels.mpedb"
 size_mb = 64
 max_readers = 8
-
-[[table]]
-name = "pixels"
-primary_key = ["id"]
-
-  [[table.column]]
-  name = "id"
-  type = "int64"
-
-  [[table.column]]
-  name = "px"
-  type = "any"        # "any" accepts every scalar type; rigid types refuse
-                      # type-changing pairs early, with the pair named
 ```
 
 ```python
 import mpedb
 db = mpedb.Database("pixels.toml")
+db.query("CREATE TABLE pixels (id INTEGER PRIMARY KEY, px ANY)")
 ```
+
+Two rules for a table RETL will transform: it needs a **declared
+single-column primary key**, and a column that will receive type-changing
+transforms (int→float etc.) must be `ANY` — `ANY` accepts every scalar type,
+while rigid types (`INTEGER`, `TEXT`, …) refuse type-changing pairs early,
+with the pair named. (Declaring tables in the TOML with `[[table]]` blocks
+still works and gives the same result; it is just more to write.)
 
 ---
 
@@ -251,8 +247,41 @@ Rules enforced for you (each is a named refusal, not a surprise):
   half-transformed column is worse than none.
 - `retl_revert`/`retl_putback` of an unknown run id, a double revert, a missing
   residual row, or a tampered column (revert only) are all named errors.
-- The bookkeeping tables (`retl_lineage`, `retl_residual`) are refused as ETL
-  targets, and they are ordinary tables — query them with SQL freely.
+- The bookkeeping tables (`retl_lineage`, `retl_residual`, `retl_versions`,
+  `retl_archives`, `retl_archive_members`) are refused as ETL targets, and
+  they are ordinary tables — query them with SQL freely.
+
+### Whole blobs too: versions and archives
+
+The same keep-what-was-lost discipline applies to raw bytes. Two built-in,
+engine-coded transforms (no PySpell involved):
+
+```python
+v1 = db.retl_put_version("model.onnx", first_bytes)   # -> 1
+v2 = db.retl_put_version("model.onnx", second_bytes)  # -> 2; v1 silently
+                                                      #    became a reverse delta
+db.retl_get_version("model.onnx", 1) == first_bytes   # always True — or a
+                                                      # NAMED corruption error
+```
+
+The newest version is always stored full; each older one is a delta against
+the version above it, **verified byte-identical before the rewrite commits**,
+and every 8th version stays full so no reconstruction ever walks more than 7
+deltas. Nothing is deleted, ever.
+
+```python
+aid = db.retl_pack_in("dataset.zip", zip_bytes)  # members -> rows you can query
+db.retl_pack_out(aid) == zip_bytes               # byte-identical, hash-gated
+```
+
+A zip goes in by *splice*: each member's data segment becomes a row in
+`retl_archive_members`, and the residual keeps every other byte (headers,
+ordering quirks, self-extracting stubs, non-UTF-8 names — all of it), so the
+reconstruction is byte-identical, not merely "a zip with the same files".
+Editing a member row afterwards makes `retl_pack_out` refuse by name —
+re-ingest the edited data as a new archive instead. Both transforms appear in
+`retl_log()` (outcomes `versioned` / `packed`) and are re-verified by
+`retl_fsck()`.
 
 ---
 
@@ -347,7 +376,13 @@ scale as its own apply with the full source as the residual).
 | `db.retl_revert(run_id)` | same dict | exact undo; hash-gated |
 | `db.retl_putback(run_id)` | same dict | undo through edits; PutRes-verified per row |
 | `db.retl_log()` | list of dicts | all runs, oldest first, failures included |
-| `db.retl_fsck()` | list of finding strings | verify-at-rest: every standing run re-checked (top-run hash, residual coverage, pair loadability); empty = clean; reports, never repairs |
+| `db.retl_fsck()` | list of finding strings | verify-at-rest: every standing run re-checked (top-run hash, residual coverage, pair loadability) AND every stored version/archive re-materialized against its hash; empty = clean; reports, never repairs |
+| `db.retl_put_version(obj, data)` | version number | blob versioning: newest kept full, the previous newest rewritten as a reverse delta (verified byte-identical before commit), every 8th version stays full |
+| `db.retl_get_version(obj, ver)` | `bytes` | materialize ANY version; every reconstruction step hash-verified — corruption is a named error, never wrong bytes |
+| `db.retl_versions(obj)` | list of dicts | `ver, stored_as ("full"/"delta"), bytes, content_hash` |
+| `db.retl_pack_in(name, data)` | archive id | splice a zip: members become rows in `retl_archive_members` (queryable!), the residual keeps every other byte; reconstruction verified byte-identical BEFORE the ingest commits. zip64, encrypted and overlapping archives are refused by name |
+| `db.retl_pack_out(archive_id)` | `bytes` | rebuild the zip byte-identically, hash-gated — a member row edited outside the pipeline is a named refusal (re-ingest instead of mutating) |
+| `db.retl_archives()` | list of dicts | `archive_id, name, members, content_hash` |
 
 Everything raises `mpedb.Error` subclasses (`ProgrammingError` for refusals,
 `OperationalError` for engine trouble) with the engine's full message. These

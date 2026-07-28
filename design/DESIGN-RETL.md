@@ -1,10 +1,13 @@
 # DESIGN-RETL — reversible PySpell ETL: lens pairs, residuals, round-trip verification
 
-**Status: DESIGNED; stage 1 (the bijective corner) and stage 2 (residual
-pairs + `retl apply|revert|putback|log` + lineage) IMPLEMENTED 2026-07-28** —
+**Status: DESIGNED; stage 1 (the bijective corner), stage 2 (residual
+pairs + `retl apply|revert|putback|log` + lineage) and stage 3's storage
+domains (blob versioning `retl put|get|versions`, zip splice
+`retl pack-in|pack-out|archives` — §8.2–8.4 codecs + `retl_store`)
+IMPLEMENTED 2026-07-28** —
 user-facing contract: `PYSPELL-RETL.md` (the self-contained Python guide) —
-`crates/mpedb/src/lens.rs`, `mpedb lens` in the CLI, tests in
-`crates/mpedb/tests/lens.rs`. The prior-art groundwork is `design/RETL-BIDI.md`
+`crates/mpedb/src/{lens,retl,retl_codec,retl_store}.rs`, `mpedb lens`/`mpedb
+retl` in the CLI, tests in `crates/mpedb/tests/{lens,retl,retl_store}.rs`. The prior-art groundwork is `design/RETL-BIDI.md`
 (including the 2026-07-28 addendum: Jeopardy, Hermes, CRIL, RC 2023–2025,
 Sparcl JFP 2024, wire-format practice, lineage practice), whose eleven design
 commitments bind this document; every section below names the commitment it
@@ -389,9 +392,10 @@ addressing), so **`revert` refuses hard when the lineage row is missing**. A
 residual whose lineage row was deleted is an uninterpretable scalar, and an
 equally explicit error, never a NULL read.
 
-The envelope, stage 3's composite-residual carrier — **designed 2026-07-28,
-NOT BUILT** (it lands as `crates/mpedb/src/etl_codec.rs` when stage 3 does;
-the 23-finding adversarial check of the build sketch is folded in below):
+The envelope, stage 3's composite-residual carrier — designed 2026-07-28,
+**BUILT the same day** as `crates/mpedb/src/retl_codec.rs` (envelope + both
+payload codecs; the 23-finding adversarial check of the build sketch is
+folded in below), with the storage half in `crates/mpedb/src/retl_store.rs`:
 
 ```
 kind      u8      ONE dispatch byte — the value IS both the version and the
@@ -611,12 +615,26 @@ guard refuses oversized runs with numbers: the single big txn is the design
 retry, and a named refusal beats an un-completable loop. Apply is an offline
 operation — it holds the writer lock for the duration, and says so.
 
-**Stage 3 — the domains. [not built]** Version storage as base+diff (binds #50
-and #52: `forward(v1, edit) → v2` with the diff as residual, verified
-`apply(v1, diff) == v2` byte-identically at ingest); container round-trip
-(pristine-tar's pattern for .gz/.zip, which has been in Debian infrastructure for
-~20 years); mpedbfs presentation (#54). Composite residuals get the §8.2
-envelope there, composed by nesting (the pristine-tar `wrapper` pattern).
+**Stage 3 — the domains. [BUILT 2026-07-28, B-block]** Version storage as
+base+diff: `retl put/get/versions` (`retl_store.rs`) — the newest version
+stored FULL, the previous newest rewritten as a reverse delta whose base is
+exactly the version above, verified byte-identical AS PERSISTED before the
+commit, every `FULL_EVERY = 8`th version a permanent full anchor (the Bennett
+knob, §11 finding 11), nothing ever deleted. Its three failure disciplines:
+a stored full that fails its recorded hash HARD-errors the put (rewriting
+would launder corruption and delete the last good copy — finding 12); a
+delta that bloats or fails its own round trip keeps the full and the put
+still succeeds (finding 13); verification re-reads the persisted rows in the
+same txn, so the row codec is inside the trust boundary (finding 14).
+Container round-trip: `retl pack-in/pack-out/archives` — zip SPLICE per
+§8.4, members as queryable rows, reconstruction verified byte-identically
+before the ingest commits and hash-gated on every pack-out. Both are lineage
+(`lens = builtin:delta-v1` / `builtin:zip-splice-v1`, outcomes `versioned` /
+`packed` — never `applied`, so revert/putback/stacking ignore them), and
+`retl fsck` re-materializes every version and re-splices every archive.
+Still not built from the stage-3 slate: mpedbfs presentation (#54).
+Composite PySpell residuals in the envelope remain future work — the
+envelope and codecs exist; the pipeline composition does not.
 
 Parked stage-3+ ideas from the 2026-07-28 survey, deliberately NOT stage 2:
 
