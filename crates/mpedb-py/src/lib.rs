@@ -1011,6 +1011,40 @@ impl PyDatabase {
         Ok(d.into_any().unbind())
     }
 
+    /// Read-only dry run of a map sync: one dict per table pair with the
+    /// would-move counts, EVERY named conflict (a sync aborts on the
+    /// first), and `diverged` — rows whose state says both sides are clean
+    /// while forward(source) != target, the silent breach the echo guard
+    /// cannot see. `clean` on the report level = nothing to do, nothing
+    /// wrong.
+    fn rretl_map_check(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+        let db = &self.db;
+        let r = py.detach(|| db.rretl_map_check(name)).map_err(map_err)?;
+        let top = pyo3::types::PyDict::new(py);
+        top.set_item("clean", r.is_clean())?;
+        top.set_item("pending_total", r.pending_total())?;
+        let tables = pyo3::types::PyList::empty(py);
+        for t in &r.tables {
+            let d = pyo3::types::PyDict::new(py);
+            d.set_item("source", &t.src)?;
+            d.set_item("target", &t.dst)?;
+            d.set_item("pending_a2b", t.pending_a2b)?;
+            d.set_item("pending_b2a", t.pending_b2a)?;
+            d.set_item("would_create_b", t.would_create_b)?;
+            d.set_item("would_create_a", t.would_create_a)?;
+            d.set_item("would_delete_a", t.would_delete_a)?;
+            d.set_item("would_delete_b", t.would_delete_b)?;
+            d.set_item("would_adopt", t.would_adopt)?;
+            d.set_item("unchanged", t.unchanged)?;
+            d.set_item("orphan_state", t.orphan_state)?;
+            d.set_item("conflicts", t.conflicts.clone())?;
+            d.set_item("diverged", t.diverged.clone())?;
+            tables.append(d)?;
+        }
+        top.set_item("tables", tables)?;
+        Ok(top.into_any().unbind())
+    }
+
     /// Every stored map name.
     fn rretl_maps(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let db = &self.db;

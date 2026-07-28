@@ -310,6 +310,71 @@ impl MapSyncReport {
     }
 }
 
+/// One mapped table pair's result from [`Database::rretl_map_check`] — a
+/// read-only dry run of the sync classification. `conflicts` collects
+/// EVERY named sync-blocker (the sync aborts on the first; the check keeps
+/// going and names them all). `diverged` is the invariant the echo guard
+/// structurally cannot see: state records both sides clean, yet
+/// `forward(source) != target` — a standing, silent divergence (tampered
+/// state, a redefine that dodged re-baselining, or an engine bug).
+/// `orphan_state` counts state rows whose key is gone from BOTH sides;
+/// that is pending cleanup for the next sync's pass 3, not a breach.
+#[derive(Debug, Default)]
+pub struct MapCheckTable {
+    pub src: String,
+    pub dst: String,
+    pub pending_a2b: u64,
+    pub pending_b2a: u64,
+    pub would_create_b: u64,
+    pub would_create_a: u64,
+    pub would_delete_a: u64,
+    pub would_delete_b: u64,
+    pub would_adopt: u64,
+    pub unchanged: u64,
+    pub orphan_state: u64,
+    pub conflicts: Vec<String>,
+    pub diverged: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct MapCheckReport {
+    pub tables: Vec<MapCheckTable>,
+}
+
+impl MapCheckReport {
+    /// Rows a sync would move or record (state adoptions included).
+    pub fn pending_total(&self) -> u64 {
+        self.tables
+            .iter()
+            .map(|t| {
+                t.pending_a2b
+                    + t.pending_b2a
+                    + t.would_create_b
+                    + t.would_create_a
+                    + t.would_delete_a
+                    + t.would_delete_b
+                    + t.would_adopt
+            })
+            .sum()
+    }
+
+    /// Every named breach: conflicts a sync would abort on, plus diverged
+    /// rows. Empty = a sync would run through.
+    pub fn breaches(&self) -> Vec<&String> {
+        self.tables
+            .iter()
+            .flat_map(|t| t.conflicts.iter().chain(t.diverged.iter()))
+            .collect()
+    }
+
+    /// Nothing to do and nothing wrong — the post-sync steady state.
+    pub fn is_clean(&self) -> bool {
+        self.pending_total() == 0
+            && self.breaches().is_empty()
+            && self.tables.iter().all(|t| t.orphan_state == 0)
+    }
+}
+
 impl crate::Database {
     /// Store (or replace) a mapping. The spec is validated NOW — sources
     /// exist with a usable row identity, every named pair loads and is
@@ -332,19 +397,36 @@ impl crate::Database {
     }
 
     fn store_map_record(&self, name: &str, toml_text: &str) -> Result<()> {
-        let key = crate::sys_record_subkey(NS_MAP, name.as_bytes())?;
         let mut record = vec![MAP_RECORD_V1];
         record.extend_from_slice(toml_text.as_bytes());
-        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        let res = (|| {
-            w.sys_put(&key, &record)?;
-            w.bump_schema_gen();
+        // A CHANGED spec under the same name RE-BASELINES: the state rows'
+        // hashes were recorded under the old spec, and against a new one
+        // they misclassify — same columns with a swapped pair leaves every
+        // chain untouched, so every row reads "both clean" and the target
+        // keeps the OLD pair's forward forever, silently. Deleting the
+        // map's state (atomically with the record) forces the next sync
+        // through the no-state paths: adopt-on-agree re-arbitrates, and
+        // disagreement is a named conflict. An UNCHANGED re-define keeps
+        // state, so a dropped map's history stays adoptable.
+        let have = self.committed_tables()?;
+        let has_state = have.iter().any(|(n, _)| n == T_MAP_STATE);
+        let mut s = self.begin()?;
+        let res = (|| -> Result<()> {
+            let prior = s.sys_record_get(NS_MAP, name.as_bytes())?;
+            if has_state && prior.is_some() && prior.as_deref() != Some(record.as_slice()) {
+                s.query(
+                    "DELETE FROM rretl_map_state WHERE map = $1",
+                    &[Value::Text(name.into())],
+                )?;
+            }
+            s.sys_record_put(NS_MAP, name.as_bytes(), &record)?;
+            s.bump_schema_gen();
             Ok(())
         })();
         match res {
-            Ok(()) => w.commit()?,
+            Ok(()) => s.commit()?,
             Err(e) => {
-                w.abort();
+                s.rollback();
                 return Err(e);
             }
         }
@@ -387,8 +469,10 @@ impl crate::Database {
             .collect())
     }
 
-    /// Drop a mapping. Its state rows stay (they are history a re-defined
-    /// map with the same name can pick up); `true` when it existed.
+    /// Drop a mapping. Its state rows stay — history that a re-define of
+    /// the same name with the SAME spec picks up unchanged (a CHANGED spec
+    /// re-baselines: [`store_map_record`](Self::rretl_map_define) deletes
+    /// them). `true` when it existed.
     pub fn rretl_map_drop(&self, name: &str) -> Result<bool> {
         let key = crate::sys_record_subkey(NS_MAP, name.as_bytes())?;
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
@@ -567,6 +651,26 @@ impl crate::Database {
                 Err(e)
             }
         }
+    }
+
+    /// Read-only dry run of [`rretl_map_sync`](Self::rretl_map_sync):
+    /// classify every row exactly as the sync would, without writing —
+    /// what WOULD move, every conflict named (not just the first the sync
+    /// aborts on), plus the two audits a sync never performs: `diverged`
+    /// (state clean on both sides while `forward(source) != target`) and
+    /// `orphan_state`. Like `rretl_fsck` it is not one snapshot across
+    /// chunks — exact when nothing writes concurrently.
+    pub fn rretl_map_check(&self, name: &str) -> Result<MapCheckReport> {
+        let spec = self.load_map(name)?;
+        let resolved = self.resolve_map(&spec)?;
+        let have = self.committed_tables()?;
+        let has_state = have.iter().any(|(n, _)| n == T_MAP_STATE);
+        let mut report = MapCheckReport::default();
+        for rt in &resolved {
+            let has_dst = have.iter().any(|(n, _)| n == &rt.dst);
+            report.tables.push(check_table(self, name, rt, has_state, has_dst)?);
+        }
+        Ok(report)
     }
 }
 
@@ -1147,5 +1251,358 @@ fn sync_table(
         }
     }
 
+    Ok(())
+}
+
+// ------------------------------------------------------------------ check
+
+/// The read-only twin of [`sync_table`]: the SAME (state, target-row)
+/// classification, but nothing is written, no error aborts the walk, and
+/// the both-clean arm — which the sync skips untouched by design (that IS
+/// the echo guard) — is actually verified: `forward(source)` must equal
+/// the target. Any edit here must be mirrored in `sync_table`, and vice
+/// versa; the two matches are the same contract read-only vs read-write.
+fn check_table(
+    db: &crate::Database,
+    name: &str,
+    rt: &ResolvedTable,
+    has_state: bool,
+    has_dst: bool,
+) -> Result<MapCheckTable> {
+    let chunk = chunk_rows();
+    let mut out = MapCheckTable {
+        src: rt.src.clone(),
+        dst: rt.dst.clone(),
+        ..Default::default()
+    };
+    let src_cols: Vec<String> = rt.cols.iter().map(|c| c.src.clone()).collect();
+    let dst_cols: Vec<String> = rt.cols.iter().map(|c| c.dst.clone()).collect();
+    let (sk, dk) = (&rt.src_key, &rt.dst_key);
+
+    let state_get = "SELECT a_hash, b_hash FROM rretl_map_state \
+                     WHERE map = $1 AND tbl = $2 AND pk_enc = $3";
+    let dst_get = format!(
+        "SELECT {} FROM \"{}\" WHERE \"{dk}\" = $1",
+        quoted(&dst_cols),
+        rt.dst
+    );
+    let src_exists = format!("SELECT \"{sk}\" FROM \"{}\" WHERE \"{sk}\" = $1", rt.src);
+    let dst_exists = format!("SELECT \"{dk}\" FROM \"{}\" WHERE \"{dk}\" = $1", rt.dst);
+
+    let state_of = |pk_enc: Vec<u8>| -> Result<Option<(String, String)>> {
+        if !has_state {
+            return Ok(None);
+        }
+        let st = rows_of(db.query(
+            state_get,
+            &[
+                Value::Text(name.into()),
+                Value::Text(rt.dst.clone()),
+                Value::Blob(pk_enc),
+            ],
+        )?)?;
+        Ok(st
+            .first()
+            .map(|r| (crate::rretl::as_text(&r[0]), crate::rretl::as_text(&r[1]))))
+    };
+    let agree = |ys: &[Value], ybs: &[Value]| {
+        ys.iter().zip(ybs).all(|(a, b)| crate::lens::same_value(a, b))
+    };
+
+    // ---- pass 1: every source row -----------------------------------------
+    let first = format!(
+        "SELECT \"{sk}\", {} FROM \"{}\" ORDER BY \"{sk}\" LIMIT {chunk}",
+        quoted(&src_cols),
+        rt.src
+    );
+    let next = format!(
+        "SELECT \"{sk}\", {} FROM \"{}\" WHERE \"{sk}\" > $1 ORDER BY \"{sk}\" LIMIT {chunk}",
+        quoted(&src_cols),
+        rt.src
+    );
+    let mut last: Option<Value> = None;
+    loop {
+        let rows = match &last {
+            None => rows_of(db.query(&first, &[])?)?,
+            Some(k) => rows_of(db.query(&next, std::slice::from_ref(k))?)?,
+        };
+        let got = rows.len();
+        if got == 0 {
+            break;
+        }
+        for row in &rows {
+            let key = &row[0];
+            let xs = &row[1..];
+            let a_now = chain(xs);
+            let st = state_of(crate::lens::value_bits(key))?;
+            let b = if has_dst {
+                rows_of(db.query(&dst_get, std::slice::from_ref(key))?)?
+                    .into_iter()
+                    .next()
+            } else {
+                None
+            };
+            match (st, b) {
+                (None, None) => match forward_all(rt, xs) {
+                    Ok(_) => out.would_create_b += 1,
+                    Err(e) => out.conflicts.push(e.to_string()),
+                },
+                (None, Some(ybs)) => match forward_all(rt, xs) {
+                    Ok(ys) if agree(&ys, &ybs) => out.would_adopt += 1,
+                    Ok(_) => out.conflicts.push(
+                        conflict(
+                            name,
+                            &rt.dst,
+                            key,
+                            "both sides hold the row and disagree, and no recorded sync \
+                             can arbitrate",
+                        )
+                        .to_string(),
+                    ),
+                    Err(e) => out.conflicts.push(e.to_string()),
+                },
+                (Some((st_a, _)), None) => {
+                    if a_now == st_a {
+                        out.would_delete_a += 1;
+                    } else {
+                        out.conflicts.push(
+                            conflict(
+                                name,
+                                &rt.dst,
+                                key,
+                                "deleted on the target side while the source row changed",
+                            )
+                            .to_string(),
+                        );
+                    }
+                }
+                (Some((st_a, st_b)), Some(ybs)) => {
+                    let b_now = chain(&ybs);
+                    match (a_now != st_a, b_now != st_b) {
+                        (false, false) => match forward_all(rt, xs) {
+                            Ok(ys) if agree(&ys, &ybs) => out.unchanged += 1,
+                            Ok(_) => out.diverged.push(format!(
+                                "`{}` row {key:?}: state records both sides clean, but \
+                                 forward(source) != target — a standing divergence the \
+                                 echo guard cannot see",
+                                rt.dst
+                            )),
+                            Err(e) => out.diverged.push(format!(
+                                "`{}` row {key:?}: state records both sides clean, but \
+                                 the pair's forward refuses the source value ({e})",
+                                rt.dst
+                            )),
+                        },
+                        (true, false) => match forward_all(rt, xs) {
+                            Ok(_) => out.pending_a2b += 1,
+                            Err(e) => out.conflicts.push(e.to_string()),
+                        },
+                        (false, true) => match inverse_all(rt, key, xs, &ybs) {
+                            Ok(_) => out.pending_b2a += 1,
+                            Err(e) => out.conflicts.push(e.to_string()),
+                        },
+                        (true, true) => out.conflicts.push(
+                            conflict(
+                                name,
+                                &rt.dst,
+                                key,
+                                "both sides changed since the last sync",
+                            )
+                            .to_string(),
+                        ),
+                    }
+                }
+            }
+        }
+        last = Some(rows[got - 1][0].clone());
+        if got < chunk {
+            break;
+        }
+    }
+
+    // ---- pass 2: target rows with no source row ---------------------------
+    if has_dst {
+        let first = format!(
+            "SELECT \"{dk}\", {} FROM \"{}\" ORDER BY \"{dk}\" LIMIT {chunk}",
+            quoted(&dst_cols),
+            rt.dst
+        );
+        let next = format!(
+            "SELECT \"{dk}\", {} FROM \"{}\" WHERE \"{dk}\" > $1 ORDER BY \"{dk}\" \
+             LIMIT {chunk}",
+            quoted(&dst_cols),
+            rt.dst
+        );
+        let mut last: Option<Value> = None;
+        loop {
+            let rows = match &last {
+                None => rows_of(db.query(&first, &[])?)?,
+                Some(k) => rows_of(db.query(&next, std::slice::from_ref(k))?)?,
+            };
+            let got = rows.len();
+            if got == 0 {
+                break;
+            }
+            for row in &rows {
+                let key = &row[0];
+                let ybs = &row[1..];
+                if !rows_of(db.query(&src_exists, std::slice::from_ref(key))?)?.is_empty() {
+                    continue; // classified in pass 1
+                }
+                match state_of(crate::lens::value_bits(key))? {
+                    Some((_, st_b)) => {
+                        if chain(ybs) == st_b {
+                            out.would_delete_b += 1;
+                        } else {
+                            out.conflicts.push(
+                                conflict(
+                                    name,
+                                    &rt.dst,
+                                    key,
+                                    "deleted on the source side while the target row changed",
+                                )
+                                .to_string(),
+                            );
+                        }
+                    }
+                    None => {
+                        // The creation-path preconditions, named exactly as
+                        // the sync names them.
+                        if rt.rowid_identity {
+                            out.conflicts.push(format!(
+                                "map sync `{name}`: row {key:?} was created on `{}` but \
+                                 the source identity is `{}`'s hidden rowid, which only \
+                                 the source can assign — create the row on the source side",
+                                rt.dst, rt.src
+                            ));
+                        } else if let Some(c) = rt.cols.iter().find(|c| {
+                            c.lens
+                                .as_ref()
+                                .is_some_and(|l| l.class != LensClass::Bijective)
+                        }) {
+                            out.conflicts.push(format!(
+                                "map sync `{name}`: row {key:?} was created on `{}`, but \
+                                 column `{}` maps through a non-bijective pair — there is \
+                                 no residual to attach (§4's creation path); create the \
+                                 row on `{}` instead",
+                                rt.dst, c.dst, rt.src
+                            ));
+                        } else {
+                            let creatable =
+                                rt.cols.iter().zip(ybs).try_for_each(|(c, y)| match &c.lens {
+                                    None => Ok(()),
+                                    Some(l) => {
+                                        let x = call1(&l.inverse, y)?;
+                                        let fwd = call1(&l.forward, &x)?;
+                                        if !crate::lens::same_value(&fwd, y) {
+                                            return Err(Error::Unsupported(format!(
+                                                "map sync `{name}`: created row {key:?} on \
+                                                 `{}` has `{}` = {y:?}, outside its pair's \
+                                                 image",
+                                                rt.dst, c.dst
+                                            )));
+                                        }
+                                        Ok(())
+                                    }
+                                });
+                            match creatable {
+                                Ok(()) => out.would_create_a += 1,
+                                Err(e) => out.conflicts.push(e.to_string()),
+                            }
+                        }
+                    }
+                }
+            }
+            last = Some(rows[got - 1][0].clone());
+            if got < chunk {
+                break;
+            }
+        }
+    }
+
+    // ---- pass 3: state rows with NEITHER side left ------------------------
+    if has_state {
+        let first = format!(
+            "SELECT pk_enc, k FROM rretl_map_state WHERE map = $1 AND tbl = $2 \
+             ORDER BY pk_enc LIMIT {chunk}"
+        );
+        let next = format!(
+            "SELECT pk_enc, k FROM rretl_map_state WHERE map = $1 AND tbl = $2 AND \
+             pk_enc > $3 ORDER BY pk_enc LIMIT {chunk}"
+        );
+        let base = vec![Value::Text(name.into()), Value::Text(rt.dst.clone())];
+        let mut last: Option<Value> = None;
+        loop {
+            let rows = match &last {
+                None => rows_of(db.query(&first, &base)?)?,
+                Some(k) => {
+                    let mut p = base.clone();
+                    p.push(k.clone());
+                    rows_of(db.query(&next, &p)?)?
+                }
+            };
+            let got = rows.len();
+            if got == 0 {
+                break;
+            }
+            for row in &rows {
+                let key = &row[1];
+                let in_src =
+                    !rows_of(db.query(&src_exists, std::slice::from_ref(key))?)?.is_empty();
+                let in_dst = has_dst
+                    && !rows_of(db.query(&dst_exists, std::slice::from_ref(key))?)?.is_empty();
+                if !in_src && !in_dst {
+                    out.orphan_state += 1;
+                }
+            }
+            last = Some(rows[got - 1][0].clone());
+            if got < chunk {
+                break;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// The map half of `rretl fsck` (verify-at-rest): every stored map must
+/// still parse, resolve and load its pairs, and no synced row may stand
+/// DIVERGED — state clean on both sides while `forward(source) != target`,
+/// the breach the echo guard structurally cannot see. Pending work,
+/// conflicts and orphaned state rows are user state, not integrity
+/// findings; they belong to [`Database::rretl_map_check`], not to fsck.
+pub(crate) fn fsck_maps(db: &crate::Database, findings: &mut Vec<String>) -> Result<()> {
+    let names = db.rretl_maps()?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    let have = db.committed_tables()?;
+    let has_state = have.iter().any(|(n, _)| n == T_MAP_STATE);
+    for name in names {
+        let spec = match db.load_map(&name) {
+            Ok(s) => s,
+            Err(e) => {
+                findings.push(format!("map `{name}`: its stored record cannot be read ({e})"));
+                continue;
+            }
+        };
+        let resolved = match db.resolve_map(&spec) {
+            Ok(r) => r,
+            Err(e) => {
+                findings.push(format!(
+                    "map `{name}`: no longer resolves ({e}) — syncing it is impossible \
+                     until this is fixed"
+                ));
+                continue;
+            }
+        };
+        for rt in &resolved {
+            let has_dst = have.iter().any(|(n, _)| n == &rt.dst);
+            let t = check_table(db, &name, rt, has_state, has_dst)?;
+            for d in t.diverged {
+                findings.push(format!("map `{name}`: {d}"));
+            }
+        }
+    }
     Ok(())
 }

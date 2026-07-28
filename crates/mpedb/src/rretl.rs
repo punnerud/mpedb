@@ -327,11 +327,15 @@ impl crate::Database {
     /// reports and never repairs — a repair would need to know which side is
     /// right, and fsck does not.
     pub fn rretl_fsck(&self) -> Result<Vec<String>> {
+        let mut findings = Vec::new();
+        // Maps are checked FIRST and unconditionally: a defined-but-never-
+        // synced map has a record and no lineage tables, and the early
+        // return below would silently skip it.
+        crate::rretl_map::fsck_maps(self, &mut findings)?;
         let bundle = self.engine.schema();
         if !bundle.schema.tables.iter().any(|t| t.name == T_LINEAGE && !t.dead) {
-            return Ok(Vec::new());
+            return Ok(findings);
         }
-        let mut findings = Vec::new();
         let runs = rows_of(self.query(
             "SELECT run_id, lens, tbl, col, output_hash, residual_hash FROM rretl_lineage \
              WHERE outcome = 'applied' ORDER BY run_id",

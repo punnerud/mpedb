@@ -452,3 +452,160 @@ fn a_constructed_spec_round_trips_through_canonical_toml() {
     );
     assert_eq!(d.rretl_map_sync("crm").unwrap().changed_total(), 0);
 }
+
+/// `map check` is the read-only twin of sync: same classification, no
+/// writes, every blocker named instead of aborting on the first.
+#[test]
+fn check_is_the_dry_run_twin_of_sync() {
+    let (d, _s) = seeded("check");
+
+    // Before the first sync nothing exists on the target side: the check
+    // sees three creations pending and writes NOTHING (repeat is stable).
+    let r = d.rretl_map_check("crm").unwrap();
+    assert_eq!(r.tables.len(), 1);
+    assert_eq!(r.tables[0].would_create_b, 3);
+    assert_eq!(r.pending_total(), 3);
+    assert!(!r.is_clean());
+    let r2 = d.rretl_map_check("crm").unwrap();
+    assert_eq!(r2.tables[0].would_create_b, 3, "check must not materialize");
+
+    d.rretl_map_sync("crm").unwrap();
+    let r = d.rretl_map_check("crm").unwrap();
+    assert!(r.is_clean(), "post-sync steady state: {r:?}");
+    assert_eq!(r.tables[0].unchanged, 3);
+
+    // One edit per side (different rows): both directions pending, no
+    // conflict, and a sync drains it back to clean.
+    d.query("UPDATE customers SET score = 4 WHERE id = 1", &[]).unwrap();
+    d.query("UPDATE crm_customers SET neg_score = 8 WHERE id = 2", &[]).unwrap();
+    let r = d.rretl_map_check("crm").unwrap();
+    assert_eq!(r.tables[0].pending_a2b, 1);
+    assert_eq!(r.tables[0].pending_b2a, 1);
+    assert!(r.tables[0].conflicts.is_empty());
+    d.rretl_map_sync("crm").unwrap();
+    assert!(d.rretl_map_check("crm").unwrap().is_clean());
+
+    // Both sides of the SAME row: the sync aborts, the check names it and
+    // keeps counting everything else.
+    d.query("UPDATE customers SET score = 5 WHERE id = 3", &[]).unwrap();
+    d.query("UPDATE crm_customers SET neg_score = 0 - 9 WHERE id = 3", &[]).unwrap();
+    let r = d.rretl_map_check("crm").unwrap();
+    assert_eq!(r.tables[0].conflicts.len(), 1, "{:?}", r.tables[0].conflicts);
+    assert!(r.tables[0].conflicts[0].contains("CONFLICT"));
+    assert!(r.tables[0].conflicts[0].contains("Int(3)"));
+    assert_eq!(r.tables[0].unchanged, 2);
+    assert!(d.rretl_map_sync("crm").is_err());
+
+    // The documented resolution: revert one side, re-sync, clean again.
+    d.query("UPDATE customers SET score = 2 WHERE id = 3", &[]).unwrap();
+    let r = d.rretl_map_sync("crm").unwrap();
+    assert_eq!(r.b_to_a, 1);
+    assert!(d.rretl_map_check("crm").unwrap().is_clean());
+}
+
+/// Hull 1 made visible: a state row doctored so BOTH sides read clean while
+/// forward(source) != target. The echo guard skips it by design — sync
+/// reports nothing moved — and exactly `map check`/`rretl fsck` see it.
+#[test]
+fn a_tampered_state_row_stands_diverged_and_only_check_and_fsck_see_it() {
+    let (d, _s) = seeded("diverged");
+    d.rretl_map_sync("crm").unwrap();
+
+    // Swap the FULL mapped column set of target rows 1 and 3, and swap
+    // their recorded b_hashes to match: state now agrees with both sides.
+    let b = |id: i64| {
+        rows(d
+            .query(
+                "SELECT full_label, neg_score, abs_balance FROM crm_customers WHERE id = $1",
+                &[Value::Int(id)],
+            )
+            .unwrap())
+        .remove(0)
+    };
+    let (r1, r3) = (b(1), b(3));
+    let put = |id: i64, v: &[Value]| {
+        let mut p = vec![Value::Int(id)];
+        p.extend(v.iter().cloned());
+        d.query(
+            "UPDATE crm_customers SET full_label = $2, neg_score = $3, abs_balance = $4 \
+             WHERE id = $1",
+            &p,
+        )
+        .unwrap();
+    };
+    put(1, &r3);
+    put(3, &r1);
+    let st = rows(d
+        .query(
+            "SELECT pk_enc, b_hash FROM rretl_map_state ORDER BY pk_enc",
+            &[],
+        )
+        .unwrap());
+    assert_eq!(st.len(), 3);
+    let swap = |pk: &Value, hash: &Value| {
+        d.query(
+            "UPDATE rretl_map_state SET b_hash = $2 WHERE map = $1 AND pk_enc = $3",
+            &[Value::Text("crm".into()), hash.clone(), pk.clone()],
+        )
+        .unwrap();
+    };
+    swap(&st[0][0], &st[2][1]);
+    swap(&st[2][0], &st[0][1]);
+
+    // The sync is structurally blind to this — that is the price of the
+    // echo guard, and the reason the check exists.
+    assert_eq!(d.rretl_map_sync("crm").unwrap().changed_total(), 0);
+
+    let r = d.rretl_map_check("crm").unwrap();
+    assert_eq!(r.tables[0].diverged.len(), 2, "{:?}", r.tables[0].diverged);
+    assert_eq!(r.tables[0].unchanged, 1);
+    assert_eq!(r.pending_total(), 0);
+    assert!(!r.is_clean());
+
+    let findings = d.rretl_fsck().unwrap();
+    let map_findings: Vec<_> = findings.iter().filter(|f| f.contains("map `crm`")).collect();
+    assert_eq!(map_findings.len(), 2, "{findings:?}");
+}
+
+/// Hull 2 closed: redefining a map with a CHANGED spec re-baselines (its
+/// state rows are deleted in the same txn), so the next sync re-arbitrates
+/// instead of silently reading every row as clean under hashes recorded
+/// for the OLD spec. An UNCHANGED redefine keeps state.
+#[test]
+fn redefining_a_changed_map_re_baselines_its_state() {
+    let (d, _s) = seeded("redefine");
+    d.rretl_map_sync("crm").unwrap();
+
+    // Same TOML again: state survives, the next sync is still the no-op.
+    d.rretl_map_define(MAP).unwrap();
+    assert_eq!(
+        ints(&d, "SELECT count(*) FROM rretl_map_state")[0],
+        3,
+        "an unchanged redefine must keep state"
+    );
+    assert_eq!(d.rretl_map_sync("crm").unwrap().changed_total(), 0);
+
+    // Changed spec: the neg pair on score becomes an identity copy. The
+    // raw value chains are untouched, so WITHOUT re-baselining every row
+    // would read "both clean" and the target would keep the OLD pair's
+    // forward forever — the silent failure this fix exists for.
+    let changed = MAP.replace(
+        "  source = \"score\"\n  target = \"neg_score\"\n  pair = \"neg\"",
+        "  source = \"score\"\n  target = \"neg_score\"",
+    );
+    assert_ne!(changed, MAP);
+    d.rretl_map_define(&changed).unwrap();
+    assert_eq!(
+        ints(&d, "SELECT count(*) FROM rretl_map_state")[0],
+        0,
+        "a changed redefine must re-baseline"
+    );
+
+    // Re-arbitration is honest: both sides hold the rows and now DISAGREE
+    // (identity vs the old neg forward), which is a named conflict — not a
+    // silent skip.
+    let err = d.rretl_map_sync("crm").unwrap_err().to_string();
+    assert!(err.contains("no recorded sync can arbitrate"), "{err}");
+    let r = d.rretl_map_check("crm").unwrap();
+    assert_eq!(r.tables[0].conflicts.len(), 3, "{:?}", r.tables[0].conflicts);
+}

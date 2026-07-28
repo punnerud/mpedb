@@ -307,9 +307,13 @@ def stage4(workdir):
     rows = db.query("SELECT absv FROM ext ORDER BY id")
     assert [x[0] for x in rows] == [4, 9], rows
 
-    # Echo guard: a repeated sync moves nothing.
+    # Echo guard: a repeated sync moves nothing, and the read-only check
+    # agrees the map is at its steady state.
     r = db.rretl_map_sync("m")
     assert r["unchanged"] == 2 and r["a_to_b"] == 0 and r["b_to_a"] == 0, r
+    chk = db.rretl_map_check("m")
+    assert chk["clean"] and chk["pending_total"] == 0, chk
+    assert chk["tables"][0]["unchanged"] == 2, chk
 
     # Edit the target's magnitude; the sign comes home via the LIVE rex.
     with db.begin() as tx:
@@ -328,6 +332,10 @@ def stage4(workdir):
         raise AssertionError("both-sides-moved must conflict")
     except mpedb.Error as e:
         assert "CONFLICT" in str(e), e
+    # The check names the same conflict without aborting on it.
+    chk = db.rretl_map_check("m")
+    assert not chk["clean"] and len(chk["tables"][0]["conflicts"]) == 1, chk
+    assert "CONFLICT" in chk["tables"][0]["conflicts"][0], chk
 
     print("rretl stage 4: all assertions passed")
 

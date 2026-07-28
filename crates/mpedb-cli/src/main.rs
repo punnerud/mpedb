@@ -120,6 +120,11 @@ usage: mpedb <command> [args]
                                            repeating is a no-op (state-hash
                                            echo guard), both-sides-moved is
                                            a named CONFLICT that aborts whole
+  rretl map check <target> <name>            READ-ONLY dry run: what a sync
+                                           would move, EVERY conflict named,
+                                           plus the audit the echo guard
+                                           cannot do (state says clean but
+                                           forward(A) != B); exit 1 on breach
   rretl map show|list|drop <target> [name]   manage stored maps
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
@@ -759,6 +764,41 @@ fn cmd_rretl(args: &[String]) -> CliResult {
                 r.deleted_b,
                 r.unchanged
             );
+            Ok(())
+        }
+        [m, sub, config, name] if m == "map" && sub == "check" => {
+            let db = crate::util::open_target(config)?;
+            let r = db.rretl_map_check(name)?;
+            for t in &r.tables {
+                println!(
+                    "{} -> {}: pending a→b {}, b→a {}, +b {}, +a {}, -a {}, -b {}, \
+                     adopt {}, clean {}, orphans {}",
+                    t.src,
+                    t.dst,
+                    t.pending_a2b,
+                    t.pending_b2a,
+                    t.would_create_b,
+                    t.would_create_a,
+                    t.would_delete_a,
+                    t.would_delete_b,
+                    t.would_adopt,
+                    t.unchanged,
+                    t.orphan_state
+                );
+                for c in &t.conflicts {
+                    println!("blocker: {c}");
+                }
+                for d in &t.diverged {
+                    println!("DIVERGED: {d}");
+                }
+            }
+            let breaches = r.breaches().len();
+            if breaches > 0 {
+                return Err(Failure::Runtime(format!(
+                    "rretl map check `{name}`: {breaches} breach(es) — a sync would \
+                     abort or silent divergence is standing"
+                )));
+            }
             Ok(())
         }
         [m, sub, config, name] if m == "map" && sub == "show" => {
