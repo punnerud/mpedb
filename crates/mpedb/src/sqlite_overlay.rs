@@ -815,6 +815,69 @@ impl MergeCtx<'_> {
     }
 }
 
+impl MergeCtx<'_> {
+    /// Enforce the base's secondary UNIQUE constraints over the MERGED view
+    /// (#133), skipping the row whose PK is `exclude` (an UPDATE does not
+    /// collide with itself).
+    ///
+    /// This is the fix for a WRONG ANSWER, and the shape of the bug is worth
+    /// keeping: attach drops the base's UNIQUE constraints, so `t.indexes` is
+    /// empty, so the executor's otherwise-correct `INSERT OR REPLACE` loop —
+    /// which probes every unique index for a victim — iterated nothing and the
+    /// insert went straight through. The row DUPLICATED, silently, and only
+    /// after a reopen (before that the delta happened to hold the earlier row).
+    ///
+    /// A SCAN, deliberately, and this is the honest cost: the base's index
+    /// b-trees are not walked by this reader, so there is nothing to probe.
+    /// `O(rows)` per checked write on a table carrying a secondary UNIQUE —
+    /// acceptable because the overlay is a compatibility path, not the hot
+    /// one, and because the alternative on offer was a wrong answer. Tables
+    /// with no secondary UNIQUE pay nothing (the set list is empty and this
+    /// returns before scanning).
+    fn check_unique(
+        &mut self,
+        table: u32,
+        values: &[Value],
+        exclude: Option<&Value>,
+    ) -> Result<()> {
+        let sets = self.at.unique_sets(table);
+        if sets.is_empty() {
+            return Ok(());
+        }
+        // sqlite's rule, same as the native path: a NULL in any indexed column
+        // means no index entry, so no conflict.
+        let live: Vec<&Vec<usize>> = sets
+            .iter()
+            .filter(|cols| !cols.iter().any(|&c| values[c].is_null()))
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let pk_i = self.pk_idx[table as usize];
+        let rows = self.scan_rows_raw(table, None, None)?;
+        for row in &rows {
+            if exclude.is_some_and(|e| &row[pk_i] == e) {
+                continue;
+            }
+            for cols in &live {
+                if cols.iter().all(|&c| row[c] == values[c]) {
+                    let t = self.at.schema().table(table);
+                    let names: Vec<String> = cols
+                        .iter()
+                        .filter_map(|&c| t.and_then(|t| t.columns.get(c)).map(|c| c.name.clone()))
+                        .collect();
+                    return Err(Error::UniqueViolation {
+                        table: t.map(|t| t.name.clone()).unwrap_or_default(),
+                        constraint: names.join(", "),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+}
+
 impl TxnCtx for MergeCtx<'_> {
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         if let Some(row) = self.ovl.get_by_pk(table, pk)? {
@@ -903,6 +966,7 @@ impl TxnCtx for MergeCtx<'_> {
                 .unwrap_or_default();
             return Err(Error::PrimaryKeyViolation { table: name });
         }
+        self.check_unique(table, values, None)?;
         let pre = self.pre_for(table, &pk)?;
         let mut full = values.to_vec();
         full.push(Value::Bool(false));
@@ -914,6 +978,8 @@ impl TxnCtx for MergeCtx<'_> {
         self.check_not_null(table, new_values)?;
         // sqlite re-evaluates every CHECK against the NEW row on UPDATE too.
         self.at.check_row(table, new_values)?;
+        let self_pk = new_values[self.pk_idx[table as usize]].clone();
+        self.check_unique(table, new_values, Some(&self_pk))?;
         // The executor only calls this for rows it just read from the merged
         // view, so existence is established; materialize into the overlay.
         let pk = new_values[self.pk_idx[table as usize]].clone();

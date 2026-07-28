@@ -96,6 +96,17 @@ pub struct Table {
     /// Whether any column is `GENERATED ALWAYS AS`. Its value is computed, not
     /// stored, and mpedb has no expression to compute it with.
     pub has_generated: bool,
+    /// Column-name groups carrying a UNIQUE constraint (#133), from BOTH
+    /// sources sqlite splits them across: the `CREATE TABLE` text (column-level
+    /// `UNIQUE` and table-level `UNIQUE(...)`, whose auto-index rows carry NULL
+    /// sql and so cannot be recovered from `sqlite_master` alone) and every
+    /// `CREATE UNIQUE INDEX` row naming this table.
+    ///
+    /// Names, not ordinals, and unresolvable ones are the caller's to refuse:
+    /// an index over an expression or with a COLLATE/DESC modifier is not a
+    /// plain column list, and enforcing it as one would be a wrong answer of
+    /// its own.
+    pub unique_sets: Vec<Vec<String>>,
 }
 
 impl Table {
@@ -220,7 +231,28 @@ impl SqliteFile {
                 col_checks: parsed.col_checks,
                 table_checks: parsed.table_checks,
                 has_generated: parsed.has_generated,
+                unique_sets: parsed.unique_sets,
             });
+            Ok(())
+        })?;
+        // Second source for the same constraint: `CREATE UNIQUE INDEX` rows.
+        // sqlite splits UNIQUE across two places — inline in the table text
+        // (auto-index, NULL sql) and standalone index rows — so reading only
+        // one of them enforces half the constraints, which is the shape #133
+        // was (none of them, since indexes were skipped entirely).
+        self.scan_rowid_tree(1, &mut |_rowid, vals| {
+            let [Value::Text(ty), _, Value::Text(tbl), _, Value::Text(sql)] = &vals[..] else {
+                return Ok(());
+            };
+            if ty != "index" {
+                return Ok(());
+            }
+            let Some(cols) = parse_create_unique_index(sql) else {
+                return Ok(()); // not UNIQUE, or a shape we do not read
+            };
+            if let Some(t) = out.iter_mut().find(|t| &t.name == tbl) {
+                t.unique_sets.push(cols);
+            }
             Ok(())
         })?;
         Ok(out)
@@ -538,6 +570,7 @@ struct ParsedCreate {
     not_null: Vec<bool>,
     defaults: Vec<Option<String>>,
     col_checks: Vec<Vec<String>>,
+    unique_sets: Vec<Vec<String>>,
     table_checks: Vec<String>,
     has_generated: bool,
 }
@@ -612,6 +645,10 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
     let mut col_checks: Vec<Vec<String>> = Vec::new();
     let mut table_checks: Vec<String> = Vec::new();
     let mut has_generated = false;
+    // Column-name groups carrying a UNIQUE constraint (#133), from the CREATE
+    // TABLE text only — `CREATE UNIQUE INDEX` lives in its own `sqlite_master`
+    // row and is collected by the caller.
+    let mut unique_sets: Vec<Vec<String>> = Vec::new();
 
     for part in split_depth0(body) {
         let part = part.trim();
@@ -636,6 +673,32 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
                     .collect();
             }
             continue;
+        }
+        // Table constraint: `UNIQUE(a, b)`, optionally named
+        // (`CONSTRAINT x UNIQUE(...)`). Same shape as the PK branch above
+        // (#133).
+        {
+            let u = upper.strip_prefix("CONSTRAINT ").map_or(upper.as_str(), |r| {
+                // `CONSTRAINT <name> UNIQUE(...)` — drop the name token.
+                r.split_once(char::is_whitespace).map_or(r, |(_, rest)| rest.trim_start())
+            });
+            if u.starts_with("UNIQUE") {
+                if let Some(o) = part.find('(') {
+                    let inner = part[o + 1..].trim_end_matches(')');
+                    let cols: Vec<String> = split_depth0(inner)
+                        .into_iter()
+                        .map(|c| {
+                            unquote(
+                                c.split_whitespace().next().unwrap_or("").trim_end_matches(','),
+                            )
+                        })
+                        .collect();
+                    if !cols.is_empty() {
+                        unique_sets.push(cols);
+                    }
+                }
+                continue;
+            }
         }
         if upper.starts_with("CHECK") || upper.starts_with("CONSTRAINT") {
             // A table-level `CHECK (…)`, possibly under a `CONSTRAINT <name>`.
@@ -691,6 +754,14 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
                 // Bare `AS` after the type is the short form of GENERATED.
                 "AS" => has_generated = true,
                 "DEFAULT" => dflt = default_text(rest, k),
+                // Column-level `UNIQUE` (#133). It is read from the same
+                // depth-0 tokenization as NOT NULL, so a `UNIQUE` inside a
+                // CHECK body or a default string is not mistaken for the
+                // constraint. sqlite backs this with an auto-index whose
+                // `sqlite_master` row carries NULL sql, which is exactly why
+                // the constraint cannot be recovered from the index rows
+                // alone and has to be parsed here.
+                "UNIQUE" => unique_sets.push(vec![name.clone()]),
                 _ => {}
             }
         }
@@ -719,7 +790,49 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
         col_checks,
         table_checks,
         has_generated,
+        unique_sets,
     })
+}
+
+/// `CREATE UNIQUE INDEX <name> ON <table> (<c1>, <c2>)` → the column names.
+///
+/// `None` for anything that is not a plain-column UNIQUE index: a non-unique
+/// index, a partial one (`… WHERE …`), or a key term that is not a bare column
+/// (an expression, or one carrying `COLLATE`/`ASC`/`DESC`). Those are refused
+/// rather than approximated — treating `lower(email)` as `email` would enforce
+/// a constraint sqlite does not have, which is a wrong answer pointing the
+/// other way (#133).
+fn parse_create_unique_index(sql: &str) -> Option<Vec<String>> {
+    let up = sql.to_ascii_uppercase();
+    let head = up.find(" ON ")?;
+    if !up[..head].contains("UNIQUE") {
+        return None;
+    }
+    let open = sql[head..].find('(')? + head;
+    let close = sql.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    // A trailing `WHERE` makes it partial: the constraint holds only over the
+    // matching subset, which a whole-table check would over-enforce.
+    if up[close..].contains("WHERE") {
+        return None;
+    }
+    let mut cols = Vec::new();
+    for term in split_depth0(&sql[open + 1..close]) {
+        let t = term.trim().trim_end_matches(',').trim();
+        if t.is_empty() {
+            return None;
+        }
+        // One bare identifier and nothing else.
+        let mut it = t.split_whitespace();
+        let first = it.next()?;
+        if it.next().is_some() || first.contains('(') {
+            return None;
+        }
+        cols.push(unquote(first));
+    }
+    (!cols.is_empty()).then_some(cols)
 }
 
 /// The bodies of every `CHECK (…)` in a constraint tail or table-constraint

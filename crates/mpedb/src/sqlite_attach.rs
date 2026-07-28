@@ -696,6 +696,44 @@ impl SqliteAttach {
         Ok(())
     }
 
+    /// Column ordinals of every UNIQUE constraint on `table` that mpedb can
+    /// resolve against the DERIVED columns (#133).
+    ///
+    /// The base's UNIQUE constraints are dropped from the attached mpedb
+    /// schema on purpose — carrying them as `IndexDef`s would let the planner
+    /// choose index access paths this reader cannot serve, since the base's
+    /// index b-trees are not walked (`get_by_index` and friends refuse by
+    /// name). So they live HERE instead, off the schema, reachable only by the
+    /// write path that must enforce them.
+    ///
+    /// A set naming a column that does not resolve is dropped rather than
+    /// guessed: enforcing the wrong columns is a wrong answer, and so is
+    /// enforcing a constraint sqlite does not have.
+    pub(crate) fn unique_sets(&self, table: u32) -> Vec<Vec<usize>> {
+        let Some(a) = self.tables.get(table as usize) else {
+            return Vec::new();
+        };
+        let Some(def) = self.schema.table(table) else {
+            return Vec::new();
+        };
+        a.src
+            .unique_sets
+            .iter()
+            .filter_map(|names| {
+                names
+                    .iter()
+                    .map(|n| def.columns.iter().position(|c| c.name.eq_ignore_ascii_case(n)))
+                    .collect::<Option<Vec<usize>>>()
+            })
+            // A set that is exactly the PK is already enforced by the PK
+            // itself; checking it twice would only cost a scan.
+            .filter(|cols| {
+                let pk: Vec<usize> = def.primary_key.iter().map(|&c| c as usize).collect();
+                *cols != pk
+            })
+            .collect()
+    }
+
     /// PK-ordered base scan with keycode bounds — the overlay merge's right-
     /// hand stream.
     pub(crate) fn base_scan(

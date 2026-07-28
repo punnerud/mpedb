@@ -806,3 +806,59 @@ fn django_schema_attaches_with_live_checks() {
     let got = rows(ovl.query("SELECT age, data FROM app_item", &[]).unwrap());
     assert_eq!(got, vec![vec![Value::Int(30), Value::Text("{\"k\": [1, 2]}".into())]]);
 }
+
+/// #133, the wrong answer: a secondary UNIQUE conflict against a BASE row was
+/// invisible, so `INSERT OR REPLACE` inserted a second row carrying the same
+/// unique value instead of replacing the first.
+///
+/// The trigger was a REOPEN. Before it, the earlier row usually sat in the
+/// delta, where the PK check happened to find it; after it, the row lived only
+/// in the base and nothing looked there. So the test writes, drops the handle,
+/// reopens, and only then provokes the conflict — the sequence is the bug.
+///
+/// The root cause was two layers down: attach dropped the base's UNIQUE
+/// constraints (`indexes: vec![]`), so the executor's `INSERT OR REPLACE`
+/// victim loop — which is correct, and probes every unique index — iterated an
+/// empty list.
+#[test]
+fn secondary_unique_sees_the_base_after_a_reopen() {
+    let p = setup("uniq133");
+    // A second UNIQUE column, alongside the INTEGER PRIMARY KEY.
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "CREATE TABLE acct (id INTEGER PRIMARY KEY, email TEXT UNIQUE, tag TEXT);
+         INSERT INTO acct VALUES (1, 'a@x', 'first');",
+    )
+    .unwrap();
+    drop(c);
+
+    // Reopen so the row is reachable ONLY through the base.
+    {
+        let mut o = SqliteOverlay::open(&p).unwrap();
+        assert_eq!(rows(o.query("SELECT id FROM acct", &[]).unwrap()).len(), 1);
+    }
+    let mut o = SqliteOverlay::open(&p).unwrap();
+
+    // The wrong answer was: this SUCCEEDS and leaves two rows both holding
+    // 'a@x'. It must not. (Full sqlite semantics — replacing the base row —
+    // needs the base's index b-trees walked so the executor can find the
+    // victim; until then the constraint refuses rather than duplicates, which
+    // is the difference between a named error and a corrupt table.)
+    let r = o.query(
+        "INSERT OR REPLACE INTO acct (id, email, tag) VALUES (2, 'a@x', 'second')",
+        &[],
+    );
+    assert!(r.is_err(), "a duplicate 'a@x' was accepted: {r:?}");
+
+    let all = rows(o.query("SELECT id FROM acct WHERE email = 'a@x'", &[]).unwrap());
+    assert_eq!(all.len(), 1, "the base row must still be the only 'a@x'");
+
+    // A plain INSERT collides the same way, and a non-conflicting one still
+    // works — the check must not refuse everything.
+    assert!(o
+        .query("INSERT INTO acct (id, email, tag) VALUES (3, 'a@x', 'third')", &[])
+        .is_err());
+    o.query("INSERT INTO acct (id, email, tag) VALUES (4, 'b@x', 'ok')", &[])
+        .unwrap();
+    assert_eq!(rows(o.query("SELECT id FROM acct", &[]).unwrap()).len(), 2);
+}
