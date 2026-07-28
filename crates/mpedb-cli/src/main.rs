@@ -78,6 +78,10 @@ usage: mpedb <command> [args]
   fn define <target> <file.py|file.rs>     store a PySpell SQL function
   fn drop <target> <name>                  drop a stored function
   fn list <target>                         list stored functions
+  lens define <target> <name> <fwd> <inv>  register a reversible pair over two
+         [--class bijective|lossy]         stored functions; `bijective` is
+                                           VERIFIED and refused if it is not
+  lens verify|list|drop <target> [name]    re-run a pair's round trip, or manage
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
   tune set <target> name=value | show      stored engine switches (ndv_discount,
@@ -175,6 +179,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "advise" => cmd_advise(rest),
         "model" => cmd_model(rest),
         "fn" => cmd_fn(rest),
+        "lens" => cmd_lens(rest),
         "op" => cmd_op(rest),
         "tune" => cmd_tune(rest),
         "trigger" => cmd_trigger(rest),
@@ -420,6 +425,83 @@ fn cmd_fn(args: &[String]) -> CliResult {
             Ok(())
         }
         _ => usage("fn needs: define <target> <file.py|rs> | drop <target> <name> | list <target>"),
+    }
+}
+
+/// `mpedb lens …` — reversible pairs over stored functions (DESIGN-ETL, #52).
+/// `define` VERIFIES a `bijective` declaration against the probe corpus before
+/// anything is written, and refuses it with a named counter-example otherwise;
+/// that refusal is the feature. The sample count is reported rather than a bare
+/// "verified" because the evidence is statistical, not universal.
+fn cmd_lens(args: &[String]) -> CliResult {
+    use mpedb::lens::LensClass;
+    match args {
+        [sub, config, name, fwd, inv, rest @ ..] if sub == "define" => {
+            let mut class = LensClass::Bijective;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--class" => {
+                        let v = it.next().ok_or_else(|| {
+                            Failure::Usage("--class needs bijective|residual|lossy".into())
+                        })?;
+                        class = LensClass::parse(v)?;
+                    }
+                    other => return usage(format!("lens define: unexpected argument {other}")),
+                }
+            }
+            let db = crate::util::open_target(config)?;
+            let samples = db.create_lens(name, fwd, inv, class)?;
+            match class {
+                LensClass::Lossy => println!(
+                    "lens {name} registered as lossy: NOT invertible, so the source must be kept"
+                ),
+                _ => println!(
+                    "lens {name} registered as {}: {fwd} \u{21c4} {inv}, round trip held on \
+                     {samples} probe inputs",
+                    class.as_str()
+                ),
+            }
+            Ok(())
+        }
+        [sub, config, name] if sub == "verify" => {
+            let db = crate::util::open_target(config)?;
+            let samples = db.verify_lens(name)?;
+            println!("lens {name}: round trip held on {samples} probe inputs");
+            Ok(())
+        }
+        [sub, config, name] if sub == "drop" => {
+            let db = crate::util::open_target(config)?;
+            if db.drop_lens(name)? {
+                println!("lens {name} dropped");
+            } else {
+                println!("no lens named {name}");
+            }
+            Ok(())
+        }
+        [sub, config] if sub == "list" => {
+            let db = crate::util::open_target(config)?;
+            let lenses = db.list_lenses()?;
+            if lenses.is_empty() {
+                println!("no lens pairs");
+            }
+            for l in lenses {
+                println!(
+                    "{}  {}  {} samples{}\n    forward {}\n    inverse {}",
+                    l.name,
+                    l.class.as_str(),
+                    l.samples,
+                    if l.healthy { "" } else { "  [DEFINITION BLOB MISSING]" },
+                    l.forward_hash,
+                    l.inverse_hash,
+                );
+            }
+            Ok(())
+        }
+        _ => usage(
+            "lens needs: define <target> <name> <forward> <inverse> [--class bijective|lossy] \
+             | verify <target> <name> | drop <target> <name> | list <target>",
+        ),
     }
 }
 

@@ -215,7 +215,7 @@ impl crate::Database {
         Ok(set)
     }
 
-    fn scan_func_records(
+    pub(crate) fn scan_func_records(
         &self,
         r: &mpedb_core::engine::ReadTxn<'_>,
     ) -> Result<Vec<(String, [u8; 32], u16)>> {
