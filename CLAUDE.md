@@ -167,7 +167,7 @@ log-based engine), and the hardware published when the hardware is the answer.
   WAL torn-tail power-loss simulation.
 - `crates/mpedb-fs` — `mpedbfs`, a READ-ONLY FUSE view (#54, DESIGN-MPEDBFS):
   `/obj/<name>/{latest,v<N>}` for versioned blobs and `/archive/<id>-<name>/…`
-  for a spliced zip's members as a real tree. Adds no data — it is the adapter
+  for a spliced zip's members as a real tree, INFLATED (a member is stored as the zip had it, so serving those bytes raw was a wrong answer — method 8 is decoded, anything else refused). Adds no data — it is the adapter
   for programs that only speak paths. Read-only is a DECISION, not a stage
   (a partial write is not a version, and a writable mount would hold the
   single writer lock across a user's `cp`). One snapshot per open file, and

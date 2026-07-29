@@ -89,6 +89,30 @@ fn rows(r: ExecResult) -> Vec<Vec<Value>> {
     }
 }
 
+fn as_int(v: &Value) -> i64 {
+    match v {
+        Value::Int(i) => *i,
+        _ => -1,
+    }
+}
+
+/// A member is stored exactly as the zip had it, so the presented bytes are
+/// the INFLATED ones. Method 0 is stored-as-is; 8 is raw deflate (no zlib
+/// header). Anything else is refused rather than served: a member this view
+/// cannot decode must not look like one it can.
+fn inflate(method: i64, raw: &[u8]) -> Option<Vec<u8>> {
+    match method {
+        0 => Some(raw.to_vec()),
+        8 => {
+            use std::io::Read;
+            let mut out = Vec::new();
+            flate2::read::DeflateDecoder::new(raw).read_to_end(&mut out).ok()?;
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// A name out of the database. A zip member's name is stored as BYTES —
 /// the format allows any encoding — so a Blob is decoded lossily rather
 /// than debug-printed, which is what turned member names into
@@ -184,7 +208,8 @@ impl Fs {
                 let r = self
                     .db
                     .query(
-                        "SELECT name, data FROM rretl_archive_members WHERE archive_id = $1",
+                        "SELECT name, method, data FROM rretl_archive_members \
+                         WHERE archive_id = $1",
                         &[Value::Int(*id)],
                     )
                     .ok()?;
@@ -192,13 +217,13 @@ impl Fs {
                 // directory listing handed out: the column may hold either
                 // text or bytes, and one row must not be findable under one
                 // spelling and listed under another.
-                rows(r).into_iter().find(|row| text(&row[0]) == *member).and_then(|row| {
-                    match &row[1] {
-                        Value::Blob(b) => Some(b.clone()),
-                        Value::Text(t) => Some(t.as_bytes().to_vec()),
-                        _ => None,
-                    }
-                })
+                let row = rows(r).into_iter().find(|row| text(&row[0]) == *member)?;
+                let raw = match &row[2] {
+                    Value::Blob(b) => b.clone(),
+                    Value::Text(t) => t.as_bytes().to_vec(),
+                    _ => return None,
+                };
+                inflate(as_int(&row[1]), &raw)
             }
             _ => None,
         }

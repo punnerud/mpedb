@@ -22,3 +22,9 @@ mpedb = { path = "../mpedb" }
 # no pkg-config — only the runtime helper every FUSE-capable box already has.
 fuser = { version = "0.18", default-features = false }
 libc = "0.2"
+# A zip member is stored EXACTLY as the archive had it — deflate stream and
+# all — because `pack-out` must reproduce the original byte for byte. A
+# filesystem that handed those bytes to `cat` would be serving compressed
+# garbage under a plausible name, so the view inflates. Only here: the
+# engine never needs it.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

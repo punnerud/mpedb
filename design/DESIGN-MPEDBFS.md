@@ -66,6 +66,26 @@ are immutable rows for the same reason.
 for a delta is the delta. Using it would have made `ls -l` disagree with
 `wc -c`, and the kernel would have truncated reads at the smaller number.
 
+## 3.1 A member is stored as the zip had it — so the view inflates
+
+`pack-out` has to reproduce the original archive byte for byte, so a member
+row holds exactly what the zip held: for method 8, a raw deflate stream.
+v1 shipped handing those bytes straight to `cat`, which is the worst kind of
+bug this project has a rule against — not a refusal, not an error, but
+compressed garbage under a plausible name, with `ls -l` reporting 34 bytes
+for a 2 400-byte file. (The first test used a `zipfile.ZipFile(…, "w")`
+default, which is ZIP_STORED, so it never exercised the compressed path.)
+
+The view now inflates: method 0 is served as-is, method 8 through a raw
+deflate decoder, and **any other method is refused rather than served** —
+a member this view cannot decode must not look like one it can. It surfaces
+as a file that fails to open (`EIO`), which is the only vocabulary FUSE
+gives; it reports size 0 rather than a size it cannot know.
+
+`flate2` lives in `mpedb-fs` alone. The engine never needs an inflater —
+splice keeps the compressed bytes precisely so it does not — and the
+dependency-light promise is about the engine.
+
 ## 4. Inodes are handed out once
 
 The namespace is rebuilt from the database on every `readdir` — new
@@ -101,7 +121,7 @@ on it does not build; with it off it builds and mounts.)
 
 | stage | contents | status |
 |---|---|---|
-| v1 | `/obj` (versioned blobs) + `/archive` (spliced zip members as a tree), read-only | **BUILT** |
+| v1 | `/obj` (versioned blobs) + `/archive` (spliced zip members as a tree, inflated), read-only | **BUILT** |
 | v2 | lazy ETL: a file whose bytes are a lens applied on read | designed below, refused |
 | v3 | write support | refused by design (§1), not staged |
 
