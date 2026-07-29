@@ -173,8 +173,12 @@ log-based engine), and the hardware published when the hardware is the answer.
   single writer lock across a user's `cp`). One snapshot per open file, and
   sizes are cached because a version's CONTENT is immutable even though its
   STORAGE is not (`VersionInfo.bytes` is the ENVELOPE's size — using it would
-  truncate reads). Its OWN workspace, like mpedb-capi, so a box without
-  /dev/fuse never compiles it: `cargo build --manifest-path
+  truncate reads). Lazy-ETL-as-a-file (v2) is CLOSED, not pending: a file needs a SIZE
+  before content, so a derived view runs the whole transform per stat —
+  measured 12 ms per 20k-row view, ~120 ms per `ls -l` over ten of them,
+  every time, against 12 ms ONCE for an export. Reopens only for a format
+  whose length follows from schema + row count. Its OWN workspace, like
+  mpedb-capi, so a box without /dev/fuse never compiles it: `cargo build --manifest-path
   crates/mpedb-fs/Cargo.toml`; `fuser` with default-features off, so no
   libfuse headers, mounting via `fusermount3`.
 - `crates/mpedb-py` — PyO3 module `mpedb` (abi3-py312, GIL released around engine calls);

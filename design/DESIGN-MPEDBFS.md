@@ -1,8 +1,8 @@
 # mpedbfs — the database as paths (#54)
 
 **Status: v1 BUILT 2026-07-29** (blobs and spliced archives, read-only,
-Linux). v2 (lazy ETL) and write support are designed here and refused by
-name.
+Linux). v2 (lazy ETL) is CLOSED as measured-and-not-worth-it (§6); write
+support is refused by design (§1).
 
 ## 0. What it adds, and what it does not
 
@@ -122,17 +122,53 @@ on it does not build; with it off it builds and mounts.)
 | stage | contents | status |
 |---|---|---|
 | v1 | `/obj` (versioned blobs) + `/archive` (spliced zip members as a tree, inflated), read-only | **BUILT** |
-| v2 | lazy ETL: a file whose bytes are a lens applied on read | designed below, refused |
+| v2 | lazy ETL: a file whose bytes are a transform applied on read | **CLOSED — measured against the alternative, not worth it** |
 | v3 | write support | refused by design (§1), not staged |
 
-### v2, and the question it has to answer first
+### v2 is closed, and this is the measurement
 
-The shape is obvious — `/lens/<pair>/<table>.csv` produces the forward
-image without materializing it — and the hard part is not the plumbing. It
-is that a file must have a SIZE before it has content, and a transformed
-table's size is not known until the transform runs. The three honest
-answers are: materialize on `open` and pay (what v1 does for blobs),
-report a size the reader must not trust (what `/proc` does, and what breaks
-`cp`), or present a format whose length is computable from the schema and
-the row count. Until one of those is chosen with a measurement behind it,
-`/lens` does not exist rather than existing badly.
+The shape was never in doubt: a path under the mount presents a derived
+view — a transform applied to a table — without materializing a copy. The
+word doing the work in that sentence is *lazy*, and the filesystem
+interface takes it away.
+
+**A file must have a SIZE before it has content.** `getattr` is answered
+before anyone opens anything, and for a derived presentation the length is
+not knowable from metadata — you get it by running the transform. So the
+laziness is gone exactly where it was supposed to pay: `ls -l` runs the
+whole transform, per file, per listing.
+
+Measured on the dev box: one full transform-and-render of a 20 000-row
+column is 12 ms and 238 kB. A directory holding ten such views therefore
+costs **~120 ms per `ls -l`, and the same again on the next one**, because
+rows change and there is nothing to cache against — unlike v1, where a blob
+version's content is immutable and one materialization answers forever
+(§3).
+
+The alternative it was measured against is one command that writes the file
+once: the same 12 ms, paid a single time, after which the OS page cache
+serves it and every tool in the world can read it. **The mount adds nothing
+the export does not, and charges the transform again on every stat.** That
+is not a close call, and it does not become one at a bigger table — the
+ratio is per-listing versus once.
+
+What would reopen it, concretely: **a presentation whose length is
+computable from the schema and the row count.** A fixed-width format has
+that property; CSV over variable-width values does not. If such a format
+arrives with a reason to exist, the size is answerable without running the
+transform, the laziness survives `getattr`, and the calculus above changes
+sign. Until then `/lens` does not exist, rather than existing badly.
+
+### The one piece that may come back, and its trigger
+
+The argument above is about presenting a whole table. It does not touch a
+much smaller thing: **one row's transformed value as one file**, where the
+size is a single materialization of a single value and the cost structure
+is v1's, not v2's.
+
+That stays unbuilt on purpose. Nobody has asked for it, and this document
+opens by warning against exactly this — growing a second, worse API for
+something the first API already does well. The trigger for revisiting is a
+user with a program that speaks only paths and a per-row transform it needs
+applied; absent that, the honest answer is that `rretl` already returns the
+value in one call.
