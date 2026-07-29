@@ -9,6 +9,7 @@ __pycache__/
 # its own line — a missed one gets a build tree staged by `git add -A`.
 crates/mpedb-capi/target/
 crates/mpedb-olapbench/target/
+crates/mpedb-fs/target/
 :memory:*
 
 # Scratch-notater som erklærer seg selv som ikke-commit (rest.txt:2).

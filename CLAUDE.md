@@ -165,6 +165,18 @@ log-based engine), and the hardware published when the hardware is the answer.
   1:1). stress/crash take
   `--durability commit|wal` to exercise the intent ring on real disk; `powerloss` is the
   WAL torn-tail power-loss simulation.
+- `crates/mpedb-fs` — `mpedbfs`, a READ-ONLY FUSE view (#54, DESIGN-MPEDBFS):
+  `/obj/<name>/{latest,v<N>}` for versioned blobs and `/archive/<id>-<name>/…`
+  for a spliced zip's members as a real tree. Adds no data — it is the adapter
+  for programs that only speak paths. Read-only is a DECISION, not a stage
+  (a partial write is not a version, and a writable mount would hold the
+  single writer lock across a user's `cp`). One snapshot per open file, and
+  sizes are cached because a version's CONTENT is immutable even though its
+  STORAGE is not (`VersionInfo.bytes` is the ENVELOPE's size — using it would
+  truncate reads). Its OWN workspace, like mpedb-capi, so a box without
+  /dev/fuse never compiles it: `cargo build --manifest-path
+  crates/mpedb-fs/Cargo.toml`; `fuser` with default-features off, so no
+  libfuse headers, mounting via `fusermount3`.
 - `crates/mpedb-py` — PyO3 module `mpedb` (abi3-py312, GIL released around engine calls);
   build: `cargo build --release -p mpedb-py`, ship `libmpedb_py.so` as `mpedb.so`.
 

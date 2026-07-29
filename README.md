@@ -410,6 +410,11 @@ data is in: lens pairs verified against a probe corpus, in-place column
 transforms that can be reverted or put back onto edits, and table-set maps
 that keep two shapes in sync both ways.
 
+**[design/DESIGN-MPEDBFS.md](design/DESIGN-MPEDBFS.md)** — `mpedbfs` mounts
+what the database already holds as ordinary paths, read-only, for the
+programs that speak nothing else: `/obj/<name>/latest` for a versioned blob,
+`/archive/<id>-<name>/…` for a spliced zip's members as a tree.
+
 **[GUIDE.md](GUIDE.md)** is the practical guide: quickstart, the schema config,
 queries, transactions, upsert, joins, durability, a side-by-side for people
 coming from sqlite3, and migrating a real sqlite3 database. Every Rust snippet

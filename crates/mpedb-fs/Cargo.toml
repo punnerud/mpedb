@@ -1,0 +1,24 @@
+# Its OWN workspace, like mpedb-capi: the FUSE dependency needs a running
+# `fusermount3` and /dev/fuse, which a build machine may legitimately not
+# have. As a member it would put that requirement in front of every
+# `cargo test --workspace`. Build and test it with:
+#     cargo test --manifest-path crates/mpedb-fs/Cargo.toml
+[workspace]
+
+[package]
+name = "mpedb-fs"
+version = "0.1.0"
+edition = "2021"
+description = "mpedbfs — read-only FUSE view of what an .mpedb file already holds"
+
+[[bin]]
+name = "mpedbfs"
+path = "src/main.rs"
+
+[dependencies]
+mpedb = { path = "../mpedb" }
+# `default-features = false` drops the libfuse C linkage: mounting then goes
+# through the setuid `fusermount3` helper, so the build needs no headers and
+# no pkg-config — only the runtime helper every FUSE-capable box already has.
+fuser = { version = "0.18", default-features = false }
+libc = "0.2"
