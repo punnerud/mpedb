@@ -24,10 +24,46 @@ blocker.
 
 ## 1. Ecosystem parity (P7 residual)
 
-Measured at `03ff5ea`/`d83c21d` on the M3, `C-API-COMPAT.md` is the live sheet.
-Django **826/831 + 490/493 + 314/324 + 514/528**, CPython **450/474** on the M3 (this Linux runner scores **458/466** at
-`858dbb5` on CPython 3.12.3 — different interpreter, different denominator, do
-not subtract).
+**Re-measured 2026-07-29 on the Linux runner, and the count that matters is now
+SHIM-ONLY — the arms are diffed by test NAME, not by pass count.** A test that
+fails on both arms is the runner's problem and is not mpedb's; counting it
+against us is how the old numbers drifted.
+
+| group | tests | shim-only failures |
+|---|---|---|
+| Django A (`basic lookup transactions ordering update delete` + `aggregation annotations expressions`) | 831 | **0** |
+| Django `queries` | 493 | **0** |
+| Django `backends` | 324 | 5 |
+| Django `model_fields` | 528 | 2 |
+| CPython `test_sqlite3` (3.12.3) | 467 | 8 |
+
+Django's whole residual is **seven named tests**, and three of them are one
+thing (FK enforcement):
+
+- `SchemaTests.test_constraint_checks_disabled_atomic_allowed`, `…test_disable_constraint_checking_failure_disallowed`, `test_uuid…test_unsaved_fk` — FOREIGN KEY enforcement
+- `IntrospectionTests.test_get_primary_key_column`, `…_pk_constraint` — DDL inside a SAVEPOINT
+- `backends.sqlite.tests.Tests.test_init_command` — `PRAGMA` (D10)
+- `test_jsonfield…test_lookups_special_chars` — JSON-path escapes
+
+Two earlier entries in this section were wrong about their own cause, and the
+correction is worth keeping:
+
+* **The "7 delete-batching errors" were not a delete problem and not a
+  contamination cascade from a leaked signal receiver.** Every one was
+  `database is out of space`. The shim gave a `mode=memory` database **1 MiB**,
+  chosen so CPython's `test_backup.test_progress` would report a small page
+  count — a global default tuned to flatter one test. Measured: such a database
+  dies after **7 749** one-row inserts, the six labels in G1 share one test
+  database, and running `delete` alone passes 59/59. The default is now 64 MiB
+  and G1 is 392/392. `test_progress` failed before the change and fails after
+  it, so the tuning had bought nothing even for its own test.
+* **The IN-list injection test was not "failing on both arms".** Stock is clean;
+  it was ours. It is now declared through Django's own `django_test_skips`
+  (adaptation D12), because the test is `skipUnless(vendor == "sqlite")` and its
+  docstring says it only applies to databases that do NOT validate parameter
+  types — mpedb does, which is COMPAT.md deviation 4 and the product. The
+  security property it checks holds here more strongly than in sqlite: sqlite
+  answers, we refuse.
 
 - [ ] **Derived-table placement** — `test_qs_with_subcompound_qs`,
       `test_distinct_ordered_sliced_subquery`. Both need `exec/`:
@@ -89,12 +125,30 @@ not subtract).
 > a fix lands without a re-measure. When a row here quotes an error string, the
 > cheapest check is `grep` for that string first.
 
-**Will not be closed, and the ceiling should say so.** `PRAGMA foreign_keys`
-×2 + `test_unsaved_fk` (mpedb parses `REFERENCES` and discards it),
-`PRAGMA synchronous` (D10), CPython `test_backup.test_progress`. Closing any of
-them means *claiming* enforcement or durability semantics mpedb does not have.
-**Reachable ceiling: Django 2 171/2 176, CPython 467/474 = parity with stock.**
-State that as a line, do not round it away.
+**~~Will not be closed~~ — REOPENED 2026-07-29.** This used to read: *"`PRAGMA
+foreign_keys` ×2 + `test_unsaved_fk`, `PRAGMA synchronous` (D10), CPython
+`test_backup.test_progress`. Closing any of them means claiming enforcement or
+durability semantics mpedb does not have."*
+
+That was a **scope decision, not an impossibility**, taken when the goal was
+"never answer wrongly" — and then an honest refusal beats a fake semantic. The
+goal is now 100 % against sqlite3, so the decision is taken again, and the
+answer is that we build the semantics rather than decline to have them:
+
+* **FK enforcement** is unbuilt, not unbuildable. `skip_references_clause`
+  already parses the whole grammar — actions, `MATCH`, `DEFERRABLE` — and
+  discards it. Triggers with `RAISE(ABORT)`, index point-probes on the write
+  path and a commit-time hook next to the optimistic guard are all shipped.
+  Closes three Django tests and one CPython test, and un-skips four more.
+* **`PRAGMA synchronous`** (D10): the getter can report the mode the config
+  actually chose — `none`/`async`/`wal` already mean OFF/NORMAL/FULL, and
+  `DESIGN.md` §durability draws the mapping itself. That is not a lie.
+* **`test_progress`** is the one genuinely hard position: matching means
+  reporting a page count that is not mpedb's geometry. It stays last, and if it
+  does not land it is the single honest residual — stated, not rounded away.
+
+The old ceiling line (`Django 2 171/2 176, CPython 467/474`) is retired: it was
+computed from the set above being permanent.
 
 ---
 

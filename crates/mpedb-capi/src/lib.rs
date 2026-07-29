@@ -1417,12 +1417,24 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
     // NEW file; an existing one keeps the geometry it was created with.
     let req = requested_size_mb(filename);
     let (path, kind, size_mb) = match target {
-        // Ephemeral / named-memory: small default (1 MiB, not 16). CPython's
-        // backup progress test uses pages=1 and expects a tiny step count; a
-        // 16 MiB fallocate made 4096 progress callbacks. Callers that need
-        // more set `file:…?size_mb=N`.
-        Target::Ephemeral => (ephemeral_path(), Backing::Ephemeral, req.unwrap_or(1)),
-        Target::NamedMemory(p) => (p, Backing::NamedMemory, req.unwrap_or(1)),
+        // Ephemeral / named-memory used to default to 1 MiB, to make CPython's
+        // `test_backup.test_progress` report a small step count. That was a
+        // global default tuned to flatter ONE test, and it was measured to cost
+        // seven others: a named-memory database died after **7 749** one-row
+        // inserts with `database is out of space`, which is what broke Django's
+        // whole `delete` label (the six labels in G1 share one test database,
+        // and by the time `delete` ran the 1 MiB was gone — running `delete`
+        // alone passes 59/59). sqlite grows on demand and never hits this.
+        //
+        // The tuning bought nothing even for its own test: `test_progress`
+        // asserts a page count of exactly 2, and mpedb reported 73 at 1 MiB —
+        // it failed then and it fails now. So the default is what a database
+        // needs, and the backup page arithmetic is fixed where it lives
+        // (DESIGN-CAPI / the S4 position), not by starving every consumer.
+        //
+        // Callers that want a different reservation still set `file:…?size_mb=N`.
+        Target::Ephemeral => (ephemeral_path(), Backing::Ephemeral, req.unwrap_or(64)),
+        Target::NamedMemory(p) => (p, Backing::NamedMemory, req.unwrap_or(64)),
         Target::File(p) => (p, Backing::File, req.unwrap_or(64)),
     };
 

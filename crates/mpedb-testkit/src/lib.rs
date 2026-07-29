@@ -19,6 +19,7 @@
 //! deterministic, reproducible failures); sqlite is in-process via the
 //! pinned bundled build, and psql is driven as a batch subprocess.
 
+pub mod corpus_baseline;
 pub mod diff;
 pub mod pg;
 pub mod slt;

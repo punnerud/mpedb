@@ -67,6 +67,8 @@
 //! - Re-creating a table with a *different* schema in one file poisons it
 //!   (file-authoritative schema); the sampled corpus never does this.
 
+use mpedb_testkit::corpus_baseline as baseline;
+
 use mpedb::{Config, Database, ExecResult, Value};
 
 
@@ -2601,6 +2603,26 @@ fn main() {
         idx_census::enable(out);
         args.remove(i);
     }
+    // `--baseline <path>` / `--write-baseline <path>`: the expected-counts gate.
+    // Reading it makes a silently shifting category an EXIT CODE; writing it is
+    // the deliberate act of saying "this is what the tree does now".
+    let mut baseline_path: Option<String> = None;
+    let mut write_baseline: Option<String> = None;
+    let mut corpus_root: Option<String> = None;
+    for (flag, slot) in [
+        ("--baseline", &mut baseline_path),
+        ("--write-baseline", &mut write_baseline),
+        ("--corpus-root", &mut corpus_root),
+    ] {
+        if let Some(i) = args.iter().position(|a| a == flag) {
+            let v = args.get(i + 1).cloned().unwrap_or_else(|| {
+                eprintln!("{flag} needs a path argument");
+                std::process::exit(2);
+            });
+            *slot = Some(v);
+            args.drain(i..=i + 1);
+        }
+    }
     SAMPLE_ALL.store(sample_all, std::sync::atomic::Ordering::Relaxed);
     let mut jobs: usize = 1;
     if let Some(i) = args.iter().position(|a| a == "--jobs") {
@@ -2622,7 +2644,11 @@ fn main() {
         eprintln!(
             "usage: sqlite_corpus [--as-sqlite] [--samples-all] [--verify] [--size-mb N] \
              [--jobs N] [--join-cells N] [--footprint-census[=out.tsv]] \
-             [--index-census[=out.tsv]] <file.test> [...]"
+             [--index-census[=out.tsv]] [--baseline <t.tsv>] [--write-baseline <t.tsv>] \
+             [--corpus-root <dir>] <file.test> [...]\n\
+             \n\
+             --baseline exits 0 on an exact match, 1 on a regression, 3 when the \
+             baseline is stale (only improvements)."
         );
         std::process::exit(2);
     }
@@ -2681,16 +2707,54 @@ fn main() {
     );
 
     // ---------------- per-file table ----------------
+    //
+    // Rows are labelled by KEY (the path with the run's common root stripped),
+    // not by file name: 127 of the corpus's files share a basename — there are
+    // thirteen `slt_good_0.test` — so a name-labelled table attributed a failure
+    // to whichever of them the reader guessed.
+    // The root the keys are relative to. A baseline being COMPARED supplies it
+    // — a subset run must key itself the way the full run that wrote the
+    // baseline did, and inferring it from this run's own paths does not.
+    let recorded = baseline_path
+        .as_ref()
+        .map(|p| baseline::read(Path::new(p)))
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("cannot read baseline: {e}");
+            std::process::exit(2);
+        });
+    let root = corpus_root
+        .clone()
+        .or_else(|| recorded.as_ref().map(|b| b.root.clone()))
+        .unwrap_or_else(|| baseline::infer_root(&args));
+    let keys = baseline::keys_for(&args, &root).unwrap_or_else(|e| {
+        eprintln!("{e}\n(pass --corpus-root to say which directory the keys are relative to)");
+        std::process::exit(2);
+    });
+    let mut base_table = baseline::Table::new();
     println!();
     println!(
-        "{:<28} {:>7} {:>7} {:>6} {:>7} {:>7} {:>7} {:>6} {:>7} {:>7}",
+        "{:<44} {:>7} {:>7} {:>6} {:>7} {:>7} {:>7} {:>6} {:>7} {:>7}",
         "file", "records", "pass", "pass%", "s-pass", "q-pass", "unsupp", "wrong", "errmis", "skipped"
     );
     let (mut t_total, mut t_pass, mut t_unsupp, mut t_wrong, mut t_errmis, mut t_skip) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-    for r in &reports {
+    for (i, r) in reports.iter().enumerate() {
+        let key = keys.get(i).cloned().unwrap_or_else(|| r.name.clone());
         if let Some(f) = &r.fatal {
-            println!("{:<28} FATAL: {f}", r.name);
+            println!("{:<44} FATAL: {f}", key);
+            base_table.insert(
+                key,
+                baseline::Row {
+                    total: r.total,
+                    pass: 0,
+                    unsupported: 0,
+                    wrong: 0,
+                    errmis: 0,
+                    skipped: 0,
+                    fatal: true,
+                },
+            );
             continue;
         }
         let run = r.total - r.skipped;
@@ -2700,8 +2764,8 @@ fn main() {
             0.0
         };
         println!(
-            "{:<28} {:>7} {:>7} {:>5.1}% {:>7} {:>7} {:>7} {:>6} {:>7} {:>7}",
-            r.name,
+            "{:<44} {:>7} {:>7} {:>5.1}% {:>7} {:>7} {:>7} {:>6} {:>7} {:>7}",
+            key,
             r.total,
             r.pass(),
             pct,
@@ -2711,6 +2775,18 @@ fn main() {
             r.wrong_total,
             r.errmis_total,
             r.skipped
+        );
+        base_table.insert(
+            key,
+            baseline::Row {
+                total: r.total,
+                pass: r.pass(),
+                unsupported: r.unsupported_total(),
+                wrong: r.wrong_total,
+                errmis: r.errmis_total,
+                skipped: r.skipped,
+                fatal: false,
+            },
         );
         t_total += r.total;
         t_pass += r.pass();
@@ -2724,7 +2800,7 @@ fn main() {
         .iter()
         .fold((0usize, 0usize), |(s, q), r| (s + r.stmt_pass, q + r.query_pass));
     println!(
-        "{:<28} {:>7} {:>7} {:>5.1}% {:>7} {:>7} {:>7} {:>6} {:>7} {:>7}",
+        "{:<44} {:>7} {:>7} {:>5.1}% {:>7} {:>7} {:>7} {:>6} {:>7} {:>7}",
         "TOTAL",
         t_total,
         t_pass,
@@ -2842,4 +2918,28 @@ fn main() {
 
     census::report();
     idx_census::report();
+
+    // ---------------- the baseline gate ----------------
+    //
+    // Last, so the whole report is still printed on a regression — the diff
+    // says WHICH file moved, and the reader wants the categories next to it.
+    if let Some(p) = &write_baseline {
+        let out = baseline::Baseline { root: root.clone(), files: base_table.clone() };
+        match baseline::write(Path::new(p), &out) {
+            Ok(()) => println!(
+                "\nbaseline written: {p} ({} files, root {root})",
+                base_table.len()
+            ),
+            Err(e) => {
+                eprintln!("cannot write baseline {p}: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if let Some(base) = &recorded {
+        let code = baseline::compare(&base.files, &base_table).exit_code();
+        if code != 0 {
+            std::process::exit(code);
+        }
+    }
 }

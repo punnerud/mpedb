@@ -161,4 +161,53 @@ for arm in ${WB_ARM:-stock shim}; do
         i=$((i + 1))
     done
 done
+
+# ---- the failure list, BY NAME ----------------------------------------------
+#
+# Until now this script printed counts and nothing else, and the record of WHICH
+# tests failed lived in whatever the operator happened to paste into a commit
+# message. That is how "7 delete-batching errors" ended up being the only
+# surviving description of seven specific test ids: a class label, not a list.
+#
+# A count cannot tell a fixed test from a newly broken one. So each arm's ids go
+# to a file, and the SHIM-ONLY set — the difference — is what actually measures
+# mpedb. A test failing on both arms is the runner's problem, not the engine's,
+# and it must not be counted against us or fixed by us.
+ids_of() {  # $@ = logs -> sorted dotted test ids
+    grep -hE '^(FAIL|ERROR): ' "$@" 2>/dev/null \
+        | sed -E 's/^(FAIL|ERROR): [^ ]+ \(([^)]*)\).*/\2/' \
+        | sort -u
+}
+for arm in stock shim; do
+    ls "$OUT"/${arm}_g*.txt >/dev/null 2>&1 || continue
+    ids_of "$OUT"/${arm}_g*.txt > "$OUT/${arm}_ids.txt"
+done
+if [ -f "$OUT/stock_ids.txt" ] && [ -f "$OUT/shim_ids.txt" ]; then
+    comm -13 "$OUT/stock_ids.txt" "$OUT/shim_ids.txt" > "$OUT/shim_only_ids.txt"
+    comm -23 "$OUT/stock_ids.txt" "$OUT/shim_ids.txt" > "$OUT/stock_only_ids.txt"
+    echo
+    echo "stock failures: $(wc -l < "$OUT/stock_ids.txt")  shim failures: $(wc -l < "$OUT/shim_ids.txt")"
+    echo "SHIM-ONLY ($(wc -l < "$OUT/shim_only_ids.txt")) — this is the number that measures mpedb:"
+    sed 's/^/  /' "$OUT/shim_only_ids.txt"
+    if [ -s "$OUT/stock_only_ids.txt" ]; then
+        echo "stock-only ($(wc -l < "$OUT/stock_only_ids.txt")) — the shim passes these and stock does not:"
+        sed 's/^/  /' "$OUT/stock_only_ids.txt"
+    fi
+    # The gate: an expected-set file, compared by NAME. Regenerate deliberately
+    # with WB_WRITE_EXPECTED=1 — never by editing it to match a bad run.
+    EXPECTED="${WB_EXPECTED:-$HERE/expected_shim_only.txt}"
+    if [ -n "${WB_WRITE_EXPECTED:-}" ]; then
+        cp "$OUT/shim_only_ids.txt" "$EXPECTED"
+        echo "expected-set written: $EXPECTED"
+    elif [ -f "$EXPECTED" ]; then
+        if diff -u "$EXPECTED" "$OUT/shim_only_ids.txt" > "$OUT/expected.diff"; then
+            echo "EXPECTED SET: exact match"
+        else
+            echo "EXPECTED SET: MOVED —"
+            sed 's/^/  /' "$OUT/expected.diff"
+            echo "(re-run with WB_WRITE_EXPECTED=1 once the move is understood and intended)"
+            exit 1
+        fi
+    fi
+fi
 echo "logs in $OUT"

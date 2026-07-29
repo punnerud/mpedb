@@ -37,9 +37,48 @@ ablation switches (`WB_NO_D2`, `WB_NO_D8`) so their cost can be re-measured.
 import os
 
 from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteDatabaseWrapper
+from django.db.backends.sqlite3.features import (
+    DatabaseFeatures as SQLiteDatabaseFeatures,
+)
 from django.db.backends.sqlite3.operations import (
     DatabaseOperations as SQLiteDatabaseOperations,
 )
+
+
+class DatabaseFeatures(SQLiteDatabaseFeatures):
+    @property
+    def django_test_skips(self):
+        skips = super().django_test_skips
+        if os.environ.get("WB_NO_D12"):
+            return skips
+        # ADAPTATION D12 — and this one is not a gap, it is the product.
+        #
+        # The test is `@unittest.skipUnless(connection.vendor == "sqlite", "This
+        # defensive test only works on databases that don't validate parameter
+        # types")`. Its own docstring says so: "It's limited to SQLite, as
+        # PostgreSQL, Oracle and other vendors have defense in depth against
+        # this by type checking." It runs against us only because the backend
+        # subclasses Django's sqlite3 one and therefore reports vendor "sqlite".
+        #
+        # It filters `name__in=[F("num_chairs") + "1)) OR ((1==1"]`. sqlite
+        # coerces the text to 1, adds, and compares an integer against a text
+        # column to get an empty result. mpedb refuses BOTH steps by name
+        # (`cannot compare with IN list: text and int64`) — implicit text↔number
+        # conversion in arithmetic and comparison is COMPAT.md deviation 4, the
+        # rigid typing that is the whole point of the engine.
+        #
+        # The security property the test checks — no injection — holds here
+        # MORE strongly than in sqlite: sqlite answers, we refuse. Making it
+        # pass would mean deleting the type check it exists to say sqlite lacks.
+        # So this is declared the way Django asks a type-checking backend to
+        # declare it, with the same mechanism PostgreSQL and Oracle rely on.
+        # Applied to BOTH arms. Ablation: `WB_NO_D12=1`.
+        skips = dict(skips)
+        skips["mpedb validates parameter types, so this sqlite-only defensive test does not apply"] = {
+            "expressions.tests.IterableLookupInnerExpressionsTests."
+            "test_expressions_not_introduce_sql_injection_via_untrusted_string_inclusion",
+        }
+        return skips
 
 
 class DatabaseOperations(SQLiteDatabaseOperations):
@@ -64,6 +103,7 @@ class DatabaseOperations(SQLiteDatabaseOperations):
 
 class DatabaseWrapper(SQLiteDatabaseWrapper):
     ops_class = DatabaseOperations
+    features_class = DatabaseFeatures
 
     # GAP D2 (mpedb-sql): `AUTOINCREMENT` is refused BY NAME — mpedb's INTEGER
     # PRIMARY KEY auto-assigns max+1 but REUSES ids after a delete, and the
