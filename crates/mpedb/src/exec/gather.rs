@@ -23,8 +23,10 @@ pub(super) struct JoinCells {
 }
 
 impl JoinCells {
+    /// One memory probe per join (never per row) — see [`clamp_to_memory`] for
+    /// why a budget can be lowered here.
     pub(super) fn new(budget: u64) -> JoinCells {
-        JoinCells { budget, live: 0 }
+        JoinCells { budget: clamp_to_memory(budget), live: 0 }
     }
 
     /// Would charging `n` more cells stay inside the budget? Asked BEFORE
@@ -41,21 +43,23 @@ impl JoinCells {
     /// query's input — which is what the #125 memory contract actually requires
     /// (`prune_width_mem`: held bytes must not scale with input); the old
     /// universal 65,536 was that contract plus an accident of arithmetic
-    /// (`DEFAULT_MAX_JOIN_CELLS = 2^28`, and 2^28/4096 = 65,536 exactly).
+    /// (the old `DEFAULT_MAX_JOIN_CELLS = 2^28`, and 2^28/4096 = 65,536 exactly).
     ///
-    /// `budget/1024` at the default budget is 262,144 cells (~10 MiB at the
-    /// measured ~40 B/cell) — enough that a 20k-row dimension table hashes,
-    /// which the old constant refused (the measured star-join gap to
-    /// PostgreSQL). The floor keeps every configuration at least as capable as
-    /// before, and an UNLIMITED budget (0) deliberately keeps the old
-    /// constant: opting out of the cell budget must not silently license
-    /// unbounded builds.
+    /// The DIVISOR is chosen to land the default at 262,144 cells (~10 MiB at
+    /// the measured ~40 B/cell) — enough that a 20k-row dimension table hashes,
+    /// which the old universal constant refused (the measured star-join gap to
+    /// PostgreSQL). It is 64 rather than 1024 only because the default budget
+    /// moved from 2^28 to 2^24: the CAP is the calibrated quantity and is
+    /// unchanged, the fraction is just how it is expressed. The floor keeps
+    /// every configuration at least as capable as before, and an UNLIMITED
+    /// budget (0) deliberately keeps the old constant: opting out of the cell
+    /// budget must not silently license unbounded builds.
     pub(super) fn hash_build_cap(&self) -> u64 {
         const FLOOR: u64 = 65_536;
         if self.budget == 0 {
             FLOOR
         } else {
-            FLOOR.max(self.budget / 1024)
+            FLOOR.max(self.budget / 64)
         }
     }
 
@@ -92,15 +96,34 @@ fn join_oom() -> Error {
     Error::OutOfMemory { what: "a nested-loop join's intermediate rows" }
 }
 
-/// Can a join budget of `cells` plausibly be allocated by this process?
-/// ~40 B resident per cell (the calibration constant from
-/// [`mpedb_types::config::DEFAULT_MAX_JOIN_CELLS`]'s measurement), compared
-/// against the tighter of the address-space rlimit and, on Linux,
-/// `MemAvailable`. Falls back to "fits" when nothing is readable — that is
-/// today's behaviour, so an exotic platform loses nothing. The 3/4 factor
-/// leaves room for the transient candidate row and the engine's own maps.
-fn budget_fits_in_memory(cells: u64) -> bool {
-    let need = cells.saturating_mul(40);
+/// ~40 B resident per cell — the calibration constant measured for
+/// [`mpedb_types::config::DEFAULT_MAX_JOIN_CELLS`].
+const BYTES_PER_CELL: u64 = 40;
+
+/// The largest join budget this process could plausibly hold, in CELLS, or
+/// `None` when nothing bounding is readable (an exotic platform then behaves
+/// exactly as it always did). Bounded by the tighter of the address-space
+/// rlimit and, on Linux, `MemAvailable`.
+///
+/// The quarter is not timidity. The accumulator is a growing `Vec`, so at every
+/// reallocation the old and new buffers are BOTH live — a steady state of `n`
+/// bytes has a transient peak near `2n`, before the mapped database and the
+/// engine's own maps. MEASURED with the earlier 3/4 factor under a 2 GB rlimit:
+/// the allocation failed at ~33 M cells while the ceiling sat at 37.5 M, i.e.
+/// the wall arrived FIRST and the deterministic trip point — the entire point
+/// of the ceiling — never fired.
+///
+/// Read ONCE per process. `MemAvailable` moves constantly, and re-reading it per
+/// join would put a `/proc` read on the path of every aggregate and every joined
+/// query while making the trip point wander mid-workload. Once is also the more
+/// honest reading: this is a backstop against a budget the machine could never
+/// hold, not a live memory meter.
+fn plausible_cell_ceiling() -> Option<u64> {
+    static CEILING: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CEILING.get_or_init(probe_cell_ceiling)
+}
+
+fn probe_cell_ceiling() -> Option<u64> {
     // `mut` only where an arm narrows it: on Windows every arm below is a
     // no-op, and an unconditional `mut` is a warning the Linux lint pass
     // cannot see (#159 stage 4 found it by cross-linting the facade).
@@ -148,7 +171,40 @@ fn budget_fits_in_memory(cells: u64) -> bool {
             bound = bound.min(kb.saturating_mul(1024));
         }
     }
-    bound == u64::MAX || need <= bound / 4 * 3
+    (bound != u64::MAX).then_some(bound / 4 / BYTES_PER_CELL)
+}
+
+/// Lower a budget this process could never actually reach to one it can.
+///
+/// The cell budget's whole job is to turn a runaway join's OOM abort into a
+/// clean [`Error::RuntimeBudget`]. A budget of 2^28 cells is ~11 GB resident —
+/// on any smaller box it is not a guard at all, and the fallible-reservation
+/// backstop does not cover for it: under Linux's default heuristic overcommit
+/// the reservation SUCCEEDS and the kill lands when the pages are touched.
+/// MEASURED on a 7.9 GB box: a 30-way permuted chain with a FULL join (which
+/// the solver declines, so the chain stays in textual order) reached 1.3 GB in
+/// 1.6 s and was still climbing — stopped only by an rlimit, and OOM-killing
+/// the host without one.
+///
+/// The cost is that the trip point becomes a property of the MACHINE where the
+/// budget did not fit it. That is the trade, taken deliberately: on such a
+/// machine the documented deterministic trip point never existed, and a
+/// reproducible refusal beats a reproducible box-kill. A budget that DOES fit
+/// is never touched, so a deployment that needs the trip point identical
+/// everywhere gets exactly that by configuring one its machines can hold.
+///
+/// `0` — the explicit unlimited opt-out — stays unlimited: that one is the
+/// caller's decision, and it keeps the fallible per-allocation path.
+fn clamp_to_memory(budget: u64) -> u64 {
+    if budget == 0 {
+        return 0;
+    }
+    match plausible_cell_ceiling() {
+        // `max(1)` so a pathologically small ceiling still bounds rather than
+        // silently becoming the unlimited sentinel.
+        Some(c) if c < budget => c.max(1),
+        _ => budget,
+    }
 }
 
 /// Build one joined row of exactly `cap` values.
@@ -692,17 +748,15 @@ pub(super) fn gather_joined_arena(
     // explicit `max_join_cells = 0` opt-out pays for per-allocation
     // fallibility (see `build_joined_row`).
     //
-    // …unless the budget CANNOT FIT: the cap only guards if it trips before
-    // the memory wall, and a budget of 2^28 cells ≈ 11 GB resident never
-    // trips inside a 3 GB rlimit — measured: `select5`'s `join-17-4` died on
-    // SIGABRT with the default config, exactly the host-killing failure this
-    // budget exists to prevent. So when the budget's byte-equivalent exceeds
-    // what this process can plausibly allocate (rlimit and, on Linux,
-    // MemAvailable), the row build goes fallible too: answers are unchanged
-    // (fallibility only changes the failure MODE at the wall, abort → clean
-    // Error::OutOfMemory), the deterministic trip point is unchanged, and a
-    // healthy box still pays nothing. One probe per gather, not per row.
-    let fallible = cells.budget == 0 || !budget_fits_in_memory(cells.budget);
+    // A budget that could not fit this process was already LOWERED to one that
+    // can (`clamp_to_memory`, applied once in `JoinCells::new`), so a finite
+    // budget now always trips before the memory wall and the deterministic cap
+    // is the guard on every box — not only on one big enough for the number in
+    // the config. That leaves exactly one case for fallible reservation: the
+    // explicit `max_join_cells = 0` opt-out, which asked for no cap at all and
+    // pays per-allocation fallibility so the wall is a clean
+    // `Error::OutOfMemory` rather than an abort.
+    let fallible = cells.budget == 0;
     for (ji, join) in joins.iter().enumerate() {
         let inner_def = table_def(schema, plan, join.table)?;
         let inner_width = inner_def.columns.len();
@@ -1150,9 +1204,9 @@ pub(super) fn gather_rows(
 /// `C = clamp(1, budget_cells / (W·S), 65536)`, which is right for a stage
 /// whose throughput improves with a bigger chunk. A FOLD is not such a stage:
 /// its hold is O(groups) whichever way the input arrives, so every cell above
-/// the re-descent amortization point buys nothing but peak. With the default
-/// `max_join_cells = 268 435 456` that formula clamps to 65 536 rows ≈ 20 MB
-/// held for `SELECT count(*)`, against 61.8 KB for the same scan through
+/// the re-descent amortization point buys nothing but peak. At the default
+/// `max_join_cells` that formula saturates at its own 65 536-row ceiling for
+/// `SELECT count(*)` — ≈ 20 MB held, against 61.8 KB for the same scan through
 /// `stream_query`. The budget is still consulted — as a DIVISOR below, so a
 /// deliberately tiny budget still shrinks the batch, and as the §4.3 tripwire
 /// on the group map, which is the state a chunk size genuinely cannot move.

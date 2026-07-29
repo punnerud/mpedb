@@ -307,17 +307,31 @@ pub struct Config {
 /// runaway caught-by-default (see design/DESIGN-RUNTIME-BUDGET.md).
 pub const DEFAULT_MAX_WORK_ROWS: u64 = 1_000_000_000;
 
-/// The join-materialization cell budget default (2^28). Calibrated against
-/// the heaviest legitimate queries in the sqllogictest corpus, measured at
-/// ~40 B resident per cell: `select4.test` (100% pass) peaks at 31.7 M live
-/// cells ≈ 1.1 GB resident, and `select5.test`'s passing prefix (through
-/// `join-17-3`, 871/871) peaks at 68 M ≈ 2.7 GB. 268 M cells is 8.5× the
-/// former and 3.9× the latter, yet a genuine runaway (`select5.test`'s
-/// `join-17-4`, a 17-way comma join whose only constant anchor is the 16th
-/// of 17 conjuncts, product 10^17 rows) crosses it while the intermediate
-/// product is ~11 GB — a clean deterministic error where unbounded execution
-/// is an OOM kill. `0` = unlimited.
-pub const DEFAULT_MAX_JOIN_CELLS: u64 = 268_435_456;
+/// The join-materialization cell budget default (2^24 ≈ 670 MB at the measured
+/// ~40 B resident per cell). `0` = unlimited.
+///
+/// It was 2^28 — 268 M cells, ~11 GB — calibrated against a corpus peak of
+/// 68 M cells in `select5.test`. That calibration measured the PLANNER, not the
+/// queries: those 68 M cells were cartesian products the join solver had
+/// declined to reorder (its state mask was 24 tables wide; `select5` joins up
+/// to 64). With the solver covering the full width the same file peaks at 9 MB,
+/// and the WHOLE 622-file corpus peaks at 345 MB resident — so the number
+/// calibrated against the old peak was 30× larger than anything legitimate
+/// needs.
+///
+/// That mattered because a budget is only a guard if it trips BEFORE the memory
+/// wall, and ~11 GB is past the wall on any ordinary machine: MEASURED on a
+/// 7.9 GB box, a runaway join was OOM-KILLED by the kernel — taking the whole
+/// process group with it — while still far under the budget that was supposed
+/// to catch it. Fallible reservation does not cover for that either, since
+/// Linux's default heuristic overcommit lets the reservation succeed and kills
+/// on first touch.
+///
+/// 2^24 is ~2× the corpus's measured high-water and small enough to trip on any
+/// box, which is what makes the runaway a named [`crate::Error::RuntimeBudget`]
+/// rather than a dead host. Deliberately NOT derived from the machine: the trip
+/// point is a property of the data and the plan, so it reproduces everywhere.
+pub const DEFAULT_MAX_JOIN_CELLS: u64 = 16_777_216;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

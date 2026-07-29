@@ -3,7 +3,10 @@
 //! points, so they live together regardless of which submodule now holds a
 //! given production.
 
-use super::{parse_expr_only, parse_statement, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS, MAX_SET_ITEMS};
+use super::{
+    parse_expr_only, parse_statement, MAX_FROM_TABLES, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS,
+    MAX_SET_ITEMS,
+};
 use crate::ast::{BinOp, DeleteStmt, Expr, InsertStmt, SelectStmt, Stmt, UnOp};
 use crate::plan::{LimitVal, SetOp, SortDir};
 use mpedb_types::{Error, Value};
@@ -668,6 +671,24 @@ fn item_count_caps() {
         Err(Error::Parse { msg, .. }) if msg.contains("too many SET assignments")
     ));
     assert!(parse_statement(&mk_set(MAX_SET_ITEMS)).is_ok());
+
+    // FROM: 65 tables rejected, 64 accepted — sqlite 3.45.1 answers a 64-way
+    // join and refuses the 65th with "at most 64 tables in a join", MEASURED.
+    // This one is not headroom against the wire format: 64 is the width of the
+    // join solver's state mask, and past it the solver declined and left the
+    // chain in TEXTUAL order — which on a permuted chain is a cartesian product
+    // that materialized 1.3 GB in 1.7 s and kept climbing.
+    let mk_from = |n: usize| {
+        format!(
+            "SELECT * FROM {}",
+            (1..=n).map(|i| format!("t{i}")).collect::<Vec<_>>().join(",")
+        )
+    };
+    assert!(matches!(
+        parse_statement(&mk_from(MAX_FROM_TABLES + 1)),
+        Err(Error::Parse { msg, .. }) if msg.contains("at most 64 tables in a join")
+    ));
+    assert!(parse_statement(&mk_from(MAX_FROM_TABLES)).is_ok());
 }
 
 #[test]

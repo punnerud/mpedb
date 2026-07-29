@@ -1032,10 +1032,20 @@ impl Engine {
             concurrency: Concurrency::Serial,
             flusher: None, // read-only tooling handle; async needs a config
             extent_threshold: None,
-            // Tooling handle (no config): the budgets are unlimited (a `dump`/
-            // verify pass legitimately scans whole tables).
+            // Tooling handle (no config): the WORK-ROW budget is unlimited, a
+            // `dump`/verify pass legitimately scans whole tables and a row count
+            // is exactly what it would refuse.
             work_budget: 0,
-            join_cells_budget: 0,
+            // The JOIN-CELL budget is not in that class and gets the ordinary
+            // default. Nothing this handle exists for materializes an n-way
+            // product — but this is also the handle behind `mpedb <file.mpedb>`,
+            // so "unlimited" here meant the everyday interactive path ran with
+            // the memory guard OFF. MEASURED: a runaway join grew to 1.3 GB and
+            // OOM-KILLED the host, while the identical query under a config that
+            // spells the same budget out refuses by name in 0.00 s. A default is
+            // not a deployment assertion — it should not depend on whether the
+            // caller passed a TOML.
+            join_cells_budget: mpedb_types::config::DEFAULT_MAX_JOIN_CELLS,
             query_threads: 1, // tooling handle: always serial
             // Read-only tooling: no SQL layer to install a compiler, and no
             // writes for a CHECK to guard.

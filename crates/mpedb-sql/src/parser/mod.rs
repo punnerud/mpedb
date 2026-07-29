@@ -88,6 +88,11 @@ pub(crate) const MAX_SELECT_ITEMS: usize = 4096;
 const MAX_COMPOUND_ARMS: usize = 64;
 pub(crate) const MAX_ORDER_BY_ITEMS: usize = 64;
 pub(crate) const MAX_SET_ITEMS: usize = 1024;
+/// Tables in one FROM — sqlite's own limit, and the width of the join solver's
+/// state mask. Unlike its neighbours this one is not headroom against the wire
+/// format: it is the point past which there is no plan worth making, so the
+/// refusal is the answer. See the call site in `parser::select`.
+pub(crate) const MAX_FROM_TABLES: usize = 64;
 
 /// Parse a complete statement. Returns the AST, whether it was wrapped in
 /// `EXPLAIN`, and the number of parameters ($n gives max n; `?` are numbered

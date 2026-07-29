@@ -163,12 +163,36 @@ const DP_FULL_MAX: usize = 12;
 /// what keeps the algorithm choice deterministic across processes.
 const MAX_STATES: usize = 20_000;
 
-/// Widest chain the solver will look at. Bounded by the `u32` state mask (31)
-/// and set above the plan format's own `MAX_JOINS = 16` (17 tables), so the
-/// solver never becomes the reason a statement is refused. `select5.test`
-/// carries comma joins up to 64 tables wide; those are refused by plan
-/// validation, and the solver simply declines to look at them.
-const MAX_SOLVE: usize = 24;
+/// A set of table POSITIONS in the scope being solved — never table ids. One
+/// bit per position, so the width of this type IS [`MAX_SOLVE`].
+type Mask = u64;
+
+/// The mask holding position `t` alone.
+fn bit(t: usize) -> Mask {
+    1 << t
+}
+
+/// Every position in a scope of `n`. Written out rather than `(1 << n) - 1`
+/// because at `n == MAX_SOLVE` that shift is undefined.
+fn full_mask(n: usize) -> Mask {
+    if n >= Mask::BITS as usize {
+        Mask::MAX
+    } else {
+        bit(n) - 1
+    }
+}
+
+/// Widest chain the solver will look at — the width of [`Mask`], and the same
+/// 64 tables sqlite itself allows in one join.
+///
+/// It was 24 (the `u32` mask's 31, minus headroom) on the belief that a wider
+/// comma join was refused downstream anyway. MEASURED, that was false in both
+/// halves: `select5.test`'s 18- through 24-way joins ANSWER, and its 25-way and
+/// wider ones were not refused but planned in textual order — 7 cartesian steps,
+/// ~10^13 work-rows, and an intermediate the executor materialized until the
+/// box died. The solver declining was itself the runaway. Above the format cap
+/// by design, so the solver is never the thing that refuses.
+const MAX_SOLVE: usize = 64;
 
 /// How many propose → probe → re-solve rounds the compile-time ping-pong runs
 /// before it gives up on being frugal, buys every cost input and solves once
@@ -214,22 +238,22 @@ struct Node<'a> {
     ndv: std::cell::OnceCell<Vec<Option<u32>>>,
     /// Equality pins on this table's columns: `(column index, mask of tables
     /// the pinning expression needs placed first)`. A constant pin has mask 0.
-    pins: Vec<(usize, u32)>,
+    pins: Vec<(usize, Mask)>,
     /// The FULL table mask of every conjunct that mentions this table. A
     /// conjunct is resolved — evaluated, per #65 — at the step that places its
     /// LAST table, i.e. when `mask & !(placed | 1<<t) == 0`. Multi-table
     /// entries are what make a step non-cartesian; a `1<<t` entry is a
     /// single-table filter, which constrains the table wherever it is placed
     /// but (unless it yields a KNOWN access path) bounds nothing.
-    conj: Vec<u32>,
+    conj: Vec<Mask>,
     /// `conj` contains this table alone: a constant anchor, a LIKE, …
     self_filter: bool,
     /// Tables this one shares a conjunct with.
-    adj: u32,
+    adj: Mask,
     /// Need-masks (the OTHER side's tables) of linking equalities in the
     /// hash-representable shape — see [`Cost::unhashable`]. A step is
     /// hash-rescuable once any entry's mask is fully placed.
-    hash_link: Vec<u32>,
+    hash_link: Vec<Mask>,
     /// **v2 barrier (#116).** This table is the NULL-extended inner side of a
     /// LEFT join: its position is FIXED, so the set of tables that precede it
     /// — and therefore exactly what it preserves and what it NULL-extends — is
@@ -280,7 +304,7 @@ impl<'a> Problem<'a> {
     /// Is entering `t` with `placed` already done a KNOWN (single-row) step?
     /// Mirrors `extract_join_access`'s preference: full PK first, then a
     /// full-width UNIQUE index.
-    fn known(&self, placed: u32, t: usize) -> bool {
+    fn known(&self, placed: Mask, t: usize) -> bool {
         let node = &self.nodes[t];
         let pinned = |col: u16| {
             node.pins
@@ -315,7 +339,7 @@ impl<'a> Problem<'a> {
     /// (the caveat is DESIGN-MPEE-GENERAL §8). Zero when the table's stats
     /// are unbought (the UNBOUGHT floor is already the lower bound) or the
     /// index was never analyzed.
-    fn ndv_discount(&self, placed: u32, t: usize) -> u32 {
+    fn ndv_discount(&self, placed: Mask, t: usize) -> u32 {
         let node = &self.nodes[t];
         let Some(ndv) = node.ndv.get() else { return 0 };
         let pinned = |col: u16| {
@@ -344,11 +368,11 @@ impl<'a> Problem<'a> {
     ///
     /// Depends only on `(placed, t, pos)` — never on the ORDER `placed` was
     /// built in — which is what makes the subset DP in [`Self::dp`] correct.
-    fn step(&self, placed: u32, t: usize, pos: usize) -> Cost {
+    fn step(&self, placed: Mask, t: usize, pos: usize) -> Cost {
         let node = &self.nodes[t];
         let known = self.known(placed, t);
         // Everything this table's conjuncts still need, once it is in.
-        let after = !(placed | (1 << t));
+        let after = !(placed | (bit(t)));
         let linked = node.conj.iter().any(|&m| m.count_ones() > 1 && m & after == 0);
         let constrained = linked || node.self_filter || known;
         // v2: every conjunct RESOLVED at this step is charged its position.
@@ -380,25 +404,25 @@ impl<'a> Problem<'a> {
 
     /// Cost of ordering the tables of one segment, given the fixed `prefix`
     /// already placed before it and the position `base` the segment starts at.
-    fn order_cost(&self, prefix: u32, base: usize, order: &[usize]) -> Cost {
+    fn order_cost(&self, prefix: Mask, base: usize, order: &[usize]) -> Cost {
         let mut placed = prefix;
         let mut cost = Cost::default();
         for (i, &t) in order.iter().enumerate() {
             cost = cost.add(self.step(placed, t, base + i));
-            placed |= 1 << t;
+            placed |= bit(t);
         }
         cost
     }
 
     /// Tables adjacent to the placed set and not yet placed.
-    fn frontier(&self, placed: u32) -> u32 {
-        let mut f = 0u32;
+    fn frontier(&self, placed: Mask) -> Mask {
+        let mut f = 0 as Mask;
         for t in 0..self.n {
-            if placed & (1 << t) != 0 {
+            if placed & (bit(t)) != 0 {
                 f |= self.nodes[t].adj;
             }
         }
-        f & !placed & ((1u32 << self.n) - 1)
+        f & !placed & full_mask(self.n)
     }
 
     /// Dynamic program over subsets, level by level in increasing population
@@ -417,14 +441,14 @@ impl<'a> Problem<'a> {
     /// the segment's own tables and `base` the position its first table takes.
     /// With no barrier in the chain this is `(0, full, 0)` and the whole thing
     /// is v1's DP verbatim.
-    fn dp(&self, prefix: u32, univ: u32, base: usize, seeds: u32) -> Option<Vec<usize>> {
+    fn dp(&self, prefix: Mask, univ: Mask, base: usize, seeds: Mask) -> Option<Vec<usize>> {
         let m = univ.count_ones() as usize;
-        let mut levels: Vec<BTreeMap<u32, (Cost, u8)>> = vec![BTreeMap::new(); m];
+        let mut levels: Vec<BTreeMap<Mask, (Cost, u8)>> = vec![BTreeMap::new(); m];
         for t in 0..self.n {
-            if seeds & univ & (1 << t) == 0 {
+            if seeds & univ & (bit(t)) == 0 {
                 continue;
             }
-            levels[0].insert(1u32 << t, (self.step(prefix, t, base), t as u8));
+            levels[0].insert(bit(t), (self.step(prefix, t, base), t as u8));
         }
         for k in 0..m - 1 {
             if levels[k].len() > MAX_STATES {
@@ -444,11 +468,11 @@ impl<'a> Problem<'a> {
                     cand = univ & !mask;
                 }
                 for t in 0..self.n {
-                    if cand & (1 << t) == 0 {
+                    if cand & (bit(t)) == 0 {
                         continue;
                     }
                     let nc = cost.add(self.step(placed, t, base + k + 1));
-                    let nm = mask | (1 << t);
+                    let nm = mask | (bit(t));
                     match levels[k + 1].get(&nm) {
                         // Strictly-better only: on a tie the first insertion
                         // wins, and insertions run in ascending (mask, t)
@@ -468,7 +492,7 @@ impl<'a> Problem<'a> {
         for k in (0..m).rev() {
             let &(_, last) = levels[k].get(&mask)?;
             order[k] = last as usize;
-            mask &= !(1u32 << last);
+            mask &= !bit(last as usize);
         }
         Some(order)
     }
@@ -490,11 +514,11 @@ impl<'a> Problem<'a> {
     /// transferring — a left-deep order has a START but no END, so extremal
     /// sampling here degenerates to *seed selection plus hub identification*
     /// rather than bracketing a route.
-    fn extremes(&self, prefix: u32, univ: u32) -> u32 {
-        let mut m = 0u32;
+    fn extremes(&self, prefix: Mask, univ: Mask) -> Mask {
+        let mut m = 0 as Mask;
         for t in 0..self.n {
-            if univ & (1 << t) != 0 && self.known(prefix, t) {
-                m |= 1 << t;
+            if univ & (bit(t)) != 0 && self.known(prefix, t) {
+                m |= bit(t);
             }
         }
         // The size extremes read whatever magnitudes have been BOUGHT so far
@@ -506,7 +530,7 @@ impl<'a> Problem<'a> {
         let by = |f: &dyn Fn(usize) -> u32, max: bool| -> Option<usize> {
             let mut best: Option<usize> = None;
             for t in 0..self.n {
-                if univ & (1 << t) == 0 {
+                if univ & (bit(t)) == 0 {
                     continue;
                 }
                 match best {
@@ -517,13 +541,13 @@ impl<'a> Problem<'a> {
             best
         };
         if let Some(t) = by(&|t| self.bucket(t), false) {
-            m |= 1 << t;
+            m |= bit(t);
         }
         if let Some(t) = by(&|t| self.bucket(t), true) {
-            m |= 1 << t;
+            m |= bit(t);
         }
         if let Some(t) = by(&|t| self.nodes[t].adj.count_ones(), true) {
-            m |= 1 << t;
+            m |= bit(t);
         }
         m
     }
@@ -538,7 +562,7 @@ impl<'a> Problem<'a> {
     /// converges this degenerates to the extremal-seeded greedy — still a
     /// *valid* plan, since ordering an INNER chain never changes the answer,
     /// only possibly a non-optimal one.
-    fn search(&self, prefix: u32, univ: u32, base: usize) -> Vec<usize> {
+    fn search(&self, prefix: Mask, univ: Mask, base: usize) -> Vec<usize> {
         let m = univ.count_ones() as usize;
         if m <= DP_FULL_MAX {
             // Small enough to be exhaustive: extremal sampling would only be a
@@ -567,7 +591,7 @@ impl<'a> Problem<'a> {
             }
         }
         for t in 0..self.n {
-            if ex & (1 << t) != 0 {
+            if ex & (bit(t)) != 0 {
                 consider(self.greedy_from(prefix, univ, base, t), &mut best);
             }
         }
@@ -581,9 +605,9 @@ impl<'a> Problem<'a> {
     /// taking the cheapest frontier candidate under the SAME scoring function.
     /// O(n^2), fully deterministic, and the guaranteed floor when every DP
     /// round blew the state cap.
-    fn greedy_from(&self, prefix: u32, univ: u32, base: usize, seed: usize) -> Vec<usize> {
+    fn greedy_from(&self, prefix: Mask, univ: Mask, base: usize, seed: usize) -> Vec<usize> {
         let m = univ.count_ones() as usize;
-        let mut placed = prefix | (1u32 << seed);
+        let mut placed = prefix | (bit(seed));
         let mut order = vec![seed];
         for i in 1..m {
             let mut cand = self.frontier(placed) & univ;
@@ -592,7 +616,7 @@ impl<'a> Problem<'a> {
             }
             let mut best: Option<(Cost, usize)> = None;
             for t in 0..self.n {
-                if cand & (1 << t) == 0 {
+                if cand & (bit(t)) == 0 {
                     continue;
                 }
                 let c = self.step(placed, t, base + i);
@@ -605,11 +629,11 @@ impl<'a> Problem<'a> {
             // panics a query: bail to whatever order has been built plus the
             // rest in textual order.
             let Some((_, t)) = best else {
-                order.extend((0..self.n).filter(|t| univ & (1 << t) != 0 && placed & (1 << t) == 0));
+                order.extend((0..self.n).filter(|&t| univ & bit(t) != 0 && placed & bit(t) == 0));
                 return order;
             };
             order.push(t);
-            placed |= 1 << t;
+            placed |= bit(t);
         }
         order
     }
@@ -626,29 +650,29 @@ impl<'a> Problem<'a> {
     /// segments do not interact and solving them left to right is exact.
     fn solve_chain(&self) -> Vec<usize> {
         let mut order: Vec<usize> = Vec::with_capacity(self.n);
-        let mut placed = 0u32;
+        let mut placed = 0 as Mask;
         let mut p = 0usize;
         while p < self.n {
             if self.nodes[p].barrier {
                 order.push(p);
-                placed |= 1 << p;
+                placed |= bit(p);
                 p += 1;
                 continue;
             }
-            let mut univ = 0u32;
+            let mut univ = 0 as Mask;
             let base = p;
             while p < self.n && !self.nodes[p].barrier {
-                univ |= 1 << p;
+                univ |= bit(p);
                 p += 1;
             }
             if univ.count_ones() == 1 {
                 order.push(base);
-                placed |= 1 << base;
+                placed |= bit(base);
                 continue;
             }
             for t in self.search(placed, univ, base) {
                 order.push(t);
-                placed |= 1 << t;
+                placed |= bit(t);
             }
         }
         order
@@ -699,13 +723,13 @@ impl<'a> Problem<'a> {
     /// The tables whose magnitude this order's cost depends on and that have
     /// not been paid for yet.
     fn owed(&self, order: &[usize]) -> Vec<usize> {
-        let mut placed = 0u32;
+        let mut placed = 0 as Mask;
         let mut owed = Vec::new();
         for &t in order {
             if !self.known(placed, t) && self.nodes[t].bucket.get().is_none() {
                 owed.push(t);
             }
-            placed |= 1 << t;
+            placed |= bit(t);
         }
         owed
     }
@@ -932,8 +956,8 @@ pub(super) fn reorder<'s>(
         let s = slot as usize;
         (0..n).find(|&i| s >= base[i] && s < base[i + 1])
     };
-    let mask_of = |e: &BExpr| -> Option<u32> {
-        let mut m = 0u32;
+    let mask_of = |e: &BExpr| -> Option<Mask> {
+        let mut m = 0 as Mask;
         for c in cols_of(e) {
             m |= 1 << table_of(c)?;
         }
@@ -963,7 +987,7 @@ pub(super) fn reorder<'s>(
     // is a LEFT join's inner side filters the already-NULL-extended row and
     // stays in `joined_filter` (#65's rule, `planner/join.rs`), so it restricts
     // no step and must not be priced as if it did.
-    let lands_on_barrier = |m: u32| -> bool {
+    let lands_on_barrier = |m: Mask| -> bool {
         let last = (0..n).filter(|&t| m & (1 << t) != 0).max_by_key(|&t| seg[t]);
         last.is_some_and(|t| barrier[t])
     };
@@ -1002,7 +1026,7 @@ pub(super) fn reorder<'s>(
         //     crediting the preserved side with it would be a false constraint.
         //   - a moved conjunct landing after a barrier: nothing at all.
         //   - otherwise: every table it mentions, as v1 did.
-        let constrains: u32 = match owner {
+        let constrains: Mask = match owner {
             Some(k) => m & (1 << k),
             None if lands_on_barrier(m) => 0,
             None => m,

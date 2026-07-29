@@ -8,7 +8,9 @@
 //! `select_core` and `eat_all_quantifier` are `pub(super)` so the statement
 //! dispatch, the DML grammar and the expression grammar can reach them.
 
-use super::{ParamStyle, Parser, MAX_COMPOUND_ARMS, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS};
+use super::{
+    ParamStyle, Parser, MAX_COMPOUND_ARMS, MAX_FROM_TABLES, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS,
+};
 use crate::ast::{CompoundStmt, Expr, JoinClause, JoinKind, SelectStmt, Stmt};
 use crate::plan::{LimitVal, SetOp, SortDir};
 use crate::token::{Kw, Tok};
@@ -397,6 +399,20 @@ impl<'a> Parser<'a> {
             }
             if from_parens > 0 {
                 return Err(self.err_here("unclosed `(` in FROM"));
+            }
+            // sqlite's own ceiling, MEASURED at 3.45.1: a 65th table is
+            // "Parse error … at most 64 tables in a join". Refusing here rather
+            // than downstream is what makes the wide case SAFE — the join
+            // solver's mask is 64 wide, and above it the solver used to decline
+            // and leave the chain in TEXTUAL order. On the permuted chains this
+            // corpus is built from, that order is a cartesian product: measured
+            // at 65 tables, 1.3 GB materialized in 1.7 s and climbing, held back
+            // only by an rlimit. There is no plan worth making here, and sqlite
+            // agrees — so say so, by name, before anything is planned.
+            if joins.len() >= MAX_FROM_TABLES {
+                return Err(self.err_here(format!(
+                    "at most {MAX_FROM_TABLES} tables in a join"
+                )));
             }
             (table, from_derived, from_alias, joins)
         } else {

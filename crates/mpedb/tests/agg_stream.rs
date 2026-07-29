@@ -345,7 +345,10 @@ fn c_invariance() {
 fn budget_does_not_change_answers() {
     let dir = mpedb_testkit::scratch_base_str();
     let mut baseline: Option<Vec<Vec<Vec<Value>>>> = None;
-    for (i, cells) in [0u64, 512, 4096, 268_435_456].into_iter().enumerate() {
+    for (i, cells) in [0u64, 512, 4096, mpedb_types::config::DEFAULT_MAX_JOIN_CELLS]
+        .into_iter()
+        .enumerate()
+    {
         let path = format!(
             "{dir}/mpedb-agg-budget-{}-{}-{i}.mpedb",
             std::process::id(),

@@ -49,8 +49,15 @@ pub(crate) use explain::render_program;
 ///    corrupt rather than as "written by a newer mpedb". The bump makes it say
 ///    the true thing.
 /// Self-imposed ceiling on joins in one SELECT, so a corrupt plan cannot make the
-/// decoder allocate unboundedly. Far above any hand-written query.
-const MAX_JOINS: usize = 16;
+/// decoder allocate unboundedly.
+///
+/// 63 joins = 64 tables: the solver's `MAX_SOLVE` and the same width sqlite
+/// itself allows. It was 16, which no hand-written query was supposed to reach —
+/// but `select5.test` reaches 64, and the corpus only never saw the refusal
+/// because it runs on `query_once`, which never encodes. Through the C-API
+/// (prepare → registry → decode) the very same statement came back "corrupt".
+/// One number for both paths, so the answer cannot depend on which one asked.
+const MAX_JOINS: usize = 63;
 
 // 8: Join grew a kind byte (INNER/LEFT, with RIGHT/FULL tags reserved),
 //    KeyPart grew OuterCol (index nested-loop parametrization), and
