@@ -360,7 +360,28 @@ S6 — 2000-linjersregelen + Wine/Windows (#197). Hører ETTER commiten.
   restvakt. Etter commiten, som eget steg.
 
 
-7. FALLGRUVER
+7. KJENT FLAKY TEST (IKKE EN REGRESJON — MÅLT)
+----------------------------------------------
+
+  crates/mpedb/tests/rretl_map.rs
+    the_daemon_advances_both_tables_together_and_resumes
+
+  Feiler sporadisk på LINUX under full parallell `cargo test --workspace`:
+  gjenopptakelsen lager hele settet (8 rader) i stedet for chunken (2), altså
+  som om markøren ikke ble gjenopptatt. Passerer isolert, per fil, og på M3.
+
+  ATTRIBUERT VED MÅLING, ikke antatt: den feiler på BASE-commiten 568bb97 også
+  — 1 av 3 kjøringer, uten en eneste av S3/#101/S5-endringene i treet. Den lå
+  der fra før.
+
+  En felle på veien dit: /dev/shm er 3,8 GB tmpfs og var 93 % full av 345
+  etterlatte testdatabaser. Det ga «StorageFull» i columnar_extent_leak OG
+  gjorde denne feilen hyppigere. Rydd før tunge kjøringer:
+      find /dev/shm -maxdepth 1 -type f -delete
+  Per-commit-porten gjør det nå selv.
+
+
+8. FALLGRUVER
 -------------
 
   * IKKE `sleep` i forgrunnen for å polle en jobb — bruk run_in_background,
@@ -380,7 +401,7 @@ S6 — 2000-linjersregelen + Wine/Windows (#197). Hører ETTER commiten.
     flates til én linje før den mates inn.
 
 
-8. UFRAVIKELIG
+9. UFRAVIKELIG
 --------------
 
   * 0 gale svar er porten, ikke passraten.
