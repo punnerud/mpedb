@@ -52,6 +52,8 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
                 p.parse_drop_view()?
             } else if p.eat_word("TRIGGER") {
                 p.parse_drop_trigger()?
+            } else if p.eat_word("INDEX") {
+                p.parse_drop_index()?
             } else {
                 p.parse_drop_policy()?
             }
@@ -835,6 +837,20 @@ impl<'a> Parser<'a> {
             self.advance();
         }
         Ok(DdlStmt::CreateView { name, select_sql, if_not_exists })
+    }
+
+    /// `DROP INDEX [IF EXISTS] <name>`. sqlite also accepts a
+    /// `<schema>.<name>` form; a qualified name would need ATTACH-aware
+    /// resolution and is left to parse as the bare identifier it is.
+    fn parse_drop_index(&mut self) -> Result<DdlStmt> {
+        let if_exists = if self.eat_word("IF") {
+            self.expect_word("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident("index name")?;
+        Ok(DdlStmt::DropIndex { name, if_exists })
     }
 
     fn parse_drop_view(&mut self) -> Result<DdlStmt> {

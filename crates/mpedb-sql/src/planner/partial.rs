@@ -230,6 +230,7 @@ mod tests {
             columns: vec![1],
             unique: false,
             predicate: pred.map(|s| s.to_string()),
+            name: None,
         }
     }
 

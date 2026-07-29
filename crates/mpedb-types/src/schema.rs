@@ -254,6 +254,20 @@ pub struct IndexDef {
     /// parameterized predicates are refused until P6 (`AccessPath::Guarded`).
     /// On the wire since canonical-bytes **v10**.
     pub predicate: Option<String>,
+    /// The name the index was created with (`CREATE INDEX <name> ON …`), or
+    /// `None` for one derived from a column flag (`unique = true` /
+    /// `indexed = true` in the config), which never had a name to keep.
+    ///
+    /// mpedb indexes are POSITIONAL — `index_no` is the position in
+    /// `TableDef::indexes` plus one, and that is what plans and B-trees key on.
+    /// The name is carried alongside purely so a user can NAME one:
+    /// `DROP INDEX <name>` and `REINDEX <name>` are unanswerable without it,
+    /// and both were corpus failures for exactly that reason (`DROP INDEX`
+    /// did not parse at all; `REINDEX <typo>` was accepted where sqlite
+    /// errors, because nothing could tell a real index name from a typo).
+    ///
+    /// On the wire since canonical-bytes **v11**.
+    pub name: Option<String>,
 }
 
 /// Distinguishes an ordinary table from a full-text-search virtual table
@@ -696,6 +710,8 @@ fn normalize_and_derive(t: &mut TableDef) {
             columns: vec![i as u16],
             unique: c.unique,
             predicate: None,
+            // Derived from a column flag: there never was a name to keep.
+            name: None,
         })
         .collect();
     for e in explicit {
@@ -802,6 +818,59 @@ impl Schema {
         let schema = Schema { tables };
         schema.validate()?;
         Ok(schema)
+    }
+
+    /// Evolve this schema by REMOVING the index at `pos` in `table_id`'s index
+    /// list (`DROP INDEX`).
+    ///
+    /// The entry is removed, not tombstoned, because `index_no = position + 1`
+    /// is the contract every plan and B-tree key on — so the engine renumbers
+    /// the catalog tree-roots above `pos` to match, in the same transaction.
+    /// A tombstone would keep a dead tree alive forever and still cost the
+    /// numbering, which is the worst of both.
+    ///
+    /// A FLAG-DERIVED index (one with no name, from `unique`/`indexed` in the
+    /// config) is refused here rather than silently dropped: its existence is
+    /// declared by the config, so removing it would put the live schema at odds
+    /// with the file's own declaration on the next attach.
+    pub fn with_dropped_index(&self, table_id: u32, pos: usize) -> Result<Schema> {
+        let mut tables = self.tables.clone();
+        let slot = tables
+            .get_mut(table_id as usize)
+            .filter(|t| t.id == table_id && !t.dead)
+            .ok_or_else(|| Error::Schema(format!("no live table with id {table_id}")))?;
+        let ix = slot.indexes.get(pos).ok_or_else(|| {
+            Error::Schema(format!(
+                "table `{}` has no index at position {pos}",
+                slot.name
+            ))
+        })?;
+        if ix.name.is_none() {
+            return Err(Error::Schema(format!(
+                "the index on `{}` was derived from a column flag and has no name — \
+                 drop it by editing the declaration, not with DROP INDEX",
+                slot.name
+            )));
+        }
+        slot.indexes.remove(pos);
+        let schema = Schema { tables };
+        schema.validate()?;
+        Ok(schema)
+    }
+
+    /// Find an index by NAME anywhere in the schema, as `(table_id, position)`.
+    /// Index names are compared case-insensitively, like every other SQL
+    /// identifier here.
+    pub fn find_index_by_name(&self, name: &str) -> Option<(u32, usize)> {
+        let want = name.to_ascii_lowercase();
+        for t in self.tables.iter().filter(|t| !t.dead) {
+            for (i, ix) in t.indexes.iter().enumerate() {
+                if ix.name.as_deref().map(|n| n.to_ascii_lowercase()) == Some(want.clone()) {
+                    return Some((t.id, i));
+                }
+            }
+        }
+        None
     }
 
     /// Evolve this schema by RENAMING a table (#47 stage 5). Pure metadata: the
@@ -1361,7 +1430,7 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(10u8); // schema encoding version (v10: IndexDef.predicate)
+        buf.push(11u8); // schema encoding version (v11: IndexDef.name)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -1450,6 +1519,15 @@ impl Schema {
                         write_str(&mut buf, src);
                     }
                 }
+                // Index name (v11). Absent (0) for a flag-derived index, so a
+                // config-only schema grows by one zero byte per index.
+                match &ix.name {
+                    None => buf.push(0),
+                    Some(n) => {
+                        buf.push(1);
+                        write_str(&mut buf, n);
+                    }
+                }
             }
         }
         buf
@@ -1464,15 +1542,16 @@ impl Schema {
         let mut pos = 0usize;
         let version = *buf.get(pos).ok_or_else(err)?;
         pos += 1;
-        // v9 = generated columns; v10 = IndexDef.predicate. Older versions
-        // refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if version != 9 && version != 10 {
+        // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name.
+        // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
+        if !(9..=11).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
             )));
         }
         let has_index_predicate = version >= 10;
+        let has_index_name = version >= 11;
         let ntables = read_u32(buf, &mut pos)? as usize;
         if ntables > MAX_TABLES {
             return Err(Error::Corrupt("table count out of range".into()));
@@ -1644,10 +1723,26 @@ impl Schema {
                 } else {
                     None
                 };
+                let name = if has_index_name {
+                    match *buf.get(pos).ok_or_else(err)? {
+                        0 => {
+                            pos += 1;
+                            None
+                        }
+                        1 => {
+                            pos += 1;
+                            Some(read_str(buf, &mut pos)?)
+                        }
+                        _ => return Err(Error::Corrupt("bad index name tag".into())),
+                    }
+                } else {
+                    None
+                };
                 indexes.push(IndexDef {
                     columns: cols,
                     unique,
                     predicate,
+                    name,
                 });
             }
             // Reconstruct the in-memory convenience flags from the index
@@ -1907,7 +2002,7 @@ mod tests {
                     unique: false, indexed: true, default: None, check: None, collation: Collation::Binary },
             ],
             primary_key: vec![0],
-            indexes: vec![IndexDef { columns: vec![1, 2], unique: false, predicate: None }],
+            indexes: vec![IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None }],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
         };
         // The single-PK column's flags are noise and must normalize away.
@@ -1919,9 +2014,9 @@ mod tests {
         assert_eq!(
             t.indexes,
             vec![
-                IndexDef { columns: vec![1], unique: true, predicate: None },
-                IndexDef { columns: vec![2], unique: false, predicate: None },
-                IndexDef { columns: vec![1, 2], unique: false, predicate: None },
+                IndexDef { columns: vec![1], unique: true, predicate: None, name: None },
+                IndexDef { columns: vec![2], unique: false, predicate: None, name: None },
+                IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None },
             ]
         );
         assert!(!t.columns[0].unique && !t.columns[0].indexed);
@@ -1949,7 +2044,7 @@ mod tests {
                 col("w", ColumnType::Int64),
             ],
             primary_key: vec![0],
-            indexes: vec![IndexDef { columns: vec![2], unique: false, predicate: None }],
+            indexes: vec![IndexDef { columns: vec![2], unique: false, predicate: None, name: None }],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
         }])
         .unwrap();
@@ -1959,19 +2054,19 @@ mod tests {
         // sqlite's, and the planner — not the schema — is what keeps it from
         // ever being probed.
         let mut ok = base.clone();
-        ok.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false, predicate: None }];
+        ok.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false, predicate: None, name: None }];
         Schema::from_canonical_bytes(&ok.canonical_bytes()).unwrap();
 
         // Duplicate index shapes refuse.
         let mut evil = base.clone();
         evil.tables[0]
             .indexes
-            .push(IndexDef { columns: vec![2], unique: false, predicate: None });
+            .push(IndexDef { columns: vec![2], unique: false, predicate: None, name: None });
         assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
 
         // An index equal to the whole single-column PK duplicates index 0.
         let mut evil = base.clone();
-        evil.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true, predicate: None }];
+        evil.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true, predicate: None, name: None }];
         assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
 
         // v1 bytes (version byte 1) refuse by name — no migration exists.
@@ -2088,7 +2183,7 @@ mod tests {
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
         // The version byte is 9.
-        assert_eq!(s.canonical_bytes()[0], 10);
+        assert_eq!(s.canonical_bytes()[0], 11);
         // A v8 file refuses cleanly (no misread of the new generated bytes).
         let mut v8 = s.canonical_bytes();
         v8[0] = 8;
@@ -2216,7 +2311,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 10);
+        assert_eq!(s.canonical_bytes()[0], 11);
 
         // Truncation at every offset is Corrupt, never a panic.
         let bytes = s.canonical_bytes();
@@ -2274,7 +2369,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 10);
+        assert_eq!(s.canonical_bytes()[0], 11);
         // The text is part of the schema identity: `f float` and `f REAL` are
         // the same storage and DIFFERENT schemas, because a consumer keying
         // converters off the decltype sees two different columns.
@@ -2333,7 +2428,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 10);
+        assert_eq!(s.canonical_bytes()[0], 11);
 
         // The collation changes the hash: a BINARY `name` is a different schema.
         let mut plain = s.clone();
@@ -2486,7 +2581,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "the compiled program survives byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 10);
+        assert_eq!(s.canonical_bytes()[0], 11);
 
         // It computes, in declaration order, through the decoded schema.
         let mut row = vec![Value::Int(21), Value::Null];

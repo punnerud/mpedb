@@ -739,7 +739,14 @@ fn raw_to_config(
                                 })
                         })
                         .collect::<Result<Vec<u16>>>()?;
-                    Ok(crate::schema::IndexDef { columns: cols, unique: ix.unique, predicate: None })
+                    // A config `[[table.index]]` entry has no name — naming an index is a
+                    // `CREATE INDEX` thing, and the config declares shape, not identity.
+                    Ok(crate::schema::IndexDef {
+                        columns: cols,
+                        unique: ix.unique,
+                        predicate: None,
+                        name: None,
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?;
             tables.push(TableDef {

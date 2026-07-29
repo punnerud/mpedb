@@ -98,6 +98,30 @@ impl Database {
     }
 
     /// `DROP VIEW [IF EXISTS] <name>`.
+    /// `DROP INDEX [IF EXISTS] <name>` — resolved by the index's stored name
+    /// (canonical-bytes v11), which is the only handle a user has: mpedb
+    /// indexes are POSITIONAL, so before names were persisted this statement
+    /// could not even be parsed.
+    pub(crate) fn apply_drop_index(&self, name: &str, if_exists: bool) -> Result<ExecResult> {
+        self.engine.refresh_schema_if_stale()?;
+        let found = self.engine.schema().schema.find_index_by_name(name);
+        let Some((table_id, pos)) = found else {
+            if if_exists {
+                return Ok(ExecResult::Affected(0));
+            }
+            return Err(Error::Bind(format!("DROP INDEX: no such index `{name}`")));
+        };
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
+        match w.drop_index(table_id, pos) {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        Ok(ExecResult::Affected(0))
+    }
+
     pub(crate) fn apply_drop_view(&self, name: &str, if_exists: bool) -> Result<ExecResult> {
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         let found = resolve_view_key(&mut w, name)?;
@@ -383,6 +407,10 @@ pub(crate) fn table_def_from_spec(
                     .collect::<Result<Vec<u16>>>()?,
                 unique: true,
                 predicate: None,
+                // An inline/table UNIQUE constraint. sqlite gives these an
+                // auto name (`sqlite_autoindex_…`) that DROP INDEX refuses to
+                // touch, so carrying none is the same reachable surface.
+                name: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -815,6 +843,7 @@ impl Database {
         columns: &[String],
         unique: bool,
         predicate: Option<String>,
+        name: Option<String>,
     ) -> Result<ExecResult> {
         self.engine.refresh_schema_if_stale()?;
         let bundle = self.engine.schema();
@@ -831,7 +860,7 @@ impl Database {
             return Ok(ExecResult::Affected(0));
         }
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        match w.create_index(id, cols, unique, predicate) {
+        match w.create_index(id, cols, unique, predicate, name) {
             Ok(()) => w.commit()?,
             Err(e) => {
                 w.abort();
@@ -875,13 +904,18 @@ impl Database {
                 return self.apply_alter_drop_column(&table, &column);
             }
             DdlStmt::CreateIndex {
+                name,
                 table,
                 columns,
                 unique,
                 where_clause,
                 ..
             } => {
-                return self.apply_create_index(&table, &columns, unique, where_clause);
+                return self
+                    .apply_create_index(&table, &columns, unique, where_clause, Some(name));
+            }
+            DdlStmt::DropIndex { name, if_exists } => {
+                return self.apply_drop_index(&name, if_exists);
             }
             DdlStmt::CreateView { name, select_sql, if_not_exists } => {
                 return self.apply_create_view(&name, &select_sql, if_not_exists);
@@ -917,12 +951,35 @@ impl Database {
             DdlStmt::DropTrigger { name, if_exists } => {
                 return self.apply_drop_trigger(&name, if_exists);
             }
-            // `ANALYZE`/`REINDEX` are accepted no-ops. The planner is rule-based
-            // (no statistics for ANALYZE to gather) and indexes are maintained
-            // eagerly on every write (nothing for REINDEX to rebuild), so both
-            // succeed touching nothing — matching sqlite's "it works" so tools
-            // and migrations that emit them do not break.
-            DdlStmt::Analyze { name: _ } | DdlStmt::Reindex { target: _ } => {}
+            // `ANALYZE` is an accepted no-op: the planner is rule-based, so
+            // there are no statistics to gather.
+            DdlStmt::Analyze { name: _ } => {}
+            // `REINDEX` is a no-op too — indexes are maintained eagerly on
+            // every write, so there is nothing to rebuild — but a NAMED target
+            // must still EXIST. sqlite errors on a name that is neither a
+            // table, an index, nor a collation, and accepting it was a real
+            // divergence: it was the corpus's only error mismatch
+            // (`evidence/slt_lang_reindex.test:40  REINDEX tXiX`), and it hid
+            // behind a "zero error mismatches" headline because a lenient
+            // no-op looks exactly like success.
+            DdlStmt::Reindex { target } => {
+                if let Some(name) = &target {
+                    let bundle = self.engine.schema();
+                    let known_collation = matches!(
+                        name.to_ascii_uppercase().as_str(),
+                        "BINARY" | "NOCASE" | "RTRIM"
+                    );
+                    let exists = known_collation
+                        || bundle.schema.table_id(name).is_some()
+                        || bundle.schema.find_index_by_name(name).is_some();
+                    if !exists {
+                        return Err(Error::Bind(format!(
+                            "unable to identify the object to be reindexed: `{name}` is \
+                             neither a table, an index, nor a collation"
+                        )));
+                    }
+                }
+            }
             DdlStmt::DropPolicy { table, name } => {
                 self.drop_policy(&table, &name)?;
             }

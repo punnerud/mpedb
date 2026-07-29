@@ -7,11 +7,11 @@ evidence/in2.test	54	53	0	0	0	1	0
 evidence/slt_lang_aggfunc.test	5	5	0	0	0	0	0
 evidence/slt_lang_createtrigger.test	26	26	0	0	0	0	0
 evidence/slt_lang_createview.test	25	15	0	0	0	10	0
-evidence/slt_lang_dropindex.test	8	7	1	0	0	0	0
+evidence/slt_lang_dropindex.test	8	8	0	0	0	0	0
 evidence/slt_lang_droptable.test	12	12	0	0	0	0	0
 evidence/slt_lang_droptrigger.test	12	12	0	0	0	0	0
 evidence/slt_lang_dropview.test	13	13	0	0	0	0	0
-evidence/slt_lang_reindex.test	7	6	0	0	1	0	0
+evidence/slt_lang_reindex.test	7	7	0	0	0	0	0
 evidence/slt_lang_replace.test	14	14	0	0	0	0	0
 evidence/slt_lang_update.test	27	27	0	0	0	0	0
 index/between/1/slt_good_0.test	10022	10022	0	0	0	0	0

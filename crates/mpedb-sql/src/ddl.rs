@@ -205,6 +205,11 @@ pub enum DdlStmt {
         /// whole-table index (P1 / DESIGN-WORKLOAD-INDEXES).
         where_clause: Option<String>,
     },
+    /// `DROP INDEX [IF EXISTS] <name>`. Resolved by the index's stored NAME
+    /// (canonical-bytes v11) — mpedb indexes are positional, so without a name
+    /// there is nothing for the user to point at. A flag-derived index has no
+    /// name and is refused by name rather than matched by shape.
+    DropIndex { name: String, if_exists: bool },
     /// `CREATE VIEW [IF NOT EXISTS] <name> AS <select>` (#73). The SELECT is
     /// captured as source text and re-parsed + flattened into referencing
     /// queries (design/DESIGN-VIEW.md). Applied by the facade as a catalog mutation.

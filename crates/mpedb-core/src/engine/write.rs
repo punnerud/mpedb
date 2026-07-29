@@ -2002,6 +2002,66 @@ impl<'e> WriteTxn<'e> {
         self.publish_schema(&new_schema)
     }
 
+    /// DROP INDEX: free the index's tree and remove it from the schema.
+    ///
+    /// `pos` is the position in `TableDef::indexes`; its tree is `index_no =
+    /// pos + 1` (index 0 is the PK tree). Because `index_no` IS the position,
+    /// every index above the dropped one must move down by one — catalog
+    /// tree-root entry and in-memory cache together, in this transaction. Doing
+    /// it any other way leaves a plan pointing at the wrong B-tree, which is a
+    /// wrong ANSWER rather than an error.
+    ///
+    /// Ordering mirrors `drop_table`: validate via the schema first (so an
+    /// illegal drop bails before a page is freed), then free, then relink, then
+    /// publish.
+    pub fn drop_index(&mut self, table_id: u32, pos: usize) -> Result<()> {
+        let bundle = Arc::clone(&self.bundle);
+        let new_schema = bundle.schema.with_dropped_index(table_id, pos)?;
+        let live = bundle
+            .schema
+            .table(table_id)
+            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
+        let n_idx = live.indexes.len() as u32;
+        let dropped_ino = pos as u32 + 1;
+
+        // 1. Free the dropped tree's pages.
+        let mut pages: BTreeSet<u64> = BTreeSet::new();
+        let (root, _count) = self.tree_root(table_id, dropped_ino)?;
+        if root != 0 {
+            btree::collect_pages(self, root, &mut pages)?;
+        }
+        if pages.len() as u64 > MAX_DROP_PAGES {
+            return Err(Error::Unsupported(format!(
+                "index {dropped_ino} of table {table_id} spans {} pages; DROP is bounded \
+                 to {MAX_DROP_PAGES} per commit",
+                pages.len()
+            )));
+        }
+        for p in pages {
+            PageStore::free(self, p)?;
+        }
+
+        // 2. Unlink the dropped entry, then SHIFT every higher index down one.
+        //    Read the whole tail first: deleting and re-inserting as we go would
+        //    have each step read a key the previous step just moved.
+        let mut tail: Vec<(u32, (u64, u64))> = Vec::new();
+        for ino in (dropped_ino + 1)..=n_idx {
+            tail.push((ino, self.tree_root(table_id, ino)?));
+        }
+        for ino in dropped_ino..=n_idx {
+            let root = self.catalog_root;
+            let out = btree::delete(self, root, &cat_tree_key(table_id, ino))?;
+            self.catalog_root = out.new_root;
+            self.table_roots.remove(&(table_id, ino));
+        }
+        for (ino, (root, count)) in tail {
+            self.set_tree_root(table_id, ino - 1, root, count);
+        }
+
+        // 3. Publish.
+        self.publish_schema(&new_schema)
+    }
+
     /// CREATE INDEX: add a secondary index and BUILD its tree over the existing
     /// rows. Scans the PK tree once, computes each row's index key (skipping
     /// rows with any NULL indexed column — SQL membership), and inserts
@@ -2014,6 +2074,9 @@ impl<'e> WriteTxn<'e> {
         columns: Vec<u16>,
         unique: bool,
         predicate: Option<String>,
+        // `name`: what the user wrote. Carried so `DROP INDEX`/`REINDEX` can
+        // name one; the index itself is still identified POSITIONALLY.
+        name: Option<String>,
     ) -> Result<()> {
         let bundle = Arc::clone(&self.bundle);
         // A UNIQUE partial index needs membership evaluation on every write
@@ -2034,6 +2097,7 @@ impl<'e> WriteTxn<'e> {
                 columns: columns.clone(),
                 unique,
                 predicate,
+                name,
             },
         )?;
         let (tname, new_ino, idx_coll) = {

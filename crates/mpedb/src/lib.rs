@@ -3882,6 +3882,7 @@ impl WriteSession<'_> {
                 self.txn.alter_drop_column(id, &column)?;
             }
             DdlStmt::CreateIndex {
+                name,
                 table,
                 columns,
                 unique,
@@ -3901,7 +3902,7 @@ impl WriteSession<'_> {
                     return Ok(ExecResult::Affected(0));
                 }
                 self.txn
-                    .create_index(id, cols, unique, where_clause)?;
+                    .create_index(id, cols, unique, where_clause, Some(name))?;
             }
             // VIEW / TRIGGER ride this session's txn (sys-keyspace + schema_gen
             // bump) so CPython's implicit transaction + iterdump can CREATE them
@@ -3913,6 +3914,19 @@ impl WriteSession<'_> {
                 if_not_exists,
             } => {
                 self.create_view_in_txn(&name, &select_sql, if_not_exists)?;
+            }
+            // DROP INDEX frees a B-tree and renumbers the catalog roots above
+            // it — engine work that the in-session DDL path does not carry, so
+            // it takes the out-of-txn catalog path like CREATE INDEX above it.
+            DdlStmt::DropIndex { name, if_exists } => {
+                let found = self.txn.schema_bundle().schema.find_index_by_name(&name);
+                match found {
+                    Some((table_id, pos)) => self.txn.drop_index(table_id, pos)?,
+                    None if if_exists => {}
+                    None => {
+                        return Err(Error::Bind(format!("DROP INDEX: no such index `{name}`")))
+                    }
+                }
             }
             DdlStmt::DropView { name, if_exists } => {
                 self.drop_view_in_txn(&name, if_exists)?;

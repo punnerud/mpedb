@@ -194,6 +194,7 @@ pub fn ddl_access(ddl: &DdlStmt) -> AccessReport {
         DdlStmt::CreateIndex { name, table, .. } => {
             vec![create(K::Index, name, Some(table))]
         }
+        DdlStmt::DropIndex { name, .. } => vec![drop(K::Index, name, None)],
         DdlStmt::CreateView { name, .. } => vec![create(K::View, name, None)],
         DdlStmt::DropView { name, .. } => vec![drop(K::View, name, None)],
         DdlStmt::CreateTrigger(s) => vec![create(K::Trigger, &s.name, Some(&s.table))],
