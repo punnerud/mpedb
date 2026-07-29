@@ -22,6 +22,31 @@ blocker.
 
 ---
 
+## 0. The corpus: two records, and what they cost to close
+
+Measured 2026-07-29: **5 938 276 of 5 938 278 (99,9999663 %), 0 wrong answers,
+0 error mismatches.** Both remaining records are in
+`random/groupby/slt_good_12.test`, both are the bare-column rule under two or
+more `min()`/`max()`, and BOTH return an EMPTY result set anyway (`WHERE 37 IS
+NULL` in one, a `HAVING` that can never be true in the other) — mpedb refuses at
+COMPILE time a query whose answer is not in doubt.
+
+* **`:47732`** — `max(DISTINCT -95)` … `min(col0)`. The tempting fix is to
+  discount a min/max over a non-NULL CONSTANT from the count: it improves only
+  on the group's first row, so "surely" it can never be the aggregate the
+  witness follows. **Tried and REFUTED by the differential oracle in one
+  query** (`tests/group_by_dialect.rs`): on a group whose column is all NULL the
+  real min/max never improves either, and sqlite then ends on the group's LAST
+  row — not the constant's first row, not any extremum. The refusal is correct.
+  Closing this needs sqlite's actual witness rule for ≥2, probed rather than
+  reasoned.
+
+* **`:61639`** — `MAX(-col0)` inside `COALESCE(+54, …)`, a DEAD arm constant
+  folding removes. mpedb lifts aggregates BEFORE folding, and deliberately
+  over-collects so the grouped-tuple slot positions the projection was bound
+  against stay put. Closing it means either folding before the lift or teaching
+  the lift the same pruning rule — a structural change, for one record.
+
 ## 1. Ecosystem parity (P7 residual)
 
 **Re-measured 2026-07-29 on the Linux runner, and the count that matters is now

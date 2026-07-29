@@ -449,7 +449,16 @@ fn sqlite_mode_two_minmax_with_const_last_follows_lowest_rowid() {
     let _ = std::fs::remove_file(path2);
     // Still refused — each of these breaks the "provably lowest-rowid" proof:
     for q in [
-        // The const min/max is NOT last: sqlite follows min(x)'s extremum row.
+        // The const min/max is NOT last. It is TEMPTING to discount it: a
+        // constant improves only on the group's first row, so "surely" it can
+        // never be the aggregate the witness follows, leaving one effective
+        // min/max and the ordinary single-extremum rule. That was tried
+        // (2026-07-29) and this oracle refuted it in one query. On the group
+        // whose `x` is ALL NULL, `min(x)` never improves either — and sqlite
+        // then ends on the group's LAST row (`h`), not on the constant's first
+        // row (`g`) and not on any extremum. So "the last min/max decides" is
+        // false exactly when the last one never improves, and the discount
+        // would turn this clean refusal into a WRONG ANSWER. It stays refused.
         "SELECT name, min(-52), min(x) FROM t GROUP BY g",
         // A NULL constant never "improves", so sqlite drifts to the LAST row.
         "SELECT name, min(x), max(NULL) FROM t GROUP BY g",
