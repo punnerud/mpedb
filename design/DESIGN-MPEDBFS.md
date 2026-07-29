@@ -84,6 +84,12 @@ compile it:
 cargo build --manifest-path crates/mpedb-fs/Cargo.toml
 ```
 
+macOS needs macFUSE, which is a system extension the user installs and
+approves — the M3 in this project's gate does not have it, so mpedbfs is
+**built and mounted on Linux only** so far. That is a coverage statement,
+not a portability claim: nothing in the code is Linux-specific, and the
+first macOS run is the thing that would prove it.
+
 `fuser` is taken with `default-features = false`, which drops the libfuse C
 linkage: mounting goes through the setuid `fusermount3` helper instead, so
 the build needs no headers and no `pkg-config` — only the runtime helper
