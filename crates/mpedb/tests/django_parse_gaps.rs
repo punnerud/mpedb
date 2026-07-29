@@ -442,10 +442,14 @@ fn a_check_fires_in_the_transaction_that_created_the_table() {
     assert_eq!(mpedb_rows(&t.db, "SELECT COUNT(*) FROM c3"), vec![vec!["1".to_string()]]);
 }
 
-/// `REFERENCES` is PARSED and NOT ENFORCED — which is exactly what sqlite does
-/// under its default `PRAGMA foreign_keys = OFF`. Asserted rather than assumed:
-/// the dangling child row goes in and the `ON DELETE CASCADE` does not fire, in
-/// BOTH engines.
+/// `REFERENCES` is parsed and, BY DEFAULT, not enforced — which is exactly what
+/// sqlite does under its own default `PRAGMA foreign_keys = OFF`. Asserted
+/// rather than assumed: the dangling child row goes in and the `ON DELETE
+/// CASCADE` does not fire, in BOTH engines.
+///
+/// Enforcement exists since #194 and is one pragma away; this test pins the
+/// DEFAULT, which is the thing an existing database's behaviour depends on.
+/// `tests/foreign_key.rs` is its twin with the pragma ON.
 #[test]
 fn references_is_parsed_and_not_enforced_like_sqlite_default() {
     let setup: &[&str] = &[

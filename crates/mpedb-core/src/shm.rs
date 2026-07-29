@@ -2526,7 +2526,7 @@ impl Shm {
     ///
     /// When [`Self::exclusive_write`] is set (in-place private writer), *other*
     /// threads spin until it clears. The owning thread nests freely (TLS depth)
-    /// so `trigger_set` / catalog reloads under the write lock do not deadlock.
+    /// so `write_rules` / catalog reloads under the write lock do not deadlock.
     fn claim_and_pin_private(&self) -> Result<(u32, u64, MetaSnapshot)> {
         let mut spins = 0u32;
         loop {

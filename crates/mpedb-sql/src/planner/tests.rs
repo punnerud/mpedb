@@ -43,6 +43,7 @@ pub(crate) fn test_schema() -> Schema {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_types::TableKind::Standard,
+        foreign_keys: Vec::new(),
     };
     let orders = TableDef {
         id: 0,
@@ -58,6 +59,7 @@ pub(crate) fn test_schema() -> Schema {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_types::TableKind::Standard,
+        foreign_keys: Vec::new(),
     };
     let events = TableDef {
         id: 0,
@@ -75,6 +77,7 @@ pub(crate) fn test_schema() -> Schema {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_types::TableKind::Standard,
+        foreign_keys: Vec::new(),
     };
     Schema::new(vec![users, orders, events]).unwrap()
 }
@@ -123,6 +126,7 @@ fn secondary_index_numbering() {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_types::TableKind::Standard,
+        foreign_keys: Vec::new(),
     };
     // The derivation lives in Schema::new now (single source: TableDef.indexes).
     let s = Schema::new(vec![t]).unwrap();
@@ -655,6 +659,7 @@ fn a_three_column_pk_pins_two_equalities_and_ranges_the_third() {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_types::TableKind::Standard,
+        foreign_keys: Vec::new(),
     };
     let s = Schema::new(vec![t]).unwrap();
     let p = prepare(

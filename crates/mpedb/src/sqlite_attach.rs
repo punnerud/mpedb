@@ -282,6 +282,7 @@ impl SqliteAttach {
                         dead: false,
                         implicit_rowid: false,
                         kind: mpedb_types::TableKind::Standard,
+                        foreign_keys: Vec::new(),
                     },
                 )
             } else if t.without_rowid {
@@ -324,6 +325,7 @@ impl SqliteAttach {
                         dead: false,
                         implicit_rowid: false,
                         kind: mpedb_types::TableKind::Standard,
+                        foreign_keys: Vec::new(),
                     },
                 )
             } else {
@@ -355,6 +357,7 @@ impl SqliteAttach {
                         // wrong answer and not a cosmetic difference.
                         implicit_rowid: true,
                         kind: mpedb_types::TableKind::Standard,
+                        foreign_keys: Vec::new(),
                     },
                 )
             };

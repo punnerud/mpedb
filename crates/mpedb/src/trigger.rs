@@ -1,12 +1,12 @@
 //! SQL triggers (DESIGN-TRIGGERS): the `trigger/<name>` sys-keyspace catalog
-//! record, its versioned wire format, and the compiled, gen-gated [`TriggerSet`]
+//! record, its versioned wire format, and the compiled, gen-gated [`WriteRules`]
 //! the executor consults at fire time.
 //!
 //! Triggers are pure sys-keyspace catalog entries, exactly like views and
 //! policies: they do NOT enter the Schema canonical bytes and do NOT need a
 //! `PLAN_FORMAT` change. A `CREATE`/`DROP TRIGGER` bumps `schema_gen`, so every
 //! attached process (including a different one acting as the ring leader) drops
-//! its cached [`TriggerSet`] and rebuilds it — the same freshness contract views
+//! its cached [`WriteRules`] and rebuilds it — the same freshness contract views
 //! and policies already ride (DESIGN-TRIGGERS §6).
 //!
 //! Stage 3 fires `BEFORE`/`AFTER` × `INSERT`/`UPDATE`/`DELETE FOR EACH ROW` with
@@ -315,11 +315,15 @@ pub(crate) struct CompiledTrigger {
     pub when: Option<(ExprProgram, RowMap)>,
 }
 
-/// The gen-gated set of triggers this process can fire, grouped by target table
-/// id (DESIGN-TRIGGERS stage 3): `BEFORE`/`AFTER` × `INSERT`/`UPDATE`/`DELETE
-/// FOR EACH ROW`. `INSTEAD OF`, `FOR EACH STATEMENT`, and `EXECUTE PROCEDURE`
-/// are refused at `CREATE`, so those never reach here.
-pub(crate) struct TriggerSet {
+/// Everything the write path must obey beyond the row's own columns, gen-gated
+/// as one unit so a statement can never see a trigger from one schema
+/// generation and a foreign key from another.
+///
+/// The triggers are grouped by target table id (DESIGN-TRIGGERS stage 3):
+/// `BEFORE`/`AFTER` × `INSERT`/`UPDATE`/`DELETE FOR EACH ROW`. `INSTEAD OF`,
+/// `FOR EACH STATEMENT`, and `EXECUTE PROCEDURE` are refused at `CREATE`, so
+/// those never reach here.
+pub(crate) struct WriteRules {
     pub before_insert: HashMap<u32, Vec<CompiledTrigger>>,
     pub before_update: HashMap<u32, Vec<CompiledTrigger>>,
     pub before_delete: HashMap<u32, Vec<CompiledTrigger>>,
@@ -331,13 +335,18 @@ pub(crate) struct TriggerSet {
     /// that is already ACTIVE in this cascade is not re-entered (sqlite's
     /// default), ON = full recursion under the depth cap + work meter.
     pub recursive: bool,
+    /// The foreign-key graph of this schema generation (#194), or `None` when
+    /// enforcement is OFF for this connection — sqlite's default and mpedb's.
+    /// `None` and an EMPTY graph are the same outcome and both cost one branch;
+    /// they are kept apart because only one of them can be turned on.
+    pub fks: Option<std::sync::Arc<crate::fk::FkGraph>>,
 }
 
-impl TriggerSet {
+impl WriteRules {
     /// The trigger-free set — allocation-free, so trigger-free databases pay
     /// nothing on the write path but one empty-map lookup per row.
-    pub(crate) fn empty() -> TriggerSet {
-        TriggerSet {
+    pub(crate) fn empty() -> WriteRules {
+        WriteRules {
             before_insert: HashMap::new(),
             before_update: HashMap::new(),
             before_delete: HashMap::new(),
@@ -345,6 +354,7 @@ impl TriggerSet {
             after_update: HashMap::new(),
             after_delete: HashMap::new(),
             recursive: false,
+            fks: None,
         }
     }
 }
@@ -455,14 +465,14 @@ impl Database {
     /// Scan `trigger/*`, decode each record, compile the fireable ones against
     /// the live schema. Skips triggers whose target table was dropped (their
     /// record may linger — harmless, never fires). Called only on a
-    /// `schema_gen` change (see [`Database::trigger_set`]).
-    fn build_trigger_set(&self) -> Result<TriggerSet> {
+    /// `schema_gen` change (see [`Database::write_rules`]).
+    fn build_write_rules(&self) -> Result<WriteRules> {
         let bundle = self.engine.schema();
         let schema = &bundle.schema;
         let r = self.engine.begin_read()?;
         let scan = r.sys_scan_range(TRIGGER_PREFIX, TRIGGER_PREFIX_END);
         r.finish()?;
-        let mut set = TriggerSet::empty();
+        let mut set = WriteRules::empty();
         set.recursive = self.tunables()?.recursive_triggers;
         for (subkey, value) in scan? {
             if !subkey.starts_with(TRIGGER_PREFIX) {
@@ -656,22 +666,56 @@ impl Database {
         }
     }
 
-    /// The current [`TriggerSet`], rebuilt only when a DDL commit moved
+    /// The current [`WriteRules`], rebuilt only when a DDL commit moved
     /// `schema_gen` (here or in another process). Identical freshness contract
     /// to the plan cache, so the two can never disagree within one statement.
-    pub(crate) fn trigger_set(&self) -> Result<Arc<TriggerSet>> {
+    ///
+    /// The cache key carries the connection's `PRAGMA foreign_keys` state too:
+    /// flipping it is rare (Django does it twice per migration run) and a
+    /// rebuild is cheaper than asking two caches to agree.
+    pub(crate) fn write_rules(&self) -> Result<Arc<WriteRules>> {
         let gen = self.engine.schema().schema_gen;
+        let fk_on = self.fk_enforced();
         {
-            let g = self.trigger_cache.read().expect(POISON);
-            if let Some((cached_gen, set)) = &*g {
-                if *cached_gen == gen {
+            let g = self.rules_cache.read().expect(POISON);
+            if let Some((cached_gen, cached_fk, set)) = &*g {
+                if *cached_gen == gen && *cached_fk == fk_on {
                     return Ok(set.clone());
                 }
             }
         }
-        let set = Arc::new(self.build_trigger_set()?);
-        *self.trigger_cache.write().expect(POISON) = Some((gen, set.clone()));
+        let mut rules = self.build_write_rules()?;
+        if fk_on {
+            rules.fks = Some(Arc::new(crate::fk::FkGraph::build(
+                &self.engine.schema().schema,
+            )));
+        }
+        let set = Arc::new(rules);
+        *self.rules_cache.write().expect(POISON) = Some((gen, fk_on, set.clone()));
         Ok(set)
+    }
+
+    /// Is `table` on EITHER side of a foreign key — does it declare one, or
+    /// does something reference it (#194)? The optimistic blind-apply route
+    /// must not take a table that answers yes: it never calls the executor, so
+    /// it would skip the parent probe and every cascade.
+    ///
+    /// Answers `true` on error, and `true` whenever enforcement is off but the
+    /// schema HAS keys — a connection that flips `PRAGMA foreign_keys` on must
+    /// not find rows another statement blind-applied under a stale answer.
+    pub(crate) fn table_has_foreign_key(&self, table: u32) -> bool {
+        let bundle = self.engine.schema();
+        let schema = &bundle.schema;
+        let Some(t) = schema.tables.iter().find(|t| t.id == table && !t.dead) else {
+            return true;
+        };
+        if !t.foreign_keys.is_empty() {
+            return true;
+        }
+        schema
+            .tables
+            .iter()
+            .any(|o| !o.dead && o.foreign_keys.iter().any(|fk| fk.parent.eq_ignore_ascii_case(&t.name)))
     }
 
     /// Does `table` carry ANY trigger — `BEFORE` or `AFTER`, insert/update/
@@ -680,7 +724,7 @@ impl Database {
     /// would skip every trigger (before OR after). On error, answers `true`
     /// (conservative: force the safe executor path).
     pub(crate) fn table_has_trigger(&self, table: u32) -> bool {
-        self.trigger_set()
+        self.write_rules()
             .map(|s| {
                 s.before_insert.contains_key(&table)
                     || s.before_update.contains_key(&table)

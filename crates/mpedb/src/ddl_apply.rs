@@ -436,6 +436,45 @@ pub(crate) fn table_def_from_spec(
             .map(|n| col_index(n))
             .collect::<Result<Vec<u16>>>()?
     };
+    // FOREIGN KEYs. Only the CHILD side resolves here — the parent stays in
+    // names because a forward reference is legal (see `ForeignKeyDef`). The two
+    // things decidable without a catalog are decided now, both of them errors
+    // sqlite also raises at CREATE time:
+    //   * a child column that does not exist,
+    //   * a declared parent list of a different width than the child list.
+    let foreign_keys = spec
+        .foreign_keys
+        .iter()
+        .map(|fk| {
+            let columns = fk
+                .columns
+                .iter()
+                .map(|n| {
+                    col_index(n).map_err(|_| {
+                        Error::Bind(format!(
+                            "unknown column \"{n}\" in foreign key definition"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<u16>>>()?;
+            if !fk.parent_columns.is_empty() && fk.parent_columns.len() != columns.len() {
+                return Err(Error::Bind(
+                    "number of columns in foreign key does not match the number of \
+                     columns in the referenced table"
+                        .into(),
+                ));
+            }
+            Ok(mpedb_types::ForeignKeyDef {
+                columns,
+                parent: fk.parent.clone(),
+                parent_columns: fk.parent_columns.clone(),
+                on_delete: fk.on_delete,
+                on_update: fk.on_update,
+                deferred: fk.deferred,
+                name: fk.name.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut def = mpedb_types::TableDef {
         id: 0, // assigned by Schema::with_added_table (lowest free)
         name: spec.name,
@@ -445,6 +484,7 @@ pub(crate) fn table_def_from_spec(
         dead: false,
         implicit_rowid,
         kind: mpedb_types::TableKind::Standard,
+        foreign_keys,
     };
     // GENERATED ALWAYS AS (…): compile each expression against the FINISHED
     // table and store the PROGRAM on the column (unlike CHECK, whose source is
@@ -534,6 +574,9 @@ pub(crate) fn virtual_table_def_from_spec(
         dead: false,
         implicit_rowid: false,
         kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer },
+        // An FTS shadow table is engine-owned; user DDL never attaches a key
+        // to it.
+        foreign_keys: Vec::new(),
     })
 }
 
@@ -721,6 +764,31 @@ impl Database {
                 return Err(Error::Bind(format!("DROP TABLE: no such table `{name}`")));
             }
         };
+        // With enforcement on, sqlite treats DROP TABLE as deleting every row
+        // (measured, 3.45.1: dropping a parent with live children fails), so a
+        // table something still points at cannot go. Checked here rather than
+        // per row because the answer is the same for all of them.
+        if self.fk_enforced() {
+            let bundle = self.engine.schema();
+            let sc = &bundle.schema;
+            if let Some(t) = sc.tables.iter().find(|t| t.id == id && !t.dead) {
+                for other in sc.tables.iter().filter(|o| !o.dead && o.id != id) {
+                    for fk in &other.foreign_keys {
+                        if !fk.parent.eq_ignore_ascii_case(&t.name) {
+                            continue;
+                        }
+                        // Only a table with ROWS in it blocks — an empty child
+                        // has nothing dangling, which is what sqlite reports too.
+                        let r = self.engine.begin_read()?;
+                        let rows = r.row_count(other.id);
+                        r.finish()?;
+                        if rows? > 0 {
+                            return Err(crate::fk::violation(&other.name, fk));
+                        }
+                    }
+                }
+            }
+        }
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         // Cascade: a dropped table's triggers are dead — remove their records in
         // the same commit (DESIGN-TRIGGERS §3.1).

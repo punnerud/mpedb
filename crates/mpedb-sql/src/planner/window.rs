@@ -335,6 +335,7 @@ fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableDef {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_types::TableKind::Standard,
+        foreign_keys: Vec::new(),
     }
 }
 

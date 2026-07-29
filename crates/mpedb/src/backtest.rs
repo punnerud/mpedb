@@ -120,7 +120,7 @@ impl Database {
         let compiled = self.compile_stored_trigger(&st, schema)?.ok_or_else(|| {
             Error::Bind("the trigger's target table no longer exists".into())
         })?;
-        let live = self.trigger_set()?;
+        let live = self.write_rules()?;
         let t = schema
             .table(st.table_id)
             .ok_or_else(|| Error::Bind("the trigger's target table no longer exists".into()))?;

@@ -50,6 +50,7 @@ fn schema() -> Schema {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_sql::TableKind::Standard,
+        foreign_keys: Vec::new(),
     };
     let orders = TableDef {
         id: 0,
@@ -75,6 +76,7 @@ fn schema() -> Schema {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_sql::TableKind::Standard,
+        foreign_keys: Vec::new(),
     };
     let events = TableDef {
         id: 0,
@@ -92,6 +94,7 @@ fn schema() -> Schema {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_sql::TableKind::Standard,
+        foreign_keys: Vec::new(),
     };
     Schema::new(vec![users, orders, events]).unwrap()
 }

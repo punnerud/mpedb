@@ -2,6 +2,53 @@ use super::*;
 
 // ---- footprint ---------------------------------------------------------------
 
+/// Add every table a FOREIGN KEY on `t` names, plus every table whose key names
+/// `t`, to `reads` (#194).
+///
+/// `design/DESIGN-STREAM-EXEC.md` §"Foreign keys are safe today only because
+/// they are parsed and discarded" named exactly this trap: enforcement reads
+/// the PARENT on an insert/update and SWEEPS the children on a delete or a
+/// re-key, so a footprint claiming only the written table under-claims, and
+/// `conflicts_with` — a set intersection — then calls two statements
+/// independent when one can invalidate the other.
+///
+/// Claimed from the SCHEMA, not from the connection's `PRAGMA foreign_keys`:
+/// a footprint is part of a plan's compile-time identity, and a plan must not
+/// mean two things depending on a runtime flag. A key-free table pays one
+/// `is_empty()` per table in the schema.
+fn union_foreign_key_tables(
+    t: &mpedb_types::TableDef,
+    schema: &mpedb_types::Schema,
+    reads: &mut TableSet,
+) -> Result<()> {
+    for fk in &t.foreign_keys {
+        if let Some(p) = schema
+            .tables
+            .iter()
+            .find(|o| !o.dead && o.name.eq_ignore_ascii_case(&fk.parent))
+        {
+            reads.insert(checked_table(p.id, schema)?);
+        }
+    }
+    // The other direction: a DELETE or a key-changing UPDATE of `t` reads (and
+    // may write) every child. A forward reference whose parent does not exist
+    // yet contributes nothing, which is right — there is nothing to conflict
+    // with.
+    for other in &schema.tables {
+        if other.dead || other.id == t.id {
+            continue;
+        }
+        if other
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.parent.eq_ignore_ascii_case(&t.name))
+        {
+            reads.insert(checked_table(other.id, schema)?);
+        }
+    }
+    Ok(())
+}
+
 fn access_key_and_indexes(a: &AccessPath) -> (KeyAccess, u64) {
     match a {
         AccessPath::PkPoint(parts) => (KeyAccess::Point(parts.clone()), 1),
@@ -360,6 +407,7 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
             }
             let mut tables_written = TableSet::new();
             tables_written.insert(checked_table(*table, schema)?);
+            union_foreign_key_tables(t, schema, &mut tables_read)?;
             Footprint {
                 tables_read,
                 tables_written,
@@ -393,8 +441,10 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                 }
             }
             let one: TableSet = [checked_table(*table, schema)?].into_iter().collect();
+            let mut tables_read = one.clone();
+            union_foreign_key_tables(t, schema, &mut tables_read)?;
             Footprint {
-                tables_read: one.clone(),
+                tables_read,
                 tables_written: one,
                 indexes_used,
                 key_access,
@@ -407,8 +457,10 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                 .ok_or_else(|| Error::Corrupt("table id out of range".into()))?;
             let (key_access, indexes_used) = access_key_and_indexes(access);
             let one: TableSet = [checked_table(*table, schema)?].into_iter().collect();
+            let mut tables_read = one.clone();
+            union_foreign_key_tables(t, schema, &mut tables_read)?;
             Footprint {
-                tables_read: one.clone(),
+                tables_read,
                 tables_written: one,
                 // A delete unlinks the row from every index.
                 indexes_used: indexes_used | all_secondary_bits(t)?,

@@ -351,58 +351,103 @@ impl<'a> Parser<'a> {
     }
 
     /// The tail of a `REFERENCES <table> [(col, …)] [ON …|MATCH …|[NOT]
-    /// DEFERRABLE …]*` clause — consumed and DISCARDED.
+    /// DEFERRABLE …]*` clause, KEPT.
     ///
-    /// This is not a shrug. sqlite's default is `PRAGMA foreign_keys = OFF`,
-    /// under which sqlite ITSELF parses a foreign key and enforces nothing:
-    /// the dangling child row goes in, the `ON DELETE CASCADE` never fires.
-    /// mpedb has no `foreign_keys = ON` to switch to, so parse-and-drop is
-    /// sqlite's default behaviour exactly — and mpedb must never claim to
-    /// enforce an FK. Pinned differentially in
-    /// `crates/mpedb/tests/django_parse_gaps.rs`.
-    fn skip_references_clause(&mut self) -> Result<()> {
-        let _table = self.ident("table name after REFERENCES")?;
-        if self.peek() == Some(&Tok::LParen) {
-            let _cols = self.paren_ident_list()?;
-        }
+    /// It was consumed and discarded until 2026-07-29, and that was not a
+    /// shrug: sqlite's own default is `PRAGMA foreign_keys = OFF`, under which
+    /// sqlite too parses a foreign key and enforces nothing. Parse-and-drop was
+    /// sqlite's default behaviour exactly; what it lacked was an `ON` to offer.
+    /// `crates/mpedb/tests/django_parse_gaps.rs` pinned the old behaviour and
+    /// moved with this change.
+    ///
+    /// `child` is the child-side column list, already parsed by the caller —
+    /// one name for the column-level shorthand, the parenthesised list for the
+    /// table-level `FOREIGN KEY (…)` form.
+    fn references_clause(
+        &mut self,
+        child: Vec<String>,
+        name: Option<String>,
+    ) -> Result<crate::ddl::ForeignKeySpec> {
+        use mpedb_types::FkAction;
+        let parent = self.ident("table name after REFERENCES")?;
+        let parent_columns = if self.peek() == Some(&Tok::LParen) {
+            self.paren_ident_list()?
+        } else {
+            Vec::new()
+        };
+        let mut on_delete = FkAction::NoAction;
+        let mut on_update = FkAction::NoAction;
+        let mut deferred = false;
         // `ON DELETE|UPDATE <action>`, `MATCH <name>`, `[NOT] DEFERRABLE
-        // [INITIALLY DEFERRED|IMMEDIATE]`. Every one of them is a rule about
-        // enforcement, and there is no enforcement, so every one is dropped.
-        // `SET` and `MATCH` are real keywords in this tokenizer, the action
-        // words are not.
+        // [INITIALLY DEFERRED|IMMEDIATE]`. `SET` and `MATCH` are real keywords
+        // in this tokenizer, the action words are not.
         loop {
             if self.eat_kw(Kw::On) {
-                if !(self.eat_kw(Kw::Delete) || self.eat_kw(Kw::Update)) {
+                let is_delete = if self.eat_kw(Kw::Delete) {
+                    true
+                } else if self.eat_kw(Kw::Update) {
+                    false
+                } else {
                     return Err(self.err_here("expected DELETE or UPDATE after REFERENCES … ON"));
-                }
-                if self.eat_kw(Kw::Set) {
-                    if !(self.eat_kw(Kw::Null) || self.eat_word("DEFAULT")) {
+                };
+                let action = if self.eat_kw(Kw::Set) {
+                    if self.eat_kw(Kw::Null) {
+                        FkAction::SetNull
+                    } else if self.eat_word("DEFAULT") {
+                        FkAction::SetDefault
+                    } else {
                         return Err(self.err_here("expected NULL or DEFAULT after ON … SET"));
                     }
-                } else if self.eat_word("CASCADE") || self.eat_word("RESTRICT") {
-                    // nothing more
+                } else if self.eat_word("CASCADE") {
+                    FkAction::Cascade
+                } else if self.eat_word("RESTRICT") {
+                    FkAction::Restrict
                 } else if self.eat_word("NO") {
                     self.expect_word("ACTION")?;
+                    FkAction::NoAction
                 } else {
                     return Err(self.err_here(
                         "expected SET NULL, SET DEFAULT, CASCADE, RESTRICT or NO ACTION",
                     ));
-                }
+                };
+                *(if is_delete {
+                    &mut on_delete
+                } else {
+                    &mut on_update
+                }) = action;
             } else if self.eat_kw(Kw::Match) {
+                // MATCH SIMPLE is the only mode sqlite implements; MATCH FULL
+                // and MATCH PARTIAL parse and behave as SIMPLE there. Following
+                // sqlite means accepting the word and ignoring it — the modes
+                // differ only for a PARTIALLY NULL composite key, and SIMPLE
+                // (skip the check) is what both engines do.
                 let _ = self.ident("a name after MATCH")?;
             } else if self.at_deferrable() {
-                let _ = self.eat_kw(Kw::Not);
+                let not = self.eat_kw(Kw::Not);
                 self.expect_word("DEFERRABLE")?;
-                if self.eat_word("INITIALLY")
-                    && !(self.eat_word("DEFERRED") || self.eat_word("IMMEDIATE"))
-                {
-                    return Err(self.err_here("expected DEFERRED or IMMEDIATE after INITIALLY"));
+                // Only `DEFERRABLE INITIALLY DEFERRED` defers. A bare
+                // `DEFERRABLE`, `INITIALLY IMMEDIATE`, and `NOT DEFERRABLE`
+                // are all immediate — sqlite's rule exactly.
+                if self.eat_word("INITIALLY") {
+                    if self.eat_word("DEFERRED") {
+                        deferred = !not;
+                    } else if !self.eat_word("IMMEDIATE") {
+                        return Err(self.err_here("expected DEFERRED or IMMEDIATE after INITIALLY"));
+                    }
                 }
             } else {
                 break;
             }
         }
-        Ok(())
+        Ok(crate::ddl::ForeignKeySpec {
+            columns: child,
+            parent,
+            parent_columns,
+            on_delete,
+            on_update,
+            deferred,
+            name,
+        })
     }
 
     /// At `DEFERRABLE` or `NOT DEFERRABLE`. The two-token lookahead is what
@@ -493,6 +538,7 @@ impl<'a> Parser<'a> {
             check: None,
             collation: Collation::Binary,
             generated: None,
+            references: None,
         };
         loop {
             // A per-column constraint may carry a `CONSTRAINT <name>` prefix.
@@ -545,7 +591,13 @@ impl<'a> Parser<'a> {
                     None => src,
                 });
             } else if self.eat_word("REFERENCES") {
-                self.skip_references_clause()?;
+                if col.references.is_some() {
+                    return Err(self.err_here(format!(
+                        "column `{}` carries more than one REFERENCES clause",
+                        col.name
+                    )));
+                }
+                col.references = Some(self.references_clause(vec![col.name.clone()], None)?);
             } else if self.eat_word("GENERATED") {
                 // `GENERATED ALWAYS AS (…)`. The two words are one token pair in
                 // sqlite's grammar — `GENERATED` alone is absorbed into the
@@ -615,6 +667,7 @@ impl<'a> Parser<'a> {
         let mut table_pk: Vec<String> = Vec::new();
         let mut uniques: Vec<Vec<String>> = Vec::new();
         let mut checks: Vec<String> = Vec::new();
+        let mut foreign_keys: Vec<crate::ddl::ForeignKeySpec> = Vec::new();
         loop {
             // `CONSTRAINT <name>` introduces a NAMED table constraint; once it
             // is there a column definition can no longer follow.
@@ -637,15 +690,22 @@ impl<'a> Parser<'a> {
                 checks.push(self.capture_paren_source()?);
             } else if self.eat_word("FOREIGN") {
                 self.expect_word("KEY")?;
-                let _cols = self.paren_ident_list()?;
+                let cols = self.paren_ident_list()?;
                 self.expect_word("REFERENCES")?;
-                self.skip_references_clause()?;
+                foreign_keys.push(self.references_clause(cols, named)?);
             } else if let Some(n) = named {
                 return Err(self.err_here(format!(
                     "expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY after `CONSTRAINT {n}`"
                 )));
             } else {
-                columns.push(self.parse_column_def()?);
+                let mut col = self.parse_column_def()?;
+                // The column-level shorthand IS a table constraint; it just
+                // spells its one child column implicitly. Hoisting it here
+                // keeps the resolver with a single list to walk.
+                if let Some(fk) = col.references.take() {
+                    foreign_keys.push(fk);
+                }
+                columns.push(col);
             }
             if !self.eat(&Tok::Comma) {
                 break;
@@ -658,6 +718,7 @@ impl<'a> Parser<'a> {
             table_pk,
             uniques,
             checks,
+            foreign_keys,
         }))
     }
 
@@ -1191,6 +1252,7 @@ impl<'a> Parser<'a> {
                 check: None,
                 collation: Collation::Binary,
                 generated: None,
+                references: None,
             };
             loop {
                 if self.eat_kw(Kw::Not) {
@@ -1230,9 +1292,7 @@ impl<'a> Parser<'a> {
                         "ALTER TABLE ADD COLUMN cannot carry a CHECK — the rows already in                          the table were never tested against it (sqlite refuses this too);                          declare the CHECK in CREATE TABLE",
                     ));
                 } else if self.eat_word("REFERENCES") {
-                    // Parsed and dropped, exactly as in CREATE TABLE and
-                    // exactly as sqlite does under `foreign_keys = OFF`.
-                    self.skip_references_clause()?;
+                    col.references = Some(self.references_clause(vec![col.name.clone()], None)?);
                 } else if self.eat_word("GENERATED") {
                     self.expect_word("ALWAYS")?;
                     col.generated = Some(self.parse_generated_tail()?);

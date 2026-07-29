@@ -668,10 +668,21 @@ fn pragma_busy_timeout_round_trips_and_is_the_c_api_knob() {
         // sqlite clamps a negative to 0.
         assert_eq!(one("PRAGMA busy_timeout = -1"), ("timeout".into(), 0));
 
-        // `foreign_keys` stays 0 through a set: mpedb enforces no foreign key,
-        // and reporting 1 would promise enforcement that does not exist
-        // (C-API-COMPAT gap D11). sqlite's own default is 0 too.
+        // `foreign_keys` is REAL since #194 — it was 0-through-a-set while
+        // mpedb enforced nothing (old C-API-COMPAT gap D11), and reporting 1
+        // then would have promised enforcement that did not exist. Now the
+        // setter moves the connection's state and the getter reports it.
+        // sqlite's default is OFF, and so is mpedb's.
+        assert_eq!(one("PRAGMA foreign_keys"), ("foreign_keys".into(), 0));
         assert_eq!(exec(db, "PRAGMA foreign_keys = ON"), SQLITE_OK);
+        assert_eq!(one("PRAGMA foreign_keys"), ("foreign_keys".into(), 1));
+        // INSIDE a transaction it is a SILENT no-op — measured against sqlite
+        // 3.45.1, which keeps the old value rather than erroring.
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "PRAGMA foreign_keys = OFF"), SQLITE_OK);
+        assert_eq!(one("PRAGMA foreign_keys"), ("foreign_keys".into(), 1));
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        assert_eq!(exec(db, "PRAGMA foreign_keys = OFF"), SQLITE_OK);
         assert_eq!(one("PRAGMA foreign_keys"), ("foreign_keys".into(), 0));
 
         sqlite3_close(db);

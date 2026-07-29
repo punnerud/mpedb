@@ -132,6 +132,7 @@ pub fn error_codes(e: &DbError) -> (c_int, c_int) {
         DbError::UniqueViolation { .. } => (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_UNIQUE),
         DbError::NotNullViolation { .. } => (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL),
         DbError::CheckViolation { .. } => (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK),
+        DbError::ForeignKeyViolation { .. } => (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_FOREIGNKEY),
         // A trigger body's RAISE(ABORT, 'msg') — sqlite's SQLITE_CONSTRAINT_TRIGGER,
         // message = the raise text verbatim (Display already is).
         DbError::Raise(_) => (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER),
@@ -187,6 +188,10 @@ pub fn sqlite_shaped_message(e: &DbError) -> Option<String> {
             Some(format!("UNIQUE constraint failed: {raw}"))
         }
         DbError::NotNullViolation { .. } => Some(format!("NOT NULL constraint failed: {raw}")),
+        // sqlite says exactly this and NOTHING else — no table, no column, no
+        // constraint name (measured, 3.45.1), and its own test suite asserts on
+        // the string. The detail mpedb carries stays on the native surface.
+        DbError::ForeignKeyViolation { .. } => Some("FOREIGN KEY constraint failed".to_string()),
         DbError::Busy => Some("database is locked".to_string()),
         // "no such collation sequence: <name>" is sqlite's own wording and
         // consumers assert on it EXACTLY (CPython's `test_deregister_collation`

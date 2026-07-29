@@ -2,7 +2,7 @@
 //! transaction. Shared by the autocommit paths on [`crate::Database`] and the
 //! interactive [`crate::WriteSession`] via the [`TxnCtx`] abstraction.
 
-use crate::trigger::{CompiledTrigger, TriggerSet};
+use crate::trigger::{CompiledTrigger, WriteRules};
 use crate::ExecResult;
 use mpedb_core::{FoldOpts, FoldStop, ReadTxn, WriteTxn};
 use mpedb_sql::{
@@ -36,6 +36,29 @@ std::thread_local! {
 /// successful `insert_row`, so the final call reflects the last inserted row.
 pub(crate) fn record_last_insert_rowid(rowid: i64) {
     LAST_INSERT_ROWID.with(|c| c.set(Some(rowid)));
+}
+
+thread_local! {
+    /// Violations a `DEFERRABLE INITIALLY DEFERRED` key produced, held until
+    /// COMMIT (#194). Thread-local for the same reason `LAST_INSERT_ROWID` is:
+    /// every write path runs `exec_stmt` synchronously in the caller's thread,
+    /// and the engine's writer lock means one write transaction per thread at a
+    /// time — so this cannot be two transactions' lists at once.
+    static FK_DEFERRED: std::cell::RefCell<Vec<crate::fk::Deferred>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hold a deferred violation over to COMMIT.
+pub(crate) fn push_fk_deferred(d: Vec<crate::fk::Deferred>) {
+    if d.is_empty() {
+        return;
+    }
+    FK_DEFERRED.with(|c| c.borrow_mut().extend(d));
+}
+
+/// Take the held-over violations — COMMIT re-probes them, ROLLBACK drops them.
+pub(crate) fn take_fk_deferred() -> Vec<crate::fk::Deferred> {
+    FK_DEFERRED.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// Take (read and clear) the rowid assigned by the last INSERT executed on this
@@ -1191,7 +1214,7 @@ pub(crate) fn exec_stmt(
 ) -> Result<ExecResult> {
     // Read paths and any caller that cannot fire triggers use the trigger-free
     // set — one empty-map lookup per written row, no allocation.
-    exec_stmt_triggered(ctx, schema, plan, params, partial, &TriggerSet::empty(), 0)
+    exec_stmt_triggered(ctx, schema, plan, params, partial, &WriteRules::empty(), 0)
 }
 
 /// Maximum depth of the trigger cascade (DESIGN-TRIGGERS §4.4). Each level is a
@@ -1201,7 +1224,7 @@ pub(crate) const MAX_TRIGGER_DEPTH: u32 = 32;
 
 /// Like [`exec_stmt`], but with the trigger set to fire from (and the current
 /// cascade `depth`). The write paths pass the leader's/session's gen-gated
-/// [`TriggerSet`]; a trigger body re-enters here with `depth + 1` on the SAME
+/// [`WriteRules`]; a trigger body re-enters here with `depth + 1` on the SAME
 /// `ctx`, never through the facade (DESIGN-TRIGGERS §4.3).
 pub(crate) fn exec_stmt_triggered(
     ctx: &mut dyn TxnCtx,
@@ -1209,7 +1232,7 @@ pub(crate) fn exec_stmt_triggered(
     plan: &CompiledPlan,
     params: &[Value],
     partial: &mut bool,
-    triggers: &TriggerSet,
+    triggers: &WriteRules,
     depth: u32,
 ) -> Result<ExecResult> {
     // #40 instrument: statement-total time, so resolve + stmt reconciles
@@ -1234,7 +1257,7 @@ fn exec_stmt_impl(
     plan: &CompiledPlan,
     params: &[Value],
     partial: &mut bool,
-    triggers: &TriggerSet,
+    triggers: &WriteRules,
     depth: u32,
 ) -> Result<ExecResult> {
     let coerced = coerce_params(plan, params)?;
@@ -2598,7 +2621,7 @@ fn exec_stmt_rest(
     plan: &CompiledPlan,
     params: &[Value],
     partial: &mut bool,
-    triggers: &TriggerSet,
+    triggers: &WriteRules,
     depth: u32,
 ) -> Result<ExecResult> {
     match &plan.stmt {
@@ -2746,6 +2769,21 @@ fn exec_stmt_rest(
                 // row conflicting on several constraints is removed once. A NULL
                 // in a probed key means no entry and no conflict (UNIQUE and the
                 // rowid-alias auto-assign both permit it), so it is skipped.
+                // FOREIGN KEY, child side: the row must name a parent that
+                // exists. Runs AFTER the BEFORE triggers (a body may supply the
+                // parent) and BEFORE the row lands, so a violation leaves
+                // nothing behind — sqlite's order.
+                if let Some(g) = &triggers.fks {
+                    if g.has_outgoing(*table) {
+                        let mut held = Vec::new();
+                        if let Err(e) = crate::fk::check_child(ctx, schema, *table, &row, &mut held)
+                        {
+                            *partial = applied > 0;
+                            return Err(e);
+                        }
+                        push_fk_deferred(held);
+                    }
+                }
                 if matches!(on_conflict, PlanOnConflict::Replace) {
                     let mut victims: Vec<Vec<Value>> = Vec::new();
                     let pk_of = |r: &[Value]| -> Vec<Value> {
@@ -2768,6 +2806,34 @@ fn exec_stmt_rest(
                     for v in victims {
                         if deleted.contains(&v) {
                             continue;
+                        }
+                        // A REPLACE victim is a DELETE as far as foreign keys
+                        // are concerned — sqlite fires ON DELETE actions for it
+                        // too. The pre-image has to be read before it goes.
+                        if let Some(g) = &triggers.fks {
+                            if g.has_incoming(&t.name) {
+                                if let Some(old) = ctx.get_by_pk(*table, &v)? {
+                                    let mut held = Vec::new();
+                                    let r = crate::fk::on_parent_change(
+                                        ctx, schema, g, *table, &old, None, &mut held,
+                                        crate::fk::Phase::Guard, 0,
+                                    )
+                                    .and_then(|()| {
+                                        ctx.delete_by_pk(*table, &v)?;
+                                        crate::fk::on_parent_change(
+                                            ctx, schema, g, *table, &old, None, &mut held,
+                                            crate::fk::Phase::Act, 0,
+                                        )
+                                    });
+                                    if let Err(e) = r {
+                                        *partial = true;
+                                        return Err(e);
+                                    }
+                                    push_fk_deferred(held);
+                                    deleted.push(v);
+                                    continue;
+                                }
+                            }
                         }
                         ctx.delete_by_pk(*table, &v)?;
                         deleted.push(v);
@@ -3042,9 +3108,53 @@ fn exec_stmt_rest(
                         return Err(e);
                     }
                 }
+                // FOREIGN KEY (#194). Two sides, both before the rewrite:
+                // the post-image must still name a live parent, and any child
+                // pointing at the PRE-image's key must be acted on.
+                let mut fk_held = Vec::new();
+                if let Some(g) = &triggers.fks {
+                    let r = (|ctx: &mut dyn TxnCtx| -> Result<()> {
+                        if g.has_outgoing(*table) {
+                            crate::fk::check_child(ctx, schema, *table, &new_row, &mut fk_held)?;
+                        }
+                        if g.has_incoming(&t.name) {
+                            crate::fk::on_parent_change(
+                                ctx,
+                                schema,
+                                g,
+                                *table,
+                                old,
+                                Some(&new_row),
+                                &mut fk_held,
+                                crate::fk::Phase::Guard,
+                                0,
+                            )?;
+                        }
+                        Ok(())
+                    })(ctx);
+                    if let Err(e) = r {
+                        *partial = affected > 0;
+                        return Err(e);
+                    }
+                }
                 match ctx.update_by_pk(*table, &new_row) {
                     Ok(true) => {
                         affected += 1;
+                        // The MUTATING half of the parent side runs here, on
+                        // the far side of the write: `ON UPDATE CASCADE`
+                        // carries children to a key that only exists now.
+                        if let Some(g) = &triggers.fks {
+                            if g.has_incoming(&t.name) {
+                                if let Err(e) = crate::fk::on_parent_change(
+                                    ctx, schema, g, *table, old, Some(&new_row), &mut fk_held,
+                                    crate::fk::Phase::Act, 0,
+                                ) {
+                                    *partial = true;
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        push_fk_deferred(std::mem::take(&mut fk_held));
                         // RETURNING on UPDATE projects the POST-image: SQL
                         // returns the row as it now is, not as it was.
                         if let Some(proj) = returning {
@@ -3126,9 +3236,36 @@ fn exec_stmt_rest(
                         return Err(e);
                     }
                 }
+                // FOREIGN KEY (#194): every child pointing at this row is
+                // cascaded, nulled or refused BEFORE the parent disappears.
+                let mut fk_held = Vec::new();
+                if let Some(g) = &triggers.fks {
+                    if g.has_incoming(&t.name) {
+                        if let Err(e) = crate::fk::on_parent_change(
+                            ctx, schema, g, *table, old, None, &mut fk_held,
+                            crate::fk::Phase::Guard, 0,
+                        ) {
+                            *partial = affected > 0;
+                            return Err(e);
+                        }
+                    }
+                }
                 match ctx.delete_by_pk(*table, &pk) {
                     Ok(true) => {
                         affected += 1;
+                        // Cascades run AFTER the parent is gone, as in sqlite.
+                        if let Some(g) = &triggers.fks {
+                            if g.has_incoming(&t.name) {
+                                if let Err(e) = crate::fk::on_parent_change(
+                                    ctx, schema, g, *table, old, None, &mut fk_held,
+                                    crate::fk::Phase::Act, 0,
+                                ) {
+                                    *partial = true;
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        push_fk_deferred(std::mem::take(&mut fk_held));
                         // RETURNING on DELETE projects the row as it WAS: there
                         // is no post-image to show.
                         if let Some(proj) = returning {
@@ -3187,7 +3324,7 @@ fn fire_insert(
     bucket: &std::collections::HashMap<u32, Vec<CompiledTrigger>>,
     table: u32,
     new_row: &[Value],
-    triggers: &TriggerSet,
+    triggers: &WriteRules,
     depth: u32,
 ) -> Result<crate::trigger::FireOutcome> {
     match bucket.get(&table) {
@@ -3210,7 +3347,7 @@ fn fire_update(
     new_row: &[Value],
     old_row: &[Value],
     changed: &[u16],
-    triggers: &TriggerSet,
+    triggers: &WriteRules,
     depth: u32,
 ) -> Result<crate::trigger::FireOutcome> {
     match bucket.get(&table) {
@@ -3229,7 +3366,7 @@ fn fire_delete(
     bucket: &std::collections::HashMap<u32, Vec<CompiledTrigger>>,
     table: u32,
     old_row: &[Value],
-    triggers: &TriggerSet,
+    triggers: &WriteRules,
     depth: u32,
 ) -> Result<crate::trigger::FireOutcome> {
     match bucket.get(&table) {
@@ -3256,7 +3393,7 @@ pub(crate) fn fire_row_triggers(
     new: Option<&[Value]>,
     old: Option<&[Value]>,
     changed: &[u16],
-    triggers: &TriggerSet,
+    triggers: &WriteRules,
     depth: u32,
 ) -> Result<crate::trigger::FireOutcome> {
     if trigs.is_empty() {
@@ -3444,7 +3581,7 @@ struct CtxBridge<'a> {
     ctx: &'a mut dyn TxnCtx,
     schema: &'a Schema,
     plans: &'a std::collections::HashMap<[u8; 32], Arc<CompiledPlan>>,
-    triggers: &'a TriggerSet,
+    triggers: &'a WriteRules,
     depth: u32,
     streams: Vec<Option<std::vec::IntoIter<Vec<Value>>>>,
 }

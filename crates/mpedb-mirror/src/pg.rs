@@ -278,6 +278,7 @@ pub fn to_table_def(src: &PgTable) -> Result<TableDef> {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_types::TableKind::Standard,
+        foreign_keys: Vec::new(),
     })
 }
 

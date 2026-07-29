@@ -126,6 +126,9 @@ impl Database {
                 extent_threshold: default_extent_threshold(),
                 max_work_rows: DEFAULT_MAX_WORK_ROWS,
                 max_join_cells: DEFAULT_MAX_JOIN_CELLS,
+                // A cold tier holds ONE drained table; a foreign key would have
+                // nothing on this side to point at.
+                foreign_keys: false,
                 max_query_threads: 0,
                 require_policy: Default::default(),
                 bare_group_by: Default::default(),
@@ -194,7 +197,7 @@ impl Database {
         }
         // Typed-plane writes fire no triggers; refuse the ones that would be
         // skipped (hot-side DELETE, cold-side INSERT).
-        let hot_trg = self.trigger_set()?;
+        let hot_trg = self.write_rules()?;
         if hot_trg.before_delete.contains_key(&hot_def.id)
             || hot_trg.after_delete.contains_key(&hot_def.id)
         {
@@ -203,7 +206,7 @@ impl Database {
                  would not fire (v1)"
             )));
         }
-        let cold_trg = cold.trigger_set()?;
+        let cold_trg = cold.write_rules()?;
         if cold_trg.before_insert.contains_key(&cold_def.id)
             || cold_trg.after_insert.contains_key(&cold_def.id)
         {

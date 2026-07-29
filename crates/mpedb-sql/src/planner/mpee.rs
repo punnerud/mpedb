@@ -1285,6 +1285,7 @@ mod tests {
                 dead: false,
                 implicit_rowid: false,
                 kind: mpedb_types::TableKind::Standard,
+                foreign_keys: Vec::new(),
             })
             .collect();
         Schema::new(tables).unwrap()
@@ -1380,6 +1381,7 @@ mod tests {
                 dead: false,
                 implicit_rowid: false,
                 kind: mpedb_types::TableKind::Standard,
+                foreign_keys: Vec::new(),
             },
             TableDef {
                 id: 0,
@@ -1390,6 +1392,7 @@ mod tests {
                 dead: false,
                 implicit_rowid: false,
                 kind: mpedb_types::TableKind::Standard,
+                foreign_keys: Vec::new(),
             },
         ])
         .unwrap();

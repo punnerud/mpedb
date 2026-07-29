@@ -538,6 +538,7 @@ pub(crate) fn spec_col(name: &str, ty: ColumnType) -> mpedb_sql::CreateColumnSpe
         default: None,
         check: None,
         generated: None,
+        references: None,
     }
 }
 
@@ -553,6 +554,7 @@ pub(crate) fn create_bookkeeping(
         table_pk: pk.iter().map(|c| (*c).to_string()).collect(),
         uniques: Vec::new(),
         checks: Vec::new(),
+        foreign_keys: Vec::new(),
     }))?;
     Ok(())
 }

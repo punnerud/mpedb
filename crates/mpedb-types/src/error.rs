@@ -72,6 +72,20 @@ pub enum Error {
     PrimaryKeyViolation {
         table: String,
     },
+    /// A FOREIGN KEY was not satisfied: a child row named a parent that does
+    /// not exist, or a parent row was deleted/re-keyed while a RESTRICT/NO
+    /// ACTION child still pointed at it.
+    ///
+    /// The payload is DIAGNOSTIC ONLY. sqlite reports every one of these as the
+    /// single bare string "FOREIGN KEY constraint failed" — no table, no column,
+    /// no constraint name — and consumers (CPython's tests among them) match on
+    /// that exact text, so the C-API shapes it back down. Keeping the detail on
+    /// the native surface is the same trade `CheckViolation` makes.
+    ForeignKeyViolation {
+        table: String,
+        /// The `CONSTRAINT <name>` it was declared with, when it had one.
+        constraint: Option<String>,
+    },
     /// An INSERT/UPDATE row failed a row-level-security `WITH CHECK` policy
     /// (design/DESIGN-MULTIDB.md §3.7). Deliberately carries NO predicate text — the
     /// policy source may embed thresholds/allow-lists (§6.6).
@@ -196,6 +210,10 @@ impl fmt::Display for Error {
             Error::PrimaryKeyViolation { table } => {
                 write!(f, "PRIMARY KEY violation in {table}")
             }
+            Error::ForeignKeyViolation { table, constraint } => match constraint {
+                Some(c) => write!(f, "FOREIGN KEY violation: {table} ({c})"),
+                None => write!(f, "FOREIGN KEY violation: {table}"),
+            },
             Error::WriteRejected { table } => {
                 write!(f, "write to {table} rejected by a constraint")
             }

@@ -424,6 +424,7 @@ fn stale_plan_surfaces_plan_invalidated() {
         dead: false,
         implicit_rowid: false,
         kind: mpedb_types::TableKind::Standard,
+        foreign_keys: Vec::new(),
     }])
     .unwrap();
     let foreign = mpedb_sql::prepare(sql, &other_schema).unwrap();

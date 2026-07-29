@@ -59,6 +59,11 @@ pub struct CreateColumnSpec {
     /// before the DDL commits. `VIRTUAL` is the default when neither word
     /// follows, matching sqlite.
     pub generated: Option<(String, mpedb_types::GeneratedKind)>,
+    /// The column-level `REFERENCES <t> […]` shorthand. Kept on the COLUMN
+    /// rather than hoisted by the parser because `parse_column_def` is shared
+    /// with `ALTER TABLE ADD COLUMN`, which has no table spec to hoist into;
+    /// each caller decides what to do with it.
+    pub references: Option<ForeignKeySpec>,
 }
 
 /// `CREATE TABLE <name> (col TYPE [cons…], …[, PRIMARY KEY (a, b)]
@@ -77,6 +82,34 @@ pub struct CreateTableSpec {
     /// name any column, so unlike a column CHECK it belongs to no single
     /// column; the facade folds them into one row-level constraint.
     pub checks: Vec<String>,
+    /// `FOREIGN KEY (…) REFERENCES …`, both the table-level form and the
+    /// column-level `REFERENCES` shorthand, in declaration order. Names, not
+    /// ordinals — the parser has no catalog; the facade resolves them.
+    pub foreign_keys: Vec<ForeignKeySpec>,
+}
+
+/// One parsed `REFERENCES` clause, still in NAMES. The facade resolves it
+/// against the live catalog into a [`mpedb_types::ForeignKeyDef`], which is
+/// where a missing table or a non-unique parent key becomes an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeySpec {
+    /// Child columns, in key order. One entry for the column-level shorthand.
+    pub columns: Vec<String>,
+    pub parent: String,
+    /// Parent columns. EMPTY means `REFERENCES t` with no list, which sqlite
+    /// resolves to the parent's PRIMARY KEY — the resolution needs the catalog,
+    /// so it does not happen here.
+    pub parent_columns: Vec<String>,
+    pub on_delete: mpedb_types::FkAction,
+    pub on_update: mpedb_types::FkAction,
+    /// `DEFERRABLE INITIALLY DEFERRED`. `NOT DEFERRABLE` and a bare
+    /// `DEFERRABLE` both mean immediate, matching sqlite.
+    pub deferred: bool,
+    /// From `CONSTRAINT <name> FOREIGN KEY …`. Unlike the other table
+    /// constraints, whose names are parsed and dropped, an FK's name is KEPT:
+    /// it is what `PRAGMA foreign_key_list` reports and what a violation
+    /// message quotes.
+    pub name: Option<String>,
 }
 
 /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] <name> USING fts5(<col>, …

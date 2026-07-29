@@ -56,15 +56,15 @@
 //! emits one `mpedb-ring-batch` stderr line per committed batch (never
 //! enable in throughput arms — the writes perturb timing).
 
-use crate::exec::{exec_stmt_triggered, resolve_part, WriteCtx};
-use crate::trigger::TriggerSet;
+use crate::exec::{exec_stmt_triggered, resolve_part, TxnCtx, WriteCtx};
+use crate::trigger::WriteRules;
 use crate::{Database, ExecResult};
 use mpedb_core::{row, PendingIntent, WriteTxn};
 use mpedb_sql::{AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
 use mpedb_types::expr::{Instr, ScalarFn};
 use mpedb_types::value::{read_value, write_value};
 use mpedb_types::{
-    keycode, Concurrency, DefaultExpr, Error, KeyAccess, KeyPart, PlanHash, Result, Value,
+    keycode, Concurrency, DefaultExpr, Error, KeyAccess, KeyPart, PlanHash, Result, Schema, Value,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -718,12 +718,50 @@ pub(crate) fn hint_notify_keys(txn: &mut WriteTxn<'_>, plan: &CompiledPlan, para
     }
 }
 
+/// Settle the `DEFERRABLE INITIALLY DEFERRED` violations this statement held
+/// over — the autocommit half of the rule `WriteSession::commit` implements for
+/// an explicit transaction (#194).
+///
+/// **Autocommit is a transaction too.** A statement outside `BEGIN` has an
+/// IMPLICIT commit, and sqlite decides the deferred keys there: MEASURED
+/// against sqlite 3.45.1, a lone `INSERT` naming a missing parent is refused
+/// and no row lands. Missing this is a wrong answer, not a missing test — the
+/// row is accepted.
+///
+/// It sits per STATEMENT rather than at the three `txn.commit()` sites below
+/// because a ring batch is many autocommit statements sharing one commit: one
+/// member's dangling key must fail that member and no one else. `exec_own` and
+/// `execute_prepared` are the only two autocommit statement executors, so these
+/// are the only two places it belongs.
+///
+/// A violation here failed a statement that already applied its rows, so it
+/// raises `partial`: the leader's per-member undo must consult `undo_is_exact`
+/// rather than assume nothing landed.
+fn settle_stmt_deferred(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    partial: &mut bool,
+) -> Result<()> {
+    let pending = crate::exec::take_fk_deferred();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    crate::fk::settle_deferred(ctx, schema, &pending).inspect_err(|_| *partial = true)
+}
+
+/// Drop what a FAILED statement held over. Its rows are being rolled back, so
+/// its violations are not this thread's next statement's problem — leaving them
+/// would turn a rolled-back row into a false refusal later.
+fn drop_stmt_deferred() {
+    let _ = crate::exec::take_fk_deferred();
+}
+
 fn exec_own(
     db: &Database,
     txn: &mut WriteTxn<'_>,
     plan: &CompiledPlan,
     params: &[Value],
-    triggers: &TriggerSet,
+    triggers: &WriteRules,
     partial: &mut bool,
 ) -> Result<ExecResult> {
     let tables = db.host_tables(plan);
@@ -734,8 +772,14 @@ fn exec_own(
     let colls: Option<&dyn mpedb_types::HostColls> =
         tables.as_ref().map(|(_, _, c)| c as &dyn mpedb_types::HostColls);
     hint_notify_keys(txn, plan, params);
+    let bundle = db.schema();
     let mut ctx = WriteCtx::new(txn, host, aggs, colls);
-    exec_stmt_triggered(&mut ctx, &db.schema(), plan, params, partial, triggers, 0)
+    let out = exec_stmt_triggered(&mut ctx, &bundle, plan, params, partial, triggers, 0);
+    let Ok(out) = out else {
+        drop_stmt_deferred();
+        return out;
+    };
+    settle_stmt_deferred(&mut ctx, &bundle, partial).map(|()| out)
 }
 
 /// Execute one prepared foreign intent inside the leader's transaction.
@@ -749,14 +793,26 @@ fn execute_prepared(
     txn: &mut WriteTxn<'_>,
     plan: &CompiledPlan,
     params: &[Value],
-    triggers: &TriggerSet,
+    triggers: &WriteRules,
     partial: &mut bool,
 ) -> Result<u64> {
     hint_notify_keys(txn, plan, params);
-    match exec_stmt_triggered(txn, &db.schema(), plan, params, partial, triggers, 0)? {
-        ExecResult::Affected(n) => Ok(n),
-        _ => Err(Error::Internal("write plan returned rows".into())),
-    }
+    let bundle = db.schema();
+    let out = exec_stmt_triggered(txn, &bundle, plan, params, partial, triggers, 0);
+    let n = match out {
+        Ok(ExecResult::Affected(n)) => n,
+        Ok(_) => {
+            drop_stmt_deferred();
+            return Err(Error::Internal("write plan returned rows".into()));
+        }
+        Err(e) => {
+            drop_stmt_deferred();
+            return Err(e);
+        }
+    };
+    // This intent is its enqueuer's WHOLE transaction — settle it here, not at
+    // the leader's group commit, so a dangling key fails this member alone.
+    settle_stmt_deferred(txn, &bundle, partial).map(|()| n)
 }
 
 /// Can the cheap per-statement savepoint undo this FAILED statement exactly,
@@ -912,6 +968,12 @@ fn optimistic_eligible(db: &Database, plan: &CompiledPlan) -> bool {
         // The blind-apply path never calls the executor, so it would skip firing
         // ANY trigger — BEFORE or AFTER, insert/update/delete — route such tables
         // through the serial executor instead.
+        return false;
+    }
+    if db.table_has_foreign_key(table) {
+        // Same reason (#194): the blind path would skip the parent probe and
+        // every ON DELETE/UPDATE action. Fail-closed on error, like the
+        // trigger test above.
         return false;
     }
     match &plan.stmt {
@@ -1187,7 +1249,7 @@ fn tname(db: &Database, table: u32) -> String {
 /// Plain serial execute of one statement under a fresh writer lock — the
 /// optimistic fallback (ineligible statements and exhausted-retry conflicts).
 fn serial_execute(db: &Database, plan: &CompiledPlan, params: &[Value]) -> Result<ExecResult> {
-    let triggers = db.trigger_set()?;
+    let triggers = db.write_rules()?;
     let mut txn = db.engine.begin_write_deadline(db.busy_deadline())?;
     let mut partial = false;
     match exec_own(db, &mut txn, plan, params, &triggers, &mut partial) {
@@ -1304,7 +1366,7 @@ pub(crate) fn lead_and_execute(
     // The trigger set to fire from: the leader's own gen-gated set, applied to
     // its own statement AND every foreign intent it drains (DESIGN-TRIGGERS
     // §4.5). Built here so the whole round shares one set.
-    let triggers = db.trigger_set()?;
+    let triggers = db.write_rules()?;
     if !ring_enabled(db) {
         // pure direct path: no scans, no staging — nobody can be enqueued
         // (enqueue is gated identically, and durability is file-frozen so
@@ -1505,6 +1567,7 @@ mod tests {
             dead: false,
             implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
+            foreign_keys: Vec::new(),
         };
         Schema::new(vec![table("a"), table("b")]).unwrap()
     }

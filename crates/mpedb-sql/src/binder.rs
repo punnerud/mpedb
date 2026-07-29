@@ -4075,6 +4075,7 @@ mod tests {
             dead: false,
             implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -4483,6 +4484,7 @@ mod tests {
             dead: false,
             implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
+            foreign_keys: Vec::new(),
         };
         let sc = Scope {
             names: vec![a.name.clone(), b.name.clone()],
@@ -4526,6 +4528,7 @@ mod tests {
             dead: false,
             implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
+            foreign_keys: Vec::new(),
         };
         let sc = Scope {
             names: vec![a.name.clone(), b.name.clone()],

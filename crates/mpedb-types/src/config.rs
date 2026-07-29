@@ -270,6 +270,11 @@ pub struct DbOptions {
     /// travels with the data's origin. A per-process compilation option like
     /// `durability`, so it lives here rather than in the file-frozen schema.
     pub bare_group_by: BareGroupBy,
+    /// Initial `PRAGMA foreign_keys` for connections opened from this config
+    /// (`[compat] foreign_keys`, default false — sqlite's default). A
+    /// per-process option like `durability`: the FILE never records whether
+    /// keys were enforced, only that they were declared.
+    pub foreign_keys: bool,
     /// This process's role in a sync topology (`[sync] role`, #157):
     /// `standalone` (default), `replica` or `authority`.
     ///
@@ -392,17 +397,36 @@ struct RawCompat {
     /// `"sqlite"` (lenient bare columns, the default) or `"postgres"` (strict).
     #[serde(default)]
     bare_group_by: Option<String>,
+    /// Initial `PRAGMA foreign_keys` for connections opened from this config
+    /// (#194). Default FALSE — sqlite's own default, and the only value that
+    /// leaves an existing database's write behaviour unchanged. A connection
+    /// can still flip it at runtime.
+    #[serde(default)]
+    foreign_keys: Option<bool>,
+}
+
+/// The resolved `[compat]` section.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompatOptions {
+    pub bare_group_by: BareGroupBy,
+    pub foreign_keys: bool,
 }
 
 impl RawCompat {
-    fn resolve(this: Option<&RawCompat>) -> Result<BareGroupBy> {
-        match this.and_then(|c| c.bare_group_by.as_deref()) {
-            None | Some("sqlite") => Ok(BareGroupBy::Sqlite),
-            Some("postgres") => Ok(BareGroupBy::Postgres),
-            Some(other) => Err(Error::Config(format!(
-                "compat.bare_group_by must be sqlite|postgres, got `{other}`"
-            ))),
-        }
+    fn resolve(this: Option<&RawCompat>) -> Result<CompatOptions> {
+        let bare_group_by = match this.and_then(|c| c.bare_group_by.as_deref()) {
+            None | Some("sqlite") => BareGroupBy::Sqlite,
+            Some("postgres") => BareGroupBy::Postgres,
+            Some(other) => {
+                return Err(Error::Config(format!(
+                    "compat.bare_group_by must be sqlite|postgres, got `{other}`"
+                )))
+            }
+        };
+        Ok(CompatOptions {
+            bare_group_by,
+            foreign_keys: this.and_then(|c| c.foreign_keys).unwrap_or(false),
+        })
     }
 }
 
@@ -574,12 +598,12 @@ impl Config {
         let raw: RawConfig =
             toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
         let runtime = RawRuntime::resolve(raw.runtime.as_ref());
-        let bare_group_by = RawCompat::resolve(raw.compat.as_ref())?;
+        let compat = RawCompat::resolve(raw.compat.as_ref())?;
         let (sync_role, sync_upstream) = match raw.sync {
             Some(s) => (s.role, s.upstream),
             None => (None, None),
         };
-        raw_to_config(raw.database, raw.tables, runtime, bare_group_by, sync_role, sync_upstream)
+        raw_to_config(raw.database, raw.tables, runtime, compat, sync_role, sync_upstream)
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Config> {
@@ -595,7 +619,7 @@ fn raw_to_config(
     db: RawDatabase,
     raw_tables: Vec<RawTable>,
     runtime: RuntimeLimits,
-    bare_group_by: BareGroupBy,
+    compat: CompatOptions,
     sync_role: Option<String>,
     sync_upstream: Option<String>,
 ) -> Result<Config> {
@@ -763,6 +787,9 @@ fn raw_to_config(
                 // Config-defined tables are always ordinary; FTS tables are
                 // created live via `CREATE VIRTUAL TABLE` (design/DESIGN-FTS.md).
                 kind: crate::schema::TableKind::Standard,
+                // The config declares one table's SHAPE. A foreign key is a
+                // relationship BETWEEN two, and arrives with `CREATE TABLE`.
+                foreign_keys: Vec::new(),
             });
         }
 
@@ -787,7 +814,8 @@ fn raw_to_config(
                 max_join_cells: runtime.max_join_cells,
                 max_query_threads: runtime.max_query_threads,
                 require_policy,
-                bare_group_by,
+                bare_group_by: compat.bare_group_by,
+                foreign_keys: compat.foreign_keys,
                 sync_role: sync_role.unwrap_or_else(|| "standalone".to_string()),
                 sync_upstream,
             },
@@ -892,7 +920,7 @@ impl WorkspaceConfig {
                     ));
                 }
                 let runtime = RawRuntime::resolve(raw.runtime.as_ref());
-                let bare_group_by = RawCompat::resolve(raw.compat.as_ref())?;
+                let compat = RawCompat::resolve(raw.compat.as_ref())?;
                 let mut members = Vec::with_capacity(raw.databases.len());
                 let mut seen_alias = std::collections::HashSet::new();
                 let mut seen_path = std::collections::HashSet::new();
@@ -916,7 +944,7 @@ impl WorkspaceConfig {
                     // per member — a workspace-wide `[sync]` would have to mean
                     // something different for each member and therefore means
                     // nothing.
-                    let config = raw_to_config(db, tables, runtime, bare_group_by, None, None)?;
+                    let config = raw_to_config(db, tables, runtime, compat, None, None)?;
                     if !seen_path.insert(config.options.path.clone()) {
                         return Err(Error::Config(format!(
                             "two workspace members map to the same file `{}`",

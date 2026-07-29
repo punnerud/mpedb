@@ -753,8 +753,25 @@ fn find_table<'a>(schema: &'a mpedb::Schema, name: &str) -> Option<&'a mpedb::Ta
         .find(|t| t.name.eq_ignore_ascii_case(name))
 }
 
+/// sqlite's spelling of an FK action in `foreign_key_list`.
+fn fk_action_name(a: mpedb::FkAction) -> &'static str {
+    match a {
+        mpedb::FkAction::NoAction => "NO ACTION",
+        mpedb::FkAction::Restrict => "RESTRICT",
+        mpedb::FkAction::Cascade => "CASCADE",
+        mpedb::FkAction::SetNull => "SET NULL",
+        mpedb::FkAction::SetDefault => "SET DEFAULT",
+    }
+}
+
 fn cols(names: &[&str]) -> Vec<String> {
     names.iter().map(|s| s.to_string()).collect()
+}
+
+/// [`cols`] for callers outside this module (the FK pragmas, answered in
+/// `lib.rs` because they need the connection).
+pub(crate) fn pragma_cols(names: &[&str]) -> Vec<String> {
+    cols(names)
 }
 
 /// Answer a `PRAGMA` statement. Returns `(columns, rows)`; an unknown pragma is
@@ -772,6 +789,7 @@ pub fn pragma(
     schema: &mpedb::Schema,
     sql: &str,
     busy_timeout_ms: &mut i32,
+    fk_on: &bool,
     idx: &IndexRecords,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>), DbError> {
     let (name, arg) = parse_pragma(sql);
@@ -920,11 +938,47 @@ pub fn pragma(
             }
             Ok((cols_out, vec![]))
         }
-        "foreign_key_list" => Ok((
-            cols(&["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"]),
-            vec![],
-        )),
-        "foreign_key_check" => Ok((cols(&["table", "rowid", "parent", "fkid"]), vec![])),
+        // Column ORDER is sqlite's, and it is not the order the words appear
+        // in the DDL: `on_update` comes BEFORE `on_delete` (verified against
+        // the 3.45.1 binary). `match` is always "NONE" — MATCH SIMPLE is the
+        // only mode either engine implements.
+        "foreign_key_list" => {
+            let cols_out =
+                cols(&["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"]);
+            let Some(t) = arg.as_deref().and_then(|a| find_table(schema, a)) else {
+                return Ok((cols_out, vec![]));
+            };
+            let mut rows = Vec::new();
+            // sqlite numbers keys from the LAST declared one down to 0, so the
+            // first `REFERENCES` in the DDL has the highest id. Reversing keeps
+            // a consumer that sorts by id (Django's introspection does) in
+            // declaration order.
+            let n = t.foreign_keys.len();
+            for (i, fk) in t.foreign_keys.iter().enumerate() {
+                let id = (n - 1 - i) as i64;
+                for (seq, &c) in fk.columns.iter().enumerate() {
+                    rows.push(vec![
+                        Value::Int(id),
+                        Value::Int(seq as i64),
+                        Value::Text(fk.parent.clone()),
+                        Value::Text(
+                            t.columns.get(c as usize).map(|c| c.name.clone()).unwrap_or_default(),
+                        ),
+                        // An empty parent list means "the parent's PRIMARY
+                        // KEY", which sqlite reports as NULL here rather than
+                        // resolving — the parent may not exist yet.
+                        match fk.parent_columns.get(seq) {
+                            Some(n) => Value::Text(n.clone()),
+                            None => Value::Null,
+                        },
+                        Value::Text(fk_action_name(fk.on_update).into()),
+                        Value::Text(fk_action_name(fk.on_delete).into()),
+                        Value::Text("NONE".into()),
+                    ]);
+                }
+            }
+            Ok((cols_out, rows))
+        }
         // `busy_timeout` is REAL on this shim: the same milliseconds
         // `sqlite3_busy_timeout()` sets, honoured by the BUSY retry loop AND —
         // via the caller mirroring it into `Database::set_busy_timeout` (#109)
@@ -943,13 +997,14 @@ pub fn pragma(
         // Getters that a consumer may read: return a single conventional value.
         // A setter form (`= value`) returns no rows, as sqlite does.
         //
-        // `foreign_keys` answers 0 — which is BOTH sqlite's own default and the
-        // literal truth: mpedb parses `REFERENCES` and discards it, enforcing no
-        // foreign key. The setter is a no-op, so `PRAGMA foreign_keys = ON`
-        // followed by a read still reports 0. That divergence is deliberate:
-        // reporting 1 would tell a consumer its FK violations will be caught
-        // when they will not. See C-API-COMPAT gap D11.
-        "foreign_keys" if arg.is_none() => Ok((cols(&["foreign_keys"]), vec![vec![Value::Int(0)]])),
+        // `foreign_keys` is REAL since #194 — both directions. The SETTER is
+        // handled by the caller (it needs to know whether a transaction is
+        // open, which is where sqlite makes it a silent no-op); this arm only
+        // reports the connection's live state.
+        "foreign_keys" if arg.is_none() => Ok((
+            cols(&["foreign_keys"]),
+            vec![vec![Value::Int(i64::from(*fk_on))]],
+        )),
         "journal_mode" => Ok((cols(&["journal_mode"]), vec![vec![Value::Text("memory".into())]])),
         "user_version" if arg.is_none() => {
             Ok((cols(&["user_version"]), vec![vec![Value::Int(0)]]))

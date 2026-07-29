@@ -159,6 +159,7 @@ mod tests {
                 dead: false,
                 kind: TableKind::Standard,
                 implicit_rowid: false,
+                foreign_keys: Vec::new(),
             })
             .collect();
         let schema = Schema::new(tables).unwrap();

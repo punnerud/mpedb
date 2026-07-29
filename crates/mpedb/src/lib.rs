@@ -82,6 +82,7 @@ mod tier;
 mod backtest;
 pub mod colseg;
 mod derived;
+mod fk;
 mod trigger;
 mod workspace;
 
@@ -117,13 +118,15 @@ pub use mpedb_types::model::WorkloadModel;
 /// each solved it differently.
 pub use mpedb_types::toml_escape;
 pub use mpedb_types::{
-    BudgetKind, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, Footprint,
+    BudgetKind, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, FkAction, Footprint,
+    ForeignKeyDef,
     HostAggState, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema,
     TableDef, TableSet, Value, MAX_DB_SIZE_MB,
 };
 
 use exec::{exec_stmt, ChargeMode, ReadCtx};
 pub use exec::take_last_insert_rowid;
+pub use fk::FkCheckRow;
 use mpedb_core::{CheckPrograms, Engine, WriteTxn};
 use mpedb_sql::{CompiledPlan, HostUdfSet, PlanStmt};
 use registry::{decode_registry_plan, patched_last_used, plan_subkey};
@@ -728,7 +731,12 @@ pub struct Database {
     /// like the plan cache: `(gen, set)`, rebuilt only when a `CREATE`/`DROP
     /// TRIGGER` (here or in another process) moves the gen. `None` = not yet
     /// built. Consulted by the write executor to fire `AFTER INSERT` triggers.
-    trigger_cache: RwLock<Option<(u64, Arc<trigger::TriggerSet>)>>,
+    rules_cache: RwLock<Option<(u64, bool, Arc<trigger::WriteRules>)>>,
+    /// `PRAGMA foreign_keys` for THIS connection (#194). OFF by default —
+    /// sqlite's default, and the only one that leaves an existing database's
+    /// behaviour unchanged. `[compat] foreign_keys = true` in the config flips
+    /// the initial value; the pragma flips it at runtime.
+    fk_enforce: std::sync::atomic::AtomicBool,
     /// Table ids this process declared `require_policy = true` for
     /// (DESIGN-MULTIDB §6.3). Resolved from names ONCE at open — so a typo or a
     /// renamed table fails immediately and loudly, rather than silently
@@ -860,7 +868,12 @@ impl Database {
             spell_cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             conn_id: next_conn_id(),
-            trigger_cache: RwLock::new(None),
+            rules_cache: RwLock::new(None),
+            // No config, so sqlite's own default: OFF. A tool that attaches a
+            // file config-free has not asked for enforcement, and turning it on
+            // would change what `dump` and the mirror daemon are allowed to
+            // write mid-import.
+            fk_enforce: std::sync::atomic::AtomicBool::new(false),
             path: path.to_path_buf(),
             storage: mpedb_types::StorageKind::File,
             // No config, so no §6.3 assertions — consistent with this
@@ -943,7 +956,8 @@ impl Database {
             spell_cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             conn_id: next_conn_id(),
-            trigger_cache: RwLock::new(None),
+            rules_cache: RwLock::new(None),
+            fk_enforce: std::sync::atomic::AtomicBool::new(config.options.foreign_keys),
             path,
             storage,
             require_policy,
@@ -2325,6 +2339,61 @@ impl Database {
         self.run_plan(None, &compiled, &full)
     }
 
+    /// `PRAGMA foreign_keys` for THIS connection (#194): are foreign keys
+    /// enforced on the write path?
+    ///
+    /// Default OFF, which is sqlite's own default — a `REFERENCES` clause is
+    /// parsed, stored and reported by both engines whether or not anything
+    /// checks it. `[compat] foreign_keys = true` sets the initial value from
+    /// config.
+    pub fn fk_enforced(&self) -> bool {
+        self.fk_enforce.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set `PRAGMA foreign_keys` for this connection.
+    ///
+    /// The caller is responsible for sqlite's "no-op inside a transaction"
+    /// rule (measured: sqlite silently keeps the old value rather than
+    /// erroring) — the pragma handler enforces it, because only it knows
+    /// whether a transaction is open.
+    pub fn set_fk_enforced(&self, on: bool) {
+        self.fk_enforce.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Every foreign-key violation standing in the database right now —
+    /// `PRAGMA foreign_key_check` (#194). One row per dangling child:
+    /// `(child table, child primary key, parent table name, key index)`, the
+    /// same four columns sqlite reports.
+    ///
+    /// Read-only and independent of [`Database::fk_enforced`]: the whole point
+    /// is to audit a database that was filled with enforcement OFF, which is
+    /// exactly what Django's migration runner does.
+    pub fn foreign_key_check(
+        &self,
+        table: Option<&str>,
+    ) -> Result<Vec<FkCheckRow>> {
+        let bundle = self.schema();
+        let only = match table {
+            None => None,
+            Some(name) => match bundle
+                .schema
+                .tables
+                .iter()
+                .find(|t| !t.dead && t.name.eq_ignore_ascii_case(name))
+            {
+                Some(t) => Some(t.id),
+                // sqlite answers an empty set for an unknown table rather than
+                // erroring.
+                None => return Ok(Vec::new()),
+            },
+        };
+        let txn = self.engine.begin_read()?;
+        let mut ctx = exec::ReadCtx(&txn, None, None, None, exec::ChargeMode::PerRow);
+        let out = fk::check_all(&mut ctx, &bundle.schema, only);
+        txn.finish()?;
+        out
+    }
+
     /// Bound every writer-lock wait on this handle (#109). `None` (the
     /// default) blocks indefinitely — mpedb's historical native behavior.
     /// `Some(t)` makes [`Database::begin`], autocommit DML/DDL, and the other
@@ -3256,16 +3325,32 @@ impl WriteSession<'_> {
     /// A poisoned session (see the type-level docs) refuses: the transaction
     /// is rolled back and [`Error::Unsupported`] is returned, so a partially
     /// applied statement can never be persisted.
-    pub fn commit(self) -> Result<()> {
+    pub fn commit(mut self) -> Result<()> {
         if self.poisoned {
+            exec::take_fk_deferred();
             self.txn.abort();
             return Err(poisoned_err());
+        }
+        // DEFERRABLE INITIALLY DEFERRED keys are settled HERE, before anything
+        // is made durable (#194): a violation the transaction fixed in between
+        // is not a violation, and one it did not is a failed COMMIT that takes
+        // the whole transaction with it — sqlite's behaviour exactly.
+        let pending = exec::take_fk_deferred();
+        if !pending.is_empty() {
+            let bundle = self.db.schema();
+            let mut ctx = exec::WriteCtx::new(&mut self.txn, None, None, None);
+            if let Err(e) = fk::settle_deferred(&mut ctx, &bundle.schema, &pending) {
+                self.txn.abort();
+                return Err(e);
+            }
         }
         self.txn.commit()
     }
 
     /// Discard everything written through this session.
     pub fn rollback(self) {
+        // Held-over violations belong to the transaction that made them.
+        exec::take_fk_deferred();
         self.txn.abort()
     }
 
@@ -3645,7 +3730,7 @@ impl WriteSession<'_> {
         let mut full = full;
         ring_exec::rebase_splice_params(&mut self.txn, plan, full.to_mut(), origin)?;
         ring_exec::widen_guard(&mut self.txn, plan, &full);
-        let triggers = self.db.trigger_set()?;
+        let triggers = self.db.write_rules()?;
         // Execute against the session's OWN schema view (== the txn's captured
         // bundle), so a statement touching a table this session created/altered
         // earlier resolves against the shape it will commit with (#95). For a
@@ -4683,6 +4768,7 @@ primary_key = ["id"]
             dead: false,
             implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
         let foreign = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1", &other_schema).unwrap();
@@ -5090,6 +5176,7 @@ primary_key = ["id"]
             dead: false,
             implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
         let foreign = mpedb_sql::prepare(sql, &foreign_schema).unwrap();

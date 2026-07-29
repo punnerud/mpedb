@@ -339,6 +339,106 @@ pub struct TableDef {
     /// shape: an explicit `CREATE TABLE t(rowid INTEGER PRIMARY KEY)` has the
     /// same columns but a VISIBLE rowid, so the flag must be stored.
     pub implicit_rowid: bool,
+    /// FOREIGN KEYs declared on this table, in declaration order. Empty for
+    /// almost every table — and the write path's first question is
+    /// `is_empty()`, so a table without one pays NOTHING for the feature.
+    ///
+    /// On the wire since canonical-bytes **v12**.
+    pub foreign_keys: Vec<ForeignKeyDef>,
+}
+
+/// What a FOREIGN KEY does when the row it points at moves or goes away.
+///
+/// All five of sqlite's names are kept, because a schema that declares
+/// `ON DELETE CASCADE` and silently gets `NO ACTION` is worse than one that
+/// refuses to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FkAction {
+    /// The default. For an IMMEDIATE key this is indistinguishable from
+    /// `Restrict` — both refuse — but they are stored apart so the deferred
+    /// mode does not have to re-derive which the author wrote.
+    #[default]
+    NoAction,
+    /// Refuse while any child row still references the parent.
+    Restrict,
+    /// Delete the children too (`ON DELETE`), or carry the new key into them
+    /// (`ON UPDATE`).
+    Cascade,
+    /// Set the child's referencing columns to NULL.
+    SetNull,
+    /// Set them to their column DEFAULT (NULL when none is declared).
+    SetDefault,
+}
+
+impl FkAction {
+    pub fn tag(self) -> u8 {
+        match self {
+            FkAction::NoAction => 0,
+            FkAction::Restrict => 1,
+            FkAction::Cascade => 2,
+            FkAction::SetNull => 3,
+            FkAction::SetDefault => 4,
+        }
+    }
+    /// `None` (→ `Corrupt`) for an unknown byte, like every other wire tag here.
+    pub fn from_tag(t: u8) -> Option<FkAction> {
+        Some(match t {
+            0 => FkAction::NoAction,
+            1 => FkAction::Restrict,
+            2 => FkAction::Cascade,
+            3 => FkAction::SetNull,
+            4 => FkAction::SetDefault,
+            _ => return None,
+        })
+    }
+}
+
+/// One FOREIGN KEY: this table's `columns` must match a live row of `parent`.
+///
+/// `REFERENCES` was parsed and DISCARDED until 2026-07-29 — and that was not a
+/// shrug. sqlite's own default is `PRAGMA foreign_keys = OFF`, under which
+/// sqlite ALSO parses a foreign key and enforces nothing, so parse-and-drop was
+/// sqlite's default behaviour exactly. It was never a wrong answer; it just
+/// meant mpedb had no `ON` to offer.
+///
+/// # Why the parent is a NAME and not a table id
+///
+/// Everything else the catalog stores is resolved to ordinals at DDL time, and
+/// the first draft of this type did the same. It is wrong, and sqlite says so
+/// (measured, 3.45.1):
+///
+/// ```text
+/// CREATE TABLE c (id INTEGER PRIMARY KEY, p INTEGER REFERENCES par(id));  -- OK
+/// CREATE TABLE par (id INTEGER PRIMARY KEY);                              -- OK
+/// INSERT INTO c VALUES (2, 5);                                            -- now checked
+/// ```
+///
+/// A forward reference is LEGAL, and it is not exotic — a schema migration
+/// that creates tables in dependency-free order (Django's, for one) relies on
+/// it. Resolving at DDL time would mean refusing the first statement. So the
+/// parent side stays in names and is resolved at WRITE time, which is also
+/// where sqlite reports `no such table` and `foreign key mismatch`. The CHILD
+/// columns are ordinals: that table is the one being defined, so a name that
+/// does not resolve is a `CREATE TABLE` error there too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyDef {
+    /// Child column ordinals, in key order.
+    pub columns: Vec<u16>,
+    /// The referenced table's NAME (see the type docs). Case is preserved as
+    /// written; resolution is case-insensitive, like every other table lookup.
+    pub parent: String,
+    /// Parent column NAMES, in the SAME key order. EMPTY means `REFERENCES t`
+    /// with no list, which resolves to the parent's PRIMARY KEY — and the
+    /// parent may not exist yet, so that resolution cannot happen here.
+    pub parent_columns: Vec<String>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+    /// `DEFERRABLE INITIALLY DEFERRED` — checked at COMMIT rather than at the
+    /// end of the statement.
+    pub deferred: bool,
+    /// The constraint's declared name, if it had one (`CONSTRAINT fk_x FOREIGN
+    /// KEY …`). Carried for the error message, which is what a user greps.
+    pub name: Option<String>,
 }
 
 impl TableDef {
@@ -354,6 +454,7 @@ impl TableDef {
             dead: true,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }
     }
 }
@@ -1430,7 +1531,7 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(11u8); // schema encoding version (v11: IndexDef.name)
+        buf.push(12u8); // schema encoding version (v12: TableDef.foreign_keys)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -1529,6 +1630,35 @@ impl Schema {
                     }
                 }
             }
+            // FOREIGN KEYs (v12). Almost every table has none, so the common
+            // case is a single zero u16 — the same "one length word" price the
+            // index list already pays.
+            buf.extend_from_slice(&(t.foreign_keys.len() as u16).to_le_bytes());
+            for fk in &t.foreign_keys {
+                buf.extend_from_slice(&(fk.columns.len() as u16).to_le_bytes());
+                for &c in &fk.columns {
+                    buf.extend_from_slice(&c.to_le_bytes());
+                }
+                write_str(&mut buf, &fk.parent);
+                // The LENGTH is written rather than assumed equal to
+                // `columns.len()`: a decoder must not trust two counts to agree
+                // when one byte of a hostile mapping can make them disagree.
+                // Zero is legal here and means "the parent's PRIMARY KEY".
+                buf.extend_from_slice(&(fk.parent_columns.len() as u16).to_le_bytes());
+                for c in &fk.parent_columns {
+                    write_str(&mut buf, c);
+                }
+                buf.push(fk.on_delete.tag());
+                buf.push(fk.on_update.tag());
+                buf.push(u8::from(fk.deferred));
+                match &fk.name {
+                    None => buf.push(0),
+                    Some(n) => {
+                        buf.push(1);
+                        write_str(&mut buf, n);
+                    }
+                }
+            }
         }
         buf
     }
@@ -1544,7 +1674,7 @@ impl Schema {
         pos += 1;
         // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name.
         // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if !(9..=11).contains(&version) {
+        if !(9..=12).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
@@ -1552,6 +1682,7 @@ impl Schema {
         }
         let has_index_predicate = version >= 10;
         let has_index_name = version >= 11;
+        let has_foreign_keys = version >= 12;
         let ntables = read_u32(buf, &mut pos)? as usize;
         if ntables > MAX_TABLES {
             return Err(Error::Corrupt("table count out of range".into()));
@@ -1758,6 +1889,71 @@ impl Schema {
                     }
                 }
             }
+            let mut foreign_keys = Vec::new();
+            if has_foreign_keys {
+                let nfk = read_u16(buf, &mut pos)? as usize;
+                if nfk > MAX_COLUMNS {
+                    return Err(Error::Corrupt("foreign key count out of range".into()));
+                }
+                for _ in 0..nfk {
+                    let nc = read_u16(buf, &mut pos)? as usize;
+                    if nc == 0 || nc > MAX_COLUMNS {
+                        return Err(Error::Corrupt("fk column count out of range".into()));
+                    }
+                    let mut cols = Vec::with_capacity(nc);
+                    for _ in 0..nc {
+                        cols.push(read_u16(buf, &mut pos)?);
+                    }
+                    let parent = read_str(buf, &mut pos)?;
+                    let npc = read_u16(buf, &mut pos)? as usize;
+                    // The two key sides must line up: a foreign key whose child
+                    // and parent halves differ in width has no meaning, and
+                    // accepting one would hand the write path a zip() that
+                    // silently drops columns. Zero is the one legal
+                    // disagreement — it means the list was not written.
+                    if npc != 0 && npc != nc {
+                        return Err(Error::Corrupt(
+                            "fk parent column count differs from child".into(),
+                        ));
+                    }
+                    let mut pcols = Vec::with_capacity(npc);
+                    for _ in 0..npc {
+                        pcols.push(read_str(buf, &mut pos)?);
+                    }
+                    let on_delete = FkAction::from_tag(*buf.get(pos).ok_or_else(err)?)
+                        .ok_or_else(|| Error::Corrupt("bad fk ON DELETE action".into()))?;
+                    pos += 1;
+                    let on_update = FkAction::from_tag(*buf.get(pos).ok_or_else(err)?)
+                        .ok_or_else(|| Error::Corrupt("bad fk ON UPDATE action".into()))?;
+                    pos += 1;
+                    let deferred = match *buf.get(pos).ok_or_else(err)? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(Error::Corrupt("bad fk deferred flag".into())),
+                    };
+                    pos += 1;
+                    let fk_name = match *buf.get(pos).ok_or_else(err)? {
+                        0 => {
+                            pos += 1;
+                            None
+                        }
+                        1 => {
+                            pos += 1;
+                            Some(read_str(buf, &mut pos)?)
+                        }
+                        _ => return Err(Error::Corrupt("bad fk name tag".into())),
+                    };
+                    foreign_keys.push(ForeignKeyDef {
+                        columns: cols,
+                        parent,
+                        parent_columns: pcols,
+                        on_delete,
+                        on_update,
+                        deferred,
+                        name: fk_name,
+                    });
+                }
+            }
             tables.push(TableDef {
                 id,
                 name,
@@ -1767,6 +1963,7 @@ impl Schema {
                 dead,
                 kind,
                 implicit_rowid,
+                foreign_keys,
             });
         }
         if pos != buf.len() {
@@ -1866,6 +2063,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .unwrap()
     }
@@ -1900,6 +2098,7 @@ mod tests {
                         primary_key: vec![0],
                         indexes: vec![],
                         dead: false, kind: TableKind::Standard, implicit_rowid: false,
+                        foreign_keys: Vec::new(),
                     })
                     .collect(),
             )
@@ -1928,6 +2127,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }]);
         assert!(bad.is_err());
         // reserved prefix
@@ -1947,6 +2147,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }]);
         assert!(bad.is_err());
     }
@@ -1965,7 +2166,9 @@ mod tests {
                 affinity: Affinity::implied_by(ColumnType::Int64),
             nullable: false, unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
         let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
-            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard, implicit_rowid: false };
+            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard, implicit_rowid: false,
+                foreign_keys: Vec::new(),
+            };
 
         let s = Schema::new(vec![tbl("orders"), tbl("users"), tbl("accounts")]).unwrap();
         let got: Vec<(&str, u32)> =
@@ -2004,6 +2207,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None }],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            foreign_keys: Vec::new(),
         };
         // The single-PK column's flags are noise and must normalize away.
         t.columns[0].unique = true;
@@ -2046,6 +2250,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![2], unique: false, predicate: None, name: None }],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
 
@@ -2089,7 +2294,8 @@ mod tests {
             affinity: Affinity::implied_by(ColumnType::Int64),
         };
         TableDef { id: 0, name: n.into(), columns: vec![col("id")],
-            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard, implicit_rowid: false }
+            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard,
+            implicit_rowid: false, foreign_keys: Vec::new() }
     }
 
     #[test]
@@ -2183,7 +2389,7 @@ mod tests {
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
         // The version byte is 9.
-        assert_eq!(s.canonical_bytes()[0], 11);
+        assert_eq!(s.canonical_bytes()[0], 12);
         // A v8 file refuses cleanly (no misread of the new generated bytes).
         let mut v8 = s.canonical_bytes();
         v8[0] = 8;
@@ -2257,6 +2463,7 @@ mod tests {
             dead: false,
             kind: TableKind::Standard,
             implicit_rowid: true,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
         let t = &s.tables[0];
@@ -2291,6 +2498,7 @@ mod tests {
             dead: false,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
         assert_eq!(ipk.tables[0].rowid_name_col("rowid"), Some(0));
@@ -2304,6 +2512,7 @@ mod tests {
             dead: false,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
         assert_eq!(wr.tables[0].rowid_name_col("rowid"), None);
@@ -2311,7 +2520,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 11);
+        assert_eq!(s.canonical_bytes()[0], 12);
 
         // Truncation at every offset is Corrupt, never a panic.
         let bytes = s.canonical_bytes();
@@ -2355,6 +2564,7 @@ mod tests {
             dead: false,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
         let c = &s.tables[0].columns;
@@ -2369,7 +2579,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 11);
+        assert_eq!(s.canonical_bytes()[0], 12);
         // The text is part of the schema identity: `f float` and `f REAL` are
         // the same storage and DIFFERENT schemas, because a consumer keying
         // converters off the decltype sees two different columns.
@@ -2420,6 +2630,7 @@ mod tests {
             dead: false,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
         assert_eq!(s.tables[0].columns[1].collation, Collation::NoCase);
@@ -2428,7 +2639,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 11);
+        assert_eq!(s.canonical_bytes()[0], 12);
 
         // The collation changes the hash: a BINARY `name` is a different schema.
         let mut plain = s.clone();
@@ -2477,6 +2688,7 @@ mod tests {
                 dead: false,
                 kind: TableKind::Standard,
                 implicit_rowid: false,
+                foreign_keys: Vec::new(),
             }])
         };
         // A UNIQUE and a plain index on a NOCASE column are now ACCEPTED (the
@@ -2497,6 +2709,7 @@ mod tests {
             dead: false,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .is_ok());
 
@@ -2519,6 +2732,7 @@ mod tests {
             dead: false,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .unwrap_err();
         assert!(format!("{err}").contains("text"), "{err}");
@@ -2575,13 +2789,14 @@ mod tests {
             dead: false,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
 
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "the compiled program survives byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 11);
+        assert_eq!(s.canonical_bytes()[0], 12);
 
         // It computes, in declaration order, through the decoded schema.
         let mut row = vec![Value::Int(21), Value::Null];
@@ -2624,6 +2839,7 @@ mod tests {
                 dead: false,
                 kind: TableKind::Standard,
                 implicit_rowid: false,
+                foreign_keys: Vec::new(),
             }])
         };
         let a = || ColumnDef { nullable: false, ..plain("a", ColumnType::Int64) };
@@ -2702,6 +2918,7 @@ mod tests {
             dead: false,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            foreign_keys: Vec::new(),
         }])
         .unwrap();
 

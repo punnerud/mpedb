@@ -54,6 +54,70 @@ static EPHEMERAL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A connection: the mpedb engine handle plus sqlite's per-connection state
 /// (open transaction, busy timeout, last error, change counters).
+/// A pragma's answer: `(column names, rows)`.
+type PragmaAnswer = (Vec<String>, Vec<Vec<Value>>);
+
+/// `PRAGMA foreign_keys [= …]` and `PRAGMA foreign_key_check [(t)]` (#194).
+/// `Ok(None)` = not one of these, carry on with the ordinary pragma handler.
+///
+/// Split out from `introspect::pragma` because both need something a pure
+/// schema function does not have: the setter needs to know whether a
+/// transaction is open, and the check needs to run a read.
+fn fk_pragma(
+    c: &mut Sqlite3,
+    sqltext: &str,
+) -> Result<Option<PragmaAnswer>, DbError> {
+    let (name, arg) = introspect::parse_pragma(sqltext);
+    match name.to_ascii_lowercase().as_str() {
+        "foreign_keys" => {
+            let Some(a) = arg.as_deref() else {
+                return Ok(None); // getter: the ordinary handler reports it
+            };
+            // sqlite is a SILENT no-op inside a transaction (measured, 3.45.1:
+            // `BEGIN; PRAGMA foreign_keys=OFF; PRAGMA foreign_keys` still
+            // answers 1). Erroring would be a different answer, not a stricter
+            // one.
+            if c.txn.is_none() {
+                let on = match a.trim().to_ascii_lowercase().as_str() {
+                    "1" | "on" | "yes" | "true" => true,
+                    "0" | "off" | "no" | "false" => false,
+                    // sqlite ignores an unparsable value rather than erroring.
+                    _ => return Ok(Some((Vec::new(), Vec::new()))),
+                };
+                c.db.set_fk_enforced(on);
+            }
+            // A setter returns no rows, as sqlite does.
+            Ok(Some((Vec::new(), Vec::new())))
+        }
+        "foreign_key_check" => {
+            let rows = c
+                .db
+                .foreign_key_check(arg.as_deref())?
+                .into_iter()
+                .map(|(table, pk, parent, fkid)| {
+                    vec![
+                        Value::Text(table),
+                        // sqlite reports the child's ROWID here. A composite or
+                        // non-integer primary key has none, and sqlite answers
+                        // NULL for those too (a WITHOUT ROWID child).
+                        match pk.as_slice() {
+                            [Value::Int(id)] => Value::Int(*id),
+                            _ => Value::Null,
+                        },
+                        Value::Text(parent),
+                        Value::Int(fkid as i64),
+                    ]
+                })
+                .collect();
+            Ok(Some((
+                introspect::pragma_cols(&["table", "rowid", "parent", "fkid"]),
+                rows,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
 pub struct Sqlite3 {
     // `txn` borrows `db` (self-referential via the 'static transmute in
     // `begin`), so it MUST be declared — and therefore dropped — before `db`.
@@ -500,9 +564,19 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                     c.db.schema()
                 }
             };
+            // `PRAGMA foreign_keys [= ON|OFF]` and `PRAGMA foreign_key_check`
+            // (#194) are answered HERE rather than in `introspect`: the setter
+            // must know whether a transaction is open (sqlite makes it a silent
+            // no-op inside one — measured, 3.45.1), and the check must run a
+            // read transaction. Everything else the pragma handler answers is a
+            // pure function of the schema.
+            if let Some((columns, rows)) = fk_pragma(c, sqltext)? {
+                return Ok(Outcome::Rows { columns, rows });
+            }
             let idx = sqlite_index_records(c);
+            let fk_on = c.db.fk_enforced();
             let (columns, rows) =
-                introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms, &idx)?;
+                introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms, &fk_on, &idx)?;
             // `PRAGMA busy_timeout = N` may have moved the knob — mirror it
             // into the engine's writer-lock deadline (#109), same as
             // `sqlite3_busy_timeout`. Unconditional: an atomic store, cheap.

@@ -222,6 +222,7 @@ mod tests {
             dead: false,
             implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
+            foreign_keys: Vec::new(),
         }
     }
 
