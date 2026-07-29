@@ -4,26 +4,23 @@
 //!
 //! Unlike the curated `tests/slt/*.test` runner in `src/slt.rs` (which uses an
 //! mpedb SLT dialect with a `# schema:` header), this binary consumes the
-//! *canonical* corpus files unmodified, bridging the model gap with a shim:
+//! *canonical* corpus files unmodified — and, since 2026-07-29, executes them
+//! unmodified too. The database is opened with a ZERO-table seed and the
+//! corpus's own `CREATE TABLE` / `CREATE INDEX` / `DROP TABLE` run for real.
 //!
-//! - **CREATE TABLE shim**: mpedb has no `CREATE TABLE` (task #47) — pass 1
-//!   scans the file for `CREATE TABLE` statements, loosely parses them
-//!   (affinity-style type mapping: `*INT*`→int64, `*CHAR*/*CLOB*/TEXT`→text,
-//!   `REAL/FLOA/DOUB/NUMERIC/DEC`→float64, typeless→int64) and builds the TOML
-//!   schema the database is opened with. At runtime `CREATE TABLE` becomes a
-//!   shim success, `DROP TABLE` becomes `DELETE FROM t` + "does not exist"
-//!   bookkeeping (so `statement error` on double CREATE/DROP behaves like
-//!   sqlite).
-//! - **Synthetic PK**: corpus tables have no PK and allow duplicate rows;
-//!   every table gets a hidden `rowid_ int64` PK. Every `INSERT ... VALUES`
-//!   without a column list is rewritten to name the declared columns, so the
-//!   PK is omitted and the engine's rowid-alias auto-assign (max+1, sqlite's
-//!   own rule) numbers the rows — a shim-side counter cannot stay in sync
-//!   once a passthrough `INSERT ... SELECT` copies real rowids past it.
-//! - **`SELECT *` rewrite**: a select list of exactly `*` (or `alias.*`) is
-//!   expanded to the declared column list (single table, or an INNER JOIN
-//!   chain), so the synthetic column never leaks into results.
-//! - **`SELECT ALL`** is rewritten to `SELECT` (mpedb has no ALL quantifier).
+//! It did not always. Until #47 (live DDL) and #94 (implicit rowid) shipped,
+//! the runner had to manufacture a TOML schema by pre-scanning the file, give
+//! every table a hidden `rowid_` primary key, rewrite every `INSERT` to skip
+//! that key, expand `SELECT *` so it never leaked, and simulate `DROP TABLE`
+//! as `DELETE FROM`. That shim was the single largest source of "failures" in
+//! the whole corpus: **1 365 of 1 391 recorded refusals were its own doing**,
+//! along with the 4 records flagged as wrong answers, which were cascades from
+//! four `REPLACE INTO` statements its INSERT rewriter did not recognise.
+//! Deleting it moved the corpus from 99,9765 % to **99,99955 %** with **zero**
+//! wrong answers, and every remaining failure is now a named engine gap.
+//!
+//! One rewrite survives: **`SELECT ALL`** → `SELECT` (mpedb has no ALL
+//! quantifier). That is a real surface gap, not a schema workaround.
 //!
 //! Result comparison follows the canonical sqllogictest conventions: one value
 //! per line, NULL as `NULL`, empty string as `(empty)`, `I` via truncation
@@ -57,15 +54,12 @@
 //! file is a full mpedb open + unique-SQL compile, which is slower per stmt
 //! than C sqlite but parallelizes cleanly).
 //!
-//! Known shim limitations (also see the final report):
-//! - INSERT ... SELECT is not rewritten (fails as subquery).
-//! - `SELECT *` in comma-join FROM clauses is not expanded (comma joins are
-//!   unsupported anyway; categorized as comma-join).
+//! Known runner limitations (also see the final report). The first four of the
+//! old six were the shim's and went with it; what is left is about RENDERING,
+//! not about the schema:
 //! - Float rendering uses Rust `{:.3}`, which matches C `%.3f` for f64 in
 //!   practice but is not bit-for-bit proven; `T`-typed floats use a `%.1f`
 //!   approximation of sqlite's text rendering.
-//! - Re-creating a table with a *different* schema in one file poisons it
-//!   (file-authoritative schema); the sampled corpus never does this.
 
 use mpedb_testkit::corpus_baseline as baseline;
 
@@ -412,316 +406,35 @@ fn scan(sql: &str) -> Vec<Tok> {
     toks
 }
 
-// =========================================================== schema shim
+// ====================================================== statement handling
 
-#[derive(Clone)]
-struct TableInfo {
-    /// Name as written in the corpus file.
-    raw_name: String,
-    /// Lowercased for lookups.
-    name: String,
-    /// Declared columns (name, toml type) — NOT including the synthetic PK.
-    cols: Vec<(String, &'static str)>,
-    /// Normalized column signature for re-create comparison.
-    signature: String,
-    exists: bool,
-    poisoned: bool,
-}
-
-/// Loosely parse `CREATE TABLE name(coldefs...)` (canonical corpus shapes:
-/// possibly multi-line, inline constraints, VARCHAR(n)). Returns None if the
-/// statement is not a parseable CREATE TABLE.
-fn parse_create_table(sql: &str) -> Option<TableInfo> {
+/// The corpus statement, as it will be handed to the engine.
+///
+/// This used to be a whole schema shim: a pre-scanned table list, a hidden
+/// `rowid_` primary key per table, an `exists` flag so `DROP TABLE` could be
+/// faked as `DELETE FROM`, an `INSERT` rewriter that named the declared columns
+/// so the synthetic key was skipped, a `SELECT *` expander so it never leaked,
+/// and a `PreparedSql` enum with three non-engine outcomes (`Done`, `SimError`,
+/// `Unsupported`) for the statements none of that could express.
+///
+/// All of it existed because mpedb had no `CREATE TABLE` and no implicit rowid
+/// when the runner was written. Both shipped (#47, #94), and the lifetime table
+/// cap went 64 → 4096 while the heaviest corpus file declares 955. So the
+/// corpus's own DDL is now simply executed, and the measured failures the shim
+/// was itself causing — 1 289 index accumulations (a faked `DROP TABLE` left
+/// every `CREATE INDEX` piled on one live table until the 32-index cap), 72
+/// star-arity refusals (`SELECT *` expansion could not reach into a subquery),
+/// 4 unrecognised `REPLACE INTO`, and the 4 "wrong answers" that cascaded from
+/// those four — are gone, because the thing causing them is gone.
+///
+/// One rewrite survives: `SELECT ALL` → `SELECT`. That is a real (tiny) surface
+/// gap, not a schema workaround.
+fn prepare_statement(sql: &str) -> String {
     let toks = scan(sql);
-    if toks.len() < 4 || toks[0].up != "CREATE" || toks[1].up != "TABLE" {
-        return None;
+    if !toks.is_empty() && toks[0].up == "SELECT" {
+        return strip_select_all(sql);
     }
-    let mut j = 2;
-    if toks.len() > j + 2 && toks[j].up == "IF" && toks[j + 1].up == "NOT" && toks[j + 2].up == "EXISTS"
-    {
-        j += 3;
-    }
-    if !toks[j].is_word {
-        return None;
-    }
-    let raw_name = sql[toks[j].start..toks[j].end].to_string();
-    j += 1;
-    if j >= toks.len() || toks[j].up != "(" {
-        return None;
-    }
-    let body_open = j;
-    // Find the matching close paren (depth of the '(' token itself).
-    let open_depth = toks[body_open].depth;
-    let mut close = None;
-    for (k, t) in toks.iter().enumerate().skip(body_open + 1) {
-        if t.up == ")" && t.depth == open_depth {
-            close = Some(k);
-            break;
-        }
-    }
-    let close = close?;
-    // Split the token range into column defs at depth == open_depth + 1 commas.
-    let inner = &toks[body_open + 1..close];
-    let mut defs: Vec<Vec<&Tok>> = vec![Vec::new()];
-    for t in inner {
-        if t.up == "," && t.depth == open_depth + 1 {
-            defs.push(Vec::new());
-        } else {
-            defs.last_mut().unwrap().push(t);
-        }
-    }
-    let mut cols = Vec::new();
-    for def in &defs {
-        if def.is_empty() {
-            continue;
-        }
-        let first = def[0];
-        if !first.is_word {
-            return None;
-        }
-        // Table-level constraint, not a column.
-        if matches!(
-            first.up.as_str(),
-            "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN" | "CONSTRAINT"
-        ) {
-            continue;
-        }
-        let col_name = sql[first.start..first.end].to_string();
-        if col_name.eq_ignore_ascii_case("rowid_") {
-            return None; // would collide with the synthetic PK
-        }
-        let type_text: String = def[1..]
-            .iter()
-            .take_while(|t| {
-                !matches!(
-                    t.up.as_str(),
-                    "PRIMARY" | "NOT" | "NULL" | "UNIQUE" | "DEFAULT" | "CHECK" | "REFERENCES"
-                        | "COLLATE"
-                )
-            })
-            .map(|t| t.up.clone())
-            .collect::<Vec<_>>()
-            .join(" ");
-        // sqlite affinity rules, mapped onto mpedb's rigid types.
-        let toml_type = if type_text.contains("INT") {
-            "int64"
-        } else if type_text.contains("CHAR") || type_text.contains("CLOB") || type_text.contains("TEXT")
-        {
-            "text"
-        } else if type_text.contains("REAL")
-            || type_text.contains("FLOA")
-            || type_text.contains("DOUB")
-            || type_text.contains("NUMERIC")
-            || type_text.contains("DEC")
-        {
-            "float64"
-        } else {
-            "int64" // typeless / blob: int64 is the least-wrong rigid choice
-        };
-        cols.push((col_name, toml_type));
-    }
-    if cols.is_empty() {
-        return None;
-    }
-    let signature = cols
-        .iter()
-        .map(|(n, t)| format!("{}:{t}", n.to_ascii_lowercase()))
-        .collect::<Vec<_>>()
-        .join(",");
-    Some(TableInfo {
-        name: raw_name.to_ascii_lowercase(),
-        raw_name,
-        cols,
-        signature,
-        exists: false,
-        poisoned: false,
-    })
-}
-
-/// mpedb caps the number of user tables per database at `MAX_TABLES - 8` (4096
-/// total minus an 8-slot system reserve = 4088). Tables beyond the cap are left
-/// out of the schema and every statement touching them is counted under
-/// `engine-table-cap` instead of polluting the other categories. As of the
-/// sparse-footprint change (PLAN_FORMAT 42, design/DESIGN-TABLE-CAP.md) this is
-/// 4088 — no corpus file comes near it, so the category is now a pure backstop.
-const ENGINE_TABLE_CAP: usize = 4088;
-
-struct Shim {
-    tables: Vec<TableInfo>,
-    /// Lowercased names of tables dropped from the schema by the cap.
-    over_cap: Vec<String>,
-}
-
-impl Shim {
-    fn find(&self, name: &str) -> Option<usize> {
-        let lower = name.to_ascii_lowercase();
-        self.tables.iter().position(|t| t.name == lower)
-    }
-
-    fn over_cap_referenced(&self, toks: &[Tok]) -> Option<String> {
-        for t in toks.iter().filter(|t| t.is_word) {
-            let lower = t.up.to_ascii_lowercase();
-            if self.over_cap.contains(&lower) {
-                return Some(lower);
-            }
-        }
-        None
-    }
-
-    /// Any known table that is referenced by `sql` but does not currently
-    /// "exist" (dropped, or not yet created) → sqlite would say "no such
-    /// table". Word-boundary match on the scanner's word tokens.
-    fn missing_table_referenced(&self, toks: &[Tok]) -> Option<String> {
-        for t in toks.iter().filter(|t| t.is_word) {
-            let lower = t.up.to_ascii_lowercase();
-            if let Some(idx) = self.tables.iter().position(|ti| ti.name == lower) {
-                if !self.tables[idx].exists {
-                    return Some(self.tables[idx].raw_name.clone());
-                }
-            }
-        }
-        None
-    }
-}
-
-enum PreparedSql {
-    Run(String),
-    /// Handled entirely by the shim; counts as success.
-    Done,
-    /// Shim-simulated engine error (mirrors sqlite semantics, e.g. "no such
-    /// table"). Counts as an error for expect-error purposes.
-    SimError(String),
-    /// Shim cannot express this statement against a rigid schema.
-    Unsupported(&'static str, String),
-}
-
-impl Shim {
-    fn prepare_statement(&mut self, sql: &str) -> PreparedSql {
-        let toks = scan(sql);
-        if toks.is_empty() {
-            return PreparedSql::Run(sql.to_string());
-        }
-        if let Some(name) = self.over_cap_referenced(&toks) {
-            return PreparedSql::Unsupported(
-                "engine-table-cap",
-                format!("table {name} exceeds mpedb's {ENGINE_TABLE_CAP}-table cap"),
-            );
-        }
-        let head = toks[0].up.as_str();
-        if head == "CREATE" && toks.len() > 1 && toks[1].up == "TABLE" {
-            return self.shim_create(sql, &toks);
-        }
-        if head == "DROP" && toks.len() > 1 && toks[1].up == "TABLE" {
-            return self.shim_drop(sql, &toks);
-        }
-        if let Some(missing) = self.missing_table_referenced(&toks) {
-            return PreparedSql::SimError(format!("no such table: {missing}"));
-        }
-        if head == "INSERT" {
-            return self.shim_insert(sql, &toks);
-        }
-        if head == "SELECT" {
-            return PreparedSql::Run(shim_select(sql, self));
-        }
-        PreparedSql::Run(sql.to_string())
-    }
-
-    fn shim_create(&mut self, sql: &str, toks: &[Tok]) -> PreparedSql {
-        let Some(parsed) = parse_create_table(sql) else {
-            return PreparedSql::Run(sql.to_string()); // engine will reject; categorized
-        };
-        let if_not_exists = toks.len() > 4 && toks[2].up == "IF";
-        match self.find(&parsed.name) {
-            Some(idx) => {
-                let t = &mut self.tables[idx];
-                if t.poisoned {
-                    return PreparedSql::Unsupported(
-                        "table-recreate",
-                        format!("table {} re-created with a different schema", t.raw_name),
-                    );
-                }
-                if t.exists {
-                    if if_not_exists {
-                        return PreparedSql::Done;
-                    }
-                    return PreparedSql::SimError(format!("table {} already exists", t.raw_name));
-                }
-                if t.signature != parsed.signature {
-                    t.poisoned = true;
-                    return PreparedSql::Unsupported(
-                        "table-recreate",
-                        format!("table {} re-created with a different schema", t.raw_name),
-                    );
-                }
-                t.exists = true;
-                // Re-create after a DROP: make sure the fixed table is empty.
-                PreparedSql::Run(format!("DELETE FROM {}", t.raw_name))
-            }
-            None => PreparedSql::Run(sql.to_string()), // not in the pass-1 schema
-        }
-    }
-
-    fn shim_drop(&mut self, sql: &str, toks: &[Tok]) -> PreparedSql {
-        let mut j = 2;
-        let mut if_exists = false;
-        if toks.len() > j + 1 && toks[j].up == "IF" && toks[j + 1].up == "EXISTS" {
-            if_exists = true;
-            j += 2;
-        }
-        if j >= toks.len() || !toks[j].is_word {
-            return PreparedSql::Run(sql.to_string());
-        }
-        let name = &sql[toks[j].start..toks[j].end];
-        match self.find(name) {
-            Some(idx) if self.tables[idx].exists => {
-                self.tables[idx].exists = false;
-                PreparedSql::Run(format!("DELETE FROM {}", self.tables[idx].raw_name))
-            }
-            _ if if_exists => PreparedSql::Done,
-            _ => PreparedSql::SimError(format!("no such table: {name}")),
-        }
-    }
-
-    /// `INSERT INTO t VALUES (..),(..)` → name the declared columns so the
-    /// synthetic `rowid_` PK is OMITTED and the engine's rowid-alias
-    /// auto-assign (max(rowid)+1 per row, sqlite's own non-AUTOINCREMENT rule)
-    /// numbers the rows. The shim used to simulate rowids with a per-table
-    /// counter, but a passthrough `INSERT … SELECT` copies REAL rowids the
-    /// counter never saw — the next VALUES insert then collided on the PK
-    /// (in1.test t4n/t7n). Statements that already name a column list cannot
-    /// name `rowid_` (`parse_create_table` refuses tables that use the name),
-    /// so they pass through and auto-assign the same way.
-    fn shim_insert(&self, sql: &str, toks: &[Tok]) -> PreparedSql {
-        if toks.len() < 4 || toks[1].up != "INTO" || !toks[2].is_word {
-            return PreparedSql::Run(sql.to_string());
-        }
-        let table_raw = sql[toks[2].start..toks[2].end].to_string();
-        let Some(idx) = self.find(&table_raw) else {
-            return PreparedSql::Run(sql.to_string());
-        };
-        if toks[3].up != "VALUES" {
-            // Explicit column list, INSERT … SELECT, DEFAULT VALUES, …
-            return PreparedSql::Run(sql.to_string());
-        }
-        let values_text = &sql[toks[3].end..];
-        let cols = self.tables[idx]
-            .cols
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-        PreparedSql::Run(format!("INSERT INTO {table_raw} ({cols}) VALUES{values_text}"))
-    }
-}
-
-/// SELECT shims: strip the `ALL` quantifier; expand a lone `*` (or `alias.*`)
-/// select list to the declared column list so `rowid_` never leaks.
-fn shim_select(sql: &str, shim: &Shim) -> String {
-    let mut sql = strip_select_all(sql);
-    if let Some(expanded) = expand_star(&sql, shim) {
-        sql = expanded;
-    }
-    sql
+    sql.to_string()
 }
 
 /// Rewrite every `SELECT ALL` to `SELECT` (top level and subqueries — the
@@ -745,199 +458,6 @@ fn strip_select_all(sql: &str) -> String {
     }
     out.push_str(&sql[pos..]);
     out
-}
-
-const CLAUSE_KEYWORDS: [&str; 7] = ["WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "OFFSET", "UNION"];
-
-/// If the select list is exactly `*` or `alias.*`, and the FROM clause is a
-/// single table or a chain of `[INNER] JOIN ... ON ...`, expand the star to
-/// the declared columns (qualified when multiple sources or an alias filter).
-fn expand_star(sql: &str, shim: &Shim) -> Option<String> {
-    let toks = scan(sql);
-    if toks.is_empty() || toks[0].up != "SELECT" {
-        return None;
-    }
-    let mut j = 1;
-    if j < toks.len() && toks[j].up == "DISTINCT" {
-        j += 1;
-    }
-    // Select list must be `*` or `word . *`.
-    let (star_start, star_end, alias_filter);
-    if j < toks.len() && toks[j].up == "*" {
-        star_start = toks[j].start;
-        star_end = toks[j].end;
-        alias_filter = None;
-        j += 1;
-    } else if j + 2 < toks.len()
-        && toks[j].is_word
-        && toks[j + 1].up == "."
-        && toks[j + 2].up == "*"
-    {
-        star_start = toks[j].start;
-        star_end = toks[j + 2].end;
-        alias_filter = Some(sql[toks[j].start..toks[j].end].to_ascii_lowercase());
-        j += 3;
-    } else {
-        return None;
-    }
-    if j >= toks.len() || toks[j].up != "FROM" || toks[j].depth != 0 {
-        return None;
-    }
-
-    // FROM-level paren groups — `FROM ( a JOIN b ON … )` — are associativity
-    // no-ops the engine accepts since #64, but the depth-based walk below
-    // would see the whole group as a subexpression and bail (which is how
-    // the shim's rowid_ column leaked as 123 phantom "wrong results" the day
-    // paren-FROM landed). Flatten them: drop the group's paren tokens and
-    // pull the interior up one level. Repeats for nesting.
-    let mut flat: Vec<Tok> = toks.to_vec();
-    while let Some(from) = flat.iter().position(|t| t.up == "FROM" && t.depth == 0) {
-        let open = from + 1;
-        if open >= flat.len() || flat[open].up != "(" {
-            break;
-        }
-        let mut depth = 0i32;
-        let mut close = None;
-        for (m, t) in flat.iter().enumerate().skip(open) {
-            if t.up == "(" {
-                depth += 1;
-            } else if t.up == ")" {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(m);
-                    break;
-                }
-            }
-        }
-        let c = close?;
-        for t in &mut flat[open + 1..c] {
-            t.depth -= 1;
-        }
-        flat.remove(c);
-        flat.remove(open);
-    }
-    let toks: &[Tok] = &flat;
-
-    // `ident [AS alias | bare-alias]` at position k → (name, qualifier, next k).
-    fn parse_source(sql: &str, toks: &[Tok], mut k: usize) -> Option<(String, String, usize)> {
-        const STOP: [&str; 8] = ["INNER", "JOIN", "ON", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"];
-        if k >= toks.len() || !toks[k].is_word || CLAUSE_KEYWORDS.contains(&toks[k].up.as_str()) {
-            return None;
-        }
-        let name_raw = sql[toks[k].start..toks[k].end].to_string();
-        let mut qual = name_raw.clone();
-        k += 1;
-        if k < toks.len() && toks[k].up == "AS" && toks[k].depth == 0 {
-            k += 1;
-            if k >= toks.len() || !toks[k].is_word {
-                return None;
-            }
-            qual = sql[toks[k].start..toks[k].end].to_string();
-            k += 1;
-        } else if k < toks.len()
-            && toks[k].is_word
-            && toks[k].depth == 0
-            && !CLAUSE_KEYWORDS.contains(&toks[k].up.as_str())
-            && !STOP.contains(&toks[k].up.as_str())
-        {
-            qual = sql[toks[k].start..toks[k].end].to_string();
-            k += 1;
-        }
-        Some((name_raw, qual, k))
-    }
-
-    // Parse FROM sources: ident [AS alias] (INNER? JOIN ident [AS alias] ON ...)*
-    let mut sources: Vec<(String, String)> = Vec::new(); // (table lower, qualifier raw)
-    let (name_raw, qual, mut k) = parse_source(sql, toks, j + 1)?;
-    sources.push((name_raw.to_ascii_lowercase(), qual));
-    loop {
-        if k >= toks.len() || toks[k].depth != 0 {
-            break;
-        }
-        match toks[k].up.as_str() {
-            "INNER" => {
-                k += 1;
-                if k >= toks.len() || toks[k].up != "JOIN" {
-                    return None;
-                }
-                k += 1;
-            }
-            // The comma-join executes since #56 — its stars must expand too,
-            // or the shim's synthetic rowid_ column leaks into the output
-            // (542 phantom "wrong results" the day comma-joins landed).
-            "JOIN" | "," => k += 1,
-            // CROSS JOIN and LEFT [OUTER] JOIN execute as well — same rule,
-            // same phantom otherwise (94 of them the day CROSS landed).
-            "CROSS" => {
-                k += 1;
-                if k >= toks.len() || toks[k].up != "JOIN" {
-                    return None;
-                }
-                k += 1;
-            }
-            "LEFT" => {
-                k += 1;
-                if k < toks.len() && toks[k].up == "OUTER" {
-                    k += 1;
-                }
-                if k >= toks.len() || toks[k].up != "JOIN" {
-                    return None;
-                }
-                k += 1;
-            }
-            "RIGHT" | "FULL" | "NATURAL" => return None,
-            _ => break, // WHERE/ORDER/... or end of statement
-        }
-        let (name_raw, qual, nk) = parse_source(sql, toks, k)?;
-        sources.push((name_raw.to_ascii_lowercase(), qual));
-        k = nk;
-        // Skip any ON condition: advance to the next JOIN/INNER/comma or
-        // clause keyword at depth 0 (or end of tokens). Stopping at the comma
-        // matters — a comma source has no ON, and skipping past it would
-        // swallow the NEXT source.
-        while k < toks.len() {
-            let t = &toks[k];
-            if t.depth == 0
-                && (t.up == ","
-                    || (t.is_word
-                        && (t.up == "JOIN"
-                            || t.up == "INNER"
-                            || t.up == "CROSS"
-                            || t.up == "LEFT"
-                            || CLAUSE_KEYWORDS.contains(&t.up.as_str()))))
-            {
-                break;
-            }
-            k += 1;
-        }
-    }
-    // Build the expansion.
-    let multi = sources.len() > 1;
-    let mut cols = Vec::new();
-    for (tname, qual) in &sources {
-        if let Some(af) = &alias_filter {
-            if af != &qual.to_ascii_lowercase() && af != tname {
-                continue;
-            }
-        }
-        let idx = shim.tables.iter().position(|t| &t.name == tname)?;
-        for (cname, _) in &shim.tables[idx].cols {
-            if multi || alias_filter.is_some() {
-                cols.push(format!("{qual}.{cname}"));
-            } else {
-                cols.push(cname.clone());
-            }
-        }
-    }
-    if cols.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{}{}{}",
-        &sql[..star_start],
-        cols.join(", "),
-        &sql[star_end..]
-    ))
 }
 
 // ======================================================== categorization
@@ -973,6 +493,10 @@ fn strip_strings(sql: &str) -> String {
 fn has_word(toks: &[Tok], word: &str) -> bool {
     toks.iter().any(|t| t.is_word && t.up == word)
 }
+
+/// Words that end a FROM clause at depth 0.
+const CLAUSE_KEYWORDS: [&str; 7] =
+    ["WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "OFFSET", "UNION"];
 
 /// FROM clause (depth 0) contains a top-level comma → comma join.
 fn has_comma_join(toks: &[Tok]) -> bool {
@@ -1111,23 +635,13 @@ fn categories(sql: &str, err: &str) -> Vec<&'static str> {
     {
         cats.insert(0, "mixed-arm-types");
     }
-    // Another *shim* artifact: `shim_select` expands a bare `*` only in the
-    // OUTER select list, so `x IN (SELECT * FROM t)` still sees the synthetic
-    // `rowid_` column and looks like a 2-column IN subquery. sqlite's `t` has
-    // one column there. (The corpus has no row-value INs, so this message is
-    // the artifact, not a real arity gap.)
-    if err.contains("an IN subquery must select exactly one column") {
-        cats.insert(0, "shim-star-arity");
-    }
-    // A *shim* artifact, not an index-DDL gap: `DROP TABLE` is simulated as
-    // `DELETE FROM` (a real DROP would burn one of mpedb's 64 lifetime table
-    // ids, and the corpus re-creates its tables hundreds of times per file),
-    // so every CREATE INDEX in a re-created table's block piles onto the SAME
-    // live table until it trips mpedb's 32-indexes-per-table cap. sqlite drops
-    // the indexes with the table and never has more than a handful live.
-    if err.contains("indexes (max") {
-        cats.insert(0, "shim-index-accumulation");
-    }
+    // `shim-star-arity` and `shim-index-accumulation` used to live here. Both
+    // named the RUNNER's own damage — a `SELECT *` expander that could not see
+    // into a subquery, and a faked `DROP TABLE` that let indexes pile onto one
+    // live table until the 32-index cap. The runner now executes the corpus's
+    // DDL, so neither error can be produced and neither category can occur.
+    // They are gone rather than kept at zero: a category that cannot fire is a
+    // reader's trap, not a measurement.
     if err.contains("ENGINE PANIC") {
         cats.insert(0, "ENGINE-PANIC");
     }
@@ -1312,21 +826,8 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
         }
     };
 
-    // Pass 1: gather CREATE TABLE statements we will execute.
-    let mut shim = Shim { tables: Vec::new(), over_cap: Vec::new() };
-    for rec in records.iter().filter(|r| !r.skip) {
-        if let Kind::Statement { .. } = rec.kind {
-            if let Some(t) = parse_create_table(&rec.sql) {
-                if shim.find(&t.name).is_none() && !shim.over_cap.contains(&t.name) {
-                    if shim.tables.len() < ENGINE_TABLE_CAP {
-                        shim.tables.push(t);
-                    } else {
-                        shim.over_cap.push(t.name);
-                    }
-                }
-            }
-        }
-    }
+    // No pass 1, and no synthetic schema. The corpus's own DDL is executed.
+
 
     // In-memory: path = ":memory:" → Shm::open_memory (memfd + ftruncate only;
     // no fallocate / pre-zero). size_mb is a virtual high-water cap (pages
@@ -1342,21 +843,9 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
             JOIN_CELLS.load(std::sync::atomic::Ordering::Relaxed)
         );
     }
-    if shim.tables.is_empty() {
-        // Config needs at least one table; none of this file's DDL parsed.
-        cfg.push_str("\n[[table]]\nname = \"shim_dummy_\"\nprimary_key = [\"rowid_\"]\n  [[table.column]]\n  name = \"rowid_\"\n  type = \"int64\"\n");
-    }
-    for t in &shim.tables {
-        let _ = write!(cfg, "\n[[table]]\nname = \"{}\"\nprimary_key = [\"rowid_\"]\n", t.name);
-        cfg.push_str("  [[table.column]]\n  name = \"rowid_\"\n  type = \"int64\"\n");
-        for (cn, ct) in &t.cols {
-            let _ = write!(
-                cfg,
-                "  [[table.column]]\n  name = \"{}\"\n  type = \"{ct}\"\n",
-                cn.to_ascii_lowercase()
-            );
-        }
-    }
+    // A ZERO-table seed is legal (CLAUDE.md: "tables arrive via live DDL"), and
+    // it is what lets the corpus's own `CREATE TABLE` be the thing under test
+    // rather than a thing the runner works around.
     let db = match Config::from_toml_str(&cfg).and_then(Database::open_with_config) {
         Ok(db) => db,
         Err(e) => {
@@ -1377,23 +866,8 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
                     rep.skipped += 1;
                     continue;
                 }
-                let outcome = shim.prepare_statement(&rec.sql);
-                let result: Result<(), String> = match outcome {
-                    PreparedSql::Done => Ok(()),
-                    PreparedSql::SimError(msg) => Err(format!("[shim] {msg}")),
-                    PreparedSql::Unsupported(cat, msg) => {
-                        if *expect_error {
-                            rep.stmt_pass += 1;
-                        } else {
-                            *rep.unsupported.entry(cat).or_default() += 1;
-                            *rep.co_counts.entry(cat).or_default() += 1;
-                            failed_writes += 1;
-                            let _ = msg;
-                        }
-                        continue;
-                    }
-                    PreparedSql::Run(sql) => exec_sql(&db, &sql).map(|_| ()),
-                };
+                let result: Result<(), String> =
+                    exec_sql(&db, &prepare_statement(&rec.sql)).map(|_| ());
                 match (result, expect_error) {
                     (Ok(()), false) => rep.stmt_pass += 1,
                     (Err(_), true) => rep.stmt_pass += 1,
@@ -1420,24 +894,9 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
                     rep.skipped += 1;
                     continue;
                 }
-                // Queries never create/drop, but must see dropped tables as
-                // missing and get the SELECT shims.
-                let toks = scan(&rec.sql);
-                if shim.over_cap_referenced(&toks).is_some() {
-                    *rep.unsupported.entry("engine-table-cap").or_default() += 1;
-                    *rep.co_counts.entry("engine-table-cap").or_default() += 1;
-                    continue;
-                }
-                if let Some(missing) = shim.missing_table_referenced(&toks) {
-                    let cats = categories(&rec.sql, "");
-                    let _ = missing;
-                    *rep.unsupported.entry(cats[0]).or_default() += 1;
-                    for c in &cats {
-                        *rep.co_counts.entry(c).or_default() += 1;
-                    }
-                    continue;
-                }
-                let sql = shim_select(&rec.sql, &shim);
+                // A dropped table is now the ENGINE's "no such table", not a
+                // simulated one, so the query goes straight through.
+                let sql = strip_select_all(&rec.sql);
                 let rows = match exec_sql(&db, &sql) {
                     Ok(ExecResult::Rows { rows, .. }) => rows,
                     Ok(_) => {

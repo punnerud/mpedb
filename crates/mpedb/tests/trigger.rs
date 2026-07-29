@@ -701,3 +701,67 @@ primary_key = ["id"]
     assert_eq!(mpedb_rows(&db, "SELECT count(*) FROM audit"), vec![vec!["0"]]);
     let _ = std::fs::remove_file(&path);
 }
+
+/// A FROM-less `SELECT <expr>` as a trigger body statement: sqlite evaluates it
+/// and discards the row, and 23 records of `evidence/slt_lang_{create,drop}
+/// trigger.test` are exactly `BEGIN SELECT 1; END`. mpedb used to refuse the
+/// whole `CREATE TRIGGER`.
+///
+/// The three things this pins, in order of what could go wrong:
+///   1. it is accepted, and the trigger actually fires;
+///   2. it changes NOTHING — a discarded row is discarded, so this widening
+///      cannot turn a clean refusal into a wrong ANSWER;
+///   3. it is still EVALUATED, so an expression that raises still aborts the
+///      triggering statement. Accepting-and-skipping would have been the wrong
+///      shape and is indistinguishable from (1) and (2) alone.
+#[test]
+fn a_select_expr_trigger_body_evaluates_and_discards() {
+    let (db, path) = open("select-body");
+    apply(
+        &db,
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+            // sqlite's own legacy form: no BEFORE/AFTER, body is a bare SELECT.
+            "CREATE TRIGGER tr1 UPDATE ON t BEGIN SELECT 1; END",
+        ],
+    );
+    apply(&db, &["INSERT INTO t (id, n) VALUES (1, 10)"]);
+    apply(&db, &["UPDATE t SET n = 20 WHERE id = 1"]);
+    // (1) + (2): the update went through and the row is exactly what it should
+    // be. The trigger contributed nothing, which is the entire contract.
+    assert_eq!(mpedb_rows(&db, "SELECT id, n FROM t"), vec![vec!["1", "20"]]);
+
+    // (3) the expression is really evaluated: one that raises aborts the
+    // statement, and the row keeps its old value. It has to reference NEW to
+    // survive const folding — a body of `SELECT 9223372036854775807 + 1` is
+    // rejected at CREATE TRIGGER time instead, which is a better answer than
+    // sqlite's (it fails at fire time) but does not test the fire path.
+    apply(
+        &db,
+        &["CREATE TRIGGER tr2 UPDATE ON t BEGIN SELECT 9223372036854775807 + NEW.n; END"],
+    );
+    let e = db
+        .query("UPDATE t SET n = 30 WHERE id = 1", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("overflow"),
+        "the body expression must be evaluated, not skipped: {e}"
+    );
+    assert_eq!(mpedb_rows(&db, "SELECT id, n FROM t"), vec![vec!["1", "20"]]);
+
+    // A body SELECT that reads a TABLE is still a named refusal: the fire path
+    // fills parameter slots from the row images and runs no query plan.
+    let e = db
+        .query(
+            "CREATE TRIGGER tr3 UPDATE ON t BEGIN SELECT n FROM t; END",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("INSERT, UPDATE, or DELETE"),
+        "a table-reading body SELECT must still refuse by name: {e}"
+    );
+    let _ = std::fs::remove_file(&path);
+}

@@ -74,6 +74,19 @@ pub enum TriggerStmt {
         msg: String,
         gate: Option<(ExprProgram, RowMap)>,
     },
+    /// A FROM-less `SELECT <expr>[, …]` — sqlite evaluates the expressions and
+    /// throws the row away. `CREATE TRIGGER t1r1 UPDATE ON t1 BEGIN SELECT 1;
+    /// END;` is the canonical shape, and it is what 23 corpus records use.
+    ///
+    /// Nothing is observable except errors and time: the row goes nowhere. That
+    /// is exactly why accepting it cannot turn a refusal into a WRONG ANSWER —
+    /// there is no answer. What it can still do is raise, and it should: an
+    /// overflow inside the expression aborts the triggering statement, which is
+    /// mpedb's documented arithmetic deviation applying uniformly.
+    Eval {
+        progs: Vec<ExprProgram>,
+        map: RowMap,
+    },
 }
 
 /// Compile a trigger's `BEGIN <stmt>; … END` body against `target` — the table
@@ -115,6 +128,10 @@ pub fn compile_trigger_body(
         let scope = RowScope { target, allow_new, allow_old };
         if let Some(raise) = compile_raise_stmt(&stmt, &scope)? {
             out.push(raise);
+            continue;
+        }
+        if let Some(eval) = compile_eval_stmt(&stmt, &scope)? {
+            out.push(eval);
             continue;
         }
         let mut map: RowMap = Vec::new();
@@ -196,6 +213,63 @@ fn compile_raise_stmt(stmt: &Stmt, scope: &RowScope) -> Result<Option<TriggerStm
         msg: msg.clone(),
         gate,
     }))
+}
+
+/// Recognize a FROM-less `SELECT <expr>[, …] [WHERE <cond>]` whose select list
+/// is NOT the RAISE idiom (that is `compile_raise_stmt`'s, and it runs first),
+/// and compile it to evaluate-and-discard.
+///
+/// The accepted shape is deliberately the same FROM-less one the RAISE gate
+/// uses: no table, no join, no derived table, no GROUP BY / HAVING / ORDER BY /
+/// LIMIT / OFFSET. A body `SELECT` that reads a table is still refused by name,
+/// because a trigger body cannot run a query plan — the surrounding machinery
+/// fills parameter slots from the NEW/OLD row images and nothing else. Widening
+/// to `SELECT … FROM t` is a separate question with a separate answer.
+fn compile_eval_stmt(stmt: &Stmt, scope: &RowScope) -> Result<Option<TriggerStmt>> {
+    let Stmt::Select(sel) = stmt else { return Ok(None) };
+    if sel.table.is_some()
+        || sel.from_derived.is_some()
+        || !sel.joins.is_empty()
+        || sel.distinct
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || !sel.order_by.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+    {
+        return Ok(None);
+    }
+    // `SELECT *` with no FROM has nothing to expand; leave it to the refusal.
+    let Some(items) = &sel.items else { return Ok(None) };
+    if items.is_empty() {
+        return Ok(None);
+    }
+
+    // Every expression is rewritten into the SAME row map first, so the slot
+    // count the binder is given is the final one. Binding as we go would make
+    // the first program's slot count too small for the second's.
+    let mut map: RowMap = Vec::new();
+    let mut exprs: Vec<ast::Expr> = Vec::with_capacity(items.len() + 1);
+    for (e, _alias) in items {
+        let mut e = e.clone();
+        rewrite_row_in_expr(&mut e, scope, &mut map)?;
+        exprs.push(e);
+    }
+    // A WHERE on a discarded row cannot change anything observable, but it can
+    // still error, so it is evaluated like the rest rather than dropped.
+    if let Some(w) = &sel.where_clause {
+        let mut w = w.clone();
+        rewrite_row_in_expr(&mut w, scope, &mut map)?;
+        exprs.push(w);
+    }
+
+    let mut progs = Vec::with_capacity(exprs.len());
+    for e in &exprs {
+        let mut b = Binder::new(dual_def(), map.len() as u16, true);
+        let (bound, _ty) = b.bind_expr(e)?;
+        progs.push(binder::compile_program(&bound)?);
+    }
+    Ok(Some(TriggerStmt::Eval { progs, map }))
 }
 
 /// Split a trigger's `BEGIN … END` body source into its top-level statements at

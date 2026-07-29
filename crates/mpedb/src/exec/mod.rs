@@ -3349,6 +3349,17 @@ pub(crate) fn fire_row_triggers(
                                 }
                             }
                         }
+                        // A FROM-less `SELECT <expr>` body statement: sqlite
+                        // evaluates it and drops the row. So do we — the values
+                        // go nowhere, but an expression that RAISES still
+                        // aborts the triggering statement, which is the point
+                        // of evaluating rather than skipping.
+                        mpedb_sql::TriggerStmt::Eval { progs, map } => {
+                            let params = pick(map)?;
+                            for prog in progs {
+                                let _ = prog.eval(&[], &params)?;
+                            }
+                        }
                     }
                 }
             }
