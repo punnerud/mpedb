@@ -87,14 +87,17 @@ fn create_index_where_parses_and_builds() {
         "{:?}",
         ix.predicate
     );
-    // UNIQUE partial is refused until membership evaluation ships.
+    // UNIQUE partial: was refused outright until membership evaluation shipped;
+    // now it builds over its MEMBERS and enforces among them. Row 2's `b` is
+    // NULL, so it is not one, and the index is not blocked by it.
+    db.query("CREATE UNIQUE INDEX ux ON t (b) WHERE b IS NOT NULL", &[])
+        .unwrap();
+    db.query("INSERT INTO t (id, a, b) VALUES (3, 30, NULL)", &[])
+        .unwrap();
     let err = db
-        .query("CREATE UNIQUE INDEX ux ON t (b) WHERE b IS NOT NULL", &[])
+        .query("INSERT INTO t (id, a, b) VALUES (4, 40, 'x')", &[])
         .unwrap_err();
-    assert!(
-        format!("{err}").contains("UNIQUE INDEX") || format!("{err}").contains("partial"),
-        "{err}"
-    );
+    assert!(format!("{err}").contains("UNIQUE"), "{err}");
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }
@@ -396,4 +399,131 @@ fn update_and_delete_ride_the_same_implication() {
     assert_eq!(mp(&db, "SELECT id FROM t ORDER BY id"), ["2", "3", "4", "5", "6"]);
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
+}
+
+// ----------------------------------------------------- UNIQUE partial indexes
+
+/// Run `setup` statement by statement through BOTH engines, then compare.
+///
+/// A partial index's whole content is WHICH ROWS ARE MEMBERS, and under a
+/// UNIQUE one membership is observable in exactly one way: the write that
+/// collides is refused. So the statement each engine refuses at IS the answer
+/// being differentialled here, and the surviving rows are the corroboration.
+fn agree(setup: &[&str], probe: &str) {
+    let (db, path) = open();
+    let mut mp_fail = None;
+    for (i, s) in setup.iter().enumerate() {
+        if db.query(s, &[]).is_err() {
+            mp_fail = Some(i);
+            break;
+        }
+    }
+    let mut script = String::new();
+    let mut sq_fail = None;
+    for (i, s) in setup.iter().enumerate() {
+        let mut probe_script = script.clone();
+        probe_script.push_str(s);
+        probe_script.push_str(";\n");
+        if sqlite_oracle::try_script_stdout(&probe_script, "").is_err() {
+            sq_fail = Some(i);
+            break;
+        }
+        script.push_str(s);
+        script.push_str(";\n");
+    }
+    assert_eq!(
+        mp_fail, sq_fail,
+        "engines disagree on WHICH statement is refused\nscript: {setup:#?}"
+    );
+    script.push_str(probe);
+    script.push_str(";\n");
+    let want: Vec<String> = sqlite_oracle::script_stdout(&script, "")
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .collect();
+    assert_eq!(mp(&db, probe), want, "surviving rows differ for `{probe}`");
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+const UIX: &str = "CREATE UNIQUE INDEX ux ON t (a) WHERE b > 5";
+
+/// Only TRUE is a member. This is NOT the CHECK rule (where NULL passes): both
+/// FALSE and NULL leave the row out, so duplicate keys under either are legal.
+#[test]
+fn only_a_true_predicate_makes_a_row_a_member() {
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT)",
+            UIX,
+            "INSERT INTO t (id, a, b) VALUES (1, 7, NULL)", // predicate NULL
+            "INSERT INTO t (id, a, b) VALUES (2, 7, NULL)", // …so no collision
+            "INSERT INTO t (id, a, b) VALUES (3, 8, 1)",    // predicate FALSE
+            "INSERT INTO t (id, a, b) VALUES (4, 8, 2)",    // …so no collision
+        ],
+        "SELECT count(*) FROM t",
+    );
+    // …and TRUE twice on one key is the violation.
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT)",
+            UIX,
+            "INSERT INTO t (id, a, b) VALUES (1, 9, 9)",
+            "INSERT INTO t (id, a, b) VALUES (2, 9, 9)",
+        ],
+        "SELECT count(*) FROM t",
+    );
+}
+
+/// A row can JOIN the index without any INDEXED column moving — the predicate
+/// reads `b`, which the index does not cover. The cheap "did an indexed column
+/// change?" test that guards whole-table index maintenance is blind to this,
+/// which is why partial indexes compare the entry KEYS instead.
+#[test]
+fn a_row_that_joins_the_index_on_update_collides() {
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT)",
+            UIX,
+            "INSERT INTO t (id, a, b) VALUES (1, 7, 9)", // member
+            "INSERT INTO t (id, a, b) VALUES (2, 7, 1)", // same key, NOT a member
+            "UPDATE t SET b = 9 WHERE id = 2",           // joins → collides
+        ],
+        "SELECT count(*) FROM t",
+    );
+}
+
+/// The other direction: a member that LEAVES the set frees its key, so the
+/// value can be taken again. A missed delete here would be a phantom conflict
+/// forever after.
+#[test]
+fn a_row_that_leaves_the_index_frees_its_key() {
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT)",
+            UIX,
+            "INSERT INTO t (id, a, b) VALUES (1, 7, 9)",
+            "UPDATE t SET b = 1 WHERE id = 1", // leaves the index
+            "INSERT INTO t (id, a, b) VALUES (3, 7, 9)", // key is free again
+        ],
+        "SELECT id, a, b FROM t ORDER BY id",
+    );
+}
+
+/// The BUILD respects membership too: an index created over existing rows takes
+/// only the members, so rows that would have collided under a whole-table
+/// UNIQUE do not block the DDL.
+#[test]
+fn the_build_admits_only_members() {
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT)",
+            "INSERT INTO t (id, a, b) VALUES (1, 7, 1)",
+            "INSERT INTO t (id, a, b) VALUES (2, 7, 2)", // duplicate a, both non-members
+            "INSERT INTO t (id, a, b) VALUES (3, 9, 9)",
+            UIX,                                          // builds over members only
+            "INSERT INTO t (id, a, b) VALUES (4, 9, 9)",  // …and still enforces
+        ],
+        "SELECT count(*) FROM t",
+    );
 }

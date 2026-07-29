@@ -78,7 +78,8 @@ use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, Frame,
     CompoundArm, DerivedPlan, FrameBound, FrameMode, InsertSource, CompoundPlan, GroupKey, Join, JoinKind, OrderOver,
     PlanOnConflict, PlanStmt, PolicyStamp, Projection, RecursiveCtePlan, SelectPlan, SubBody,
-    LimitVal, SubPlan, SubPlanKind, WindowSpec, CTE_TABLE, MAX_PLAN_SUBPLANS,
+    LimitVal, SubPlan, SubPlanKind, WinInt, WindowFunc, WindowSpec, CTE_TABLE,
+    MAX_PLAN_SUBPLANS,
 };
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};
@@ -445,7 +446,41 @@ fn register_limit_params(
         }
         Ok(())
     }
+    /// A window value function's integer argument, when it is a parameter.
+    /// Same integer typing as LIMIT: the slot is Int64, so a caller binding
+    /// text or a float is refused by the ordinary parameter check rather than
+    /// coerced — which is precisely the per-row guessing the offset rules
+    /// forbid, only moved to bind time.
+    fn win(f: WindowFunc, ptypes: &mut [Option<ColumnType>]) -> Result<()> {
+        let arg = match f {
+            WindowFunc::Lag(v) | WindowFunc::Lead(v) | WindowFunc::NthValue(v)
+            | WindowFunc::Ntile(v) => v,
+            _ => return Ok(()),
+        };
+        let Some(i) = arg.param() else { return Ok(()) };
+        match ptypes.get(i as usize) {
+            Some(None) => ptypes[i as usize] = Some(ColumnType::Int64),
+            Some(Some(ColumnType::Int64)) => {}
+            Some(Some(other)) => {
+                return Err(bind_err(format!(
+                    "parameter ${} is used both as {other:?} and as a window \
+                     function's integer argument",
+                    i + 1
+                )))
+            }
+            None => {
+                return Err(bind_err(format!(
+                    "window function parameter ${} out of range",
+                    i + 1
+                )))
+            }
+        }
+        Ok(())
+    }
     fn sel(sp: &SelectPlan, ptypes: &mut [Option<ColumnType>]) -> Result<()> {
+        for w in &sp.windows {
+            win(w.func, ptypes)?;
+        }
         one(sp.limit, ptypes)?;
         one(sp.offset, ptypes)
     }

@@ -176,7 +176,7 @@ fn resolve_window_func(
         // current row, so it must share the value's type.
         ast::WindowFunc::Lag | ast::WindowFunc::Lead => {
             let offset = match extra_args.first() {
-                None => 1,
+                None => WinInt::Lit(1),
                 Some(e) => const_int_arg(binder, e, "lag/lead offset")?,
             };
             let (default_prog, def_ty) = match extra_args.get(1) {
@@ -203,9 +203,11 @@ fn resolve_window_func(
                 Some(e) => const_int_arg(binder, e, "nth_value n")?,
                 None => return Err(bind_err("nth_value() requires a second argument")),
             };
-            if n < 1 {
+            // A literal is checkable now; a parameter only once bound, and the
+            // executor raises there — which is also where sqlite raises.
+            if matches!(n, WinInt::Lit(v) if v < 1) {
                 return Err(bind_err(
-                    "nth_value()'s second argument must be a positive integer constant",
+                    "nth_value()'s second argument must be a positive integer",
                 ));
             }
             (P::NthValue(n), None, arg_ty.unwrap_or(ColumnType::Int64), true)
@@ -219,9 +221,9 @@ fn resolve_window_func(
                 Some(e) => const_int_arg(binder, e, "ntile bucket count")?,
                 None => return Err(bind_err("ntile() requires an argument")),
             };
-            if n < 1 {
+            if matches!(n, WinInt::Lit(v) if v < 1) {
                 return Err(bind_err(
-                    "ntile()'s argument must be a positive integer constant",
+                    "ntile()'s argument must be a positive integer",
                 ));
             }
             (P::Ntile(n), None, ColumnType::Int64, false)
@@ -266,20 +268,27 @@ fn resolve_frame(fa: &ast::FrameAst) -> Frame {
     }
 }
 
-/// Bind a value-function offset / n argument and require it to fold to a
-/// constant integer. A non-constant (a column, a parameter, an arithmetic
-/// expression) or non-integer value is REFUSED: sqlite coerces the offset
-/// per-row with brittle, version-specific rules (a non-integer float yields
-/// all-NULL, non-numeric text yields 0), and the 0-wrong-answer contract forbids
-/// guessing. The overwhelmingly common forms — `lag(x, 2)`, `nth_value(x, 3)` —
-/// are integer literals and pass; a bare `lag(x)` never reaches here (offset
-/// defaults to 1).
-fn const_int_arg(binder: &mut Binder<'_>, e: &ast::Expr, what: &str) -> Result<i64> {
+/// Bind a value-function offset / n argument to a [`WinInt`] — a constant
+/// integer, or a PARAMETER slot resolved once per execution.
+///
+/// What stays refused is what is genuinely per-ROW: a column, or an expression
+/// over one. There sqlite coerces the value per row under brittle,
+/// version-specific rules (a non-integer float yields all-NULL, non-numeric
+/// text yields 0), and the 0-wrong-answer contract forbids guessing.
+///
+/// A parameter is not in that class. It is ONE value for the whole execution,
+/// exactly like `LIMIT ?` ([`LimitVal`], the precedent). Refusing it cost 18 of
+/// Django's 27 `expressions_window` tests, for offsets that are plain literals
+/// in the Python source — the ORM wraps every such argument in a `Value`, and
+/// its compiler emits that as a bound `?`. A bound value that is not an integer
+/// is refused at EXECUTION, by name, where its type is finally known.
+fn const_int_arg(binder: &mut Binder<'_>, e: &ast::Expr, what: &str) -> Result<WinInt> {
     let (b, _) = binder.bind_expr(e)?;
     match b {
-        BExpr::Const(Value::Int(n)) => Ok(n),
+        BExpr::Const(Value::Int(n)) => Ok(WinInt::Lit(n)),
+        BExpr::Param(i) => Ok(WinInt::Param(i)),
         _ => Err(bind_err(format!(
-            "{what} must be a constant integer — a non-constant or non-integer \
+            "{what} must be a constant integer or a parameter — a per-row \
              {what} is refused (sqlite's per-row coercion is not reproducible)"
         ))),
     }

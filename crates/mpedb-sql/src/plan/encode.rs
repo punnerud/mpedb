@@ -546,7 +546,13 @@ fn encode_window(w: &WindowSpec, buf: &mut Vec<u8>) {
         | WindowFunc::Lead(o)
         | WindowFunc::NthValue(o)
         | WindowFunc::Ntile(o) => {
-            buf.extend_from_slice(&o.to_le_bytes());
+            // Tagged (format 63): a literal carries its i64, a parameter its
+            // slot. Eight raw bytes could not tell the two apart.
+            buf.push(o.tag());
+            match o {
+                WinInt::Lit(n) => buf.extend_from_slice(&n.to_le_bytes()),
+                WinInt::Param(i) => buf.extend_from_slice(&i.to_le_bytes()),
+            }
         }
         _ => {}
     }

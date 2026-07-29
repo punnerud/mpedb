@@ -885,6 +885,17 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
 /// One [`WindowSpec`] — the exact mirror of `encode_window`. A closed func tag
 /// (unknown ⇒ `Corrupt`, like `AggFn::from_tag`), and `distinct` is rejected
 /// (stage 1 does not support it, and neither does the planner that emits this).
+/// A window value function's integer argument (format 63): a tag byte, then
+/// either the literal i64 or the parameter slot. An unknown tag is corrupt —
+/// never silently a literal, which would read the slot bytes as a value.
+fn decode_win_int(buf: &[u8], pos: &mut usize) -> Result<WinInt> {
+    match r_u8(buf, pos)? {
+        0 => Ok(WinInt::Lit(r_u64(buf, pos)? as i64)),
+        1 => Ok(WinInt::Param(r_u16(buf, pos)?)),
+        t => Err(corrupt(format!("bad window integer-argument tag {t}"))),
+    }
+}
+
 fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
     let mut host: Option<String> = None;
     let func = match r_u8(buf, pos)? {
@@ -896,27 +907,28 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
                 .ok_or_else(|| corrupt("unknown window aggregate function"))?;
             WindowFunc::Agg(f)
         }
-        // Value/offset functions (format 34). Lag/Lead/NthValue carry a trailing
-        // i64 (constant offset / n); FirstValue/LastValue carry nothing extra.
-        5 => WindowFunc::Lag(r_u64(buf, pos)? as i64),
-        6 => WindowFunc::Lead(r_u64(buf, pos)? as i64),
+        // Value/offset functions (format 34, widened to `WinInt` in 63).
+        // Lag/Lead/NthValue/Ntile carry a tagged literal-or-parameter;
+        // FirstValue/LastValue carry nothing extra.
+        5 => WindowFunc::Lag(decode_win_int(buf, pos)?),
+        6 => WindowFunc::Lead(decode_win_int(buf, pos)?),
         7 => WindowFunc::FirstValue,
         8 => WindowFunc::LastValue,
         9 => {
-            let n = r_u64(buf, pos)? as i64;
-            // nth_value's n is a POSITIVE integer (the planner refuses n < 1, and
-            // sqlite errors on it at runtime); a blob claiming otherwise is
-            // corrupt rather than a source of a wrong answer.
-            if n < 1 {
+            let n = decode_win_int(buf, pos)?;
+            // nth_value's n is a POSITIVE integer. A LITERAL that is not is a
+            // corrupt blob; a PARAMETER can only be checked when it is bound, so
+            // the executor raises there — exactly as sqlite does at runtime.
+            if matches!(n, WinInt::Lit(v) if v < 1) {
                 return Err(corrupt("nth_value n must be a positive integer"));
             }
             WindowFunc::NthValue(n)
         }
-        // Rank/distribution functions (format 35). Ntile carries a trailing i64
-        // (the constant bucket count ≥ 1); PercentRank/CumeDist carry nothing.
+        // Rank/distribution functions (format 35). Ntile carries the bucket
+        // count (≥ 1); PercentRank/CumeDist carry nothing.
         10 => {
-            let n = r_u64(buf, pos)? as i64;
-            if n < 1 {
+            let n = decode_win_int(buf, pos)?;
+            if matches!(n, WinInt::Lit(v) if v < 1) {
                 return Err(corrupt("ntile bucket count must be a positive integer"));
             }
             WindowFunc::Ntile(n)

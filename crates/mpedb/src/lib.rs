@@ -127,7 +127,7 @@ pub use mpedb_types::{
 use exec::{exec_stmt, ChargeMode, ReadCtx};
 pub use exec::take_last_insert_rowid;
 pub use fk::FkCheckRow;
-use mpedb_core::{CheckPrograms, Engine, WriteTxn};
+use mpedb_core::{CheckPrograms, Engine, SchemaPrograms, WriteTxn};
 use mpedb_sql::{CompiledPlan, HostUdfSet, PlanStmt};
 use registry::{decode_registry_plan, patched_last_used, plan_subkey};
 use std::collections::HashMap;
@@ -814,8 +814,9 @@ pub struct Database {
 /// writer's in-transaction reload) goes through the identical path. A source
 /// that will not compile is an error here, never a silently unenforced
 /// constraint.
-fn compile_schema_checks(schema: &mpedb_types::Schema) -> Result<CheckPrograms> {
+fn compile_schema_checks(schema: &mpedb_types::Schema) -> Result<SchemaPrograms> {
     let mut checks: CheckPrograms = Vec::with_capacity(schema.tables.len());
+    let mut index_predicates = Vec::with_capacity(schema.tables.len());
     for table in &schema.tables {
         let mut per_col = Vec::with_capacity(table.columns.len());
         for col in &table.columns {
@@ -830,8 +831,24 @@ fn compile_schema_checks(schema: &mpedb_types::Schema) -> Result<CheckPrograms> 
             });
         }
         checks.push(per_col);
+        // Partial-index predicates ride the same pass: one compiler call, one
+        // schema, so a bundle can never hold checks from one schema and index
+        // predicates from another.
+        let mut per_index = Vec::with_capacity(table.indexes.len());
+        for ix in &table.indexes {
+            per_index.push(match &ix.predicate {
+                None => None,
+                Some(src) => Some(mpedb_sql::compile_index_predicate(src, table).map_err(|e| {
+                    Error::Schema(format!(
+                        "partial index predicate on `{}` failed to compile: {e}",
+                        table.name
+                    ))
+                })?),
+            });
+        }
+        index_predicates.push(per_index);
     }
-    Ok(checks)
+    Ok(SchemaPrograms { checks, index_predicates })
 }
 
 impl Database {
@@ -938,7 +955,9 @@ impl Database {
                 })?;
             require_policy.insert(id as u32);
         }
-        let mut engine = Engine::open(&config, checks)?;
+        // The seed bundle takes CHECKs only; `set_check_compiler` below rebuilds
+        // it with the index predicates too, from the LIVE catalog schema.
+        let mut engine = Engine::open(&config, checks.checks)?;
         // DESIGN-BLOBEXTENT §8: per-process knob, like durability. The format
         // self-describes, so this only decides what NEW writes do.
         engine.set_extent_threshold(config.options.extent_threshold);

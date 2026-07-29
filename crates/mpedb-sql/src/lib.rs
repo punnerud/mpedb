@@ -45,8 +45,8 @@ pub use plan::{
     AccessPath, AggCall, Aggregation, CompiledPlan, CompoundArm, CompoundPlan, ConflictProbe, Frame,
     FrameBound, FrameMode, FtsQuery, FtsTerm, GroupKey, InsertSource, Join, JoinKind, OrderOver,
     parallel_fold_shape, LimitVal, PlanOnConflict, PlanStmt, PolicyStamp, Projection, DerivedPlan, dual_def,
-    RecursiveCtePlan, SelectPlan, SetOp, SortDir, SubBody, SubPlan, SubPlanKind, WindowFunc,
-    WindowSpec, CTE_TABLE, DUAL_TABLE,
+    RecursiveCtePlan, SelectPlan, SetOp, SortDir, SubBody, SubPlan, SubPlanKind, WinInt,
+    WindowFunc, WindowSpec, CTE_TABLE, DUAL_TABLE,
 };
 pub use planner::{
     magnitude, row_prune, secondary_indexes, set_mpee_enabled, CostSource, Mask, RowCountFn,
@@ -316,6 +316,19 @@ pub fn compile_check(expr_src: &str, table: &TableDef) -> Result<ExprProgram> {
     let mut binder = binder::Binder::new(table, 0, false);
     let bound = binder.bind_check(&expr)?;
     binder::compile_program(&bound)
+}
+
+/// Compile a partial index's `WHERE <expr>` against the finished table.
+///
+/// Same shape as [`compile_check`] — an expression over the table's own
+/// columns, no parameters — but the two are NOT interchangeable at evaluation
+/// time and the separate name is the reminder. A CHECK passes on TRUE *or*
+/// NULL; index membership is a `WHERE`, so only TRUE is a member (MEASURED
+/// against sqlite 3.45.1: two rows may share a partial-UNIQUE key when the
+/// predicate is FALSE *and* when it is NULL). The engine applies that rule in
+/// `index_predicate_admits`.
+pub fn compile_index_predicate(expr_src: &str, table: &TableDef) -> Result<ExprProgram> {
+    compile_check(expr_src, table)
 }
 
 /// Compile a `GENERATED ALWAYS AS (<expr>)` body against the finished table,

@@ -24,10 +24,15 @@
 # 2. **This is the GNU toolchain; CI is MSVC.** `windows-latest` builds with
 #    MSVC, which has a different CRT and different codegen. `-msvc` cannot be
 #    built here at all — a dependency's assembly needs `ml64.exe`.
-# 3. **Only the portable crates.** The engine is Unix-only BY CONSTRUCTION
-#    (mmap, flock, robust pthread mutexes, /proc); see the header of
-#    `.github/workflows/windows.yml`. Pointing this at the workspace would fail
-#    on line one forever.
+# 3. **Not the whole workspace.** This used to say "only the portable crates —
+#    the engine is Unix-only BY CONSTRUCTION". That stopped being true when the
+#    engine grew its Windows arm (#159: `crate::os` over kernel32, `LockFileEx`
+#    for the writer lock, `GetProcessTimes` for pid identity). MEASURED: the
+#    engine's own suite and the facade's lib tests run green here, concurrency
+#    tests included — which is the half the nightly job was the only cover for.
+#    `mpedb`'s INTEGRATION tests still do not: they spawn helper processes
+#    through Unix-shaped harness pieces. `mpedb-py` (PyO3) and `mpedb-fs`
+#    (FUSE) are Unix by construction and always will be.
 #
 # So: a screening tool for the nightly job, not a replacement for it, and not a
 # gate. The nightly Windows run remains the thing that decides.
@@ -100,4 +105,10 @@ echo "wine       = $WINE_BIN"
 echo "target     = x86_64-pc-windows-gnu (mingw)"
 echo
 
-cargo test -p mpedb-types -p mpedb-sql --target x86_64-pc-windows-gnu "$@"
+# Explicit crate list, not `--workspace`: the Unix-shaped members (mpedb-py,
+# mpedb-fs) would fail at link time and say nothing about Windows.
+cargo test -p mpedb-types -p mpedb-sql -p mpedb-core \
+    --target x86_64-pc-windows-gnu "$@"
+# The facade's LIB tests are the engine surface; its integration tests are not
+# portable (see caveat 3).
+cargo test -p mpedb --lib --target x86_64-pc-windows-gnu "$@"

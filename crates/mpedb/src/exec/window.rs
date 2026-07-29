@@ -12,7 +12,7 @@
 //! `select_footprint` never sees it).
 
 use super::*;
-use mpedb_sql::{Frame, FrameBound, FrameMode, WindowFunc, WindowSpec};
+use mpedb_sql::{Frame, FrameBound, FrameMode, WinInt, WindowFunc, WindowSpec};
 use mpedb_types::{Accum, HostAggState, HostAggs};
 use std::cmp::Ordering;
 
@@ -195,6 +195,8 @@ pub(super) fn compute_windows(
             &idx,
             rows,
             w,
+            // Resolved once per window, before any row is touched (format 63).
+            resolve_win_int(w.func, params)?,
             arg_colls.get(k).copied().unwrap_or(Collation::Binary),
             &part_key,
             &order_vals,
@@ -217,6 +219,11 @@ fn assign_window(
     idx: &[usize],
     rows: &mut [Vec<Value>],
     w: &WindowSpec,
+    // The value function's integer argument (`lag`/`lead` offset, `nth_value`'s
+    // n, `ntile`'s bucket count), resolved ONCE for this execution by
+    // `resolve_win_int`. It is a literal or a PARAMETER, never per-row — which
+    // is why one read serves every row here.
+    win_int: i64,
     // The argument's collating sequence — the min/max compare (and the DISTINCT
     // dedup, had windows allowed one) of a `WindowFunc::Agg` accumulator.
     coll: Collation,
@@ -255,6 +262,7 @@ fn assign_window(
                 part,
                 rows,
                 w.func,
+                win_int,
                 coll,
                 frame,
                 arg_vals,
@@ -348,7 +356,8 @@ fn assign_window(
             // after (lead) the current row; out of range ⇒ the per-row default
             // (or NULL). A negative constant offset is legal and simply looks the
             // other way (`p - offset`), exactly as sqlite computes it.
-            WindowFunc::Lag(offset) | WindowFunc::Lead(offset) => {
+            WindowFunc::Lag(_) | WindowFunc::Lead(_) => {
+                let offset = win_int;
                 let forward = matches!(w.func, WindowFunc::Lead(_));
                 for (off, &i) in part.iter().enumerate() {
                     let cur = off as i64;
@@ -395,7 +404,8 @@ fn assign_window(
             // `h`), so the FIXED row `part[n-1]` is in-frame once `h >= n` — it
             // appears at the peer group that first reaches it and stays for the
             // rest of the partition.
-            WindowFunc::NthValue(nn) => {
+            WindowFunc::NthValue(_) => {
+                let nn = win_int;
                 let mut g = 0usize;
                 while g < part.len() {
                     let mut h = g + 1;
@@ -420,7 +430,8 @@ fn assign_window(
             // (1-based) along the window order. sqlite's rule: the first `sz % nb`
             // buckets get `ceil(sz/nb)` rows, the rest `floor(sz/nb)`. The planner
             // guarantees an ORDER BY (so the order is deterministic) and `nb >= 1`.
-            WindowFunc::Ntile(nb) => {
+            WindowFunc::Ntile(_) => {
+                let nb = win_int;
                 let sz = part.len() as i64;
                 let nb = nb.max(1); // validated ≥ 1; guard division regardless
                 let floor = sz / nb;
@@ -492,12 +503,64 @@ fn assign_window(
 /// always correct (no incremental removal, so `min`/`max` stay exact); window
 /// partitions are small in practice and the default-frame fast paths are
 /// untouched.
+/// A window value function's integer argument for THIS execution (format 63).
+///
+/// A literal is itself; a parameter is read once here. The value is one value
+/// for the whole execution — never per row — which is the entire reason a
+/// parameter is admissible where a column reference is not.
+///
+/// A bound non-integer is refused BY NAME. sqlite coerces instead (MEASURED at
+/// 3.45.1: `lag(a, 1.5)` yields all-NULL, `lag(a, 'x')` behaves as offset 0),
+/// and those rules are the version-specific guesswork the 0-wrong-answer
+/// contract forbids reproducing. The binder types such a slot `Int64`, so in
+/// practice the ordinary parameter check refuses it first; this is the
+/// backstop for a plan that reached the executor another way.
+///
+/// `nth_value`/`ntile` additionally require n ≥ 1, and raise HERE when the
+/// value came from a parameter — which is where sqlite raises too (MEASURED:
+/// `nth_value(a, 0)` and `ntile(0)` are runtime errors, not parse errors).
+fn resolve_win_int(func: WindowFunc, params: &[Value]) -> Result<i64> {
+    let (arg, positive, what) = match func {
+        WindowFunc::Lag(v) | WindowFunc::Lead(v) => (v, false, "lag/lead offset"),
+        WindowFunc::NthValue(v) => (v, true, "second argument to nth_value"),
+        WindowFunc::Ntile(v) => (v, true, "argument of ntile"),
+        _ => return Ok(0),
+    };
+    let n = match arg {
+        WinInt::Lit(n) => n,
+        WinInt::Param(i) => match params.get(i as usize) {
+            Some(Value::Int(n)) => *n,
+            Some(other) => {
+                return Err(Error::TypeMismatch(format!(
+                    "{what} must be an integer, got {}",
+                    other.type_name()
+                )))
+            }
+            None => {
+                return Err(Error::Internal(format!(
+                    "window parameter ${} is not bound",
+                    i + 1
+                )))
+            }
+        },
+    };
+    if positive && n < 1 {
+        return Err(Error::TypeMismatch(format!(
+            "{what} must be a positive integer"
+        )));
+    }
+    Ok(n)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn assign_framed(
     slot: usize,
     part: &[usize],
     rows: &mut [Vec<Value>],
     func: WindowFunc,
+    // `nth_value`'s n, already resolved for this execution (see
+    // `resolve_win_int`) — the framed path never sees the parameters.
+    win_int: i64,
     // The argument's collating sequence, for a min/max aggregate over the frame.
     coll: Collation,
     frame: &Frame,
@@ -553,7 +616,8 @@ fn assign_framed(
             // The n-th row (1-based) WITHIN the frame, or NULL if the frame is
             // shorter than n. `nn >= 1` is validated; compute in i64 so an absurd
             // constant n just yields NULL rather than overflowing.
-            WindowFunc::NthValue(nn) => {
+            WindowFunc::NthValue(_) => {
+                let nn = win_int;
                 let idx = lo as i64 + (nn - 1);
                 if idx >= lo as i64 && idx < hi as i64 {
                     arg_vals[part[idx as usize]].clone().unwrap_or(Value::Null)

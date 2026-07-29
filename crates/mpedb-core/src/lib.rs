@@ -85,7 +85,8 @@ pub fn durability_barrier(fd: crate::wasmcompat::RawFd) -> core::ffi::c_int {
 
 pub use cdc::{CaptureConfig, DirtyEntry, DirtyOp};
 pub use engine::{
-    CheckPrograms, Engine, FoldOpts, FoldStop, ReadTxn, RowCursor, TxnSavepoint, TxnSavepointFull,
+    CheckPrograms, Engine, FoldOpts, FoldStop, ReadTxn, RowCursor, SchemaPrograms, TxnSavepoint,
+    TxnSavepointFull,
     WorkMeter, WriteTxn,
 };
 pub use ring::{IntentRing, PendingIntent, RingResult, RING_PARAMS_CAP};

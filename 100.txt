@@ -1,0 +1,394 @@
+100 % MOT SQLITE3 — STATUS OG OVERLEVERING
+==========================================
+Skrevet 2026-07-29 (fjerde revisjon). Gren: s0-baseline.
+Plan: ~/.claude/plans/logical-discovering-matsumoto.md
+
+
+0. LES DETTE FØRST
+------------------
+
+(a) EKSTRAVOLUMENE FORSVINNER VED HVER REBOOT.
+    `~/.cargo/config.toml` peker target-dir til /mnt/xfs/mpedb-target.
+    /mnt/xfs (/dev/sdb, xfs) og /mnt/ext4 (/dev/sdc) står IKKE i /etc/fstab.
+    Etter omstart er de tomme, root-eide kataloger, og cargo begynner
+    stilltiende å fylle 38 GB-rotdisken. Symptomet er at en binær du «nettopp
+    bygget» ikke finnes, og at `df -h /mnt/xfs` viser /dev/sda1.
+
+        sudo mount /dev/sdb /mnt/xfs && sudo mount /dev/sdc /mnt/ext4
+
+    Sudo krever passord → be Morten kjøre det med `!`-prefiks.
+    SJEKK `mount | grep /mnt/` FØR et tungt bygg, ikke etterpå.
+    Permanent fiks (ikke gjort — Mortens valg):
+        UUID=f7d2cb1f-85cc-478d-bca0-0d559942231a /mnt/xfs  xfs  defaults,nofail 0 2
+        UUID=912b3a63-3ee8-42c5-8d27-5648fe7b99a1 /mnt/ext4 ext4 defaults,nofail 0 2
+
+(b) EN RUNAWAY-PROBE KJØRES ALDRI UTEN INNHEGNING, OG ALDRI SAMTIDIG MED
+    NOE ANNET TUNGT. OOM-killeren treffer `tmux-spawn-*.scope`, altså scope-et
+    Claude Codes kommandoer kjører i — den dreper verktøyet sammen med proben.
+    Det skjedde ÉN gang 29/7 kl. 18:18, da en uinngjerdet probe kjørte mens
+    baseline-skrivingen pågikk; begge døde, og det så ut som et sporløst kill.
+    Riktig form:  ( ulimit -v 2000000; <kommando> )
+    Et budsjett som VIRKER trenger uansett et nett: budsjettet TILLATER per
+    definisjon at akkurat så mye holdes før det nekter.
+
+
+1. HVOR VI ER
+-------------
+
+Fem commits LOKALT på s0-baseline, ingenting pushet:
+
+  a1b4f8f  S0: measure the three suites again, and make the baseline an exit code
+  f8f77ab  S1+S2a: delete the corpus shim, and let a trigger body SELECT
+  2fa33c4  S2b: index names on the wire (schema v11) — DROP INDEX and a strict REINDEX
+  8b5cd29  S2c: the min/max discount is UNSOUND — the oracle refuted it, refusal stays
+  568bb97  S2c: the corpus is at 100 % — sqlite's ≥2 min/max rule, PROBED
+
+Oppå det, UCOMMITTET: S3 (FK-håndhevelse) + §4-fiksen + §5-fiksen.
+
+ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
+
+  korpus (sqllogictest)  622/622 filer, 7 420 638 records, 100,0 %,
+                         0 gale svar, 0 error-mismatch. BASELINE: eksakt
+                         treff, EXIT 0. 275 s, topp-RSS 345 MB.
+                         ← porten er kjørbar ende-til-ende for FØRSTE gang
+  Django G1+G2           831/831, SHIM-ONLY 0, EXPECTED SET eksakt treff
+  Django g3-g5           1345 tester, SHIM-ONLY 4 (var 5 — se §4)
+  CPython test_sqlite3   466 kjørt, 458 pass, SHIM-ONLY 8, STOCK-ONLY 0
+  cargo test --workspace 208 suiter ok
+  mpedb-capi (eget ws)   ok
+  clippy, begge ws       rene
+
+
+2. HVA S3 ER
+------------
+
+  * Skjema v12: TableDef.foreign_keys + FkAction (NoAction/Restrict/Cascade/
+    SetNull/SetDefault), kanonisk-bytes fram og tilbake, ukjent tag →
+    Error::Corrupt. Ingen migrering (stående regel).
+  * ForeignKeyDef.parent er et NAVN, ikke en tabell-id. MÅLT: sqlite 3.45.1
+    godtar foroverreferanse, og Djangos migreringsrekkefølge trenger det.
+  * fk.rs: `Phase::Guard` / `Phase::Act` — nektende handlinger FØR skrivingen,
+    muterende ETTER, fordi ON UPDATE CASCADE bærer barn til en nøkkel som først
+    finnes når forelderen er skrevet om.
+  * WriteRules bærer `fks: Option<Arc<FkGraph>>`; None = av. Cache nøklet
+    (schema_gen, fk_on).
+  * PRAGMA foreign_keys per connection, default AV; setteren er STILLE no-op i
+    transaksjon (målt). foreign_key_list + Database::foreign_key_check.
+  * Error::ForeignKeyViolation → SQLITE_CONSTRAINT_FOREIGNKEY (787).
+  * DROP TABLE nekter når et barn har rader (målt).
+  * Blind-apply utelukker FK-tabeller (ring_exec.rs), fail-closed —
+    `table_has_foreign_key` dekker BEGGE retninger (egne nøkler ELLER å være
+    navngitt som forelder), så den stien kan aldri produsere utsatte brudd.
+  * Deferred: trådlokal liste, avgjort i WriteSession::commit OG — siden §4 —
+    per setning på autocommit-stien.
+
+  cargo test -p mpedb --test foreign_key → 18/18 ok
+
+
+3. §4 LUKKET — UTSATT FK-BRUDD PÅ AUTOCOMMIT-STIEN
+---------------------------------------------------
+
+DIAGNOSE (hypotesen i forrige revisjon var riktig): `take_fk_deferred` fantes
+KUN i WriteSession::commit/rollback. Autocommit-skriving går via
+`ring_exec::lead_and_execute` og committer i ring_exec — helt utenom. Et
+DEFERRABLE INITIALLY DEFERRED-brudd forsvant dermed stille, og raden ble
+GODTATT der sqlite nekter den. Et galt svar, ikke en manglende test.
+
+MÅLT FØRST: sqlite 3.45.1, INSERT uten BEGIN → «FOREIGN KEY constraint
+failed (19)», 0 rader.
+
+FIKSEN: `exec_own` og `execute_prepared` i ring_exec.rs ER de to eneste
+autocommit-setningseksekutorene (fire kallsteder, alle i ring_exec), så
+avgjørelsen hører hjemme DER — ikke ved de tre `txn.commit()`-punktene. En
+ring-batch er mange autocommit-setninger som deler ÉN commit, og ett medlems
+dinglende nøkkel skal felle det medlemmet og ingen andre. Feiler avgjørelsen,
+heves `partial`, så lederens per-medlem-angring går via `undo_is_exact` i
+stedet for å anta at ingenting landet. En setning som FEILER slipper lista
+(ellers blir en rullet-tilbake rad en falsk nekting senere).
+
+BEKREFTET UAVHENGIG: Djangos egen suite gikk fra 5 til 4 shim-only, og den som
+forsvant er nøyaktig
+  model_fields.test_uuid.TestAsPrimaryKeyTransactionTests.test_unsaved_fk
+
+
+4. §5 LUKKET — select5.test OOM-ET BOKSEN (#101)
+--------------------------------------------------
+
+MÅLINGEN som avgjorde alt (inngjerdet, per join-aritet):
+
+    j24   0,02 s      7 MB
+    j25   4,97 s   1790 MB   ← klippet, eksakt ved 25 tabeller
+
+`mpee.rs` sa `const MAX_SOLVE: usize = 24` med begrunnelsen at bredere comma-
+joins «refuses by plan validation». MÅLT var det FEIL I BEGGE HALVDELER:
+18- til 24-veis joins SVARER, og 25+ ble ikke nektet, men planlagt i
+TEKSTREKKEFØLGE — 7 kartesiske steg, ~10^13 work-rows, og et mellomprodukt
+eksekveringen materialiserte til boksen døde. At løseren avsto VAR runaway-en.
+
+FIKSEN, FEM LEDD:
+
+  1. mpee.rs: maskene u32 → `type Mask = u64` (+ `bit()`/`full_mask()`, fordi
+     `1 << 64` er udefinert). MAX_SOLVE 24 → 64 = sqlites egen grense.
+     select5 gikk fra å drepe boksen til 1436/1436 på 1,4 s og 9 MB.
+  2. plan/mod.rs: MAX_JOINS 16 → 63. Korpuset kjører `query_once` og encoder
+     aldri, så nektingen viste seg aldri der — men GJENNOM C-API-en
+     (prepare → register → decode) kom den samme setningen tilbake som
+     «corrupt». Ett tall for begge stier.
+  3. parser/select.rs: >64 tabeller nektes ved parse, med sqlites egen ordlyd
+     («at most 64 tables in a join»). MÅLT at sqlite gjør nøyaktig det. Over
+     64 finnes ingen plan verdt å lage.
+  4. DEFAULT_MAX_JOIN_CELLS 2^28 (~11 GB) → 2^24 (~670 MB). Den gamle
+     kalibreringen målte PLANLEGGEREN: de «68 M celler select5 trenger» var
+     kartesiske produkter løseren hadde avstått fra å ordne. Med løseren på
+     full bredde topper hele korpuset på 345 MB. Et budsjett på 11 GB er
+     ingen vakt på en 7,9 GB-boks — og feilbar allokering redder den ikke,
+     fordi Linux' heuristiske overcommit LAR reservasjonen lykkes og dreper
+     ved berøring.
+  5. engine/mod.rs: den config-frie «tooling»-handelen satte BEGGE budsjettene
+     til 0 = ubegrenset. Det er riktig for work-rows (en dump skanner lovlig
+     hele tabeller) men ikke for join-celler — og det er den handelen
+     `mpedb <fil.mpedb>` bruker, altså den daglige stien. DETTE var grunnen
+     til at vakten aldri fyrte. Nå får den den vanlige standarden.
+
+  Pluss en backstop i gather.rs: et budsjett prosessen aldri kan nå klemmes
+  ned til ett den kan (`clamp_to_memory`, én probe per prosess). Faktoren er
+  1/4, ikke 3/4 — akkumulatoren er en voksende Vec, så et stabilt nivå på n
+  bytes har en transient topp nær 2n. MÅLT med 3/4: allokeringen feilet på
+  ~33 M celler mens taket sto på 37,5 M, altså kom veggen FØRST.
+
+RESULTATET, på den samme proben som drepte boksen (30-veis permutert kjede
+med FULL join, som løseren avstår fra):
+    før:  1,3 GB og klatrende, OOM-kill
+    nå:   «runtime budget exceeded: 16777226 live joined cells > limit
+           16777216 … nested-loop join with "u10"», 0,51 s, 561 MB
+
+MERK at #101 sto som lukket. Den var det ikke. Vakten fantes, men sto på et
+tall maskinen aldri nådde, på en sti som hadde den slått av.
+
+
+5. GJENSTÅR
+-----------
+
+  a) M3 (ssh m3) full gate FØR push — stående regel. IKKE KJØRT.
+  b) Deretter er S3 + §4 + §5 klar til commit. Vurder tre commits, ikke én:
+     de er uavhengige og §5 rører planlegger og runtime-standarder, ikke FK.
+     Ingenting er committet — Morten bestemmer.
+
+  §6c (hastighetsklausulen) er GJORT. Kontrollarm: 568bb97 bygget i
+  /mnt/xfs/wt-pre-s3 med eget CARGO_TARGET_DIR (401 MB; /mnt/xfs forsvinner
+  uansett ved reboot). At armen er ekte pre-S3 er verifisert FUNKSJONELT —
+  den kjenner ikke `[compat] foreign_keys` — ikke ved strengsøk, for
+  «foreign key mismatch» finnes også i den bundlede sqlite CLI-en lenker.
+  `bench --auto`, interleavet A/B, 5 repetisjoner, medianer:
+
+      op       pre-S3     ny        delta    spredning
+      insert   204 047    205 447   +0,69 %   8,6 %
+      select   507 593    509 547   +0,38 %   1,5 %   ← nullkontroll
+      update   171 191    175 394   +2,46 %   6,0 %
+
+  Alle tre innenfor spredningen og alle i FAVORABEL retning. Nullkontrollen
+  er `select`: FK kan ikke røre lesing, så den måler ren støy — og den
+  beveger seg like mye som insert. Instrumentet er validert mot en KJENT
+  effekt: durability none→commit gir insert 207 197 → 134 631 ops/s (−35 %).
+  Ærlig formulering: ingen kostnad påvisbar over et ~9 % støygulv, på et
+  instrument som oppløser 35 % klart. Skal noe under 9 % utelukkes, trengs
+  flere repetisjoner eller en smalere mikrobenk.
+
+  Django og CPython er ferdig målt (§1) og trenger ingen ny kjøring med
+  mindre koden endres igjen.
+  D8-linja i mpedb_backend/base.py bør få begrunnelsen oppdatert: den står nå
+  på sqlite_master-evaluatoren alene, ikke på FK-fraværet (D8-ablasjonen 29/7:
+  WB_NO_D8=1 → SHIM-ONLY 5 → 51).
+
+
+6. RESTEN AV PLANEN
+-------------------
+
+S4 — CPython-posisjonene (#195). MÅLT 29/7: shim-only er nøyaktig 8.
+  TRIAGE 29/7 kveld, etter å ha lest hva hver test FAKTISK krever:
+
+    * test_connection_config — `sqlite3_db_config(SQLITE_DBCONFIG_ENABLE_FKEY)`
+      get+set. Testen verifiserer til slutt at et FK-brudd faktisk nekter, så
+      den er FØRST nå mulig, takket være S3. Minst arbeid av de åtte.
+    * backup-paret — Mortens stegvise `backup(pages=N)`, se under.
+    * serialize/deserialize — via mpedb-mirrors sqlite-eksportør.
+    * AUTOINCREMENT ×2 — reverserer en dokumentert nekting, men den nektingen
+      begrunnes med en MANGLENDE FUNKSJON, ikke en hindring: mpedb har per
+      design ÉN skriver av gangen (skrivelåsen; intent-ringen finnes nettopp
+      fordi skrivere serialiseres), så en høyvannsteller i skrive-txn-en
+      legger til NULL ny serialisering. PostgreSQLs svar — ikke-transaksjonelle
+      sekvenser med per-sesjon-cache — trengs ikke her; det virker der fordi
+      AUTOINCREMENT bare forbyr GJENBRUK, ikke hull, og det samme gjør at
+      blokk-allokering ville vært lovlig om vi noen gang fikk flere skrivere.
+      Én reell kobling: optimistisk blind-apply må utelate slike tabeller,
+      samme fail-closed-mønster som `table_has_foreign_key`/`table_has_trigger`.
+    * fts4-dump — står på et EKTE designvalg (ingen extension-ABI). 100 %
+      krever at det omgjøres. Mortens valg.
+    * test_error_msg_decode_error — SER trivielt ut, er det ikke. Krever at
+      `'xxx' || X'FA'` gir TEXT med UGYLDIG UTF-8 (MÅLT i sqlite: typeof=text,
+      hex 787878FA797979). `Value::Text` er en Rust-`String` og kan ikke holde
+      de bytene. Den ene testen krever altså byte-basert TEXT i kjernen — stor
+      endring med gal-svar-risiko overalt.
+
+  De åtte:
+      test_backup.BackupTests.test_progress
+      test_backup.BackupTests.test_modifying_progress
+      test_dbapi.SerializeTests.test_serialize_deserialize
+      test_dbapi.ConnectionTests.test_connection_config
+      test_dump.DumpTests.test_dump_autoincrement
+      test_dump.DumpTests.test_dump_autoincrement_create_new_db
+      test_dump.DumpTests.test_dump_virtual_tables
+      test_regression.RegressionTests.test_error_msg_decode_error
+  Mortens innspill 29/7 lukker backup-paret: `backup(pages=N)` gjøres STEGVIS
+  med sqlites restart-semantikk — mellom hvert steg leses kildens commit-teller
+  i metasiden; har den flyttet seg, start kopien på nytt. Ingen vakt på
+  skriverne, ingen holdt lås, null kost når ingen skriver. `pages=-1` beholder
+  ett-skudds-kopien. Tar BÅDE test_progress og test_modifying_progress.
+  Resten: serialize/deserialize via mpedb-mirrors sqlite-eksportør;
+  AUTOINCREMENT + sqlite_sequence (fjerner Django-D2); fts4 shadow-table-dump.
+
+S5 — Djangos rester (#196). MÅTTE SKALERES OPP 29/7 KVELD.
+
+  I de 12 labelene vi har målt hele tiden er det 4 shim-only: 2
+  introspection-PK, 1 test_init_command, 1 JSON-path-escape. Pluss D8-gjelden
+  (sqlite_master som ekte relasjon, deler #130) og 1 PRAGMA synchronous.
+
+  MEN VI KJØRTE BARE 12 AV 215 LABELS — og 151 av dem rører databasen. Et
+  bredt sveip 29/7 over 40 DB-tunge ORM-labels (WB_GROUP_BASE=6, logger i
+  /mnt/xfs/mpedb-scratch/djsuite-wide) ga stock 0 feil, shim 54, PLUSS tre
+  grupper som ikke engang kom gjennom MIGRERINGEN. Rangert etter innflytelse:
+
+  OPPSETTSBLOKKERE (hele grupper kjører 0 tester — mest å hente):
+    1. `UNIQUE INDEX … WHERE` (partiell unik indeks). ← LUKKET, se §S5a.
+    2. Parentesert DEFAULT-uttrykk. Blokkerer g11 (custom_pk, custom_columns,
+       model_inheritance, model_regress, field_defaults). mpedb lagrer en
+       KONSTANT default, ikke et uttrykk. NESTE OPPGAVE.
+
+  S5a — PARTIELL UNIK INDEKS: LUKKET 29/7 kveld.
+
+  Før: `CREATE UNIQUE INDEX … WHERE` ble nektet, og migreringen døde, så to
+  hele grupper kjørte 0 tester. Etter: 218 tester låst opp, 213 grønne.
+      g6  constraints/nested_foreign_keys/null_fk/null_fk_ordering/
+          force_insert_update   126 tester, shim OK, 0 feil  ← FK-flaten grønn
+      g7  indexes/introspection/model_indexes/datatypes/max_lengths
+          92 tester, 4 shim-only (1 FUNKSJONSindeks `ON t(LOWER(x))` — egen
+          funksjon; 3 introspeksjons-gjeld, samme familie som de kjente)
+
+  SEMANTIKKEN ER MÅLT MOT sqlite 3.45.1, ikke resonnert:
+    * Bare TRUE gir medlemskap. FALSE OG NULL utelukker begge — to rader kan
+      dele en partiell-unik nøkkel under hver av dem. Dette er IKKE CHECK-
+      regelen (der NULL passerer); et indeks-predikat er et WHERE.
+    * En rad kan BLI medlem uten at noen INDEKSERT kolonne endres, fordi
+      predikatet leser andre kolonner (`UPDATE t SET b=9` under
+      `UNIQUE(a) WHERE b>5` kolliderer). Den vanlige «endret en indeksert
+      kolonne seg?»-snarveien er blind for dette — derfor sammenligner en
+      partiell indeks entry-NØKLENE i stedet. Motsatt vei teller også: et
+      medlem som forlater settet FRIGJØR nøkkelen.
+
+  FORMEN: medlemskap avgjøres ett sted, `WriteTxn::index_entry_key`, som
+  returnerer `None` for en ikke-medlem — samme `None` de eksisterende stiene
+  allerede ga for «en indeksert kolonne er NULL». Alle skrivestier (insert,
+  delete, update, undo) beholdt dermed sin `else { continue }` uendret. Tre
+  kopier av testen ville drevet fra hverandre, og den som drev ville etterlatt
+  en indeksoppføring tabellen ikke rettferdiggjør.
+
+  Predikatene kompileres av FASADEN i samme kall som CHECK-ene
+  (`SchemaPrograms`), slik at en bundle aldri kan holde checks fra ett skjema
+  og indeks-predikater fra et annet. Kilde uten kompilert program er en HARD
+  nekting, aldri «alle rader er medlem» — det siste ville vært et galt svar
+  under en unik partiell indeks, og er nøyaktig hvorfor de var nektet før.
+  Den initielle byggingen bruker SAMME kompilator på det nye skjemaet, så
+  byggingen og senere skrivinger ikke kan være uenige.
+
+  Én følgefiks: en partiell indeks over PK-kolonnen ble avvist som «duplicates
+  the primary key tree». Den gjør ikke det — den holder bare medlemmene, og
+  det er slik Django skriver en betinget constraint over pk-en.
+
+  DE 54, KLYNGET:
+       27  expressions_window   ← se S5b, familien på 18 er lukket
+       16  bulk_create
+        6  prefetch_related
+        4  db_functions         (Concat non-str, Right)
+        1  delete_regress
+
+  S5b — PARAMETER SOM VINDUSFUNKSJONENS HELTALLSARGUMENT: LUKKET 29/7 kveld.
+
+  `lag`/`lead`-offset, `nth_value`s n og `ntile`s bøttetall måtte være
+  literaler. Djangos ORM pakker HVERT slikt argument i en `Value`, som
+  kompilatoren emitterer som en bunden `?` — så offsets som er rene literaler
+  i Python-kilden (`Lag('salary', offset=1)`) ble nektet. Etter: den familien
+  er borte fra feillista; `expressions_window` alene står på 18 shim-only, og
+  ingen av dem er lenger «must be a constant integer».
+
+  Nektingens begrunnelse gjaldt PER-RAD-koersjon, og en parameter er ikke i
+  den klassen: den er ÉN verdi for hele kjøringen, akkurat som `LIMIT ?`
+  (`LimitVal` er presedensen, og `WinInt` er formet etter den). Et per-rad-
+  uttrykk — en kolonne — nektes fortsatt, ved bind.
+
+  MÅLT MOT sqlite 3.45.1 FØR implementasjonen, og det var avgjørende:
+      lag(a, 0)   → gjeldende rad          lag(a, 1.5) → alle NULL
+      lag(a, -1)  → skifter MOTSATT vei    lag(a, 'x') → som offset 0
+      nth_value(a, 0) og ntile(0)          → HARD kjøretidsfeil
+  0 og negativ er altså veldefinert, ikke feil — en resolver som klemte eller
+  avviste dem ville svart GALT i stedet for å nekte. mpedb traff dem allerede
+  eksakt for literaler, så bare kilden til tallet er ny. Ikke-heltall nektes
+  ved navn: binderen typer slotten Int64 (som LIMIT), så den vanlige
+  parametersjekken tar det først; eksekvereren har backstoppen.
+
+  Plan-format 62 → 63: argumentet er `WinInt::{Lit(i64), Param(u16)}` og
+  encodes tagget. Åtte rå bytes kunne ikke skille de to.
+
+  Merk at dette er FØRSTE måling av denne flaten — den er ikke en regresjon
+  fra noe. De 831 + 1345 testene vi har kjørt siden run 1 er fortsatt like
+  grønne; de dekket bare mindre enn vi trodde.
+
+S6 — 2000-linjersregelen + Wine/Windows (#197). Hører ETTER commiten.
+
+#123 — STRØMMENDE JOIN. Vurdert 29/7 og BEVISST UTSATT, ikke glemt.
+  `stream.rs:155`: strømmestien er i dag en bar ytre skanning — joins,
+  DISTINCT, aggregat og ORDER BY faller alle tilbake til materialisering, og
+  det står en navngitt fallgruve der (et tidligere forsøk «returnerte stille
+  de ytre radene som om resten av planen ikke fantes»). DESIGN-STREAM-EXEC
+  §9.3 priser kostnaden selv: en andre kodesti per form, hver med egen
+  differensialtest-gjeld mot sqlite-orakelet.
+  Hva det VILLE endret: den rene INNER/LEFT-kjeden — nettopp select5-formen —
+  ville blitt et TIDSproblem (som max_work_rows alt avgrenser) i stedet for et
+  minneproblem. Hva som ville STÅTT IGJEN: FULL joins `inner_matched` (én bit
+  per indre rad, må spenne hele skanningen), hash-byggsiden, og aggregatets
+  gruppekart — designet sier selv at «no chunk size makes it smaller».
+  Budsjettet blir altså aldri overflødig, bare degradert fra hovedvakt til
+  restvakt. Etter commiten, som eget steg.
+
+
+7. FALLGRUVER
+-------------
+
+  * IKKE `sleep` i forgrunnen for å polle en jobb — bruk run_in_background,
+    eller `until <sjekk>; do sleep N; done`.
+  * Korpus-runneren tar FIL-argumenter, ikke en katalog.
+  * `journalctl -k` viser IKKE bruker-systemds OOM-linjer. Bruk
+    `journalctl --user -b --since ...` og SJEKK RIKTIG TIDSVINDU (et drap i
+    forrige boot krever `-b -1`).
+  * Rydd /dev/shm før tunge kjøringer (#137):
+      ls /dev/shm | grep -E '^(mpedb|etl|rretl|ingest|collab|tier|corpus)' \
+        | while read -r f; do rm -f "/dev/shm/$f"; done
+  * Django-runneren: WB_LABEL_GROUPS (linjeseparert) + WB_GROUP_BASE for en
+    andre invokasjon; WB_OUT for loggkatalog. G1/G2 er FROSNE — utvid aldri
+    dem. `expected_shim_only.txt` dekker BARE G1+G2; en gruppe-3-5-kjøring
+    rapporterer alltid «EXPECTED SET: MOVED» og skal IKKE skrive fila.
+  * mpedb-CLI-en er linjebasert på piped stdin: en flerlinjes SQL-setning må
+    flates til én linje før den mates inn.
+
+
+8. UFRAVIKELIG
+--------------
+
+  * 0 gale svar er porten, ikke passraten.
+  * Hver utvidelse testes på VERDI og typeof(), ikke på at den parser.
+  * Kontrollarm for alt som påstås å koste noe.
+  * Suitene ER spesifikasjonen — maks én minimal repro per fiks.
+  * Ingen bakoverkompat-byrde: v12 nekter eldre filer høylytt.
+  * MÅL, ikke resonner. I dag alene har målingen overkjørt fem antakelser:
+    parent-som-tabell-id, kaskade-før-skriv, planens påstand om at S3 frigjør
+    D8, `MAX_SOLVE`-kommentarens påstand om at brede joins nektes nedstrøms,
+    og cellebudsjettets kalibrering — som målte planleggeren, ikke spørringene.

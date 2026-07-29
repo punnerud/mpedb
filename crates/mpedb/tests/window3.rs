@@ -294,3 +294,84 @@ fn ntile_refusals() {
     .to_lowercase()
     .contains("frame"));
 }
+
+// ------------------------------------- parameterised value-function arguments
+
+/// The same query with the integer argument BOUND, against sqlite running the
+/// LITERAL — the exact claim being made: a parameter must answer what the
+/// literal answers, because it is one value for the whole execution.
+fn assert_param_matches_literal(d: &Database, sql_param: &str, sql_lit: &str, n: i64) {
+    let got = match d.query(sql_param, &[Value::Int(n)]).unwrap() {
+        ExecResult::Rows { rows, .. } => rows
+            .into_iter()
+            .map(|r| r.iter().map(render).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        other => panic!("expected rows from `{sql_param}`, got {other:?}"),
+    };
+    assert_eq!(got, sqlite_rows(sql_lit), "param {n} differs from the literal");
+}
+
+/// Django's ORM wraps every `lag`/`lead`/`nth_value`/`ntile` integer argument in
+/// a `Value`, which its compiler emits as a bound `?`. Refusing that refused 18
+/// of Django's 27 `expressions_window` tests over offsets that are plain
+/// literals in the Python source.
+///
+/// The offsets that are NOT 1 are the load-bearing ones: MEASURED against sqlite
+/// 3.45.1, `0` means the current row and a NEGATIVE offset looks the other way —
+/// so a resolver that clamped or rejected them would answer wrongly rather than
+/// refuse.
+#[test]
+fn a_bound_parameter_answers_what_the_literal_answers() {
+    let t = db();
+    for n in [1i64, 0, -1, 2] {
+        assert_param_matches_literal(
+            &t.db,
+            "SELECT id, lag(k, $1) OVER (ORDER BY id) FROM w3 ORDER BY id",
+            &format!("SELECT id, lag(k, {n}) OVER (ORDER BY id) FROM w3 ORDER BY id"),
+            n,
+        );
+        assert_param_matches_literal(
+            &t.db,
+            "SELECT id, lead(k, $1) OVER (ORDER BY id) FROM w3 ORDER BY id",
+            &format!("SELECT id, lead(k, {n}) OVER (ORDER BY id) FROM w3 ORDER BY id"),
+            n,
+        );
+    }
+    for n in [1i64, 2, 3] {
+        assert_param_matches_literal(
+            &t.db,
+            "SELECT id, nth_value(k, $1) OVER (ORDER BY id) FROM w3 ORDER BY id",
+            &format!("SELECT id, nth_value(k, {n}) OVER (ORDER BY id) FROM w3 ORDER BY id"),
+            n,
+        );
+        assert_param_matches_literal(
+            &t.db,
+            "SELECT id, ntile($1) OVER (ORDER BY id) FROM w3 ORDER BY id",
+            &format!("SELECT id, ntile({n}) OVER (ORDER BY id) FROM w3 ORDER BY id"),
+            n,
+        );
+    }
+}
+
+/// `n < 1` is a RUNTIME error for a bound value — which is where sqlite raises
+/// it too (MEASURED: `nth_value(a, 0)` and `ntile(0)` are runtime errors, not
+/// parse errors). A per-ROW argument stays refused at bind: that is the case
+/// where sqlite's coercion becomes version-specific guesswork.
+#[test]
+fn a_bound_argument_is_still_checked() {
+    let t = db();
+    for sql in [
+        "SELECT nth_value(k, $1) OVER (ORDER BY id) FROM w3",
+        "SELECT ntile($1) OVER (ORDER BY id) FROM w3",
+    ] {
+        let e = t.db.query(sql, &[Value::Int(0)]).unwrap_err().to_string();
+        assert!(e.contains("positive integer"), "{sql}: {e}");
+    }
+    // A column is per-row and stays refused, at BIND time.
+    let e = t
+        .db
+        .query("SELECT lag(k, k) OVER (ORDER BY id) FROM w3", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("per-row"), "{e}");
+}

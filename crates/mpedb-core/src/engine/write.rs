@@ -289,6 +289,45 @@ pub struct WriteTxn<'e> {
 }
 
 impl<'e> WriteTxn<'e> {
+    /// The key `row` occupies in secondary index `i` of table position `tid`, or
+    /// `None` when the row is not a MEMBER of that index.
+    ///
+    /// The single place membership is decided, for every write path. There are
+    /// two ways out of an index and both must produce the same `None`:
+    ///
+    /// * any indexed column is NULL (SQL's own index-membership rule), and
+    /// * the row fails a partial index's `WHERE` predicate.
+    ///
+    /// Every caller already treats `None` as "no entry", so folding the second
+    /// rule in here is what makes insert, delete, update and the initial build
+    /// agree by construction. Three copies of this test would drift, and the
+    /// one that drifted would leave an index entry the table does not justify.
+    fn index_entry_key(
+        &self,
+        tid: usize,
+        i: usize,
+        row: &[Value],
+        pk_key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let table = &self.bundle.schema.tables[tid];
+        let ix = &table.indexes[i];
+        if !super::index_predicate_admits(
+            self.bundle.index_predicates.get(tid).and_then(|v| v.get(i)),
+            ix.predicate.as_ref(),
+            &table.name,
+            row,
+        )? {
+            return Ok(None);
+        }
+        Ok(index_row_key(
+            self.bundle.sec_unique[tid][i],
+            &self.bundle.sec_indexes[tid][i],
+            row,
+            pk_key,
+            &self.bundle.sec_specs[tid][i],
+        ))
+    }
+
     pub(super) fn tree_root(&mut self, table_id: u32, index_no: u32) -> Result<(u64, u64)> {
         if let Some(&e) = self.table_roots.get(&(table_id, index_no)) {
             return Ok(e);
@@ -998,14 +1037,9 @@ impl<'e> WriteTxn<'e> {
                     continue;
                 }
                 // A unique key is the values alone; any-NULL means no entry and
-                // no conflict (SQL: UNIQUE permits multiple NULLs).
-                let Some(ikey) = index_row_key(
-                    true,
-                    &self.bundle.sec_indexes[tid][i],
-                    values,
-                    &[],
-                    &self.bundle.sec_specs[tid][i],
-                ) else {
+                // no conflict (SQL: UNIQUE permits multiple NULLs), and so does
+                // failing a partial index's predicate.
+                let Some(ikey) = self.index_entry_key(tid, i, values, &[])? else {
                     continue;
                 };
                 let ino = (i + 1) as u32;
@@ -1100,13 +1134,7 @@ impl<'e> WriteTxn<'e> {
             // construction. Any-NULL ⇒ no entry (membership rule). Both
             // store the pk as the payload so a lookup fetches the row.
             let unique = self.bundle.sec_unique[tid][i];
-            let Some(ikey) = index_row_key(
-                unique,
-                &self.bundle.sec_indexes[tid][i],
-                values,
-                &key,
-                &self.bundle.sec_specs[tid][i],
-            ) else {
+            let Some(ikey) = self.index_entry_key(tid, i, values, &key)? else {
                 continue;
             };
             let ino = (i + 1) as u32;
@@ -1158,14 +1186,7 @@ impl<'e> WriteTxn<'e> {
         let tid = table_id as usize;
         for &i in installed.iter().rev() {
             let i = i as usize;
-            let unique = self.bundle.sec_unique[tid][i];
-            let Some(ikey) = index_row_key(
-                unique,
-                &self.bundle.sec_indexes[tid][i],
-                values,
-                pk_key,
-                &self.bundle.sec_specs[tid][i],
-            ) else {
+            let Some(ikey) = self.index_entry_key(tid, i, values, pk_key)? else {
                 continue;
             };
             let ino = (i + 1) as u32;
@@ -1274,13 +1295,7 @@ impl<'e> WriteTxn<'e> {
         self.set_tree_root(table_id, 0, out.new_root, count - 1);
 
         for i in 0..n_sec {
-            let Some(ikey) = index_row_key(
-                self.bundle.sec_unique[tid][i],
-                &self.bundle.sec_indexes[tid][i],
-                &old,
-                &key,
-                &self.bundle.sec_specs[tid][i],
-            ) else {
+            let Some(ikey) = self.index_entry_key(tid, i, &old, &key)? else {
                 continue;
             };
             let ino = (i + 1) as u32;
@@ -1332,19 +1347,29 @@ impl<'e> WriteTxn<'e> {
                     self.bundle.sec_specs[tid][i][j],
                 )
             });
-            if !changed {
+            // …but "changed" is only the WHOLE question for a whole-table
+            // index. A partial one can be JOINED by a row whose indexed columns
+            // never moved — the predicate reads other columns (MEASURED against
+            // sqlite: `UPDATE t SET b=9` makes an existing `a` collide under
+            // `UNIQUE(a) WHERE b>5`). So the cheap compare may only skip where
+            // it is complete.
+            let partial = self.bundle.schema.tables[tid].indexes[i].predicate.is_some();
+            if !partial && !changed {
                 continue;
             }
-            // Any-NULL in the NEW values ⇒ no entry ⇒ nothing to conflict.
-            let Some(ikey) = index_row_key(
-                true,
-                cols,
-                new_values,
-                &[],
-                &self.bundle.sec_specs[tid][i],
-            ) else {
+            // Any-NULL in the NEW values ⇒ no entry ⇒ nothing to conflict, and
+            // so does failing the predicate.
+            let Some(ikey) = self.index_entry_key(tid, i, new_values, &[])? else {
                 continue;
             };
+            // For a partial index the row's OWN entry may already sit under
+            // this key (it was a member and stayed one); `changed` is what
+            // rules that out for a whole-table index, and this is the same
+            // question asked exactly.
+            if partial && self.index_entry_key(tid, i, &old, &[])?.as_deref() == Some(ikey.as_slice())
+            {
+                continue;
+            }
             let ino = (i + 1) as u32;
             let (iroot, _) = self.tree_root(table_id, ino)?;
             if btree::get(self, iroot, &ikey)?.is_some() {
@@ -1395,12 +1420,21 @@ impl<'e> WriteTxn<'e> {
                     self.bundle.sec_specs[tid][i][j],
                 )
             });
-            if !changed {
+            // Same asymmetry as the pre-check: a partial index also moves when
+            // its predicate's ANSWER moves, and the predicate may read columns
+            // the index does not cover.
+            let partial = self.bundle.schema.tables[tid].indexes[i].predicate.is_some();
+            if !partial && !changed {
                 continue;
             }
-            let unique = self.bundle.sec_unique[tid][i];
-            let okey = index_row_key(unique, cols, &old, &key, &self.bundle.sec_specs[tid][i]);
-            let nkey = index_row_key(unique, cols, new_values, &key, &self.bundle.sec_specs[tid][i]);
+            let okey = self.index_entry_key(tid, i, &old, &key)?;
+            let nkey = self.index_entry_key(tid, i, new_values, &key)?;
+            // Membership and key both unchanged: nothing to do. (For a
+            // whole-table index `changed` already decided this; for a partial
+            // one this is where a no-op predicate re-evaluation stops.)
+            if okey == nkey {
+                continue;
+            }
             let ino = (i + 1) as u32;
             let (mut iroot, mut icount) = self.tree_root(table_id, ino)?;
             if let Some(okey) = okey {
@@ -2079,18 +2113,13 @@ impl<'e> WriteTxn<'e> {
         name: Option<String>,
     ) -> Result<()> {
         let bundle = Arc::clone(&self.bundle);
-        // A UNIQUE partial index needs membership evaluation on every write
-        // (otherwise rows outside the predicate would spuriously collide).
-        // Non-unique partials may build a full index and still answer correctly
-        // because the planner never picks a partial for access (P1 shipping).
-        if unique && predicate.is_some() {
-            return Err(Error::Unsupported(
-                "UNIQUE INDEX … WHERE is not supported yet — a partial unique \
-                 index needs membership evaluation on every write (P1 partial \
-                 build); use a non-unique partial or a whole-table UNIQUE"
-                    .into(),
-            ));
-        }
+        // A partial index is BUILT over its members only, and every later write
+        // re-decides membership through `index_entry_key`. Before that existed,
+        // a partial index was built whole and a UNIQUE one had to be refused
+        // outright — rows outside the predicate would have collided with each
+        // other. (A non-unique partial was allowed because the planner never
+        // picked one for access, so a too-large index still answered.)
+        let pred_src = predicate.clone();
         let new_schema = bundle.schema.with_added_index(
             table_id,
             mpedb_types::IndexDef {
@@ -2100,6 +2129,19 @@ impl<'e> WriteTxn<'e> {
                 name,
             },
         )?;
+        // The predicate program for the index being built, from the SAME
+        // compiler the bundle rebuild will use — so the rows this build admits
+        // and the rows later writes admit cannot disagree. A predicate that has
+        // no program refuses below, in `index_predicate_admits`.
+        let build_pred: Option<Option<mpedb_types::ExprProgram>> = pred_src.as_ref().map(|_| {
+            self.eng
+                .compile_programs(&new_schema, &bundle.checks)
+                .index_predicates
+                .get(table_id as usize)
+                .and_then(|v| v.get(bundle.schema.table(table_id).map_or(0, |t| t.indexes.len())))
+                .cloned()
+                .flatten()
+        });
         let (tname, new_ino, idx_coll) = {
             let table = bundle
                 .schema
@@ -2126,6 +2168,14 @@ impl<'e> WriteTxn<'e> {
             let mut c = btree::cursor(self, pkroot, None, None)?;
             while let Some((k, v)) = c.next(self)? {
                 let values = row::decode_row(&v, &col_types)?;
+                if !super::index_predicate_admits(
+                    build_pred.as_ref(),
+                    pred_src.as_ref(),
+                    &tname,
+                    &values,
+                )? {
+                    continue;
+                }
                 if let Some(ikey) = index_row_key(unique, &columns, &values, &k, &idx_coll) {
                     entries.push((ikey, k));
                 }
@@ -2218,8 +2268,8 @@ impl<'e> WriteTxn<'e> {
         // `schema_gen_bump`). It never escapes this txn's lifetime; it only
         // keeps the value distinct from the pre-DDL bundle's gen.
         let gen = self.meta.schema_gen + 1;
-        let checks = self.eng.compile_checks(&schema, &self.bundle.checks);
-        let bundle = Arc::new(SchemaBundle::new_at(gen, schema, checks));
+        let programs = self.eng.compile_programs(&schema, &self.bundle.checks);
+        let bundle = Arc::new(SchemaBundle::new_at(gen, schema, programs));
         self.bundle = Arc::clone(&bundle);
         Ok(bundle)
     }

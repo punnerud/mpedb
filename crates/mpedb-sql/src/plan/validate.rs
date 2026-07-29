@@ -792,13 +792,18 @@ impl CompiledPlan {
                         if matches!(w.func, WF::Host) && w.arg.is_none() {
                             return Err(corrupt("host window aggregate requires an argument"));
                         }
+                        // A LITERAL that is not positive is a corrupt blob. A
+                        // PARAMETER is only knowable once bound, so the executor
+                        // raises there instead — which is also where sqlite
+                        // raises (MEASURED: `nth_value(a, 0)` and `ntile(0)` are
+                        // both runtime errors, not parse errors).
                         if let WF::NthValue(n) = w.func {
-                            if n < 1 {
+                            if matches!(n, WinInt::Lit(v) if v < 1) {
                                 return Err(corrupt("nth_value n must be a positive integer"));
                             }
                         }
                         if let WF::Ntile(n) = w.func {
-                            if n < 1 {
+                            if matches!(n, WinInt::Lit(v) if v < 1) {
                                 return Err(corrupt("ntile bucket count must be a positive integer"));
                             }
                         }

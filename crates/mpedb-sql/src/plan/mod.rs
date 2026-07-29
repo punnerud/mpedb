@@ -485,7 +485,16 @@ const MAX_JOINS: usize = 63;
 //     collation — sqlite compares min/max (aggregate AND scalar) under the
 //     argument's collation, which a BINARY-only compare answered wrongly on
 //     any NOCASE/RTRIM column (tests/agg_collate.rs).
-const PLAN_FORMAT: u8 = 62;
+// v63: the integer argument of `lag`/`lead`/`nth_value`/`ntile` is a
+//     [`WinInt`] — a literal OR a PARAMETER slot — instead of a bare i64, and
+//     encodes as a tag byte plus its payload rather than eight raw bytes.
+//     Django's ORM wraps every such argument in a `Value`, which its compiler
+//     emits as a bound `?`; refusing the parameter form refused 18 of the 27
+//     `expressions_window` tests over an offset that is a plain literal in the
+//     Python source. The integer SEMANTICS are untouched (0 = the current row,
+//     negative looks the other way — both already matched sqlite); only where
+//     the integer comes from is new.
+const PLAN_FORMAT: u8 = 63;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1143,11 +1152,11 @@ pub enum WindowFunc {
     Agg(AggFn),
     /// `lag(expr, offset, …)` — the value `offset` rows BEFORE the current row in
     /// the partition (window order); out of range ⇒ the spec's `default` (or
-    /// NULL). Frame-independent. The `i64` is the CONSTANT offset (folded at
-    /// prepare; a non-constant offset is refused).
-    Lag(i64),
+    /// NULL). Frame-independent. The offset is a literal or a PARAMETER
+    /// ([`WinInt`]); a per-ROW expression is refused.
+    Lag(WinInt),
     /// `lead(expr, offset, …)` — the value `offset` rows AFTER the current row.
-    Lead(i64),
+    Lead(WinInt),
     /// `first_value(expr)` — the first row of the frame, i.e. (default frame)
     /// the partition's first row: constant across the partition.
     FirstValue,
@@ -1157,13 +1166,13 @@ pub enum WindowFunc {
     LastValue,
     /// `nth_value(expr, n)` — the n-th row (1-based, `i64`) of the frame, or NULL
     /// if the frame has fewer than n rows. `n` is a CONSTANT ≥ 1 (validated).
-    NthValue(i64),
+    NthValue(WinInt),
     /// `ntile(n)` — the partition's rows distributed into `n` buckets as equally
     /// as possible (bucket number 1..n). sqlite's rule: the first `rows % n`
     /// buckets get `ceil(rows/n)` rows, the rest `floor`. `n` is a CONSTANT ≥ 1
     /// (validated); requires ORDER BY (the planner refuses it otherwise). Result
     /// is `Int64`, never NULL. Takes no per-row value.
-    Ntile(i64),
+    Ntile(WinInt),
     /// `percent_rank()` — `(rank - 1) / (rows_in_partition - 1)`, or 0.0 for a
     /// one-row partition. Uses `rank()` semantics (ties share). `Float64`, never
     /// NULL, no argument.
@@ -1221,6 +1230,49 @@ const MAX_WINDOWS: usize = 64;
 pub enum LimitVal {
     Lit(u64),
     Param(u16),
+}
+
+/// The integer argument of a window value function — `lag`/`lead`'s offset,
+/// `nth_value`'s n, `ntile`'s bucket count (format 63).
+///
+/// [`LimitVal`] is the precedent and the reasoning is the same: the value is
+/// ONE value for the whole execution, so it may be a parameter without the plan
+/// having to bake it in. What is genuinely per-ROW — a column reference or an
+/// expression over one — stays refused, because that is where sqlite's coercion
+/// becomes version-specific guesswork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinInt {
+    Lit(i64),
+    Param(u16),
+}
+
+impl WinInt {
+    /// Wire tag: literal or parameter slot.
+    pub(crate) fn tag(self) -> u8 {
+        match self {
+            WinInt::Lit(_) => 0,
+            WinInt::Param(_) => 1,
+        }
+    }
+
+    /// The parameter slot this reads, if any — what validate range-checks and
+    /// what the binder counts toward a plan's parameter arity.
+    pub fn param(self) -> Option<u16> {
+        match self {
+            WinInt::Lit(_) => None,
+            WinInt::Param(i) => Some(i),
+        }
+    }
+}
+
+impl std::fmt::Display for WinInt {
+    /// `$N` for a parameter — the same spelling `LIMIT ?` already explains with.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WinInt::Lit(n) => write!(f, "{n}"),
+            WinInt::Param(i) => write!(f, "${}", i + 1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

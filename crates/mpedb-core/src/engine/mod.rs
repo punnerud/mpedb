@@ -478,21 +478,84 @@ fn index_row_key(
     Some(k)
 }
 
+/// Does `row` satisfy secondary index `i`'s partial predicate — i.e. is it a
+/// MEMBER of the index?
+///
+/// `None` predicate (a whole-table index) admits every row. A partial index
+/// admits only rows the predicate evaluates TRUE for: FALSE and NULL are both
+/// non-members, MEASURED against sqlite 3.45.1, which lets two rows share a
+/// partial-UNIQUE key under either. (This is a `WHERE`, so it is NOT the CHECK
+/// rule, where NULL passes.)
+///
+/// A predicate SOURCE with no compiled program is a hard refusal, never a
+/// silent "everyone is a member": under a UNIQUE partial index that reading
+/// would make rows OUTSIDE the predicate collide with each other — a wrong
+/// answer, and the exact reason partial UNIQUE indexes were refused outright
+/// before there was a predicate to evaluate.
+fn index_predicate_admits(
+    prog: Option<&Option<ExprProgram>>,
+    src: Option<&String>,
+    table: &str,
+    row: &[mpedb_types::Value],
+) -> Result<bool> {
+    let Some(src) = src else { return Ok(true) };
+    let Some(Some(prog)) = prog else {
+        return Err(Error::Unsupported(format!(
+            "partial index on `{table}` cannot be enforced here: its predicate \
+             `{src}` has no compiled program (this handle has no SQL layer \
+             installed). Refusing rather than treating every row as a member."
+        )));
+    };
+    let mut stack = Vec::new();
+    match prog.eval_with_stack(&mut stack, row, &[])? {
+        mpedb_types::Value::Bool(b) => Ok(b),
+        mpedb_types::Value::Null => Ok(false),
+        v => Err(Error::TypeMismatch(format!(
+            "partial index predicate on `{table}` evaluated to {}, expected bool",
+            v.type_name()
+        ))),
+    }
+}
+
 /// Per-column compiled CHECK programs, one entry per table (indexed like
 /// `schema.tables`), one per column. Compiled by the facade (SQL layer);
 /// `None` = no CHECK on that column.
 pub type CheckPrograms = Vec<Vec<Option<ExprProgram>>>;
 
-/// Compiles a schema's `ColumnDef::check` SOURCE strings into [`CheckPrograms`].
+/// Per table, per secondary index (`index_no - 1`): the compiled
+/// `CREATE INDEX … WHERE <pred>` predicate. `None` = a whole-table index, whose
+/// membership is every row.
 ///
-/// mpedb-core stores CHECK sources but cannot parse SQL, so the facade installs
-/// one of these ([`Engine::set_check_compiler`]) and the engine calls it every
-/// time it (re)builds a bundle from the catalog. Without it, a table created by
-/// `CREATE TABLE … CHECK (…)` carries its constraint in the schema and gets an
-/// EMPTY program slot — a constraint that is stored, reported by the catalog,
-/// and never enforced. Whether a CHECK fires must not depend on whether the
-/// table came from the config or from DDL.
-pub type CheckCompiler = dyn Fn(&Schema) -> Result<CheckPrograms> + Send + Sync;
+/// The truth rule is **not** CHECK's. A CHECK passes on TRUE *or* NULL; index
+/// membership is a `WHERE`, so only TRUE is a member — MEASURED against sqlite
+/// 3.45.1, which lets two rows share a partial-unique key when the predicate is
+/// FALSE *and* when it is NULL.
+pub type IndexPredicates = Vec<Vec<Option<ExprProgram>>>;
+
+/// Everything the SQL layer has to compile out of a schema's stored SOURCE
+/// strings, produced in ONE call so the two can never describe different
+/// schemas: per-column CHECKs and per-index partial predicates.
+pub struct SchemaPrograms {
+    pub checks: CheckPrograms,
+    pub index_predicates: IndexPredicates,
+}
+
+/// Compiles a schema's stored SOURCE strings into [`SchemaPrograms`].
+///
+/// mpedb-core stores CHECK and partial-index sources but cannot parse SQL, so
+/// the facade installs one of these ([`Engine::set_check_compiler`]) and the
+/// engine calls it every time it (re)builds a bundle from the catalog. Without
+/// it, a table created by `CREATE TABLE … CHECK (…)` carries its constraint in
+/// the schema and gets an EMPTY program slot — a constraint that is stored,
+/// reported by the catalog, and never enforced. Whether a CHECK fires must not
+/// depend on whether the table came from the config or from DDL.
+///
+/// A missing INDEX predicate is not treated that leniently: an index whose
+/// source is present but whose program is not refuses the write (see
+/// `WriteTxn::index_member`). "Not compiled" would otherwise mean "every row is
+/// a member", which for a UNIQUE partial index is a wrong answer — rows outside
+/// the predicate would collide with each other.
+pub type CheckCompiler = dyn Fn(&Schema) -> Result<SchemaPrograms> + Send + Sync;
 
 /// How to rebuild a whole row from one secondary-index ENTRY
 /// ([`SchemaBundle::covering`]): which columns the key carries, which the
@@ -592,6 +655,11 @@ pub struct SchemaBundle {
     pub schema_gen: u64,
     pub schema: Schema,
     pub checks: CheckPrograms,
+    /// Compiled partial-index predicates — see [`IndexPredicates`]. EMPTY when
+    /// no compiler has run yet; a table/index whose schema carries a predicate
+    /// SOURCE but whose slot here is absent refuses the write rather than
+    /// admitting every row (`WriteTxn::index_member`).
+    pub index_predicates: IndexPredicates,
     /// Per table, per index (`index_no - 1`): the indexed column ordinals in
     /// key order.
     pub sec_indexes: Vec<Vec<Vec<u16>>>,
@@ -623,13 +691,25 @@ impl std::ops::Deref for SchemaBundle {
 }
 
 impl SchemaBundle {
-    pub fn new_at(schema_gen: u64, schema: Schema, checks: CheckPrograms) -> SchemaBundle {
-        let mut b = SchemaBundle::new(schema, checks);
+    pub fn new_at(schema_gen: u64, schema: Schema, programs: SchemaPrograms) -> SchemaBundle {
+        let mut b = SchemaBundle::new_with_programs(schema, programs);
         b.schema_gen = schema_gen;
         b
     }
 
+    /// CHECKs only, no compiled index predicates — the shape every caller that
+    /// has no SQL layer to compile with uses (`Engine::open`'s seed, core
+    /// tests). A partial index is then unenforceable and says so at the write,
+    /// rather than admitting every row.
     pub fn new(schema: Schema, checks: CheckPrograms) -> SchemaBundle {
+        SchemaBundle::new_with_programs(
+            schema,
+            SchemaPrograms { checks, index_predicates: Vec::new() },
+        )
+    }
+
+    pub fn new_with_programs(schema: Schema, programs: SchemaPrograms) -> SchemaBundle {
+        let SchemaPrograms { checks, index_predicates } = programs;
         let sec_indexes = schema
             .tables
             .iter()
@@ -670,6 +750,7 @@ impl SchemaBundle {
             schema_gen: 0,
             schema,
             checks,
+            index_predicates,
             sec_indexes,
             sec_unique,
             col_types,
@@ -885,9 +966,9 @@ impl Engine {
     pub fn set_check_compiler(&self, f: Arc<CheckCompiler>) -> Result<()> {
         *self.check_compiler.write().expect("check compiler lock poisoned") = Some(f);
         let cur = self.bundle();
-        let checks = self.compile_checks(&cur.schema, &cur.checks);
+        let programs = self.compile_programs(&cur.schema, &cur.checks);
         *self.bundle.write().expect("schema bundle lock poisoned") =
-            Arc::new(SchemaBundle::new_at(cur.schema_gen, cur.schema.clone(), checks));
+            Arc::new(SchemaBundle::new_at(cur.schema_gen, cur.schema.clone(), programs));
         Ok(())
     }
 
@@ -905,23 +986,25 @@ impl Engine {
     /// is a source that compiled. If one ever did fail, the empty slot is the
     /// same "not yet compiled" state the pre-compiler code left, and the next
     /// `CREATE`/`ALTER` naming that column re-reports it.
-    pub(super) fn compile_checks(&self, schema: &Schema, prev: &CheckPrograms) -> CheckPrograms {
+    pub(super) fn compile_programs(&self, schema: &Schema, prev: &CheckPrograms) -> SchemaPrograms {
         let compiler = self
             .check_compiler
             .read()
             .expect("check compiler lock poisoned")
             .clone();
         if let Some(f) = compiler {
-            if let Ok(c) = f(schema) {
-                debug_assert_eq!(c.len(), schema.tables.len());
-                if c.len() == schema.tables.len() {
-                    return c;
+            if let Ok(p) = f(schema) {
+                debug_assert_eq!(p.checks.len(), schema.tables.len());
+                if p.checks.len() == schema.tables.len() {
+                    return p;
                 }
             }
         }
         let mut checks = prev.clone();
         checks.resize(schema.tables.len(), Vec::new());
-        checks
+        // No compiler (or a failed compile) leaves the predicates EMPTY, which
+        // is the fail-closed state, not "every row is a member".
+        SchemaPrograms { checks, index_predicates: Vec::new() }
     }
 
     /// Replace the current bundle with the catalog's stored schema. The
@@ -941,9 +1024,9 @@ impl Engine {
         // CHECK programs are compiled by the facade from check sources; the
         // installed compiler recompiles the WHOLE stored schema, so a table a
         // peer created with a CHECK is enforced here too and not merely stored.
-        let checks = self.compile_checks(&stored, &cur.checks);
+        let programs = self.compile_programs(&stored, &cur.checks);
         *self.bundle.write().expect("schema bundle lock poisoned") =
-            Arc::new(SchemaBundle::new_at(gen, stored, checks));
+            Arc::new(SchemaBundle::new_at(gen, stored, programs));
         Ok(())
     }
 

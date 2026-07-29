@@ -1398,7 +1398,13 @@ impl Schema {
                     })?;
                     // `any` IS allowed here. See `ANY_KEY_COLUMNS` below.
                 }
-                if ix.columns.len() == 1
+                // A PARTIAL index over the PK column is not the PK tree: it
+                // holds only the rows its predicate admits, so it answers a
+                // question the PK tree cannot (`UNIQUE(pk) WHERE …` is how
+                // Django writes a conditional constraint over the pk). Only a
+                // whole-table one is the duplicate this rejects.
+                if ix.predicate.is_none()
+                    && ix.columns.len() == 1
                     && t.primary_key.len() == 1
                     && t.primary_key[0] == ix.columns[0]
                 {
