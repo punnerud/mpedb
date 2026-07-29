@@ -381,22 +381,21 @@ fn sqlite_mode_refuses_the_unreproducible_arbitrary_edges() {
     // refuses (never a wrong answer) even though sqlite accepts them:
     let (db, path) = open("arb-refuse", Some("sqlite"));
     load(&db, DATA);
-    for q in [
-        // Two-or-more min/max: sqlite follows the LAST min/max — an order-
-        // dependent pick its own docs call "arbitrary" (verified: `min(x), max(x)`
-        // and `max(x), min(x)` give DIFFERENT bare rows). Refused.
-        "SELECT name, min(x), max(x) FROM t GROUP BY g",
-        "SELECT name, max(x), max(x + 1) FROM t GROUP BY g",
-        // Over a JOIN there is no single rowid to pick by (the row is
-        // `[outer ‖ inner]`), so the arbitrary case stays refused.
-        "SELECT t.name, count(*) FROM t JOIN u ON t.g = u.gid GROUP BY t.g",
-    ] {
-        let err = db.query(q, &[]).unwrap_err().to_string();
-        assert!(
-            err.contains("must appear in GROUP BY"),
-            "sqlite mode should refuse `{q}`, got: {err}"
-        );
-    }
+    // Two-or-more min/max used to live here. sqlite's docs call that pick
+    // "arbitrary", but PROBING it showed a completely uniform rule — the LAST
+    // min/max's witness row — which the executor already reproduced. Those
+    // shapes are now VERIFIED against sqlite in
+    // `sqlite_mode_bare_column_follows_the_last_minmax`, not refused.
+    //
+    // What is left is the case with NO min/max to follow: over a JOIN the row
+    // is `[outer ‖ inner]` and there is no single rowid to pick by, so sqlite's
+    // genuinely arbitrary choice stays refused.
+    let q = "SELECT t.name, count(*) FROM t JOIN u ON t.g = u.gid GROUP BY t.g";
+    let err = db.query(q, &[]).unwrap_err().to_string();
+    assert!(
+        err.contains("must appear in GROUP BY"),
+        "sqlite mode should refuse `{q}`, got: {err}"
+    );
     // Over a NON-rowid (text) primary key, mpedb's min-PK is not sqlite's rowid,
     // so the arbitrary case is refused there too — but a single min/max still
     // works (its witness rule does not depend on the PK being the rowid).
@@ -418,64 +417,72 @@ fn sqlite_mode_refuses_the_unreproducible_arbitrary_edges() {
 }
 
 #[test]
-fn sqlite_mode_two_minmax_with_const_last_follows_lowest_rowid() {
-    // The ≥2-min/max carve-out (slt_good_12.test:72600 shape): sqlite follows
-    // the LAST min/max, and one with a non-NULL CONSTANT argument "improves"
-    // only on the group's first row — so the pick is the LOWEST-ROWID row,
-    // which mpedb reproduces with the same min-PK witness as the 0-min/max
-    // case. Every accepted shape is verified against the bundled sqlite.
-    let (db, path) = open("mm-const-last", Some("sqlite"));
+fn sqlite_mode_bare_column_follows_the_last_minmax() {
+    // PROBED against sqlite 3.45 (2026-07-29), and the rule turned out to be
+    // completely uniform — there is no "arbitrary" case to refuse:
+    //
+    //   bare columns come from the LAST min()/max()'s WITNESS row;
+    //   if that aggregate never improves (all-NULL argument, or a FILTER that
+    //   rejects every row) they come from the group's LAST row — except that a
+    //   filter rejecting everything falls back to the group's FIRST row;
+    //   with NO min/max at all they come from the group's FIRST (lowest-rowid) row.
+    //
+    // The one-min/max case is k=1 of that, and a trailing CONSTANT min/max
+    // improves exactly once — on the first row — so the old "const last →
+    // lowest rowid" carve-out is the same answer by the general rule rather
+    // than a special case. The executor already reproduced every branch; only
+    // the planner gate and "which min/max governs" had to change.
+    //
+    // An earlier attempt discounted constant min/max aggregates from the COUNT
+    // instead, and this oracle refuted it: the gate said "one effective
+    // min/max" while the EXECUTOR still saw two and fell back to lowest-rowid,
+    // so an all-NULL group answered `g` where sqlite answers `h`. The rule was
+    // right; the change was half of it.
+    let (db, path) = open("mm-last", Some("sqlite"));
     load(&db, DATA);
     for q in [
-        // min-const and max-const last; includes the ties (g=10), the interior
-        // NULL (g=20) and the all-NULL group (g=30 — sqlite still takes the
-        // FIRST row here, not the all-NULL "last row" of the single-min rule).
+        // Two reals: the LAST one governs, either order.
+        "SELECT g, name, min(x), max(x) FROM t GROUP BY g",
+        "SELECT name, min(x), max(x) FROM t GROUP BY g",
+        "SELECT name, max(x), min(x) FROM t GROUP BY g",
+        "SELECT name, max(x), max(x + 1) FROM t GROUP BY g",
+        // Constant FIRST, real last — the corpus shape
+        // (`slt_good_12.test`: max(DISTINCT -95) … min(col0)).
+        "SELECT name, min(-52), min(x) FROM t GROUP BY g",
+        "SELECT g, name, max(99), min(x) FROM t GROUP BY g",
+        "SELECT g, name, max(-95), min(-52), min(x) FROM t GROUP BY g",
+        "SELECT g, name FROM t GROUP BY g HAVING max(-95) = -95 AND min(x) IS NOT NULL",
+        // Constant LAST — improves once, on the first row.
         "SELECT g, name, min(x), min(-52) FROM t GROUP BY g",
         "SELECT g, name, min(x), max(99) FROM t GROUP BY g",
-        // Three min/max: only the LAST governs, the others may be arbitrary.
         "SELECT g, name, min(x), max(x), min(-52) FROM t GROUP BY g",
-        // The corpus shape: both min/max live in HAVING, const one last.
         "SELECT g, name FROM t GROUP BY g HAVING min(x) IS NULL OR min(-52) = -52",
+        // A NULL constant NEVER improves, so the witness drifts to the LAST row.
+        "SELECT name, min(x), max(NULL) FROM t GROUP BY g",
+        // A FILTER restricts the witness to the rows it accepts, and when it
+        // accepts NONE the group falls back to its FIRST row.
+        "SELECT name, min(x), min(-52) FILTER (WHERE x > 3) FROM t GROUP BY g",
     ] {
         assert_matches_sqlite(&db, q);
     }
-    let (db2, path2) = open("mm-const-last-ooo", Some("sqlite"));
+    // Out of rowid order, so "first row" cannot be confused with "first inserted".
+    let (db2, path2) = open("mm-last-ooo", Some("sqlite"));
     load(&db2, OOO);
-    assert_matches_sqlite_data(
-        &db2,
-        OOO,
-        "SELECT g, name, min(x), min(-52) FROM t GROUP BY g",
-    );
-    let _ = std::fs::remove_file(path2);
-    // Still refused — each of these breaks the "provably lowest-rowid" proof:
     for q in [
-        // The const min/max is NOT last. It is TEMPTING to discount it: a
-        // constant improves only on the group's first row, so "surely" it can
-        // never be the aggregate the witness follows, leaving one effective
-        // min/max and the ordinary single-extremum rule. That was tried
-        // (2026-07-29) and this oracle refuted it in one query. On the group
-        // whose `x` is ALL NULL, `min(x)` never improves either — and sqlite
-        // then ends on the group's LAST row (`h`), not on the constant's first
-        // row (`g`) and not on any extremum. So "the last min/max decides" is
-        // false exactly when the last one never improves, and the discount
-        // would turn this clean refusal into a WRONG ANSWER. It stays refused.
-        "SELECT name, min(-52), min(x) FROM t GROUP BY g",
-        // A NULL constant never "improves", so sqlite drifts to the LAST row.
-        "SELECT name, min(x), max(NULL) FROM t GROUP BY g",
-        // A FILTER moves the pick to the first row the filter ACCEPTS.
-        "SELECT name, min(x), min(-52) FILTER (WHERE x > 3) FROM t GROUP BY g",
-        // ORDER BY references a min/max: sqlite builds its aggregate list as
-        // SELECT → ORDER BY → HAVING, so ITS last min/max is min(x) (probed on
-        // 3.45: the bare column follows the HAVING min/max, not the ORDER BY
-        // one) while mpedb lifts HAVING first — refused instead of guessing.
-        "SELECT g, name FROM t GROUP BY g HAVING min(x) < 100 ORDER BY min(-52)",
+        "SELECT g, name, min(x), min(-52) FROM t GROUP BY g",
+        "SELECT g, name, min(-52), min(x) FROM t GROUP BY g",
     ] {
-        let err = db.query(q, &[]).unwrap_err().to_string();
-        assert!(
-            err.contains("must appear in GROUP BY"),
-            "should refuse `{q}`, got: {err}"
-        );
+        assert_matches_sqlite_data(&db2, OOO, q);
     }
+    let _ = std::fs::remove_file(path2);
+
+    // The ONE shape still refused, and it is about OUR list order, not sqlite's
+    // rule: sqlite builds its aggregate list SELECT -> ORDER BY -> HAVING while
+    // the lift runs SELECT -> HAVING -> ORDER BY, so "last" only agrees while
+    // ORDER BY references no min/max. Refused rather than reconstructed.
+    let q = "SELECT g, name FROM t GROUP BY g HAVING min(x) < 100 ORDER BY min(-52)";
+    let err = db.query(q, &[]).unwrap_err().to_string();
+    assert!(err.contains("must appear in GROUP BY"), "should refuse `{q}`, got: {err}");
     let _ = std::fs::remove_file(path);
 }
 

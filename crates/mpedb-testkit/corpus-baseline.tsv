@@ -482,7 +482,7 @@ random/groupby/slt_good_0.test	10559	10012	0	0	0	547	0
 random/groupby/slt_good_1.test	10718	10012	0	0	0	706	0
 random/groupby/slt_good_10.test	10254	10012	0	0	0	242	0
 random/groupby/slt_good_11.test	11246	10012	0	0	0	1234	0
-random/groupby/slt_good_12.test	12706	10010	2	0	0	2694	0
+random/groupby/slt_good_12.test	12706	10012	0	0	0	2694	0
 random/groupby/slt_good_13.test	3452	3182	0	0	0	270	0
 random/groupby/slt_good_2.test	10684	10012	0	0	0	672	0
 random/groupby/slt_good_3.test	10840	10012	0	0	0	828	0

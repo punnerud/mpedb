@@ -675,15 +675,23 @@ pub(super) fn plan_aggregate_select(
         let reproducible = match n_minmax {
             1 => true,
             0 => rowid_pick_ok,
-            _ => {
-                rowid_pick_ok
-                    && minmax_const[*minmax_ix.last().expect("n_minmax >= 2")]
-                    && !order_refs.iter().any(|&s| {
-                        (s as usize) >= n_keys
-                            && s < k_aggs
-                            && minmax_ix.contains(&(s as usize - n_keys))
-                    })
-            }
+            // PROBED against sqlite 3.45 (2026-07-29, nine shapes in
+            // `tests/group_by_dialect.rs`): the rule is uniform — the bare
+            // columns follow the LAST min/max's witness row, and the executor
+            // already reproduces exactly that, all-NULL fallback included. So
+            // ≥2 needs no `rowid_pick_ok` (the witness follows the aggregate,
+            // not a rowid) and no constant-argument carve-out (a trailing
+            // constant improves once, on the first row — the same answer the
+            // old min-PK route gave, now by the general rule).
+            //
+            // What DOES still have to hold is the ordering caveat: sqlite
+            // builds its aggregate list SELECT → ORDER BY → HAVING while the
+            // lift above runs SELECT → HAVING → ORDER BY, so "last" agrees
+            // between the two only while ORDER BY references no min/max at
+            // all. That overlap stays refused rather than reconstructed.
+            _ => !order_refs.iter().any(|&s| {
+                (s as usize) >= n_keys && s < k_aggs && minmax_ix.contains(&(s as usize - n_keys))
+            }),
         };
         if !reproducible {
             let reason = if n_minmax == 0 {

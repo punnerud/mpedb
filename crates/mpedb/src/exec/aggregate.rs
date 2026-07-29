@@ -381,18 +381,27 @@ impl<'a> Folder<'a> {
         //
         // A HOST aggregate is never a min/max: `AggTarget::native()` is None for
         // one, so it can neither govern the witness nor be miscounted here.
-        let mm: Option<(&AggCall, mpedb_types::AggFn)> = {
-            let mut it = agg.aggs.iter().filter_map(|c| match c.func.native() {
+        // The LAST min/max governs, whatever the count. Probed against sqlite
+        // 3.45 across nine shapes (`tests/group_by_dialect.rs`): with
+        // `min(x), min(y)` the bare columns follow min(y); swap them and they
+        // follow min(x); a trailing CONSTANT min/max improves only on the first
+        // row, so they follow that — which is the lowest-rowid row the old
+        // carve-out routed to the min-PK branch for, i.e. the same answer by a
+        // uniform rule. The one-min/max case is k=1 of it.
+        //
+        // Zero min/max still means the min-PK branch (sqlite's "arbitrary" is
+        // the group's lowest-rowid row).
+        //
+        // A HOST aggregate is never a min/max: `AggTarget::native()` is None for
+        // one, so it can neither govern the witness nor be miscounted here.
+        let mm: Option<(&AggCall, mpedb_types::AggFn)> = agg
+            .aggs
+            .iter()
+            .filter_map(|c| match c.func.native() {
                 Some(f @ (mpedb_types::AggFn::Min | mpedb_types::AggFn::Max)) => Some((c, f)),
                 _ => None,
-            });
-            match (it.next(), it.next()) {
-                // Exactly one min/max → its witness row governs the bare columns.
-                (Some(c), None) => Some(c),
-                // Zero (→ lowest rowid) or two-plus (planner-refused) → min-PK.
-                _ => None,
-            }
-        };
+            })
+            .next_back();
         // The collation each GROUP BY key groups under: a bare NOCASE/RTRIM
         // column collapses case-/space-variants into ONE group (sqlite parity);
         // a computed key is BINARY. Folded before encoding, so `'abc'` and

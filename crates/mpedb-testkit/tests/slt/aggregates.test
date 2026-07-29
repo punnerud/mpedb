@@ -373,11 +373,28 @@ NULL
 sales
 50
 
-# But TWO-OR-MORE min/max is still REFUSED: sqlite fills the bare column from the
-# LAST min/max (an order-dependent pick its own docs call "arbitrary"), so mpedb
-# declines rather than risk a value that differs from sqlite (#88).
-statement error must appear in GROUP BY
+# TWO-OR-MORE min/max used to be refused here, on the grounds that sqlite's
+# pick is "arbitrary". It is not: PROBED against sqlite 3.45 (2026-07-29) the
+# rule is uniform — the bare column comes from the LAST min/max's witness row —
+# and mpedb's executor already reproduced exactly that, all-NULL fallback
+# included. The values below are sqlite's own: `eng` takes its `amt` from the
+# max(amt)=300 row, `sales` from max(amt)=50, and the all-NULL `ops` group
+# yields NULL.
+query TIII rowsort
 SELECT dept, amt, min(amt), max(amt) FROM t GROUP BY dept
+----
+eng
+300
+100
+300
+ops
+NULL
+NULL
+NULL
+sales
+50
+50
+50
 
 # The key must decide the groups — an aggregate cannot.
 statement error cannot contain an aggregate
