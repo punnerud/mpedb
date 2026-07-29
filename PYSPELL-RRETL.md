@@ -393,6 +393,35 @@ r["conflicts"]        # counted and skipped, never fatal — see map_check
 * * * * * mpedb rretl map run /etc/app/db.toml crm --max-secs 45 --runner server-1
 ```
 
+### Making it react instead of scan
+
+A round walks every row on both sides, so on a big table a change waits for
+the cursor to reach it. Declare `stream = true` and mpedb puts triggers on
+the mapped tables: every write appends the key it touched to a journal, and
+the daemon drains that FIRST.
+
+```python
+db.rretl_map_define({"name": "crm", "stream": True, "tables": [...]})
+db.rretl_map_backlog("crm")     # {"crm_customers": 3} — what is waiting
+r = db.rretl_map_run("crm", max_secs=45)
+r["streamed"]                   # journal entries consumed this run
+```
+
+Measured: at the same per-tick budget, a change at the far end of an
+8 000-row table is mirrored after **1** invocation instead of 40. The
+latency stops following the table's size.
+
+Three things that are true and matter:
+
+- **It costs the WRITE path.** Every insert, update and delete on a mapped
+  table now also writes a journal row. That is why it is opt-in.
+- **The scan does not go away, and must not.** Triggers fire on the SQL path
+  only — a `mirror import`, a restored file, or a `DROP TRIGGER` leaves rows
+  that differ with nothing recording it. The rounds are what find those, so
+  keep running them; the journal only decides what gets synced first.
+- **`map sync` clears the journal** when it succeeds: it did the whole set
+  in one transaction, so nothing is outstanding by definition.
+
 Four things to know:
 
 - **Every commit advances the whole set** — a chunk from EACH table per

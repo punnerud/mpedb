@@ -1027,6 +1027,10 @@ impl PyDatabase {
 
     /// Queue derived calls from this receipt's keys, in the SAME
     /// transaction as the rows that produced them.
+    /// The trigger-fed journal's backlog per mapped table (rRETL §15).
+    fn rretl_map_backlog(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+        pyrretl::rretl_map_backlog(&self.db, py, name)
+    }
     fn ingest_derive(
         &self,
         py: Python<'_>,

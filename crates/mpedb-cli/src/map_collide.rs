@@ -56,7 +56,7 @@ target = "ext"
   target = "wc"
 "#;
 
-fn setup(dir: &Path, secs: u64, keyspace: u64) -> Result<(String, PathBuf, u128), Failure> {
+fn setup(dir: &Path, secs: u64, keyspace: u64, stream: bool) -> Result<(String, PathBuf, u128), Failure> {
     std::fs::create_dir_all(dir)?;
     let dir = dir.canonicalize()?;
     let db_path = dir.join("map.mpedb");
@@ -87,7 +87,11 @@ fn setup(dir: &Path, secs: u64, keyspace: u64) -> Result<(String, PathBuf, u128)
     def("def sgn(x):\n    if x < 0:\n        return 1\n    return 0\n")?;
     def("def unmag(y, s):\n    if s == 1:\n        return 0 - y\n    return y\n")?;
     db.create_residual_lens("mag", "mag", "sgn", "unmag", mpedb::ColumnType::Int64)?;
-    db.rretl_map_define(MAP_TOML)?;
+    db.rretl_map_define(&if stream {
+        MAP_TOML.replace("[map]", "[map]\nstream = true")
+    } else {
+        MAP_TOML.to_string()
+    })?;
 
     let mut rng = Rng::seeded(&[0x6d61_7063, keyspace, secs]);
     let ins = db.prepare("INSERT INTO src (id, v, q, w) VALUES ($1, $2, $3, $4)")?;
@@ -126,7 +130,11 @@ fn legal_v(rng: &mut Rng) -> i64 {
 // ------------------------------------------------------------------- parent
 
 pub fn run_parent(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["dir", "writers", "secs", "kill-ms", "keyspace", "mode"], &[])?;
+    let p = args::parse(
+        argv,
+        &["dir", "writers", "secs", "kill-ms", "keyspace", "mode"],
+        &["stream"],
+    )?;
     let dir = PathBuf::from(p.require("dir")?);
     let writers = p.u64_or("writers", 2)?.max(1);
     let secs = p.u64_or("secs", 5)?.max(1);
@@ -142,7 +150,11 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         other => return usage(format!("--mode must be sync or run, got `{other}`")),
     };
 
-    let (cfg, exe, deadline) = setup(&dir, secs, keyspace)?;
+    // The stream form (§15) puts the journal's triggers in the writers' path
+    // and the drain in the syncer's — a different set of writes to be killed
+    // between, so it gets its own fuzz.
+    let stream = p.has("stream");
+    let (cfg, exe, deadline) = setup(&dir, secs, keyspace, stream)?;
     let _wd = Watchdog::arm(secs + 60, "map-collide");
     let deadline_s = deadline.to_string();
 
@@ -229,11 +241,23 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         ));
     }
     check_bad_exits(bad_exits)?;
+    // The journal must be EMPTY at the end. A leftover entry after the
+    // final drain would mean a kill separated "the row was synced" from
+    // "the entry was consumed" — the one thing §15.5's single transaction
+    // exists to prevent.
+    let left: i64 = db.rretl_map_backlog("m")?.iter().map(|(_, n)| n).sum();
+    if left != 0 {
+        return Err(Failure::Runtime(format!(
+            "MAP-COLLIDE: {left} journal entr(ies) survived the final drain after \
+             {kills} kill(s) — a kill separated the sync from the entry that named it"
+        )));
+    }
     println!(
-        "map-collide({}): writers={writers}x2 secs={secs} syncer-kills={kills} \
-         conflict-fixes={fixes} rows={n_src} check=clean fsck=clean — no row lost, \
-         duplicated or half-synced across kills",
-        if daemon { "run" } else { "sync" }
+        "map-collide({}{}): writers={writers}x2 secs={secs} syncer-kills={kills} \
+         conflict-fixes={fixes} rows={n_src} check=clean fsck=clean journal=drained \
+         — no row lost, duplicated or half-synced across kills",
+        if daemon { "run" } else { "sync" },
+        if stream { "+stream" } else { "" }
     );
     Ok(())
 }

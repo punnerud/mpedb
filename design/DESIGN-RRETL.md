@@ -1112,3 +1112,124 @@ must still converge to a clean `map check` and `rretl fsck`. Measured at
 473 kills on Linux, converged clean — the cursor and the rows it covers
 are written in one transaction, so a kill between commits cannot separate
 them.
+
+---
+
+## 15. #53 — the stream form: the map learns what changed **[BUILT 2026-07-29]**
+
+§14's daemon is honest but blunt: every round walks the source, then the
+target, then the state table. That is O(rows) per round no matter how few
+rows moved, and it is the reason `--max-secs` exists. A map over a million
+rows where twelve changed pays for a million.
+
+The stream form removes the scan from the common case. A trigger on each
+mapped table appends the key it just touched to a journal, and the daemon
+drains the journal before it advances the scan. Latency stops being "how
+long is a round" and becomes "how long until the next drain".
+
+### 15.1 What it is NOT: the journal is a fast path, never the truth
+
+This is the same rule ingest states about deltas and dumps (DESIGN-INGEST
+§4), and it is load-bearing here for reasons that are specific and named:
+
+- **Triggers fire on the SQL path.** A write that reaches the tables another
+  way — `mirror import`, the typed row API, a restore that swaps a file in —
+  leaves no journal entry. The rows are still different; nothing recorded
+  that they became different.
+- **A trigger is a schema object the user can drop.** `DROP TRIGGER
+  rrmap_crm_cases_ins` is a legal statement, and it silently turns the fast
+  path off.
+- **A map defined over tables that already have rows** has no journal
+  history for them at all.
+
+So the scan does not go away. `map run` keeps doing rounds; the journal only
+means each round finds almost nothing left to do. **A map whose journal is
+the only thing that ever ran is a map that will drift, and no amount of
+draining detects it — only the round does.**
+
+### 15.2 A JOURNAL, not a set
+
+```
+rretl_map_dirty (seq)  →  map, tbl, side, k, ts_micros
+```
+
+`seq` is an implicit rowid: the trigger inserts without it. Append-only, and
+deliberately so.
+
+The obvious design — a SET keyed `(map, tbl, pk)`, so a hot row costs one
+entry rather than one per write — is the one the duel already broke. A raw
+pk inside a composite key hits the engine's 976-byte encoded-key cap, and
+the rest of rRETL's bookkeeping only escapes it by keying on `pk_ref`
+(blake3 of the pk's canonical bits). **A trigger body cannot compute a
+blake3.** It can INSERT what it was handed, and nothing else.
+
+So: append the key, tolerate duplicates, collapse them at drain time. This
+is also the cheapest thing the write path can be asked to carry — one
+insert into a table with one index, no read, no hash.
+
+### 15.3 The echo is bounded at 1
+
+The syncer's own pushes fire the triggers — verified, not assumed: a trigger
+fires inside a `WriteSession` exactly as it does for a top-level statement.
+So every row the daemon writes re-appears in the journal.
+
+That terminates, and the argument is the state table's (§13.2): the next
+drain classifies the re-appeared row against the state written by the push
+that caused it, finds both sides clean, and writes NOTHING. No write, no
+trigger, no new entry. The amplification is exactly one extra classification
+per pushed row — not a loop, and not something the operator has to tune.
+
+### 15.4 Opt in, because it is the write path that pays
+
+`stream = true` on the map, default off. A journal insert on every write to
+a mapped table is a real cost on somebody else's latency, and a map that is
+synced nightly over a table written a thousand times a second should not pay
+it. Turning it on is a decision with a number attached, so it is the
+operator's.
+
+`map define` installs the triggers (`rrmap_<map>_<tbl>_<ins|upd|del>`) in the
+same transaction as the map record; `map drop` removes them in the same
+transaction as the record's deletion. A name that already exists as a user
+trigger is refused at define time rather than overwritten.
+
+### 15.5 Drain and scan share one transaction
+
+A chunk is: drain up to `chunk` journal entries, classify their distinct
+keys, push what they need, delete the entries, advance the scan cursor by
+one chunk — all in ONE transaction. A kill between commits therefore cannot
+separate "the row was synced" from "the entry was consumed", which is the
+same property §14 relies on for the cursor.
+
+`map sync` (the whole-set form) clears the map's journal on success: it
+holds the writer lock for the entire transaction, so when it commits there
+is nothing outstanding by construction. Leaving stale entries would only
+make the next daemon round re-classify rows it already knows are clean.
+
+### 15.6 What it is worth — LATENCY, not total work
+
+The first claim written here was that the journal does 500× less work. It
+does not, and the measurement said so: `map run` still advances the scan
+every invocation, so a streaming round classifies the same rows as a
+scanning one PLUS the journal's. Total work is unchanged.
+
+What changes is how long a change waits. The daemon's budget bounds each
+invocation, and the drain runs FIRST, so a change is synced on the next
+tick instead of when the scan's cursor happens to reach it. Measured on the
+dev box (`MPEDB_RRETL_CHUNK=200`, `map run --max-rows 200`, five rows
+changed at the far end of the scan order):
+
+| rows | scan: invocations before the change is mirrored | journal |
+|---|---|---|
+| 2 000 | 10 | **1** |
+| 4 000 | 20 | **1** |
+| 8 000 | 40 | **1** |
+
+The scan's latency is `rows / budget` invocations and grows with the table;
+the journal's is 1 and does not. That is the whole trade: the same work per
+tick, spent on the rows that actually moved first.
+
+A map that wants the scan to cost less as well has the budget for it —
+`--max-secs` and `--max-rows` already bound a round, and with the journal
+carrying the changes the round can be run as slowly as the operator's
+tolerance for undetected drift (§15.1) allows. That knob is the crontab
+line, not a new flag.

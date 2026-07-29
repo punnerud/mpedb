@@ -121,6 +121,19 @@ log-based engine), and the hardware published when the hardware is the answer.
   push + state row share one txn. classify_p1/classify_p2 in rretl_map.rs
   are the ONE decision function sync, check and run all use — three
   copies would drift, which is exactly the bug class the duel found)
+  + `stream = true` on a map (#53 stream half, DESIGN-RRETL §15: triggers
+  on both sides append the touched key to `rretl_map_dirty`, an append-only
+  JOURNAL — a set keyed (map,tbl,pk) would hit the 976-byte key cap and a
+  trigger body cannot compute the blake3 that `pk_ref` needs. `map run`
+  drains it BEFORE the scan chunk, in the SAME txn, so a kill cannot
+  separate the sync from the entry that named it. The journal is a FAST
+  PATH, never the truth — triggers fire on the SQL path only, so a mirror
+  import or a dropped trigger leaves rows that differ with nothing
+  recording it, and only the round finds those. MEASURED: latency, not
+  total work — at equal budget a far-end change on 8 000 rows lands after
+  1 invocation instead of 40; the round still runs and still costs the
+  table. Echo is bounded at 1 (the push re-journals, the next drain reads
+  clean and writes nothing). Opt-in because the write path pays)
   + `ingest define|show|state|advise|conflicts|resolve` +
   `next|pending|done|release|reap` (#52 stage B, DESIGN-INGEST: getting
   data IN, which is the half rRETL does not own. A source is a call

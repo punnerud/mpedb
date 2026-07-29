@@ -74,6 +74,7 @@ pub mod ingest_run;
 pub mod ingest_task;
 pub mod rretl_map;
 pub mod rretl_map_run;
+pub mod rretl_map_stream;
 pub mod model;
 pub mod stats;
 mod stream;

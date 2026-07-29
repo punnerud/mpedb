@@ -38,6 +38,15 @@ fn map_spec_from_py(spec: &Bound<'_, PyAny>) -> PyResult<mpedb::rretl_map::MapSp
             .into())
     })?;
     let name = need_str(d, "name", "the map dict")?;
+    // The journal is opt-in (§15.4): it puts an insert on every write to a
+    // mapped table, so it is declared, never inferred.
+    let stream = match d.get_item("stream")? {
+        None => false,
+        Some(v) if v.is_none() => false,
+        Some(v) => v
+            .extract::<bool>()
+            .map_err(|_| bad("map spec: `stream` must be true or false".into()))?,
+    };
     let tables_any = d
         .get_item("tables")?
         .ok_or_else(|| bad("map spec: missing `tables`".into()))?;
@@ -71,7 +80,7 @@ fn map_spec_from_py(spec: &Bound<'_, PyAny>) -> PyResult<mpedb::rretl_map::MapSp
         }
         tables.push(mpedb::rretl_map::MapTable { source, target, target_key, columns });
     }
-    Ok(mpedb::rretl_map::MapSpec { name, tables })
+    Ok(mpedb::rretl_map::MapSpec { name, tables, stream })
 }
 
     /// Transform `table.column` IN PLACE with a registered pair, in ONE
@@ -283,6 +292,7 @@ pub(crate) fn rretl_map_run(
     d.set_item("round", r.round)?;
     d.set_item("rows", r.rows)?;
     d.set_item("commits", r.commits)?;
+    d.set_item("streamed", r.streamed)?;
     d.set_item("conflicts", r.conflicts)?;
     d.set_item("conflict_notes", r.conflict_notes.clone())?;
     d.set_item(
@@ -348,4 +358,19 @@ pub(crate) fn rretl_map_show(db: &mpedb::Database, py: Python<'_>, name: &str) -
 /// Drop a map (its sync state rows remain). True when it existed.
 pub(crate) fn rretl_map_drop(db: &mpedb::Database, py: Python<'_>, name: &str) -> PyResult<bool> {
     py.detach(|| db.rretl_map_drop(name)).map_err(map_err)
+}
+
+/// How much the trigger-fed journal has waiting, per mapped table
+/// (DESIGN-RRETL §15). Empty on a map that is not streaming.
+pub(crate) fn rretl_map_backlog(
+    db: &mpedb::Database,
+    py: Python<'_>,
+    name: &str,
+) -> PyResult<Py<PyAny>> {
+    let b = py.detach(|| db.rretl_map_backlog(name)).map_err(map_err)?;
+    let out = pyo3::types::PyDict::new(py);
+    for (tbl, n) in b {
+        out.set_item(tbl, n)?;
+    }
+    Ok(out.into_any().unbind())
 }

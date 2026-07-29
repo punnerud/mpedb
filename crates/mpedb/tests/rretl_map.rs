@@ -423,6 +423,7 @@ fn a_constructed_spec_round_trips_through_canonical_toml() {
     d.rretl_map_drop("crm").unwrap();
     let spec = MapSpec {
         name: "crm".into(),
+        stream: false,
         tables: vec![MapTable {
             source: "customers".into(),
             target: "crm_customers".into(),
@@ -885,4 +886,120 @@ fn the_daemon_counts_conflicts_and_keeps_going() {
     // The conflicted row is untouched and still visible to `check`.
     assert_eq!(ints(&d, "SELECT neg_score FROM crm_customers WHERE id = 2"), vec![-9]);
     assert_eq!(d.rretl_map_check("crm").unwrap().tables[0].conflicts.len(), 1);
+}
+
+// ----------------------------------------------- §15: the stream form
+
+/// A streaming map of the same shape. Everything else is `seeded`'s.
+fn streamed(tag: &str) -> (Database, Scratch) {
+    let (d, s) = seeded(tag);
+    d.rretl_map_drop("crm").unwrap();
+    d.rretl_map_define(&MAP.replace("name = \"crm\"", "name = \"crm\"\nstream = true"))
+        .unwrap();
+    (d, s)
+}
+
+fn backlog(d: &Database) -> i64 {
+    d.rretl_map_backlog("crm").unwrap().iter().map(|(_, n)| n).sum()
+}
+
+fn run(d: &Database) -> mpedb::rretl_map_run::MapRunReport {
+    d.rretl_map_run("crm", &mpedb::rretl_map_run::RunOptions::default()).unwrap()
+}
+
+/// The point of the whole section: a round costs the CHANGES, not the table
+/// — and lands the same answer the scan would.
+#[test]
+fn the_journal_costs_the_changes_and_the_scan_costs_the_table() {
+    let (d, _s) = streamed("cost");
+    // Materialize, and let the round finish so the cursors are clean.
+    d.rretl_map_sync("crm").unwrap();
+    assert_eq!(backlog(&d), 0, "a full sync leaves nothing outstanding");
+
+    // One row moves. The journal now names exactly it.
+    d.query("UPDATE customers SET score = 40 WHERE id = 2", &[]).unwrap();
+    assert_eq!(backlog(&d), 1);
+
+    let r = run(&d);
+    assert!(r.streamed >= 1, "the drain consumed the entry: {r:?}");
+    assert_eq!(ints(&d, "SELECT neg_score FROM crm_customers ORDER BY id"), vec![-10, -40, -2]);
+
+    // And the echo terminates: the push re-journaled the target row, the
+    // next drain classifies it clean, and nothing is left.
+    let r2 = run(&d);
+    assert_eq!(r2.moved.changed_total(), 0, "the echo wrote nothing: {r2:?}");
+    assert_eq!(backlog(&d), 0, "and drained itself");
+}
+
+/// The claim that keeps the design honest: the journal is a FAST PATH, so a
+/// change it never heard about is still found — by the scan, which does not
+/// go away.
+#[test]
+fn a_change_the_journal_missed_is_still_caught_by_the_round() {
+    let (d, _s) = streamed("missed");
+    d.rretl_map_sync("crm").unwrap();
+
+    // A write, and then its journal entries are destroyed — exactly what a
+    // `mirror import`, a dropped trigger or a restored file leaves behind:
+    // rows that differ with nothing recording that they do.
+    d.query("UPDATE customers SET label = 'ADA' WHERE id = 1", &[]).unwrap();
+    d.query("DELETE FROM rretl_map_dirty", &[]).unwrap();
+    assert_eq!(backlog(&d), 0, "nothing knows this row moved");
+
+    // Rounds still walk everything, so the round finds it.
+    for _ in 0..8 {
+        let r = run(&d);
+        if r.round > 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        rows(d.query("SELECT full_label FROM crm_customers WHERE id = 1", &[]).unwrap())[0][0],
+        Value::Text("ADA".into())
+    );
+}
+
+/// Streaming is a property of the definition, and turning it off has to take
+/// the triggers with it — a journal nobody drains is a table that only grows.
+#[test]
+fn redefining_without_stream_removes_the_triggers() {
+    let (d, _s) = streamed("toggle");
+    d.rretl_map_sync("crm").unwrap();
+    d.query("UPDATE customers SET score = 11 WHERE id = 1", &[]).unwrap();
+    assert_eq!(backlog(&d), 1);
+
+    // Redefine WITHOUT `stream`: the triggers go, and so does the backlog.
+    d.rretl_map_define(MAP).unwrap();
+    assert_eq!(backlog(&d), 0, "the journal was cleared with the triggers");
+    d.query("UPDATE customers SET score = 12 WHERE id = 1", &[]).unwrap();
+    assert_eq!(backlog(&d), 0, "and nothing records writes any more");
+
+    // Back on again, and the write path records once more.
+    d.rretl_map_define(&MAP.replace("name = \"crm\"", "name = \"crm\"\nstream = true"))
+        .unwrap();
+    d.query("UPDATE customers SET score = 13 WHERE id = 1", &[]).unwrap();
+    assert_eq!(backlog(&d), 1);
+
+    // And `map drop` leaves nothing behind either.
+    d.rretl_map_drop("crm").unwrap();
+    d.query("UPDATE customers SET score = 14 WHERE id = 1", &[]).unwrap();
+    assert_eq!(backlog(&d), 0);
+}
+
+/// A delete on either side is a change like any other — the journal carries
+/// OLD's key, so the drain sees the row that is no longer there.
+#[test]
+fn the_journal_carries_deletes_from_both_sides() {
+    let (d, _s) = streamed("deletes");
+    d.rretl_map_sync("crm").unwrap();
+
+    d.query("DELETE FROM customers WHERE id = 3", &[]).unwrap();
+    assert_eq!(backlog(&d), 1);
+    run(&d);
+    assert_eq!(ints(&d, "SELECT id FROM crm_customers ORDER BY id"), vec![1, 2]);
+
+    // The other direction: the target loses a row, the source follows.
+    d.query("DELETE FROM crm_customers WHERE id = 2", &[]).unwrap();
+    run(&d);
+    assert_eq!(ints(&d, "SELECT id FROM customers ORDER BY id"), vec![1]);
 }

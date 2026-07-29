@@ -91,11 +91,22 @@ pub struct MapRunReport {
     pub conflicts: u64,
     /// The first few, verbatim, so a cron mail says something useful.
     pub conflict_notes: Vec<String>,
+    /// Journal entries consumed (§15). Zero on a map that is not streaming.
+    pub streamed: u64,
     pub round: i64,
     pub stopped_by: Option<RunStop>,
 }
 
 impl MapRunReport {
+    /// Count a conflict and keep the first few verbatim. ONE place, because
+    /// the scan and the journal drain both report into the same run.
+    pub(crate) fn note_conflict(&mut self, msg: String) {
+        self.conflicts += 1;
+        if self.conflict_notes.len() < MAX_CONFLICT_NOTES {
+            self.conflict_notes.push(msg);
+        }
+    }
+
     pub fn note(&self) -> String {
         format!(
             "round {}, {} row(s) in {} commit(s): a→b {}, b→a {}, +b {}, +a {}, -a {}, \
@@ -349,7 +360,7 @@ impl crate::Database {
         let mut s = self.begin()?;
         let claimed = (|| -> Result<i64> {
             ensure_run_tables(&mut s, &have)?;
-            crate::rretl_map::prepare_map_tables(&mut s, name, &resolved, &have)?;
+            crate::rretl_map::prepare_map_tables(&mut s, name, &resolved, &have, spec.stream)?;
             let mut rec = read_run(&mut s, name)?;
             if !rec.runner.is_empty() && opts.runner.as_deref() != Some(rec.runner.as_str()) {
                 return Err(Error::Unsupported(format!(
@@ -386,6 +397,14 @@ impl crate::Database {
 
         let mut report = MapRunReport { round, ..Default::default() };
         let chunk = chunk_rows();
+        // A map can be streaming without the journal table existing yet (a
+        // spec that declares it but has never seen a write), so both have to
+        // be true before the drain reads.
+        let streaming = spec.stream
+            && self
+                .committed_tables()?
+                .iter()
+                .any(|(n, _)| n == crate::rretl_map_stream::T_MAP_DIRTY);
         let over_budget = |rows: u64| {
             opts.max_rows.is_some_and(|m| rows >= m)
                 || opts
@@ -403,6 +422,18 @@ impl crate::Database {
             let step = (|| -> Result<bool> {
                 let mut any = false;
                 for rt in &resolved {
+                    // The journal FIRST, and in the same transaction as the
+                    // scan chunk below (§15.5): a kill between commits can
+                    // then never separate "the row was synced" from "the
+                    // entry was consumed". Draining costs nothing when the
+                    // map is not streaming — the table does not exist.
+                    if streaming {
+                        let n = crate::rretl_map_stream::drain_chunk(
+                            &mut s, name, rt, chunk, &mut report,
+                        )?;
+                        report.streamed += n as u64;
+                        any |= n > 0;
+                    }
                     let mut cur = read_cursor(&mut s, name, &rt.dst)?;
                     if cur.phase == 0 {
                         continue;
@@ -524,12 +555,7 @@ fn run_one_chunk(
 ) -> Result<()> {
     let sql = MapSql::new(rt, chunk);
     let mut w = MapWriter::new(name, rt, &sql);
-    let note = |report: &mut MapRunReport, msg: String| {
-        report.conflicts += 1;
-        if report.conflict_notes.len() < MAX_CONFLICT_NOTES {
-            report.conflict_notes.push(msg);
-        }
-    };
+    let note = |report: &mut MapRunReport, msg: String| report.note_conflict(msg);
     match cur.phase {
         1 => {
             let rows = match &cur.k {

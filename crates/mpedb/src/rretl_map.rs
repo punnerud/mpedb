@@ -62,6 +62,11 @@ pub struct MapTable {
 pub struct MapSpec {
     pub name: String,
     pub tables: Vec<MapTable>,
+    /// Trigger-fed journal instead of a scan for the common case
+    /// (DESIGN-RRETL §15). Opt-in, because it puts an insert on every write
+    /// to a mapped table — somebody else's latency, so somebody else's
+    /// decision.
+    pub stream: bool,
 }
 
 /// Identifier check for every NAME the spec contributes to formatted SQL.
@@ -95,6 +100,12 @@ impl MapSpec {
                 .ok_or_else(|| Error::Unsupported("map spec: missing map.name".into()))?,
             "map.name",
         )?;
+        let stream = match map.get("stream") {
+            Some(v) => v.as_bool().ok_or_else(|| {
+                Error::Unsupported("map spec: map.stream must be true or false".into())
+            })?,
+            None => false,
+        };
         let raw_tables = map
             .get("table")
             .and_then(|t| t.as_array())
@@ -145,7 +156,7 @@ impl MapSpec {
             }
             tables.push(MapTable { source, target, target_key, columns });
         }
-        let spec = MapSpec { name, tables };
+        let spec = MapSpec { name, tables, stream };
         spec.validate()?;
         Ok(spec)
     }
@@ -157,6 +168,9 @@ impl MapSpec {
     /// contain a quote, a newline or a backslash.
     pub fn to_toml(&self) -> String {
         let mut out = format!("[map]\nname = \"{}\"\n", self.name);
+        if self.stream {
+            out.push_str("stream = true\n");
+        }
         for t in &self.tables {
             out.push_str(&format!(
                 "\n[[map.table]]\nsource = \"{}\"\ntarget = \"{}\"\n",
@@ -302,12 +316,12 @@ pub(crate) struct ResolvedTable {
     pub(crate) src: String,
     pub(crate) dst: String,
     /// Source row identity: a declared single-column PK, or `rowid`.
-    src_key: String,
+    pub(crate) src_key: String,
     src_key_ty: ColumnType,
     /// Whether the identity is the hidden rowid — creation on the target
     /// side is refused then (the source assigns rowids, nothing else can).
     rowid_identity: bool,
-    dst_key: String,
+    pub(crate) dst_key: String,
     /// Target table missing entirely: auto-create at sync time.
     create_dst: bool,
     cols: Vec<ResolvedCol>,
@@ -421,9 +435,9 @@ impl crate::Database {
     /// healthy — so `map sync` never discovers a broken definition mid-run.
     pub fn rretl_map_define(&self, toml_text: &str) -> Result<()> {
         let spec = MapSpec::from_toml_str(toml_text)?;
-        self.resolve_map(&spec)?;
+        let resolved = self.resolve_map(&spec)?;
         self.refuse_overlap_with_other_maps(&spec)?;
-        self.store_map_record(&spec.name, toml_text)
+        self.store_map_record(&spec.name, toml_text, &resolved, spec.stream)
     }
 
     /// A table may be a map SOURCE or a map TARGET, never both, and never a
@@ -477,12 +491,18 @@ impl crate::Database {
     /// whichever door the definition came through.
     pub fn rretl_map_define_spec(&self, spec: &MapSpec) -> Result<()> {
         spec.validate()?;
-        self.resolve_map(spec)?;
+        let resolved = self.resolve_map(spec)?;
         self.refuse_overlap_with_other_maps(spec)?;
-        self.store_map_record(&spec.name, &spec.to_toml())
+        self.store_map_record(&spec.name, &spec.to_toml(), &resolved, spec.stream)
     }
 
-    fn store_map_record(&self, name: &str, toml_text: &str) -> Result<()> {
+    fn store_map_record(
+        &self,
+        name: &str,
+        toml_text: &str,
+        resolved: &[ResolvedTable],
+        stream: bool,
+    ) -> Result<()> {
         let mut record = vec![MAP_RECORD_V1];
         record.extend_from_slice(toml_text.as_bytes());
         // A CHANGED spec under the same name RE-BASELINES: the state rows'
@@ -514,6 +534,18 @@ impl crate::Database {
                     "DELETE FROM rretl_map_state WHERE map = $1",
                     &[Value::Text(name.into())],
                 )?;
+            }
+            // The journal's triggers are part of the map's definition, so
+            // they land in the SAME transaction as the record. A redefine
+            // that turns streaming OFF must also take them away — a trigger
+            // nobody drains is a table that only grows.
+            let prior_n = crate::rretl_map_stream::prior_table_count(prior.as_deref());
+            if stream {
+                crate::rretl_map_stream::ensure_dirty_table(&mut s, &have)?;
+                crate::rretl_map_stream::install(&mut s, name, resolved, prior_n, &have)?;
+            } else {
+                crate::rretl_map_stream::remove(&mut s, name, prior_n.max(resolved.len()))?;
+                crate::rretl_map_stream::clear(&mut s, name, &have)?;
             }
             s.sys_record_put(NS_MAP, name.as_bytes(), &record)?;
             s.bump_schema_gen();
@@ -587,6 +619,10 @@ impl crate::Database {
                     &[Value::Text(name.into())],
                 )?;
             }
+            let prior = s.sys_record_get(NS_MAP, name.as_bytes())?;
+            let n = crate::rretl_map_stream::prior_table_count(prior.as_deref());
+            crate::rretl_map_stream::remove(&mut s, name, n)?;
+            crate::rretl_map_stream::clear(&mut s, name, &have)?;
             s.sys_record_delete(NS_MAP, name.as_bytes())?;
             s.bump_schema_gen();
             Ok(())
@@ -788,7 +824,7 @@ impl crate::Database {
         let resolved = self.resolve_map(&spec)?;
         let have = self.committed_tables()?;
         let mut s = self.begin()?;
-        let out = map_sync_in(&mut s, name, &resolved, &have);
+        let out = map_sync_in(&mut s, name, &resolved, &have, spec.stream);
         match out {
             Ok(mut report) => {
                 let run_id = next_run_id(&mut s)?;
@@ -809,6 +845,11 @@ impl crate::Database {
                     error: report.note(),
                 }
                 .insert(&mut s)?;
+                // The whole-set form held the writer lock for this entire
+                // transaction, so on commit there is nothing outstanding by
+                // construction (§15.5). Leaving the entries would only make
+                // the next daemon round re-classify rows it just cleaned.
+                crate::rretl_map_stream::clear(&mut s, name, &have)?;
                 s.commit()?;
                 Ok(report)
             }
@@ -880,8 +921,9 @@ fn map_sync_in(
     name: &str,
     tables: &[ResolvedTable],
     have: &[(String, Vec<String>)],
+    stream: bool,
 ) -> Result<MapSyncReport> {
-    prepare_map_tables(s, name, tables, have)?;
+    prepare_map_tables(s, name, tables, have, stream)?;
     let mut report = MapSyncReport::default();
     for rt in tables {
         sync_table(s, name, rt, &mut report)?;
@@ -897,10 +939,11 @@ pub(crate) fn prepare_map_tables(
     name: &str,
     tables: &[ResolvedTable],
     have: &[(String, Vec<String>)],
+    stream: bool,
 ) -> Result<()> {
     ensure_state_table(s, have)?;
     crate::rretl::ensure_lineage_tables(s, have)?;
-    for rt in tables {
+    for (i, rt) in tables.iter().enumerate() {
         if rt.create_dst && !have.iter().any(|(n, _)| n == &rt.dst) {
             // A missing target is "materialize it" ONLY the first time. Once
             // the map has state for that target, missing means the table was
@@ -923,6 +966,12 @@ pub(crate) fn prepare_map_tables(
                 cols.push(spec_col(&c.dst, ColumnType::Any));
             }
             crate::rretl::create_bookkeeping(s, &rt.dst, cols, &[&rt.dst_key])?;
+            // The target exists as of NOW, which is the first moment its
+            // journal triggers can be created (§15.4). `map define` could
+            // not: the table was not there yet.
+            if stream {
+                crate::rretl_map_stream::install_side(s, name, i, rt, 'b')?;
+            }
         }
     }
     Ok(())

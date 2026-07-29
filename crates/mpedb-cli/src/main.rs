@@ -115,7 +115,12 @@ usage: mpedb <command> [args]
   rretl map define <target> <map.toml>       store a table-SET map: source
                                            tables mirrored into a different
                                            target shape through lens pairs
-                                           (design/DESIGN-RRETL.md §13)
+                                           (design/DESIGN-RRETL.md §13).
+                                           `stream = true` in [map] installs
+                                           triggers so `map run` syncs what
+                                           changed instead of scanning for
+                                           it (§15) — opt-in, because it
+                                           costs the write path an insert
   rretl map sync <target> <name>             sync BOTH directions in one txn:
                                            edits flow through the pairs,
                                            repeating is a no-op (state-hash
@@ -855,6 +860,11 @@ fn cmd_rretl(args: &[String]) -> CliResult {
             }
             if st.in_progress.is_empty() {
                 println!("no round in progress — the next run starts a fresh one");
+            }
+            // A backlog that only grows means the daemon is not keeping up
+            // with the writes (DESIGN-RRETL §15).
+            for (tbl, n) in db.rretl_map_backlog(name)? {
+                println!("journal: {n} entr(ies) waiting for `{tbl}`");
             }
             Ok(())
         }
