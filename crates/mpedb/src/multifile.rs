@@ -130,6 +130,48 @@ impl Database {
         }
     }
 
+    /// One attached member's stored views as `(name, select_source)`. A view is
+    /// an object of the schema it was created in, so reflecting `other.v` has
+    /// to ask `other` — main's catalog does not know it exists.
+    pub fn attached_list_views(&self, name: &str) -> Vec<(String, String)> {
+        let guard = self.attached.read().expect(POISON);
+        match guard.find(name) {
+            None => Vec::new(),
+            Some(i) => guard.members[i].db.list_views().unwrap_or_default(),
+        }
+    }
+
+    /// One attached member's stored triggers — the twin of
+    /// [`attached_list_views`], for the same reason.
+    pub fn attached_list_triggers(&self, name: &str) -> Vec<(String, String, String)> {
+        let guard = self.attached.read().expect(POISON);
+        match guard.find(name) {
+            None => Vec::new(),
+            Some(i) => guard.members[i].db.list_triggers().unwrap_or_default(),
+        }
+    }
+
+    /// Run `sql` on one attached member and report its output columns and
+    /// their declared types — what `PRAGMA <schema>.table_info(<view>)` needs.
+    ///
+    /// Asked of the MEMBER because a view's columns are a property of the
+    /// schema it lives in. The cross-file read path cannot answer it: that path
+    /// resolves member TABLES, and a view there is not one.
+    pub fn attached_probe_columns(
+        &self,
+        db: &str,
+        sql: &str,
+    ) -> Option<(Vec<String>, Vec<Option<String>>)> {
+        let guard = self.attached.read().expect(POISON);
+        let m = &guard.members[guard.find(db)?];
+        let columns = match m.db.query(sql, &[]) {
+            Ok(ExecResult::Rows { columns, .. }) => columns,
+            _ => return None,
+        };
+        let decl = m.db.output_decltypes(sql).unwrap_or_default();
+        Some((columns, decl))
+    }
+
     pub fn temp_schema_or_empty(&self) -> Arc<mpedb_core::engine::SchemaBundle> {
         self.attached_schema("temp").unwrap_or_else(empty_bundle)
     }
@@ -557,7 +599,7 @@ impl Database {
             .members
             .iter()
             .map(|m| {
-                let names = m
+                let mut names: HashSet<String> = m
                     .db
                     .schema()
                     .tables
@@ -565,6 +607,12 @@ impl Database {
                     .filter(|t| !t.dead)
                     .map(|t| t.name.clone())
                     .collect();
+                // A member's VIEWS are names in that schema too, exactly as
+                // main's are above. Leaving them out made `other.v` fail to
+                // bind while `other.sqlite_master` happily listed it.
+                for (name, _) in m.db.list_views().unwrap_or_default() {
+                    names.insert(name);
+                }
                 (m.name.clone(), names)
             })
             .collect();

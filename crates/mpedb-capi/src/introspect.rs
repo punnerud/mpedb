@@ -207,6 +207,13 @@ pub(crate) struct DdlTarget {
     pub create: bool,
     /// The object's name, unquoted, without any `schema.` qualifier.
     pub name: String,
+    /// The `schema.` qualifier as written, unquoted — `None` when the statement
+    /// gave none. Which schema an object lives in decides where its verbatim
+    /// DDL record is filed: two schemas may hold a table of ONE name (
+    /// SQLAlchemy's reflection suite builds `users` in both), and a single
+    /// name-keyed record in main meant the second CREATE overwrote the first's
+    /// text — so `main.users` reported the ATTACHED table's constraints.
+    pub schema: Option<String>,
     /// Byte offset of the name token within the trivia-stripped statement —
     /// where sqlite's stored `sql` text begins.
     pub name_at: usize,
@@ -369,8 +376,10 @@ pub(crate) fn schema_ddl_target(sql: &str) -> Option<DdlTarget> {
     }
     // A `schema.name` qualifier: the name is the component AFTER the dot, and
     // sqlite's stored text starts there too.
+    let mut schema = None;
     if w.peek_dot() {
         let _ = w.word(); // the '.' itself
+        schema = Some(std::mem::take(&mut name));
         (name, at) = w.word()?;
     }
     // `CREATE INDEX <name> ON <table> (…)`: the table the index belongs to.
@@ -390,7 +399,7 @@ pub(crate) fn schema_ddl_target(sql: &str) -> Option<DdlTarget> {
     } else {
         None
     };
-    Some(DdlTarget { kind, create, name, name_at: at, on_table })
+    Some(DdlTarget { kind, create, name, schema, name_at: at, on_table })
 }
 
 /// A view/trigger verbatim record: no shape fingerprint (there is no
@@ -801,6 +810,13 @@ fn unquote(s: &str) -> String {
         return inner.replace(&format!("{delim}{delim}"), &delim.to_string());
     }
     s.to_string()
+}
+
+/// Does `name` name a real TABLE in `schema`? The pragma handler's own test,
+/// exposed so the view path can defer to it rather than run a second, drifting
+/// one.
+pub(crate) fn names_a_table(schema: &mpedb::Schema, name: &str) -> bool {
+    find_table(schema, name).is_some()
 }
 
 fn find_table<'a>(schema: &'a mpedb::Schema, name: &str) -> Option<&'a mpedb::TableDef> {

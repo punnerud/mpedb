@@ -568,8 +568,8 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // ends up describing the wrong file.
             let qualifier = introspect::pragma_schema(sqltext)
                 .filter(|q| !q.eq_ignore_ascii_case("main"));
-            let bundle = match qualifier {
-                Some(q) => c.db.attached_schema_or_empty(&q),
+            let bundle = match qualifier.as_deref() {
+                Some(q) => c.db.attached_schema_or_empty(q),
                 None => match c.txn.as_ref() {
                     Some(s) => s.schema(),
                     None => {
@@ -587,7 +587,17 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             if let Some((columns, rows)) = fk_pragma(c, sqltext)? {
                 return Ok(Outcome::Rows { columns, rows });
             }
-            let idx = sqlite_index_records(c);
+            // A VIEW answers `table_info` too — with its RESULT columns, which
+            // is how SQLAlchemy's `get_multi_*` reflection discovers that a
+            // view has columns at all. Returning nothing for one silently
+            // dropped every view from those results. It is answered here and
+            // not in `introspect` because the columns come from COMPILING the
+            // view's SELECT, and that needs the connection.
+            if let Some((columns, rows)) = view_table_info(c, &bundle, sqltext, qualifier.as_deref())
+            {
+                return Ok(Outcome::Rows { columns, rows });
+            }
+            let idx = sqlite_index_records_of(c, qualifier.as_deref());
             let fk_on = c.db.fk_enforced();
             let (columns, rows) =
                 introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms, &fk_on, &idx)?;
@@ -627,17 +637,18 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                     }
                 }
             };
-            // A TEMP object's verbatim text lives where the object does — its
-            // CREATE ran against the temp member. Every OTHER schema, attached
-            // ones included, files its records in main: `ATTACH` hands out a
-            // database this connection did not create the objects in, so main
-            // is the only place with a text for them. Reading an attached
-            // member's own records instead found none and lost the schema's
-            // views entirely.
+            // The verbatim text comes from the SAME schema the rows do —
+            // `record_member` files it there. Reading main for every schema
+            // could not work: two schemas may hold a table of one name, and
+            // one name-keyed record cannot hold two texts.
             let verbatim_from: Option<&str> =
-                (introspect::master_reference(sqltext) == Some(true)).then_some("temp");
+                if introspect::master_reference(sqltext) == Some(true) {
+                    Some("temp")
+                } else {
+                    master_q_name.as_deref()
+                };
             let verbatim = sqlite_master_records_of(c, verbatim_from);
-            let idx = sqlite_index_records(c);
+            let idx = sqlite_index_records_of(c, verbatim_from);
             // Prefer txn-visible catalog (uncommitted CREATE VIEW/TRIGGER).
             let mut verbatim = verbatim;
             let (views, triggers) = if verbatim_from == Some("temp") {
@@ -650,6 +661,12 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                     views.push((name, select_sql));
                 }
                 (views, Vec::new())
+            } else if let Some(m) = verbatim_from {
+                // An attached member's views are objects of THAT schema.
+                // Reading main's catalog here reported main's views under
+                // every attached schema — a wrong answer, and it hid the fact
+                // that a qualified `CREATE VIEW` was not landing anywhere.
+                (c.db.attached_list_views(m), c.db.attached_list_triggers(m))
             } else {
                 match c.txn.as_mut() {
                     Some(s) => (
@@ -795,11 +812,17 @@ fn sqlite_master_records_of(c: &mut Sqlite3, member: Option<&str>) -> HashMap<St
 /// Same one-scan discipline as [`sqlite_master_records`], and the same
 /// transaction rule: through the OPEN session when there is one, so an index
 /// created in an uncommitted transaction can still be named.
-fn sqlite_index_records(c: &mut Sqlite3) -> introspect::IndexRecords {
+/// The index records of one schema — `None` for main (this connection's own,
+/// txn-visible), or an attached member by name. Scoped for the same reason the
+/// DDL records are: two schemas may hold an index of one name.
+fn sqlite_index_records_of(c: &mut Sqlite3, member: Option<&str>) -> introspect::IndexRecords {
     let ns = introspect::IDX_NS;
-    let all = match c.txn.as_mut() {
-        Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
-        None => c.db.sys_record_scan(ns).unwrap_or_default(),
+    let all = match member {
+        Some(m) => c.db.attached_sys_record_scan(m, ns),
+        None => match c.txn.as_mut() {
+            Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
+            None => c.db.sys_record_scan(ns).unwrap_or_default(),
+        },
     };
     introspect::index_records(all)
 }
@@ -813,6 +836,103 @@ fn table_index_count(c: &Sqlite3, table: &str) -> Option<usize> {
     };
     let exact = introspect::exact_table_name(&schema, table)?;
     introspect::table_by_exact_name(&schema, &exact).map(|t| t.indexes.len())
+}
+
+/// `PRAGMA [<schema>.]table_info(<view>)` — a view's RESULT columns.
+///
+/// sqlite reports the same six columns it does for a table, with `notnull`,
+/// `dflt_value` and `pk` all empty: a view has no storage, so it has no
+/// constraints of its own even when the column it selects is a NOT NULL primary
+/// key (measured against 3.45.1 — `CREATE VIEW v AS SELECT * FROM t` over an
+/// `INTEGER PRIMARY KEY` reports `pk` 0).
+///
+/// `None` means "not a view" and the ordinary pragma handler takes it. Only
+/// `table_info`/`table_xinfo` are answered — `index_list` on a view is empty in
+/// sqlite too, which the ordinary handler already returns.
+fn view_table_info(
+    c: &mut Sqlite3,
+    bundle: &mpedb::Schema,
+    sqltext: &str,
+    qualifier: Option<&str>,
+) -> Option<(Vec<String>, Vec<Vec<Value>>)> {
+    let (name, arg) = introspect::parse_pragma(sqltext);
+    let xinfo = match name.to_ascii_lowercase().as_str() {
+        "table_info" => false,
+        "table_xinfo" => true,
+        _ => return None,
+    };
+    let arg = arg?;
+    // A table of that name wins: `find_table` is what the ordinary handler
+    // consults, so asking it here keeps the two from disagreeing.
+    if introspect::names_a_table(bundle, &arg) {
+        return None;
+    }
+    let exact = match qualifier {
+        Some(q) => c
+            .db
+            .attached_list_views(q)
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&arg))
+            .map(|(n, _)| n)?,
+        None => resolve_object_name(c, introspect::DdlKind::View, &arg)?,
+    };
+    // Qualified through the same spelling the caller used, so an attached
+    // schema's view is compiled against that member.
+    // The probe runs UNQUALIFIED on whichever schema owns the view — main
+    // here, or the member itself. It cannot be qualified and run on main: a
+    // read against an attached member takes the cross-file path, which resolves
+    // that member's TABLES and has no view of its own to expand.
+    let probe = format!("SELECT * FROM \"{}\" LIMIT 0", exact.replace('"', "\"\""));
+    let (cols, decl) = match qualifier {
+        Some(q) => c.db.attached_probe_columns(q, &probe)?,
+        None => {
+            let cols = match c.db.query(&probe, &[]) {
+                Ok(mpedb::ExecResult::Rows { columns, .. }) => columns,
+                _ => return None,
+            };
+            (cols, c.db.output_decltypes(&probe).unwrap_or_default())
+        }
+    };
+    let mut names: Vec<&str> = vec!["cid", "name", "type", "notnull", "dflt_value", "pk"];
+    if xinfo {
+        names.push("hidden");
+    }
+    let rows = cols
+        .into_iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let ty = decl.get(i).cloned().flatten().unwrap_or_default();
+            let mut row = vec![
+                Value::Int(i as i64),
+                Value::Text(col),
+                Value::Text(ty),
+                Value::Int(0),
+                Value::Null,
+                Value::Int(0),
+            ];
+            if xinfo {
+                row.push(Value::Int(0));
+            }
+            row
+        })
+        .collect();
+    Some((names.into_iter().map(str::to_string).collect(), rows))
+}
+
+/// Which attached member holds this statement's object, or `None` for main.
+///
+/// `CREATE TEMP …` names no schema but is not main either, so the temp rewrite
+/// is what decides that case — the same function the router uses, so the record
+/// cannot disagree with where the object actually went.
+fn record_member(sqltext: &str, target: &introspect::DdlTarget) -> Option<String> {
+    match target.schema.as_deref() {
+        Some(q) if q.eq_ignore_ascii_case("main") => None,
+        Some(q) => Some(q.to_string()),
+        None => mpedb::rewrite_temp_ddl(sqltext)
+            .ok()
+            .flatten()
+            .map(|_| "temp".to_string()),
+    }
 }
 
 /// File (or forget) a catalog object's own `CREATE …` text after the statement
@@ -839,7 +959,14 @@ fn record_object_ddl(
     // The `CREATE TABLE` fingerprint is computed with the index records in
     // hand, exactly as `sqlite_master` recomputes it — a fingerprint taken
     // under a different rule would never match itself again.
-    let idx = sqlite_index_records(c);
+    // WHICH SCHEMA does this object live in? Its verbatim DDL record is filed
+    // there, and read back from there — main for an unqualified statement,
+    // otherwise the schema named. Filing every record in main under the bare
+    // object name is a WRONG ANSWER once two schemas hold an object of one
+    // name: the second CREATE overwrote the first's text, so `main.users`
+    // reported the attached `test_schema.users`'s named CHECK constraints.
+    let member = record_member(sqltext, target);
+    let idx = sqlite_index_records_of(c, member.as_deref());
     let (kind, create, name) = (target.kind, target.create, target.name.as_str());
     // `CREATE INDEX` files in its OWN namespace, keyed by the index name, with
     // the shape of the `IndexDef` the statement just appended as the
@@ -848,7 +975,7 @@ fn record_object_ddl(
     // no-op (in which case nothing was appended and there is nothing to record).
     if let introspect::DdlKind::Index { .. } = kind {
         if !create {
-            forget_index_record(c, name);
+            forget_index_record(c, member.as_deref(), name);
             return;
         }
         let verbatim = introspect::ddl_verbatim(sqltext, target.name_at, kind);
@@ -857,9 +984,12 @@ fn record_object_ddl(
         else {
             return;
         };
-        let schema = match c.txn.as_ref() {
-            Some(s) => s.schema(),
-            None => c.db.schema(),
+        let schema = match member.as_deref() {
+            Some(m) => c.db.attached_schema_or_empty(m),
+            None => match c.txn.as_ref() {
+                Some(s) => s.schema(),
+                None => c.db.schema(),
+            },
         };
         let Some(fp) = introspect::exact_table_name(&schema, table)
             .and_then(|e| introspect::table_by_exact_name(&schema, &e).map(|t| (t, e)))
@@ -872,15 +1002,9 @@ fn record_object_ddl(
             return;
         };
         let rec = introspect::index_record(&fp, &verbatim);
-        let _ = match c.txn.as_mut() {
-            Some(s) => s.sys_record_put(introspect::IDX_NS, name.as_bytes(), &rec),
-            None => c.db.sys_record_put(introspect::IDX_NS, name.as_bytes(), &rec),
-        };
+        put_record(c, member.as_deref(), introspect::IDX_NS, name.as_bytes(), &rec);
         return;
     }
-    // Does this statement target the TEMP schema? Needed on BOTH the create
-    // and the drop path, so it is decided before either.
-    let to_temp = mpedb::rewrite_temp_ddl(sqltext).ok().flatten().is_some();
     let value = if create {
         let verbatim = introspect::ddl_verbatim(sqltext, target.name_at, kind);
         if verbatim.is_empty() {
@@ -906,13 +1030,12 @@ fn record_object_ddl(
                 // no record was written at all, and `sqlite_temp_master`
                 // reported a reconstruction that had dropped the table's named
                 // CHECK constraints.
-                let schema = if to_temp {
-                    c.db.temp_schema_or_empty()
-                } else {
-                    match c.txn.as_ref() {
+                let schema = match member.as_deref() {
+                    Some(m) => c.db.attached_schema_or_empty(m),
+                    None => match c.txn.as_ref() {
                         Some(s) => s.schema(),
                         None => c.db.schema(),
-                    }
+                    },
                 };
                 let Some(exact) = introspect::exact_table_name(&schema, name) else {
                     return;
@@ -937,14 +1060,7 @@ fn record_object_ddl(
     match value {
         Some((exact, rec)) => {
             let (ns, key) = introspect::ddl_key(&exact);
-            if to_temp {
-                c.db.attached_sys_record_put("temp", ns, &key, &rec);
-            } else {
-                let _ = match c.txn.as_mut() {
-                    Some(s) => s.sys_record_put(ns, &key, &rec),
-                    None => c.db.sys_record_put(ns, &key, &rec),
-                };
-            }
+            put_record(c, member.as_deref(), ns, &key, &rec);
         }
         // DROP: forget the text. The facade has no delete outside a session, so
         // autocommit writes an EMPTY record instead — a tombstone, since
@@ -952,36 +1068,53 @@ fn record_object_ddl(
         None => {
             let exact = resolve_object_name(c, kind, name).unwrap_or_else(|| name.to_string());
             let (ns, key) = introspect::ddl_key(&exact);
-            let _ = match c.txn.as_mut() {
-                Some(s) => s.sys_record_delete(ns, &key).map(|_| ()),
-                None => c.db.sys_record_put(ns, &key, &[]),
-            };
+            // The record lives with the object, so the tombstone does too —
+            // dropping `test_schema.users` must not blank main's text.
+            put_record(c, member.as_deref(), ns, &key, &[]);
             // A DROPPED TABLE takes its index names with it. Without this, a
             // re-CREATEd table of the same name and shape would inherit the old
             // table's index records — a name (and a `CREATE INDEX` text) for an
             // index nobody created, which is exactly the "almost right metadata"
             // failure the fingerprint exists to prevent.
             if kind == introspect::DdlKind::Table {
-                forget_table_index_records(c, &exact);
+                forget_table_index_records(c, member.as_deref(), &exact);
             }
         }
     }
 }
 
+/// File one record in the schema that owns it. An empty value is a TOMBSTONE:
+/// the facade has no delete outside a session, and `master_sql` only trusts a
+/// record that carries a fingerprint.
+fn put_record(c: &mut Sqlite3, member: Option<&str>, ns: &str, key: &[u8], val: &[u8]) {
+    match member {
+        Some(m) => {
+            c.db.attached_sys_record_put(m, ns, key, val);
+        }
+        None => {
+            let _ = match c.txn.as_mut() {
+                Some(s) if val.is_empty() => s.sys_record_delete(ns, key).map(|_| ()),
+                Some(s) => s.sys_record_put(ns, key, val),
+                None => c.db.sys_record_put(ns, key, val),
+            };
+        }
+    }
+}
+
 /// Tombstone one index record by name.
-fn forget_index_record(c: &mut Sqlite3, name: &str) {
-    let _ = match c.txn.as_mut() {
-        Some(s) => s.sys_record_delete(introspect::IDX_NS, name.as_bytes()).map(|_| ()),
-        None => c.db.sys_record_put(introspect::IDX_NS, name.as_bytes(), &[]),
-    };
+fn forget_index_record(c: &mut Sqlite3, member: Option<&str>, name: &str) {
+    put_record(c, member, introspect::IDX_NS, name.as_bytes(), &[]);
 }
 
 /// Tombstone every index record whose fingerprint names `table`.
-fn forget_table_index_records(c: &mut Sqlite3, table: &str) {
+fn forget_table_index_records(c: &mut Sqlite3, member: Option<&str>, table: &str) {
     let ns = introspect::IDX_NS;
-    let all = match c.txn.as_mut() {
-        Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
-        None => c.db.sys_record_scan(ns).unwrap_or_default(),
+    let all = match member {
+        Some(m) => c.db.attached_sys_record_scan(m, ns),
+        None => match c.txn.as_mut() {
+            Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
+            None => c.db.sys_record_scan(ns).unwrap_or_default(),
+        },
     };
     for (k, v) in all {
         let owns = introspect::index_record_fingerprint(&v)
@@ -989,10 +1122,7 @@ fn forget_table_index_records(c: &mut Sqlite3, table: &str) {
         if !owns {
             continue;
         }
-        let _ = match c.txn.as_mut() {
-            Some(s) => s.sys_record_delete(ns, &k).map(|_| ()),
-            None => c.db.sys_record_put(ns, &k, &[]),
-        };
+        put_record(c, member, ns, &k, &[]);
     }
 }
 

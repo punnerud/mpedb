@@ -651,3 +651,33 @@ fn a_temp_view_over_a_main_table_is_created_read_and_dropped() {
     f.query("DROP VIEW v", &[]).unwrap();
     assert!(f.query("SELECT a FROM v", &[]).is_err());
 }
+
+/// Two schemas may hold an object of ONE name. Each keeps its own catalog, and
+/// a lookup against one must never answer with the other's.
+///
+/// The C-API's verbatim-DDL records were filed in main under the bare object
+/// name, so `CREATE TABLE other.users` overwrote main's record and `main.users`
+/// then reported the ATTACHED table's named CHECK constraints — a wrong answer,
+/// not a missing one. `t` exists in both fixtures for exactly this reason; this
+/// is the view half of it.
+#[test]
+fn one_name_in_two_schemas_keeps_two_view_definitions() {
+    let f = fix("twoschema", false);
+    f.main.query("CREATE VIEW t_v AS SELECT tag FROM t", &[]).unwrap();
+    f.main
+        .query("CREATE VIEW other.t_v AS SELECT tag FROM other.t", &[])
+        .unwrap();
+
+    // Each member's own catalog holds its own view; neither leaks into the
+    // other's listing, and the two bodies are different statements.
+    let main_views = f.main.list_views().unwrap();
+    let other_views = f.main.attached_list_views("other");
+    assert_eq!(main_views.len(), 1);
+    assert_eq!(other_views.len(), 1);
+    assert_eq!(main_views[0].0, "t_v");
+    assert_eq!(other_views[0].0, "t_v");
+    assert_ne!(main_views[0].1, other_views[0].1);
+
+    // And they read their OWN table: main's `t` has three rows, `other`'s one.
+    assert_eq!(mpedb_rows(&f.main, "SELECT count(*) FROM t_v")[0][0], Value::Int(3));
+}
