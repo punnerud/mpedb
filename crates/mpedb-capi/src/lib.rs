@@ -765,7 +765,7 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                     create: true,
                     on_table: Some(t),
                     ..
-                } => table_index_count(c, record_member(sqltext, d).as_deref(), t),
+                } => table_index_count(c, record_member(c, sqltext, d).as_deref(), t),
                 _ => None,
             });
             let res = if let Some(s) = c.txn.as_mut() {
@@ -879,7 +879,18 @@ fn names_temp_object(c: &Sqlite3, name: &str) -> bool {
         .temp_views_all()
         .iter()
         .any(|(n, _, _)| n.eq_ignore_ascii_case(name));
-    in_view || introspect::names_a_table(&c.db.temp_schema_or_empty(), name)
+    // INDEXES count: `PRAGMA index_info(<a temp index>)` has to read the temp
+    // member's records, and an index is an object of the schema its table is
+    // in like any other.
+    let in_index = c
+        .db
+        .attached_sys_record_scan("temp", introspect::IDX_NS)
+        .iter()
+        .any(|(k, v)| {
+            !v.is_empty()
+                && std::str::from_utf8(k).is_ok_and(|n| n.eq_ignore_ascii_case(name))
+        });
+    in_view || in_index || introspect::names_a_table(&c.db.temp_schema_or_empty(), name)
 }
 
 /// `PRAGMA [<schema>.]table_info(<view>)` — a view's RESULT columns.
@@ -996,14 +1007,42 @@ fn view_table_info(
 /// `CREATE TEMP …` names no schema but is not main either, so the temp rewrite
 /// is what decides that case — the same function the router uses, so the record
 /// cannot disagree with where the object actually went.
-fn record_member(sqltext: &str, target: &introspect::DdlTarget) -> Option<String> {
+fn record_member(c: &Sqlite3, sqltext: &str, target: &introspect::DdlTarget) -> Option<String> {
     match target.schema.as_deref() {
         Some(q) if q.eq_ignore_ascii_case("main") => None,
         Some(q) => Some(q.to_string()),
-        None => mpedb::rewrite_temp_ddl(sqltext)
-            .ok()
-            .flatten()
-            .map(|_| "temp".to_string()),
+        None => {
+            if mpedb::rewrite_temp_ddl(sqltext).ok().flatten().is_some() {
+                return Some("temp".to_string());
+            }
+            // `CREATE INDEX ix ON <temp table>` carries no TEMP keyword and no
+            // qualifier — sqlite puts the index wherever its TABLE lives, and
+            // the table name is a REFERENCE, so temp shadows main for it the
+            // way it does for every other bare name. (A CREATE's own NAME never
+            // shadows; that is a different rule and it stays.) Without this the
+            // index was built but its record filed in main, where the
+            // "how many indexes did this table have" lookup found no table —
+            // so the name was dropped and `sqlite_temp_master` reported a
+            // synthesised `sqlite_autoindex_…` for an index the caller named.
+            let on_temp_table = matches!(target.kind, introspect::DdlKind::Index { .. })
+                && target
+                    .on_table
+                    .as_deref()
+                    .is_some_and(|t| names_temp_object(c, t));
+            // A `DROP INDEX ix` has no ON clause; the index itself is what may
+            // be in temp, and its record is what has to be forgotten there.
+            let drops_temp_index = matches!(target.kind, introspect::DdlKind::Index { .. })
+                && !target.create
+                && c.db
+                    .attached_sys_record_scan("temp", introspect::IDX_NS)
+                    .iter()
+                    .any(|(k, v)| {
+                        !v.is_empty()
+                            && std::str::from_utf8(k)
+                                .is_ok_and(|n| n.eq_ignore_ascii_case(&target.name))
+                    });
+            (on_temp_table || drops_temp_index).then(|| "temp".to_string())
+        }
     }
 }
 
@@ -1037,7 +1076,7 @@ fn record_object_ddl(
     // object name is a WRONG ANSWER once two schemas hold an object of one
     // name: the second CREATE overwrote the first's text, so `main.users`
     // reported the attached `test_schema.users`'s named CHECK constraints.
-    let member = record_member(sqltext, target);
+    let member = record_member(c, sqltext, target);
     let idx = sqlite_index_records_of(c, member.as_deref());
     let (kind, create, name) = (target.kind, target.create, target.name.as_str());
     // `CREATE INDEX` files in its OWN namespace, keyed by the index name, with

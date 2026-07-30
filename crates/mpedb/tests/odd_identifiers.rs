@@ -17,6 +17,12 @@ fn config(tag: &str) -> (Config, std::path::PathBuf) {
     let path = mpedb_testkit::scratch_base()
         .join(format!("mpedb-oddident-{tag}.mpedb"));
     let _ = std::fs::remove_file(&path);
+    // The WAL too. The scratch name is fixed, so a run that was interrupted
+    // leaves one behind — and a leftover WAL REPLAYS the old catalog into the
+    // fresh file, which surfaces as `duplicate table name` on the first CREATE
+    // and looks exactly like a code regression. (Observed on M3; the sibling
+    // fixtures in this crate already do this.)
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
     let toml = format!(
         r#"
 [database]
