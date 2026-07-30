@@ -392,6 +392,33 @@ De 66 siste DB-labelene ble målt (WB_GROUP_BASE=20, logger i
   `SchemaPrograms`), som allerede evaluerer et program per rad per indeks.
   Krever skjema-wire v13 (IndexDef må bære uttrykkskilder).
 
+  KONTRAKTEN ER MÅLT (30/7, sqlite 3.45.1) — dette er den dyre halvdelen, og
+  den avgjør representasjonen:
+    * `LOWER(a)` som er NULL BLIR indeksert, og to slike kolliderer IKKE under
+      UNIQUE. mpedbs eksisterende regel («ingen oppføring når en nøkkeldel er
+      NULL») gir samme OBSERVERBARE oppførsel, siden indeksen aldri brukes til
+      oppslag — så ingen ny medlemskapsregel trengs.
+    * `'AB'` og `'Ab'` kolliderer under `UNIQUE(LOWER(a))`. Vedlikeholdet må
+      altså evaluere på ekte; det er ikke nok å lagre uttrykket.
+    * `PRAGMA index_info` rapporterer en uttrykksdel som **cid = -2** med NULL
+      navn (`index_xinfo` viser -2 for uttrykket, -1 for rowid).
+    * `sqlite_master.sql` bærer CREATE-teksten ORDRETT. Det er den Djangos
+      `get_constraints` parser, så teksten må lagres som skrevet.
+
+  FORESLÅTT REPRESENTASJON (ikke bygget): `IndexDef.exprs: Vec<Option<String>>`
+  parallelt med `columns`, og `columns[i] = u16::MAX` som sentinel for «denne
+  delen er et uttrykk». Det unngår å skrive om `Vec<u16>`, som ~16 kallsteder
+  og hele nøkkelbyggingen henger på. Nøkkelen bygges ett sted allerede
+  (`WriteTxn::index_entry_key`, fra S5), og programmene kan ri på
+  `SchemaPrograms` slik predikatene gjør.
+
+  ET FORSØK BLE RULLET TILBAKE 30/7 og det var riktig: jeg begynte på wire-
+  formatet (v13) før kontrakten over var målt, og satt fast på hvordan ÉN
+  ordinal per del skal representere et uttrykk som leser TO kolonner. Svaret
+  er at den ikke skal — sentinelen sier «uttrykk», og `columns` slutter å
+  beskrive den delen. Mål kontrakten først; det er den samme lærdommen som
+  §9 sier.
+
   MERK EN DEKLARASJONSFEIL: `mpedb_backend` arver
   `supports_expression_indexes = True` fra Djangos sqlite-features. Den er
   usann i dag. Å sette den False ville SKIPPE testene i stedet for å feile dem
