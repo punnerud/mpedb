@@ -592,11 +592,19 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // TRIGGER from this session appear in iterdump mid-transaction.
             // Outside a txn, refresh first: a just-committed CREATE bumps
             // schema_gen, and `Database::schema()` alone does not reload.
-            let bundle = match c.txn.as_ref() {
-                Some(s) => s.schema(),
-                None => {
-                    let _ = c.db.refresh_schema_if_stale();
-                    c.db.schema()
+            // `sqlite_temp_master` lists the TEMP schema and nothing else, so
+            // it reads the temp member's own catalog. A connection that never
+            // made a temp table has no such member, and the honest answer there
+            // is an EMPTY catalog — not an error, and not main's contents.
+            let bundle = if introspect::master_reference(sqltext) == Some(true) {
+                c.db.temp_schema_or_empty()
+            } else {
+                match c.txn.as_ref() {
+                    Some(s) => s.schema(),
+                    None => {
+                        let _ = c.db.refresh_schema_if_stale();
+                        c.db.schema()
+                    }
                 }
             };
             let verbatim = sqlite_master_records(c, &bundle);

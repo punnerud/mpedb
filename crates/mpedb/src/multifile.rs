@@ -87,6 +87,28 @@ impl Database {
     ///
     /// Not counted against `MAX_ATTACHED`: sqlite's limit is on databases the
     /// user attached, and `temp` is not one of them.
+    /// The schema of an attached member, or `None` when nothing is attached
+    /// under that name. `sqlite_temp_master` needs the `temp` member's, and
+    /// asking for a name that is not attached is an ordinary "empty", not an
+    /// error: a connection that never made a temp table has no temp schema.
+    pub fn attached_schema(&self, name: &str) -> Option<Arc<mpedb_core::engine::SchemaBundle>> {
+        let guard = self.attached.read().expect(POISON);
+        guard.find(name).map(|i| guard.members[i].db.schema())
+    }
+
+    /// The TEMP schema's catalog for `sqlite_temp_master`, or an EMPTY one when
+    /// this connection never made a temp table. Empty is the honest answer
+    /// there — the schema does not exist yet — and it is not an error.
+    pub fn temp_schema_or_empty(&self) -> Arc<mpedb_core::engine::SchemaBundle> {
+        self.attached_schema("temp").unwrap_or_else(|| {
+            // A zero-table schema is legal (#47) and is exactly what a
+            // connection with no temp tables has.
+            let empty = mpedb_types::Schema::new(Vec::new())
+                .expect("a zero-table schema is valid");
+            Arc::new(mpedb_core::engine::SchemaBundle::new(empty, Vec::new()))
+        })
+    }
+
     pub(crate) fn ensure_temp_schema(&self) -> Result<()> {
         {
             let guard = self.attached.read().expect(POISON);
@@ -94,7 +116,11 @@ impl Database {
                 return Ok(());
             }
         }
-        let db = open_ephemeral_attach()?;
+        // Seedless: `open_ephemeral_attach` plants an `attach_seed` table, and
+        // for `temp` that is user-visible — it showed up in
+        // `sqlite_temp_master` as a table nobody created. A zero-table schema
+        // is legal (#47) and is what an untouched temp schema actually is.
+        let db = open_ephemeral_temp()?;
         let mut guard = self.attached.write().expect(POISON);
         // Another thread on this connection may have won the race.
         if guard.find("temp").is_some() {
@@ -119,6 +145,26 @@ impl Database {
 /// asked for this path, so DETACH leaves it where it is.
 fn create_attach_target(path: &str) -> Result<Database> {
     let p = path.replace('\\', "\\\\").replace('"', "\\\"");
+    let toml = format!("[database]\npath = \"{p}\"\nsize_mb = 16\nmax_readers = 32\n");
+    Database::open_with_config(Config::from_toml_str(&toml)?)
+}
+
+/// The `temp` schema's backing file: like [`open_ephemeral_attach`] but with no
+/// seed table, because everything in `temp` is user-visible.
+fn open_ephemeral_temp() -> Result<Database> {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    let seq = ATTACH_EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "mpedb-temp-{}-{}.mpedb",
+        std::process::id(),
+        seq
+    ));
+    let _ = std::fs::remove_file(&path);
+    let p = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
     let toml = format!("[database]\npath = \"{p}\"\nsize_mb = 16\nmax_readers = 32\n");
     Database::open_with_config(Config::from_toml_str(&toml)?)
 }

@@ -1061,8 +1061,38 @@ const MASTER_COLS: [&str; 5] = ["type", "name", "tbl_name", "rootpage", "sql"];
 /// Does `sql` read `sqlite_master`/`sqlite_schema`? (identifier match, so a
 /// string literal containing the word does not trigger it).
 pub fn references_sqlite_master(sql: &str) -> bool {
+    master_reference(sql).is_some()
+}
+
+/// Which catalog a statement reads: `Some(false)` for the main one,
+/// `Some(true)` for the TEMP one, `None` for neither.
+///
+/// `sqlite_temp_master` is a separate table in sqlite, listing only the temp
+/// schema — and it is how SQLAlchemy enumerates temp tables, so answering
+/// "unknown table" for it cost 280 tests once temp tables existed to list.
+pub fn master_reference(sql: &str) -> Option<bool> {
+    let temp = names_a_catalog(sql, &["sqlite_temp_master", "sqlite_temp_schema"]);
+    let main = names_a_catalog(sql, &["sqlite_master", "sqlite_schema"]);
+    match (temp, main) {
+        // A statement naming ONLY the temp catalog reads the temp schema.
+        (true, false) => Some(true),
+        // One naming BOTH — SQLAlchemy's table listing is
+        // `… FROM sqlite_master UNION … FROM sqlite_temp_master` — cannot be
+        // answered from one catalog, and the mini-evaluator has no way to run
+        // the two branches against different ones. Answering from TEMP alone
+        // lost every main table and cost 122 tests; main alone is what this
+        // did before temp schemas existed and is the better wrong answer of
+        // the two, since temp is usually empty. A real UNION here needs the
+        // evaluator to resolve per-branch, which is its own piece of work.
+        (true, true) => Some(false),
+        (false, true) => Some(false),
+        (false, false) => None,
+    }
+}
+
+fn names_a_catalog(sql: &str, kws: &[&str]) -> bool {
     let lower = sql.to_ascii_lowercase();
-    for kw in ["sqlite_master", "sqlite_schema"] {
+    for kw in kws {
         let mut from = 0;
         while let Some(pos) = lower[from..].find(kw) {
             let at = from + pos;
