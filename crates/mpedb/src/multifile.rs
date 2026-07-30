@@ -42,7 +42,7 @@ use crate::exec::{exec_stmt, ChargeMode, ReadCtx, TxnCtx};
 use crate::{Database, ExecResult, Session, POISON};
 use mpedb_core::ReadTxn;
 use mpedb_sql::{
-    AttachStmt, CompiledPlan, DbResolution, DbScope, PlanHash, PolicyCatalog, SortDir,
+    AttachStmt, CompiledPlan, DbResolution, DbScope, DdlStmt, PlanHash, PolicyCatalog, SortDir,
 };
 use mpedb_types::{Config, Error, ExprProgram, HostFns, Result, Schema, TableDef, Value};
 use std::collections::HashSet;
@@ -105,6 +105,29 @@ impl Database {
     /// file.
     pub fn attached_schema_or_empty(&self, name: &str) -> Arc<mpedb_core::engine::SchemaBundle> {
         self.attached_schema(name).unwrap_or_else(empty_bundle)
+    }
+
+    /// Scan an attached member's sys-record namespace.
+    pub fn attached_sys_record_scan(&self, name: &str, ns: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let guard = self.attached.read().expect(POISON);
+        match guard.find(name) {
+            None => Vec::new(),
+            Some(i) => guard.members[i].db.sys_record_scan(ns).unwrap_or_default(),
+        }
+    }
+
+    /// Store a sys record IN an attached member.
+    ///
+    /// The verbatim CREATE text has to live where the object does. A temp
+    /// object's DDL runs against the temp member, so writing its record to main
+    /// left `sqlite_temp_master` reporting a RECONSTRUCTED `sql` — which drops
+    /// named CHECK constraints, and those are what a reflecting consumer reads.
+    pub fn attached_sys_record_put(&self, name: &str, ns: &str, key: &[u8], val: &[u8]) -> bool {
+        let guard = self.attached.read().expect(POISON);
+        match guard.find(name) {
+            None => false,
+            Some(i) => guard.members[i].db.sys_record_put(ns, key, val).is_ok(),
+        }
     }
 
     pub fn temp_schema_or_empty(&self) -> Arc<mpedb_core::engine::SchemaBundle> {
@@ -263,6 +286,79 @@ impl Database {
             .collect()
     }
 
+    /// Intercept `CREATE TEMP VIEW` and a `DROP VIEW` that names one; `None`
+    /// means "not a temp-view statement" and the caller carries on.
+    ///
+    /// Runs BEFORE `resolve_db_refs_hook`, so the temp rewrite never turns a
+    /// view body that reads `main` into a cross-file statement (see
+    /// [`Database::temp_views`]).
+    pub(crate) fn temp_view_stmt_hook(&self, sql: &str) -> Result<Option<ExecResult>> {
+        if let Some(rewritten) = mpedb_sql::rewrite_temp_ddl(sql)? {
+            // `rewrite_temp_ddl` both drops the TEMP keyword and qualifies the
+            // name for a member. The view is not going to a member, so the
+            // qualifier comes straight back off — and what is left is exactly
+            // the text sqlite stores for a temp object.
+            let verbatim = rewritten.replacen("temp.", "", 1);
+            // A parse failure is NOT ours to report: this hook runs ahead of
+            // reference resolution, so plenty of legal statements are not yet
+            // in a shape the DDL parser accepts. Anything that is not plainly
+            // a `CREATE VIEW` falls through to the ordinary router.
+            let Ok(Some(DdlStmt::CreateView { name, select_sql, if_not_exists })) =
+                mpedb_sql::parse_ddl(&verbatim)
+            else {
+                return Ok(None);
+            };
+            let mut guard = self.temp_views.write().expect(POISON);
+            if guard.contains_key(&name) {
+                if if_not_exists {
+                    return Ok(Some(ExecResult::Affected(0)));
+                }
+                return Err(Error::Bind(format!("view {name} already exists")));
+            }
+            guard.insert(name, (select_sql, verbatim));
+            return Ok(Some(ExecResult::Affected(0)));
+        }
+        // A bare `DROP VIEW v` hits the temp view first — same shadowing rule
+        // as resolution, so a temp view and a main view of one name are dropped
+        // newest-first, exactly as sqlite does it.
+        // Bare, or explicitly `temp.`-qualified. Every other qualifier —
+        // `main.v`, an attached `other.v` — belongs to the router, which is
+        // also what strips it, so those fall through untouched.
+        let (probe, qualified) = match strip_temp_qualifier(sql) {
+            Some(p) => (p, true),
+            None => (sql.to_string(), false),
+        };
+        let Ok(Some(DdlStmt::DropView { name, .. })) = mpedb_sql::parse_ddl(&probe) else {
+            return Ok(None);
+        };
+        let mut guard = self.temp_views.write().expect(POISON);
+        match guard.remove(&name) {
+            Some(_) => Ok(Some(ExecResult::Affected(0))),
+            // `temp.v` names the temp schema and nothing else, so a miss there
+            // must not fall through to main and drop a different view.
+            None if qualified => Err(Error::Bind(format!("no such view: temp.{name}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Every connection-local temp view as `(name, SELECT source, verbatim
+    /// CREATE text)` — the C-API's `sqlite_temp_master` source.
+    pub fn temp_views_all(&self) -> Vec<(String, String, String)> {
+        self.temp_views
+            .read()
+            .expect(POISON)
+            .iter()
+            .map(|(n, (s, v))| (n.clone(), s.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Merge the temp views over a main view catalog (temp shadows main).
+    pub(crate) fn merge_temp_views(&self, cat: &mut mpedb_sql::ViewCatalog) {
+        for (name, (src, _)) in self.temp_views.read().expect(POISON).iter() {
+            cat.insert(name.clone(), src.clone());
+        }
+    }
+
     /// Intercept `ATTACH`/`DETACH`; `None` means "not an attach statement".
     pub(crate) fn attach_stmt_hook(&self, sql: &str) -> Result<Option<ExecResult>> {
         match mpedb_sql::parse_attach(sql)? {
@@ -407,6 +503,22 @@ impl Database {
         }
     }
 
+}
+
+/// Remove a `temp.` qualifier that sits directly in front of an object name,
+/// returning `None` when the statement carries no such qualifier. Textual on
+/// purpose: it runs on statements the DDL parser has not accepted yet, and an
+/// object name cannot contain a `.`, so the word ahead of the FIRST one is the
+/// schema or nothing.
+fn strip_temp_qualifier(sql: &str) -> Option<String> {
+    let dot = sql.find('.')?;
+    let word_start = sql[..dot].rfind(|c: char| c.is_whitespace())? + 1;
+    sql[word_start..dot]
+        .eq_ignore_ascii_case("temp")
+        .then(|| format!("{}{}", &sql[..word_start], &sql[dot + 1..]))
+}
+
+impl Database {
     /// Run a pure attached-only statement on the named member.
     pub(crate) fn query_attached_only(
         &self,

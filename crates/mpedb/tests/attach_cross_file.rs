@@ -619,3 +619,35 @@ fn a_temp_table_is_readable_inside_a_write_transaction() {
     }
     s.commit().unwrap();
 }
+
+/// A temp VIEW reads `main` — which is the ordinary case, and is why a temp
+/// view is connection-local TEXT rather than an object in the temp member.
+///
+/// Routed at the member, `CREATE VIEW temp.v AS SELECT … FROM u` became a CROSS
+/// statement between two files; the DDL path had no meaning for that and
+/// dropped it silently. No view, no error, and the first sign of trouble was a
+/// later `DROP VIEW` failing to bind.
+#[test]
+fn a_temp_view_over_a_main_table_is_created_read_and_dropped() {
+    let f = fix("tempview", false);
+    f.query("CREATE TABLE u (a INT)", &[]).unwrap();
+    f.query("INSERT INTO u (a) VALUES (7)", &[]).unwrap();
+    f.query("CREATE TEMP VIEW v AS SELECT a FROM u", &[]).unwrap();
+
+    let one = |sql: &str| match f.query(sql, &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => rows[0][0].clone(),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(one("SELECT a FROM v"), Value::Int(7));
+
+    // Re-creating is an error; IF NOT EXISTS makes it a no-op.
+    assert!(f.query("CREATE TEMP VIEW v AS SELECT 1", &[]).is_err());
+    f.query("CREATE TEMP VIEW IF NOT EXISTS v AS SELECT 1", &[]).unwrap();
+    assert_eq!(one("SELECT a FROM v"), Value::Int(7));
+
+    // `temp.` names the temp schema and nothing else, so a miss there is an
+    // error rather than a fall-through that drops main's view of that name.
+    assert!(f.query("DROP VIEW temp.nope", &[]).is_err());
+    f.query("DROP VIEW v", &[]).unwrap();
+    assert!(f.query("SELECT a FROM v", &[]).is_err());
+}

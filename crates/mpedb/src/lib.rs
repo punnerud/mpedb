@@ -127,6 +127,9 @@ pub use mpedb_types::{
 use exec::{exec_stmt, ChargeMode, ReadCtx};
 pub use exec::take_last_insert_rowid;
 pub use fk::FkCheckRow;
+/// Re-exported for the C-API shim, which has to know whether a DDL statement
+/// targets the TEMP schema before it can file the statement's text there.
+pub use mpedb_sql::rewrite_temp_ddl;
 use mpedb_core::{CheckPrograms, Engine, SchemaPrograms, WriteTxn};
 use mpedb_sql::{CompiledPlan, HostUdfSet, PlanStmt};
 use registry::{decode_registry_plan, patched_last_used, plan_subkey};
@@ -794,6 +797,21 @@ pub struct Database {
     /// Connection-local `ATTACH DATABASE` list (#51, sqlite compat) — never
     /// persisted, never shared. See `multifile.rs`.
     attached: RwLock<multifile::AttachState>,
+    /// `CREATE TEMP VIEW` — name → (SELECT source, verbatim CREATE text).
+    ///
+    /// A temp view does NOT live in the temp MEMBER, and that is the whole
+    /// point. A view is only stored text, and sqlite's temp views are
+    /// connection-private while still reading `main` freely — a temp view over
+    /// a main table is the ordinary case (SQLAlchemy's reflection suite builds
+    /// one). Routing `CREATE VIEW temp.v AS SELECT … FROM u` at the member made
+    /// it a CROSS statement between two files, which the DDL path had no
+    /// meaning for and dropped on the floor: no view, no error, and a later
+    /// `DROP VIEW` failing to bind was the first anyone heard of it.
+    ///
+    /// Held here, the text merges into main's `ViewCatalog` at compile
+    /// (shadowing a main view of the same name, as sqlite resolves it) and the
+    /// body binds against main with nothing special happening.
+    temp_views: RwLock<std::collections::BTreeMap<String, (String, String)>>,
     /// Compiled cross-file plans (#51): connection-local like host-UDF plans
     /// (their table ids only mean anything against THIS attach list), so they
     /// live here and never touch the shared registry. Cleared on
@@ -931,6 +949,7 @@ impl Database {
             host_colls: RwLock::new(HashMap::new()),
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             attached: RwLock::new(Default::default()),
+            temp_views: RwLock::new(Default::default()),
             cross_cache: RwLock::new(HashMap::new()),
             cross_cache_live: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1009,6 +1028,7 @@ impl Database {
             host_colls: RwLock::new(HashMap::new()),
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             attached: RwLock::new(Default::default()),
+            temp_views: RwLock::new(Default::default()),
             cross_cache: RwLock::new(HashMap::new()),
             cross_cache_live: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2054,6 +2074,9 @@ impl Database {
         if let Some(res) = self.attach_stmt_hook(sql)? {
             return Ok(res);
         }
+        if let Some(res) = self.temp_view_stmt_hook(sql)? {
+            return Ok(res);
+        }
         // Only the `Passthrough` arm may be memoized. The others resolve
         // against the connection's ATTACH list, so their routing is not a
         // function of the text alone: the same SQL routes elsewhere after an
@@ -2258,6 +2281,9 @@ impl Database {
         params: &[Value],
     ) -> Result<ExecResult> {
         if let Some(res) = self.attach_stmt_hook(sql)? {
+            return Ok(res);
+        }
+        if let Some(res) = self.temp_view_stmt_hook(sql)? {
             return Ok(res);
         }
         let routed;

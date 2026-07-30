@@ -35,6 +35,9 @@ impl Database {
         for (name, src) in self.list_views()? {
             cat.insert(name, src);
         }
+        // Connection-local temp views shadow main's, which is why they are
+        // merged last.
+        self.merge_temp_views(&mut cat);
         Ok(cat)
     }
 

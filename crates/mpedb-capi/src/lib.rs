@@ -612,12 +612,12 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // is an EMPTY catalog — not an error, and not main's contents.
             // `<schema>.sqlite_master` reads THAT database's catalog — how
             // SQLAlchemy lists an attached schema's views.
-            let master_q = introspect::master_schema(sqltext)
+            let master_q_name = introspect::master_schema(sqltext)
                 .filter(|q| !q.eq_ignore_ascii_case("main"));
             let bundle = if introspect::master_reference(sqltext) == Some(true) {
                 c.db.temp_schema_or_empty()
-            } else if let Some(q) = master_q {
-                c.db.attached_schema_or_empty(&q)
+            } else if let Some(q) = master_q_name.as_deref() {
+                c.db.attached_schema_or_empty(q)
             } else {
                 match c.txn.as_ref() {
                     Some(s) => s.schema(),
@@ -627,18 +627,40 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                     }
                 }
             };
-            let verbatim = sqlite_master_records(c, &bundle);
+            // A TEMP object's verbatim text lives where the object does — its
+            // CREATE ran against the temp member. Every OTHER schema, attached
+            // ones included, files its records in main: `ATTACH` hands out a
+            // database this connection did not create the objects in, so main
+            // is the only place with a text for them. Reading an attached
+            // member's own records instead found none and lost the schema's
+            // views entirely.
+            let verbatim_from: Option<&str> =
+                (introspect::master_reference(sqltext) == Some(true)).then_some("temp");
+            let verbatim = sqlite_master_records_of(c, verbatim_from);
             let idx = sqlite_index_records(c);
             // Prefer txn-visible catalog (uncommitted CREATE VIEW/TRIGGER).
-            let (views, triggers) = match c.txn.as_mut() {
-                Some(s) => (
-                    s.list_views().unwrap_or_default(),
-                    s.list_triggers().unwrap_or_default(),
-                ),
-                None => (
-                    c.db.list_views().unwrap_or_default(),
-                    c.db.list_triggers().unwrap_or_default(),
-                ),
+            let mut verbatim = verbatim;
+            let (views, triggers) = if verbatim_from == Some("temp") {
+                // A temp view is connection-local text, not a member object,
+                // so it comes from the handle rather than from any catalog —
+                // and main's views must NOT appear under `sqlite_temp_master`.
+                let mut views = Vec::new();
+                for (name, select_sql, text) in c.db.temp_views_all() {
+                    verbatim.insert(name.clone(), introspect::object_ddl_record(&text));
+                    views.push((name, select_sql));
+                }
+                (views, Vec::new())
+            } else {
+                match c.txn.as_mut() {
+                    Some(s) => (
+                        s.list_views().unwrap_or_default(),
+                        s.list_triggers().unwrap_or_default(),
+                    ),
+                    None => (
+                        c.db.list_views().unwrap_or_default(),
+                        c.db.list_triggers().unwrap_or_default(),
+                    ),
+                }
             };
             let (columns, rows) = introspect::sqlite_master(
                 &bundle, sqltext, params, &verbatim, &idx, &views, &triggers,
@@ -738,8 +760,19 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
 /// transaction per object per query is quadratic for no reason. `0xff` bounds
 /// the scan above every key: keys are object names, and no valid UTF-8 byte
 /// sequence starts with `0xff`.
-fn sqlite_master_records(c: &mut Sqlite3, _schema: &mpedb::Schema) -> HashMap<String, Vec<u8>> {
+/// The verbatim-DDL records of one schema: `None` for main (this connection's
+/// own, txn-visible), or an attached database by name.
+fn sqlite_master_records_of(c: &mut Sqlite3, member: Option<&str>) -> HashMap<String, Vec<u8>> {
     let ns = introspect::DDL_NS;
+    if let Some(m) = member {
+        return c
+            .db
+            .attached_sys_record_scan(m, ns)
+            .into_iter()
+            .filter(|(_, v)| !v.is_empty())
+            .filter_map(|(k, v)| String::from_utf8(k).ok().map(|k| (k, v)))
+            .collect();
+    }
     let all = match c.txn.as_mut() {
         Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
         None => c.db.sys_record_scan(ns).unwrap_or_default(),
@@ -845,20 +878,41 @@ fn record_object_ddl(
         };
         return;
     }
+    // Does this statement target the TEMP schema? Needed on BOTH the create
+    // and the drop path, so it is decided before either.
+    let to_temp = mpedb::rewrite_temp_ddl(sqltext).ok().flatten().is_some();
     let value = if create {
         let verbatim = introspect::ddl_verbatim(sqltext, target.name_at, kind);
         if verbatim.is_empty() {
             return;
         }
+        // sqlite stores a temp object's text WITHOUT the `TEMP` keyword
+        // (measured: `CREATE TEMP TABLE tt (…)` reads back as
+        // `CREATE TABLE tt (…)`), which is exactly the rewrite the temp schema
+        // already performs, minus the qualifier the router then strips.
+        let verbatim = match mpedb::rewrite_temp_ddl(&verbatim).ok().flatten() {
+            Some(r) => r.replacen("temp.", "", 1),
+            None => verbatim,
+        };
         match kind {
             introspect::DdlKind::Table => {
                 // Re-resolve against the schema the statement just produced —
                 // the open WriteSession's bundle when in a txn, else the
                 // committed facade schema. Fingerprint + verbatim ride the
                 // same txn.
-                let schema = match c.txn.as_ref() {
-                    Some(s) => s.schema(),
-                    None => c.db.schema(),
+                //
+                // A `CREATE TEMP TABLE` produced its table in the TEMP member,
+                // so resolving against main found nothing and returned early:
+                // no record was written at all, and `sqlite_temp_master`
+                // reported a reconstruction that had dropped the table's named
+                // CHECK constraints.
+                let schema = if to_temp {
+                    c.db.temp_schema_or_empty()
+                } else {
+                    match c.txn.as_ref() {
+                        Some(s) => s.schema(),
+                        None => c.db.schema(),
+                    }
                 };
                 let Some(exact) = introspect::exact_table_name(&schema, name) else {
                     return;
@@ -883,10 +937,14 @@ fn record_object_ddl(
     match value {
         Some((exact, rec)) => {
             let (ns, key) = introspect::ddl_key(&exact);
-            let _ = match c.txn.as_mut() {
-                Some(s) => s.sys_record_put(ns, &key, &rec),
-                None => c.db.sys_record_put(ns, &key, &rec),
-            };
+            if to_temp {
+                c.db.attached_sys_record_put("temp", ns, &key, &rec);
+            } else {
+                let _ = match c.txn.as_mut() {
+                    Some(s) => s.sys_record_put(ns, &key, &rec),
+                    None => c.db.sys_record_put(ns, &key, &rec),
+                };
+            }
         }
         // DROP: forget the text. The facade has no delete outside a session, so
         // autocommit writes an EMPTY record instead — a tombstone, since
