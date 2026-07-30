@@ -505,3 +505,38 @@ fn a_cte_body_may_carry_dollar_parameters() {
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+/// A RECURSIVE CTE body may carry `$n` parameters too.
+///
+/// Same rule as an ordinary CTE's, decided in the parser because that is what
+/// owns the statement's slot count: `$n` is absolute and the count is raised to
+/// cover the body's; `?` is positional and refused, because the re-parse would
+/// number the body's from zero into the outer statement's own slots.
+#[test]
+fn a_recursive_cte_body_may_carry_dollar_parameters() {
+    let (db, path) = open();
+    setup(&db);
+    let rows = |sql: &str, params: &[Value]| match db.query(sql, params).unwrap() {
+        ExecResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows from `{sql}`, got {other:?}"),
+    };
+    assert_eq!(
+        rows(
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < $1) \
+             SELECT n FROM c ORDER BY n",
+            &[Value::Int(3)]
+        ),
+        vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]
+    );
+    let e = db
+        .query(
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < ?) \
+             SELECT n FROM c",
+            &[Value::Int(3)],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("`?`"), "{e}");
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}

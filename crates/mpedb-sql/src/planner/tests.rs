@@ -740,3 +740,27 @@ fn create_table_if_not_exists_parses() {
         other => panic!("expected CreateTable, got {other:?}"),
     }
 }
+
+/// A SELECT-list ALIAS used as a whole GROUP BY or ORDER BY term.
+///
+/// `SELECT x + y AS lx FROM t GROUP BY lx ORDER BY lx` is legal in sqlite and
+/// PostgreSQL, and it is what an ORM writes for an annotated, ordered
+/// aggregation. Both clauses resolved against the BASE row, where no `lx`
+/// exists — so the grouped path refused a name the UNGROUPED path already
+/// accepted.
+#[test]
+fn a_grouped_query_resolves_an_output_alias_in_group_by_and_order_by() {
+    let s = test_schema();
+    for sql in [
+        "SELECT age AS a FROM users GROUP BY a ORDER BY a",
+        "SELECT count(id) AS c, age AS a FROM users GROUP BY age ORDER BY a",
+        "SELECT count(id) AS c, age AS a FROM users GROUP BY a ORDER BY a",
+        // A real COLUMN of that name still wins — the substitution fires only
+        // where resolution would otherwise fail.
+        "SELECT age AS id FROM users GROUP BY id ORDER BY id",
+    ] {
+        prepare(sql, &s).unwrap_or_else(|e| panic!("`{sql}` should compile: {e:?}"));
+    }
+    // A name that is neither a column nor an alias still refuses.
+    assert!(prepare("SELECT age AS a FROM users GROUP BY nope", &s).is_err());
+}

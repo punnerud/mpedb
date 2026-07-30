@@ -840,9 +840,18 @@ impl<'a> Parser<'a> {
         if body_explain {
             return Err(self.err_here("EXPLAIN is not allowed inside a recursive CTE body"));
         }
-        if body_params != 0 {
-            return Err(self.err_here("a recursive CTE body may not use parameters"));
+        // Parameters in the body, on the same rule as an ordinary CTE's: `$n`
+        // is ABSOLUTE, so the body's indices already are the caller's — the
+        // statement's slot count just has to cover them, and the parser owns
+        // that count here. `?` is POSITIONAL and the re-parse numbers the
+        // body's from zero, colliding with the outer statement's own; refused
+        // by name, because answering it would bind the wrong values.
+        if has_question_param(&body_src)? {
+            return Err(self.err_here(
+                "a recursive CTE body uses `?` parameters, which are numbered by                  position and would collide with the outer statement's; use                  `$1`-style numbering, which is absolute",
+            ));
         }
+        self.max_params = self.max_params.max(body_params as u32);
         let comp = match body_stmt {
             Stmt::Compound(c) => c,
             _ => {

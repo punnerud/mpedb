@@ -35,6 +35,41 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
     }
 }
 
+/// Substitute a SELECT-list ALIAS used as a whole `GROUP BY` or `ORDER BY`
+/// term with the item it names.
+///
+/// `SELECT x + y AS lx FROM t GROUP BY lx ORDER BY lx` is legal in sqlite and
+/// PostgreSQL, and it is what an ORM writes for an annotated, ordered
+/// aggregation. Both clauses resolved against the BASE row here, where no `lx`
+/// exists, so the grouped path refused a name the UNGROUPED path already
+/// accepted.
+///
+/// A name that resolves as a real COLUMN keeps doing so — the substitution
+/// fires only where resolution would otherwise fail, so no query that worked
+/// can change meaning.
+///
+/// The whole term only. `ORDER BY lx + 1` names the alias inside an expression,
+/// which sqlite also resolves; that needs a recursive walk over every `Expr`
+/// shape and is not what any measured consumer writes, so it keeps the existing
+/// refusal rather than a partial rewrite that would work in some shapes and not
+/// others.
+fn subst_output_alias(
+    e: &ast::Expr,
+    items: &[(ast::Expr, Option<String>)],
+    scope: &Scope<'_>,
+) -> ast::Expr {
+    let ast::Expr::Col(n) = e else {
+        return e.clone();
+    };
+    if scope.resolve(n).is_ok() {
+        return e.clone();
+    }
+    items
+        .iter()
+        .find(|(_, a)| a.as_deref().is_some_and(|a| mpedb_types::ident_eq(a, n)))
+        .map_or_else(|| e.clone(), |(item, _)| item.clone())
+}
+
 /// Lift every aggregate out of `e`, replacing it with a reference to its slot in
 /// the GROUPED tuple. Returns the rewritten expression.
 ///
@@ -399,6 +434,11 @@ pub(super) fn plan_aggregate_select(
         } else {
             g
         };
+        let aliased_key;
+        let g = {
+            aliased_key = subst_output_alias(g, items, base_scope);
+            &aliased_key
+        };
         if contains_agg(g) {
             return Err(bind_err(
                 "GROUP BY cannot contain an aggregate — the key decides the \
@@ -464,8 +504,9 @@ pub(super) fn plan_aggregate_select(
     // ordering by an aggregate that IS selected does not compute it twice.
     let mut rewritten_order = Vec::with_capacity(s.order_by.len());
     for (e, desc) in &s.order_by {
+        let e = subst_output_alias(e, items, base_scope);
         rewritten_order.push((
-            lift_aggs(e, &keys, base_scope, mode, &mut agg_specs, &mut bare)?,
+            lift_aggs(&e, &keys, base_scope, mode, &mut agg_specs, &mut bare)?,
             *desc,
         ));
     }
