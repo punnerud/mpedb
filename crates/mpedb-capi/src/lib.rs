@@ -637,6 +637,13 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // SQLAlchemy lists an attached schema's views.
             let master_q_name = introspect::master_schema(sqltext)
                 .filter(|q| !q.eq_ignore_ascii_case("main"));
+            // `<schema>.sqlite_temp_master` does not exist — the temp schema is
+            // the connection's own and cannot be qualified with another name.
+            // sqlite errors, and a consumer may DEPEND on that error rather
+            // than on an empty result (see `qualified_temp_master`).
+            if let Some(q) = introspect::qualified_temp_master(sqltext) {
+                return Err(DbError::Bind(format!("no such table: {q}.sqlite_temp_master")));
+            }
             let reference = introspect::master_reference(sqltext);
             // Which catalog(s) supply rows. A statement naming both reads main
             // first and temp second, as its `UNION ALL` writes them.

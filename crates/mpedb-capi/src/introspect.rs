@@ -1195,8 +1195,26 @@ pub enum MasterRef {
 /// attached database's VIEWS; answering that from main described the wrong
 /// file. Quoted or bare, like the pragma qualifier.
 pub fn master_schema(sql: &str) -> Option<String> {
+    catalog_qualifier(sql, &["sqlite_master", "sqlite_schema"])
+}
+
+/// The `<schema>.` a TEMP-catalog reference was qualified with, if any.
+///
+/// There is no such object: `sqlite_temp_master` names the connection's one
+/// temp schema and cannot be qualified with another. sqlite says `no such
+/// table: <q>.sqlite_temp_master`, and SQLAlchemy DEPENDS on that error —
+/// its `_get_table_sql` tries a `UNION ALL` over both catalogs and falls back
+/// to plain `sqlite_master` when the DBAPI raises. Answering an empty result
+/// instead let the fallback never run, so every table in an attached schema
+/// reflected as "no such table" (measured: `ComponentReflectionTestExtra`).
+pub fn qualified_temp_master(sql: &str) -> Option<String> {
+    catalog_qualifier(sql, &["sqlite_temp_master", "sqlite_temp_schema"])
+        .filter(|q| !q.eq_ignore_ascii_case("temp"))
+}
+
+fn catalog_qualifier(sql: &str, kws: &[&str]) -> Option<String> {
     let lower = sql.to_ascii_lowercase();
-    for kw in ["sqlite_master", "sqlite_schema"] {
+    for kw in kws {
         let mut from = 0;
         while let Some(pos) = lower[from..].find(kw) {
             let at = from + pos;
