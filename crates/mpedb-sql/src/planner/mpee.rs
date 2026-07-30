@@ -1287,6 +1287,7 @@ mod tests {
     /// shape, small enough to build without an engine.
     fn chain_schema(n: usize) -> Schema {
         let c = |name: &str, nullable: bool| mpedb_types::ColumnDef {
+            default_text: None,
             generated: None,
             decl: None,
             name: name.into(),
@@ -1375,6 +1376,7 @@ mod tests {
     #[test]
     fn ndv_flips_a_star_to_dimension_first() {
         let c = |name: &str, ty: ColumnType, indexed: bool| mpedb_types::ColumnDef {
+            default_text: None,
             generated: None,
             decl: None,
             name: name.into(),
@@ -1388,6 +1390,7 @@ mod tests {
             affinity: mpedb_types::Affinity::implied_by(ty),
         };
         let key = |name: &str| mpedb_types::ColumnDef {
+            default_text: None,
             nullable: false,
             ..c(name, ColumnType::Int64, false)
         };

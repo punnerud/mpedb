@@ -76,6 +76,29 @@ pub enum DefaultExpr {
     Const(Value),
     /// `now()` — the commit-time timestamp, filled in by the engine.
     Now,
+    /// sqlite's three time keywords in DEFAULT position: `CURRENT_TIMESTAMP`,
+    /// `CURRENT_DATE`, `CURRENT_TIME`. Filled in by the engine from the same
+    /// clock [`DefaultExpr::Now`] uses, rendered as TEXT in sqlite's spelling
+    /// (`YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DD`, `HH:MM:SS`, all UTC).
+    ///
+    /// Distinct from `Now`, which is a `Timestamp` VALUE on a timestamp column
+    /// — these are text, on a column of any type, because that is what sqlite
+    /// stores and what a consumer reflecting the DDL then reads back.
+    CurrentTimestamp,
+    CurrentDate,
+    CurrentTime,
+}
+
+impl DefaultExpr {
+    /// The DDL spelling of a time-keyword default, or `None` for the others.
+    pub fn time_keyword(&self) -> Option<&'static str> {
+        match self {
+            DefaultExpr::CurrentTimestamp => Some("CURRENT_TIMESTAMP"),
+            DefaultExpr::CurrentDate => Some("CURRENT_DATE"),
+            DefaultExpr::CurrentTime => Some("CURRENT_TIME"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +113,15 @@ pub struct ColumnDef {
     /// whether inserts are checked.
     pub indexed: bool,
     pub default: Option<DefaultExpr>,
+    /// The DEFAULT's DDL TEXT, exactly as written — what sqlite's
+    /// `PRAGMA table_info` reports in `dflt_value` (canonical bytes v15).
+    ///
+    /// Kept rather than derived because the stored VALUE cannot reproduce it:
+    /// `DEFAULT 1` and `DEFAULT true` on a BOOLEAN column fold to one value and
+    /// sqlite prints them differently, and `DEFAULT (3+5)` prints as `3+5`, not
+    /// `8`. A schema built from TOML has no DDL text and leaves this `None`,
+    /// which reports as NULL — the same answer sqlite gives for no default.
+    pub default_text: Option<String>,
     /// CHECK expression source (SQL expression over this table's columns).
     /// Compiled to expression IR at attach time by the SQL layer; the source
     /// text participates in the schema hash.
@@ -1603,7 +1635,7 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(14u8); // schema encoding version (v14: IndexDef.collations)
+        buf.push(15u8); // schema encoding version (v15: time-keyword defaults)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -1650,6 +1682,16 @@ impl Schema {
                         write_value(&mut buf, v);
                     }
                     Some(DefaultExpr::Now) => buf.push(2),
+                    Some(DefaultExpr::CurrentTimestamp) => buf.push(3),
+                    Some(DefaultExpr::CurrentDate) => buf.push(4),
+                    Some(DefaultExpr::CurrentTime) => buf.push(5),
+                }
+                match &c.default_text {
+                    None => buf.push(0),
+                    Some(src) => {
+                        buf.push(1);
+                        write_str(&mut buf, src);
+                    }
                 }
                 match &c.check {
                     None => buf.push(0),
@@ -1768,7 +1810,7 @@ impl Schema {
         // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name;
         // v12 = TableDef.foreign_keys; v13 = IndexDef.exprs.
         // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if !(9..=14).contains(&version) {
+        if !(9..=15).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
@@ -1863,7 +1905,30 @@ impl Schema {
                         pos += 1;
                         Some(DefaultExpr::Now)
                     }
+                    3 => {
+                        pos += 1;
+                        Some(DefaultExpr::CurrentTimestamp)
+                    }
+                    4 => {
+                        pos += 1;
+                        Some(DefaultExpr::CurrentDate)
+                    }
+                    5 => {
+                        pos += 1;
+                        Some(DefaultExpr::CurrentTime)
+                    }
                     _ => return Err(Error::Corrupt("bad default tag".into())),
+                };
+                let default_text = match *buf.get(pos).ok_or_else(err)? {
+                    0 => {
+                        pos += 1;
+                        None
+                    }
+                    1 => {
+                        pos += 1;
+                        Some(read_str(buf, &mut pos)?)
+                    }
+                    _ => return Err(Error::Corrupt("bad default-text tag".into())),
                 };
                 let check = match *buf.get(pos).ok_or_else(err)? {
                     0 => {
@@ -1900,6 +1965,7 @@ impl Schema {
                     unique: false,
                     indexed: false,
                     default,
+                    default_text,
                     check,
                     collation,
                     affinity,
@@ -2177,7 +2243,7 @@ mod tests {
             id: 0,
             name: "users".into(),
             columns: vec![
-                ColumnDef { generated: None, decl: None,
+                ColumnDef { generated: None, default_text: None, decl: None,
                     name: "id".into(),
                     ty: ColumnType::Int64,
                     nullable: false,
@@ -2187,7 +2253,7 @@ mod tests {
                     check: None, collation: Collation::Binary,
                     affinity: Affinity::implied_by(ColumnType::Int64),
                 },
-                ColumnDef { generated: None, decl: None,
+                ColumnDef { generated: None, default_text: None, decl: None,
                     name: "email".into(),
                     ty: ColumnType::Text,
                     nullable: false,
@@ -2197,7 +2263,7 @@ mod tests {
                     check: None, collation: Collation::Binary,
                     affinity: Affinity::implied_by(ColumnType::Text),
                 },
-                ColumnDef { generated: None, decl: None,
+                ColumnDef { generated: None, default_text: None, decl: None,
                     name: "age".into(),
                     ty: ColumnType::Int64,
                     nullable: true,
@@ -2234,7 +2300,7 @@ mod tests {
                     .map(|n| TableDef {
                         id: 0,
                         name: n.to_string(),
-                        columns: vec![ColumnDef { generated: None, decl: None,
+                        columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
                             name: "id".into(),
                             ty: ColumnType::Int64,
                             nullable: false,
@@ -2263,7 +2329,7 @@ mod tests {
         let bad = Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),
-            columns: vec![ColumnDef { generated: None, decl: None,
+            columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: true,
@@ -2283,7 +2349,7 @@ mod tests {
         let bad = Schema::new(vec![TableDef {
             id: 0,
             name: "__mpedb_plans".into(),
-            columns: vec![ColumnDef { generated: None, decl: None,
+            columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,
@@ -2311,7 +2377,7 @@ mod tests {
     /// what keeps every positional engine cache correct until DROP's audit).
     #[test]
     fn ids_are_dense_explicit_and_survive_the_wire() {
-        let col = |n: &str| ColumnDef { generated: None, decl: None, name: n.into(), ty: ColumnType::Int64,
+        let col = |n: &str| ColumnDef { generated: None, default_text: None, decl: None, name: n.into(), ty: ColumnType::Int64,
                 affinity: Affinity::implied_by(ColumnType::Int64),
             nullable: false, unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
         let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
@@ -2343,13 +2409,13 @@ mod tests {
             id: 0,
             name: "t".into(),
             columns: vec![
-                ColumnDef { generated: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                ColumnDef { generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     unique: true, indexed: true, default: None, check: None, collation: Collation::Binary },
-                ColumnDef { generated: None, decl: None, name: "a".into(), ty: ColumnType::Int64, nullable: true,
+                ColumnDef { generated: None, default_text: None, decl: None, name: "a".into(), ty: ColumnType::Int64, nullable: true,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     unique: true, indexed: true, default: None, check: None, collation: Collation::Binary },
-                ColumnDef { generated: None, decl: None, name: "b".into(), ty: ColumnType::Text, nullable: true,
+                ColumnDef { generated: None, default_text: None, decl: None, name: "b".into(), ty: ColumnType::Text, nullable: true,
                         affinity: Affinity::implied_by(ColumnType::Text),
                     unique: false, indexed: true, default: None, check: None, collation: Collation::Binary },
             ],
@@ -2383,14 +2449,14 @@ mod tests {
 
     #[test]
     fn hostile_bytes_refuse_cleanly() {
-        let col = |n: &str, ty| ColumnDef { generated: None, decl: None, name: n.into(), ty, nullable: true,
+        let col = |n: &str, ty| ColumnDef { generated: None, default_text: None, decl: None, name: n.into(), ty, nullable: true,
                 affinity: Affinity::implied_by(ty),
             unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
         let base = Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),
             columns: vec![
-                ColumnDef { generated: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                ColumnDef { generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     unique: false, indexed: false, default: None, check: None, collation: Collation::Binary },
                 col("v", ColumnType::Any),
@@ -2437,7 +2503,7 @@ mod tests {
     }
 
     fn tbl(n: &str) -> TableDef {
-        let col = |n: &str| ColumnDef { generated: None, decl: None,
+        let col = |n: &str| ColumnDef { generated: None, default_text: None, decl: None,
             name: n.into(), ty: ColumnType::Int64, nullable: false,
             unique: false, indexed: false, default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ColumnType::Int64),
@@ -2538,7 +2604,7 @@ mod tests {
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
         // The version byte is 9.
-        assert_eq!(s.canonical_bytes()[0], 14);
+        assert_eq!(s.canonical_bytes()[0], 15);
         // A v8 file refuses cleanly (no misread of the new generated bytes).
         let mut v8 = s.canonical_bytes();
         v8[0] = 8;
@@ -2593,12 +2659,12 @@ mod tests {
     /// survives, and the helpers report the right visible set.
     #[test]
     fn implicit_rowid_round_trips_and_helpers() {
-        let col = |n: &str, ty| ColumnDef { generated: None, decl: None,
+        let col = |n: &str, ty| ColumnDef { generated: None, default_text: None, decl: None,
             name: n.into(), ty, nullable: true, unique: false, indexed: false,
             default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ty),
         };
-        let rowid = ColumnDef { generated: None, decl: None,
+        let rowid = ColumnDef { generated: None, default_text: None, decl: None,
             name: "rowid".into(), ty: ColumnType::Int64, nullable: false,
             unique: false, indexed: false, default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ColumnType::Int64),
@@ -2669,7 +2735,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 14);
+        assert_eq!(s.canonical_bytes()[0], 15);
 
         // Truncation at every offset is Corrupt, never a panic.
         let bytes = s.canonical_bytes();
@@ -2683,7 +2749,7 @@ mod tests {
     /// contributes to the hash, and truncation at every offset is Corrupt.
     #[test]
     fn column_decl_text_round_trips_and_is_hostile_safe() {
-        let col = |n: &str, ty, decl: Option<&str>| ColumnDef { generated: None,
+        let col = |n: &str, ty, decl: Option<&str>| ColumnDef { generated: None, default_text: None,
             name: n.into(),
             ty,
             nullable: true,
@@ -2728,7 +2794,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 14);
+        assert_eq!(s.canonical_bytes()[0], 15);
         // The text is part of the schema identity: `f float` and `f REAL` are
         // the same storage and DIFFERENT schemas, because a consumer keying
         // converters off the decltype sees two different columns.
@@ -2754,12 +2820,12 @@ mod tests {
     /// Corrupt — the roundtrip/truncation contract extended to the new field.
     #[test]
     fn column_collation_round_trips_and_is_hostile_safe() {
-        let col = |n: &str, ty, coll| ColumnDef { generated: None, decl: None,
+        let col = |n: &str, ty, coll| ColumnDef { generated: None, default_text: None, decl: None,
             name: n.into(), ty, nullable: true, unique: false, indexed: false,
             default: None, check: None, collation: coll,
             affinity: Affinity::implied_by(ty),
         };
-        let id = ColumnDef { generated: None, decl: None,
+        let id = ColumnDef { generated: None, default_text: None, decl: None,
             name: "id".into(), ty: ColumnType::Int64, nullable: false, unique: false,
             indexed: false, default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ColumnType::Int64),
@@ -2788,7 +2854,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 14);
+        assert_eq!(s.canonical_bytes()[0], 15);
 
         // The collation changes the hash: a BINARY `name` is a different schema.
         let mut plain = s.clone();
@@ -2823,11 +2889,11 @@ mod tests {
                 id: 0,
                 name: "t".into(),
                 columns: vec![
-                    ColumnDef { generated: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                    ColumnDef { generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                         unique: false, indexed: false, default: None, check: None,
                             affinity: Affinity::implied_by(ColumnType::Int64),
                         collation: Collation::Binary },
-                    ColumnDef { generated: None, decl: None, name: "name".into(), ty: ColumnType::Text, nullable: true,
+                    ColumnDef { generated: None, default_text: None, decl: None, name: "name".into(), ty: ColumnType::Text, nullable: true,
                         unique, indexed: !unique, default: None, check: None,
                             affinity: Affinity::implied_by(ColumnType::Text),
                         collation: Collation::NoCase },
@@ -2849,7 +2915,7 @@ mod tests {
         assert!(Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),
-            columns: vec![ColumnDef { generated: None, decl: None, name: "k".into(), ty: ColumnType::Text, nullable: false,
+            columns: vec![ColumnDef { generated: None, default_text: None, decl: None, name: "k".into(), ty: ColumnType::Text, nullable: false,
                 unique: false, indexed: false, default: None, check: None,
                     affinity: Affinity::implied_by(ColumnType::Text),
                 collation: Collation::NoCase }],
@@ -2867,11 +2933,11 @@ mod tests {
             id: 0,
             name: "t".into(),
             columns: vec![
-                ColumnDef { generated: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                ColumnDef { generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                     unique: false, indexed: false, default: None, check: None,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     collation: Collation::Binary },
-                ColumnDef { generated: None, decl: None, name: "n".into(), ty: ColumnType::Int64, nullable: true,
+                ColumnDef { generated: None, default_text: None, decl: None, name: "n".into(), ty: ColumnType::Int64, nullable: true,
                     unique: false, indexed: false, default: None, check: None,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     collation: Collation::NoCase },
@@ -2909,7 +2975,7 @@ mod tests {
     #[test]
     fn generated_column_round_trips_and_is_hostile_safe() {
         use crate::expr::Instr;
-        let plain = |n: &str, ty| ColumnDef { generated: None, decl: None,
+        let plain = |n: &str, ty| ColumnDef { generated: None, default_text: None, decl: None,
             name: n.into(), ty, nullable: true, unique: false, indexed: false,
             default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ty),
@@ -2945,7 +3011,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "the compiled program survives byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 14);
+        assert_eq!(s.canonical_bytes()[0], 15);
 
         // It computes, in declaration order, through the decoded schema.
         let mut row = vec![Value::Int(21), Value::Null];
@@ -2964,7 +3030,7 @@ mod tests {
     #[test]
     fn generated_column_validation_rules() {
         use crate::expr::Instr;
-        let plain = |n: &str, ty| ColumnDef { generated: None, decl: None,
+        let plain = |n: &str, ty| ColumnDef { generated: None, default_text: None, decl: None,
             name: n.into(), ty, nullable: true, unique: false, indexed: false,
             default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ty),
@@ -3043,7 +3109,7 @@ mod tests {
     #[test]
     fn drop_and_rename_column_refuse_on_a_generated_table() {
         use crate::expr::Instr;
-        let plain = |n: &str, ty, nullable| ColumnDef { generated: None, decl: None,
+        let plain = |n: &str, ty, nullable| ColumnDef { generated: None, default_text: None, decl: None,
             name: n.into(), ty, nullable, unique: false, indexed: false,
             default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ty),

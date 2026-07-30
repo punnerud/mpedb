@@ -49,6 +49,12 @@ pub struct CreateColumnSpec {
     /// reaches the schema, because what is persisted is the folded constant.
     /// `Some` and `default: None` always travel together.
     pub default_src: Option<String>,
+    /// The DEFAULT's DDL TEXT, exactly as written — what sqlite's
+    /// `PRAGMA table_info` reports in `dflt_value`. Not derivable from the
+    /// stored value: `DEFAULT 1` and `DEFAULT true` on a BOOLEAN column fold to
+    /// one value and sqlite prints them differently, and `DEFAULT (3+5)` prints
+    /// as `3+5` rather than `8`.
+    pub default_text: Option<String>,
     /// `CHECK (<expr>)` declared on the column, captured as SOURCE text (like a
     /// policy predicate or a view body) because the parser does not yet know the
     /// column list to bind against. The facade compiles it against the finished
@@ -880,16 +886,25 @@ mod tests {
     /// refuse BY NAME rather than storing something else.
     #[test]
     fn non_constant_defaults_refuse_by_name() {
-        for (sql, needle) in [
-            ("CREATE TABLE t (a TEXT DEFAULT CURRENT_TIMESTAMP)", "CURRENT_TIMESTAMP"),
-            ("CREATE TABLE t (a TEXT DEFAULT CURRENT_DATE)", "CURRENT_DATE"),
-            ("CREATE TABLE t (a TEXT DEFAULT CURRENT_TIME)", "CURRENT_TIME"),
-            // A BARE function call is still a parse error: sqlite requires the
-            // parentheses around an expression default, and so do we.
-            ("CREATE TABLE t (a INT DEFAULT abs(-1))", "constant literal"),
+        // A BARE function call is a parse error: sqlite requires the
+        // parentheses around an expression default, and so do we.
+        let e = parse_ddl("CREATE TABLE t (a INT DEFAULT abs(-1))").unwrap_err().to_string();
+        assert!(e.contains("constant literal"), "{e}");
+        // sqlite's three time keywords PARSE now: the schema carries them
+        // (canonical bytes v15) and the engine fills them per statement, so
+        // they no longer have to be refused for want of a representation.
+        for (sql, want) in [
+            ("CREATE TABLE t (a TEXT DEFAULT CURRENT_TIMESTAMP)", DefaultExpr::CurrentTimestamp),
+            ("CREATE TABLE t (a TEXT DEFAULT CURRENT_DATE)", DefaultExpr::CurrentDate),
+            ("CREATE TABLE t (a TEXT DEFAULT CURRENT_TIME)", DefaultExpr::CurrentTime),
         ] {
-            let e = parse_ddl(sql).unwrap_err().to_string();
-            assert!(e.contains(needle), "{sql}: {e}");
+            match parse_ddl(sql).unwrap().unwrap() {
+                DdlStmt::CreateTable(spec) => {
+                    assert_eq!(spec.columns[0].default, Some(want), "{sql}");
+                    assert!(spec.columns[0].default_src.is_none(), "{sql}");
+                }
+                other => panic!("{sql}: {other:?}"),
+            }
         }
         // `DEFAULT ( <expr> )` PARSES now — it is captured as source and folded
         // to a literal by the DDL applier, which is where the expression

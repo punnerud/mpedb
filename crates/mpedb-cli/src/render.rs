@@ -106,6 +106,13 @@ pub fn schema_toml(schema: &Schema) -> String {
                 Some(DefaultExpr::Const(v)) => {
                     out.push_str(&format!("  default = {v}\n"));
                 }
+                // The three time keywords render as they were written, which is
+                // what the TOML loader reads back.
+                Some(other) => {
+                    if let Some(kw) = other.time_keyword() {
+                        out.push_str(&format!("  default = \"{kw}\"\n"));
+                    }
+                }
             }
             if let Some(check) = &col.check {
                 out.push_str(&format!("  check = \"{check}\"\n"));
@@ -136,7 +143,7 @@ mod tests {
             "  padded  ",
             "back\\slash",
         ];
-        let col = |n: &str| ColumnDef { generated: None, decl: None,
+        let col = |n: &str| ColumnDef { generated: None, default_text: None, decl: None,
             name: n.into(),
             ty: ColumnType::Int64,
             nullable: false,

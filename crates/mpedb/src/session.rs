@@ -118,7 +118,7 @@ pub(crate) fn resolve_params_timed<'a>(
 /// Microseconds since the Unix epoch. The single clock read behind a literal
 /// `'now'`; a clock before the epoch stores 0 rather than panicking, matching
 /// `exec::now_micros`.
-fn now_micros() -> i64 {
+pub(crate) fn now_micros() -> i64 {
     mpedb_core::wall_clock_micros()
 }
 

@@ -194,6 +194,7 @@ mod tests {
 
     fn col(name: &str, ty: ColumnType, nullable: bool) -> ColumnDef {
         ColumnDef {
+            default_text: None,
             generated: None,
             decl: None,
             name: name.into(),

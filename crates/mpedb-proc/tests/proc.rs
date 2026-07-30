@@ -404,7 +404,7 @@ fn stale_plan_surfaces_plan_invalidated() {
     let h = mpedb_sql::prepare(sql, &db.schema()).unwrap().hash();
 
     // A *different* schema whose shape still fits: same table, extra column.
-    let col = |name: &str| ColumnDef { generated: None, decl: None,
+    let col = |name: &str| ColumnDef { generated: None, default_text: None, decl: None,
         name: name.into(),
         ty: ColumnType::Int64,
         nullable: false,

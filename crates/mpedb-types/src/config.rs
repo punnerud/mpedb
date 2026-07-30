@@ -720,7 +720,7 @@ fn raw_to_config(
                         Error::Config(format!("bad default for {}.{}: {m}", t.name, c.name))
                     })?),
                 };
-                columns.push(ColumnDef { generated: None, decl: None,
+                columns.push(ColumnDef { generated: None, default_text: None, decl: None,
                     name: c.name.clone(),
                     ty,
                     nullable: c.nullable,
@@ -1021,6 +1021,14 @@ fn parse_default(v: &toml::Value, ty: ColumnType) -> std::result::Result<Default
             } else {
                 Err("now() only valid for timestamp columns".into())
             };
+        }
+        // sqlite's three time keywords, in the spelling `render` writes — so a
+        // dumped schema round-trips through TOML.
+        match s.to_ascii_uppercase().as_str() {
+            "CURRENT_TIMESTAMP" => return Ok(DefaultExpr::CurrentTimestamp),
+            "CURRENT_DATE" => return Ok(DefaultExpr::CurrentDate),
+            "CURRENT_TIME" => return Ok(DefaultExpr::CurrentTime),
+            _ => {}
         }
     }
     let val = match (v, ty) {

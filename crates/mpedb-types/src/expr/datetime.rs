@@ -442,7 +442,24 @@ fn unsupported_modifiers(name: &str, n: usize) -> Error {
 /// Out-of-range instants (a clock before year 1 or past 9999) are CLAMPED to the
 /// representable ends rather than wrapping: the value is then rejected by the
 /// parser as an out-of-range time string — an error, never a wrong answer.
-pub fn sqlite_now_string(unix_micros: i64) -> String {
+/// The three DEFAULT time keywords, rendered exactly as sqlite's
+/// `datetime('now')`, `date('now')` and `time('now')` do — no fractional
+/// seconds, UTC, in that order.
+///
+/// Beside [`sqlite_now_string`] and built from the SAME `Dt`, so the DEFAULT
+/// path and the expression path cannot drift: `CURRENT_TIMESTAMP` in a DEFAULT
+/// and `CURRENT_TIMESTAMP` in a SELECT are the same instant rendered the same
+/// way. Slicing the millisecond form would have worked for every real clock
+/// and quietly failed for none of them, which is the wrong kind of correct.
+pub fn sqlite_now_parts(unix_micros: i64) -> (String, String, String) {
+    let x = now_dt(unix_micros);
+    let date = format!("{:04}-{:02}-{:02}", x.y, x.mo, x.d);
+    let time = format!("{:02}:{:02}:{:02}", x.h, x.mi, x.s as i32);
+    (format!("{date} {time}"), date, time)
+}
+
+/// The clock instant as a computed `Dt` — the shared half of the two renderers.
+fn now_dt(unix_micros: i64) -> Dt {
     // Julian-day milliseconds of the Unix epoch: 2440587.5 days.
     const UNIX_EPOCH_JD_MS: i64 = 210_866_760_000_000;
     let ms = unix_micros.div_euclid(1000);
@@ -452,6 +469,11 @@ pub fn sqlite_now_string(unix_micros: i64) -> String {
     x.valid_jd = true;
     x.compute_ymd();
     x.compute_hms();
+    x
+}
+
+pub fn sqlite_now_string(unix_micros: i64) -> String {
+    let x = now_dt(unix_micros);
     let milli = (x.s * 1000.0 + 0.5) as i64 % 1000;
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",

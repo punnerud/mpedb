@@ -967,7 +967,17 @@ pub fn pragma(
                         // never been pointed at it.
                         Value::Text(c.decltype().unwrap_or("").to_string()),
                         Value::Int(if c.nullable { 0 } else { 1 }),
-                        Value::Null, // dflt_value: not reconstructed
+                        // `dflt_value` is the DEFAULT's DDL TEXT, not its
+                        // value: sqlite reports `'x'` with quotes, `3+5`
+                        // unfolded, `1` on a BOOLEAN column as `1`. The schema
+                        // carries that text (v15) precisely because the folded
+                        // value cannot reproduce it. A schema built from TOML
+                        // has no DDL text and reports NULL, which is also what
+                        // sqlite says for a column with no default.
+                        match &c.default_text {
+                            Some(t) => Value::Text(t.clone()),
+                            None => Value::Null,
+                        },
                         Value::Int(pk),
                     ];
                     if xinfo {

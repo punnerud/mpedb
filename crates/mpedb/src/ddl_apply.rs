@@ -267,6 +267,13 @@ fn coerce_default(
     let v = match (&v, ty) {
         (Value::Int(i), ColumnType::Float64) => Value::Float(*i as f64),
         (Value::Int(i), ColumnType::Timestamp) => Value::Timestamp(*i),
+        // `BOOLEAN DEFAULT 1`. sqlite has no boolean type, so an ORM declaring
+        // one writes an integer default for it — and the INSERT path already
+        // takes the same value on the same column (`INSERT INTO t (b) VALUES
+        // (1)` stores `1`/`integer`, byte-identical to sqlite). Refusing it
+        // HERE and accepting it there was the two paths disagreeing about one
+        // column, not a rule.
+        (Value::Int(i), ColumnType::Bool) if *i == 0 || *i == 1 => Value::Bool(*i == 1),
         _ => v,
     };
     if !v.fits(ty) {
@@ -408,6 +415,9 @@ pub(crate) fn table_def_from_spec(
                 other => other.cloned(),
             };
             Ok(mpedb_types::ColumnDef { generated: None,
+                // The DEFAULT's DDL text verbatim, for `dflt_value` — sqlite
+                // reports what was WRITTEN, which the folded value cannot say.
+                default_text: c.default_text.clone(),
                 // The declared text VERBATIM, so `sqlite3_column_decltype`
                 // answers what CREATE TABLE said, not the canonical name.
                 decl: c.decl.clone(),
@@ -471,7 +481,7 @@ pub(crate) fn table_def_from_spec(
         // Append the hidden rowid as the trailing column and make it the sole PK.
         // It IS a single-Int64-PK rowid alias, so the existing NULL→max(rowid)+1
         // auto-assign machinery (#85) drives it with no engine change.
-        columns.push(mpedb_types::ColumnDef { generated: None, decl: None,
+        columns.push(mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
             name: "rowid".into(),
             ty: mpedb_types::ColumnType::Int64,
             nullable: false,
@@ -589,7 +599,7 @@ pub(crate) fn table_def_from_spec(
 pub(crate) fn virtual_table_def_from_spec(
     spec: mpedb_sql::CreateVirtualTableSpec,
 ) -> Result<mpedb_types::TableDef> {
-    let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef { generated: None, decl: None,
+    let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
         name: name.to_string(),
         ty,
         nullable,
@@ -662,10 +672,16 @@ pub(crate) fn add_column_from_spec(
             table,
             &spec.name,
         )?,
-        // The ADD-COLUMN parser only ever emits a Const literal (no now()).
-        Some(DefaultExpr::Now) => {
+        // sqlite refuses a NON-CONSTANT default on ADD COLUMN — there is no
+        // one value to seed the existing rows with. `now()` and the three time
+        // keywords are all that shape.
+        Some(ref d @ (DefaultExpr::Now
+        | DefaultExpr::CurrentTimestamp
+        | DefaultExpr::CurrentDate
+        | DefaultExpr::CurrentTime)) => {
+            let what = d.time_keyword().unwrap_or("now()");
             return Err(Error::Bind(format!(
-                "ALTER TABLE {table} ADD COLUMN {}: now() is not a constant default \
+                "ALTER TABLE {table} ADD COLUMN {}: {what} is not a constant default \
                  (sqlite refuses a non-constant ADD-COLUMN default)",
                 spec.name
             )))
@@ -688,6 +704,9 @@ pub(crate) fn add_column_from_spec(
         Some(DefaultExpr::Const(fill.clone()))
     };
     let mut col = mpedb_types::ColumnDef { generated: None,
+        // ADD COLUMN's default is a CONSTANT (a non-constant one is refused
+        // above), so its DDL text is what the column keeps.
+        default_text: spec.default_text.clone(),
         decl: spec.decl.clone(),
         name: spec.name,
         ty: spec.ty,

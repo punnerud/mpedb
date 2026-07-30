@@ -516,26 +516,29 @@ impl<'a> Parser<'a> {
 
     /// `DEFAULT <value>` in a column definition.
     ///
-    /// A literal constant only, which is `ALTER TABLE ADD COLUMN`'s existing
-    /// rule reused verbatim. sqlite is LOOSER here: it also takes a
-    /// parenthesized expression (`DEFAULT (datetime('now'))`) and the bare
-    /// `CURRENT_DATE`/`CURRENT_TIME`/`CURRENT_TIMESTAMP` words. mpedb's stored
-    /// [`DefaultExpr`] can hold neither — it is a `Const` or the engine's
-    /// commit-time `Now`, and `Now` is a microsecond `Timestamp` where sqlite's
-    /// `CURRENT_TIMESTAMP` is the TEXT `'YYYY-MM-DD HH:MM:SS'`. Accepting the
-    /// keyword would store a DIFFERENT value than sqlite stores, so both refuse
-    /// by name: a clean refusal beats a value that is quietly not sqlite's.
+    /// A literal constant, a parenthesized CONSTANT expression, or one of
+    /// sqlite's three time keywords.
+    ///
+    /// The keywords used to be refused, and the reason given was sound for the
+    /// schema as it was: mpedb's stored [`DefaultExpr`] could hold only a
+    /// `Const` or the engine's microsecond `Timestamp` `Now`, where sqlite's
+    /// `CURRENT_TIMESTAMP` is the TEXT `'YYYY-MM-DD HH:MM:SS'` — so accepting
+    /// the word would have stored a DIFFERENT value than sqlite stores. The
+    /// schema now carries the three forms itself (canonical bytes v15), and the
+    /// engine fills them from the same clock and the same renderer the
+    /// EXPRESSION path uses, so the two spellings of `CURRENT_TIMESTAMP` cannot
+    /// disagree.
     fn parse_column_default(&mut self) -> Result<ColumnDefault> {
         if let Some(Tok::Ident(w)) = self.peek() {
-            let lw = w.to_ascii_lowercase();
-            if matches!(lw.as_str(), "current_date" | "current_time" | "current_timestamp") {
-                return Err(self.err_here(format!(
-                    "DEFAULT {} is not supported — mpedb has no TEXT datetime default, and \
-                     sqlite's is the string `YYYY-MM-DD HH:MM:SS`, so accepting the keyword \
-                     would store a different value than sqlite stores; use a constant, or \
-                     supply the value on INSERT",
-                    lw.to_ascii_uppercase()
-                )));
+            let kw = match w.to_ascii_lowercase().as_str() {
+                "current_date" => Some(DefaultExpr::CurrentDate),
+                "current_time" => Some(DefaultExpr::CurrentTime),
+                "current_timestamp" => Some(DefaultExpr::CurrentTimestamp),
+                _ => None,
+            };
+            if let Some(kw) = kw {
+                self.pos += 1;
+                return Ok(ColumnDefault::Value(kw));
             }
         }
         if self.peek() == Some(&Tok::LParen) {
@@ -595,6 +598,7 @@ impl<'a> Parser<'a> {
             pk: false,
             default: None,
             default_src: None,
+            default_text: None,
             check: None,
             collation: Collation::Binary,
             generated: None,
@@ -641,9 +645,29 @@ impl<'a> Parser<'a> {
                         self.err_here(format!("column `{}` has more than one DEFAULT", col.name))
                     );
                 }
+                // sqlite's `PRAGMA table_info` reports `dflt_value` as the
+                // DDL TEXT of the default, not its value: `'x'` keeps its
+                // quotes, `3+5` stays unfolded, `1` on a BOOLEAN column stays
+                // `1`. Captured here because only the parser knows the span;
+                // the stored VALUE cannot reproduce it (`DEFAULT 1` and
+                // `DEFAULT true` fold to one value and print differently).
+                let at = self.here();
                 match self.parse_column_default()? {
-                    ColumnDefault::Value(d) => col.default = Some(d),
-                    ColumnDefault::Expr(src) => col.default_src = Some(src),
+                    ColumnDefault::Value(d) => {
+                        col.default = Some(d);
+                        col.default_text = self
+                            .src
+                            .get(at..self.here())
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty());
+                    }
+                    // `DEFAULT ( <expr> )` reports WITHOUT the wrapping parens
+                    // — measured: sqlite says `3+5`, not `(3+5)` — and that is
+                    // exactly the text `capture_paren_source` already returned.
+                    ColumnDefault::Expr(src) => {
+                        col.default_text = Some(src.clone());
+                        col.default_src = Some(src);
+                    }
                 }
             } else if self.eat_word("CHECK") {
                 let src = self.capture_paren_source()?;
@@ -1342,6 +1366,7 @@ impl<'a> Parser<'a> {
                 pk: false,
                 default: None,
                 default_src: None,
+                default_text: None,
                 check: None,
                 collation: Collation::Binary,
                 generated: None,

@@ -7,7 +7,7 @@ use mpedb_sql::{
 };
 
 fn col(name: &str, ty: ColumnType) -> ColumnDef {
-    ColumnDef { generated: None, decl: None,
+    ColumnDef { generated: None, default_text: None, decl: None,
         name: name.into(),
         ty,
         nullable: true,
@@ -26,11 +26,11 @@ fn schema() -> Schema {
         id: 0,
         name: "users".into(),
         columns: vec![
-            ColumnDef { generated: None,
+            ColumnDef { generated: None, default_text: None,
                 nullable: false,
                 ..col("id", ColumnType::Int64)
             },
-            ColumnDef { generated: None,
+            ColumnDef { generated: None, default_text: None,
                 nullable: false,
                 unique: true,
                 indexed: false,
@@ -39,7 +39,7 @@ fn schema() -> Schema {
             col("age", ColumnType::Int64),
             col("score", ColumnType::Float64),
             col("active", ColumnType::Bool),
-            ColumnDef { generated: None,
+            ColumnDef { generated: None, default_text: None,
                 default: Some(DefaultExpr::Now),
                 ..col("created", ColumnType::Timestamp)
             },
@@ -56,15 +56,15 @@ fn schema() -> Schema {
         id: 0,
         name: "orders".into(),
         columns: vec![
-            ColumnDef { generated: None,
+            ColumnDef { generated: None, default_text: None,
                 nullable: false,
                 ..col("user_id", ColumnType::Int64)
             },
-            ColumnDef { generated: None,
+            ColumnDef { generated: None, default_text: None,
                 nullable: false,
                 ..col("item_no", ColumnType::Int64)
             },
-            ColumnDef { generated: None,
+            ColumnDef { generated: None, default_text: None,
                 unique: true,
                 indexed: false,
                 ..col("sku", ColumnType::Text)
@@ -82,7 +82,7 @@ fn schema() -> Schema {
         id: 0,
         name: "events".into(),
         columns: vec![
-            ColumnDef { generated: None,
+            ColumnDef { generated: None, default_text: None,
                 nullable: false,
                 default: Some(DefaultExpr::Now),
                 ..col("ts", ColumnType::Timestamp)

@@ -27,7 +27,7 @@ mod tests;
 #[cfg(test)]
 mod vec_tests;
 
-pub use datetime::sqlite_now_string;
+pub use datetime::{sqlite_now_parts, sqlite_now_string};
 pub use scalar::ScalarFn;
 
 use ops::{

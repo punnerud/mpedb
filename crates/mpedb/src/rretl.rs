@@ -571,6 +571,7 @@ pub(crate) fn ensure_lineage_tables(
 pub(crate) fn spec_col(name: &str, ty: ColumnType) -> mpedb_sql::CreateColumnSpec {
     mpedb_sql::CreateColumnSpec {
         default_src: None,
+        default_text: None,
         name: name.into(),
         ty,
         affinity: mpedb_types::Affinity::implied_by(ty),

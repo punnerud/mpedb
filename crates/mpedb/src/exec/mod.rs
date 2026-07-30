@@ -31,9 +31,32 @@ std::thread_local! {
     static LAST_INSERT_ROWID: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
+/// The value a column's DEFAULT contributes when an INSERT omits it.
+///
+/// One function for the three insert paths (plan executor, INSERT…SELECT, and
+/// the ring's fast prepare) so a default cannot mean one thing on one path and
+/// another on the next. `now_micros` is read ONCE per statement by the caller:
+/// every row of one INSERT must carry the same instant, which is what sqlite
+/// does and what a test comparing two rows of one statement depends on.
 /// Record the rowid of a row just inserted into a rowid-alias table (facade hook
 /// for `sqlite3_last_insert_rowid`). Called from the INSERT loop after each
 /// successful `insert_row`, so the final call reflects the last inserted row.
+pub(crate) fn default_cell(default: Option<&DefaultExpr>, now: i64, now_micros: i64) -> Value {
+    match default {
+        Some(DefaultExpr::Const(v)) => v.clone(),
+        Some(DefaultExpr::Now) => Value::Timestamp(now),
+        Some(k @ (DefaultExpr::CurrentTimestamp | DefaultExpr::CurrentDate | DefaultExpr::CurrentTime)) => {
+            let (ts, date, time) = mpedb_types::sqlite_now_parts(now_micros);
+            Value::Text(match k {
+                DefaultExpr::CurrentDate => date,
+                DefaultExpr::CurrentTime => time,
+                _ => ts,
+            })
+        }
+        None => Value::Null,
+    }
+}
+
 pub(crate) fn record_last_insert_rowid(rowid: i64) {
     LAST_INSERT_ROWID.with(|c| c.set(Some(rowid)));
 }
@@ -2663,11 +2686,7 @@ fn exec_stmt_rest(
                                 srow.get(si as usize).cloned().unwrap_or(Value::Null),
                                 col.ty,
                             ),
-                            None => match &col.default {
-                                Some(DefaultExpr::Const(v)) => v.clone(),
-                                Some(DefaultExpr::Now) => Value::Timestamp(now),
-                                None => Value::Null,
-                            },
+                            None => default_cell(col.default.as_ref(), now, now_micros()),
                         });
                     }
                     built.push(std::borrow::Cow::Owned(row));
@@ -3806,11 +3825,8 @@ fn build_insert_row_impl<'a>(
                 .ok_or_else(|| internal("insert const"))?,
             InsertSource::Default => {
                 let col = t.columns.get(ci).ok_or_else(|| internal("insert col"))?;
-                match &col.default {
-                    Some(DefaultExpr::Const(v)) => v.clone(),
-                    Some(DefaultExpr::Now) => Value::Timestamp(now),
-                    None => Value::Null, // plan-validated: column is nullable
-                }
+                // plan-validated: a column with no default is nullable
+                default_cell(col.default.as_ref(), now, now_micros())
             }
             InsertSource::Expr(prog) => {
                 // Dual row: empty tuple. Program carries its own const pool.

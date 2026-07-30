@@ -27,7 +27,7 @@ pub use error::{BudgetKind, Error, Result};
 pub use ident::{fold_ident, ident_eq};
 pub mod agg;
 pub use agg::{Accum, HostAggState, HostAggs};
-pub use expr::{sqlite_now_string, CmpKind, ExprProgram, HostFns, Instr, ScalarFn};
+pub use expr::{sqlite_now_parts, sqlite_now_string, CmpKind, ExprProgram, HostFns, Instr, ScalarFn};
 
 /// The aggregate functions.
 ///

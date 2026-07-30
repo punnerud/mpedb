@@ -1563,7 +1563,7 @@ pub(crate) fn cte_working_table_def(
         columns: columns
             .iter()
             .zip(col_types)
-            .map(|(name, &ty)| mpedb_types::ColumnDef { generated: None, decl: None,
+            .map(|(name, &ty)| mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
                 name: name.clone(),
                 ty,
                 nullable: true,

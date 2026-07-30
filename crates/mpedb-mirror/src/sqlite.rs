@@ -279,7 +279,7 @@ pub fn to_table_def(src: &SourceTable) -> Result<TableDef> {
             )));
         }
         let is_pk = src.pk.contains(&i);
-        columns.push(ColumnDef { generated: None, decl: None,
+        columns.push(ColumnDef { generated: None, default_text: None, decl: None,
             name: c.name.clone(),
             ty: c.mapped,
             // PK columns are NOT NULL in mpedb regardless of sqlite's flag

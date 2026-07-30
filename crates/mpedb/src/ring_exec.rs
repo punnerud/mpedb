@@ -64,7 +64,7 @@ use mpedb_sql::{AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
 use mpedb_types::expr::{Instr, ScalarFn};
 use mpedb_types::value::{read_value, write_value};
 use mpedb_types::{
-    keycode, Concurrency, DefaultExpr, Error, KeyAccess, KeyPart, PlanHash, Result, Schema, Value,
+    keycode, Concurrency, Error, KeyAccess, KeyPart, PlanHash, Result, Schema, Value,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -1080,11 +1080,11 @@ fn optimistic_prep_inner(
                         None => return Prep::Fallback,
                     },
                     InsertSource::Default => match db.schema().table(table).and_then(|t| t.columns.get(ci)) {
-                        Some(c) => match &c.default {
-                            Some(DefaultExpr::Const(v)) => v.clone(),
-                            Some(DefaultExpr::Now) => Value::Timestamp(now),
-                            None => Value::Null,
-                        },
+                        Some(c) => crate::exec::default_cell(
+                            c.default.as_ref(),
+                            now,
+                            crate::session::now_micros(),
+                        ),
                         None => return Prep::Fallback,
                     },
                     // Expression cells need the dual-row eval path; fall back
@@ -1547,7 +1547,7 @@ mod tests {
 
     /// Tables `a` (id 0) and `b` (id 1), each `(id int64 PK, v int64 NULL)`.
     fn test_schema() -> Schema {
-        let col = |name: &str, nullable: bool| ColumnDef { generated: None, decl: None,
+        let col = |name: &str, nullable: bool| ColumnDef { generated: None, default_text: None, decl: None,
             name: name.into(),
             ty: ColumnType::Int64,
             nullable,

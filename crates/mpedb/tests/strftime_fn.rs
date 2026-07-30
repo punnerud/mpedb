@@ -418,17 +418,75 @@ fn now_binds_the_statement_instant_and_nothing_else_does() {
         db.query("SELECT current_timestamp()", &[]).is_err(),
         "current_timestamp() is not a function"
     );
-    for kw in ["CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"] {
-        let m = db
-            .query(&format!("CREATE TABLE nowtest_{kw} (a INT PRIMARY KEY, b TEXT DEFAULT {kw})"), &[])
-            .map(|r| panic!("DEFAULT {kw} must be refused, got {r:?}"))
-            .unwrap_err()
-            .to_string();
-        assert!(m.contains(kw), "{kw}: {m}");
+    // The same three keywords in DEFAULT position are now STORED (schema v15)
+    // and filled per statement from the same clock and the same renderer this
+    // expression path uses — which is the point: the two spellings of
+    // `CURRENT_TIMESTAMP` must be one answer, not two.
+    for (kw, width) in [("CURRENT_TIMESTAMP", 19), ("CURRENT_DATE", 10), ("CURRENT_TIME", 8)] {
+        let t = format!("nowtest_{kw}");
+        db.query(&format!("CREATE TABLE {t} (a INT PRIMARY KEY, b TEXT DEFAULT {kw})"), &[])
+            .unwrap_or_else(|e| panic!("DEFAULT {kw}: {e}"));
+        db.query(&format!("INSERT INTO {t} (a) VALUES (1)"), &[]).unwrap();
+        match db.query(&format!("SELECT b FROM {t}"), &[]).unwrap() {
+            ExecResult::Rows { rows, .. } => match &rows[0][0] {
+                Value::Text(s) => assert_eq!(s.len(), width, "{kw} rendered `{s}`"),
+                other => panic!("{kw}: expected text, got {other:?}"),
+            },
+            other => panic!("expected rows, got {other:?}"),
+        }
+        // Every row of ONE insert carries ONE instant, as sqlite does.
+        db.query(&format!("INSERT INTO {t} (a) VALUES (2), (3)"), &[]).unwrap();
+        match db.query(&format!("SELECT count(DISTINCT b) FROM {t} WHERE a > 1"), &[]).unwrap() {
+            ExecResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(1), "{kw}"),
+            other => panic!("expected rows, got {other:?}"),
+        }
     }
+    // A non-constant default still cannot be added to an EXISTING table: there
+    // is no one value to seed the rows with, and sqlite refuses it too.
+    assert!(db
+        .query("ALTER TABLE nowtest_CURRENT_DATE ADD COLUMN c TEXT DEFAULT CURRENT_DATE", &[])
+        .is_err());
 
     // And the deterministic time strings still work.
     assert!(db.query("SELECT strftime('%Y-%m-%d', '2020-01-02')", &[]).is_ok());
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// `PRAGMA table_info`'s `dflt_value` is the DEFAULT's DDL TEXT, not its value.
+///
+/// sqlite reports what was WRITTEN — `'x'` keeps its quotes, `3+5` stays
+/// unfolded, `1` on a BOOLEAN column stays `1`. The stored value cannot say any
+/// of that: `DEFAULT 1` and `DEFAULT true` fold to ONE value and print
+/// differently, and a folded `(3+5)` is `8`. So the schema carries the text
+/// (canonical bytes v15) beside the value, and it comes off the WIRE — this
+/// asserts it after a REOPEN, not straight out of the parser.
+#[test]
+fn dflt_value_is_the_ddl_text_and_survives_a_reopen() {
+    let (db, path) = mpedb_db();
+    let want: Vec<(&str, &str)> = vec![
+        ("a", "10"),
+        ("b", "'x'"),
+        ("c", "3+5"),
+        ("d", "CURRENT_TIMESTAMP"),
+    ];
+    db.query(
+        "CREATE TABLE dt (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 10, b TEXT DEFAULT 'x', \
+         c INTEGER DEFAULT (3+5), d TEXT DEFAULT CURRENT_TIMESTAMP)",
+        &[],
+    )
+    .unwrap();
+    drop(db);
+
+    let db = Database::open_from_file(&path).unwrap();
+    let bundle = db.schema();
+    let t = bundle.tables.iter().find(|t| t.name == "dt").expect("table dt");
+    for (name, text) in &want {
+        let c = t.columns.iter().find(|c| &c.name == name).unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(c.default_text.as_deref(), Some(*text), "column {name}");
+    }
+    // A column with no default has no text, which reports as NULL.
+    assert!(t.columns.iter().find(|c| c.name == "id").unwrap().default_text.is_none());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
 }
