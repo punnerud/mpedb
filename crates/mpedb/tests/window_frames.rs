@@ -401,3 +401,45 @@ fn order_dependent_no_order_by_is_refused_not_guessed() {
         "refusal should explain the missing ORDER BY, got: {msg}"
     );
 }
+
+/// A frame OFFSET may be a parameter: `ROWS BETWEEN ? PRECEDING AND CURRENT
+/// ROW`, which is what an ORM writes for a window size decided at run time.
+///
+/// It was refused because "the content-hashed plan bakes it in" — but the frame
+/// size is ONE value for the whole execution, which is exactly the property
+/// that already lets `lag`/`lead`'s offset be a parameter (`WinInt`). Baking it
+/// in also made every distinct window size a distinct plan hash.
+///
+/// The parameter is resolved ONCE per execution, before the row loop: a
+/// boundary is consulted per row, and re-reading it there would be both wasted
+/// work and a place for a mid-scan error.
+#[test]
+fn a_frame_offset_may_be_a_parameter() {
+    let d = db();
+    // The parameterised form and the literal form must agree with each other
+    // AND with sqlite.
+    for (n, lit) in [(0i64, "0"), (1, "1"), (2, "2")] {
+        let param_q =
+            "SELECT id, sum(amt) OVER (ORDER BY id ROWS BETWEEN $1 PRECEDING AND CURRENT ROW) \
+             FROM t ORDER BY id";
+        let lit_q = format!(
+            "SELECT id, sum(amt) OVER (ORDER BY id ROWS BETWEEN {lit} PRECEDING AND CURRENT ROW) \
+             FROM t ORDER BY id"
+        );
+        let got = match d.query(param_q, &[Value::Int(n)]).unwrap() {
+            ExecResult::Rows { rows, .. } => rows
+                .into_iter()
+                .map(|r| r.iter().map(render).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(got, mpedb_rows(&d, &lit_q), "parameter must equal the literal, n={n}");
+        assert_eq!(got, sqlite_rows(&lit_q), "and both must equal sqlite, n={n}");
+    }
+    // A NEGATIVE offset is a RUN-time error, as sqlite's is — not a parse error,
+    // because the value is not known until the parameter is bound.
+    let q = "SELECT sum(amt) OVER (ORDER BY id ROWS BETWEEN $1 PRECEDING AND CURRENT ROW) FROM t";
+    assert!(d.query(q, &[Value::Int(-1)]).is_err(), "a negative frame offset must be refused");
+    // …and a non-integer likewise.
+    assert!(d.query(q, &[Value::Text("x".into())]).is_err());
+}

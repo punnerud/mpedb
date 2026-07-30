@@ -1106,7 +1106,7 @@ impl<'a> Parser<'a> {
     /// that isn't UNBOUNDED FOLLOWING, an end that isn't UNBOUNDED PRECEDING, and
     /// start ≤ end) is enforced by the planner, so its message names the exact
     /// problem uniformly.
-    fn window_frame(&mut self) -> Result<Option<FrameAst>> {
+    fn window_frame(&mut self) -> Result<Option<Box<FrameAst>>> {
         let mode = if self.eat_word("ROWS") {
             FrameMode::Rows
         } else if self.eat_word("RANGE") {
@@ -1126,7 +1126,7 @@ impl<'a> Parser<'a> {
             // CURRENT ROW`.
             (self.frame_bound()?, FrameBound::CurrentRow)
         };
-        Ok(Some(FrameAst { mode, start, end }))
+        Ok(Some(Box::new(FrameAst { mode, start, end })))
     }
 
     /// One frame boundary: `UNBOUNDED PRECEDING`, `<N> PRECEDING`, `CURRENT ROW`,
@@ -1150,17 +1150,49 @@ impl<'a> Parser<'a> {
             }
             return Err(self.err_here("expected ROW after CURRENT"));
         }
-        // `<N> PRECEDING | FOLLOWING`. Only a bare non-negative integer literal is
-        // accepted; a negative sign, a parameter, or any expression is a clean
-        // parse error here (the offset must be a constant baked into the plan).
-        if let Some(&Tok::Int(n)) = self.peek() {
-            self.pos += 1;
-            let n = n as u64; // Tok::Int is always ≥ 0 (a sign is a separate token)
+        // `<N> PRECEDING | FOLLOWING`, where N is a non-negative integer literal
+        // OR a parameter. A parameter is legitimate for the same reason
+        // `lag`/`lead`'s offset takes one (`WinInt`): the frame size is ONE
+        // value for the whole execution, so the plan does not have to bake it
+        // in — and baking it in made every distinct window size a distinct plan
+        // hash. What is genuinely per-ROW — a column, or an expression over one
+        // — stays refused, which is where sqlite's coercion becomes guesswork.
+        let off = match self.peek() {
+            // `Tok::Int` is always ≥ 0 (a sign is a separate token).
+            Some(&Tok::Int(n)) => {
+                self.pos += 1;
+                Some(crate::plan::WinInt::Lit(n))
+            }
+            Some(&Tok::DollarParam(i)) => {
+                let pos = self.here();
+                self.pos += 1;
+                self.param_style(ParamStyle::Dollar, pos)?;
+                self.max_params = self.max_params.max(i as u32 + 1);
+                Some(crate::plan::WinInt::Param(i))
+            }
+            Some(&Tok::Question) => {
+                let pos = self.here();
+                self.pos += 1;
+                self.param_style(ParamStyle::Question, pos)?;
+                let i = self.next_question;
+                if i >= u16::MAX as u32 {
+                    return Err(Error::Parse {
+                        pos,
+                        msg: "too many `?` parameters (max 65535)".into(),
+                    });
+                }
+                self.next_question += 1;
+                self.max_params = self.max_params.max(i + 1);
+                Some(crate::plan::WinInt::Param(i as u16))
+            }
+            _ => None,
+        };
+        if let Some(off) = off {
             if self.eat_word("PRECEDING") {
-                return Ok(FrameBound::Preceding(n));
+                return Ok(FrameBound::Preceding(off));
             }
             if self.eat_word("FOLLOWING") {
-                return Ok(FrameBound::Following(n));
+                return Ok(FrameBound::Following(off));
             }
             return Err(self.err_here("expected PRECEDING or FOLLOWING after a frame offset"));
         }

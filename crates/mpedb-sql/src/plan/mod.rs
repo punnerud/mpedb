@@ -494,7 +494,7 @@ const MAX_JOINS: usize = 63;
 //     Python source. The integer SEMANTICS are untouched (0 = the current row,
 //     negative looks the other way — both already matched sqlite); only where
 //     the integer comes from is new.
-const PLAN_FORMAT: u8 = 63;
+const PLAN_FORMAT: u8 = 64;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1029,9 +1029,14 @@ pub enum FrameMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameBound {
     UnboundedPreceding,
-    Preceding(u64),
+    /// The offset, which may be a PARAMETER — one value for the whole
+    /// execution, the same reasoning [`WinInt`] carries for `lag`/`lead`.
+    /// `ROWS BETWEEN ? PRECEDING AND CURRENT ROW` is what an ORM writes for a
+    /// runtime window size, and baking it in would have made every distinct
+    /// size a distinct plan hash.
+    Preceding(WinInt),
     CurrentRow,
-    Following(u64),
+    Following(WinInt),
     UnboundedFollowing,
 }
 

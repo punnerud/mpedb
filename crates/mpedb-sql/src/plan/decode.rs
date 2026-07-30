@@ -1055,9 +1055,9 @@ fn decode_opt_frame(buf: &[u8], pos: &mut usize) -> Result<Option<Frame>> {
 fn decode_frame_bound(buf: &[u8], pos: &mut usize) -> Result<FrameBound> {
     Ok(match r_u8(buf, pos)? {
         1 => FrameBound::UnboundedPreceding,
-        2 => FrameBound::Preceding(r_u64(buf, pos)?),
+        2 => FrameBound::Preceding(decode_win_int(buf, pos)?),
         3 => FrameBound::CurrentRow,
-        4 => FrameBound::Following(r_u64(buf, pos)?),
+        4 => FrameBound::Following(decode_win_int(buf, pos)?),
         5 => FrameBound::UnboundedFollowing,
         t => return Err(corrupt(format!("bad window frame boundary tag {t}"))),
     })

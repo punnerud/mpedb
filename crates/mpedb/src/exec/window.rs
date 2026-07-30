@@ -197,6 +197,12 @@ pub(super) fn compute_windows(
             w,
             // Resolved once per window, before any row is touched (format 63).
             resolve_win_int(w.func, params)?,
+            // The frame's boundary offsets, likewise: a boundary is consulted
+            // per ROW, and its offset may be a parameter.
+            match &w.frame {
+                Some(f) => resolve_frame_offsets(f, params)?,
+                None => FrameOffsets { start: 0, end: 0 },
+            },
             arg_colls.get(k).copied().unwrap_or(Collation::Binary),
             &part_key,
             &order_vals,
@@ -224,6 +230,9 @@ fn assign_window(
     // `resolve_win_int`. It is a literal or a PARAMETER, never per-row — which
     // is why one read serves every row here.
     win_int: i64,
+    // The frame's two boundary offsets, resolved for this execution alongside
+    // `win_int` and for the same reason.
+    fo: FrameOffsets,
     // The argument's collating sequence — the min/max compare (and the DISTINCT
     // dedup, had windows allowed one) of a `WindowFunc::Agg` accumulator.
     coll: Collation,
@@ -265,6 +274,7 @@ fn assign_window(
                 win_int,
                 coll,
                 frame,
+                fo,
                 arg_vals,
                 order_vals,
                 dirs,
@@ -564,6 +574,9 @@ fn assign_framed(
     // The argument's collating sequence, for a min/max aggregate over the frame.
     coll: Collation,
     frame: &Frame,
+    // The frame's two boundary offsets, likewise already resolved — a boundary
+    // is consulted per ROW, and its offset may be a parameter.
+    fo: FrameOffsets,
     arg_vals: &[Option<Value>],
     order_vals: &[Vec<Value>],
     dirs: &[bool],
@@ -576,7 +589,7 @@ fn assign_framed(
     // per row: it SLIDES (see `assign_host_framed`).
     if matches!(func, WindowFunc::Host) {
         return assign_host_framed(
-            slot, part, rows, frame, arg_vals, order_vals, dirs, has_order, host, host_aggs,
+            slot, part, rows, frame, fo, arg_vals, order_vals, dirs, has_order, host, host_aggs,
         );
     }
     // Peer-group structure is needed only for GROUPS/RANGE (they count / span
@@ -587,7 +600,7 @@ fn assign_framed(
         build_groups(part, order_vals, dirs, has_order)
     };
     for off in 0..len {
-        let (lo, hi) = frame_bounds(off, len, frame, &group_of, &group_starts);
+        let (lo, hi) = frame_bounds(off, len, frame, fo, &group_of, &group_starts);
         let target = part[off];
         rows[target][slot] = match func {
             WindowFunc::Agg(f) => {
@@ -673,6 +686,7 @@ fn assign_host_framed(
     part: &[usize],
     rows: &mut [Vec<Value>],
     frame: &Frame,
+    fo: FrameOffsets,
     arg_vals: &[Option<Value>],
     order_vals: &[Vec<Value>],
     dirs: &[bool],
@@ -690,7 +704,7 @@ fn assign_host_framed(
     let mut state = new_host_state(host, host_aggs)?;
     let (mut cur_lo, mut cur_hi) = (0usize, 0usize);
     for off in 0..len {
-        let (lo, hi) = frame_bounds(off, len, frame, &group_of, &group_starts);
+        let (lo, hi) = frame_bounds(off, len, frame, fo, &group_of, &group_starts);
         if lo < cur_lo || hi < cur_hi {
             // Not monotone: start this row's frame from an empty state.
             state = new_host_state(host, host_aggs)?;
@@ -790,6 +804,47 @@ fn build_groups(
     (group_of, group_starts)
 }
 
+/// A frame's two boundary OFFSETS, resolved once per execution.
+///
+/// The offsets may be PARAMETERS (`ROWS BETWEEN ? PRECEDING AND CURRENT ROW`),
+/// and a frame boundary is consulted per ROW — so they are resolved before the
+/// row loop rather than inside it. One value for the whole execution is exactly
+/// the property that lets a parameter live here at all.
+#[derive(Clone, Copy)]
+struct FrameOffsets {
+    start: i64,
+    end: i64,
+}
+
+fn resolve_frame_offsets(frame: &Frame, params: &[Value]) -> Result<FrameOffsets> {
+    let one = |b: FrameBound| -> Result<i64> {
+        let arg = match b {
+            FrameBound::Preceding(v) | FrameBound::Following(v) => v,
+            _ => return Ok(0),
+        };
+        match arg {
+            WinInt::Lit(n) => Ok(n),
+            WinInt::Param(i) => match params.get(i as usize) {
+                Some(Value::Int(n)) if *n >= 0 => Ok(*n),
+                // sqlite raises at RUN time for a negative frame offset, not at
+                // parse — measured — so a parameter carrying one does too.
+                Some(Value::Int(n)) => Err(Error::TypeMismatch(format!(
+                    "frame offset must not be negative, got {n}"
+                ))),
+                Some(other) => Err(Error::TypeMismatch(format!(
+                    "frame offset must be an integer, got {}",
+                    other.type_name()
+                ))),
+                None => Err(Error::Internal(format!(
+                    "frame parameter ${} is not bound",
+                    i + 1
+                ))),
+            },
+        }
+    };
+    Ok(FrameOffsets { start: one(frame.start)?, end: one(frame.end)? })
+}
+
 /// Resolve a frame to the half-open range `[lo, hi)` of positions within the
 /// partition slice for the row at position `off`. `lo <= hi <= len` always; an
 /// empty frame is `lo == hi`. ROWS uses physical offsets; RANGE/GROUPS use the
@@ -800,6 +855,7 @@ fn frame_bounds(
     off: usize,
     len: usize,
     frame: &Frame,
+    fo: FrameOffsets,
     group_of: &[usize],
     group_starts: &[usize],
 ) -> (usize, usize) {
@@ -812,16 +868,16 @@ fn frame_bounds(
             // maps to an empty side and is rejected before exec anyway.
             let s = match frame.start {
                 FrameBound::UnboundedPreceding => 0,
-                FrameBound::Preceding(k) => off.saturating_sub(k as i64),
+                FrameBound::Preceding(_) => off.saturating_sub(fo.start),
                 FrameBound::CurrentRow => off,
-                FrameBound::Following(k) => off.saturating_add(k as i64),
+                FrameBound::Following(_) => off.saturating_add(fo.start),
                 FrameBound::UnboundedFollowing => n,
             };
             let e = match frame.end {
                 FrameBound::UnboundedPreceding => -1,
-                FrameBound::Preceding(k) => off.saturating_sub(k as i64),
+                FrameBound::Preceding(_) => off.saturating_sub(fo.end),
                 FrameBound::CurrentRow => off,
-                FrameBound::Following(k) => off.saturating_add(k as i64),
+                FrameBound::Following(_) => off.saturating_add(fo.end),
                 FrameBound::UnboundedFollowing => n - 1,
             };
             let lo = s.clamp(0, n);
@@ -856,16 +912,16 @@ fn frame_bounds(
             };
             let lo = match frame.start {
                 FrameBound::UnboundedPreceding => 0,
-                FrameBound::Preceding(k) => start_pos(g.saturating_sub(k as i64)),
+                FrameBound::Preceding(_) => start_pos(g.saturating_sub(fo.start)),
                 FrameBound::CurrentRow => start_pos(g),
-                FrameBound::Following(k) => start_pos(g.saturating_add(k as i64)),
+                FrameBound::Following(_) => start_pos(g.saturating_add(fo.start)),
                 FrameBound::UnboundedFollowing => n,
             };
             let hi = match frame.end {
                 FrameBound::UnboundedPreceding => 0,
-                FrameBound::Preceding(k) => end_excl(g.saturating_sub(k as i64)),
+                FrameBound::Preceding(_) => end_excl(g.saturating_sub(fo.end)),
                 FrameBound::CurrentRow => end_excl(g),
-                FrameBound::Following(k) => end_excl(g.saturating_add(k as i64)),
+                FrameBound::Following(_) => end_excl(g.saturating_add(fo.end)),
                 FrameBound::UnboundedFollowing => n,
             };
             let lo = lo.clamp(0, n);

@@ -546,13 +546,7 @@ fn encode_window(w: &WindowSpec, buf: &mut Vec<u8>) {
         | WindowFunc::Lead(o)
         | WindowFunc::NthValue(o)
         | WindowFunc::Ntile(o) => {
-            // Tagged (format 63): a literal carries its i64, a parameter its
-            // slot. Eight raw bytes could not tell the two apart.
-            buf.push(o.tag());
-            match o {
-                WinInt::Lit(n) => buf.extend_from_slice(&n.to_le_bytes()),
-                WinInt::Param(i) => buf.extend_from_slice(&i.to_le_bytes()),
-            }
+            encode_win_int(o, buf);
         }
         _ => {}
     }
@@ -592,18 +586,29 @@ fn encode_opt_frame(frame: Option<&Frame>, buf: &mut Vec<u8>) {
 }
 
 /// One boundary: a tag byte, plus a trailing u64 offset for `Preceding`/
+/// Tagged (format 63): a literal carries its i64, a parameter its slot. Eight
+/// raw bytes could not tell the two apart. Shared by a window function's
+/// integer argument and a frame boundary's offset — one shape, one encoder.
+fn encode_win_int(o: WinInt, buf: &mut Vec<u8>) {
+    buf.push(o.tag());
+    match o {
+        WinInt::Lit(n) => buf.extend_from_slice(&n.to_le_bytes()),
+        WinInt::Param(i) => buf.extend_from_slice(&i.to_le_bytes()),
+    }
+}
+
 /// `Following`. Mirror of `decode_frame_bound`.
 fn encode_frame_bound(b: FrameBound, buf: &mut Vec<u8>) {
     match b {
         FrameBound::UnboundedPreceding => buf.push(1),
         FrameBound::Preceding(n) => {
             buf.push(2);
-            buf.extend_from_slice(&n.to_le_bytes());
+            encode_win_int(n, buf);
         }
         FrameBound::CurrentRow => buf.push(3),
         FrameBound::Following(n) => {
             buf.push(4);
-            buf.extend_from_slice(&n.to_le_bytes());
+            encode_win_int(n, buf);
         }
         FrameBound::UnboundedFollowing => buf.push(5),
     }

@@ -60,7 +60,7 @@ struct WindowCollect {
     order_by: Vec<(ast::Expr, bool)>,
     /// Explicit frame (`None` = default). Part of the structural key so two
     /// windows differing only by frame do not share a result slot.
-    frame: Option<ast::FrameAst>,
+    frame: Option<Box<ast::FrameAst>>,
 }
 
 /// Lift every window function out of `e`, replacing each with a reference to its
@@ -86,7 +86,7 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
                 distinct: *distinct,
                 partition_by: spec.partition_by.clone(),
                 order_by: spec.order_by.clone(),
-                frame: spec.frame,
+                frame: spec.frame.clone(),
             };
             let slot = match specs.iter().position(|s| *s == candidate) {
                 Some(i) => i,

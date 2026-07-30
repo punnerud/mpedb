@@ -506,7 +506,12 @@ pub(crate) struct WindowSpecAst {
     /// `(key, descending)`, mirroring [`SelectStmt::order_by`].
     pub order_by: Vec<(Expr, bool)>,
     /// Explicit frame clause, or `None` for the default frame.
-    pub frame: Option<FrameAst>,
+    /// BOXED: a frame boundary's offset is a [`crate::plan::WinInt`] (it may be
+    /// a parameter), which made this struct large enough to dominate `Expr`
+    /// and, through it, `Stmt`. The frame is present on a minority of windows
+    /// and read once per execution, so the indirection costs nothing that
+    /// matters and keeps every OTHER expression small.
+    pub frame: Option<Box<FrameAst>>,
 }
 
 /// An explicit window frame `{ROWS | RANGE | GROUPS} BETWEEN <start> AND <end>`
@@ -532,8 +537,10 @@ pub(crate) enum FrameMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrameBound {
     UnboundedPreceding,
-    Preceding(u64),
+    /// The offset, which may be a PARAMETER: it is ONE value for the whole
+    /// execution, exactly like `lag`/`lead`'s (see [`crate::plan::WinInt`]).
+    Preceding(crate::plan::WinInt),
     CurrentRow,
-    Following(u64),
+    Following(crate::plan::WinInt),
     UnboundedFollowing,
 }
