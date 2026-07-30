@@ -497,3 +497,34 @@ fn insert_with_scalar_subquery_round_trips() {
     let p2 = CompiledPlan::decode(&blob, &s).expect("registry decode must accept what prepare emits");
     assert_eq!(p2.hash(), plan.hash());
 }
+
+/// A compound's `ORDER BY <name>` over an arm whose FROM is a MATERIALIZED
+/// derived table.
+///
+/// The arm's slots are the derived BODY's columns, which no schema table holds
+/// — reaching for one resolved nothing and reported the name as absent. An
+/// ordinal or an explicit outer alias worked, which is what made it look like a
+/// naming rule rather than a missing case.
+///
+/// SQLAlchemy writes exactly this for a UNION of two LIMITed selectables, and
+/// the body is materialized rather than spliced because `users.id AS id` is an
+/// ALIASED item, which `check_simple` refuses.
+#[test]
+fn a_compound_orders_by_name_over_a_derived_arm() {
+    let s = schema();
+    for sql in [
+        "SELECT a.id FROM (SELECT users.id AS id FROM users) AS a \
+         UNION SELECT b.id FROM (SELECT users.id AS id FROM users) AS b ORDER BY id",
+        // The ordinal and the explicit alias were already accepted; they stay.
+        "SELECT a.id FROM (SELECT users.id AS id FROM users) AS a \
+         UNION SELECT b.id FROM (SELECT users.id AS id FROM users) AS b ORDER BY 1",
+        "SELECT a.id AS id FROM (SELECT users.id AS id FROM users) AS a \
+         UNION SELECT b.id FROM (SELECT users.id AS id FROM users) AS b ORDER BY id",
+    ] {
+        prepare(sql, &s).unwrap_or_else(|e| panic!("`{sql}` should compile: {e}"));
+    }
+    // A name that is in NO arm still refuses.
+    let sql = "SELECT a.id FROM (SELECT users.id AS id FROM users) AS a \
+               UNION SELECT b.id FROM (SELECT users.id AS id FROM users) AS b ORDER BY nope";
+    assert!(prepare(sql, &s).is_err(), "an unknown ORDER BY name must refuse");
+}

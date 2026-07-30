@@ -1188,6 +1188,21 @@ fn plan_compound(
             }
         }
     };
+    // A DERIVED arm's slots are the BODY's columns, which no schema table
+    // holds — `DerivedPlan::columns` is where their names live. Reaching for
+    // `schema.table(sp.table)` there resolved nothing and reported the name as
+    // absent, so `… UNION … ORDER BY id` refused over an arm whose FROM is a
+    // materialized derived table (SQLAlchemy writes exactly that for a UNION of
+    // two LIMITed selectables). An ordinal or an explicit alias worked, which is
+    // what made it look like a naming rule rather than a missing case.
+    let arm_name = |arm: &CompoundArm, j: usize| -> Option<String> {
+        if let CompoundArm::Derived(dp) = arm {
+            if let Some(Projection::Column(i)) = dp.outer.projection.get(j) {
+                return dp.columns.get(*i as usize).cloned();
+            }
+        }
+        out_name(arm.output_select(), j)
+    };
     let mut order_by: OrderKeys = Vec::with_capacity(c.order_by.len());
     for (e, dir) in &c.order_by {
         // Peel an explicit `COLLATE` off the term; the inner expression resolves
@@ -1204,7 +1219,7 @@ fn plan_compound(
             ));
         };
         let pos = (0..arity).find(|&j| {
-            out_name(arms[0].output_select(), j).is_some_and(|nm| nm.eq_ignore_ascii_case(n))
+            arm_name(&arms[0], j).is_some_and(|nm| nm.eq_ignore_ascii_case(n))
         });
         match pos {
             Some(j) => order_by.push((j as u16, *dir, coll)),
