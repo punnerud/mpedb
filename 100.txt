@@ -136,7 +136,16 @@ clippy ×2 + CPython + Django G1+G2) og M3 verifisert:
         verdi-subtype gjennom evaluatoren, ikke en parser-fiks.
      4  `WITH c AS (…)`-kropp som er en INSERT/UPDATE/DELETE
      4  `(a, b) IN (SELECT x, y …)` — rad-verdi mot en SUBSPØRRING; lista er
-        lukket (S3g), subspørringen nektes fortsatt ved navn
+        lukket (S3g), subspørringen nektes fortsatt ved navn. SEMANTIKKEN ER
+        ALLEREDE MÅLT og trenger ingen ny analyse: 3VL-en følger av NØYAKTIG
+        samme desugar som lista — OR over radene av (a1=b1 AND a2=b2), og
+        `NOT IN` er negasjonen av hele disjunksjonen. Orakelet, med
+        t=(1,5,10),(2,NULL,10),(3,5,NULL),(4,9,9):
+            IN  (5,10),(9,9)      → 1,4        NOT IN → (tom)
+            IN  (5,10),(NULL,7)   → 1          NOT IN → 4
+            IN  (tomt sett)       → (tom)      NOT IN → 1,2,3,4
+        Arbeidet er derfor EKSEKVERER-side (materialiser subspørringens rader
+        og sammenlign tupler), ikke semantisk design.
      4  CTE-kropp med parametere (`WITH c AS (… WHERE x IN (?, ?))`) —
         kroppen fanges som kilde og re-parses, og nummereringen er ikke
         gjennomgående
