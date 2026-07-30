@@ -64,6 +64,70 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
   clippy, begge ws       rene
 
 
+1b. SESJON 30/7 — SQLALCHEMY-FLATEN, 965 → 1186
+-----------------------------------------------
+
+Sju commits på s0-baseline, hver med full port (workspace 208 + capi +
+clippy ×2 + CPython + Django G1+G2) og M3 verifisert FØR neste:
+
+  1bbfecd  S3:  temp views er tilkoblings-lokal TEKST, ikke objekter i
+                temp-MEDLEMMET                              965 → 990
+  49ff38c  S3b: en katalogpost hører til SITT skjema, og et view svarer
+                på table_info                               990 → 1101
+  3e776a5  S3c: temp view inlines ved RUTING; temp skygger bart pragma-navn
+                                                           1101 → 1115
+  ab7fdb0  S3d: FROM-løs avledet tabell flater ut; pragma-argument kan
+                inneholde `)`                              1115 → 1137
+  889fbd3  S3e: attachet indeks beholder NAVNET; en master-referanse kan
+                nevne to kataloger                         1137 → 1171
+  0c68c99  S3f: CREATE TABLE IF NOT EXISTS; en skrivings BETINGELSE flater
+                også ut                                    1171 → 1177
+  b95a5fd  S3g: `(a, b) IN ((x, y), …)` + VALUES-stavemåten 1177 → 1186
+
+  SQLAlchemy dialect-suite:  965 → 1186 av 1277 (+221)
+  CPython test_sqlite3:      459/466 hele veien (uendret, 7 igjen)
+  Django G1+G2:              831/831 OK, 0 shim-only, hele veien
+  korpus:                    78-fils skive (hver 8., 924 177 records, 10
+                             chunks) kjørt som KONTROLL for hver endring i
+                             flatnings- eller binder-passet: 0 gale svar,
+                             0 error-mismatch, hver chunk 100,0 %
+  M3:                        208 suiter OK på hver commit, identisk Linux
+
+  FIRE GALE SVAR (ikke bare mangler) ble funnet og lukket underveis:
+    * Ett navn i to skjemaer, ÉN post: `CREATE TABLE other.users` skrev over
+      mains post, så `main.users` rapporterte det ATTACHEDE skjemaets
+      navngitte CHECK. Gjaldt indeks-postene like fullt.
+    * `<schema>.sqlite_master` listet MAINS views og triggere. Den skjulte
+      samtidig at et kvalifisert `CREATE VIEW other.v` HELE TIDEN landet
+      riktig — lista var det som sa noe annet.
+    * En `IF NOT EXISTS`-no-op skrev sin egen tekst over den stående, så
+      `sqlite_master.sql` viste en definisjon som aldri ble anvendt.
+    * `CREATE TEMP VIEW` og `CREATE INDEX other.ix` var STILLE no-ops /
+      navnetap — verste klassen, fordi ingenting rapporterte det.
+
+  METODE-LÆRDOM, målt: da lesesiden ble flyttet til det attachede medlemmet
+  UTEN skrivesiden, kostet det 42 tester. Baseline-remålingen fanget det på
+  én kjøring. Flytt ALDRI én halvdel av et par — og re-mål baselinen når et
+  tall går feil vei, før du forklarer det.
+
+  KJENT OG IKKE LUKKET (bevisst, notert): `table_info` melder `notnull` 1
+  for en PK-kolonne som ikke er DEKLARERT NOT NULL, der sqlite melder 0.
+  mpedb håndhever NOT NULL på hver PK-kolonne, så 1 er sant om mpedb;
+  sqlite melder det som ble DEKLARERT, og dens ikke-INTEGER primærnøkler tar
+  faktisk NULL. Å lukke det betyr å lagre den deklarerte flagget separat,
+  og ingen målt test henger på det i dag.
+
+  RESTEN AV SQLALCHEMY (91), rangert:
+    24  ComponentReflectionTest — get_multi_* mot test_schema + server_defaults
+    11  CTETest — `WITH c(x, y) AS (…)` (eksplisitt kolonneliste)
+     9  json_quote(json_extract(…)) — sqlite avgjør JSON-subtypen ved
+        KJØRING; mpedb har ingen subtype-bit på verdier, så den nekter.
+        Å lukke det er en verdi-subtype gjennom evaluatoren, ikke en
+        parser-fiks.
+     5  FetchLimitOffsetTest — `LIMIT 1 + 2` (uttrykk, ikke literal/param)
+     -  resten er enkelttilfeller
+
+
 2. HVA S3 ER
 ------------
 
