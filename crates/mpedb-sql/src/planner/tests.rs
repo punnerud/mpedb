@@ -682,3 +682,24 @@ fn a_three_column_pk_pins_two_equalities_and_ranges_the_third() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A FROM-less derived table is a single constant row, and flattens the same
+/// way a FROM-less CTE does.
+///
+/// SQLAlchemy writes `… IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)` for an empty
+/// IN, which puts the derived table in a NESTED position. Refused by name
+/// there, it never reached the outermost-FROM path that materializes one — so
+/// the shape most consumers actually emit was the shape that could not run.
+#[test]
+fn a_fromless_derived_table_flattens_like_a_fromless_cte() {
+    let s = test_schema();
+    for sql in [
+        "SELECT CASE WHEN (NULL IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)) \
+         THEN 1 ELSE 0 END",
+        "SELECT id FROM users WHERE age IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)",
+        "SELECT * FROM (SELECT 1 AS x, 2 AS y) WHERE x = 1",
+        "SELECT q.x FROM (SELECT 5 AS x) AS q",
+    ] {
+        prepare(sql, &s).unwrap_or_else(|e| panic!("`{sql}` should compile: {e:?}"));
+    }
+}

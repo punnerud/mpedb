@@ -680,6 +680,28 @@ fn flatten_derived(
         _ => None,
     };
     let Some(dalias) = splice_alias else {
+        // A FROM-LESS body is a single constant row, which is the same shape a
+        // FROM-less CTE has — and it flattens the same way, by substituting the
+        // body's projection for references to its columns. `check_simple`
+        // refuses it because it has no FROM table to splice, so this is checked
+        // after it rather than inside it.
+        //
+        // SQLAlchemy writes `… IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)` for an
+        // empty IN, which puts the derived table in a NESTED position — refused
+        // by name there, so it never reached the outermost-FROM path that
+        // materializes one.
+        if let SubqueryBody::Select(b) = body.as_ref() {
+            if b.table.is_none() && b.from_derived.is_none() && b.joins.is_empty() {
+                let SubqueryBody::Select(b) = *body else {
+                    unreachable!("checked immediately above")
+                };
+                // With no alias nothing outside can name the body's columns by
+                // qualifier; a name that cannot be written keeps the rewrite
+                // from matching a real one.
+                let name = s.alias.clone().unwrap_or_default();
+                return flatten_cte_fromless(s, &name, b, &name);
+            }
+        }
         // Not flattenable: hand the body to the planner unchanged.
         s.from_derived = Some(body);
         return Ok(());

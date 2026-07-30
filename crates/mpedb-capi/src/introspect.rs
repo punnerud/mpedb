@@ -777,11 +777,57 @@ pub(crate) fn parse_pragma(sql: &str) -> (String, Option<String>) {
         .collect();
     let after = rest[name.len()..].trim_start();
     let arg = if let Some(a) = after.strip_prefix('(') {
-        a.split(')').next().map(|s| unquote(s.trim()))
+        pragma_arg_body(a).map(|s| unquote(s.trim()))
     } else {
         after.strip_prefix('=').map(|a| unquote(a.trim()))
     };
     (name, arg)
+}
+
+/// Everything up to the `)` that CLOSES a pragma's argument list.
+///
+/// Splitting on the first `)` is wrong whenever the argument is a quoted name
+/// that contains one — `PRAGMA table_info("(2)")` stopped at the name's own
+/// paren and matched nothing, so a table SQLAlchemy legitimately calls `(2)`
+/// reflected as having no columns at all. Quoting is tracked (all four of
+/// sqlite's forms, with the doubled-delimiter escape) and so is nesting.
+fn pragma_arg_body(a: &str) -> Option<&str> {
+    let b = a.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        // A doubled delimiter is one literal character, not the
+                        // end of the quoted name.
+                        if b.get(i + 1) == Some(&q) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'[' => {
+                // Bracket quoting has no escape; `]` ends it.
+                while i < b.len() && b[i] != b']' {
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' if depth == 0 => return Some(&a[..i]),
+            b')' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    // No closing paren: the whole tail is the argument, which is what splitting
+    // on `)` also produced.
+    Some(a)
 }
 
 /// Strip one layer of sqlite quoting from a PRAGMA argument and undo the
