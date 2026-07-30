@@ -184,6 +184,37 @@ pub fn prepare_maybe_explain_with_views(
     // and `FROM cte AS x` resolve) while stored views keep their strip-name
     // splice unchanged. A CTE shadows a same-named view for this one statement.
     // No planner/plan-bytes/executor change (#CTE).
+    // A CTE body is captured as SOURCE and re-parsed where it is spliced, so
+    // its parameters are numbered by that second parse. Two consequences, and
+    // they are decided HERE because this is the only place that sees every
+    // body:
+    //
+    //   * `$n` is ABSOLUTE, so the body's indices are already the caller's —
+    //     but the outer parse never saw them, and the statement's slot count
+    //     would be too small for the spliced AST. Raise it.
+    //   * `?` is POSITIONAL, and the re-parse numbers the body's from zero —
+    //     the same slots the outer statement's own `?` take. Refused by name;
+    //     answering it would bind the wrong values, not fail.
+    //
+    // (The C-API rewrites every `?` to `$K` over the whole statement before
+    // mpedb sees it, so a consumer going through the shim is on the first path.)
+    let mut n_params = n_params;
+    for (name, src) in &ctes {
+        if parser::has_question_param(src)? {
+            return Err(Error::Bind(format!(
+                "CTE `{name}` body uses `?` parameters, which are numbered by \
+                 position and would collide with the outer statement's; use \
+                 `$1`-style numbering, which is absolute"
+            )));
+        }
+        let (_, _, body_params, _) = parser::parse_statement_ctes(
+            src,
+            host_udfs.aggs(),
+            host_udfs.window_aggs(),
+            &host_udfs.ops,
+        )?;
+        n_params = n_params.max(body_params);
+    }
     if ctes.is_empty() {
         view::inline_views(&mut stmt, views)?;
     } else {

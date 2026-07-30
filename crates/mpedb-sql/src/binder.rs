@@ -1089,8 +1089,23 @@ impl<'a> Binder<'a> {
                 if !self.allow_params {
                     return Err(bind_err("parameters are not allowed in this expression"));
                 }
-                // Guaranteed in range: the parser sized n_params to max index.
-                Ok((BExpr::Param(*i), self.param_types[*i as usize]))
+                // The parser sizes `n_params` to the max index it SAW, so a
+                // statement it produced whole is always in range. An AST
+                // assembled from TWO parses is not the parser's to guarantee —
+                // a CTE body is captured as source and re-parsed, and its
+                // parameters are numbered by that second parse. Splicing one in
+                // with the count left at the outer statement's value indexed
+                // past the end and PANICKED. A refusal upstream is what keeps
+                // this true today; the check is here so that violating it is an
+                // error rather than a crash.
+                let ty = self.param_types.get(*i as usize).copied().ok_or_else(|| {
+                    bind_err(format!(
+                        "parameter ${} is out of range for a statement that declares {}",
+                        *i as usize + 1,
+                        self.param_types.len()
+                    ))
+                })?;
+                Ok((BExpr::Param(*i), ty))
             }
             ast::Expr::Col(name) => {
                 let (idx, ty) = self.scope.resolve(name)?;

@@ -294,9 +294,10 @@ fn flatten_cte(
     let ref_alias = s.alias.clone().unwrap_or_else(|| tname.to_string());
     let (cte_stmt, _explain, n_params) = parse_statement(cte_src)
         .map_err(|e| bind_err(format!("CTE `{tname}` body does not parse: {e}")))?;
-    if n_params != 0 {
-        return Err(bind_err(format!("CTE `{tname}` body must not use parameters")));
-    }
+    // Parameters in the body are legal and `compile` has already raised the
+    // statement's slot count to cover them (and refused the `?` spelling, whose
+    // numbering would collide). Nothing to do here but let them through.
+    let _ = n_params;
     let mut body = match cte_stmt {
         Stmt::Select(b) => b,
         // A COMPOUND body (`SELECT … UNION ALL SELECT …`, which is also what a

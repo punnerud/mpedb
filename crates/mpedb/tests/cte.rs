@@ -461,3 +461,47 @@ fn an_explicit_column_list_renames_positionally() {
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+/// A CTE body may carry PARAMETERS.
+///
+/// The body is captured as source and re-parsed where it is spliced, so its
+/// parameters are numbered by that second parse. `$n` is ABSOLUTE — the body's
+/// indices already are the caller's — but the outer parse never saw them, so
+/// the statement's slot count has to be raised to cover the spliced AST.
+/// Leaving it at the outer value indexed past the end and PANICKED, which is
+/// what the blanket refusal was really holding back.
+///
+/// `?` is positional and the re-parse numbers the body's from zero — the same
+/// slots the outer statement's own `?` take — so it is refused BY NAME.
+/// Answering it would bind the wrong values rather than fail.
+#[test]
+fn a_cte_body_may_carry_dollar_parameters() {
+    let (db, path) = open();
+    setup(&db);
+    let rows = |sql: &str, params: &[Value]| match db.query(sql, params).unwrap() {
+        ExecResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows from `{sql}`, got {other:?}"),
+    };
+    // The body's own parameter.
+    assert_eq!(
+        rows("WITH c AS (SELECT a FROM t WHERE a = $1) SELECT a FROM c", &[Value::Int(3)]),
+        vec![vec![Value::Int(3)]]
+    );
+    // Body and outer statement together, with the body holding the HIGHER
+    // index — the case where the outer count alone is too small.
+    assert_eq!(
+        rows(
+            "WITH c AS (SELECT a FROM t WHERE a > $2) SELECT a FROM c WHERE a < $1 ORDER BY a",
+            &[Value::Int(4), Value::Int(2)]
+        ),
+        vec![vec![Value::Int(3)]]
+    );
+    // `?` in a body is refused, and the message says why.
+    let e = db
+        .query("WITH c AS (SELECT a FROM t WHERE a = ?) SELECT a FROM c", &[Value::Int(1)])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("`?`"), "{e}");
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}

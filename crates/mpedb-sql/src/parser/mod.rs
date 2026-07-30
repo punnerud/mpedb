@@ -114,6 +114,14 @@ pub(crate) fn parse_statement(sql: &str) -> Result<(Stmt, bool, u16)> {
 /// flattened like a view at reference time (#CTE).
 pub(crate) type CteDefs = Vec<(String, String)>;
 
+/// Does `sql` contain a POSITIONAL `?` parameter?
+///
+/// Tokenized rather than searched: a `?` inside a string literal is not a
+/// parameter, and a text scan cannot tell the two apart.
+pub fn has_question_param(sql: &str) -> Result<bool> {
+    Ok(tokenize(sql)?.iter().any(|t| t.tok == Tok::Question))
+}
+
 /// `VALUES (a, b), (c, d)` → `SELECT a, b UNION ALL SELECT c, d`.
 ///
 /// `None` when the source does not start with `VALUES`, or when the row groups
