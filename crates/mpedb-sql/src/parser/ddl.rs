@@ -461,6 +461,46 @@ impl<'a> Parser<'a> {
             || (matches!(self.peek(), Some(Tok::Kw(Kw::Not))) && deferrable(self.peek_at(1)))
     }
 
+    /// One key part of a `CREATE INDEX` list: `(column name, expression source)`
+    /// with exactly one of the two meaningful.
+    ///
+    /// Told apart by LOOKAHEAD rather than by trying and backtracking: a part is
+    /// a plain column exactly when an identifier is followed by what ends a
+    /// part — `,`, `)`, or `ASC`/`DESC`. `LOWER(a)`, `a || b` and a bare literal
+    /// all take the expression branch.
+    fn index_key_part(&mut self) -> Result<(String, Option<String>)> {
+        let ends_part = matches!(
+            self.peek_at(1),
+            Some(Tok::Comma) | Some(Tok::RParen) | Some(Tok::Kw(Kw::Asc)) | Some(Tok::Kw(Kw::Desc))
+        );
+        // `QuotedIdent` as well as `Ident`: Django quotes every identifier, and
+        // reading `("app_label", "model")` as two EXPRESSIONS gave both parts
+        // the same sentinel ordinal — which then failed the duplicate-column
+        // check and took down every migration that has a composite index.
+        let named = matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_)));
+        if named && ends_part {
+            return Ok((self.ident("column name")?, None));
+        }
+        let start = self.here();
+        let before = self.max_params;
+        let _e = self.expr()?;
+        let end = self.here();
+        let src = self.src.get(start..end).unwrap_or("").trim().to_string();
+        if src.is_empty() {
+            return Err(self.err_here("empty expression in a CREATE INDEX key"));
+        }
+        // A parameter would make the KEY differ between two writers of the same
+        // index, which is not an index. Counted by the PARSER rather than
+        // matched in the text: a `?` inside a string literal is not a
+        // parameter, and a text scan cannot tell the two apart.
+        if self.max_params != before {
+            return Err(self.err_here(
+                "a parameter is not allowed in an index expression",
+            ));
+        }
+        Ok((String::new(), Some(src)))
+    }
+
     /// `DEFAULT <value>` in a column definition.
     ///
     /// A literal constant only, which is `ALTER TABLE ADD COLUMN`'s existing
@@ -1131,14 +1171,28 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::On, "ON")?;
         let table = self.ident("table name")?;
         self.expect(&Tok::LParen, "(")?;
-        let mut columns = vec![self.ident("column name")?];
-        // Per-column ASC/DESC is accepted and ignored (indexes are ascending).
-        let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
-        while self.eat(&Tok::Comma) {
-            columns.push(self.ident("column name")?);
+        // A key part is a bare column name or an EXPRESSION over the table's
+        // columns (`CREATE INDEX i ON t (LOWER(a), b)`). A bare name stays a
+        // plain column part — every index the format had before v13, and the
+        // only kind the planner will pick.
+        let mut columns: Vec<String> = Vec::new();
+        let mut exprs: Vec<Option<String>> = Vec::new();
+        loop {
+            let (col, ex) = self.index_key_part()?;
+            columns.push(col);
+            exprs.push(ex);
+            // Per-column ASC/DESC is accepted and ignored (indexes ascend).
             let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
         }
         self.expect(&Tok::RParen, ")")?;
+        // Nothing downstream should have to ask twice whether this is an
+        // expression index: the vector is empty unless a part actually is one.
+        if exprs.iter().all(Option::is_none) {
+            exprs.clear();
+        }
         // Optional partial-index predicate (P1). Capture the source text so the
         // schema can store it; the expression is validated by parsing it.
         let where_clause = if self.eat_kw(Kw::Where) {
@@ -1168,6 +1222,7 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(DdlStmt::CreateIndex {
+            exprs,
             name,
             table,
             columns,

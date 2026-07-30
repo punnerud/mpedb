@@ -237,6 +237,10 @@ pub enum DdlStmt {
         name: String,
         table: String,
         columns: Vec<String>,
+        /// Parallel to `columns` when non-empty: the SQL SOURCE of key part `i`
+        /// where that part is an EXPRESSION, and `None` where it is the plain
+        /// column `columns[i]` (whose entry here is then an empty string).
+        exprs: Vec<Option<String>>,
         unique: bool,
         if_not_exists: bool,
         /// Partial-index predicate source (`WHERE …`), or `None` for a
@@ -457,6 +461,7 @@ mod tests {
         assert_eq!(
             parse_ddl("CREATE INDEX ix ON t (a)").unwrap().unwrap(),
             DdlStmt::CreateIndex {
+                exprs: Vec::new(),
                 name: "ix".into(),
                 table: "t".into(),
                 columns: vec!["a".into()],
@@ -471,6 +476,7 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             DdlStmt::CreateIndex {
+                exprs: Vec::new(),
                 name: "ix".into(),
                 table: "t".into(),
                 columns: vec!["a".into(), "b".into(), "c".into()],

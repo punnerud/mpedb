@@ -268,7 +268,32 @@ pub struct IndexDef {
     ///
     /// On the wire since canonical-bytes **v11**.
     pub name: Option<String>,
+    /// EXPRESSION key parts (`CREATE INDEX i ON t (LOWER(a), b)`), on the wire
+    /// since canonical-bytes **v13**. Empty for every plain-column index, which
+    /// is every index that existed before v13; otherwise the same length as
+    /// `columns`, entry `i` holding the SQL SOURCE of key part `i` or `None`
+    /// where that part is the plain column `columns[i]`.
+    ///
+    /// An expression part sets `columns[i]` to [`INDEX_EXPR_COL`]. It has to
+    /// mean something, and no real ordinal can: an expression may read two
+    /// columns, or none. So `columns` stops describing that part rather than
+    /// lying about it — which also matches how sqlite reports one, as
+    /// `PRAGMA index_info` column id `-2` (measured, 3.45.1).
+    ///
+    /// Membership follows the ordinary rule on the EVALUATED part: a NULL means
+    /// no entry. sqlite instead stores the entry and lets NULLs not collide —
+    /// the same observable answer for a UNIQUE index, and the difference is
+    /// unobservable here because an index with an expression part is never
+    /// chosen for ACCESS. Matching a query's expression against a stored one is
+    /// a separate problem; the consumer that needs these (Django's schema
+    /// editor) creates them, introspects them by name and drops them.
+    pub exprs: Vec<Option<String>>,
 }
+
+/// `IndexDef::columns[i]` for a key part that is an EXPRESSION, not a column.
+/// A table can never have this many columns (`MAX_COLUMNS` is far below), so
+/// the sentinel cannot collide with a real ordinal.
+pub const INDEX_EXPR_COL: u16 = u16::MAX;
 
 /// Distinguishes an ordinary table from a full-text-search virtual table
 /// (`CREATE VIRTUAL TABLE … USING fts5(…)`, design/DESIGN-FTS.md §1). An FTS
@@ -812,6 +837,7 @@ fn normalize_and_derive(t: &mut TableDef) {
             unique: c.unique,
             predicate: None,
             // Derived from a column flag: there never was a name to keep.
+            exprs: Vec::new(),
             name: None,
         })
         .collect();
@@ -898,6 +924,12 @@ impl Schema {
             .filter(|t| t.id == table_id && !t.dead)
             .ok_or_else(|| Error::Schema(format!("no live table with id {table_id}")))?;
         for &c in &index.columns {
+            // An EXPRESSION key part carries the sentinel instead of an ordinal
+            // (v13): it reads whatever its source reads, which may be two
+            // columns or none, so there is nothing here to range-check.
+            if c == INDEX_EXPR_COL {
+                continue;
+            }
             if c as usize >= slot.columns.len() {
                 return Err(Error::Schema(format!(
                     "CREATE INDEX on `{}`: column ordinal {c} out of range",
@@ -1381,7 +1413,17 @@ impl Schema {
                         t.name
                     )));
                 }
-                let mut cols = ix.columns.clone();
+                // Duplicate COLUMNS are a malformed index. Two EXPRESSION
+                // parts are not duplicates just because they share the sentinel
+                // — `(LOWER(a), UPPER(a))` is two different keys — so they are
+                // compared by SOURCE instead, which is what actually identifies
+                // them.
+                let mut cols: Vec<u16> = ix
+                    .columns
+                    .iter()
+                    .copied()
+                    .filter(|&c| c != INDEX_EXPR_COL)
+                    .collect();
                 cols.sort_unstable();
                 if cols.windows(2).any(|w| w[0] == w[1]) {
                     return Err(Error::Schema(format!(
@@ -1389,7 +1431,19 @@ impl Schema {
                         t.name
                     )));
                 }
+                let mut srcs: Vec<&String> = ix.exprs.iter().flatten().collect();
+                srcs.sort_unstable();
+                if srcs.windows(2).any(|w| w[0] == w[1]) {
+                    return Err(Error::Schema(format!(
+                        "duplicate expression in an index on `{}`",
+                        t.name
+                    )));
+                }
                 for &ci in &ix.columns {
+                    // The expression-part sentinel names no column (v13).
+                    if ci == INDEX_EXPR_COL {
+                        continue;
+                    }
                     t.columns.get(ci as usize).ok_or_else(|| {
                         Error::Schema(format!(
                             "index column ordinal {ci} out of range in `{}`",
@@ -1537,7 +1591,7 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(12u8); // schema encoding version (v12: TableDef.foreign_keys)
+        buf.push(13u8); // schema encoding version (v13: IndexDef.exprs)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -1635,6 +1689,18 @@ impl Schema {
                         write_str(&mut buf, n);
                     }
                 }
+                // Expression key parts (v13). Empty for a plain-column index,
+                // so the common case is one zero u16 per index.
+                buf.extend_from_slice(&(ix.exprs.len() as u16).to_le_bytes());
+                for e in &ix.exprs {
+                    match e {
+                        None => buf.push(0),
+                        Some(src) => {
+                            buf.push(1);
+                            write_str(&mut buf, src);
+                        }
+                    }
+                }
             }
             // FOREIGN KEYs (v12). Almost every table has none, so the common
             // case is a single zero u16 — the same "one length word" price the
@@ -1678,9 +1744,10 @@ impl Schema {
         let mut pos = 0usize;
         let version = *buf.get(pos).ok_or_else(err)?;
         pos += 1;
-        // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name.
+        // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name;
+        // v12 = TableDef.foreign_keys; v13 = IndexDef.exprs.
         // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if !(9..=12).contains(&version) {
+        if !(9..=13).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
@@ -1689,6 +1756,7 @@ impl Schema {
         let has_index_predicate = version >= 10;
         let has_index_name = version >= 11;
         let has_foreign_keys = version >= 12;
+        let has_index_exprs = version >= 13;
         let ntables = read_u32(buf, &mut pos)? as usize;
         if ntables > MAX_TABLES {
             return Err(Error::Corrupt("table count out of range".into()));
@@ -1875,10 +1943,39 @@ impl Schema {
                 } else {
                     None
                 };
+                let exprs = if has_index_exprs {
+                    let n = read_u16(buf, &mut pos)? as usize;
+                    // Parallel to `columns` whenever present: a mismatched
+                    // length is a corrupt blob, not a key builder left to read
+                    // past the end of one of the two.
+                    if n != 0 && n != cols.len() {
+                        return Err(Error::Corrupt(
+                            "index expression list length differs from the column list".into(),
+                        ));
+                    }
+                    let mut v = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        v.push(match *buf.get(pos).ok_or_else(err)? {
+                            0 => {
+                                pos += 1;
+                                None
+                            }
+                            1 => {
+                                pos += 1;
+                                Some(read_str(buf, &mut pos)?)
+                            }
+                            _ => return Err(Error::Corrupt("bad index expression tag".into())),
+                        });
+                    }
+                    v
+                } else {
+                    Vec::new()
+                };
                 indexes.push(IndexDef {
                     columns: cols,
                     unique,
                     predicate,
+                    exprs,
                     name,
                 });
             }
@@ -2211,7 +2308,7 @@ mod tests {
                     unique: false, indexed: true, default: None, check: None, collation: Collation::Binary },
             ],
             primary_key: vec![0],
-            indexes: vec![IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None }],
+            indexes: vec![IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new() }],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
             foreign_keys: Vec::new(),
         };
@@ -2224,9 +2321,9 @@ mod tests {
         assert_eq!(
             t.indexes,
             vec![
-                IndexDef { columns: vec![1], unique: true, predicate: None, name: None },
-                IndexDef { columns: vec![2], unique: false, predicate: None, name: None },
-                IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None },
+                IndexDef { columns: vec![1], unique: true, predicate: None, name: None, exprs: Vec::new() },
+                IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new() },
+                IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new() },
             ]
         );
         assert!(!t.columns[0].unique && !t.columns[0].indexed);
@@ -2254,7 +2351,7 @@ mod tests {
                 col("w", ColumnType::Int64),
             ],
             primary_key: vec![0],
-            indexes: vec![IndexDef { columns: vec![2], unique: false, predicate: None, name: None }],
+            indexes: vec![IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new() }],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
             foreign_keys: Vec::new(),
         }])
@@ -2265,19 +2362,19 @@ mod tests {
         // sqlite's, and the planner — not the schema — is what keeps it from
         // ever being probed.
         let mut ok = base.clone();
-        ok.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false, predicate: None, name: None }];
+        ok.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false, predicate: None, name: None, exprs: Vec::new() }];
         Schema::from_canonical_bytes(&ok.canonical_bytes()).unwrap();
 
         // Duplicate index shapes refuse.
         let mut evil = base.clone();
         evil.tables[0]
             .indexes
-            .push(IndexDef { columns: vec![2], unique: false, predicate: None, name: None });
+            .push(IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new() });
         assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
 
         // An index equal to the whole single-column PK duplicates index 0.
         let mut evil = base.clone();
-        evil.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true, predicate: None, name: None }];
+        evil.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true, predicate: None, name: None, exprs: Vec::new() }];
         assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
 
         // v1 bytes (version byte 1) refuse by name — no migration exists.
@@ -2395,7 +2492,7 @@ mod tests {
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
         // The version byte is 9.
-        assert_eq!(s.canonical_bytes()[0], 12);
+        assert_eq!(s.canonical_bytes()[0], 13);
         // A v8 file refuses cleanly (no misread of the new generated bytes).
         let mut v8 = s.canonical_bytes();
         v8[0] = 8;
@@ -2526,7 +2623,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 12);
+        assert_eq!(s.canonical_bytes()[0], 13);
 
         // Truncation at every offset is Corrupt, never a panic.
         let bytes = s.canonical_bytes();
@@ -2585,7 +2682,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 12);
+        assert_eq!(s.canonical_bytes()[0], 13);
         // The text is part of the schema identity: `f float` and `f REAL` are
         // the same storage and DIFFERENT schemas, because a consumer keying
         // converters off the decltype sees two different columns.
@@ -2645,7 +2742,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 12);
+        assert_eq!(s.canonical_bytes()[0], 13);
 
         // The collation changes the hash: a BINARY `name` is a different schema.
         let mut plain = s.clone();
@@ -2802,7 +2899,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "the compiled program survives byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 12);
+        assert_eq!(s.canonical_bytes()[0], 13);
 
         // It computes, in declaration order, through the decoded schema.
         let mut row = vec![Value::Int(21), Value::Null];

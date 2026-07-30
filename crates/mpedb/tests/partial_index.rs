@@ -527,3 +527,85 @@ fn the_build_admits_only_members() {
         "SELECT count(*) FROM t",
     );
 }
+
+// ------------------------------------------------ expression key parts (v13)
+
+/// `CREATE INDEX … ON t (LOWER(a))`. The key is a COMPUTED value, so the only
+/// way to observe it is a UNIQUE collision — which is what these compare.
+///
+/// MEASURED against sqlite 3.45.1 first: an expression that evaluates to NULL is
+/// indexed and two such rows do NOT collide, while `'Ab'` and `'AB'` DO. mpedb
+/// reaches the same answers by its own membership rule (no entry for a NULL key
+/// part), and the difference is unobservable because an expression index is
+/// never chosen for access.
+#[test]
+fn an_expression_key_collides_on_the_computed_value_not_the_column() {
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)",
+            "CREATE UNIQUE INDEX ux ON t (LOWER(a))",
+            "INSERT INTO t (id, a) VALUES (1, 'Ab')",
+            "INSERT INTO t (id, a) VALUES (2, NULL)", // NULL key part…
+            "INSERT INTO t (id, a) VALUES (3, NULL)", // …twice is legal
+            "INSERT INTO t (id, a) VALUES (4, 'AB')", // collides with row 1
+        ],
+        "SELECT id, a FROM t ORDER BY id",
+    );
+}
+
+/// The BUILD evaluates too — an index created over rows that already collide
+/// through the expression is refused, exactly as one over a colliding column is.
+#[test]
+fn the_expression_index_build_sees_the_computed_key() {
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)",
+            "INSERT INTO t (id, a) VALUES (1, 'Ab')",
+            "INSERT INTO t (id, a) VALUES (2, 'AB')",
+            "CREATE UNIQUE INDEX ux ON t (LOWER(a))",
+        ],
+        "SELECT id, a FROM t ORDER BY id",
+    );
+}
+
+/// Both UPDATE directions. The cheap "did an indexed column change?" test that
+/// guards whole-table maintenance cannot answer for a computed key, so an
+/// expression index takes the same exact-key path a partial one does.
+#[test]
+fn updating_into_and_out_of_an_expression_key() {
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)",
+            "CREATE UNIQUE INDEX ux ON t (LOWER(a))",
+            "INSERT INTO t (id, a) VALUES (1, 'Ab')",
+            "INSERT INTO t (id, a) VALUES (2, 'zz')",
+            "UPDATE t SET a = 'AB' WHERE id = 2", // collides through LOWER
+        ],
+        "SELECT id, a FROM t ORDER BY id",
+    );
+    // …and leaving the key frees it.
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)",
+            "CREATE UNIQUE INDEX ux ON t (LOWER(a))",
+            "INSERT INTO t (id, a) VALUES (1, 'Ab')",
+            "UPDATE t SET a = 'qq' WHERE id = 1",
+            "INSERT INTO t (id, a) VALUES (2, 'AB')",
+        ],
+        "SELECT id, a FROM t ORDER BY id",
+    );
+}
+
+/// A key expression that does not compile against the table is refused at the
+/// DDL, not at the first INSERT.
+#[test]
+fn an_unbindable_key_expression_is_refused_at_create() {
+    let (db, path) = open();
+    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)", &[]).unwrap();
+    let e = db
+        .query("CREATE INDEX bad ON t (LOWER(nosuch))", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("does not compile"), "{e}");
+    let _ = std::fs::remove_file(&path);
+}

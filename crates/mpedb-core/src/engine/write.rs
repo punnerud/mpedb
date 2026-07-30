@@ -319,10 +319,53 @@ impl<'e> WriteTxn<'e> {
         )? {
             return Ok(None);
         }
+        // A plain-column index reads the row directly. An EXPRESSION index
+        // (v13) first evaluates each expression part into a synthetic row, so
+        // exactly one key builder serves both — and the any-NULL membership rule
+        // then applies to the value the key would actually carry.
+        if ix.exprs.is_empty() {
+            return Ok(index_row_key(
+                self.bundle.sec_unique[tid][i],
+                &self.bundle.sec_indexes[tid][i],
+                row,
+                pk_key,
+                &self.bundle.sec_specs[tid][i],
+            ));
+        }
+        let progs = self
+            .bundle
+            .index_exprs
+            .get(tid)
+            .and_then(|v| v.get(i))
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "index on `{}` has expression key parts but no compiled programs                      (this handle has no SQL layer installed). Refusing rather than                      writing a key built without them.",
+                    table.name
+                ))
+            })?;
+        let mut parts = Vec::with_capacity(ix.exprs.len());
+        for (k, e) in ix.exprs.iter().enumerate() {
+            match e {
+                None => parts.push(row[self.bundle.sec_indexes[tid][i][k] as usize].clone()),
+                Some(_) => {
+                    let prog = progs.get(k).and_then(Option::as_ref).ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "index on `{}`: key part {k} has no compiled expression",
+                            table.name
+                        ))
+                    })?;
+                    let mut stack = Vec::new();
+                    parts.push(prog.eval_with_stack(&mut stack, row, &[])?);
+                }
+            }
+        }
+        // The synthetic row is the evaluated parts in key order, so the ordinals
+        // handed to the builder are simply 0..n.
+        let ords: Vec<u16> = (0..parts.len() as u16).collect();
         Ok(index_row_key(
             self.bundle.sec_unique[tid][i],
-            &self.bundle.sec_indexes[tid][i],
-            row,
+            &ords,
+            &parts,
             pk_key,
             &self.bundle.sec_specs[tid][i],
         ))
@@ -1340,12 +1383,17 @@ impl<'e> WriteTxn<'e> {
             // the pre-check below would find the row's OWN entry and raise a
             // phantom self-conflict.
             let cols = &self.bundle.sec_indexes[tid][i];
+            // An EXPRESSION part has no column to compare, so this cheap test
+            // cannot answer for it — `exact` below routes such an index to the
+            // key comparison instead, and the `get` keeps this loop total in
+            // the meantime.
             let changed = cols.iter().enumerate().any(|(j, &c)| {
-                !index_value_equal(
-                    &old[c as usize],
-                    &new_values[c as usize],
-                    self.bundle.sec_specs[tid][i][j],
-                )
+                match (old.get(c as usize), new_values.get(c as usize)) {
+                    (Some(o), Some(n)) => {
+                        !index_value_equal(o, n, self.bundle.sec_specs[tid][i][j])
+                    }
+                    _ => true,
+                }
             });
             // …but "changed" is only the WHOLE question for a whole-table
             // index. A partial one can be JOINED by a row whose indexed columns
@@ -1353,8 +1401,12 @@ impl<'e> WriteTxn<'e> {
             // sqlite: `UPDATE t SET b=9` makes an existing `a` collide under
             // `UNIQUE(a) WHERE b>5`). So the cheap compare may only skip where
             // it is complete.
-            let partial = self.bundle.schema.tables[tid].indexes[i].predicate.is_some();
-            if !partial && !changed {
+            // Same for an EXPRESSION index: its key parts are computed, so a
+            // comparison of the indexed COLUMNS does not decide whether the key
+            // moved. Both classes take the exact key comparison below.
+            let ixd = &self.bundle.schema.tables[tid].indexes[i];
+            let exact = ixd.predicate.is_some() || !ixd.exprs.is_empty();
+            if !exact && !changed {
                 continue;
             }
             // Any-NULL in the NEW values ⇒ no entry ⇒ nothing to conflict, and
@@ -1366,7 +1418,7 @@ impl<'e> WriteTxn<'e> {
             // this key (it was a member and stayed one); `changed` is what
             // rules that out for a whole-table index, and this is the same
             // question asked exactly.
-            if partial && self.index_entry_key(tid, i, &old, &[])?.as_deref() == Some(ikey.as_slice())
+            if exact && self.index_entry_key(tid, i, &old, &[])?.as_deref() == Some(ikey.as_slice())
             {
                 continue;
             }
@@ -1413,18 +1465,24 @@ impl<'e> WriteTxn<'e> {
 
         for i in 0..n_sec {
             let cols = &self.bundle.sec_indexes[tid][i];
+            // An EXPRESSION part has no column to compare, so this cheap test
+            // cannot answer for it — `exact` below routes such an index to the
+            // key comparison instead, and the `get` keeps this loop total in
+            // the meantime.
             let changed = cols.iter().enumerate().any(|(j, &c)| {
-                !index_value_equal(
-                    &old[c as usize],
-                    &new_values[c as usize],
-                    self.bundle.sec_specs[tid][i][j],
-                )
+                match (old.get(c as usize), new_values.get(c as usize)) {
+                    (Some(o), Some(n)) => {
+                        !index_value_equal(o, n, self.bundle.sec_specs[tid][i][j])
+                    }
+                    _ => true,
+                }
             });
             // Same asymmetry as the pre-check: a partial index also moves when
             // its predicate's ANSWER moves, and the predicate may read columns
             // the index does not cover.
-            let partial = self.bundle.schema.tables[tid].indexes[i].predicate.is_some();
-            if !partial && !changed {
+            let ixd = &self.bundle.schema.tables[tid].indexes[i];
+            let exact = ixd.predicate.is_some() || !ixd.exprs.is_empty();
+            if !exact && !changed {
                 continue;
             }
             let okey = self.index_entry_key(tid, i, &old, &key)?;
@@ -2106,6 +2164,10 @@ impl<'e> WriteTxn<'e> {
         &mut self,
         table_id: u32,
         columns: Vec<u16>,
+        // Parallel to `columns` when non-empty; see `IndexDef::exprs`. A part
+        // whose entry is `Some` takes its key value from the EXPRESSION, and
+        // `columns[i]` is the `INDEX_EXPR_COL` sentinel.
+        exprs: Vec<Option<String>>,
         unique: bool,
         predicate: Option<String>,
         // `name`: what the user wrote. Carried so `DROP INDEX`/`REINDEX` can
@@ -2127,12 +2189,34 @@ impl<'e> WriteTxn<'e> {
                 unique,
                 predicate,
                 name,
+                exprs: exprs.clone(),
             },
         )?;
-        // The predicate program for the index being built, from the SAME
-        // compiler the bundle rebuild will use — so the rows this build admits
-        // and the rows later writes admit cannot disagree. A predicate that has
-        // no program refuses below, in `index_predicate_admits`.
+        // The key-part programs for the index being built, from the SAME
+        // compiler the bundle rebuild will use — so the rows this build keys
+        // and the keys later writes compute cannot disagree.
+        let build_exprs: Vec<Option<mpedb_types::ExprProgram>> = if exprs.is_empty() {
+            Vec::new()
+        } else {
+            let progs = self.eng.compile_programs(&new_schema, &bundle.checks);
+            let pos = bundle.schema.table(table_id).map_or(0, |t| t.indexes.len());
+            progs
+                .index_exprs
+                .get(table_id as usize)
+                .and_then(|v| v.get(pos))
+                .cloned()
+                .unwrap_or_default()
+        };
+        if !exprs.is_empty() && build_exprs.len() != exprs.len() {
+            return Err(Error::Unsupported(
+                "CREATE INDEX with expression key parts needs the SQL layer's \
+                 compiler; this handle has none, and building the index without \
+                 evaluating them would store the wrong keys"
+                    .into(),
+            ));
+        }
+        // The predicate program, likewise from the same compiler; a predicate
+        // with no program refuses below, in `index_predicate_admits`.
         let build_pred: Option<Option<mpedb_types::ExprProgram>> = pred_src.as_ref().map(|_| {
             self.eng
                 .compile_programs(&new_schema, &bundle.checks)
@@ -2150,11 +2234,14 @@ impl<'e> WriteTxn<'e> {
             // index 0 is the PK tree; the new secondary is appended after the
             // existing ones. The new index's per-column collation comes straight
             // from the columns it covers (it is not in the bundle's caches yet).
+            // An EXPRESSION part (v13) has no column to take a type or
+            // collation from; its value is computed, and the plain spec is what
+            // the synthetic-row key builder uses for it too.
             let coll: Vec<keycode::KeySpec> = columns
                 .iter()
-                .map(|&c| {
-                    let cd = &table.columns[c as usize];
-                    keycode::KeySpec::for_column(cd.ty, cd.collation)
+                .map(|&c| match table.columns.get(c as usize) {
+                    None => keycode::KeySpec::default(),
+                    Some(cd) => keycode::KeySpec::for_column(cd.ty, cd.collation),
                 })
                 .collect();
             (table.name.clone(), (table.indexes.len() + 1) as u32, coll)
@@ -2176,7 +2263,25 @@ impl<'e> WriteTxn<'e> {
                 )? {
                     continue;
                 }
-                if let Some(ikey) = index_row_key(unique, &columns, &values, &k, &idx_coll) {
+                // Expression parts are evaluated into a synthetic row, exactly
+                // as `index_entry_key` does for every later write — the build
+                // and the maintenance have to agree on what the key IS.
+                let (ords, parts) = if build_exprs.is_empty() {
+                    (columns.clone(), values)
+                } else {
+                    let mut parts = Vec::with_capacity(build_exprs.len());
+                    for (j, e) in build_exprs.iter().enumerate() {
+                        match e {
+                            None => parts.push(values[columns[j] as usize].clone()),
+                            Some(prog) => {
+                                let mut stack = Vec::new();
+                                parts.push(prog.eval_with_stack(&mut stack, &values, &[])?);
+                            }
+                        }
+                    }
+                    ((0..parts.len() as u16).collect(), parts)
+                };
+                if let Some(ikey) = index_row_key(unique, &ords, &parts, &k, &idx_coll) {
                     entries.push((ikey, k));
                 }
             }
@@ -2836,11 +2941,23 @@ pub struct TxnSavepointFull {
 }
 
 fn table_column_name(eng: &Engine, table_id: u32, col: u16) -> String {
+    // Total by construction: an EXPRESSION key part (v13) carries the
+    // `INDEX_EXPR_COL` sentinel and names no column, and a violation message is
+    // not the place to discover that by panicking. sqlite names the INDEX for
+    // such a constraint ("UNIQUE constraint failed: index 'ux'", measured);
+    // this says what part it was without threading the index name through every
+    // caller.
     eng.bundle()
         .schema
         .table(table_id)
-        .map(|t| t.columns[col as usize].name.clone())
-        .unwrap_or_else(|| format!("col{col}"))
+        .and_then(|t| t.columns.get(col as usize).map(|c| c.name.clone()))
+        .unwrap_or_else(|| {
+            if col == mpedb_types::INDEX_EXPR_COL {
+                "<expression>".to_string()
+            } else {
+                format!("col{col}")
+            }
+        })
 }
 
 /// Constraint name for a UNIQUE-violation error: the indexed column, or the

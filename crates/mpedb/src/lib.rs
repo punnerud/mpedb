@@ -817,6 +817,7 @@ pub struct Database {
 fn compile_schema_checks(schema: &mpedb_types::Schema) -> Result<SchemaPrograms> {
     let mut checks: CheckPrograms = Vec::with_capacity(schema.tables.len());
     let mut index_predicates = Vec::with_capacity(schema.tables.len());
+    let mut index_exprs = Vec::with_capacity(schema.tables.len());
     for table in &schema.tables {
         let mut per_col = Vec::with_capacity(table.columns.len());
         for col in &table.columns {
@@ -847,8 +848,28 @@ fn compile_schema_checks(schema: &mpedb_types::Schema) -> Result<SchemaPrograms>
             });
         }
         index_predicates.push(per_index);
+        // Key-part expressions ride the same pass, for the same reason: one
+        // compiler call, one schema, so a bundle can never hold a key built
+        // from one and a predicate from another.
+        let mut per_index_exprs = Vec::with_capacity(table.indexes.len());
+        for ix in &table.indexes {
+            let mut parts = Vec::with_capacity(ix.exprs.len());
+            for src in &ix.exprs {
+                parts.push(match src {
+                    None => None,
+                    Some(src) => Some(mpedb_sql::compile_value_expr(src, table).map_err(|e| {
+                        Error::Schema(format!(
+                            "index key expression on `{}` failed to compile: {e}",
+                            table.name
+                        ))
+                    })?),
+                });
+            }
+            per_index_exprs.push(parts);
+        }
+        index_exprs.push(per_index_exprs);
     }
-    Ok(SchemaPrograms { checks, index_predicates })
+    Ok(SchemaPrograms { checks, index_predicates, index_exprs })
 }
 
 impl Database {
@@ -3989,6 +4010,7 @@ impl WriteSession<'_> {
                 name,
                 table,
                 columns,
+                exprs,
                 unique,
                 where_clause,
                 ..
@@ -3998,15 +4020,37 @@ impl WriteSession<'_> {
                     .table_id(&table)
                     .ok_or_else(|| Error::Bind(format!("CREATE INDEX: no such table `{table}`")))?;
                 let t = schema.schema.table(id).expect("table_id resolved");
-                let cols = crate::ddl_apply::resolve_index_columns(t, &table, &columns)?;
+                // Same resolution as the autocommit applier: an expression part
+                // takes the sentinel, and its source is compiled against the
+                // table here so an unevaluable key is refused at the DDL.
+                let mut cols = Vec::with_capacity(columns.len());
+                for (i, cname) in columns.iter().enumerate() {
+                    match exprs.get(i).and_then(Option::as_ref) {
+                        None => cols.push(crate::ddl_apply::resolve_index_columns(
+                            t,
+                            &table,
+                            std::slice::from_ref(cname),
+                        )?[0]),
+                        Some(src) => {
+                            mpedb_sql::compile_value_expr(src, t).map_err(|e| {
+                                Error::Schema(format!(
+                                    "CREATE INDEX on `{table}`: key expression `{src}` does \
+                                     not compile against the table: {e}"
+                                ))
+                            })?;
+                            cols.push(mpedb_types::INDEX_EXPR_COL);
+                        }
+                    }
+                }
                 // Idempotent by shape: an identical index already present is a no-op.
                 if t.indexes.iter().any(|ix| {
                     ix.columns == cols && ix.unique == unique && ix.predicate == where_clause
+                        && ix.exprs == exprs
                 }) {
                     return Ok(ExecResult::Affected(0));
                 }
                 self.txn
-                    .create_index(id, cols, unique, where_clause, Some(name))?;
+                    .create_index(id, cols, exprs, unique, where_clause, Some(name))?;
             }
             // VIEW / TRIGGER ride this session's txn (sys-keyspace + schema_gen
             // bump) so CPython's implicit transaction + iterdump can CREATE them

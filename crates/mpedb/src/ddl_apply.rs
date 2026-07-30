@@ -458,6 +458,7 @@ pub(crate) fn table_def_from_spec(
                 // An inline/table UNIQUE constraint. sqlite gives these an
                 // auto name (`sqlite_autoindex_…`) that DROP INDEX refuses to
                 // touch, so carrying none is the same reachable surface.
+                exprs: Vec::new(),
                 name: None,
             })
         })
@@ -957,6 +958,8 @@ impl Database {
         &self,
         table: &str,
         columns: &[String],
+        // Parallel to `columns` when non-empty; see `IndexDef::exprs`.
+        exprs: &[Option<String>],
         unique: bool,
         predicate: Option<String>,
         name: Option<String>,
@@ -968,15 +971,36 @@ impl Database {
             .table_id(table)
             .ok_or_else(|| Error::Bind(format!("CREATE INDEX: no such table `{table}`")))?;
         let t = bundle.schema.table(id).expect("table_id resolved");
-        let cols = resolve_index_columns(t, table, columns)?;
+        // An expression part has no column to resolve; it takes the sentinel,
+        // and the source is compiled against the table before anything is
+        // written, so a key that cannot be evaluated is refused at the DDL
+        // rather than at the first INSERT.
+        let mut cols = Vec::with_capacity(columns.len());
+        for (i, name) in columns.iter().enumerate() {
+            match exprs.get(i).and_then(Option::as_ref) {
+                None => cols.push(resolve_index_columns(t, table, std::slice::from_ref(name))?[0]),
+                Some(src) => {
+                    mpedb_sql::compile_value_expr(src, t).map_err(|e| {
+                        Error::Schema(format!(
+                            "CREATE INDEX on `{table}`: key expression `{src}` does not \
+                             compile against the table: {e}"
+                        ))
+                    })?;
+                    cols.push(mpedb_types::INDEX_EXPR_COL);
+                }
+            }
+        }
         // Idempotent by shape: an identical index already present is a no-op.
+        // The expressions are part of the shape — two indexes over the same
+        // column through different functions are different indexes.
         if t.indexes.iter().any(|ix| {
             ix.columns == cols && ix.unique == unique && ix.predicate == predicate
+                && ix.exprs == exprs
         }) {
             return Ok(ExecResult::Affected(0));
         }
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        match w.create_index(id, cols, unique, predicate, name) {
+        match w.create_index(id, cols, exprs.to_vec(), unique, predicate, name) {
             Ok(()) => w.commit()?,
             Err(e) => {
                 w.abort();
@@ -1023,12 +1047,13 @@ impl Database {
                 name,
                 table,
                 columns,
+                exprs,
                 unique,
                 where_clause,
                 ..
             } => {
                 return self
-                    .apply_create_index(&table, &columns, unique, where_clause, Some(name));
+                    .apply_create_index(&table, &columns, &exprs, unique, where_clause, Some(name));
             }
             DdlStmt::DropIndex { name, if_exists } => {
                 return self.apply_drop_index(&name, if_exists);

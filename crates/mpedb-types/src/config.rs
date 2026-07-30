@@ -783,6 +783,7 @@ fn raw_to_config(
                         columns: cols,
                         unique: ix.unique,
                         predicate: None,
+                        exprs: Vec::new(),
                         name: None,
                     })
                 })

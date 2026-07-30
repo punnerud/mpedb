@@ -313,6 +313,12 @@ pub fn secondary_indexes(table: &TableDef) -> Vec<Option<u16>> {
         .indexes
         .iter()
         .map(|ix| match ix.columns[..] {
+            // An EXPRESSION index (v13) is never an access path: its key is a
+            // computed value, and matching a query's expression against a
+            // stored one is a problem this planner does not solve. Offering it
+            // would not be a missed optimisation, it would be a WRONG answer —
+            // the key it holds is not the column's value.
+            _ if !ix.exprs.is_empty() => None,
             [c] => Some(c),
             _ => None,
         })
@@ -341,7 +347,13 @@ pub(crate) fn conflict_probe_opt(table: &TableDef, target: &[u16]) -> Option<Con
     let mut want: Vec<u16> = target.to_vec();
     want.sort_unstable();
     let ino = table.indexes.iter().position(|ix| {
-        if !ix.unique || ix.columns.len() != want.len() || ix.predicate.is_some() {
+        // …and an expression index cannot serve a conflict target either: the
+        // target names COLUMNS, and this index does not key by them.
+        if !ix.unique
+            || ix.columns.len() != want.len()
+            || ix.predicate.is_some()
+            || !ix.exprs.is_empty()
+        {
             return false;
         }
         let mut cols = ix.columns.clone();

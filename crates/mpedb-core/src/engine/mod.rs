@@ -538,6 +538,10 @@ pub type IndexPredicates = Vec<Vec<Option<ExprProgram>>>;
 pub struct SchemaPrograms {
     pub checks: CheckPrograms,
     pub index_predicates: IndexPredicates,
+    /// Per table, per index, per KEY PART: the compiled expression for a part
+    /// that is one (`IndexDef::exprs`), `None` for a plain column part. Empty
+    /// outer entries mean the index has no expression parts at all.
+    pub index_exprs: Vec<Vec<Vec<Option<ExprProgram>>>>,
 }
 
 /// Compiles a schema's stored SOURCE strings into [`SchemaPrograms`].
@@ -660,6 +664,11 @@ pub struct SchemaBundle {
     /// SOURCE but whose slot here is absent refuses the write rather than
     /// admitting every row (`WriteTxn::index_member`).
     pub index_predicates: IndexPredicates,
+    /// Compiled index KEY-PART expressions, parallel to `index_predicates`. An
+    /// index whose schema carries expression sources but whose slot here is
+    /// absent refuses the write, for the same reason a predicate does: a key
+    /// built without its expression would be the WRONG key.
+    pub index_exprs: Vec<Vec<Vec<Option<ExprProgram>>>>,
     /// Per table, per index (`index_no - 1`): the indexed column ordinals in
     /// key order.
     pub sec_indexes: Vec<Vec<Vec<u16>>>,
@@ -704,12 +713,16 @@ impl SchemaBundle {
     pub fn new(schema: Schema, checks: CheckPrograms) -> SchemaBundle {
         SchemaBundle::new_with_programs(
             schema,
-            SchemaPrograms { checks, index_predicates: Vec::new() },
+            SchemaPrograms {
+            checks,
+            index_predicates: Vec::new(),
+            index_exprs: Vec::new(),
+        },
         )
     }
 
     pub fn new_with_programs(schema: Schema, programs: SchemaPrograms) -> SchemaBundle {
-        let SchemaPrograms { checks, index_predicates } = programs;
+        let SchemaPrograms { checks, index_predicates, index_exprs } = programs;
         let sec_indexes = schema
             .tables
             .iter()
@@ -737,7 +750,22 @@ impl SchemaBundle {
             .map(|t| {
                 t.indexes
                     .iter()
-                    .map(|ix| ix.columns.iter().map(|&i| spec_of(&t.columns[i as usize])).collect())
+                    .map(|ix| {
+                        ix.columns
+                            .iter()
+                            .map(|&i| {
+                                // An EXPRESSION part has no column to take a
+                                // collation or type from — its value is computed.
+                                // The plain spec is what an untyped computed
+                                // value keys by, which is also what the
+                                // synthetic-row builder in `index_entry_key`
+                                // hands over.
+                                t.columns
+                                    .get(i as usize)
+                                    .map_or_else(KeySpec::default, spec_of)
+                            })
+                            .collect()
+                    })
                     .collect()
             })
             .collect();
@@ -751,6 +779,7 @@ impl SchemaBundle {
             schema,
             checks,
             index_predicates,
+            index_exprs,
             sec_indexes,
             sec_unique,
             col_types,
@@ -1004,7 +1033,11 @@ impl Engine {
         checks.resize(schema.tables.len(), Vec::new());
         // No compiler (or a failed compile) leaves the predicates EMPTY, which
         // is the fail-closed state, not "every row is a member".
-        SchemaPrograms { checks, index_predicates: Vec::new() }
+        SchemaPrograms {
+            checks,
+            index_predicates: Vec::new(),
+            index_exprs: Vec::new(),
+        }
     }
 
     /// Replace the current bundle with the catalog's stored schema. The

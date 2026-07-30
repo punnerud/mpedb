@@ -159,7 +159,7 @@ pub use policy::{PolicyCmd, PolicyDef};
 pub use schema::{
     store_into, ColumnDef, DefaultExpr, FkAction, ForeignKeyDef, GeneratedCol, GeneratedKind,
     IndexDef, Schema, TableDef, TableKind,
-    MAX_IDENTIFIER_LEN, MAX_INDEXES,
+    INDEX_EXPR_COL, MAX_IDENTIFIER_LEN, MAX_INDEXES,
 };
 pub use value::{
     exact_float_as_int, exact_int_as_float, Affinity, Collation, ColumnType, HostColls, OrderColl,
