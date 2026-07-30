@@ -81,6 +81,11 @@ pub enum DbResolution {
     Cross {
         sql: String,
         tables: Vec<(String, String)>,
+        /// No reference resolved to MAIN (or to an unknown name). `tables`
+        /// lists only the ATTACHED references, so it cannot answer this — and
+        /// reading it as if it could forwarded `FROM t JOIN other.u` to the
+        /// member, where a same-named `t` silently joined the wrong table.
+        main_free: bool,
     },
     /// A write or DDL that touches exactly one attached database and nothing
     /// on main: strip the schema qualifier and run the statement on that
@@ -645,6 +650,9 @@ pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
         }
     }
 
+    let main_free = !resolved
+        .iter()
+        .any(|(_, t)| matches!(t, Target::Main | Target::Unknown));
     let mut edits = Vec::new();
     let mut cross_tables: Vec<(String, String)> = Vec::new();
     for (i, target) in &resolved {
@@ -688,6 +696,7 @@ pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
         Ok(DbResolution::Cross {
             sql: out,
             tables: cross_tables,
+            main_free,
         })
     }
 }
@@ -1117,7 +1126,7 @@ mod tests {
 
     fn cross(sql: &str) -> (String, Vec<(String, String)>) {
         match resolve_db_refs(sql, &scope()).unwrap() {
-            DbResolution::Cross { sql, tables } => (sql, tables),
+            DbResolution::Cross { sql, tables, .. } => (sql, tables),
             DbResolution::MainOnly(s) => panic!("expected Cross, got MainOnly({s})"),
             DbResolution::AttachedOnly { db, sql } => {
                 panic!("expected Cross, got AttachedOnly({db}, {sql})")

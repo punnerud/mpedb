@@ -523,13 +523,29 @@ fn attach_memory_and_shapes() {
 
 #[test]
 fn cross_file_inside_open_transaction_refuses_by_name() {
-    let f = fix("txn", false);
+    let f = fix("txn", true);
     let mut s = f.begin().unwrap();
-    let e = s.query("SELECT * FROM other.u", &[]).unwrap_err();
+    // A read touching main AND a member — the genuine cross-file question, and
+    // the one still refused inside a write transaction.
+    let e = s
+        .query("SELECT t.tag, other.u.z FROM t JOIN other.u ON t.a = other.u.x", &[])
+        .unwrap_err();
     assert!(
         e.to_string().contains("open write transaction"),
         "in-txn cross SELECT: {e}"
     );
+    // Two members is likewise cross.
+    let e = s
+        .query("SELECT other.u.x FROM other.u JOIN third.w ON other.u.x = third.w.k", &[])
+        .unwrap_err();
+    assert!(e.to_string().contains("open write transaction"), "two members: {e}");
+    // But a read touching ONE member and nothing on main is not a cross-file
+    // question — a coordinated snapshot over one file IS that file's snapshot,
+    // and the matching WRITE has always been forwarded. It answers.
+    match s.query("SELECT x FROM other.u ORDER BY x", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 4),
+        other => panic!("expected rows, got {other:?}"),
+    }
     let e = s
         .query(&format!("ATTACH '{}' AS t3", f.third_path), &[])
         .unwrap_err();

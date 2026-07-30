@@ -324,6 +324,8 @@ pub(crate) enum DbRoute {
     Cross {
         sql: String,
         tables: Vec<(String, String)>,
+        /// No reference resolved to MAIN — see [`mpedb_sql::DbResolution`].
+        main_free: bool,
     },
     /// A pure write/DDL on exactly one attached member — run on that handle.
     AttachedOnly {
@@ -566,7 +568,9 @@ impl Database {
             drop(guard);
             return match mpedb_sql::resolve_db_refs(&rewritten, &scope)? {
                 DbResolution::MainOnly(s) => Ok(DbRoute::Main(s)),
-                DbResolution::Cross { sql, tables } => Ok(DbRoute::Cross { sql, tables }),
+                DbResolution::Cross { sql, tables, main_free } => {
+                    Ok(DbRoute::Cross { sql, tables, main_free })
+                }
                 DbResolution::AttachedOnly { db, sql } => Ok(DbRoute::AttachedOnly { db, sql }),
             };
         }
@@ -589,7 +593,9 @@ impl Database {
                     Ok(DbRoute::Main(s))
                 }
             }
-            DbResolution::Cross { sql, tables } => Ok(DbRoute::Cross { sql, tables }),
+            DbResolution::Cross { sql, tables, main_free } => {
+                    Ok(DbRoute::Cross { sql, tables, main_free })
+                }
             DbResolution::AttachedOnly { db, sql } => Ok(DbRoute::AttachedOnly { db, sql }),
         }
     }

@@ -1888,7 +1888,7 @@ impl Database {
                 routed = s;
                 &routed
             }
-            multifile::DbRoute::Cross { sql, tables } => {
+            multifile::DbRoute::Cross { sql, tables, .. } => {
                 let guard = self.attached.read().expect(POISON);
                 let (cp, _) = self.compile_cross(&guard, &sql, &tables)?;
                 let hash = cp.plan.hash();
@@ -2099,7 +2099,7 @@ impl Database {
                 routed = s;
                 &routed
             }
-            multifile::DbRoute::Cross { sql, tables } => {
+            multifile::DbRoute::Cross { sql, tables, .. } => {
                 return self.query_cross(session, &sql, &tables, params)
             }
             multifile::DbRoute::AttachedOnly { db, sql } => {
@@ -2293,7 +2293,7 @@ impl Database {
                 routed = s;
                 &routed
             }
-            multifile::DbRoute::Cross { sql, tables } => {
+            multifile::DbRoute::Cross { sql, tables, .. } => {
                 return self.query_cross(session, &sql, &tables, params)
             }
             multifile::DbRoute::AttachedOnly { db, sql } => {
@@ -3257,12 +3257,52 @@ impl WriteSession<'_> {
                 routed = s;
                 &routed
             }
-            multifile::DbRoute::Cross { .. } => {
-                return Err(Error::Unsupported(
-                    "cross-file SELECT inside an open write transaction is \
-                     not supported in v1 (run it in autocommit)"
-                        .into(),
-                ))
+            multifile::DbRoute::Cross { sql, tables, main_free } => {
+                // A "cross" statement that touches exactly ONE member and
+                // nothing on main is not a cross-file question at all — a
+                // coordinated snapshot over one file IS that file's snapshot,
+                // and a pure single-member WRITE has been forwarded on exactly
+                // that reasoning all along. Forwarded HERE rather than in the
+                // resolver because the resolver's answer is also the plan's
+                // IDENTITY: a prepared cross plan is cached per attach epoch and
+                // invalidated by DETACH, and re-routing it there changed what
+                // `execute(hash)` resolves to. This is the one place the
+                // statement was otherwise a hard refusal, so nothing that works
+                // today changes.
+                let one = tables
+                    .first()
+                    .map(|(db, _)| db.clone())
+                    .filter(|db| {
+                        // `main_free` is load-bearing: `tables` lists only the
+                        // ATTACHED references, so without it `FROM t JOIN
+                        // other.u` looked single-member and was forwarded to
+                        // the member — where a same-named `t` silently joined
+                        // the WRONG table and returned no rows.
+                        main_free && tables.iter().all(|(d, _)| d.eq_ignore_ascii_case(db))
+                    });
+                match one {
+                    Some(db) => {
+                        // The cross rewrite renamed each table to the mangled
+                        // `"db.table"`; the member knows it by its own name.
+                        // An exact inverse of `mangle_db_table`, over the very
+                        // list the resolver produced — not a guess at the text.
+                        let mut bare = sql;
+                        for (d, t) in &tables {
+                            bare = bare.replace(
+                                &format!("\"{}\"", mpedb_sql::mangle_db_table(d, t)),
+                                &format!("\"{t}\""),
+                            );
+                        }
+                        return self.db.query_attached_only(&db, &bare, params);
+                    }
+                    None => {
+                        return Err(Error::Unsupported(
+                            "cross-file SELECT inside an open write transaction is \
+                             not supported in v1 (run it in autocommit)"
+                                .into(),
+                        ))
+                    }
+                }
             }
             // Pure attached-only work goes to the member handle, not this
             // session's COW. That is correct: the attached file is a separate
