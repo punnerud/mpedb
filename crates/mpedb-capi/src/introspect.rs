@@ -1060,6 +1060,20 @@ pub fn pragma(
                     .iter()
                     .enumerate()
                     .map(|(seqno, &ord)| {
+                        // An EXPRESSION key part is `cid` -2 and a NULL name in
+                        // sqlite (-1 is the rowid; a real column is its index).
+                        // mpedb reported its own sentinel and an EMPTY name,
+                        // and a consumer that tests the name for NULL to detect
+                        // an expression index — SQLAlchemy does, and skips such
+                        // an index with a warning — saw a column instead and
+                        // reflected an index it cannot use.
+                        if ord == mpedb::INDEX_EXPR_COL {
+                            return vec![
+                                Value::Int(seqno as i64),
+                                Value::Int(-2),
+                                Value::Null,
+                            ];
+                        }
                         vec![
                             Value::Int(seqno as i64),
                             Value::Int(table_info_cid(t, ord)),

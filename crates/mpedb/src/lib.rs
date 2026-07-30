@@ -121,7 +121,7 @@ pub use mpedb_types::{
     BudgetKind, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, FkAction, Footprint,
     ForeignKeyDef,
     HostAggState, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema,
-    TableDef, TableSet, Value, MAX_DB_SIZE_MB,
+    TableDef, TableSet, Value, INDEX_EXPR_COL, MAX_DB_SIZE_MB,
 };
 
 use exec::{exec_stmt, ChargeMode, ReadCtx};
