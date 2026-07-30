@@ -663,11 +663,22 @@ impl<'a> Parser<'a> {
     /// `neg_limit_in_core` so `compound_chain` can still reject a `LIMIT`
     /// before a set operator, which absence alone no longer shows.
     fn limit_int(&mut self, what: &str) -> Result<Option<LimitVal>> {
+        let save = self.pos;
         let neg = self.eat(&Tok::Minus);
         let pos = self.here();
         match self.peek() {
             Some(&Tok::Int(v)) if v >= 0 => {
                 self.pos += 1;
+                // The literal may be the head of a constant EXPRESSION —
+                // `LIMIT 1 + 2`. Rewind and take the folding path when an
+                // arithmetic operator follows; the simple form is untouched.
+                if matches!(
+                    self.peek(),
+                    Some(Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash)
+                ) {
+                    self.pos = save;
+                    return self.limit_const_expr(what);
+                }
                 if neg {
                     self.neg_limit_in_core = true;
                     // `-0` is zero, not "no bound".
@@ -699,7 +710,73 @@ impl<'a> Parser<'a> {
                 self.max_params = self.max_params.max(i + 1);
                 Ok(Some(LimitVal::Param(i as u16)))
             }
-            _ => Err(self.err_here(format!("{what} requires an integer literal or parameter"))),
+            // Anything else may still be a CONSTANT integer expression —
+            // `LIMIT 1 + 2` is what SQLAlchemy emits for an offset it computed
+            // at compile time, and sqlite evaluates it like any other
+            // expression. Folded here rather than in the binder because LIMIT
+            // never reaches the binder: it is parsed straight into `LimitVal`,
+            // which the plan format stores as a literal or a parameter.
+            //
+            // Only a fold that is TOTAL is accepted — literals and `+ - * /`
+            // over them, nothing that could depend on a row — so an expression
+            // this cannot prove constant keeps the same refusal it always had,
+            // never a guessed bound.
+            _ => {
+                self.pos = save;
+                self.limit_const_expr(what)
+            }
         }
+    }
+
+    /// `LIMIT`/`OFFSET` as a CONSTANT integer expression — `LIMIT 1 + 2`, which
+    /// is what SQLAlchemy emits for a bound it computed at compile time, and
+    /// which sqlite evaluates like any other expression.
+    ///
+    /// Folded HERE rather than in the binder because LIMIT never reaches the
+    /// binder: it is parsed straight into `LimitVal`, which the plan format
+    /// stores as a literal or a parameter. Only a TOTAL fold is accepted, so an
+    /// expression this cannot prove constant keeps the refusal it always had
+    /// rather than a guessed bound.
+    fn limit_const_expr(&mut self, what: &str) -> Result<Option<LimitVal>> {
+        let save = self.pos;
+        if let Ok(e) = self.expr() {
+            if let Some(v) = const_int(&e) {
+                // Negative is "no bound" for LIMIT and 0 for OFFSET — the same
+                // rule the literal arm applies.
+                if v < 0 {
+                    self.neg_limit_in_core = true;
+                    return Ok(None);
+                }
+                return Ok(Some(LimitVal::Lit(v as u64)));
+            }
+        }
+        self.pos = save;
+        Err(self.err_here(format!("{what} requires an integer literal or parameter")))
+    }
+}
+
+/// Fold a CONSTANT integer expression, or `None` when it is not provably one.
+///
+/// Deliberately total and tiny: integer literals, unary sign, and `+ - * /`
+/// over them. Everything else — a column, a function, a parameter, a float —
+/// returns `None` and the caller refuses, so this can never invent a bound.
+/// Overflow and division by zero return `None` for the same reason.
+fn const_int(e: &crate::ast::Expr) -> Option<i64> {
+    use crate::ast::{BinOp, Expr as E, UnOp};
+    match e {
+        E::Lit(mpedb_types::Value::Int(v)) => Some(*v),
+        E::Unary(UnOp::Neg, a) => const_int(a)?.checked_neg(),
+        E::Binary(op, a, b) => {
+            let (a, b) = (const_int(a)?, const_int(b)?);
+            match op {
+                BinOp::Add => a.checked_add(b),
+                BinOp::Sub => a.checked_sub(b),
+                BinOp::Mul => a.checked_mul(b),
+                // sqlite's `/` on two integers is integer division.
+                BinOp::Div => a.checked_div(b),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }

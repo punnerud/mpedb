@@ -216,9 +216,24 @@ SELECT id FROM t LIMIT 2.5
 statement error integer literal
 SELECT id FROM t LIMIT 'x'
 
-# The literal is consumed, then `+ 1` is trailing input.
-statement error parse error
+# A CONSTANT expression is a legal bound — sqlite evaluates it like any other
+# expression (`LIMIT 1 + 1` returns two rows, measured against 3.45.1). Only a
+# fold that is provably constant is accepted; anything row-dependent keeps the
+# literal-or-parameter refusal below.
+query I nosort
 SELECT id FROM t LIMIT 1 + 1
+----
+1
+2
+
+query I nosort
+SELECT id FROM t LIMIT 3 - 1 OFFSET 1 + 1
+----
+3
+4
+
+statement error integer literal
+SELECT id FROM t LIMIT id
 
 # OFFSET must follow LIMIT, not precede it.
 statement error parse error
