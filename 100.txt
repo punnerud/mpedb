@@ -64,7 +64,7 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
   clippy, begge ws       rene
 
 
-1b. SESJON 30/7 — SQLALCHEMY-FLATEN, 965 → 1238
+1b. SESJON 30/7 — SQLALCHEMY-FLATEN, 965 → 1246
 -----------------------------------------------
 
 Tolv commits på s0-baseline, hver med full port (workspace 208 + capi +
@@ -86,8 +86,10 @@ clippy ×2 + CPython + Django G1+G2) og M3 verifisert:
   c5cac27  S3i: `WITH c(p, q) AS …`, VALUES-kropp, compound-kropp    1191 → 1195
   8f535dc  S3j: `<schema>.sqlite_temp_master` er en FEIL             1195 → 1229
   8cc50a0  S3k: indeks på TEMP-tabell beholder navnet                1229 → 1238
+  8f01b73  S3l: DEFAULT CURRENT_TIMESTAMP; dflt_value er DDL-TEKSTEN
+                (skjema v15)                                        1238 → 1246
 
-  SQLAlchemy dialect-suite:  965 → 1238 av 1277 (+273)
+  SQLAlchemy dialect-suite:  965 → 1246 av 1277 (+281)
   CPython test_sqlite3:      459/466 hele veien (uendret, 7 igjen)
   Django G1+G2:              831/831 OK, 0 shim-only, hele veien
   korpus, FULL:              621 filer, 78 chunks, 7 419 202 records —
@@ -124,20 +126,29 @@ clippy ×2 + CPython + Django G1+G2) og M3 verifisert:
        ring_stmt_atomicity legger databasen sin der. 8 av 8 grønne så snart
        ryddingen ikke gikk samtidig.
 
-  RESTEN AV SQLALCHEMY (39), rangert:
+  ATTRIBUSJON, ÆRLIG: i S3l fjernet både tidsnøkkelordene og bool-defaulten
+  en reell feilklasse hver, og flyttet NULL tester alene — testene som traff
+  dem trengte også `dflt_value`. Hele +8 tilhører den tredje halvdelen.
+
+  RESTEN AV SQLALCHEMY (31), rangert:
      9  json_quote(json_extract(…)) — sqlite avgjør JSON-subtypen ved
         KJØRING; mpedb har ingen subtype-bit på verdier. Å lukke det er en
         verdi-subtype gjennom evaluatoren, ikke en parser-fiks.
-     5  reflektert `sql` er NULL der sqlite har tekst (SQLAlchemy regexer
-        den og får TypeError)
+     4  `WITH c AS (…)`-kropp som er en INSERT/UPDATE/DELETE
      4  `(a, b) IN (SELECT x, y …)` — rad-verdi mot en SUBSPØRRING; lista er
         lukket (S3g), subspørringen nektes fortsatt ved navn
      4  CTE-kropp med parametere (`WITH c AS (… WHERE x IN (?, ?))`) —
         kroppen fanges som kilde og re-parses, og nummereringen er ikke
         gjennomgående
      2  cross-file SELECT inne i en åpen skrivetransaksjon
-     2  DEFAULT CURRENT_TIMESTAMP (samme familie som Djangos field_defaults)
      -  resten er enkelttilfeller
+
+  DJANGOS field_defaults er fortsatt blokkert, og av noe annet enn antatt:
+  den skriver `DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))` — et LAGRET
+  uttrykk som må evalueres per setning, ikke et nøkkelord. Skjemaet bærer nå
+  de tre nøkkelordene; den generelle formen (uttrykk + kompilert program,
+  som `generated`) er neste steg, og `'now'`-nektelsen i den konstant-folderen
+  må da gjelde CHECK og indeksuttrykk, ikke DEFAULT.
 
   KJENT OG IKKE LUKKET (bevisst): `table_info` melder `notnull` 1 for en
   PK-kolonne som ikke er DEKLARERT NOT NULL, der sqlite melder 0. mpedb
