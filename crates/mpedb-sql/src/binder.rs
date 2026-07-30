@@ -699,6 +699,12 @@ pub(crate) struct Binder<'a> {
     ctx_list_keys: std::collections::BTreeSet<String>,
     allow_params: bool,
     allow_context: bool,
+    /// The statement instant (`'now'`) alone, without the rest of the session
+    /// context. A DEFAULT is EVALUATED per INSERT rather than stored as a
+    /// standing predicate, so "when the row was inserted" is exactly what it
+    /// means — unlike a CHECK or an index expression, where a time-dependent
+    /// answer would silently change under something already written.
+    allow_instant: bool,
     /// The compat dialect (COMPAT.md). Reused as the LIKE-strictness signal
     /// exactly as it is the GROUP BY strictness signal (#87): [`BareGroupBy::Sqlite`]
     /// (default) compiles case-INsensitive LIKE that coerces a numeric operand to
@@ -720,6 +726,23 @@ fn bind_err(msg: impl Into<String>) -> Error {
 }
 
 impl<'a> Binder<'a> {
+    /// A binder for a `DEFAULT ( <expr> )` body: no parameters and no session
+    /// context, but the STATEMENT INSTANT is allowed — a default is evaluated
+    /// per INSERT, so `'now'` there means "when this row was inserted", which
+    /// is the one time-dependent answer that does not change under anything
+    /// already stored.
+    pub fn new_default_expr(table: &'a TableDef) -> Binder<'a> {
+        let mut b = Binder::with_scope(Scope::single(table), 0, false);
+        b.allow_instant = true;
+        b
+    }
+
+    /// Did the bound expression read the statement instant? A default that does
+    /// not is a CONSTANT and the caller folds it to one.
+    pub fn uses_statement_instant(&self) -> bool {
+        self.ctx_keys.iter().any(|k| k == crate::STATEMENT_INSTANT_KEY)
+    }
+
     pub fn new(table: &'a TableDef, n_params: u16, allow_params: bool) -> Binder<'a> {
         Binder::with_scope(Scope::single(table), n_params, allow_params)
     }
@@ -737,6 +760,7 @@ impl<'a> Binder<'a> {
             // `current_setting()` is allowed wherever caller params are (queries
             // and, later, policy predicates); disallowed in CHECK constraints.
             allow_context: allow_params,
+            allow_instant: allow_params,
             bare_group_by: BareGroupBy::default(),
             host_udfs: HostUdfSet::default(),
         }
@@ -796,6 +820,7 @@ impl<'a> Binder<'a> {
             ctx_list_keys: self.ctx_list_keys,
             allow_params: self.allow_params,
             allow_context: self.allow_context,
+            allow_instant: self.allow_instant,
             // The compat dialect is a database-wide fact, so it survives a scope
             // change (a join's per-table rescopes must keep the same LIKE rules).
             bare_group_by: self.bare_group_by,
@@ -850,7 +875,7 @@ impl<'a> Binder<'a> {
     /// expression is stored as SOURCE and re-evaluated later, so an answer that
     /// depends on WHEN it ran would silently change under it.
     fn statement_instant(&mut self) -> Result<BExpr> {
-        if !self.allow_context {
+        if !self.allow_context && !self.allow_instant {
             return Err(bind_err(
                 "'now' is not allowed in this expression: it binds the statement instant, \
                  and this expression is stored and re-evaluated later (a CHECK, a DEFAULT \

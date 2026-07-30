@@ -220,21 +220,34 @@ fn resolve_view_key(w: &mut mpedb_core::WriteTxn<'_>, name: &str) -> Result<Opti
 /// schema's `parse_default`; everything else must match exactly or it is a
 /// clean error (never a silent conversion, the whole point of the rigid
 /// schema). `NULL` and an `any` column accept anything.
-/// Fold `DEFAULT ( <expr> )` to the literal it always evaluates to.
+/// Resolve `DEFAULT ( <expr> )`: fold it to the literal it always evaluates to,
+/// or — when it reads the STATEMENT INSTANT — keep it as a program to evaluate
+/// per INSERT.
 ///
 /// The expression is CLOSED by sqlite's own rule — it may not read a column
 /// ("default value of column [b] is not constant", MEASURED at 3.45.1) — so it
 /// is a constant written as arithmetic, and evaluating it once at DDL time is
 /// the same answer as evaluating it per row, forever. That is what lets the
-/// stored schema keep holding a plain `DefaultExpr::Const` and the wire format
-/// stay put.
+/// stored schema keeps a plain `DefaultExpr::Const` for that case.
+///
+/// `'NOW'` is the exception, and the ONE the refusal here used to catch:
+/// `DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))` — Django's `auto_now_add`
+/// — has no single value to fold to, and it is not supposed to. A DEFAULT is
+/// EVALUATED per INSERT, so "when this row was inserted" is exactly its
+/// meaning; the reasoning that bars `'now'` from a CHECK or an index
+/// expression (stored, re-evaluated later, silently changing under something
+/// already written) does not apply to it.
 ///
 /// Compiled against a table with NO columns, which is what enforces the closure:
 /// a column reference has nothing to bind to and is refused, in the same breath
 /// as anything else that will not fold (a parameter, a subquery, a
 /// non-deterministic call). The refusal names the column, because at DDL time
 /// that is the only thing the user can act on.
-fn fold_default_expr(src: &str, table: &str, column: &str) -> Result<mpedb_types::Value> {
+fn fold_default_expr(
+    src: &str,
+    table: &str,
+    column: &str,
+) -> Result<mpedb_types::DefaultExpr> {
     let closed = mpedb_types::TableDef {
         id: 0,
         name: table.to_string(),
@@ -251,10 +264,18 @@ fn fold_default_expr(src: &str, table: &str, column: &str) -> Result<mpedb_types
             "DEFAULT ({src}) on `{table}`.`{column}` is not a constant: {why}"
         ))
     };
-    let prog = mpedb_sql::compile_value_expr(src, &closed).map_err(|e| bad(e.to_string()))?;
+    let (prog, uses_instant) =
+        mpedb_sql::compile_default_expr(src, &closed).map_err(|e| bad(e.to_string()))?;
+    if uses_instant {
+        return Ok(mpedb_types::DefaultExpr::Expr(Box::new(
+            mpedb_types::DefaultProgram { src: src.to_string(), program: prog },
+        )));
+    }
     let mut stack = Vec::new();
-    prog.eval_with_stack(&mut stack, &[], &[])
-        .map_err(|e| bad(e.to_string()))
+    let v = prog
+        .eval_with_stack(&mut stack, &[], &[])
+        .map_err(|e| bad(e.to_string()))?;
+    Ok(mpedb_types::DefaultExpr::Const(v))
 }
 
 fn coerce_default(
@@ -393,9 +414,7 @@ pub(crate) fn table_def_from_spec(
             // has the same value for every row that will ever be inserted.
             let folded = match &c.default_src {
                 None => None,
-                Some(src) => Some(mpedb_types::DefaultExpr::Const(fold_default_expr(
-                    src, &spec.name, &c.name,
-                )?)),
+                Some(src) => Some(fold_default_expr(src, &spec.name, &c.name)?),
             };
             let default = match folded.as_ref().or(c.default.as_ref()) {
                 Some(mpedb_types::DefaultExpr::Const(v)) => {
@@ -678,8 +697,12 @@ pub(crate) fn add_column_from_spec(
         Some(ref d @ (DefaultExpr::Now
         | DefaultExpr::CurrentTimestamp
         | DefaultExpr::CurrentDate
-        | DefaultExpr::CurrentTime)) => {
-            let what = d.time_keyword().unwrap_or("now()");
+        | DefaultExpr::CurrentTime
+        | DefaultExpr::Expr(_))) => {
+            let what = match d {
+                DefaultExpr::Expr(d) => d.src.as_str(),
+                other => other.time_keyword().unwrap_or("now()"),
+            };
             return Err(Error::Bind(format!(
                 "ALTER TABLE {table} ADD COLUMN {}: {what} is not a constant default \
                  (sqlite refuses a non-constant ADD-COLUMN default)",

@@ -45,6 +45,14 @@ pub(crate) fn default_cell(default: Option<&DefaultExpr>, now: i64, now_micros: 
     match default {
         Some(DefaultExpr::Const(v)) => v.clone(),
         Some(DefaultExpr::Now) => Value::Timestamp(now),
+        // An instant-dependent expression default is EVALUATED here, once per
+        // statement's worth of rows like the keyword forms — the instant sits
+        // in parameter slot 0, which is the only slot a default can have (it
+        // takes no user parameters).
+        Some(DefaultExpr::Expr(d)) => d
+            .program
+            .eval(&[], &[Value::Text(mpedb_types::sqlite_now_string(now_micros))])
+            .unwrap_or(Value::Null),
         Some(k @ (DefaultExpr::CurrentTimestamp | DefaultExpr::CurrentDate | DefaultExpr::CurrentTime)) => {
             let (ts, date, time) = mpedb_types::sqlite_now_parts(now_micros);
             Value::Text(match k {

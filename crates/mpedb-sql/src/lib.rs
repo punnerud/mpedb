@@ -395,6 +395,28 @@ pub fn compile_value_expr(expr_src: &str, table: &TableDef) -> Result<ExprProgra
     binder::compile_program(&bound)
 }
 
+/// `DEFAULT ( <expr> )` — compiled, with the statement instant permitted.
+///
+/// Returns the program and whether it READS that instant. One that does not is
+/// a constant written as arithmetic (`DEFAULT (1 + 2)`), and the caller folds
+/// it to a literal exactly as before; one that does is stored and evaluated per
+/// INSERT, which is what `DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))` —
+/// Django's `auto_now_add` — asks for.
+///
+/// The instant lands in parameter slot 0 because a default takes no user
+/// parameters, which is what lets the executor evaluate the program with a
+/// one-element array and no numbering to reconcile.
+pub fn compile_default_expr(expr_src: &str, table: &TableDef) -> Result<(ExprProgram, bool)> {
+    let (expr, n_params) = parser::parse_expr_only(expr_src)?;
+    if n_params > 0 {
+        return Err(Error::Bind("parameters are not allowed in a DEFAULT".into()));
+    }
+    let mut binder = binder::Binder::new_default_expr(table);
+    let (bound, _ty) = binder.bind_expr(&expr)?;
+    let uses_instant = binder.uses_statement_instant();
+    Ok((binder::compile_program(&bound)?, uses_instant))
+}
+
 pub fn compile_generated(expr_src: &str, table: &TableDef, col: usize) -> Result<ExprProgram> {
     let (expr, n_params) = parser::parse_expr_only(expr_src)?;
     if n_params > 0 {

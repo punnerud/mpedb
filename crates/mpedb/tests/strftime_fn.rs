@@ -490,3 +490,56 @@ fn dflt_value_is_the_ddl_text_and_survives_a_reopen() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));
 }
+
+/// `DEFAULT ( <expr> )` that reads the STATEMENT INSTANT — Django's
+/// `auto_now_add`, which it emits as
+/// `DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))`.
+///
+/// This was refused: `'now'` is barred from a stored expression because a CHECK
+/// or an index predicate is re-evaluated later, where a time-dependent answer
+/// would silently change under something already written. A DEFAULT is not one
+/// of those — it is EVALUATED per INSERT, so "when this row was inserted" is
+/// precisely its meaning. It is stored as a compiled program (schema v16)
+/// rather than folded, because there is no one value to fold it to.
+///
+/// It blocked five Django labels from MIGRATING at all: 108 tests that could
+/// not run, of which 106 now pass.
+#[test]
+fn a_default_expression_may_read_the_statement_instant() {
+    let (db, path) = mpedb_db();
+    db.query(
+        "CREATE TABLE ad (id INTEGER PRIMARY KEY, \
+         pub_date TEXT DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')), \
+         folded INTEGER DEFAULT (2 + 3))",
+        &[],
+    )
+    .unwrap();
+    db.query("INSERT INTO ad (id) VALUES (1)", &[]).unwrap();
+    match db.query("SELECT pub_date, folded FROM ad", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => {
+            match &rows[0][0] {
+                // `YYYY-MM-DD HH:MM:SS.mmm`
+                Value::Text(s) => assert_eq!(s.len(), 23, "rendered `{s}`"),
+                other => panic!("expected text, got {other:?}"),
+            }
+            // A default that does NOT read the instant is still FOLDED to a
+            // literal, exactly as before — the program is only stored when
+            // there is no single value to store instead.
+            assert_eq!(rows[0][1], Value::Int(5));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // Every row of ONE statement carries ONE instant.
+    db.query("INSERT INTO ad (id) VALUES (2), (3)", &[]).unwrap();
+    match db.query("SELECT count(DISTINCT pub_date) FROM ad WHERE id > 1", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // `'now'` stays refused where the expression really is STORED and
+    // re-evaluated: a CHECK and an index predicate.
+    assert!(db
+        .query("CREATE TABLE bad (a TEXT CHECK (a > STRFTIME('%Y', 'NOW')))", &[])
+        .is_err());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+}
