@@ -449,6 +449,7 @@ pub(crate) fn table_def_from_spec(
         .iter()
         .map(|group| {
             Ok(mpedb_types::IndexDef {
+                collations: Vec::new(),
                 columns: group
                     .iter()
                     .map(|n| col_index(n))
@@ -954,12 +955,15 @@ impl Database {
     /// `CREATE [UNIQUE] INDEX … ON t (cols)`. Resolves the columns, treats an
     /// identical existing index as a no-op (idempotent — covers `IF NOT
     /// EXISTS`), then builds the index over the existing rows in one commit.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_create_index(
         &self,
         table: &str,
         columns: &[String],
         // Parallel to `columns` when non-empty; see `IndexDef::exprs`.
         exprs: &[Option<String>],
+        // Parallel to `columns` when non-empty: a per-part `COLLATE` override.
+        collations: &[Option<mpedb_types::Collation>],
         unique: bool,
         predicate: Option<String>,
         name: Option<String>,
@@ -995,12 +999,12 @@ impl Database {
         // column through different functions are different indexes.
         if t.indexes.iter().any(|ix| {
             ix.columns == cols && ix.unique == unique && ix.predicate == predicate
-                && ix.exprs == exprs
+                && ix.exprs == exprs && ix.collations == collations
         }) {
             return Ok(ExecResult::Affected(0));
         }
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        match w.create_index(id, cols, exprs.to_vec(), unique, predicate, name) {
+        match w.create_index(id, cols, exprs.to_vec(), collations.to_vec(), unique, predicate, name) {
             Ok(()) => w.commit()?,
             Err(e) => {
                 w.abort();
@@ -1048,12 +1052,13 @@ impl Database {
                 table,
                 columns,
                 exprs,
+                collations,
                 unique,
                 where_clause,
                 ..
             } => {
                 return self
-                    .apply_create_index(&table, &columns, &exprs, unique, where_clause, Some(name));
+                    .apply_create_index(&table, &columns, &exprs, &collations, unique, where_clause, Some(name));
             }
             DdlStmt::DropIndex { name, if_exists } => {
                 return self.apply_drop_index(&name, if_exists);

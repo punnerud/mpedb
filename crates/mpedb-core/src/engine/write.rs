@@ -2160,6 +2160,7 @@ impl<'e> WriteTxn<'e> {
     /// `key → pk`. A UNIQUE index whose build hits a duplicate aborts with a
     /// violation (nothing is published). One commit; the new tree's catalog
     /// root is persisted by the commit's table-root write-back.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_index(
         &mut self,
         table_id: u32,
@@ -2168,6 +2169,8 @@ impl<'e> WriteTxn<'e> {
         // whose entry is `Some` takes its key value from the EXPRESSION, and
         // `columns[i]` is the `INDEX_EXPR_COL` sentinel.
         exprs: Vec<Option<String>>,
+        // Parallel to `columns` when non-empty: a per-part `COLLATE` override.
+        collations: Vec<Option<mpedb_types::Collation>>,
         unique: bool,
         predicate: Option<String>,
         // `name`: what the user wrote. Carried so `DROP INDEX`/`REINDEX` can
@@ -2190,6 +2193,7 @@ impl<'e> WriteTxn<'e> {
                 predicate,
                 name,
                 exprs: exprs.clone(),
+                collations: collations.clone(),
             },
         )?;
         // The key-part programs for the index being built, from the SAME
@@ -2239,9 +2243,14 @@ impl<'e> WriteTxn<'e> {
             // the synthetic-row key builder uses for it too.
             let coll: Vec<keycode::KeySpec> = columns
                 .iter()
-                .map(|&c| match table.columns.get(c as usize) {
+                .enumerate()
+                .map(|(k, &c)| match table.columns.get(c as usize) {
                     None => keycode::KeySpec::default(),
-                    Some(cd) => keycode::KeySpec::for_column(cd.ty, cd.collation),
+                    Some(cd) => keycode::KeySpec::for_column(
+                        cd.ty,
+                        // A per-part `COLLATE` (v14) overrides the column's own.
+                        collations.get(k).copied().flatten().unwrap_or(cd.collation),
+                    ),
                 })
                 .collect();
             (table.name.clone(), (table.indexes.len() + 1) as u32, coll)

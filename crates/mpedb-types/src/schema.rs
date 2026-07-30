@@ -288,6 +288,17 @@ pub struct IndexDef {
     /// a separate problem; the consumer that needs these (Django's schema
     /// editor) creates them, introspects them by name and drops them.
     pub exprs: Vec<Option<String>>,
+    /// Per-key-part COLLATE override (`CREATE INDEX i ON t (a COLLATE NOCASE)`),
+    /// on the wire since canonical-bytes **v14**. Empty when every part keys by
+    /// its column's own collation, which is every index before v14; otherwise
+    /// the same length as `columns`, `None` where the part has no override.
+    ///
+    /// This is NOT an expression part: MEASURED at sqlite 3.45.1,
+    /// `a COLLATE NOCASE` reports as `index_xinfo` column id 1 named `a` with
+    /// coll NOCASE — a COLUMN whose comparison changed — and a duplicate under
+    /// it names the column (`UNIQUE constraint failed: t.a`), not the index.
+    /// It changes how the key is ENCODED, not what value it holds.
+    pub collations: Vec<Option<crate::value::Collation>>,
 }
 
 /// `IndexDef::columns[i]` for a key part that is an EXPRESSION, not a column.
@@ -833,6 +844,7 @@ fn normalize_and_derive(t: &mut TableDef) {
                 && !(t.primary_key.len() == 1 && t.primary_key[0] == *i as u16)
         })
         .map(|(i, c)| IndexDef {
+            collations: Vec::new(),
             columns: vec![i as u16],
             unique: c.unique,
             predicate: None,
@@ -1591,7 +1603,7 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(13u8); // schema encoding version (v13: IndexDef.exprs)
+        buf.push(14u8); // schema encoding version (v14: IndexDef.collations)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -1701,6 +1713,15 @@ impl Schema {
                         }
                     }
                 }
+                // Per-part COLLATE overrides (v14). Empty for an index that
+                // keys by its columns' own collations, so one zero u16.
+                buf.extend_from_slice(&(ix.collations.len() as u16).to_le_bytes());
+                for c in &ix.collations {
+                    buf.push(match c {
+                        None => 0,
+                        Some(c) => *c as u8 + 1,
+                    });
+                }
             }
             // FOREIGN KEYs (v12). Almost every table has none, so the common
             // case is a single zero u16 — the same "one length word" price the
@@ -1747,7 +1768,7 @@ impl Schema {
         // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name;
         // v12 = TableDef.foreign_keys; v13 = IndexDef.exprs.
         // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if !(9..=13).contains(&version) {
+        if !(9..=14).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
@@ -1757,6 +1778,7 @@ impl Schema {
         let has_index_name = version >= 11;
         let has_foreign_keys = version >= 12;
         let has_index_exprs = version >= 13;
+        let has_index_collations = version >= 14;
         let ntables = read_u32(buf, &mut pos)? as usize;
         if ntables > MAX_TABLES {
             return Err(Error::Corrupt("table count out of range".into()));
@@ -1971,7 +1993,31 @@ impl Schema {
                 } else {
                     Vec::new()
                 };
+                let collations = if has_index_collations {
+                    let n = read_u16(buf, &mut pos)? as usize;
+                    if n != 0 && n != cols.len() {
+                        return Err(Error::Corrupt(
+                            "index collation list length differs from the column list".into(),
+                        ));
+                    }
+                    let mut v = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let tag = *buf.get(pos).ok_or_else(err)?;
+                        pos += 1;
+                        v.push(match tag {
+                            0 => None,
+                            t => Some(
+                                crate::value::Collation::from_tag(t - 1)
+                                    .ok_or_else(|| Error::Corrupt("bad index collation tag".into()))?,
+                            ),
+                        });
+                    }
+                    v
+                } else {
+                    Vec::new()
+                };
                 indexes.push(IndexDef {
+                    collations,
                     columns: cols,
                     unique,
                     predicate,
@@ -2308,7 +2354,7 @@ mod tests {
                     unique: false, indexed: true, default: None, check: None, collation: Collation::Binary },
             ],
             primary_key: vec![0],
-            indexes: vec![IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new() }],
+            indexes: vec![IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() }],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
             foreign_keys: Vec::new(),
         };
@@ -2321,9 +2367,9 @@ mod tests {
         assert_eq!(
             t.indexes,
             vec![
-                IndexDef { columns: vec![1], unique: true, predicate: None, name: None, exprs: Vec::new() },
-                IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new() },
-                IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new() },
+                IndexDef { columns: vec![1], unique: true, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() },
+                IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() },
+                IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() },
             ]
         );
         assert!(!t.columns[0].unique && !t.columns[0].indexed);
@@ -2351,7 +2397,7 @@ mod tests {
                 col("w", ColumnType::Int64),
             ],
             primary_key: vec![0],
-            indexes: vec![IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new() }],
+            indexes: vec![IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() }],
             dead: false, kind: TableKind::Standard, implicit_rowid: false,
             foreign_keys: Vec::new(),
         }])
@@ -2362,19 +2408,19 @@ mod tests {
         // sqlite's, and the planner — not the schema — is what keeps it from
         // ever being probed.
         let mut ok = base.clone();
-        ok.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false, predicate: None, name: None, exprs: Vec::new() }];
+        ok.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() }];
         Schema::from_canonical_bytes(&ok.canonical_bytes()).unwrap();
 
         // Duplicate index shapes refuse.
         let mut evil = base.clone();
         evil.tables[0]
             .indexes
-            .push(IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new() });
+            .push(IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() });
         assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
 
         // An index equal to the whole single-column PK duplicates index 0.
         let mut evil = base.clone();
-        evil.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true, predicate: None, name: None, exprs: Vec::new() }];
+        evil.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() }];
         assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
 
         // v1 bytes (version byte 1) refuse by name — no migration exists.
@@ -2492,7 +2538,7 @@ mod tests {
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
         // The version byte is 9.
-        assert_eq!(s.canonical_bytes()[0], 13);
+        assert_eq!(s.canonical_bytes()[0], 14);
         // A v8 file refuses cleanly (no misread of the new generated bytes).
         let mut v8 = s.canonical_bytes();
         v8[0] = 8;
@@ -2623,7 +2669,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 13);
+        assert_eq!(s.canonical_bytes()[0], 14);
 
         // Truncation at every offset is Corrupt, never a panic.
         let bytes = s.canonical_bytes();
@@ -2682,7 +2728,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 13);
+        assert_eq!(s.canonical_bytes()[0], 14);
         // The text is part of the schema identity: `f float` and `f REAL` are
         // the same storage and DIFFERENT schemas, because a consumer keying
         // converters off the decltype sees two different columns.
@@ -2742,7 +2788,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 13);
+        assert_eq!(s.canonical_bytes()[0], 14);
 
         // The collation changes the hash: a BINARY `name` is a different schema.
         let mut plain = s.clone();
@@ -2899,7 +2945,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "the compiled program survives byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 13);
+        assert_eq!(s.canonical_bytes()[0], 14);
 
         // It computes, in declaration order, through the decoded schema.
         let mut row = vec![Value::Int(21), Value::Null];

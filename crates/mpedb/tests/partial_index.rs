@@ -609,3 +609,33 @@ fn an_unbindable_key_expression_is_refused_at_create() {
     assert!(e.contains("does not compile"), "{e}");
     let _ = std::fs::remove_file(&path);
 }
+
+/// `CREATE INDEX i ON t (a COLLATE NOCASE)` — a COLUMN part whose comparison
+/// changed, not an expression part.
+///
+/// MEASURED at sqlite 3.45.1: it reports as `index_xinfo` column `a` with coll
+/// NOCASE (an expression part would be column id -2), and a duplicate under it
+/// names the COLUMN — `UNIQUE constraint failed: t.a`. So the override changes
+/// how the key is ENCODED, and the part keeps its ordinal.
+#[test]
+fn a_collate_override_changes_the_key_not_the_value() {
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)",
+            "CREATE UNIQUE INDEX ux ON t (a COLLATE NOCASE)",
+            "INSERT INTO t (id, a) VALUES (1, 'Ab')",
+            "INSERT INTO t (id, a) VALUES (2, 'AB')", // equal under NOCASE
+        ],
+        "SELECT id, a FROM t ORDER BY id",
+    );
+    // Without the override the same two rows are distinct.
+    agree(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)",
+            "CREATE UNIQUE INDEX ux ON t (a)",
+            "INSERT INTO t (id, a) VALUES (1, 'Ab')",
+            "INSERT INTO t (id, a) VALUES (2, 'AB')",
+        ],
+        "SELECT id, a FROM t ORDER BY id",
+    );
+}

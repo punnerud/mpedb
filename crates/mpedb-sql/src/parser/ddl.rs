@@ -468,7 +468,7 @@ impl<'a> Parser<'a> {
     /// a plain column exactly when an identifier is followed by what ends a
     /// part — `,`, `)`, or `ASC`/`DESC`. `LOWER(a)`, `a || b` and a bare literal
     /// all take the expression branch.
-    fn index_key_part(&mut self) -> Result<(String, Option<String>)> {
+    fn index_key_part(&mut self) -> Result<(String, Option<String>, Option<Collation>)> {
         let ends_part = matches!(
             self.peek_at(1),
             Some(Tok::Comma) | Some(Tok::RParen) | Some(Tok::Kw(Kw::Asc)) | Some(Tok::Kw(Kw::Desc))
@@ -479,7 +479,20 @@ impl<'a> Parser<'a> {
         // check and took down every migration that has a composite index.
         let named = matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_)));
         if named && ends_part {
-            return Ok((self.ident("column name")?, None));
+            return Ok((self.ident("column name")?, None, None));
+        }
+        // `a COLLATE NOCASE` is a COLUMN part with its comparison changed, not
+        // an expression: MEASURED at sqlite 3.45.1 it reports as index_xinfo
+        // column `a` with coll NOCASE, and a duplicate under it names the
+        // COLUMN. So it keeps its ordinal and overrides only the key encoding.
+        // COLLATE is a plain word here, not a keyword token (the column-
+        // definition grammar eats it with `eat_word` too).
+        let collate_next = matches!(self.peek_at(1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("COLLATE"));
+        if named && collate_next {
+            let col = self.ident("column name")?;
+            let _ = self.eat_word("COLLATE");
+            let coll = self.parse_collation_name()?;
+            return Ok((col, None, Some(coll)));
         }
         let start = self.here();
         let before = self.max_params;
@@ -498,7 +511,7 @@ impl<'a> Parser<'a> {
                 "a parameter is not allowed in an index expression",
             ));
         }
-        Ok((String::new(), Some(src)))
+        Ok((String::new(), Some(src), None))
     }
 
     /// `DEFAULT <value>` in a column definition.
@@ -1177,10 +1190,12 @@ impl<'a> Parser<'a> {
         // only kind the planner will pick.
         let mut columns: Vec<String> = Vec::new();
         let mut exprs: Vec<Option<String>> = Vec::new();
+        let mut collations: Vec<Option<Collation>> = Vec::new();
         loop {
-            let (col, ex) = self.index_key_part()?;
+            let (col, ex, coll) = self.index_key_part()?;
             columns.push(col);
             exprs.push(ex);
+            collations.push(coll);
             // Per-column ASC/DESC is accepted and ignored (indexes ascend).
             let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
             if !self.eat(&Tok::Comma) {
@@ -1192,6 +1207,9 @@ impl<'a> Parser<'a> {
         // expression index: the vector is empty unless a part actually is one.
         if exprs.iter().all(Option::is_none) {
             exprs.clear();
+        }
+        if collations.iter().all(Option::is_none) {
+            collations.clear();
         }
         // Optional partial-index predicate (P1). Capture the source text so the
         // schema can store it; the expression is validated by parsing it.
@@ -1223,6 +1241,7 @@ impl<'a> Parser<'a> {
         };
         Ok(DdlStmt::CreateIndex {
             exprs,
+            collations,
             name,
             table,
             columns,

@@ -228,6 +228,7 @@ mod tests {
 
     fn ix(pred: Option<&str>) -> IndexDef {
         IndexDef {
+            collations: Vec::new(),
             columns: vec![1],
             unique: false,
             predicate: pred.map(|s| s.to_string()),

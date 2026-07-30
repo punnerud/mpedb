@@ -4011,6 +4011,7 @@ impl WriteSession<'_> {
                 table,
                 columns,
                 exprs,
+                collations,
                 unique,
                 where_clause,
                 ..
@@ -4045,12 +4046,12 @@ impl WriteSession<'_> {
                 // Idempotent by shape: an identical index already present is a no-op.
                 if t.indexes.iter().any(|ix| {
                     ix.columns == cols && ix.unique == unique && ix.predicate == where_clause
-                        && ix.exprs == exprs
+                        && ix.exprs == exprs && ix.collations == collations
                 }) {
                     return Ok(ExecResult::Affected(0));
                 }
                 self.txn
-                    .create_index(id, cols, exprs, unique, where_clause, Some(name))?;
+                    .create_index(id, cols, exprs, collations, unique, where_clause, Some(name))?;
             }
             // VIEW / TRIGGER ride this session's txn (sys-keyspace + schema_gen
             // bump) so CPython's implicit transaction + iterdump can CREATE them

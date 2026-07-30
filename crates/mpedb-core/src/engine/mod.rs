@@ -753,16 +753,29 @@ impl SchemaBundle {
                     .map(|ix| {
                         ix.columns
                             .iter()
-                            .map(|&i| {
+                            .enumerate()
+                            .map(|(k, &i)| {
                                 // An EXPRESSION part has no column to take a
                                 // collation or type from — its value is computed.
                                 // The plain spec is what an untyped computed
                                 // value keys by, which is also what the
                                 // synthetic-row builder in `index_entry_key`
                                 // hands over.
-                                t.columns
+                                let base = t
+                                    .columns
                                     .get(i as usize)
-                                    .map_or_else(KeySpec::default, spec_of)
+                                    .map_or_else(KeySpec::default, spec_of);
+                                // A per-part `COLLATE` (v14) overrides the
+                                // COLUMN's collation for this index's key only.
+                                match ix.collations.get(k).copied().flatten() {
+                                    None => base,
+                                    Some(c) => t
+                                        .columns
+                                        .get(i as usize)
+                                        .map_or_else(KeySpec::default, |cd| {
+                                            KeySpec::for_column(cd.ty, c)
+                                        }),
+                                }
                             })
                             .collect()
                     })

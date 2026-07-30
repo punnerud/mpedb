@@ -241,6 +241,8 @@ pub enum DdlStmt {
         /// where that part is an EXPRESSION, and `None` where it is the plain
         /// column `columns[i]` (whose entry here is then an empty string).
         exprs: Vec<Option<String>>,
+        /// Parallel to `columns` when non-empty: a per-part `COLLATE` override.
+        collations: Vec<Option<mpedb_types::Collation>>,
         unique: bool,
         if_not_exists: bool,
         /// Partial-index predicate source (`WHERE …`), or `None` for a
@@ -462,6 +464,7 @@ mod tests {
             parse_ddl("CREATE INDEX ix ON t (a)").unwrap().unwrap(),
             DdlStmt::CreateIndex {
                 exprs: Vec::new(),
+                collations: Vec::new(),
                 name: "ix".into(),
                 table: "t".into(),
                 columns: vec!["a".into()],
@@ -477,6 +480,7 @@ mod tests {
                 .unwrap(),
             DdlStmt::CreateIndex {
                 exprs: Vec::new(),
+                collations: Vec::new(),
                 name: "ix".into(),
                 table: "t".into(),
                 columns: vec!["a".into(), "b".into(), "c".into()],
