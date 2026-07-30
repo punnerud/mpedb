@@ -610,8 +610,14 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // it reads the temp member's own catalog. A connection that never
             // made a temp table has no such member, and the honest answer there
             // is an EMPTY catalog — not an error, and not main's contents.
+            // `<schema>.sqlite_master` reads THAT database's catalog — how
+            // SQLAlchemy lists an attached schema's views.
+            let master_q = introspect::master_schema(sqltext)
+                .filter(|q| !q.eq_ignore_ascii_case("main"));
             let bundle = if introspect::master_reference(sqltext) == Some(true) {
                 c.db.temp_schema_or_empty()
+            } else if let Some(q) = master_q {
+                c.db.attached_schema_or_empty(&q)
             } else {
                 match c.txn.as_ref() {
                     Some(s) => s.schema(),

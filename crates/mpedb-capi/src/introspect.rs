@@ -1121,6 +1121,47 @@ pub fn master_reference(sql: &str) -> Option<bool> {
     }
 }
 
+/// The `<schema>.` a catalog reference was qualified with, if any.
+///
+/// `SELECT name FROM "test_schema".sqlite_master …` is how SQLAlchemy lists an
+/// attached database's VIEWS; answering that from main described the wrong
+/// file. Quoted or bare, like the pragma qualifier.
+pub fn master_schema(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    for kw in ["sqlite_master", "sqlite_schema"] {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(kw) {
+            let at = from + pos;
+            from = at + kw.len();
+            let before = sql[..at].trim_end();
+            let Some(before) = before.strip_suffix('.') else {
+                continue;
+            };
+            let name = match before.chars().last() {
+                Some(q @ ('"' | '`' | '\'')) => before[..before.len() - 1]
+                    .rfind(q)
+                    .map(|i| before[i + 1..before.len() - 1].to_string()),
+                Some(']') => before[..before.len() - 1]
+                    .rfind('[')
+                    .map(|i| before[i + 1..before.len() - 1].to_string()),
+                _ => {
+                    let n: String = before
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    Some(n.chars().rev().collect())
+                }
+            };
+            match name {
+                Some(n) if !n.is_empty() => return Some(n),
+                _ => continue,
+            }
+        }
+    }
+    None
+}
+
 fn names_a_catalog(sql: &str, kws: &[&str]) -> bool {
     let lower = sql.to_ascii_lowercase();
     for kw in kws {
