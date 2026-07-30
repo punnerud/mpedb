@@ -749,6 +749,18 @@ impl Database {
     /// process's schema bundle and drop the local plan cache. Other processes
     /// reload at their next transaction via the schema-gen bump.
     pub(crate) fn apply_create_table(&self, spec: mpedb_sql::CreateTableSpec) -> Result<ExecResult> {
+        // `IF NOT EXISTS`: an existing table of this name makes the statement a
+        // no-op. Checked on the LIVE catalog before the write txn, the same way
+        // `CREATE INDEX`'s idempotence is.
+        if spec.if_not_exists
+            && self
+                .schema()
+                .tables
+                .iter()
+                .any(|t| !t.dead && mpedb_types::ident_eq(&t.name, &spec.name))
+        {
+            return Ok(ExecResult::Affected(0));
+        }
         let def = table_def_from_spec(spec)?;
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.create_table(def) {

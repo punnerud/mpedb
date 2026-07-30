@@ -593,6 +593,7 @@ pub(crate) fn create_bookkeeping(
     pk: &[&str],
 ) -> Result<()> {
     s.apply_ddl(mpedb_sql::DdlStmt::CreateTable(mpedb_sql::CreateTableSpec {
+        if_not_exists: false,
         name: name.into(),
         columns,
         table_pk: pk.iter().map(|c| (*c).to_string()).collect(),

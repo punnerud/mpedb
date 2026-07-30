@@ -1125,7 +1125,18 @@ fn record_object_ddl(
     match value {
         Some((exact, rec)) => {
             let (ns, key) = introspect::ddl_key(&exact);
-            put_record(c, member.as_deref(), ns, &key, &rec);
+            // A CREATE that reaches here having NOT created anything is an
+            // `IF NOT EXISTS` no-op: a plain `CREATE` over an existing object
+            // errors, and an error never gets this far. sqlite keeps the text
+            // of the statement that ACTUALLY created the object, so the
+            // standing record wins. (A DROP leaves an empty tombstone, so a
+            // genuine re-CREATE is not blocked by it.)
+            let already = sqlite_master_records_of(c, member.as_deref())
+                .get(&exact)
+                .is_some_and(|v| !v.is_empty());
+            if !already {
+                put_record(c, member.as_deref(), ns, &key, &rec);
+            }
         }
         // DROP: forget the text. The facade has no delete outside a session, so
         // autocommit writes an EMPTY record instead — a tombstone, since

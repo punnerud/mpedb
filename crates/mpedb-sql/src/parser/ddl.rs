@@ -724,6 +724,13 @@ impl<'a> Parser<'a> {
     /// be a schema-hash input that buys nothing. Duplicate names are therefore
     /// not diagnosed either — nor are they by sqlite across tables.
     fn parse_create_table(&mut self) -> Result<DdlStmt> {
+        let if_not_exists = if self.eat_word("IF") {
+            self.expect_kw(Kw::Not, "NOT")?;
+            self.expect_word("EXISTS")?;
+            true
+        } else {
+            false
+        };
         let name = self.ident("table name")?;
         self.expect(&Tok::LParen, "(")?;
         let mut columns: Vec<crate::ddl::CreateColumnSpec> = Vec::new();
@@ -777,6 +784,7 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::RParen, ")")?;
         Ok(DdlStmt::CreateTable(crate::ddl::CreateTableSpec {
             name,
+            if_not_exists,
             columns,
             table_pk,
             uniques,

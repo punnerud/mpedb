@@ -88,8 +88,28 @@ pub fn inline_views_with_ctes(
             }
             Ok(())
         }
-        Stmt::Update(u) => refuse_view_target(&u.table, views, ctes, "UPDATE"),
-        Stmt::Delete(d) => refuse_view_target(&d.table, views, ctes, "DELETE"),
+        // A write's WHERE holds subqueries like any other expression, and they
+        // may name views, CTEs or derived tables. Only the write TARGET was
+        // ever looked at, so `DELETE … WHERE id IN (SELECT 1 FROM (SELECT 1)
+        // WHERE 1!=1)` — SQLAlchemy's empty-IN — reached the planner with its
+        // derived table unflattened and was refused by name.
+        Stmt::Update(u) => {
+            refuse_view_target(&u.table, views, ctes, "UPDATE")?;
+            for (_, e) in &mut u.set {
+                flatten_expr(e, views, ctes, 0)?;
+            }
+            if let Some(w) = &mut u.where_clause {
+                flatten_expr(w, views, ctes, 0)?;
+            }
+            Ok(())
+        }
+        Stmt::Delete(d) => {
+            refuse_view_target(&d.table, views, ctes, "DELETE")?;
+            if let Some(w) = &mut d.where_clause {
+                flatten_expr(w, views, ctes, 0)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

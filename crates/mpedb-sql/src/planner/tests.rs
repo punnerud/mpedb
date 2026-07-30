@@ -703,3 +703,40 @@ fn a_fromless_derived_table_flattens_like_a_fromless_cte() {
         prepare(sql, &s).unwrap_or_else(|e| panic!("`{sql}` should compile: {e:?}"));
     }
 }
+
+/// A write's WHERE holds subqueries like any other expression. Only the write
+/// TARGET was ever inspected for views/CTEs/derived tables, so the flattener
+/// never ran over the condition — and SQLAlchemy's empty-IN reached the planner
+/// with its derived table intact and was refused by name.
+#[test]
+fn a_write_flattens_the_subqueries_in_its_condition() {
+    let s = test_schema();
+    for sql in [
+        "DELETE FROM users WHERE id IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)",
+        "UPDATE users SET age = 1 WHERE id IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)",
+    ] {
+        prepare(sql, &s).unwrap_or_else(|e| panic!("`{sql}` should compile: {e:?}"));
+    }
+}
+
+/// `CREATE TABLE IF NOT EXISTS` — every ORM's "create if missing" path. It was
+/// refused at PARSE, so a schema that already existed could not be re-declared
+/// at all.
+#[test]
+fn create_table_if_not_exists_parses() {
+    let d = crate::parse_ddl("CREATE TABLE IF NOT EXISTS t (a INTEGER PRIMARY KEY)")
+        .unwrap()
+        .expect("a DDL statement");
+    match d {
+        crate::DdlStmt::CreateTable(spec) => {
+            assert!(spec.if_not_exists);
+            assert_eq!(spec.name, "t");
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+    let d = crate::parse_ddl("CREATE TABLE t (a INTEGER PRIMARY KEY)").unwrap().unwrap();
+    match d {
+        crate::DdlStmt::CreateTable(spec) => assert!(!spec.if_not_exists),
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+}

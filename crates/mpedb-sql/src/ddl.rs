@@ -77,6 +77,12 @@ pub struct CreateColumnSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableSpec {
     pub name: String,
+    /// `CREATE TABLE IF NOT EXISTS` — an existing table of this name makes the
+    /// statement a no-op instead of an error. Every ORM's "create if missing"
+    /// path writes it; refusing it at PARSE made the whole statement
+    /// unrunnable, so a schema that already existed could not even be
+    /// re-declared.
+    pub if_not_exists: bool,
     pub columns: Vec<CreateColumnSpec>,
     /// Table-level `PRIMARY KEY (…)`; empty when a column carries the
     /// inline `PRIMARY KEY` flag instead.
