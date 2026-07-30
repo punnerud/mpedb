@@ -297,8 +297,27 @@ fn flatten_cte(
     if n_params != 0 {
         return Err(bind_err(format!("CTE `{tname}` body must not use parameters")));
     }
-    let Stmt::Select(mut body) = cte_stmt else {
-        return Err(bind_err(format!("CTE `{tname}` body is not a simple SELECT")));
+    let mut body = match cte_stmt {
+        Stmt::Select(b) => b,
+        // A COMPOUND body (`SELECT … UNION ALL SELECT …`, which is also what a
+        // multi-row `VALUES` CTE becomes) has no single base table to splice
+        // onto. It is exactly a derived table, so it becomes one and takes the
+        // materialize path that already exists for `FROM (<compound>)` — no
+        // second machinery, and the outermost-FROM restriction that path
+        // carries applies here too, reported by its own name.
+        Stmt::Compound(c) => {
+            if s.from_derived.is_some() {
+                return Err(bind_err(format!(
+                    "CTE `{tname}` has a compound body and the statement already \
+                     has a derived table in its FROM"
+                )));
+            }
+            s.table = None;
+            s.alias = Some(ref_alias);
+            s.from_derived = Some(Box::new(SubqueryBody::Compound(c)));
+            return Ok(());
+        }
+        _ => return Err(bind_err(format!("CTE `{tname}` body is not a simple SELECT"))),
     };
     // The body itself may reference a view or another CTE.
     flatten_select(&mut body, views, ctes, depth + 1)?;
@@ -308,6 +327,78 @@ fn flatten_cte(
     // and every constant-row CTE. A table-backed body keeps the keep-alias path.
     if body.table.is_none() {
         return flatten_cte_fromless(s, tname, body, &ref_alias);
+    }
+    // A body that RENAMES or COMPUTES its columns — `WITH c AS (SELECT a AS p,
+    // b + 1 AS q FROM t)`, and every `WITH c(p, q) AS …` since the column list
+    // is applied as exactly those aliases — cannot be spliced as-is: the outer
+    // names `p`, and the base table has no such column. Substituting the body's
+    // expression for each exposed name FIRST leaves an outer that refers only
+    // to the base's own columns, which is the shape the splice below wants.
+    //
+    // Cardinality is a different question and stays refused by `check_simple`:
+    // an aggregate, DISTINCT, GROUP BY or LIMIT body is not one row per base
+    // row, so no substitution makes the splice sound.
+    // Not when the body CHANGES CARDINALITY. An aggregate with no GROUP BY
+    // collapses the body to one row, so substituting its expression into an
+    // outer that is evaluated per BASE row is not the same query — and clearing
+    // the projection to make the splice legal would take the aggregate out of
+    // `check_simple`'s sight, which is what made this a silent acceptance for
+    // one iteration of this work. Left intact, it refuses exactly as before.
+    let cardinality_changing = body
+        .items
+        .as_ref()
+        .is_some_and(|items| items.iter().any(|(e, _)| expr_aggregates(e)))
+        && body.group_by.is_empty();
+    let mut renames =
+        if cardinality_changing { HashMap::new() } else { body_exposed_names(&body) };
+    // A substituted expression may name the body's own source (`SELECT t.a AS
+    // p`), and the splice below re-aliases that source to the reference name.
+    // Rename inside the substitutions too, exactly as the body's WHERE is
+    // renamed — otherwise the outer ends up holding `t.a` over a base the
+    // statement now calls `c`.
+    if !renames.is_empty() {
+        let src_name = body
+            .alias
+            .clone()
+            .or_else(|| body.table.clone())
+            .unwrap_or_default();
+        if !src_name.is_empty() {
+            for e in renames.values_mut() {
+                rename_qualifier(e, &src_name, &ref_alias);
+            }
+        }
+    }
+    if !renames.is_empty() {
+        if s.items.is_none() && s.joins.is_empty() {
+            // `SELECT * FROM c` — the star IS the body's projection, aliases
+            // included, so there is nothing to substitute into.
+            s.items = body.items.clone();
+        } else {
+            if s.items.is_none() {
+                return Err(bind_err(format!(
+                    "`SELECT *` over a JOIN with a projecting CTE (`{tname}`) is not \
+                     supported yet; list the output columns explicitly"
+                )));
+            }
+            let Some(items) = s.items.as_mut() else { unreachable!("checked above") };
+            for (e, _) in items {
+                rewrite_cte_cols(e, &renames, tname, &ref_alias)?;
+            }
+            for e in &mut s.group_by {
+                rewrite_cte_cols(e, &renames, tname, &ref_alias)?;
+            }
+            if let Some(h) = &mut s.having {
+                rewrite_cte_cols(h, &renames, tname, &ref_alias)?;
+            }
+            for (e, _) in &mut s.order_by {
+                rewrite_cte_cols(e, &renames, tname, &ref_alias)?;
+            }
+        }
+        if let Some(w) = &mut s.where_clause {
+            rewrite_cte_cols(w, &renames, tname, &ref_alias)?;
+        }
+        // The projection has done its job; the outer supplies its own now.
+        body.items = None;
     }
     check_simple(&body, tname)?;
 
@@ -1419,6 +1510,38 @@ fn collect_expr_sources(e: &Expr, out: &mut Vec<String>) {
 /// closed exactly none of them. One `check_simple` call is one bind error, so
 /// listing all the reasons costs nothing and stops the next reader from
 /// building the wrong thing.
+/// The names a CTE body EXPOSES that are not simply its base columns, mapped to
+/// the expression behind each: an explicit alias, or a computed item.
+///
+/// Empty when every item is a bare column with no alias — the shape the splice
+/// already handled, so the common case costs one scan and changes nothing.
+fn body_exposed_names(body: &SelectStmt) -> HashMap<String, Expr> {
+    let Some(items) = &body.items else {
+        return HashMap::new();
+    };
+    let renaming = items
+        .iter()
+        .any(|(e, a)| a.is_some() || !matches!(e, Expr::Col(_)));
+    if !renaming {
+        return HashMap::new();
+    }
+    let mut map = HashMap::new();
+    for (e, alias) in items {
+        let name = match (alias, e) {
+            (Some(a), _) => a.clone(),
+            (None, Expr::Col(c)) => c.clone(),
+            (None, Expr::Qualified(_, c)) => c.clone(),
+            // An un-aliased computed item has no name an outer query could
+            // write, so there is nothing to substitute for it.
+            _ => continue,
+        };
+        // First wins, matching the FROM-less path: a duplicate exposed name is
+        // a later bind error, not something to paper over here.
+        map.entry(fold_ident(&name)).or_insert_with(|| e.clone());
+    }
+    map
+}
+
 fn check_simple(v: &SelectStmt, name: &str) -> Result<()> {
     let mut bad: Vec<&str> = Vec::new();
     if v.table.is_none() {

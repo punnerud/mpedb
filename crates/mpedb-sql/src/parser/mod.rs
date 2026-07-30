@@ -114,6 +114,170 @@ pub(crate) fn parse_statement(sql: &str) -> Result<(Stmt, bool, u16)> {
 /// flattened like a view at reference time (#CTE).
 pub(crate) type CteDefs = Vec<(String, String)>;
 
+/// `VALUES (a, b), (c, d)` → `SELECT a, b UNION ALL SELECT c, d`.
+///
+/// `None` when the source does not start with `VALUES`, or when the row groups
+/// are not the plain parenthesised lists this can rewrite — in which case the
+/// body is left exactly as written and refuses downstream as it did before.
+fn values_body_to_select(src: &str) -> Option<String> {
+    let toks = tokenize(src).ok()?;
+    let first = toks.first()?;
+    let is_values = match &first.tok {
+        Tok::Kw(Kw::Values) => true,
+        Tok::Ident(w) => w.eq_ignore_ascii_case("VALUES"),
+        _ => false,
+    };
+    if !is_values {
+        return None;
+    }
+    // Each row is a depth-0 `( … )` group; anything between the groups other
+    // than a comma means this is not the simple shape.
+    let mut rows: Vec<&str> = Vec::new();
+    let mut i = 1usize;
+    while i < toks.len() {
+        if !matches!(toks[i].tok, Tok::LParen) {
+            return None;
+        }
+        let open = i;
+        let mut depth = 0usize;
+        let close = loop {
+            match toks.get(i)?.tok {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break i;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        };
+        let inner = src.get(toks[open].pos + 1..toks[close].pos)?.trim();
+        if inner.is_empty() {
+            return None;
+        }
+        rows.push(inner);
+        i = close + 1;
+        match toks.get(i).map(|t| &t.tok) {
+            None => break,
+            Some(Tok::Comma) => i += 1,
+            // Trailing text (an ORDER BY, a LIMIT) — not this shape.
+            Some(_) => return None,
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(
+        rows.iter()
+            .map(|r| format!("SELECT {r}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL "),
+    )
+}
+
+
+/// Rewrite `SELECT a, b FROM t` into `SELECT a AS x, b AS y FROM t` — a CTE's
+/// explicit column list, applied to the body source.
+///
+/// Depth-aware, so a comma inside a function call or a nested subquery does not
+/// split an item, and it stops at the first depth-0 clause keyword after the
+/// select list. A COMPOUND body is aliased on its FIRST arm, which is where SQL
+/// takes a compound's column names from.
+///
+/// `Err` (a message, not a parse error — the caller positions it) for the two
+/// shapes this cannot rename: a `*` item, whose arity is unknown until the
+/// schema is in hand, and a count that disagrees with the list.
+fn alias_select_items(src: &str, names: &[String]) -> std::result::Result<String, String> {
+    let toks = tokenize(src).map_err(|e| format!("body does not tokenize: {e}"))?;
+    if !matches!(toks.first().map(|t| &t.tok), Some(Tok::Kw(Kw::Select))) {
+        return Err("body must be a SELECT".into());
+    }
+    // Where each item starts, and where the select list ends.
+    let end_of = |i: usize| toks.get(i).map_or(src.len(), |t: &SpTok| t.pos);
+    let mut starts = vec![1usize];
+    let mut list_end = toks.len();
+    let mut depth = 0usize;
+    for (i, t) in toks.iter().enumerate().skip(1) {
+        match &t.tok {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth = depth.saturating_sub(1),
+            Tok::Comma if depth == 0 => starts.push(i + 1),
+            // The select list ends at the first depth-0 clause keyword. `AS`
+            // is not one — an item may already carry an alias, which the
+            // declared name then replaces. UNION/INTERSECT/EXCEPT are
+            // positional words rather than keyword tokens, so they are matched
+            // by text, and they matter: a compound body takes its column names
+            // from the FIRST arm, which is the arm being aliased.
+            Tok::Kw(Kw::From | Kw::Where | Kw::Group | Kw::Order | Kw::Limit)
+                if depth == 0 =>
+            {
+                list_end = i;
+                break;
+            }
+            Tok::Ident(w)
+                if depth == 0
+                    && ["UNION", "INTERSECT", "EXCEPT"]
+                        .iter()
+                        .any(|k| w.eq_ignore_ascii_case(k)) =>
+            {
+                list_end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    // Item i spans [start_i, next boundary) — the comma before the next item,
+    // or the end of the list.
+    let mut items: Vec<&str> = Vec::with_capacity(starts.len());
+    for (n, &st) in starts.iter().enumerate() {
+        let mut end_tok = starts.get(n + 1).map_or(list_end, |&s| s - 1);
+        // An item may ALREADY carry an alias — `SELECT some_table.id AS id` is
+        // how every ORM writes one — and the declared name replaces it. Left
+        // in place it produced `id AS id AS "p"`, two aliases on one item,
+        // which is a parse error rather than a rename.
+        if end_tok >= st + 2
+            && matches!(toks.get(end_tok - 2).map(|t| &t.tok), Some(Tok::Kw(Kw::As)))
+        {
+            end_tok -= 2;
+        }
+        let text = src[end_of(st)..end_of(end_tok)].trim();
+        if text.is_empty() {
+            return Err("an empty select-list item".into());
+        }
+        items.push(text);
+    }
+    if items.len() != names.len() {
+        return Err(format!(
+            "declares {} column(s) but the body returns {}",
+            names.len(),
+            items.len()
+        ));
+    }
+    if items.iter().any(|t| t.ends_with('*')) {
+        return Err("a `*` item cannot be renamed positionally".into());
+    }
+    let mut out = String::with_capacity(src.len() + names.len() * 8);
+    out.push_str(&src[..end_of(1)]);
+    for (n, (item, name)) in items.iter().zip(names).enumerate() {
+        if n > 0 {
+            out.push_str(", ");
+        }
+        // An item may already end in `AS <alias>`; the declared name replaces
+        // it, and a second `AS` after the first is what the parser reads last.
+        out.push_str(item);
+        out.push_str(" AS ");
+        out.push('"');
+        out.push_str(&name.replace('"', "\"\""));
+        out.push('"');
+    }
+    out.push(' ');
+    out.push_str(&src[end_of(list_end)..]);
+    Ok(out)
+}
+
+
 /// Like [`parse_statement`] but also returns any leading `WITH` CTE definitions
 /// as `(name, body-source-text)` pairs (#CTE). The caller folds them into the
 /// view catalog so `crate::view::inline_views` flattens a `FROM cte` reference
@@ -591,16 +755,40 @@ impl<'a> Parser<'a> {
         let mut ctes = Vec::new();
         loop {
             let name = self.ident("a CTE name after WITH")?;
-            // `WITH c(x, y) AS …` needs positional column remapping — the exact
-            // thing the flattener avoids — so it is refused, like a view with an
-            // explicit column list.
-            if self.peek() == Some(&Tok::LParen) {
-                return Err(self.err_here(
-                    "WITH with an explicit column list is not supported yet",
-                ));
+            // `WITH c(x, y) AS (SELECT a, b FROM t)` IS
+            // `WITH c AS (SELECT a AS x, b AS y FROM t)` — the column list is
+            // positional renaming and nothing else. Applying it to the captured
+            // body here means the flattener, the binder and every downstream
+            // stage see a body whose output names are already the declared
+            // ones, with no catalog type or signature change anywhere.
+            let mut cols: Vec<String> = Vec::new();
+            if self.eat(&Tok::LParen) {
+                loop {
+                    cols.push(self.ident("a column name in the CTE column list")?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen, "`)` closing the CTE column list")?;
+                if cols.is_empty() {
+                    return Err(self.err_here("a CTE column list must not be empty"));
+                }
             }
             self.expect_kw(Kw::As, "AS after the CTE name")?;
             let body = self.capture_paren_source()?;
+            // `WITH c(a, b) AS (VALUES (1, 2), (3, 4))` — a VALUES body is a
+            // compound of constant-row SELECTs and nothing more, so it is
+            // rewritten into one before anything else looks at it. SQLAlchemy
+            // writes this for a literal-rows CTE.
+            let body = values_body_to_select(&body).unwrap_or(body);
+            let body = if cols.is_empty() {
+                body
+            } else {
+                alias_select_items(&body, &cols).map_err(|msg| Error::Parse {
+                    pos: self.here(),
+                    msg: format!("CTE `{name}` column list: {msg}"),
+                })?
+            };
             ctes.push((name, body));
             if ctes.len() > 32 {
                 return Err(self.err_here("too many CTEs in one WITH (max 32)"));

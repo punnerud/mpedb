@@ -360,9 +360,15 @@ fn refusals() {
     setup(&db);
     // RECURSIVE is refused.
     assert!(db.query("WITH RECURSIVE c AS (SELECT 1) SELECT * FROM c", &[]).is_err());
-    // An explicit column list is refused.
-    assert!(db.query("WITH c(x) AS (SELECT a FROM t) SELECT x FROM c", &[]).is_err());
-    // A complex (aggregate) body is refused at reference time.
+    // An explicit column list whose ARITY disagrees with the body is refused
+    // (the list itself is supported — see
+    // `an_explicit_column_list_renames_positionally`).
+    assert!(db.query("WITH c(x, y) AS (SELECT a FROM t) SELECT x FROM c", &[]).is_err());
+    // …and one over a `*` body, whose width is not known here.
+    assert!(db.query("WITH c(x) AS (SELECT * FROM t) SELECT x FROM c", &[]).is_err());
+    // A cardinality-CHANGING body (an aggregate with no GROUP BY) is refused
+    // at reference time: it collapses to one row, so no substitution of its
+    // projection into a per-base-row outer is the same query.
     assert!(db.query("WITH c AS (SELECT count(*) AS n FROM t) SELECT * FROM c", &[]).is_err());
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
@@ -401,6 +407,57 @@ fn fromless_cte_body_is_a_constant_row() {
     assert!(db
         .query("WITH c AS (SELECT count(*) AS n) SELECT * FROM c", &[])
         .is_err());
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `WITH c(p, q) AS (SELECT a, b FROM t)` IS
+/// `WITH c AS (SELECT a AS p, b AS q FROM t)` — the column list is positional
+/// renaming and nothing else, so it is applied to the body at parse time and
+/// every stage below sees a body whose output names are already the declared
+/// ones.
+///
+/// The renaming half is what needed the flattener changed: a body that renames
+/// or COMPUTES its columns could not be spliced, because the outer names `p`
+/// and the base table has no such column. Substituting each exposed name's
+/// expression first leaves an outer that refers only to the base's columns.
+#[test]
+fn an_explicit_column_list_renames_positionally() {
+    let (db, path) = open();
+    setup(&db);
+    let rows = |sql: &str| match db.query(sql, &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows from `{sql}`, got {other:?}"),
+    };
+    // Renaming, projection order, a computed item, and a WHERE over the
+    // declared name.
+    assert_eq!(
+        rows("WITH c(p) AS (SELECT a FROM t WHERE a = 2) SELECT p FROM c"),
+        vec![vec![Value::Int(2)]]
+    );
+    assert_eq!(
+        rows("WITH c(p) AS (SELECT a + 10 FROM t WHERE a = 2) SELECT p FROM c"),
+        vec![vec![Value::Int(12)]]
+    );
+    assert_eq!(
+        rows("WITH c(p) AS (SELECT a FROM t) SELECT p FROM c WHERE p = 3"),
+        vec![vec![Value::Int(3)]]
+    );
+    // An item that ALREADY carries an alias — `SELECT t.a AS a`, which is how
+    // every ORM writes one — has it replaced, not appended: two aliases on one
+    // item is a parse error rather than a rename. A qualified item also gets
+    // its qualifier renamed to the reference name, since the splice re-aliases
+    // the base.
+    assert_eq!(
+        rows("WITH c(p) AS (SELECT t.a AS a FROM t WHERE a = 2) SELECT p FROM c"),
+        vec![vec![Value::Int(2)]]
+    );
+    // A VALUES body is a compound of constant rows and takes the derived-table
+    // materialize path.
+    assert_eq!(
+        rows("WITH c(p) AS (VALUES (7), (8)) SELECT p FROM c WHERE p = 8"),
+        vec![vec![Value::Int(8)]]
+    );
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }

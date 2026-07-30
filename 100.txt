@@ -552,6 +552,13 @@ De 66 siste DB-labelene ble målt (WB_GROUP_BASE=20, logger i
   * `journalctl -k` viser IKKE bruker-systemds OOM-linjer. Bruk
     `journalctl --user -b --since ...` og SJEKK RIKTIG TIDSVINDU (et drap i
     forrige boot krever `-b -1`).
+  * IKKE rydd /dev/shm MENS andre tester kjører. Korpus-løkken min slettet
+    filer der mellom hver chunk, og `ring_stmt_atomicity` legger databasen
+    sin i /dev/shm — den ble slettet under testen, og feilen så ut som et
+    brudd på commit-atomisiteten («committed state must match too, left:
+    []»). 2 av 3 med endringen, 4 av 4 uten, altså overbevisende — og likevel
+    galt: 8 av 8 grønne så snart ryddingen ikke gikk samtidig. Rydd FØR og
+    ETTER, aldri under.
   * Rydd /dev/shm før tunge kjøringer (#137):
       ls /dev/shm | grep -E '^(mpedb|etl|rretl|ingest|collab|tier|corpus)' \
         | while read -r f; do rm -f "/dev/shm/$f"; done
