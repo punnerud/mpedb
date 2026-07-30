@@ -566,8 +566,21 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // than main's: "that database has no such table" is the truthful
             // answer, and silently substituting main is how a reflection tool
             // ends up describing the wrong file.
-            let qualifier = introspect::pragma_schema(sqltext)
+            let mut qualifier = introspect::pragma_schema(sqltext)
                 .filter(|q| !q.eq_ignore_ascii_case("main"));
+            // An UNQUALIFIED pragma name resolves against temp first, exactly
+            // as a bare table reference does (measured: with the object only in
+            // temp, `PRAGMA table_info(x)` answers it; sqlite has no separate
+            // rule for pragmas). Without this a temp table or view answered
+            // only when the caller wrote `temp.` — and SQLAlchemy's
+            // `get_multi_*` reflection never does.
+            if qualifier.is_none() && introspect::pragma_schema(sqltext).is_none() {
+                if let (_, Some(arg)) = introspect::parse_pragma(sqltext) {
+                    if names_temp_object(c, &arg) {
+                        qualifier = Some("temp".to_string());
+                    }
+                }
+            }
             let bundle = match qualifier.as_deref() {
                 Some(q) => c.db.attached_schema_or_empty(q),
                 None => match c.txn.as_ref() {
@@ -838,6 +851,17 @@ fn table_index_count(c: &Sqlite3, table: &str) -> Option<usize> {
     introspect::table_by_exact_name(&schema, &exact).map(|t| t.indexes.len())
 }
 
+/// Does `name` name an object in the connection's TEMP schema — a temp table
+/// or a temp view? The bare-name shadowing test for pragmas.
+fn names_temp_object(c: &Sqlite3, name: &str) -> bool {
+    let in_view = c
+        .db
+        .temp_views_all()
+        .iter()
+        .any(|(n, _, _)| n.eq_ignore_ascii_case(name));
+    in_view || introspect::names_a_table(&c.db.temp_schema_or_empty(), name)
+}
+
 /// `PRAGMA [<schema>.]table_info(<view>)` — a view's RESULT columns.
 ///
 /// sqlite reports the same six columns it does for a table, with `notnull`,
@@ -867,7 +891,25 @@ fn view_table_info(
     if introspect::names_a_table(bundle, &arg) {
         return None;
     }
+    let temp = qualifier.is_some_and(|q| q.eq_ignore_ascii_case("temp"));
+    // A temp view is connection-local text, not an object of any member, so it
+    // is looked up on the handle — and its BODY is what gets probed. Probing
+    // `SELECT * FROM v` instead would go through the routing inliner, which
+    // wraps the body in a derived table, and a derived table has no base column
+    // for `output_decltypes` to report: every column came back with an empty
+    // type where sqlite reports the underlying one. mpedb refuses `CREATE VIEW
+    // v(a, b)`, so the body's output names ARE the view's column names.
+    let mut temp_body = None;
     let exact = match qualifier {
+        Some(_) if temp => {
+            let (n, body, _) = c
+                .db
+                .temp_views_all()
+                .into_iter()
+                .find(|(n, _, _)| n.eq_ignore_ascii_case(&arg))?;
+            temp_body = Some(body);
+            n
+        }
         Some(q) => c
             .db
             .attached_list_views(q)
@@ -882,8 +924,18 @@ fn view_table_info(
     // here, or the member itself. It cannot be qualified and run on main: a
     // read against an attached member takes the cross-file path, which resolves
     // that member's TABLES and has no view of its own to expand.
-    let probe = format!("SELECT * FROM \"{}\" LIMIT 0", exact.replace('"', "\"\""));
+    let probe = match temp_body {
+        Some(body) => body,
+        None => format!("SELECT * FROM \"{}\" LIMIT 0", exact.replace('"', "\"\"")),
+    };
     let (cols, decl) = match qualifier {
+        Some(_) if temp => {
+            let cols = match c.db.query(&probe, &[]) {
+                Ok(mpedb::ExecResult::Rows { columns, .. }) => columns,
+                _ => return None,
+            };
+            (cols, c.db.routed_output_decltypes(&probe))
+        }
         Some(q) => c.db.attached_probe_columns(q, &probe)?,
         None => {
             let cols = match c.db.query(&probe, &[]) {

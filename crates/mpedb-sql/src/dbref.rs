@@ -334,6 +334,81 @@ pub fn rewrite_temp_ddl(sql: &str) -> Result<Option<String>> {
     Ok(Some(out))
 }
 
+
+/// Replace every bare reference to a connection-local TEMP VIEW with its body
+/// as a subquery, before anything else looks at the statement.
+///
+/// A temp view is stored TEXT on the handle, not an object of any database, so
+/// nobody can route a reference to it: `user_tmp_v` over a temp table compiled
+/// against main (where the temp table is not), and over a main table it only
+/// worked because main is where compilation happens anyway. Inlining first
+/// makes the BODY's own references the ones that get resolved — a body over
+/// temp tables routes to temp, over main tables to main, and a mixed one is
+/// cross, which is exactly what each of those cases is.
+///
+/// Only FROM/JOIN table positions are touched (`collect_table_refs` finds
+/// them), and only unqualified ones: `main.v` is not this view, and `temp.v`
+/// already says which schema it means. An unaliased entry keeps its name as
+/// the alias, so `SELECT v.c FROM v` still resolves.
+///
+/// Returns `None` when nothing referenced a temp view. Rounds are bounded: a
+/// view whose body names another temp view expands on the next pass, and the
+/// cap is what stops a view that (somehow) names itself.
+pub fn inline_temp_views(
+    sql: &str,
+    views: &std::collections::HashMap<String, String>,
+) -> Result<Option<String>> {
+    const MAX_ROUNDS: usize = 8;
+    if views.is_empty() {
+        return Ok(None);
+    }
+    let mut cur = sql.to_string();
+    let mut changed = false;
+    for _ in 0..MAX_ROUNDS {
+        let toks = token::tokenize(&cur)?;
+        if toks.is_empty() {
+            break;
+        }
+        let end_of = |i: usize| toks.get(i + 1).map_or(cur.len(), |t| t.pos);
+        let mut head = 0usize;
+        if toks[head].tok == Tok::Kw(Kw::Explain) {
+            head += 1;
+        }
+        let refs = match collect_table_refs(&toks, head) {
+            Ok(r) => r,
+            // Not a shape the reference collector understands; leave it alone
+            // and let the ordinary path report whatever it reports.
+            Err(_) => return Ok(if changed { Some(cur) } else { None }),
+        };
+        let cte_names = collect_cte_names(&toks, head);
+        let mut edits = Vec::new();
+        for r in &refs {
+            if r.db.is_some() || has_name(&cte_names, &r.name) {
+                continue;
+            }
+            let Some(body) = views
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&r.name))
+                .map(|(_, b)| b)
+            else {
+                continue;
+            };
+            let text = if r.has_alias {
+                format!("({body}) ")
+            } else {
+                format!("({}) AS {} ", body, quote_ident(&r.name))
+            };
+            edits.push(Edit { start: toks[r.start].pos, end: end_of(r.name_idx), text });
+        }
+        if edits.is_empty() {
+            break;
+        }
+        cur = apply_edits(&cur, edits);
+        changed = true;
+    }
+    Ok(if changed { Some(cur) } else { None })
+}
+
 /// Resolve every table reference in `sql` against `scope` and rewrite
 /// (see the module docs for the full contract).
 pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {

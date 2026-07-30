@@ -45,7 +45,7 @@ use mpedb_sql::{
     AttachStmt, CompiledPlan, DbResolution, DbScope, DdlStmt, PlanHash, PolicyCatalog, SortDir,
 };
 use mpedb_types::{Config, Error, ExprProgram, HostFns, Result, Schema, TableDef, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -148,6 +148,30 @@ impl Database {
         match guard.find(name) {
             None => Vec::new(),
             Some(i) => guard.members[i].db.list_triggers().unwrap_or_default(),
+        }
+    }
+
+    /// `output_decltypes`, but ROUTED — asked of whichever handle would
+    /// actually compile the statement.
+    ///
+    /// [`Database::output_decltypes`] compiles on main unconditionally, so a
+    /// statement over temp or attached tables failed to bind there and reported
+    /// no types at all. `PRAGMA table_info` on a temp view came back with every
+    /// column typeless because of it.
+    pub fn routed_output_decltypes(&self, sql: &str) -> Vec<Option<String>> {
+        match self.resolve_db_refs_hook(sql) {
+            Ok(DbRoute::AttachedOnly { db, sql }) => {
+                let guard = self.attached.read().expect(POISON);
+                match guard.find(&db) {
+                    Some(i) => guard.members[i].db.output_decltypes(&sql).unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            }
+            Ok(DbRoute::Main(s)) => self.output_decltypes(&s).unwrap_or_default(),
+            Ok(DbRoute::Passthrough) => self.output_decltypes(sql).unwrap_or_default(),
+            // A cross-file read has no single schema to report a declared type
+            // against; empty is what sqlite reports for a computed column too.
+            _ => Vec::new(),
         }
     }
 
@@ -394,6 +418,20 @@ impl Database {
             .collect()
     }
 
+    /// Inline this connection's temp views into `sql`, or `None` if it names
+    /// none. See [`mpedb_sql::inline_temp_views`] for why it has to happen
+    /// before routing rather than at bind.
+    fn inline_temp_view_refs(&self, sql: &str) -> Result<Option<String>> {
+        let guard = self.temp_views.read().expect(POISON);
+        if guard.is_empty() {
+            return Ok(None);
+        }
+        let bodies: HashMap<String, String> =
+            guard.iter().map(|(n, (s, _))| (n.clone(), s.clone())).collect();
+        drop(guard);
+        mpedb_sql::inline_temp_views(sql, &bodies)
+    }
+
     /// Merge the temp views over a main view catalog (temp shadows main).
     pub(crate) fn merge_temp_views(&self, cat: &mut mpedb_sql::ViewCatalog) {
         for (name, (src, _)) in self.temp_views.read().expect(POISON).iter() {
@@ -510,6 +548,17 @@ impl Database {
         // first use and the statement is rewritten to name it. Everything after
         // this point — the DDL parser, the applier, the reference resolver —
         // sees a statement it already knows how to run.
+        // A reference to a connection-local temp VIEW is replaced by its body
+        // first, so what gets routed is what the view actually reads. Free
+        // when the connection has defined none.
+        let inlined;
+        let sql = match self.inline_temp_view_refs(sql)? {
+            Some(s) => {
+                inlined = s;
+                inlined.as_str()
+            }
+            None => sql,
+        };
         if let Some(rewritten) = mpedb_sql::rewrite_temp_ddl(sql)? {
             self.ensure_temp_schema()?;
             let guard = self.attached.read().expect(POISON);

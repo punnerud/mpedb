@@ -681,3 +681,28 @@ fn one_name_in_two_schemas_keeps_two_view_definitions() {
     // And they read their OWN table: main's `t` has three rows, `other`'s one.
     assert_eq!(mpedb_rows(&f.main, "SELECT count(*) FROM t_v")[0][0], Value::Int(3));
 }
+
+/// A temp view over a TEMP TABLE. The body is what has to be routed, not the
+/// view's name: expanded at bind time it compiled against main, where the temp
+/// table is not, and `SELECT * FROM v` failed with `unknown table` naming a
+/// table the caller never wrote.
+///
+/// The main-body case in
+/// [`a_temp_view_over_a_main_table_is_created_read_and_dropped`] is the other
+/// half — the two bodies route to two different places, and the inliner is
+/// what lets each go where it belongs.
+#[test]
+fn a_temp_view_over_a_temp_table_reads_the_temp_table() {
+    let f = fix("tempviewtemp", false);
+    f.main.query("CREATE TEMP TABLE tt (a INT)", &[]).unwrap();
+    f.main.query("INSERT INTO tt (a) VALUES (5)", &[]).unwrap();
+    f.main.query("INSERT INTO tt (a) VALUES (6)", &[]).unwrap();
+    f.main.query("CREATE TEMP VIEW tv AS SELECT a FROM tt", &[]).unwrap();
+
+    assert_eq!(mpedb_rows(&f.main, "SELECT count(*) FROM tv")[0][0], Value::Int(2));
+    assert_eq!(mpedb_rows(&f.main, "SELECT a FROM tv WHERE a > 5")[0][0], Value::Int(6));
+    // An alias still resolves — the inliner keeps the entry's own name when
+    // there is none, and leaves an explicit one alone.
+    assert_eq!(mpedb_rows(&f.main, "SELECT tv.a FROM tv WHERE tv.a = 5")[0][0], Value::Int(5));
+    assert_eq!(mpedb_rows(&f.main, "SELECT x.a FROM tv AS x WHERE x.a = 6")[0][0], Value::Int(6));
+}
