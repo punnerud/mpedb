@@ -675,7 +675,11 @@ fn resolve_ddl(
     let creating = toks.first().is_some_and(|t| is_word(&t.tok, "CREATE"));
     for i in 0..toks.len() {
         let after_on = matches!(&toks[i].tok, Tok::Kw(Kw::On)) || is_word(&toks[i].tok, "ON");
-        let after_table = is_word(&toks[i].tok, "TABLE") && !creating;
+        // VIEW / TRIGGER / INDEX name their object the same way TABLE does, and
+        // `CREATE TEMP VIEW v` put one in temp that `DROP VIEW v` then could not
+        // find.
+        let after_table =
+            is_any_word(&toks[i].tok, &["TABLE", "VIEW", "TRIGGER", "INDEX"]) && !creating;
         if !after_on && !after_table {
             continue;
         }

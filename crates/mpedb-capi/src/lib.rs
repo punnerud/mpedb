@@ -557,12 +557,26 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // `iterdump` runs `table_info` before COMMIT — without this the
             // dump emits `VALUES()` with no columns). Outside a txn, refresh
             // so a just-committed CREATE is not stale.
-            let bundle = match c.txn.as_ref() {
-                Some(s) => s.schema(),
-                None => {
-                    let _ = c.db.refresh_schema_if_stale();
-                    c.db.schema()
-                }
+            // A pragma qualified with an ATTACHED database answers about that
+            // database. SQLAlchemy's reflection suite attaches a second file as
+            // `test_schema` and reflects through it, so answering from main
+            // instead reported the wrong tables for 264 of its tests.
+            //
+            // A qualifier naming nothing attached yields an EMPTY schema rather
+            // than main's: "that database has no such table" is the truthful
+            // answer, and silently substituting main is how a reflection tool
+            // ends up describing the wrong file.
+            let qualifier = introspect::pragma_schema(sqltext)
+                .filter(|q| !q.eq_ignore_ascii_case("main"));
+            let bundle = match qualifier {
+                Some(q) => c.db.attached_schema_or_empty(&q),
+                None => match c.txn.as_ref() {
+                    Some(s) => s.schema(),
+                    None => {
+                        let _ = c.db.refresh_schema_if_stale();
+                        c.db.schema()
+                    }
+                },
             };
             // `PRAGMA foreign_keys [= ON|OFF]` and `PRAGMA foreign_key_check`
             // (#194) are answered HERE rather than in `introspect`: the setter

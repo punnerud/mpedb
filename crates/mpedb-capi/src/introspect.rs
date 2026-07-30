@@ -714,22 +714,53 @@ impl<'a> DdlWords<'a> {
 /// is what this did for every unqualified pragma already. That is a narrower
 /// gap than the one it replaces, and a visible one: `PRAGMA temp.table_info`
 /// answers for main rather than for the temp schema.
-pub(crate) fn parse_pragma(sql: &str) -> (String, Option<String>) {
-    // Drop the leading `pragma` keyword.
+/// The `<schema>.` a pragma was qualified with, if any — `PRAGMA
+/// test_schema.table_info(t)` answers about that attached database, not main.
+pub fn pragma_schema(sql: &str) -> Option<String> {
+    split_pragma_schema(pragma_body(sql)).0
+}
+
+/// Everything after the `PRAGMA` keyword.
+fn pragma_body(sql: &str) -> &str {
     let rest = sql.trim_start();
     let rest = &rest[rest.find(char::is_whitespace).unwrap_or(rest.len())..];
-    let rest = rest.trim();
-    let ident = |s: &str| -> String {
-        s.chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect()
+    rest.trim()
+}
+
+/// Split a leading `<schema>.` off a pragma body: `(schema, rest)`.
+///
+/// The qualifier may be QUOTED — SQLAlchemy writes
+/// `PRAGMA "test_schema".table_info("users")`, and reading only a bare
+/// identifier there sent 264 of its reflection tests to the main database
+/// instead of the attached one they were about.
+fn split_pragma_schema(body: &str) -> (Option<String>, &str) {
+    let (name, after) = match body.chars().next() {
+        Some(q @ ('"' | '`' | '\'')) => match body[1..].find(q) {
+            Some(end) => (body[1..1 + end].to_string(), &body[end + 2..]),
+            None => return (None, body),
+        },
+        Some('[') => match body.find(']') {
+            Some(end) => (body[1..end].to_string(), &body[end + 1..]),
+            None => return (None, body),
+        },
+        _ => {
+            let bare: String = body
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let n = bare.len();
+            (bare, &body[n..])
+        }
     };
-    // `<schema>.` in front, if any.
-    let first = ident(rest);
-    let rest = match rest[first.len()..].strip_prefix('.') {
-        Some(after_dot) if !first.is_empty() => after_dot.trim_start(),
-        _ => rest,
-    };
+    match (name.is_empty(), after.strip_prefix('.')) {
+        (false, Some(rest)) => (Some(name), rest.trim_start()),
+        _ => (None, body),
+    }
+}
+
+pub(crate) fn parse_pragma(sql: &str) -> (String, Option<String>) {
+    // Drop the leading `pragma` keyword, then the `<schema>.` in front, if any.
+    let (_schema, rest) = split_pragma_schema(pragma_body(sql));
     // Name = leading identifier.
     let name: String = rest
         .chars()

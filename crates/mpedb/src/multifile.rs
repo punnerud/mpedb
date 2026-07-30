@@ -99,14 +99,16 @@ impl Database {
     /// The TEMP schema's catalog for `sqlite_temp_master`, or an EMPTY one when
     /// this connection never made a temp table. Empty is the honest answer
     /// there — the schema does not exist yet — and it is not an error.
+    /// A named attached database's catalog, or an EMPTY one when nothing is
+    /// attached under that name — "that database has no such table" rather than
+    /// main's contents, which would have a reflection tool describe the wrong
+    /// file.
+    pub fn attached_schema_or_empty(&self, name: &str) -> Arc<mpedb_core::engine::SchemaBundle> {
+        self.attached_schema(name).unwrap_or_else(empty_bundle)
+    }
+
     pub fn temp_schema_or_empty(&self) -> Arc<mpedb_core::engine::SchemaBundle> {
-        self.attached_schema("temp").unwrap_or_else(|| {
-            // A zero-table schema is legal (#47) and is exactly what a
-            // connection with no temp tables has.
-            let empty = mpedb_types::Schema::new(Vec::new())
-                .expect("a zero-table schema is valid");
-            Arc::new(mpedb_core::engine::SchemaBundle::new(empty, Vec::new()))
-        })
+        self.attached_schema("temp").unwrap_or_else(empty_bundle)
     }
 
     pub(crate) fn ensure_temp_schema(&self) -> Result<()> {
@@ -147,6 +149,14 @@ fn create_attach_target(path: &str) -> Result<Database> {
     let p = path.replace('\\', "\\\\").replace('"', "\\\"");
     let toml = format!("[database]\npath = \"{p}\"\nsize_mb = 16\nmax_readers = 32\n");
     Database::open_with_config(Config::from_toml_str(&toml)?)
+}
+
+/// A catalog with no tables — what a database that is not attached, and a temp
+/// schema nobody has written to, both truthfully have. A zero-table schema is
+/// legal (#47).
+fn empty_bundle() -> Arc<mpedb_core::engine::SchemaBundle> {
+    let empty = mpedb_types::Schema::new(Vec::new()).expect("a zero-table schema is valid");
+    Arc::new(mpedb_core::engine::SchemaBundle::new(empty, Vec::new()))
 }
 
 /// The `temp` schema's backing file: like [`open_ephemeral_attach`] but with no
