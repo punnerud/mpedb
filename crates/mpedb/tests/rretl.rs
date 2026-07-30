@@ -1410,7 +1410,9 @@ fn scans_cross_chunk_boundaries_exactly() {
     // Chunk 7 makes every pass straddle many uneven boundaries. The variable
     // is read per call, and a different chunk size never changes RESULTS for
     // any concurrently running test — only how many rows each fetch carries.
-    std::env::set_var("MPEDB_RRETL_CHUNK", "7");
+    // Thread-local, not `set_var`: a file's tests run as THREADS in one
+    // process, and a process-global knob makes them race (see `ChunkGuard`).
+    let _chunk = mpedb::rretl::ChunkGuard::new(7);
     let (d, path) = db("chunky");
     define_abs_pair(&d);
     let vals: Vec<i64> = (0..100).map(|i| ((i % 13) - 6) * (1 + (i % 3))).collect();
@@ -1434,7 +1436,6 @@ fn scans_cross_chunk_boundaries_exactly() {
     d.rretl_revert(run2.run_id).unwrap();
     assert_eq!(col_v(&d), expect, "revert across boundaries is exact");
     assert!(d.rretl_fsck().unwrap().is_empty());
-    std::env::remove_var("MPEDB_RRETL_CHUNK");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1444,7 +1445,7 @@ fn scans_cross_chunk_boundaries_exactly() {
 /// tiny chunk, a full apply → putback → revert loop must stay byte-exact.
 #[test]
 fn text_pks_that_prefix_each_other_survive_chunked_scans() {
-    std::env::set_var("MPEDB_RRETL_CHUNK", "2");
+    let _chunk = mpedb::rretl::ChunkGuard::new(2);
     let path = format!(
         "{}/rretl-textpk-{}.mpedb",
         mpedb_testkit::scratch_base_str(),
@@ -1485,7 +1486,6 @@ fn text_pks_that_prefix_each_other_survive_chunked_scans() {
     d.rretl_revert(run.run_id).unwrap();
     assert_eq!(got(&d), vec![-3, 4, 7, -1, -9, 2]);
     assert!(d.rretl_fsck().unwrap().is_empty());
-    std::env::remove_var("MPEDB_RRETL_CHUNK");
     let _ = std::fs::remove_file(&path);
 }
 

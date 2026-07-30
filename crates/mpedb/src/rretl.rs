@@ -72,7 +72,50 @@ const VERIFIED_TOTAL: i64 = 2;
 /// exercised without million-row fixtures.
 const RRETL_CHUNK_DEFAULT: usize = 4096;
 
+thread_local! {
+    /// Per-THREAD chunk override — see [`ChunkGuard`].
+    static CHUNK_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the chunk size for the current THREAD until dropped.
+///
+/// The env var below is the out-of-process hook (a CLI run, a cron daemon). It
+/// is the wrong hook for a test: `cargo test` runs a file's tests as THREADS in
+/// one process, so two tests that each set and clear `MPEDB_RRETL_CHUNK` race,
+/// and the loser silently runs at the 4096 default. That is exactly what made
+/// `rretl_map::the_daemon_advances_both_tables_together_and_resumes` fail about
+/// one run in three under a full parallel workspace test while passing alone —
+/// its budget of 4 rows met a chunk of 4096 and moved the whole table. (It is
+/// also why `std::env::set_var` is `unsafe` from edition 2024.)
+///
+/// Thread-local is sound here for the same reason `FK_DEFERRED` is: every rRETL
+/// pass runs synchronously on the caller's thread.
+#[doc(hidden)]
+pub struct ChunkGuard(Option<usize>);
+
+impl ChunkGuard {
+    #[doc(hidden)]
+    pub fn new(rows: usize) -> ChunkGuard {
+        ChunkGuard(CHUNK_OVERRIDE.with(|c| c.replace(Some(rows))))
+    }
+}
+
+impl Drop for ChunkGuard {
+    fn drop(&mut self) {
+        CHUNK_OVERRIDE.with(|c| c.set(self.0));
+    }
+}
+
+/// [`chunk_rows`] for the test that pins the guard's thread scoping.
+#[doc(hidden)]
+pub fn chunk_rows_for_tests() -> usize {
+    chunk_rows()
+}
+
 pub(crate) fn chunk_rows() -> usize {
+    if let Some(n) = CHUNK_OVERRIDE.with(|c| c.get()) {
+        return n;
+    }
     std::env::var("MPEDB_RRETL_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok())

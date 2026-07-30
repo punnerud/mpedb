@@ -426,8 +426,40 @@ De 66 siste DB-labelene ble målt (WB_GROUP_BASE=20, logger i
   til 100 %.
 
 
-7. KJENT FLAKY TEST (IKKE EN REGRESJON — MÅLT)
-----------------------------------------------
+7. FLAKY TEST — LØST 30/7
+--------------------------
+
+  Var: crates/mpedb/tests/rretl_map.rs
+       the_daemon_advances_both_tables_together_and_resumes
+  feilet ~1 av 3 under full parallell `cargo test --workspace`.
+
+  ÅRSAK: chunk-overstyringen var `std::env::set_var("MPEDB_RRETL_CHUNK", …)`,
+  altså PROSESS-global — og `cargo test` kjører en fils tester som TRÅDER i
+  én prosess. To tester i rretl_map.rs satte og fjernet den samtidig, og
+  taperen kjørte stille på 4096-standarden: et budsjett på 4 rader møtte en
+  chunk på 4096 og flyttet hele tabellen. Derav «rows: 8» og «rows: 12» —
+  hele settet, ikke chunken. (Det er også grunnen til at `set_var` er
+  `unsafe` fra edition 2024.)
+
+  FIKS: `rretl::ChunkGuard`, en TRÅDLOKAL overstyring som gjenoppretter ved
+  drop. Sunt av samme grunn som `FK_DEFERRED` er trådlokal: hver rRETL-pass
+  kjører synkront i kallerens tråd. Env-variabelen står igjen som det den
+  faktisk er god for — en hook UTENFOR prosessen (CLI, cron-daemon).
+  Alle tre testfilene (rretl_map, rretl, ingest) er lagt om; ingen test
+  rører variabelen lenger.
+
+  MÅLT ETTER: 15 av 15 kjøringer av fila grønne, og 3 av 3 fulle
+  workspace-kjøringer. En regresjonstest pinner at guarden ikke lekker
+  mellom tråder.
+
+  MERK fellen på veien: /dev/shm er 3,8 GB tmpfs og var 93 % full av 345
+  etterlatte testdatabaser, som ga «StorageFull» et annet sted og gjorde
+  DENNE feilen hyppigere. To ulike saker med samme symptom.
+      find /dev/shm -maxdepth 1 -type f -delete
+
+
+7B. GAMMEL NOTAT (beholdt for sporet)
+-------------------------------------
 
   crates/mpedb/tests/rretl_map.rs
     the_daemon_advances_both_tables_together_and_resumes

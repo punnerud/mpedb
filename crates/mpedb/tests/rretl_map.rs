@@ -328,7 +328,9 @@ target = "ext_m"
 /// carry both ways, and repeats stay no-ops.
 #[test]
 fn map_sync_crosses_chunk_boundaries_exactly() {
-    std::env::set_var("MPEDB_RRETL_CHUNK", "7");
+    // Thread-local, not `set_var`: this file's tests run as THREADS in one
+    // process, and a process-global knob makes them race (see `ChunkGuard`).
+    let _chunk = mpedb::rretl::ChunkGuard::new(7);
     let (d, _s) = seeded("chunky");
     let mut w = d.begin().unwrap();
     for id in 4..=40i64 {
@@ -364,7 +366,6 @@ fn map_sync_crosses_chunk_boundaries_exactly() {
     let bal20 = ints(&d, "SELECT balance FROM customers WHERE id = 20");
     assert_eq!(bal20[0].abs(), 99);
     assert_eq!(d.rretl_map_sync("crm").unwrap().changed_total(), 0);
-    std::env::remove_var("MPEDB_RRETL_CHUNK");
 }
 
 /// The definition surface: list/show/drop round-trip, and the validator's
@@ -803,7 +804,7 @@ target = "b2"
     // Budget: 4 rows. With chunk 2 that is one commit (2 rows from EACH
     // table) plus the budget check — so both targets must hold 2 rows,
     // never 4-and-0.
-    std::env::set_var("MPEDB_RRETL_CHUNK", "2");
+    let _chunk = mpedb::rretl::ChunkGuard::new(2);
     let opts = RunOptions { max_rows: Some(4), ..Default::default() };
     let r = d.rretl_map_run("two", &opts).unwrap();
     assert_eq!(r.stopped_by, Some(RunStop::Budget));
@@ -832,7 +833,6 @@ target = "b2"
     assert_eq!(ints(&d, "SELECT count(*) FROM b2"), vec![6]);
     assert!(d.rretl_map_check("two").unwrap().is_clean());
     assert!(d.rretl_map_status("two").unwrap().round >= 1);
-    std::env::remove_var("MPEDB_RRETL_CHUNK");
 }
 
 /// The runner restriction is a named refusal, and clearing it lifts the
@@ -1002,4 +1002,25 @@ fn the_journal_carries_deletes_from_both_sides() {
     d.query("DELETE FROM crm_customers WHERE id = 2", &[]).unwrap();
     run(&d);
     assert_eq!(ints(&d, "SELECT id FROM customers ORDER BY id"), vec![1]);
+}
+
+/// The chunk override must be visible to THIS thread and no other.
+///
+/// `cargo test` runs a file's tests as threads in one process, so the old
+/// `std::env::set_var("MPEDB_RRETL_CHUNK", …)` hook was shared mutable state:
+/// two tests each setting and clearing it raced, and the loser silently ran at
+/// the 4096 default. That is what made the daemon-resume test above fail about
+/// one run in three under a full parallel workspace test while passing alone.
+#[test]
+fn the_chunk_override_does_not_leak_across_threads() {
+    let outer = mpedb::rretl::chunk_rows_for_tests();
+    let g = mpedb::rretl::ChunkGuard::new(3);
+    assert_eq!(mpedb::rretl::chunk_rows_for_tests(), 3);
+    // A guard on THIS thread is invisible to another one.
+    let seen = std::thread::spawn(mpedb::rretl::chunk_rows_for_tests)
+        .join()
+        .unwrap();
+    assert_eq!(seen, outer, "the override escaped its thread");
+    drop(g);
+    assert_eq!(mpedb::rretl::chunk_rows_for_tests(), outer, "not restored");
 }

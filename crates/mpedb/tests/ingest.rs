@@ -251,7 +251,9 @@ fn policy_local_records_instead_of_overwriting() {
 /// not grow: the sweep for deletes is chunked too.
 #[test]
 fn a_streamed_dump_crosses_chunk_boundaries() {
-    std::env::set_var("MPEDB_RRETL_CHUNK", "3");
+    // Thread-local, not `set_var`: a file's tests run as THREADS in one
+    // process, and a process-global knob makes them race (see `ChunkGuard`).
+    let _chunk = mpedb::rretl::ChunkGuard::new(3);
     let (d, _s) = seeded("chunks");
     let c = cols();
     let all: Vec<Vec<Value>> = (1..=10).map(|i| row(i, "x", i * 10)).collect();
@@ -268,7 +270,6 @@ fn a_streamed_dump_crosses_chunk_boundaries() {
     let r = d.ingest_finish(run).unwrap();
     assert_eq!((r.updated, r.deleted), (4, 6), "{r:?}");
     assert_eq!(ints(&d, "SELECT id FROM cases ORDER BY id"), vec![1, 2, 3, 4]);
-    std::env::remove_var("MPEDB_RRETL_CHUNK");
 }
 
 /// Two receipts on one table cannot interleave: a dump and a delta at once
