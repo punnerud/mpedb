@@ -1413,6 +1413,23 @@ impl<'a> Parser<'a> {
     /// error. The value is folded into a [`DefaultExpr::Const`]; the facade
     /// type-checks it against the column type.
     fn parse_add_column_default(&mut self) -> Result<DefaultExpr> {
+        // sqlite accepts REDUNDANT parentheses around a literal here — `(5)`,
+        // `(-5)`, `('hi')` all work — while refusing anything it would have to
+        // evaluate: `(3+4)` is "Cannot add a column with non-constant default"
+        // (MEASURED at 3.45.1). The rule is about the VALUE being a literal, not
+        // about the punctuation, because ADD COLUMN has to fill the rows already
+        // in the table without computing anything. So peel one layer and require
+        // a literal inside; a computed one falls through to the refusal below.
+        if self.peek() == Some(&Tok::LParen) {
+            let save = self.pos;
+            self.pos += 1;
+            if let Ok(d) = self.parse_add_column_default() {
+                if self.eat(&Tok::RParen) {
+                    return Ok(d);
+                }
+            }
+            self.pos = save;
+        }
         // A leading sign only makes sense before a numeric literal.
         let signed = if self.eat(&Tok::Minus) {
             Some(true)

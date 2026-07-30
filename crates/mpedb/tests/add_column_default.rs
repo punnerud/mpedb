@@ -372,3 +372,35 @@ fn parenthesized_expression_defaults_fold_to_what_sqlite_stores() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// sqlite accepts REDUNDANT parentheses around an ADD COLUMN default and
+/// refuses a computed one — `(5)` works, `(3+4)` is "Cannot add a column with
+/// non-constant default" (MEASURED at 3.45.1). The rule is about the VALUE
+/// being a literal, not the punctuation: ADD COLUMN has to fill the rows
+/// already in the table without evaluating anything.
+///
+/// This is the one place `DEFAULT ( … )` does NOT fold. A CREATE TABLE default
+/// may be an expression because nothing exists to fill yet.
+#[test]
+fn add_column_takes_a_parenthesized_literal_but_not_a_computed_one() {
+    let (db, path) = fresh_mpedb("paren-add");
+    let conn = fresh_sqlite();
+
+    for alter in [
+        "ALTER TABLE t ADD COLUMN c INT DEFAULT (5)",
+        "ALTER TABLE t ADD COLUMN d TEXT DEFAULT ('hi')",
+        "ALTER TABLE t ADD COLUMN e INT DEFAULT (-7)",
+    ] {
+        db.query(alter, &[]).unwrap();
+        conn.execute_batch(alter).unwrap();
+    }
+    let sel = "SELECT id, c, typeof(c), d, e FROM t ORDER BY id";
+    assert_eq!(mpedb_select(&db, sel), sqlite_select(&conn, sel));
+
+    // Computed: both refuse.
+    let bad = "ALTER TABLE t ADD COLUMN f INT DEFAULT (3+4)";
+    assert!(db.query(bad, &[]).is_err());
+    assert!(conn.execute_batch(bad).is_err());
+
+    let _ = std::fs::remove_file(&path);
+}
