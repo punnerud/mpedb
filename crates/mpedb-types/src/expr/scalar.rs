@@ -217,6 +217,20 @@ pub enum ScalarFn {
     /// produce invalid UTF-8, which is worse than an error. Same reasoning as
     /// [`ScalarFn::VecL2`]'s shape rules.
     Splice = 68,
+    /// `json_quote(json_extract(D, P…))` as ONE call.
+    ///
+    /// sqlite's `json_quote` returns an argument that already carries the JSON
+    /// subtype UNCHANGED, and quotes everything else. `json_extract` sets that
+    /// subtype exactly when the extracted node is an object or an array — a
+    /// property of the DATA, so the binder cannot decide it, and the
+    /// composition was refused rather than guessed.
+    ///
+    /// It cannot be decided from the extracted VALUE either: `json_extract('{"a":
+    /// "[1]"}', '$.a')` and `json_extract('{"a":[1]}', '$.a')` both yield the
+    /// text `[1]`, and sqlite quotes the first and not the second. Only the
+    /// node's own type separates them — which is why the pair is evaluated as a
+    /// unit here, where that type is still in hand.
+    JsonQuoteExtract = 69,
 }
 
 impl ScalarFn {
@@ -289,6 +303,7 @@ impl ScalarFn {
             66 => ScalarFn::VecL2,
             67 => ScalarFn::VecCosine,
             68 => ScalarFn::Splice,
+            69 => ScalarFn::JsonQuoteExtract,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -319,6 +334,8 @@ impl ScalarFn {
             ScalarFn::Instr | ScalarFn::Pow | ScalarFn::VecL2 | ScalarFn::VecCosine => argc == 2,
             ScalarFn::Replace => argc == 3,
             ScalarFn::Splice => argc == 4,
+            // The extract's own arity: a document and at least one path.
+            ScalarFn::JsonQuoteExtract => argc >= 2,
             // char() is variadic: 0..=255 code points (the u8 argc caps it).
             ScalarFn::Char => true,
             // printf()/format() are variadic; the format string is required, so
@@ -430,6 +447,7 @@ impl ScalarFn {
             ScalarFn::VecL2 => "vec_l2",
             ScalarFn::VecCosine => "vec_cosine",
             ScalarFn::Splice => "splice",
+            ScalarFn::JsonQuoteExtract => "json_quote",
         }
     }
 }
@@ -935,6 +953,7 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
         ScalarFn::JsonType => json::json_type(args)?,
         ScalarFn::JsonArrayLength => json::json_array_length(args)?,
         ScalarFn::JsonExtract => json::json_extract(args)?,
+        ScalarFn::JsonQuoteExtract => json::json_quote_extract(args)?,
         ScalarFn::JsonArrow => json::json_arrow(args)?,
         ScalarFn::JsonArrowText => json::json_arrow_text(args)?,
         ScalarFn::JsonPatch => json::json_patch(args)?,

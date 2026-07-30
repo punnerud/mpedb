@@ -919,6 +919,48 @@ pub(super) fn json_extract(args: &[Value]) -> Result<Value> {
     Ok(Value::Text(out))
 }
 
+/// `json_quote(json_extract(D, P…))`, evaluated as ONE call.
+///
+/// sqlite returns an argument that already carries the JSON subtype UNCHANGED
+/// and quotes everything else; `json_extract` sets that subtype exactly when
+/// the extracted node is an OBJECT or an ARRAY. The pair is fused because the
+/// node type is the only thing that separates the two answers, and it is gone
+/// by the time the extracted VALUE exists: `json_extract('{"a":"[1]"}', '$.a')`
+/// and `json_extract('{"a":[1]}', '$.a')` both yield the text `[1]`, and sqlite
+/// quotes the first and not the second.
+///
+/// A multi-path extract builds a JSON ARRAY, which is subtyped by construction
+/// — so it comes back unchanged, exactly as the single-path array case does.
+pub(super) fn json_quote_extract(args: &[Value]) -> Result<Value> {
+    let s = doc_text(&args[0], "json_extract")?;
+    let doc = parse(s)?;
+    if args.len() == 2 {
+        let steps = parse_path(path_text(&args[1], "json_extract")?)?;
+        return match lookup(&doc, &steps) {
+            // Object and array nodes carry the subtype: rendered raw, and
+            // `json_quote` hands a subtyped value back untouched.
+            Some(n @ (Node::Obj(_) | Node::Arr(_))) => {
+                let mut out = String::new();
+                n.render(&mut out);
+                Ok(Value::Text(out))
+            }
+            // Everything else is an ordinary SQL value, which `json_quote`
+            // renders as JSON — a string gains its quotes.
+            Some(n) => {
+                let v = n.to_sql()?;
+                let mut out = String::new();
+                value_to_node(&v, "json_quote()")?.render(&mut out);
+                Ok(Value::Text(out))
+            }
+            // A missing path makes `json_extract` NULL, and `json_quote(NULL)`
+            // is the TEXT `null`.
+            None => Ok(Value::Text("null".into())),
+        };
+    }
+    // Multi-path: the array is subtyped, so it passes through.
+    json_extract(args)
+}
+
 /// The abbreviated path grammar the `->` and `->>` OPERATORS accept (and
 /// `json_extract` does NOT — `json_extract('{"a":1}', 'a')` is an error in
 /// sqlite, while `'{"a":1}' -> 'a'` is 1).

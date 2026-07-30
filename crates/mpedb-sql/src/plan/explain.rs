@@ -1136,9 +1136,18 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                 {
                     args.remove(0);
                 }
-                // `->` and `->>` are OPERATORS in the grammar; render them as
-                // written rather than as the calls they lower to.
-                if matches!(
+                // `json_quote(json_extract(…))` is ONE call in the plan (the
+                // subtype decision needs both halves at once) but TWO in the
+                // text anyone wrote. Rendered as the pair, so a result-set
+                // column NAME says what the query said — sqlite's is
+                // `json_quote(json_extract('…', '$.a'))`, and the fused form
+                // would drop the inner call from it.
+                if f == mpedb_types::ScalarFn::JsonQuoteExtract {
+                    Item {
+                        s: format!("json_quote(json_extract({}))", args.join(", ")),
+                        atom: true,
+                    }
+                } else if matches!(
                     f,
                     mpedb_types::ScalarFn::JsonArrow | mpedb_types::ScalarFn::JsonArrowText
                 ) && args.len() == 2

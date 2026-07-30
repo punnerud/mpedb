@@ -2853,7 +2853,8 @@ impl<'a> Binder<'a> {
             | ScalarFn::JsonRemove
             | ScalarFn::JsonReplace
             | ScalarFn::JsonSet
-            | ScalarFn::JsonInsert => (&[], Some(ColumnType::Text)),
+            | ScalarFn::JsonInsert
+            | ScalarFn::JsonQuoteExtract => (&[], Some(ColumnType::Text)),
             ScalarFn::Max2 | ScalarFn::Min2 => (&[], None),
         };
         let mut out = Vec::with_capacity(bound.len());
@@ -3086,6 +3087,27 @@ impl<'a> Binder<'a> {
                     "json_quote() takes exactly 1 argument, got {}",
                     args.len()
                 )));
+            }
+            // `json_quote(json_extract(D, P…))` is the one composition whose
+            // answer is value-dependent — sqlite subtypes an extract only when
+            // the extracted node is an object or an array — and it is the shape
+            // consumers actually write (`CAST(JSON_QUOTE(JSON_EXTRACT(x, p)) AS
+            // VARCHAR)`). The pair is emitted as ONE call, evaluated where the
+            // node type is still in hand. Asking `json_ness` first would refuse
+            // it, so this is checked BEFORE.
+            if let ast::Expr::Func(inner, iargs) = &args[0] {
+                if inner.eq_ignore_ascii_case("json_extract") && iargs.len() >= 2 {
+                    let mut out = Vec::with_capacity(iargs.len());
+                    for a in iargs {
+                        let (e, t) = self.bind_expr(a)?;
+                        let (e, _) = self.unify_param(e, t, ColumnType::Text);
+                        out.push(e);
+                    }
+                    return Ok(Some((
+                        BExpr::Call(ScalarFn::JsonQuoteExtract, out),
+                        Some(ColumnType::Text),
+                    )));
+                }
             }
             if self.json_ness(&args[0], "json_quote()")? {
                 let (e, _) = self.bind_expr(&args[0])?;

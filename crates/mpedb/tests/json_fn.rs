@@ -798,15 +798,12 @@ fn json_refuses_blob_values() {
 fn subtype_undecidable_shapes_are_refused() {
     let (db, path) = mpedb_db();
     // json_extract is JSON only when the extracted node is a container — a
-    // property of the DATA, not of the query.
+    // property of the DATA, not of the query. `json_quote` of one is NOT in
+    // this list: the pair is evaluated as a unit, where that property is still
+    // in hand (see `json_quote_of_an_extract_matches_sqlite`).
     refuses(
         &db,
         "SELECT json_array(json_extract('{\"a\":[1]}', '$.a'))",
-        "object or an array",
-    );
-    refuses(
-        &db,
-        "SELECT json_quote(json_extract('{\"a\":[1]}', '$.a'))",
         "object or an array",
     );
     refuses(
@@ -1143,5 +1140,33 @@ fn randomized_document_sweep_matches_sqlite() {
     }
     cross_check_batch(&db, &qs);
     drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `json_quote(json_extract(D, P))` — answered, not refused.
+///
+/// The two halves are evaluated as ONE call because the answer turns on the
+/// extracted NODE's type, which is gone by the time its VALUE exists: the two
+/// documents below both yield the text `[1]`, and sqlite quotes one and not the
+/// other. Guessing from the value would have been a WRONG ANSWER; that pair is
+/// the first two cases here.
+#[test]
+fn json_quote_of_an_extract_matches_sqlite() {
+    let (db, path) = mpedb_db();
+    let queries = q(&[
+        // The ambiguous pair: a JSON string that LOOKS like an array, and a
+        // real array.
+        r#"SELECT json_quote(json_extract('{"a":"[1]"}', '$.a'))"#,
+        r#"SELECT json_quote(json_extract('{"a":[1]}', '$.a'))"#,
+        r#"SELECT json_quote(json_extract('{"a":"hi"}', '$.a'))"#,
+        r#"SELECT json_quote(json_extract('{"a":5}', '$.a'))"#,
+        r#"SELECT json_quote(json_extract('{"a":{"b":1}}', '$.a'))"#,
+        // A path that matches nothing: json_extract is NULL, and json_quote of
+        // NULL is the text `null`.
+        r#"SELECT json_quote(json_extract('{"a":1}', '$.zz'))"#,
+        // Multi-path: the extract builds an array, subtyped by construction.
+        r#"SELECT json_quote(json_extract('{"a":1,"b":2}', '$.a', '$.b'))"#,
+    ]);
+    cross_check_batch(&db, &queries);
     let _ = std::fs::remove_file(&path);
 }
