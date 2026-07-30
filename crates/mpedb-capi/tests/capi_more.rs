@@ -714,15 +714,16 @@ fn backup_init_refuses_by_name() {
 /// database is what the destination must end up as: the backup SUCCEEDS and
 /// replaces the destination with a blank database.
 #[test]
-fn backup_of_the_temp_schema_is_an_empty_database() {
+fn backup_of_the_temp_schema_copies_nothing_yet() {
     unsafe {
         let src = open_memory();
         let dst = open_memory();
         // Both connections carry real tables; neither may end up in the copy.
         assert_eq!(exec(src, "CREATE TABLE insrc (a INTEGER PRIMARY KEY)"), SQLITE_OK);
         assert_eq!(exec(dst, "CREATE TABLE indst (a INTEGER PRIMARY KEY)"), SQLITE_OK);
-        // Nothing can be put in temp in the first place — the premise.
-        assert_eq!(exec(src, "CREATE TEMP TABLE tt (a INTEGER)"), SQLITE_ERROR);
+        // A temp table exists now, and it is the interesting case: the copy
+        // must be of the TEMP schema, not of main.
+        assert_eq!(exec(src, "CREATE TEMP TABLE tt (a INTEGER)"), SQLITE_OK);
 
         let (main, temp) = (cs("main"), cs("temp"));
         let b = sqlite3_backup_init(dst, main.as_ptr(), src, temp.as_ptr());
@@ -730,8 +731,13 @@ fn backup_of_the_temp_schema_is_an_empty_database() {
         assert_eq!(sqlite3_backup_step(b, -1), SQLITE_DONE);
         assert_eq!(sqlite3_backup_finish(b), SQLITE_OK);
 
-        // Empty: the destination's own table is gone and the source's never
-        // arrived. The copy is a working database, not a husk.
+        // KNOWN DIVERGENCE, pinned here so it cannot drift unnoticed: sqlite
+        // copies the TEMP schema's contents (measured — a `tt` in temp arrives
+        // in the copy as `tt`), and mpedb produces an empty database instead.
+        // The backup path does not know about the temp member that
+        // `CREATE TEMP TABLE` now creates. What IS right either way: the
+        // destination's own table is gone and the source's MAIN table never
+        // arrived, so the copy is a working database rather than a husk.
         assert!(collect_text_col(dst, "SELECT name FROM sqlite_master").is_empty());
         assert_eq!(exec(dst, "SELECT a FROM indst"), SQLITE_ERROR);
         assert_eq!(exec(dst, "SELECT a FROM insrc"), SQLITE_ERROR);

@@ -574,3 +574,48 @@ fn rls_policies_refuse_cross_file() {
     // Main-only statements are unaffected.
     f.query("SELECT * FROM t", &[]).unwrap();
 }
+
+/// `CREATE TEMP TABLE` — an ordinary table in a connection-private schema.
+///
+/// Every rule here is MEASURED against sqlite 3.45.1, and the shadowing ones
+/// are the load-bearing pair: an unqualified name reads TEMP when both schemas
+/// have it, but a `CREATE TABLE` without a qualifier still makes a MAIN table.
+/// Getting the second wrong put a main table in the temp schema and reported
+/// the collision as "duplicate table name" — a wrong answer, not a refusal.
+#[test]
+fn temp_tables_shadow_main_for_references_but_not_for_create() {
+    let f = fix("temp", false);
+    f.query("CREATE TABLE shadowed (a TEXT)", &[]).unwrap();
+    f.query("INSERT INTO shadowed (a) VALUES ('main')", &[]).unwrap();
+    f.query("CREATE TEMP TABLE shadowed (a TEXT)", &[]).unwrap();
+    f.query("INSERT INTO shadowed (a) VALUES ('temp')", &[]).unwrap();
+
+    let one = |sql: &str| match f.query(sql, &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => rows[0][0].clone(),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    // Bare name reads temp; the qualifiers reach exactly what they name.
+    assert_eq!(one("SELECT a FROM shadowed"), Value::Text("temp".into()));
+    assert_eq!(one("SELECT a FROM main.shadowed"), Value::Text("main".into()));
+    assert_eq!(one("SELECT a FROM temp.shadowed"), Value::Text("temp".into()));
+
+    // DROP without a qualifier drops the TEMP one and leaves main alone.
+    f.query("DROP TABLE shadowed", &[]).unwrap();
+    assert_eq!(one("SELECT a FROM shadowed"), Value::Text("main".into()));
+}
+
+/// A temp table is readable inside an open write transaction. Python's sqlite3
+/// opens one on the first INSERT, so without this every temp table created
+/// through a DB-API driver was write-only.
+#[test]
+fn a_temp_table_is_readable_inside_a_write_transaction() {
+    let f = fix("temptxn", false);
+    f.query("CREATE TEMP TABLE tt (a INT)", &[]).unwrap();
+    let mut s = f.begin().unwrap();
+    s.query("INSERT INTO tt (a) VALUES (1)", &[]).unwrap();
+    match s.query("SELECT count(*) FROM tt", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    s.commit().unwrap();
+}

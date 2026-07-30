@@ -297,6 +297,43 @@ struct Edit {
     text: String,
 }
 
+/// `CREATE TEMP[ORARY] <thing> …` → `CREATE <thing> temp.…`, or `None` when the
+/// statement is not one.
+///
+/// A temp table is an ordinary table in a connection-private schema — sqlite's
+/// `temp` — so the whole feature is where it LIVES, not what it is. Rewriting
+/// the two words away here means the DDL parser, the applier and
+/// [`resolve_db_refs`] all see a statement they already handle, and nothing
+/// downstream grows a notion of temp-ness.
+pub fn rewrite_temp_ddl(sql: &str) -> Result<Option<String>> {
+    let toks = token::tokenize(sql)?;
+    let at = |i: usize, w: &str| toks.get(i).is_some_and(|t| is_word(&t.tok, w));
+    if !at(0, "CREATE") {
+        return Ok(None);
+    }
+    if !at(1, "TEMP") && !at(1, "TEMPORARY") {
+        return Ok(None);
+    }
+    // What follows TEMP is TABLE / VIEW / TRIGGER / INDEX — and then, possibly,
+    // `IF NOT EXISTS`, which must stay in front of the name.
+    let mut i = 3;
+    if at(3, "IF") {
+        i = 6;
+    }
+    let Some(name_tok) = toks.get(i) else {
+        return Ok(None);
+    };
+    // Drop the TEMP word, and qualify the name.
+    let temp_start = toks[1].pos;
+    let after_temp = toks[2].pos;
+    let mut out = String::with_capacity(sql.len() + 8);
+    out.push_str(&sql[..temp_start]);
+    out.push_str(&sql[after_temp..name_tok.pos]);
+    out.push_str("temp.");
+    out.push_str(&sql[name_tok.pos..]);
+    Ok(Some(out))
+}
+
 /// Resolve every table reference in `sql` against `scope` and rewrite
 /// (see the module docs for the full contract).
 pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
@@ -361,7 +398,18 @@ pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
                 // `main`'s own names and the CTE names are byte-keyed sets, so
                 // membership is a folded scan rather than a hash probe (both
                 // sets are small, and this runs once per table reference).
-                if has_name(&cte_names, &r.name) || has_name(&scope.main, &r.name) {
+                // `temp` SHADOWS main, and only `temp` does. MEASURED against
+                // sqlite 3.45.1: with a `t` in both, a bare `t` reads the TEMP
+                // one, `main.t` the other. A CTE still wins over both — it is
+                // lexically nearer than any schema.
+                let temp = scope.attached.iter().position(|(db, names)| {
+                    db.eq_ignore_ascii_case("temp") && has_name(names, &r.name)
+                });
+                if has_name(&cte_names, &r.name) {
+                    Target::Main
+                } else if let Some(m) = temp {
+                    Target::Attached(m)
+                } else if has_name(&scope.main, &r.name) {
                     Target::Main
                 } else if let Some(m) = scope
                     .attached
@@ -475,6 +523,53 @@ pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
         }
     }
 
+    // A read whose every reference lives in `temp` is forwarded to that member
+    // like a write already is, instead of going through the cross-file
+    // machinery. It has to be: the cross path is refused inside an open write
+    // transaction, and Python's sqlite3 opens one on the first INSERT — so
+    // `SELECT … FROM <temp table>` was unreachable in exactly the sessions that
+    // create temp tables.
+    //
+    // Only `temp`. It is connection-PRIVATE and ephemeral, so there is no
+    // cross-file snapshot question here to answer wrongly; for a database the
+    // user attached there is one, and this route would be quietly choosing an
+    // answer to it.
+    if any_attached {
+        let ms: Vec<usize> = resolved
+            .iter()
+            .filter_map(|(_, t)| match t {
+                Target::Attached(m) => Some(*m),
+                _ => None,
+            })
+            .collect();
+        let all_main_free = !resolved
+            .iter()
+            .any(|(_, t)| matches!(t, Target::Main | Target::Unknown));
+        let one = ms.first().copied();
+        if all_main_free
+            && one.is_some_and(|m| {
+                ms.iter().all(|&x| x == m) && scope.attached[m].0.eq_ignore_ascii_case("temp")
+            })
+        {
+            let m = one.expect("checked");
+            let mut edits = Vec::new();
+            for r in &refs {
+                if r.db.is_some() {
+                    edits.push(Edit {
+                        start: toks[r.start].pos,
+                        end: end_of(r.name_idx),
+                        text: format!("{} ", quote_ident(&r.name)),
+                    });
+                }
+            }
+            three_part_edits(&toks, scope, &refs, end_of, &mut edits)?;
+            return Ok(DbResolution::AttachedOnly {
+                db: scope.attached[m].0.clone(),
+                sql: apply_edits(sql, edits),
+            });
+        }
+    }
+
     let mut edits = Vec::new();
     let mut cross_tables: Vec<(String, String)> = Vec::new();
     for (i, target) in &resolved {
@@ -563,6 +658,45 @@ fn resolve_ddl(
             }
         }
         i += 1;
+    }
+    // A BARE table name that lives in `temp` belongs to temp — the same
+    // shadowing the read path applies, in the few DDL positions where a token
+    // IS a table name. Only those: matching every bare identifier would catch a
+    // column that happens to share the name.
+    //
+    // Its own pass, because the loop above walks TRIPLES (`db . name`) and
+    // stops at `len - 2` — which never even reaches the `TABLE` of a three-token
+    // `DROP TABLE t`.
+    // …but CREATE never shadows. `CREATE TABLE t` makes a MAIN table even when
+    // a temp `t` exists — only `CREATE TEMP TABLE` targets temp, and that is
+    // already rewritten to a qualified name before we get here. Routing it by
+    // shadowing put a main table in the temp schema and reported the collision
+    // as "duplicate table name", which is a wrong answer, not a refusal.
+    let creating = toks.first().is_some_and(|t| is_word(&t.tok, "CREATE"));
+    for i in 0..toks.len() {
+        let after_on = matches!(&toks[i].tok, Tok::Kw(Kw::On)) || is_word(&toks[i].tok, "ON");
+        let after_table = is_word(&toks[i].tok, "TABLE") && !creating;
+        if !after_on && !after_table {
+            continue;
+        }
+        // `DROP TABLE IF EXISTS t` puts two words in between.
+        let mut j = i + 1;
+        if toks.get(j).is_some_and(|t| is_word(&t.tok, "IF")) {
+            j += 2;
+        }
+        let Some(name) = toks.get(j).and_then(|t| ident_of(&t.tok)) else {
+            continue;
+        };
+        if matches!(toks.get(j + 1).map(|t| &t.tok), Some(Tok::Dot)) {
+            continue; // already qualified; the triple pass owns it
+        }
+        if let Some(m) = scope
+            .attached
+            .iter()
+            .position(|(db, set)| db.eq_ignore_ascii_case("temp") && has_name(set, name))
+        {
+            attached_ms.push(m);
+        }
     }
     if attached_ms.is_empty() {
         return Ok(DbResolution::MainOnly(apply_edits(sql, edits)));

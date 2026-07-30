@@ -77,6 +77,43 @@ fn open_ephemeral_attach() -> Result<Database> {
     Database::open_with_config(Config::from_toml_str(&toml)?)
 }
 
+impl Database {
+    /// Bring the connection-private `temp` schema into being, once.
+    ///
+    /// Backed by the same ephemeral member `ATTACH ':memory:'` uses: a file
+    /// under /dev/shm that is unlinked when this connection lets go of it. That
+    /// is exactly sqlite's lifetime for a temp table — MEASURED: a new
+    /// connection to the same database does not see it.
+    ///
+    /// Not counted against `MAX_ATTACHED`: sqlite's limit is on databases the
+    /// user attached, and `temp` is not one of them.
+    pub(crate) fn ensure_temp_schema(&self) -> Result<()> {
+        {
+            let guard = self.attached.read().expect(POISON);
+            if guard.find("temp").is_some() {
+                return Ok(());
+            }
+        }
+        let db = open_ephemeral_attach()?;
+        let mut guard = self.attached.write().expect(POISON);
+        // Another thread on this connection may have won the race.
+        if guard.find("temp").is_some() {
+            return Ok(());
+        }
+        guard.members.push(AttachedMember {
+            name: "temp".to_string(),
+            db,
+            ephemeral: true,
+        });
+        guard.epoch += 1;
+        drop(guard);
+        self.cross_cache.write().expect(POISON).clear();
+        self.cross_cache_live
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// Create the database `ATTACH` named but that does not exist yet, with the
 /// same defaults [`open_ephemeral_attach`] uses. Not ephemeral: the caller
 /// asked for this path, so DETACH leaves it where it is.
@@ -274,6 +311,22 @@ impl Database {
     /// Resolve database-qualified names. The fast path — no attachments and
     /// no `.` anywhere — is a single `contains` check.
     pub(crate) fn resolve_db_refs_hook(&self, sql: &str) -> Result<DbRoute> {
+        // `CREATE TEMP TABLE x …` is `CREATE TABLE temp.x …` in a
+        // connection-private schema, so the schema is brought into being on
+        // first use and the statement is rewritten to name it. Everything after
+        // this point — the DDL parser, the applier, the reference resolver —
+        // sees a statement it already knows how to run.
+        if let Some(rewritten) = mpedb_sql::rewrite_temp_ddl(sql)? {
+            self.ensure_temp_schema()?;
+            let guard = self.attached.read().expect(POISON);
+            let scope = self.build_scope(&guard)?;
+            drop(guard);
+            return match mpedb_sql::resolve_db_refs(&rewritten, &scope)? {
+                DbResolution::MainOnly(s) => Ok(DbRoute::Main(s)),
+                DbResolution::Cross { sql, tables } => Ok(DbRoute::Cross { sql, tables }),
+                DbResolution::AttachedOnly { db, sql } => Ok(DbRoute::AttachedOnly { db, sql }),
+            };
+        }
         let guard = self.attached.read().expect(POISON);
         if guard.members.is_empty() && !sql.contains('.') {
             return Ok(DbRoute::Passthrough);

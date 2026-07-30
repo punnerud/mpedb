@@ -31,6 +31,7 @@ mod view;
 pub use binder::{HostUdfSet, OpSet, SpellFnSet};
 pub use planner::sequence;
 pub use dbref::{
+    rewrite_temp_ddl,
     mangle as mangle_db_table, parse_attach, resolve_db_refs, AttachStmt, DbResolution, DbScope,
 };
 pub use ddl::{
