@@ -139,6 +139,20 @@ pub fn parse_attach(sql: &str) -> Result<Option<AttachStmt>> {
         }
         let path = match toks.get(i).map(|t| &t.tok) {
             Some(Tok::Str(s)) => s.clone(),
+            // A DOUBLE-quoted path. Double quotes are an identifier quote in
+            // SQL, but sqlite falls back to reading one as a string literal
+            // when it resolves to no identifier — and in THIS position nothing
+            // could: a file path is not a table or column name, so there is no
+            // ambiguity to get wrong here. SQLAlchemy's own test provisioning
+            // emits `ATTACH DATABASE "…" AS test_schema`, which sqlite accepts
+            // (measured) and which refusing made its whole dialect suite
+            // unrunnable at connect time.
+            //
+            // Deliberately NOT general double-quoted-string support (#132):
+            // that is a wide surface where a typo'd column name silently
+            // becomes a string, which is the footgun sqlite itself regrets.
+            // This is one position where the identifier reading has no meaning.
+            Some(Tok::QuotedIdent(s)) => s.clone(),
             Some(Tok::Question) | Some(Tok::DollarParam(_)) => {
                 return Err(Error::Unsupported(
                     "ATTACH with a bound parameter is not supported; \

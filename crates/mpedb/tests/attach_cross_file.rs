@@ -471,9 +471,11 @@ fn writes_and_ddl_to_attached_refuse_by_name() {
 fn attach_memory_and_shapes() {
     let f = fix("shapes", false);
     for (sql, needle) in [
+        // A missing DIRECTORY is an error in sqlite too ("unable to open
+        // database", measured) — unlike a missing FILE, which it creates.
         (
             "ATTACH '/nonexistent/nowhere.mpedb' AS ghost".to_string(),
-            "does not exist",
+            "No such file or directory",
         ),
         ("ATTACH ? AS pdb".to_string(), "bound parameter"),
     ] {
@@ -482,6 +484,23 @@ fn attach_memory_and_shapes() {
             e.to_string().contains(needle),
             "`{sql}` should refuse with `{needle}`, got: {e}"
         );
+    }
+    // A missing FILE in a directory that exists is CREATED, as sqlite does
+    // (measured: `ATTACH DATABASE 'newone.db'` then writing to it works).
+    // SQLAlchemy's test provisioning depends on it — its whole dialect suite
+    // attaches a scratch file it expects to be made.
+    {
+        let dir = mpedb_testkit::scratch_base();
+        let born = dir.join(format!("mpedb-attach-born-{}.mpedb", std::process::id()));
+        let _ = std::fs::remove_file(&born);
+        f.query(&format!("ATTACH '{}' AS fresh", born.display()), &[])
+            .unwrap();
+        f.query("CREATE TABLE fresh.t (id INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        f.query("INSERT INTO fresh.t (id) VALUES (1)", &[]).unwrap();
+        f.query("DETACH fresh", &[]).unwrap();
+        assert!(born.exists(), "ATTACH did not create the file");
+        let _ = std::fs::remove_file(&born);
     }
     // CPython test_database_source_name: ATTACH ':memory:' + schema-qualified
     // CREATE/INSERT, then the attached schema is a real independent file.

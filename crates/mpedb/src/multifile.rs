@@ -77,6 +77,15 @@ fn open_ephemeral_attach() -> Result<Database> {
     Database::open_with_config(Config::from_toml_str(&toml)?)
 }
 
+/// Create the database `ATTACH` named but that does not exist yet, with the
+/// same defaults [`open_ephemeral_attach`] uses. Not ephemeral: the caller
+/// asked for this path, so DETACH leaves it where it is.
+fn create_attach_target(path: &str) -> Result<Database> {
+    let p = path.replace('\\', "\\\\").replace('"', "\\\"");
+    let toml = format!("[database]\npath = \"{p}\"\nsize_mb = 16\nmax_readers = 32\n");
+    Database::open_with_config(Config::from_toml_str(&toml)?)
+}
+
 /// sqlite's default `SQLITE_MAX_ATTACHED`.
 const MAX_ATTACHED: usize = 10;
 
@@ -204,14 +213,24 @@ impl Database {
                     (db, true)
                 } else {
                     let p = std::path::Path::new(&path);
-                    if !p.exists() {
-                        return Err(Error::Unsupported(format!(
-                            "cannot ATTACH `{path}`: file does not exist (mpedb v1 \
-                             does not create databases on ATTACH; open it once with \
-                             a config first)"
-                        )));
+                    if p.exists() {
+                        (Database::open_from_file(p)?, false)
+                    } else {
+                        // sqlite CREATES the file (measured: `ATTACH DATABASE
+                        // 'new.db'` then writing to it works), and refusing was
+                        // a v1 limitation that made SQLAlchemy's dialect suite
+                        // unrunnable — its provisioning attaches a scratch file
+                        // it expects to be created.
+                        //
+                        // The cost is sqlite's too: a typo'd path becomes a new
+                        // empty database instead of an error. Being the drop-in
+                        // means taking that behaviour, not improving on it.
+                        //
+                        // Seeded with ZERO tables — legal since #47, and the
+                        // right shape here: whatever the caller creates next is
+                        // what the file should hold.
+                        (create_attach_target(&path)?, false)
                     }
-                    (Database::open_from_file(p)?, false)
                 };
                 guard.members.push(AttachedMember {
                     name,
