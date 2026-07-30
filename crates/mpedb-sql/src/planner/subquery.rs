@@ -341,6 +341,16 @@ impl Lift<'_> {
             // its slot. Uncorrelated only in this step — a correlated IN
             // wants the post-filter machinery and is refused by name.
             E::InSubquery(lhs, inner, negated) => {
+                // A ROW-VALUE probe against a subquery — `(a, b) IN (SELECT x, y
+                // FROM s)`. The `List` subplan carries ONE column, so this used
+                // to be refused; it is rewritten instead, into the two
+                // correlated `EXISTS` that ARE its 3-valued definition. No plan
+                // format and no executor change: the pieces already exist.
+                if let E::RowValue(_) = lhs.as_ref() {
+                    if let Some(rewritten) = row_value_in_subquery(lhs, inner, *negated)? {
+                        return self.rewrite(&rewritten);
+                    }
+                }
                 let lhs = self.rewrite(lhs)?;
                 let slot = self.plan_one(inner, SubPlanKind::List)?;
                 E::InParamSlot(Box::new(lhs), slot, *negated)
@@ -1054,4 +1064,100 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
             xs.iter().any(|x| refs_correlated(x, sub_base, correlated))
         }
     }
+}
+
+/// `(a, b) [NOT] IN (SELECT x, y FROM s WHERE p)` as the two correlated
+/// `EXISTS` that are its definition:
+///
+/// ```text
+/// CASE WHEN EXISTS (SELECT 1 FROM s WHERE p AND (x = a AND y = b))       THEN TRUE
+///      WHEN EXISTS (SELECT 1 FROM s WHERE p AND ((x = a AND y = b) IS NULL)) THEN NULL
+///      ELSE FALSE END
+/// ```
+///
+/// That IS the 3-valued rule — TRUE if any row matches, else NULL if any row's
+/// comparison was NULL, else FALSE — and it is why an `EXISTS` alone would be a
+/// WRONG ANSWER here: `EXISTS` collapses the NULL case to FALSE, so a probe
+/// carrying a NULL would report "not a member" where sqlite reports unknown.
+/// `NOT IN` negates the whole thing, for the same reason the list form does.
+///
+/// `Ok(None)` — keep the ordinary path and its refusal — when the subquery is
+/// not a shape this can move a condition INTO: a compound, an aggregate
+/// projection, or anything whose row set the added WHERE would change
+/// (DISTINCT, GROUP BY/HAVING, LIMIT/OFFSET). `ORDER BY` is not one of those:
+/// `EXISTS` does not care about order.
+fn row_value_in_subquery(
+    lhs: &ast::Expr,
+    inner: &ast::SubqueryBody,
+    negated: bool,
+) -> Result<Option<ast::Expr>> {
+    use ast::{BinOp, Expr, SubqueryBody, UnOp};
+    let Expr::RowValue(probe) = lhs else {
+        return Ok(None);
+    };
+    let SubqueryBody::Select(sel) = inner else {
+        return Ok(None);
+    };
+    if sel.distinct
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+        || sel.from_derived.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(items) = &sel.items else {
+        // `SELECT *`: the column count is not known until the schema is in
+        // hand, so the arity check below cannot be made here.
+        return Ok(None);
+    };
+    if items.len() != probe.len() {
+        return Err(bind_err(format!(
+            "row value has {} column(s) but the subquery selects {}",
+            probe.len(),
+            items.len()
+        )));
+    }
+    if items.iter().any(|(e, _)| crate::view::expr_aggregates(e)) {
+        return Ok(None);
+    }
+    // `x = a AND y = b`, over the inner row's scope — which is why the items
+    // move into the WHERE rather than the other way round.
+    let mut eq: Option<Expr> = None;
+    for ((item, _), p) in items.iter().zip(probe) {
+        let cmp = Expr::Binary(BinOp::Eq, Box::new(item.clone()), Box::new(p.clone()));
+        eq = Some(match eq {
+            None => cmp,
+            Some(prev) => Expr::Binary(BinOp::And, Box::new(prev), Box::new(cmp)),
+        });
+    }
+    let eq = eq.expect("arity checked non-zero by the parser");
+    let one_row = |cond: Expr| -> SubqueryBody {
+        let mut s = sel.clone();
+        s.items = Some(vec![(Expr::Lit(Value::Int(1)), None)]);
+        s.order_by = Vec::new();
+        s.where_clause = Some(match s.where_clause.take() {
+            None => cond,
+            Some(w) => Expr::Binary(BinOp::And, Box::new(w), Box::new(cond)),
+        });
+        SubqueryBody::Select(s)
+    };
+    let matched = Expr::Exists(Box::new(one_row(eq.clone())), false);
+    let unknown = Expr::Exists(
+        Box::new(one_row(Expr::IsNull(Box::new(eq), false))),
+        false,
+    );
+    let case = Expr::Case(
+        vec![
+            (matched, Expr::Lit(Value::Bool(true))),
+            (unknown, Expr::Lit(Value::Null)),
+        ],
+        Some(Box::new(Expr::Lit(Value::Bool(false)))),
+    );
+    Ok(Some(if negated {
+        Expr::Unary(UnOp::Not, Box::new(case))
+    } else {
+        case
+    }))
 }

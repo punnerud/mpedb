@@ -281,9 +281,13 @@ fn misuse_and_deferred_forms_are_refused() {
     // Arity mismatch between the two tuples.
     refuses("SELECT (1, 2) = (1, 2, 3)");
     refuses("SELECT (1, 2, 3) < (1, 2)");
-    // Row value against a subquery — deferred (a 2-column subquery cannot be a
-    // scalar operand, so either the subquery lift or the binder refuses it).
+    // Row value COMPARED to a subquery (`=`, not `IN`) — still deferred: a
+    // 2-column subquery cannot be a scalar operand, so either the subquery lift
+    // or the binder refuses it. `IN` is a different question and is answered —
+    // see `a_row_value_in_a_subquery_matches_sqlite_including_nulls`.
     refuses("SELECT a FROM t WHERE (a, b) = (SELECT id, a FROM t)");
+    // An IN-subquery whose width disagrees with the probe.
+    refuses("SELECT a FROM t WHERE (a, b) IN (SELECT id FROM t)");
 }
 
 /// A single `(expr)` stays plain grouping — the comma is what makes a row value.
@@ -346,6 +350,55 @@ fn a_row_value_in_list_matches_sqlite_including_nulls() {
         "SELECT id FROM t WHERE (x, y) NOT IN ((5, NULL)) ORDER BY id",
         "SELECT id FROM t WHERE (x, y) IN () ORDER BY id",
         "SELECT id FROM t WHERE (x, y) NOT IN () ORDER BY id",
+    ] {
+        let got = mpedb_rows(&d, q);
+        let want = sqlite_rows(&format!("{script}{q};\n"));
+        assert_eq!(got, want, "`{q}`");
+    }
+}
+
+/// `(a, b) [NOT] IN (SELECT x, y …)`, against sqlite.
+///
+/// Rewritten to the two correlated `EXISTS` that ARE its 3-valued definition —
+/// TRUE if any row matches, else NULL if any row's comparison was NULL, else
+/// FALSE. A single `EXISTS` would be a WRONG ANSWER: it collapses the NULL case
+/// to FALSE, so a probe carrying a NULL would report "not a member" where
+/// sqlite reports unknown. Rows 2 and 3 below are exactly that case.
+#[test]
+fn a_row_value_in_a_subquery_matches_sqlite_including_nulls() {
+    const SETUP: &[&str] = &[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+        "INSERT INTO t (id, x, y) VALUES (1, 5, 10)",
+        "INSERT INTO t (id, x, y) VALUES (2, NULL, 10)",
+        "INSERT INTO t (id, x, y) VALUES (3, 5, NULL)",
+        "INSERT INTO t (id, x, y) VALUES (4, 9, 9)",
+        "CREATE TABLE s (k INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "INSERT INTO s (k, a, b) VALUES (1, 5, 10)",
+        "INSERT INTO s (k, a, b) VALUES (2, 9, 9)",
+        "CREATE TABLE sn (k INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "INSERT INTO sn (k, a, b) VALUES (1, 5, 10)",
+        "INSERT INTO sn (k, a, b) VALUES (2, NULL, 7)",
+    ];
+    let d = db();
+    for s in SETUP {
+        d.query(s, &[]).unwrap();
+    }
+    let mut script = String::new();
+    for stmt in SETUP {
+        script.push_str(stmt);
+        script.push_str(";\n");
+    }
+    for q in [
+        "SELECT id FROM t WHERE (x, y) IN (SELECT a, b FROM s) ORDER BY id",
+        "SELECT id FROM t WHERE (x, y) NOT IN (SELECT a, b FROM s) ORDER BY id",
+        // The subquery itself carries a NULL — the case a plain EXISTS gets wrong.
+        "SELECT id FROM t WHERE (x, y) IN (SELECT a, b FROM sn) ORDER BY id",
+        "SELECT id FROM t WHERE (x, y) NOT IN (SELECT a, b FROM sn) ORDER BY id",
+        // Empty subquery: FALSE for every probe, NULLs included.
+        "SELECT id FROM t WHERE (x, y) IN (SELECT a, b FROM s WHERE k < 0) ORDER BY id",
+        "SELECT id FROM t WHERE (x, y) NOT IN (SELECT a, b FROM s WHERE k < 0) ORDER BY id",
+        // The subquery's own WHERE survives the rewrite.
+        "SELECT id FROM t WHERE (x, y) IN (SELECT a, b FROM s WHERE k = 2) ORDER BY id",
     ] {
         let got = mpedb_rows(&d, q);
         let want = sqlite_rows(&format!("{script}{q};\n"));

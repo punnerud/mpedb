@@ -1602,7 +1602,7 @@ fn check_simple(v: &SelectStmt, name: &str) -> Result<()> {
 /// Does this projection item aggregate (or window-aggregate) the body's rows?
 /// Only the top-level shape matters — a subquery opens its own scope, so an
 /// aggregate inside one does not collapse THIS body.
-fn expr_aggregates(e: &Expr) -> bool {
+pub(crate) fn expr_aggregates(e: &Expr) -> bool {
     match e {
         Expr::Agg(..) | Expr::Window { .. } => true,
         Expr::Unary(_, a)
