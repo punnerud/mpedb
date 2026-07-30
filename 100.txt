@@ -47,6 +47,11 @@ Oppå det, UCOMMITTET: S3 (FK-håndhevelse) + §4-fiksen + §5-fiksen.
 
 ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
 
+  (30/7: CPython 459/466 etter db_config-FK; Django field_defaults kjører
+   fortsatt ikke — `Now()` blir STRFTIME(...,'NOW'), altså en per-SETNING
+   ikke-deterministisk default, som krever at skjemaet bærer uttrykket. De
+   konstant-foldbare (`Pi()`, `Coalesce(4.5, Pi())`) er lukket.)
+
   korpus (sqllogictest)  622/622 filer, 7 420 638 records, 100,0 %,
                          0 gale svar, 0 error-mismatch. BASELINE: eksakt
                          treff, EXIT 0. 275 s, topp-RSS 345 MB.
@@ -358,6 +363,40 @@ S6 — 2000-linjersregelen + Wine/Windows (#197). Hører ETTER commiten.
   gruppekart — designet sier selv at «no chunk size makes it smaller».
   Budsjettet blir altså aldri overflødig, bare degradert fra hovedvakt til
   restvakt. Etter commiten, som eget steg.
+
+
+6B. MÅLT 30/7 — DJANGO-FLATEN ER NÅ KARTLAGT, OG ÉN FUNKSJON DOMINERER
+------------------------------------------------------------------------
+
+De 66 siste DB-labelene ble målt (WB_GROUP_BASE=20, logger i
+/mnt/xfs/mpedb-scratch/djsuite-rest): stock 1 feil, shim 68. Klynget:
+
+      57  schema.tests.SchemaTests
+       7  aggregation_regress
+       2  generic_relations_regress
+       1  hver: raw_query, cache, utils_tests
+
+  Og ÉN gruppe (unmanaged_models, update_only_fields, user_commands,
+  utils_tests, validation) kjører fortsatt 0 tester.
+
+  ÅRSAKEN ER DEN SAMME I BEGGE: UTTRYKKSINDEKSER.
+      26  «SQL parse error: expected column name»  ← CREATE INDEX ON t(LOWER(x))
+       7  «Unsupported lookup 'lower'»             ← Djangos følgefeil av samme
+       6  «expected )»
+  Pluss `indexes.tests.PartialIndexTests.test_partial_func_index` fra før.
+
+  OMFANGET ER MINDRE ENN DET SER UT. Testene lager indeksen, slår den opp ved
+  NAVN i introspeksjonen, og dropper den — de spør aldri GJENNOM den. Så
+  planleggeren trenger ikke matche uttrykk; den må bare aldri plukke en slik
+  indeks. Vedlikeholdet gjenbruker maskineriet fra S5 (`index_entry_key` +
+  `SchemaPrograms`), som allerede evaluerer et program per rad per indeks.
+  Krever skjema-wire v13 (IndexDef må bære uttrykkskilder).
+
+  MERK EN DEKLARASJONSFEIL: `mpedb_backend` arver
+  `supports_expression_indexes = True` fra Djangos sqlite-features. Den er
+  usann i dag. Å sette den False ville SKIPPE testene i stedet for å feile dem
+  — men det er å deklarere bort en evne, ikke å få den, så det er ikke veien
+  til 100 %.
 
 
 7. KJENT FLAKY TEST (IKKE EN REGRESJON — MÅLT)
