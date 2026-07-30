@@ -699,12 +699,37 @@ impl<'a> DdlWords<'a> {
 
 // ------------------------------------------------------------------ PRAGMA
 
-/// Parse `PRAGMA <name>[(<arg>)] | <name> = <value>` into `(name, arg)`.
+/// Parse `PRAGMA [<schema>.]<name>[(<arg>)] | <name> = <value>` into
+/// `(name, arg)`.
+///
+/// The SCHEMA qualifier is stripped. sqlite allows one and SQLAlchemy always
+/// writes it — `PRAGMA main.table_info("t")` is how it asks whether a table
+/// exists before creating it. Taking the leading identifier as the pragma NAME
+/// read that as a pragma called `main`, answered nothing, and so told it every
+/// table was absent: it created each one a second time and mpedb reported
+/// "duplicate table name". 241 failures in SQLAlchemy's dialect suite came from
+/// this one missing dot.
+///
+/// A qualifier other than `main` still resolves against the main schema, which
+/// is what this did for every unqualified pragma already. That is a narrower
+/// gap than the one it replaces, and a visible one: `PRAGMA temp.table_info`
+/// answers for main rather than for the temp schema.
 pub(crate) fn parse_pragma(sql: &str) -> (String, Option<String>) {
     // Drop the leading `pragma` keyword.
     let rest = sql.trim_start();
     let rest = &rest[rest.find(char::is_whitespace).unwrap_or(rest.len())..];
     let rest = rest.trim();
+    let ident = |s: &str| -> String {
+        s.chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect()
+    };
+    // `<schema>.` in front, if any.
+    let first = ident(rest);
+    let rest = match rest[first.len()..].strip_prefix('.') {
+        Some(after_dot) if !first.is_empty() => after_dot.trim_start(),
+        _ => rest,
+    };
     // Name = leading identifier.
     let name: String = rest
         .chars()
@@ -837,7 +862,17 @@ pub fn pragma(
                     let mut row = vec![
                         Value::Int(cid as i64),
                         Value::Text(c.name.clone()),
-                        Value::Text(type_name(c.ty).to_string()),
+                        // The DECLARED text, verbatim — `VARCHAR(50)` stays
+                        // `VARCHAR(50)`, and a column declared with no type at
+                        // all reports the empty string, both measured against
+                        // sqlite 3.45.1. Reporting the mapped storage class
+                        // instead told every reflecting consumer the wrong
+                        // thing: Django read `VARCHAR(50)` back as a TextField,
+                        // and SQLAlchemy lost the length entirely. It is the
+                        // same source `sqlite3_column_decltype` already
+                        // answers from (#112 wave 2); this pragma had simply
+                        // never been pointed at it.
+                        Value::Text(c.decltype().unwrap_or("").to_string()),
                         Value::Int(if c.nullable { 0 } else { 1 }),
                         Value::Null, // dflt_value: not reconstructed
                         Value::Int(pk),
