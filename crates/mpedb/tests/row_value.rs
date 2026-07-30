@@ -253,8 +253,10 @@ fn tuple_comparison_semantics_direct() {
 }
 
 /// Deferred / misuse forms — mpedb must cleanly REFUSE (a bind error, never a
-/// wrong answer): a row value in a scalar position, arity mismatch, a row-value
-/// IN-list, and a comparison against a scalar.
+/// wrong answer): a row value in a scalar position, arity mismatch, and a
+/// comparison against a scalar. The row-value IN-list moved OUT of this list
+/// when it was implemented — see
+/// [`a_row_value_in_list_matches_sqlite_including_nulls`].
 #[test]
 fn misuse_and_deferred_forms_are_refused() {
     let d = db();
@@ -279,8 +281,6 @@ fn misuse_and_deferred_forms_are_refused() {
     // Arity mismatch between the two tuples.
     refuses("SELECT (1, 2) = (1, 2, 3)");
     refuses("SELECT (1, 2, 3) < (1, 2)");
-    // Row-value IN-list — deferred by name.
-    refuses("SELECT a FROM t WHERE (a, b) IN ((1, 2), (3, 4))");
     // Row value against a subquery — deferred (a 2-column subquery cannot be a
     // scalar operand, so either the subquery lift or the binder refuses it).
     refuses("SELECT a FROM t WHERE (a, b) = (SELECT id, a FROM t)");
@@ -312,4 +312,43 @@ fn single_parenthesized_expr_is_not_a_row_value() {
         mpedb_rows(&d, "SELECT (1 + 2) * 3"),
         vec![vec!["9".to_string()]]
     );
+}
+
+/// `(a, b) [NOT] IN ((x, y), …)` and its `VALUES` spelling, against sqlite.
+///
+/// The NULL cases are the point. `NOT IN` is the NEGATION of the disjunction,
+/// not an AND of `<>`s — desugared the other way, a NULL in a non-matching row
+/// answers TRUE where sqlite answers NULL, and an ORM's `not_in()` silently
+/// gains rows.
+#[test]
+fn a_row_value_in_list_matches_sqlite_including_nulls() {
+    const SETUP: &[&str] = &[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+        "INSERT INTO t (id, x, y) VALUES (1, 5, 10)",
+        "INSERT INTO t (id, x, y) VALUES (2, NULL, 10)",
+        "INSERT INTO t (id, x, y) VALUES (3, 5, NULL)",
+        "INSERT INTO t (id, x, y) VALUES (4, 9, 9)",
+    ];
+    let d = db();
+    for s in SETUP {
+        d.query(s, &[]).unwrap();
+    }
+    let mut script = String::new();
+    for stmt in SETUP {
+        script.push_str(stmt);
+        script.push_str(";\n");
+    }
+    for q in [
+        "SELECT id FROM t WHERE (x, y) IN ((5, 10), (9, 9)) ORDER BY id",
+        "SELECT id FROM t WHERE (x, y) IN (VALUES (5, 10), (9, 9)) ORDER BY id",
+        "SELECT id FROM t WHERE (x, y) NOT IN ((5, 10), (9, 9)) ORDER BY id",
+        "SELECT id FROM t WHERE (x, y) IN ((5, NULL)) ORDER BY id",
+        "SELECT id FROM t WHERE (x, y) NOT IN ((5, NULL)) ORDER BY id",
+        "SELECT id FROM t WHERE (x, y) IN () ORDER BY id",
+        "SELECT id FROM t WHERE (x, y) NOT IN () ORDER BY id",
+    ] {
+        let got = mpedb_rows(&d, q);
+        let want = sqlite_rows(&format!("{script}{q};\n"));
+        assert_eq!(got, want, "`{q}`");
+    }
 }

@@ -630,6 +630,18 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::RParen, "`)` after IN subquery")?;
             return Ok(Expr::InSubquery(Box::new(e), Box::new(inner), negated));
         }
+        // `IN (VALUES (a, b), (c, d))` — the same list of row values, spelled
+        // as a VALUES clause. sqlite accepts both spellings for a row-value
+        // probe and SQLAlchemy emits this one; the keyword is all that differs,
+        // so it produces the identical `InList` and binds identically.
+        if self.eat_kw(Kw::Values) {
+            let mut items = vec![self.expr()?];
+            while self.eat(&Tok::Comma) {
+                items.push(self.expr()?);
+            }
+            self.expect(&Tok::RParen, "`)` closing IN")?;
+            return Ok(Expr::InList(Box::new(e), items, negated));
+        }
         let first = self.expr()?;
         if let (Expr::ContextRef(key), Some(&Tok::RParen)) = (&first, self.peek()) {
             let key = key.clone();

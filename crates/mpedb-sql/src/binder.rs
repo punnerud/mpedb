@@ -1412,6 +1412,15 @@ impl<'a> Binder<'a> {
                 ))
             }
             ast::Expr::InList(lhs, items, negated) => {
+                // A ROW VALUE probe — `(x, y) IN ((1, 2), (3, 4))`, and the
+                // `VALUES` spelling of the same list — desugars to an OR of the
+                // per-element `=` comparisons the scalar path already builds.
+                // Each arm goes through `bind_row_value_cmp`, so arity
+                // mismatches, type unification, collation and NULL 3VL are
+                // decided in ONE place rather than a second copy here.
+                if matches!(lhs.as_ref(), ast::Expr::RowValue(_)) {
+                    return self.bind_row_value_in(lhs, items, *negated);
+                }
                 // The IR encodes the arity in a u16, and the stack verifier
                 // proves depth n+1; both need this bound to be real.
                 if items.len() > u16::MAX as usize {
@@ -1886,6 +1895,39 @@ impl<'a> Binder<'a> {
     /// plan/format change. Every other shape is refused as a clean bind error
     /// (never a wrong answer): a row value against a scalar, a subquery RHS, or
     /// an arity mismatch.
+    /// `(a, b) [NOT] IN ((x, y), …)` — an OR of per-element row comparisons.
+    ///
+    /// `NOT IN` is the NEGATION of the whole disjunction, not an AND of `<>`s:
+    /// that is what makes a NULL anywhere in a non-matching row give NULL
+    /// rather than TRUE, which is sqlite's answer and the one an ORM's
+    /// `not_in()` depends on.
+    fn bind_row_value_in(
+        &mut self,
+        lhs: &ast::Expr,
+        items: &[ast::Expr],
+        negated: bool,
+    ) -> Result<(BExpr, Ty)> {
+        use ast::Expr as E;
+        // An EMPTY list is FALSE (`NOT IN` TRUE) — no row can match, NULLs
+        // included, exactly as the scalar path answers it.
+        if items.is_empty() {
+            return self.bind_expr(&E::Lit(Value::Bool(negated)));
+        }
+        // Built as AST and bound through the ordinary path, exactly as
+        // `bind_row_value_cmp` does with its own desugar: each arm then gets
+        // the same unification, coercion and constant folding a hand-written
+        // `(x=1 AND y=2) OR …` would, with no new node kind anywhere.
+        let mut acc = E::Binary(BinOp::Eq, Box::new(lhs.clone()), Box::new(items[0].clone()));
+        for it in &items[1..] {
+            let arm = E::Binary(BinOp::Eq, Box::new(lhs.clone()), Box::new(it.clone()));
+            acc = E::Binary(BinOp::Or, Box::new(acc), Box::new(arm));
+        }
+        if negated {
+            acc = E::Unary(ast::UnOp::Not, Box::new(acc));
+        }
+        self.bind_expr(&acc)
+    }
+
     fn bind_row_value_cmp(&mut self, op: BinOp, l: &ast::Expr, r: &ast::Expr) -> Result<(BExpr, Ty)> {
         use ast::Expr as E;
         let (lhs, rhs) = match (l, r) {
