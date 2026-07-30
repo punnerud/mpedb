@@ -217,6 +217,43 @@ fn resolve_view_key(w: &mut mpedb_core::WriteTxn<'_>, name: &str) -> Result<Opti
 /// schema's `parse_default`; everything else must match exactly or it is a
 /// clean error (never a silent conversion, the whole point of the rigid
 /// schema). `NULL` and an `any` column accept anything.
+/// Fold `DEFAULT ( <expr> )` to the literal it always evaluates to.
+///
+/// The expression is CLOSED by sqlite's own rule — it may not read a column
+/// ("default value of column [b] is not constant", MEASURED at 3.45.1) — so it
+/// is a constant written as arithmetic, and evaluating it once at DDL time is
+/// the same answer as evaluating it per row, forever. That is what lets the
+/// stored schema keep holding a plain `DefaultExpr::Const` and the wire format
+/// stay put.
+///
+/// Compiled against a table with NO columns, which is what enforces the closure:
+/// a column reference has nothing to bind to and is refused, in the same breath
+/// as anything else that will not fold (a parameter, a subquery, a
+/// non-deterministic call). The refusal names the column, because at DDL time
+/// that is the only thing the user can act on.
+fn fold_default_expr(src: &str, table: &str, column: &str) -> Result<mpedb_types::Value> {
+    let closed = mpedb_types::TableDef {
+        id: 0,
+        name: table.to_string(),
+        columns: Vec::new(),
+        primary_key: Vec::new(),
+        indexes: Vec::new(),
+        dead: false,
+        kind: mpedb_types::TableKind::Standard,
+        implicit_rowid: false,
+        foreign_keys: Vec::new(),
+    };
+    let bad = |why: String| {
+        Error::Schema(format!(
+            "DEFAULT ({src}) on `{table}`.`{column}` is not a constant: {why}"
+        ))
+    };
+    let prog = mpedb_sql::compile_value_expr(src, &closed).map_err(|e| bad(e.to_string()))?;
+    let mut stack = Vec::new();
+    prog.eval_with_stack(&mut stack, &[], &[])
+        .map_err(|e| bad(e.to_string()))
+}
+
 fn coerce_default(
     v: Value,
     ty: mpedb_types::ColumnType,
@@ -339,7 +376,18 @@ pub(crate) fn table_def_from_spec(
             // surprise at the first INSERT. An explicit `DEFAULT NULL` is
             // exactly "no default" and is not persisted — it is what an omitted
             // column already stores.
-            let default = match &c.default {
+            // `DEFAULT ( <expr> )` folds to a literal HERE, where the
+            // expression compiler is reachable. It is sound to fold because the
+            // expression is CLOSED — sqlite refuses one that reads a column
+            // ("default value of column [b] is not constant", measured) — so it
+            // has the same value for every row that will ever be inserted.
+            let folded = match &c.default_src {
+                None => None,
+                Some(src) => Some(mpedb_types::DefaultExpr::Const(fold_default_expr(
+                    src, &spec.name, &c.name,
+                )?)),
+            };
+            let default = match folded.as_ref().or(c.default.as_ref()) {
                 Some(mpedb_types::DefaultExpr::Const(v)) => {
                     // A DEFAULT lands in the column like any other value, so it
                     // takes the column's store-time affinity FIRST — sqlite
@@ -353,8 +401,8 @@ pub(crate) fn table_def_from_spec(
                         Some(mpedb_types::DefaultExpr::Const(v))
                     }
                 }
-                // The column-default parser only ever emits a Const literal.
-                other => other.clone(),
+                // The column-default parser emits a Const literal or `Now`.
+                other => other.cloned(),
             };
             Ok(mpedb_types::ColumnDef { generated: None,
                 // The declared text VERBATIM, so `sqlite3_column_decltype`

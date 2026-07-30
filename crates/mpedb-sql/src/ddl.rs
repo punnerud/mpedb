@@ -44,6 +44,11 @@ pub struct CreateColumnSpec {
     /// non-NULL, fills existing rows with it. `None` when no `DEFAULT` clause
     /// (and always `None` on the `CREATE TABLE` path, which refuses DEFAULT).
     pub default: Option<DefaultExpr>,
+    /// `DEFAULT ( <expr> )` captured VERBATIM, folded to a literal by the DDL
+    /// applier where the expression compiler lives. Parse-time only: it never
+    /// reaches the schema, because what is persisted is the folded constant.
+    /// `Some` and `default: None` always travel together.
+    pub default_src: Option<String>,
     /// `CHECK (<expr>)` declared on the column, captured as SOURCE text (like a
     /// policy predicate or a view body) because the parser does not yet know the
     /// column list to bind against. The facade compiles it against the finished
@@ -863,11 +868,27 @@ mod tests {
             ("CREATE TABLE t (a TEXT DEFAULT CURRENT_TIMESTAMP)", "CURRENT_TIMESTAMP"),
             ("CREATE TABLE t (a TEXT DEFAULT CURRENT_DATE)", "CURRENT_DATE"),
             ("CREATE TABLE t (a TEXT DEFAULT CURRENT_TIME)", "CURRENT_TIME"),
-            ("CREATE TABLE t (a INT DEFAULT (1 + 2))", "parenthesized"),
+            // A BARE function call is still a parse error: sqlite requires the
+            // parentheses around an expression default, and so do we.
             ("CREATE TABLE t (a INT DEFAULT abs(-1))", "constant literal"),
         ] {
             let e = parse_ddl(sql).unwrap_err().to_string();
             assert!(e.contains(needle), "{sql}: {e}");
+        }
+        // `DEFAULT ( <expr> )` PARSES now — it is captured as source and folded
+        // to a literal by the DDL applier, which is where the expression
+        // compiler is (and where a non-constant one is refused, by name).
+        // sqlite's own rule is that such an expression may not read a column,
+        // so it is a constant written as arithmetic.
+        for sql in [
+            "CREATE TABLE t (a INT DEFAULT (1 + 2))",
+            "CREATE TABLE t (a REAL DEFAULT (abs(-4.5)))",
+            "CREATE TABLE t (a INT DEFAULT (b + 1))", // non-constant: refused LATER
+        ] {
+            let stmt = parse_ddl(sql).unwrap().unwrap();
+            let DdlStmt::CreateTable(spec) = stmt else { panic!("expected CREATE TABLE") };
+            assert!(spec.columns[0].default_src.is_some(), "{sql}");
+            assert!(spec.columns[0].default.is_none(), "{sql}");
         }
         // Two DEFAULTs on one column is a clean error, not last-wins.
         assert!(parse_ddl("CREATE TABLE t (a INT DEFAULT 1 DEFAULT 2)").is_err());

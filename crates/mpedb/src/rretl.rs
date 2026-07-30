@@ -527,6 +527,7 @@ pub(crate) fn ensure_lineage_tables(
 /// into a composite PkRange.
 pub(crate) fn spec_col(name: &str, ty: ColumnType) -> mpedb_sql::CreateColumnSpec {
     mpedb_sql::CreateColumnSpec {
+        default_src: None,
         name: name.into(),
         ty,
         affinity: mpedb_types::Affinity::implied_by(ty),

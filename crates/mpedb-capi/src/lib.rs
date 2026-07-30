@@ -3008,22 +3008,54 @@ pub unsafe extern "C" fn sqlite3_limit(db: *mut Sqlite3, id: c_int, new_val: c_i
 /// not call this on the connect/CRUD paths.)
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_config(
-    _db: *mut Sqlite3,
+    db: *mut Sqlite3,
     op: c_int,
-    _a: c_int,
+    a: c_int,
     b: *mut c_void,
 ) -> c_int {
     // The `(int onoff, int *pCurrent)` toggle ops — 1002 (ENABLE_FKEY) through
     // the 1019 range; NOT 1000/1001, whose varargs are pointers with different
-    // shapes: mpedb honors none of them, so the CURRENT state written back is
-    // always 0 — the literal truth (FK enforcement, triggers, … are not
-    // active), never a lie a consumer can build on. Leaving the out pointer
-    // unwritten made CPython's getconfig read an indeterminate int.
-    if (1002..=1019).contains(&op) && !b.is_null() {
-        *(b as *mut c_int) = 0;
+    // shapes. `onoff` is 1 = on, 0 = off, -1 = report without changing, and the
+    // out pointer receives the state AFTERWARDS.
+    //
+    // Writing back a constant 0 was the literal truth while mpedb honored none
+    // of these. FOREIGN KEY enforcement is real now, so for 1002 that constant
+    // became a lie in both directions: it under-reported an enabled connection,
+    // and it failed the setter outright — CPython's `setconfig` compares what
+    // came back against what it asked for and raises "Unable to set config"
+    // when they differ, so `PRAGMA foreign_keys`'s C-API twin never worked.
+    //
+    // The other ops are still honored by nobody, and 0 stays their honest
+    // answer: a consumer that asks whether triggers are disabled gets "no",
+    // which is true, rather than an indeterminate int.
+    if !(1002..=1019).contains(&op) {
+        return SQLITE_OK;
+    }
+    let state = if op == SQLITE_DBCONFIG_ENABLE_FKEY {
+        match conn(db) {
+            None => return SQLITE_MISUSE,
+            Some(c) => {
+                // Same rule as the PRAGMA: a change inside a transaction is
+                // silently ignored (measured against sqlite), so the state that
+                // comes back is whatever actually holds now.
+                match a {
+                    0 | 1 => c.db.set_fk_enforced(a == 1),
+                    _ => {}
+                }
+                c.db.fk_enforced()
+            }
+        }
+    } else {
+        false
+    };
+    if !b.is_null() {
+        *(b as *mut c_int) = c_int::from(state);
     }
     SQLITE_OK
 }
+
+/// `SQLITE_DBCONFIG_ENABLE_FKEY` — the C-API twin of `PRAGMA foreign_keys`.
+const SQLITE_DBCONFIG_ENABLE_FKEY: c_int = 1002;
 
 /// Toggling the load-extension switch is harmless; actual loading is refused
 /// (see `sqlite3_load_extension`).

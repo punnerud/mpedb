@@ -472,7 +472,7 @@ impl<'a> Parser<'a> {
     /// `CURRENT_TIMESTAMP` is the TEXT `'YYYY-MM-DD HH:MM:SS'`. Accepting the
     /// keyword would store a DIFFERENT value than sqlite stores, so both refuse
     /// by name: a clean refusal beats a value that is quietly not sqlite's.
-    fn parse_column_default(&mut self) -> Result<DefaultExpr> {
+    fn parse_column_default(&mut self) -> Result<ColumnDefault> {
         if let Some(Tok::Ident(w)) = self.peek() {
             let lw = w.to_ascii_lowercase();
             if matches!(lw.as_str(), "current_date" | "current_time" | "current_timestamp") {
@@ -486,12 +486,18 @@ impl<'a> Parser<'a> {
             }
         }
         if self.peek() == Some(&Tok::LParen) {
-            return Err(self.err_here(
-                "a parenthesized DEFAULT expression is not supported — mpedb stores a \
-                 constant default, not an expression evaluated per row",
-            ));
+            // `DEFAULT ( <expr> )`. sqlite refuses a default that reads another
+            // column — MEASURED: `b INT DEFAULT (a+1)` is "default value of
+            // column [b] is not constant". So the expression is CLOSED: it has
+            // no row to read, and its value is the same for every row forever.
+            // That is a CONSTANT, just one written as arithmetic — which is how
+            // Django's ORM emits `db_default=Pi()` and `db_default=Coalesce(4.5,
+            // Pi())`. Captured as source here and folded to a literal where the
+            // expression compiler lives; a source that does NOT fold is refused
+            // there, by name.
+            return Ok(ColumnDefault::Expr(self.capture_paren_source()?));
         }
-        self.parse_add_column_default()
+        self.parse_add_column_default().map(ColumnDefault::Value)
     }
 
     /// The tail of a generated-column clause, positioned at the `AS`:
@@ -535,6 +541,7 @@ impl<'a> Parser<'a> {
             unique: false,
             pk: false,
             default: None,
+            default_src: None,
             check: None,
             collation: Collation::Binary,
             generated: None,
@@ -581,7 +588,10 @@ impl<'a> Parser<'a> {
                         self.err_here(format!("column `{}` has more than one DEFAULT", col.name))
                     );
                 }
-                col.default = Some(self.parse_column_default()?);
+                match self.parse_column_default()? {
+                    ColumnDefault::Value(d) => col.default = Some(d),
+                    ColumnDefault::Expr(src) => col.default_src = Some(src),
+                }
             } else if self.eat_word("CHECK") {
                 let src = self.capture_paren_source()?;
                 // Several CHECKs on one column are one conjunction — which is
@@ -1249,6 +1259,7 @@ impl<'a> Parser<'a> {
                 unique: false,
                 pk: false,
                 default: None,
+                default_src: None,
                 check: None,
                 collation: Collation::Binary,
                 generated: None,
@@ -1383,4 +1394,15 @@ impl<'a> Parser<'a> {
         };
         Ok(DefaultExpr::Const(val))
     }
+}
+
+/// What a column's `DEFAULT` clause turned out to be.
+///
+/// A literal resolves in the parser. A parenthesized expression cannot: folding
+/// it needs the expression compiler, which lives above this layer — so the
+/// source travels, and `CreateColumnSpec::default_src` carries it exactly one
+/// step further.
+enum ColumnDefault {
+    Value(DefaultExpr),
+    Expr(String),
 }

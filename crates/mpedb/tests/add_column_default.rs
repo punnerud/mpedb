@@ -326,3 +326,49 @@ fn default_persists_across_reopen() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+// ------------------------------------------------- `DEFAULT ( <expr> )`
+
+/// A parenthesized DEFAULT is a CONSTANT written as arithmetic. sqlite's own
+/// rule proves it: `b INT DEFAULT (a+1)` is refused with "default value of
+/// column [b] is not constant", so the expression has no row to read and its
+/// value is the same for every row that will ever exist. mpedb folds it once at
+/// DDL time; this pins that the folded value — and its STORAGE CLASS — is what
+/// sqlite computes per row.
+///
+/// Django's ORM is why this matters: `db_default=Pi()` compiles to
+/// `DEFAULT (3.141592653589793)` and `db_default=Coalesce(4.5, Pi())` to a
+/// COALESCE call, and refusing those refused the whole migration.
+#[test]
+fn parenthesized_expression_defaults_fold_to_what_sqlite_stores() {
+    let (cfg, path) = config("expr-default");
+    let db = Database::open_with_config(cfg).unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+
+    let ddl = "CREATE TABLE e (\
+        id INTEGER PRIMARY KEY, \
+        pi REAL DEFAULT (3.141592653589793), \
+        s TEXT DEFAULT ('hi'), \
+        c REAL DEFAULT (abs(-4.5)), \
+        n INT DEFAULT (3 + 4), \
+        co REAL DEFAULT (coalesce(4.5, 3.14)))";
+    db.query(ddl, &[]).unwrap();
+    conn.execute_batch(ddl).unwrap();
+
+    let ins = "INSERT INTO e (id) VALUES (1)";
+    db.query(ins, &[]).unwrap();
+    conn.execute_batch(ins).unwrap();
+
+    // Value AND typeof: a fold that produced the right number with the wrong
+    // storage class would be a wrong answer this comparison catches.
+    let sel = "SELECT pi, typeof(pi), s, typeof(s), c, typeof(c), n, typeof(n), co FROM e";
+    assert_eq!(mpedb_select(&db, sel), sqlite_select(&conn, sel));
+
+    // A default that reads a column is not constant, and both engines say so.
+    let bad = "CREATE TABLE bad (a INT, b INT DEFAULT (a + 1))";
+    let e = db.query(bad, &[]).unwrap_err().to_string();
+    assert!(e.contains("not a constant"), "{e}");
+    assert!(conn.execute_batch(bad).is_err() || conn.execute_batch("INSERT INTO bad DEFAULT VALUES").is_err());
+
+    let _ = std::fs::remove_file(&path);
+}

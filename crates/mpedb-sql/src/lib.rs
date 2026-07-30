@@ -345,6 +345,24 @@ pub fn compile_index_predicate(expr_src: &str, table: &TableDef) -> Result<ExprP
 /// The program is stored in the schema and re-validated by `Schema::validate`
 /// (column bounds, no forward reference to another generated column), so a
 /// caller cannot smuggle a cyclic or out-of-range expression past this.
+/// Compile an expression for its VALUE, against `table`'s columns.
+///
+/// [`compile_check`] binds a PREDICATE (its result is a truth value) and
+/// [`compile_generated`] binds an ASSIGNMENT (its result is coerced to a target
+/// column). A column DEFAULT is neither: `DEFAULT (3.14159)` must come back as
+/// the float, and the DDL applier does the column's affinity and type check
+/// afterwards, exactly as it does for a literal default. Compiling it as a check
+/// returned `true`.
+pub fn compile_value_expr(expr_src: &str, table: &TableDef) -> Result<ExprProgram> {
+    let (expr, n_params) = parser::parse_expr_only(expr_src)?;
+    if n_params > 0 {
+        return Err(Error::Bind("parameters are not allowed here".into()));
+    }
+    let mut binder = binder::Binder::new(table, 0, false);
+    let (bound, _ty) = binder.bind_expr(&expr)?;
+    binder::compile_program(&bound)
+}
+
 pub fn compile_generated(expr_src: &str, table: &TableDef, col: usize) -> Result<ExprProgram> {
     let (expr, n_params) = parser::parse_expr_only(expr_src)?;
     if n_params > 0 {
