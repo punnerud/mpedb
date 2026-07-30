@@ -1163,24 +1163,30 @@ pub fn references_sqlite_master(sql: &str) -> bool {
 /// `sqlite_temp_master` is a separate table in sqlite, listing only the temp
 /// schema — and it is how SQLAlchemy enumerates temp tables, so answering
 /// "unknown table" for it cost 280 tests once temp tables existed to list.
-pub fn master_reference(sql: &str) -> Option<bool> {
+pub fn master_reference(sql: &str) -> Option<MasterRef> {
     let temp = names_a_catalog(sql, &["sqlite_temp_master", "sqlite_temp_schema"]);
     let main = names_a_catalog(sql, &["sqlite_master", "sqlite_schema"]);
     match (temp, main) {
-        // A statement naming ONLY the temp catalog reads the temp schema.
-        (true, false) => Some(true),
-        // One naming BOTH — SQLAlchemy's table listing is
-        // `… FROM sqlite_master UNION … FROM sqlite_temp_master` — cannot be
-        // answered from one catalog, and the mini-evaluator has no way to run
-        // the two branches against different ones. Answering from TEMP alone
-        // lost every main table and cost 122 tests; main alone is what this
-        // did before temp schemas existed and is the better wrong answer of
-        // the two, since temp is usually empty. A real UNION here needs the
-        // evaluator to resolve per-branch, which is its own piece of work.
-        (true, true) => Some(false),
-        (false, true) => Some(false),
+        (true, false) => Some(MasterRef::Temp),
+        // A statement naming BOTH — `SELECT sql FROM (SELECT * FROM
+        // sqlite_master UNION ALL SELECT * FROM sqlite_temp_master) WHERE
+        // name = ?` is how SQLAlchemy asks for an object's DDL without caring
+        // which schema holds it — reads BOTH catalogs, main's rows first, as
+        // the UNION ALL writes them. Answering from main alone (which is what
+        // this did) made every temp object a "no such table" to a reflecting
+        // consumer.
+        (true, true) => Some(MasterRef::Both),
+        (false, true) => Some(MasterRef::Main),
         (false, false) => None,
     }
+}
+
+/// Which catalog(s) a statement's `sqlite_master` reference names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MasterRef {
+    Main,
+    Temp,
+    Both,
 }
 
 /// The `<schema>.` a catalog reference was qualified with, if any.
@@ -1283,14 +1289,26 @@ fn master_cell(r: &MasterRow, col: &str) -> Value {
 /// `params` are the statement's bound values: a `WHERE` operand may be a
 /// parameter (`$N` after `scan_params` rewrote `?`/`:name`), which is the ONLY
 /// form Django's `get_constraints` ever writes.
+/// One catalog the `sqlite_master` mini-evaluator reads rows from.
+///
+/// A LIST of these, because a statement may name more than one:
+/// `SELECT … FROM (SELECT * FROM sqlite_master UNION ALL SELECT * FROM
+/// sqlite_temp_master)` is how SQLAlchemy asks for an object's DDL text
+/// without caring which schema holds it. Answered from main alone, every
+/// TEMP object came back as "no such table" and was dropped from its
+/// reflection results.
+pub struct MasterSource<'a> {
+    pub schema: &'a mpedb::Schema,
+    pub verbatim: &'a std::collections::HashMap<String, Vec<u8>>,
+    pub idx: &'a IndexRecords,
+    pub views: &'a [(String, String)],
+    pub triggers: &'a [(String, String, String)],
+}
+
 pub fn sqlite_master(
-    schema: &mpedb::Schema,
+    sources: &[MasterSource],
     sql: &str,
     params: &[Value],
-    verbatim: &std::collections::HashMap<String, Vec<u8>>,
-    idx: &IndexRecords,
-    views: &[(String, String)],
-    triggers: &[(String, String, String)],
 ) -> Result<(Vec<String>, Vec<Vec<Value>>), DbError> {
     let lower = sql.to_ascii_lowercase();
     let sel = lower
@@ -1321,6 +1339,9 @@ pub fn sqlite_master(
     // grouping by table agrees with it whenever indexes are created with their
     // table (every ORM migration) and replays correctly regardless.
     let mut rows: Vec<MasterRow> = Vec::new();
+    for src in sources {
+        let (schema, verbatim, idx, views, triggers) =
+            (src.schema, src.verbatim, src.idx, src.views, src.triggers);
     for t in user_tables(schema) {
         rows.push(MasterRow {
             ty: "table",
@@ -1360,6 +1381,7 @@ pub fn sqlite_master(
             tbl_name: name.clone(),
             sql: create,
         });
+    }
     }
 
     // WHERE.

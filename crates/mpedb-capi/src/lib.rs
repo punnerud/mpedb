@@ -637,64 +637,74 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // SQLAlchemy lists an attached schema's views.
             let master_q_name = introspect::master_schema(sqltext)
                 .filter(|q| !q.eq_ignore_ascii_case("main"));
-            let bundle = if introspect::master_reference(sqltext) == Some(true) {
-                c.db.temp_schema_or_empty()
-            } else if let Some(q) = master_q_name.as_deref() {
-                c.db.attached_schema_or_empty(q)
-            } else {
-                match c.txn.as_ref() {
-                    Some(s) => s.schema(),
-                    None => {
-                        let _ = c.db.refresh_schema_if_stale();
-                        c.db.schema()
-                    }
-                }
+            let reference = introspect::master_reference(sqltext);
+            // Which catalog(s) supply rows. A statement naming both reads main
+            // first and temp second, as its `UNION ALL` writes them.
+            let members: Vec<Option<&str>> = match reference {
+                Some(introspect::MasterRef::Temp) => vec![Some("temp")],
+                Some(introspect::MasterRef::Both) => vec![None, Some("temp")],
+                _ => vec![master_q_name.as_deref()],
             };
-            // The verbatim text comes from the SAME schema the rows do —
-            // `record_member` files it there. Reading main for every schema
-            // could not work: two schemas may hold a table of one name, and
-            // one name-keyed record cannot hold two texts.
-            let verbatim_from: Option<&str> =
-                if introspect::master_reference(sqltext) == Some(true) {
-                    Some("temp")
-                } else {
-                    master_q_name.as_deref()
+            let _ = c.db.refresh_schema_if_stale();
+            let mut parts = Vec::with_capacity(members.len());
+            for member in members {
+                let bundle = match member {
+                    Some(m) => c.db.attached_schema_or_empty(m),
+                    None => match c.txn.as_ref() {
+                        Some(s) => s.schema(),
+                        None => c.db.schema(),
+                    },
                 };
-            let verbatim = sqlite_master_records_of(c, verbatim_from);
-            let idx = sqlite_index_records_of(c, verbatim_from);
-            // Prefer txn-visible catalog (uncommitted CREATE VIEW/TRIGGER).
-            let mut verbatim = verbatim;
-            let (views, triggers) = if verbatim_from == Some("temp") {
-                // A temp view is connection-local text, not a member object,
-                // so it comes from the handle rather than from any catalog —
-                // and main's views must NOT appear under `sqlite_temp_master`.
-                let mut views = Vec::new();
-                for (name, select_sql, text) in c.db.temp_views_all() {
-                    verbatim.insert(name.clone(), introspect::object_ddl_record(&text));
-                    views.push((name, select_sql));
-                }
-                (views, Vec::new())
-            } else if let Some(m) = verbatim_from {
-                // An attached member's views are objects of THAT schema.
-                // Reading main's catalog here reported main's views under
-                // every attached schema — a wrong answer, and it hid the fact
-                // that a qualified `CREATE VIEW` was not landing anywhere.
-                (c.db.attached_list_views(m), c.db.attached_list_triggers(m))
-            } else {
-                match c.txn.as_mut() {
-                    Some(s) => (
-                        s.list_views().unwrap_or_default(),
-                        s.list_triggers().unwrap_or_default(),
-                    ),
-                    None => (
-                        c.db.list_views().unwrap_or_default(),
-                        c.db.list_triggers().unwrap_or_default(),
-                    ),
-                }
-            };
-            let (columns, rows) = introspect::sqlite_master(
-                &bundle, sqltext, params, &verbatim, &idx, &views, &triggers,
-            )?;
+                // The verbatim text comes from the SAME schema the rows do —
+                // `record_member` files it there. Reading main for every schema
+                // could not work: two schemas may hold a table of one name, and
+                // one name-keyed record cannot hold two texts.
+                let mut verbatim = sqlite_master_records_of(c, member);
+                let idx = sqlite_index_records_of(c, member);
+                let (views, triggers) = if member == Some("temp") {
+                    // A temp view is connection-local text, not a member
+                    // object, so it comes from the handle rather than from any
+                    // catalog — and main's views must NOT appear under
+                    // `sqlite_temp_master`.
+                    let mut views = Vec::new();
+                    for (name, select_sql, text) in c.db.temp_views_all() {
+                        verbatim.insert(name.clone(), introspect::object_ddl_record(&text));
+                        views.push((name, select_sql));
+                    }
+                    (views, Vec::new())
+                } else if let Some(m) = member {
+                    // An attached member's views are objects of THAT schema.
+                    // Reading main's catalog here reported main's views under
+                    // every attached schema — a wrong answer, and it hid the
+                    // fact that a qualified `CREATE VIEW` was not landing
+                    // anywhere.
+                    (c.db.attached_list_views(m), c.db.attached_list_triggers(m))
+                } else {
+                    // Prefer txn-visible catalog (uncommitted CREATE VIEW/TRIGGER).
+                    match c.txn.as_mut() {
+                        Some(s) => (
+                            s.list_views().unwrap_or_default(),
+                            s.list_triggers().unwrap_or_default(),
+                        ),
+                        None => (
+                            c.db.list_views().unwrap_or_default(),
+                            c.db.list_triggers().unwrap_or_default(),
+                        ),
+                    }
+                };
+                parts.push((bundle, verbatim, idx, views, triggers));
+            }
+            let sources: Vec<introspect::MasterSource> = parts
+                .iter()
+                .map(|(bundle, verbatim, idx, views, triggers)| introspect::MasterSource {
+                    schema: bundle,
+                    verbatim,
+                    idx,
+                    views,
+                    triggers,
+                })
+                .collect();
+            let (columns, rows) = introspect::sqlite_master(&sources, sqltext, params)?;
             Ok(Outcome::Rows { columns, rows })
         }
         Kind::Begin => {
@@ -748,7 +758,7 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                     create: true,
                     on_table: Some(t),
                     ..
-                } => table_index_count(c, t),
+                } => table_index_count(c, record_member(sqltext, d).as_deref(), t),
                 _ => None,
             });
             let res = if let Some(s) = c.txn.as_mut() {
@@ -842,10 +852,13 @@ fn sqlite_index_records_of(c: &mut Sqlite3, member: Option<&str>) -> introspect:
 
 /// How many secondary indexes `table` has right now — the "before" half of the
 /// `CREATE INDEX` fingerprint capture (see [`record_object_ddl`]).
-fn table_index_count(c: &Sqlite3, table: &str) -> Option<usize> {
-    let schema = match c.txn.as_ref() {
-        Some(s) => s.schema(),
-        None => c.db.schema(),
+fn table_index_count(c: &Sqlite3, member: Option<&str>, table: &str) -> Option<usize> {
+    let schema = match member {
+        Some(m) => c.db.attached_schema_or_empty(m),
+        None => match c.txn.as_ref() {
+            Some(s) => s.schema(),
+            None => c.db.schema(),
+        },
     };
     let exact = introspect::exact_table_name(&schema, table)?;
     introspect::table_by_exact_name(&schema, &exact).map(|t| t.indexes.len())
