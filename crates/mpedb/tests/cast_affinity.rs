@@ -241,10 +241,16 @@ fn numeric_affinity_is_per_value_at_runtime() {
     assert_eq!(eval("CAST($1 AS NUMERIC)", Value::Text("42".into())), Ok(Value::Int(42)));
     assert_eq!(eval("CAST($1 AS NUMERIC)", Value::Text("3.5".into())), Ok(Value::Float(3.5)));
     assert_eq!(eval("CAST($1 AS NUMERIC)", Value::Text("1e3".into())), Ok(Value::Int(1000)));
-    // The four fixed affinities PIN a bare parameter to their storage type (PG's
-    // canonical way to type a `?`): a mismatched param value is refused, not
-    // silently coerced — the cast is the identity on a correctly-typed param.
-    assert!(eval("CAST($1 AS INTEGER)", Value::Text("12ab".into())).is_err());
+    // The four fixed affinities used to PIN a bare parameter to their storage
+    // type — PG's way of typing a `?` — which made the cast REFUSE exactly the
+    // values it exists to convert. sqlite converts them, and these are its
+    // answers (measured against 3.45.1, value and `typeof` both): the operand
+    // of a cast takes any type, and the RESULT is what the affinity fixes.
+    assert_eq!(eval("CAST($1 AS INTEGER)", Value::Text("12ab".into())), Ok(Value::Int(12)));
+    assert_eq!(eval("CAST($1 AS INTEGER)", Value::Text("abc".into())), Ok(Value::Int(0)));
+    assert_eq!(eval("CAST($1 AS INTEGER)", Value::Float(3.7)), Ok(Value::Int(3)));
+    assert_eq!(eval("CAST($1 AS REAL)", Value::Text("2.5x".into())), Ok(Value::Float(2.5)));
+    assert_eq!(eval("CAST($1 AS TEXT)", Value::Int(12)), Ok(Value::Text("12".into())));
     assert_eq!(eval("CAST($1 AS INTEGER)", Value::Int(7)), Ok(Value::Int(7)));
     assert_eq!(eval("CAST($1 AS TEXT)", Value::Text("hi".into())), Ok(Value::Text("hi".into())));
     cleanup(&path);

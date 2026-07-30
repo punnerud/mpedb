@@ -1617,13 +1617,18 @@ impl<'a> Binder<'a> {
             ast::Expr::Cast(a, tyname) => {
                 let aff = Affinity::from_type_name(tyname);
                 let (a, at) = self.bind_expr(a)?;
-                // `CAST(? AS t)` pins a bare parameter to the affinity's storage
-                // type — PG's canonical way to type a param. NUMERIC has no
-                // single storage type, so it does not pin.
-                let (a, at) = match affinity_pin_type(aff) {
-                    Some(pin) => self.unify_param(a, at, pin),
-                    None => (a, at),
-                };
+                // A CAST's operand takes ANY type — converting is the whole
+                // point of the cast. `CAST(? AS t)` used to PIN the parameter
+                // to the affinity's storage type, which is PostgreSQL's way of
+                // typing a bare param but makes the cast refuse exactly the
+                // values it exists to convert: `INSERT INTO t (x) VALUES
+                // (CAST(? AS VARCHAR(50)))` with an integer is what SQLAlchemy
+                // writes, and sqlite stores `'1'`.
+                //
+                // The RESULT stays typed by the affinity (`cast_result_type`
+                // below), so nothing downstream loses a type — only the
+                // parameter SLOT is left free, which is what lets the caller
+                // pass what sqlite would have converted.
                 let e = fold_maybe(BExpr::Cast(Box::new(a), aff), self.suppress_fold)?;
                 // The bind-time result type. A folded constant reports its own
                 // concrete type; otherwise the affinity fixes it, except NUMERIC
@@ -3619,19 +3624,6 @@ fn like_glob_operand(l: BExpr, lt: Option<ColumnType>, op: &str, coerce: bool) -
 /// Constant-fold one node whose children are already folded: if every child
 /// is a constant, evaluate now (via the same IR evaluator used at run time,
 /// so semantics — including division-by-zero errors — match exactly).
-/// The storage type a bare `CAST(? AS t)` parameter is pinned to. sqlite's
-/// affinities map onto one mpedb type each — except NUMERIC, whose runtime type
-/// is decided per value, so a NUMERIC-cast parameter stays unpinned (`None`).
-fn affinity_pin_type(aff: Affinity) -> Option<ColumnType> {
-    Some(match aff {
-        Affinity::Integer => ColumnType::Int64,
-        Affinity::Real => ColumnType::Float64,
-        Affinity::Text => ColumnType::Text,
-        Affinity::Blob => ColumnType::Blob,
-        Affinity::Numeric => return None,
-    })
-}
-
 /// The bind-time result type of a non-constant `CAST` to `aff` over a source of
 /// type `src`. INTEGER/REAL/TEXT/BLOB are fixed. NUMERIC is the subtle one: an
 /// int/real/bool/timestamp source keeps a concrete numeric type (the runtime

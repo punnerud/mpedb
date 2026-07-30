@@ -166,6 +166,65 @@ clippy ×2 + CPython + Django G1+G2) og M3 verifisert:
   målt test henger på det.
 
 
+1c. FORSLAG: SYNLIG QUIRKS-REGISTER (Mortens, 30/7) — VURDERT MOT MÅLING
+-----------------------------------------------------------------------
+
+  Forslaget: en fil-autoritativ registry av navngitte kompatibilitetsvalg, med
+  teller, begrunnelse og en vei til å skru dem av én om gangen.
+
+  PRINSIPPET ER RIKTIG, og det er billigere enn det ser ut: mekanismen finnes
+  allerede i embryo. `[compat] bare_group_by` (sqlite | postgres) ER en quirk
+  av nøyaktig denne typen — fil-/config-autoritativ, tredd gjennom `compile`
+  inn i binderen, med sqlite som default og postgres for en PG-importert
+  mirror. Registeret er å GENERALISERE den, ikke å bygge nytt maskineri.
+
+  ÉN HARD BETINGELSE, og den er ikke valgfri: en kompilerings-quirk endrer hva
+  en gitt SQL-tekst kompilerer TIL. Planene er innholds-hashet og DELT mellom
+  prosesser i katalogens sys-keyspace. Hvis to tilkoblinger er uenige om hvilke
+  quirks som er på, gir samme hash to forskjellige planer — et galt svar i
+  kjernen av designet, ikke en config-detalj. Derfor MÅ en quirk være
+  fil-autoritativ (som forslaget sier) OG delta i plan-hashen. `bare_group_by`
+  viser at det er gjørbart; enhver ny quirk må følge samme regel eller ikke
+  eksistere.
+
+  MEN LISTA ER KORTERE ENN FORSLAGET ANTAR. Målinger 30/7 flyttet fire av de
+  seks eksemplene ut av «bevisst strengere» og inn i «manglende tilfelle»:
+
+    order_by_non_output   IKKE en quirk. `SELECT x+y AS lx … GROUP BY lx
+                          ORDER BY lx` er lovlig i BÅDE sqlite og PostgreSQL;
+                          mpedb løste bare navnet mot feil tuppel. Lukket i
+                          S3q — ingen semantikk å velge mellom.
+    select_alias_in_where IKKE en quirk. sqlite tillater det ikke heller.
+    type-affinitet        DELVIS lukket: `CAST(? AS t)` PINNET parameteren til
+                          affinitetens lagringstype (PGs måte), og nektet
+                          dermed nøyaktig de verdiene CAST-en finnes for å
+                          konvertere. Alle seks formene er nå målt identiske
+                          med sqlite på verdi OG typeof(). Ingen quirk trengs.
+    korrelerte subqueries IKKE målt som en strenghets-forskjell; det som stod
+                          igjen var `(a,b) IN (SELECT …)`, lukket i S3m.
+
+  DE SOM FAKTISK ER IGJEN — og de er ekte:
+
+    declared_notnull_only  `PRAGMA table_info.notnull` melder HÅNDHEVELSE (1 for
+                           hver PK-kolonne) der sqlite melder DEKLARASJON. mpedb
+                           håndhever faktisk NOT NULL på PK, så 1 er sant om
+                           mpedb; sqlite melder det som ble skrevet. Skjemaet
+                           bærer nå `default_text` etter samme prinsipp (v15),
+                           så presedensen for «lagre det som ble DEKLARERT ved
+                           siden av det som HÅNDHEVES» er etablert.
+    pk_nullable_rowid      sqlites INTEGER PRIMARY KEY + NULL → auto-tildel.
+
+  To medlemmer er en liten, ærlig tabell. Seks ville vært et delsystem. Det er
+  forskjellen på om dette bør bygges nå eller ikke — og med to er svaret ja,
+  men som en tabell med to rader, ikke som en ny mekanisme.
+
+  Rekkefølge, hvis det skal gjøres: (1) generaliser `[compat]` til en navngitt
+  tabell som deltar i plan-hashen, (2) flytt `bare_group_by` inn i den
+  uendret som første medlem og bevis at hashen skiller, (3) legg til
+  `declared_notnull_only`, (4) teller + `mpedb strict --plan` sist, når det
+  finnes noe å telle.
+
+
 2. HVA S3 ER
 ------------
 
