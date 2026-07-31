@@ -589,6 +589,14 @@ fn encode_opt_frame(frame: Option<&Frame>, buf: &mut Vec<u8>) {
             });
             encode_frame_bound(f.start, buf);
             encode_frame_bound(f.end, buf);
+            // Format 66. Trailing, so every pre-exclusion frame gains exactly
+            // one `0` byte and the layout stays append-only.
+            buf.push(match f.exclude {
+                FrameExclude::NoOthers => 0,
+                FrameExclude::CurrentRow => 1,
+                FrameExclude::Group => 2,
+                FrameExclude::Ties => 3,
+            });
         }
     }
 }

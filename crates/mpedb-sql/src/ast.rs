@@ -522,6 +522,10 @@ pub(crate) struct FrameAst {
     pub mode: FrameMode,
     pub start: FrameBound,
     pub end: FrameBound,
+    /// `EXCLUDE {NO OTHERS | CURRENT ROW | GROUP | TIES}`. The plan type is
+    /// reused verbatim — as `FrameBound` already reuses [`crate::plan::WinInt`]
+    /// — because there is nothing to translate and two copies would drift.
+    pub exclude: crate::plan::FrameExclude,
 }
 
 /// Frame unit: physical rows, logical value range, or peer-group offsets.

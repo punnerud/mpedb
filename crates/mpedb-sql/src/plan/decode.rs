@@ -1063,7 +1063,14 @@ fn decode_opt_frame(buf: &[u8], pos: &mut usize) -> Result<Option<Frame>> {
             };
             let start = decode_frame_bound(buf, pos)?;
             let end = decode_frame_bound(buf, pos)?;
-            Ok(Some(Frame { mode, start, end }))
+            let exclude = match r_u8(buf, pos)? {
+                0 => FrameExclude::NoOthers,
+                1 => FrameExclude::CurrentRow,
+                2 => FrameExclude::Group,
+                3 => FrameExclude::Ties,
+                t => return Err(corrupt(format!("bad window frame exclusion {t}"))),
+            };
+            Ok(Some(Frame { mode, start, end, exclude }))
         }
         t => Err(corrupt(format!("bad window frame presence tag {t}"))),
     }

@@ -265,6 +265,7 @@ fn resolve_frame(fa: &ast::FrameAst) -> Frame {
         mode,
         start: bound(fa.start),
         end: bound(fa.end),
+        exclude: fa.exclude,
     }
 }
 

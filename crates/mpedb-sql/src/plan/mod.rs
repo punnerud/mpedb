@@ -494,7 +494,7 @@ const MAX_JOINS: usize = 63;
 //     Python source. The integer SEMANTICS are untouched (0 = the current row,
 //     negative looks the other way — both already matched sqlite); only where
 //     the integer comes from is new.
-const PLAN_FORMAT: u8 = 65;
+const PLAN_FORMAT: u8 = 66;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1018,6 +1018,31 @@ pub struct Frame {
     pub mode: FrameMode,
     pub start: FrameBound,
     pub end: FrameBound,
+    /// Frame EXCLUSION (format 66) — SQL:2003, and what Django's ORM emits for
+    /// `frame=ValueRange(..., exclusion=...)`. Punches a hole in an otherwise
+    /// contiguous frame, so it is the one frame feature the sliding host-
+    /// aggregate path cannot answer incrementally.
+    pub exclude: FrameExclude,
+}
+
+/// Which rows a frame drops around the CURRENT row. Measured against sqlite
+/// 3.45.1 before implementing — the peer group is the current row's ORDER BY
+/// ties WITHIN the partition, and with no ORDER BY the whole partition is one
+/// peer group (so `Group` empties the frame and `Ties` leaves exactly the
+/// current row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameExclude {
+    /// The default: nothing is dropped.
+    #[default]
+    NoOthers,
+    /// Just the current row.
+    CurrentRow,
+    /// The current row AND its peers.
+    Group,
+    /// The current row's peers, but NOT the current row — which is why this is
+    /// a filter over the frame rather than a narrowing of its bounds: the kept
+    /// row stays in its window-order position.
+    Ties,
 }
 
 /// Frame unit. `Rows` counts physical rows; `Range` compares ORDER BY values

@@ -12,7 +12,7 @@
 //! `select_footprint` never sees it).
 
 use super::*;
-use mpedb_sql::{Frame, FrameBound, FrameMode, WinInt, WindowFunc, WindowSpec};
+use mpedb_sql::{Frame, FrameBound, FrameExclude, FrameMode, WinInt, WindowFunc, WindowSpec};
 use mpedb_types::{Accum, HostAggState, HostAggs};
 use std::cmp::Ordering;
 
@@ -592,50 +592,51 @@ fn assign_framed(
             slot, part, rows, frame, fo, arg_vals, order_vals, dirs, has_order, host, host_aggs,
         );
     }
-    // Peer-group structure is needed only for GROUPS/RANGE (they count / span
-    // peer groups); ROWS is a purely physical offset and skips it.
-    let (group_of, group_starts) = if matches!(frame.mode, FrameMode::Rows) {
+    // Peer-group structure is needed for GROUPS/RANGE (they count / span peer
+    // groups) — and, since format 66, for `EXCLUDE GROUP`/`TIES` under ANY
+    // mode: the frame may be purely physical while the exclusion is by peers.
+    let (group_of, group_starts) = if matches!(frame.mode, FrameMode::Rows)
+        && !needs_peers(frame.exclude)
+    {
         (Vec::new(), Vec::new())
     } else {
         build_groups(part, order_vals, dirs, has_order)
     };
     for off in 0..len {
         let (lo, hi) = frame_bounds(off, len, frame, fo, &group_of, &group_starts);
+        let keep = exclusion(off, len, frame.exclude, &group_of, &group_starts);
         let target = part[off];
         rows[target][slot] = match func {
             WindowFunc::Agg(f) => {
                 let mut acc = Accum::new_collated(f, coll);
-                for &i in &part[lo..hi] {
-                    push_arg(&mut acc, &arg_vals[i])?;
+                for p in (lo..hi).filter(|&p| keep(p)) {
+                    push_arg(&mut acc, &arg_vals[part[p]])?;
                 }
                 acc.finish()
             }
             // The frame's FIRST / LAST row (in window order), or NULL for an
-            // empty frame.
-            WindowFunc::FirstValue => {
-                if lo < hi {
-                    arg_vals[part[lo]].clone().unwrap_or(Value::Null)
-                } else {
-                    Value::Null
-                }
-            }
-            WindowFunc::LastValue => {
-                if lo < hi {
-                    arg_vals[part[hi - 1]].clone().unwrap_or(Value::Null)
-                } else {
-                    Value::Null
-                }
-            }
+            // empty frame. `EXCLUDE` can drop either end, so both walk the
+            // KEPT positions rather than indexing `lo` / `hi - 1` — a hole at
+            // the edge would otherwise return an excluded row's value.
+            WindowFunc::FirstValue => match (lo..hi).find(|&p| keep(p)) {
+                Some(p) => arg_vals[part[p]].clone().unwrap_or(Value::Null),
+                None => Value::Null,
+            },
+            WindowFunc::LastValue => match (lo..hi).rev().find(|&p| keep(p)) {
+                Some(p) => arg_vals[part[p]].clone().unwrap_or(Value::Null),
+                None => Value::Null,
+            },
             // The n-th row (1-based) WITHIN the frame, or NULL if the frame is
-            // shorter than n. `nn >= 1` is validated; compute in i64 so an absurd
-            // constant n just yields NULL rather than overflowing.
+            // shorter than n. `nn >= 1` is validated; the count is over the
+            // KEPT rows, so an excluded row does not consume an ordinal.
             WindowFunc::NthValue(_) => {
                 let nn = win_int;
-                let idx = lo as i64 + (nn - 1);
-                if idx >= lo as i64 && idx < hi as i64 {
-                    arg_vals[part[idx as usize]].clone().unwrap_or(Value::Null)
-                } else {
-                    Value::Null
+                match usize::try_from(nn - 1)
+                    .ok()
+                    .and_then(|k| (lo..hi).filter(|&p| keep(p)).nth(k))
+                {
+                    Some(p) => arg_vals[part[p]].clone().unwrap_or(Value::Null),
+                    None => Value::Null,
                 }
             }
             // The planner refuses a frame on any other function, so this is
@@ -695,12 +696,33 @@ fn assign_host_framed(
     host_aggs: Option<&dyn HostAggs>,
 ) -> Result<()> {
     let len = part.len();
-    let (group_of, group_starts) = if matches!(frame.mode, FrameMode::Rows) {
+    let (group_of, group_starts) = if matches!(frame.mode, FrameMode::Rows)
+        && !needs_peers(frame.exclude)
+    {
         (Vec::new(), Vec::new())
     } else {
         build_groups(part, order_vals, dirs, has_order)
     };
     let arg_at = |p: usize| arg_vals[part[p]].clone().unwrap_or(Value::Null);
+    // `EXCLUDE` (format 66) punches a HOLE in the frame, so the slide below —
+    // whose whole argument is that `[cur_lo, cur_hi)` is a contiguous range
+    // moving monotonically — cannot express it. `xInverse` retracts from the
+    // LEFT EDGE only; there is no callback for "remove a row from the middle".
+    // Rebuild per row instead: still `xStep`/`xValue` in window order over
+    // exactly the frame's rows, just without the incremental saving.
+    if !matches!(frame.exclude, FrameExclude::NoOthers) {
+        for off in 0..len {
+            let (lo, hi) = frame_bounds(off, len, frame, fo, &group_of, &group_starts);
+            let keep = exclusion(off, len, frame.exclude, &group_of, &group_starts);
+            let mut st = new_host_state(host, host_aggs)?;
+            for p in (lo..hi).filter(|&p| keep(p)) {
+                st.step(&[arg_at(p)])?;
+            }
+            rows[part[off]][slot] = st.value()?;
+            let _ = st.finish();
+        }
+        return Ok(());
+    }
     let mut state = new_host_state(host, host_aggs)?;
     let (mut cur_lo, mut cur_hi) = (0usize, 0usize);
     for off in 0..len {
@@ -843,6 +865,48 @@ fn resolve_frame_offsets(frame: &Frame, params: &[Value]) -> Result<FrameOffsets
         }
     };
     Ok(FrameOffsets { start: one(frame.start)?, end: one(frame.end)? })
+}
+
+/// Does this exclusion need the peer-group structure? `GROUP`/`TIES` drop the
+/// current row's ORDER BY ties, which ROWS mode does not otherwise compute.
+fn needs_peers(e: FrameExclude) -> bool {
+    matches!(e, FrameExclude::Group | FrameExclude::Ties)
+}
+
+/// A predicate over positions of the partition slice: `true` for a row the
+/// frame KEEPS after `EXCLUDE` (format 66).
+///
+/// Exclusion is a FILTER, not a narrowing of `[lo, hi)`: `EXCLUDE TIES` keeps
+/// the current row while dropping its peers on both sides of it, so the kept
+/// row stays in its window-order position. MEASURED against sqlite 3.45.1
+/// before implementing, including the two cases a reading of the standard
+/// alone gets wrong: with NO ORDER BY the whole partition is one peer group
+/// (`GROUP` empties the frame, `TIES` leaves exactly the current row), and
+/// peers never cross a PARTITION boundary because `group_of` is per-partition.
+fn exclusion(
+    off: usize,
+    len: usize,
+    exclude: FrameExclude,
+    group_of: &[usize],
+    group_starts: &[usize],
+) -> impl Fn(usize) -> bool + use<> {
+    let (ex_lo, ex_hi, keep_current) = match exclude {
+        FrameExclude::NoOthers => (0, 0, false),
+        FrameExclude::CurrentRow => (off, off + 1, false),
+        FrameExclude::Group | FrameExclude::Ties => {
+            // `group_of` is built whenever `needs_peers`; a missing entry would
+            // be a caller bug, and dropping nothing is the safe reading.
+            match group_of.get(off) {
+                Some(&g) => {
+                    let s = group_starts.get(g).copied().unwrap_or(0);
+                    let e = group_starts.get(g + 1).copied().unwrap_or(len);
+                    (s, e, matches!(exclude, FrameExclude::Ties))
+                }
+                None => (0, 0, false),
+            }
+        }
+    };
+    move |p: usize| !(p >= ex_lo && p < ex_hi) || (keep_current && p == off)
 }
 
 /// Resolve a frame to the half-open range `[lo, hi)` of positions within the

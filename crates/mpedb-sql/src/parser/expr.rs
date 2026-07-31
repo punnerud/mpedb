@@ -1126,7 +1126,41 @@ impl<'a> Parser<'a> {
             // CURRENT ROW`.
             (self.frame_bound()?, FrameBound::CurrentRow)
         };
-        Ok(Some(Box::new(FrameAst { mode, start, end })))
+        let exclude = self.frame_exclude()?;
+        Ok(Some(Box::new(FrameAst { mode, start, end, exclude })))
+    }
+
+    /// `EXCLUDE {NO OTHERS | CURRENT ROW | GROUP | TIES}`, or the implicit
+    /// `NO OTHERS`. Every spelling is two words, so a bare `EXCLUDE` is a
+    /// named error rather than a frame that silently excludes nothing.
+    fn frame_exclude(&mut self) -> Result<crate::plan::FrameExclude> {
+        use crate::plan::FrameExclude as Ex;
+        if !self.eat_word("EXCLUDE") {
+            return Ok(Ex::NoOthers);
+        }
+        if self.eat_word("NO") {
+            if self.eat_word("OTHERS") {
+                return Ok(Ex::NoOthers);
+            }
+            return Err(self.err_here("expected OTHERS after EXCLUDE NO"));
+        }
+        if self.eat_word("CURRENT") {
+            if self.eat_word("ROW") {
+                return Ok(Ex::CurrentRow);
+            }
+            return Err(self.err_here("expected ROW after EXCLUDE CURRENT"));
+        }
+        // `GROUP` is a reserved KEYWORD, not a bare word — `eat_word` never
+        // matches it, which is why every other spelling parsed and this one
+        // reported "expected NO OTHERS, CURRENT ROW, GROUP or TIES" on the
+        // word GROUP itself.
+        if self.eat_kw(Kw::Group) {
+            return Ok(Ex::Group);
+        }
+        if self.eat_word("TIES") {
+            return Ok(Ex::Ties);
+        }
+        Err(self.err_here("expected NO OTHERS, CURRENT ROW, GROUP or TIES after EXCLUDE"))
     }
 
     /// One frame boundary: `UNBOUNDED PRECEDING`, `<N> PRECEDING`, `CURRENT ROW`,

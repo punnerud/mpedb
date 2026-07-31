@@ -149,6 +149,60 @@ fn a_moving_rows_frame_slides_and_answers_like_a_re_aggregation() {
     assert_eq!(log.iter().filter(|e| *e == "finish").count(), 1);
 }
 
+/// A frame EXCLUSION (format 66) makes the frame NON-CONTIGUOUS, which the
+/// slide cannot express: `xInverse` retracts from the LEFT EDGE, and there is
+/// no callback for "drop a row from the middle". So the exclusion path rebuilds
+/// the state per row — the ANSWERS must equal a re-aggregation, and the call
+/// SEQUENCE must contain no `inverse` at all, because a host implementation
+/// that counted its inverses would otherwise see a call it cannot make sense of.
+#[test]
+fn an_excluded_frame_rebuilds_instead_of_sliding() {
+    let db = db();
+    let log = register_sumint(&db);
+    seed(&db, &[(1, "a", 4), (2, "b", 5), (3, "c", 3), (4, "d", 8), (5, "e", 1)]);
+
+    // Whole partition minus the current row: total 21, so each row is 21 - y.
+    let r = db
+        .query(
+            "SELECT id, sumint(y) OVER (ORDER BY id \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) \
+             FROM t ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(ints(&r), [17, 16, 18, 13, 20]);
+    {
+        let log = log.lock().unwrap();
+        assert_eq!(log.iter().filter(|e| e.starts_with("inverse")).count(), 0);
+        // Five rows, four kept rows each.
+        assert_eq!(log.iter().filter(|e| e.starts_with("step")).count(), 20);
+        assert_eq!(log.iter().filter(|e| *e == "value").count(), 5);
+    }
+
+    // A moving frame WITH an exclusion: [id-1, id+1] minus the current row.
+    let r = db
+        .query(
+            "SELECT id, sumint(y) OVER (ORDER BY id \
+             ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) \
+             FROM t ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(ints(&r), [5, 7, 13, 4, 8]);
+
+    // Every row is its own peer group here (distinct `id`), so GROUP and
+    // CURRENT ROW coincide — and TIES leaves the current row alone.
+    let r = db
+        .query(
+            "SELECT id, sumint(y) OVER (ORDER BY id \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) \
+             FROM t ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(ints(&r), [21, 21, 21, 21, 21]);
+}
+
 /// The DEFAULT frame (no explicit frame) is cumulative through the end of each
 /// peer group, exactly as a built-in aggregate window is — and needs no
 /// `inverse`, because the left edge never moves.

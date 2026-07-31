@@ -352,6 +352,105 @@ fn float_aggregates_under_frames_match_sqlite() {
     }
 }
 
+/// Frame EXCLUSION (format 66): `EXCLUDE {NO OTHERS | CURRENT ROW | GROUP |
+/// TIES}`. Django emits it (`expressions_window`'s `test_row_range_rank_*`),
+/// and it is the one frame feature that makes the frame NON-CONTIGUOUS — a
+/// hole around the current row — so every consumer of the frame is exercised:
+/// the aggregates, `first_value`/`last_value` (whose edges the hole can eat)
+/// and `nth_value` (whose ordinal an excluded row must not consume).
+///
+/// The two rules a reading of the standard alone gets wrong, both MEASURED
+/// against sqlite 3.45 first: `TIES` keeps the current row IN ITS POSITION
+/// while dropping its peers, and with NO ORDER BY the whole partition is one
+/// peer group.
+#[test]
+fn frame_exclusion_matches_sqlite() {
+    let d = db();
+    let excl = ["", "EXCLUDE NO OTHERS", "EXCLUDE CURRENT ROW", "EXCLUDE GROUP", "EXCLUDE TIES"];
+    let frames = [
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+        "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+        "ROWS BETWEEN CURRENT ROW AND CURRENT ROW",
+        "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+        "GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+        // An already-empty frame: the exclusion must not resurrect a row.
+        "ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING",
+    ];
+    for f in frames {
+        for e in excl {
+            for agg in ["sum(amt)", "count(*)", "min(amt)", "group_concat(id)"] {
+                assert_same(
+                    &d,
+                    &format!("SELECT id, {agg} OVER (ORDER BY val {f} {e}) FROM t ORDER BY id"),
+                );
+            }
+            // Partitioned: peers never cross a partition boundary.
+            assert_same(
+                &d,
+                &format!(
+                    "SELECT id, group_concat(id) OVER \
+                     (PARTITION BY grp ORDER BY val {f} {e}) FROM t ORDER BY id"
+                ),
+            );
+            // The value functions, whose answer is a POSITION in the frame.
+            for vf in ["first_value(amt)", "last_value(amt)", "nth_value(amt, 2)"] {
+                assert_same(
+                    &d,
+                    &format!("SELECT id, {vf} OVER (ORDER BY val {f} {e}) FROM t ORDER BY id"),
+                );
+            }
+        }
+    }
+    // No ORDER BY: one peer group for the whole partition, so GROUP empties the
+    // frame and TIES leaves exactly the current row. (A ROWS frame with no
+    // ORDER BY is refused as order-dependent, so this uses the DEFAULT frame's
+    // legal spelling: an UNBOUNDED..UNBOUNDED ROWS frame is order-independent.)
+    for e in ["EXCLUDE CURRENT ROW", "EXCLUDE GROUP", "EXCLUDE TIES"] {
+        assert_same(
+            &d,
+            &format!(
+                "SELECT id, count(*) OVER (PARTITION BY grp \
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING {e}) \
+                 FROM t ORDER BY id"
+            ),
+        );
+    }
+    // The shorthand (no BETWEEN) carries an exclusion too.
+    assert_same(
+        &d,
+        "SELECT id, count(*) OVER (ORDER BY val ROWS 1 PRECEDING EXCLUDE CURRENT ROW) \
+         FROM t ORDER BY id",
+    );
+    assert_same(
+        &d,
+        "SELECT id, count(*) OVER (ORDER BY val GROUPS 1 PRECEDING EXCLUDE GROUP) \
+         FROM t ORDER BY id",
+    );
+}
+
+/// A malformed exclusion is a NAMED parse error, and `EXCLUDE` outside a frame
+/// clause is refused exactly as sqlite refuses it — never a frame that
+/// silently excludes nothing.
+#[test]
+fn malformed_exclusions_are_refused() {
+    let d = db();
+    for q in [
+        "SELECT id, count(*) OVER (ORDER BY val ROWS UNBOUNDED PRECEDING EXCLUDE) FROM t",
+        "SELECT id, count(*) OVER (ORDER BY val ROWS UNBOUNDED PRECEDING EXCLUDE NO) FROM t",
+        "SELECT id, count(*) OVER (ORDER BY val ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT) FROM t",
+        "SELECT id, count(*) OVER (ORDER BY val ROWS UNBOUNDED PRECEDING EXCLUDE OTHERS) FROM t",
+        "SELECT id, count(*) OVER (ORDER BY val ROWS UNBOUNDED PRECEDING EXCLUDE PEERS) FROM t",
+        // No frame clause at all — sqlite says "near \"EXCLUDE\": syntax error".
+        "SELECT id, count(*) OVER (ORDER BY val EXCLUDE TIES) FROM t",
+        "SELECT id, count(*) OVER (PARTITION BY grp EXCLUDE GROUP) FROM t",
+    ] {
+        assert!(
+            d.query(q, &[]).is_err(),
+            "expected a clean refusal for `{q}`, but it was accepted"
+        );
+    }
+}
+
 // ---- refusals: each a clean prepare-time error, never a wrong answer -------
 
 #[test]
