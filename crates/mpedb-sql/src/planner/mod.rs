@@ -386,9 +386,21 @@ fn total_subplans(subs: &[SubPlan]) -> usize {
                     // ceiling the decoder enforces.
                     SubBody::Compound(c) => compound_subplan_total(c),
                     SubBody::Select(_) => 0,
+                    SubBody::Derived(dp) => derived_subplan_total(dp),
                 }
         })
         .sum()
+}
+
+/// Every lift a materialized derived table owns, transitively: its body's own
+/// list plus whatever its body owns in turn.
+fn derived_subplan_total(dp: &crate::plan::DerivedPlan) -> usize {
+    total_subplans(&dp.body_subplans)
+        + match &dp.body {
+            SubBody::Compound(c) => compound_subplan_total(c),
+            SubBody::Select(_) => 0,
+            SubBody::Derived(inner) => derived_subplan_total(inner),
+        }
 }
 
 /// Every lift a compound's arms own, transitively.
@@ -402,13 +414,7 @@ fn compound_subplan_total(c: &CompoundPlan) -> usize {
 fn owned_subplan_total(stmt: &PlanStmt) -> usize {
     match stmt {
         PlanStmt::Compound(c) => compound_subplan_total(c),
-        PlanStmt::Derived(dp) => {
-            total_subplans(&dp.body_subplans)
-                + match &dp.body {
-                    SubBody::Compound(c) => compound_subplan_total(c),
-                    SubBody::Select(_) => 0,
-                }
-        }
+        PlanStmt::Derived(dp) => derived_subplan_total(dp),
         _ => 0,
     }
 }
@@ -516,6 +522,7 @@ fn register_limit_params(
         match &dp.body {
             SubBody::Select(ref sp) => sel(sp, ptypes)?,
             SubBody::Compound(ref cp) => comp(cp, ptypes)?,
+            SubBody::Derived(ref inner) => derived(inner, ptypes)?,
         }
         for sub in &dp.body_subplans {
             subplan(sub, ptypes)?;
@@ -526,6 +533,7 @@ fn register_limit_params(
         match &sub.body {
             SubBody::Select(sp) => sel(sp, ptypes)?,
             SubBody::Compound(cp) => comp(cp, ptypes)?,
+            SubBody::Derived(dp) => derived(dp, ptypes)?,
         }
         for child in &sub.subplans {
             subplan(child, ptypes)?;
@@ -664,12 +672,33 @@ pub(crate) fn plan_statement(
         select_tables: &impl Fn(&SelectPlan, &mut Vec<u32>),
         out: &mut Vec<u32>,
     ) {
-        match &s.body {
-            SubBody::Select(sp) => select_tables(sp, out),
-            SubBody::Compound(c) => stamp_compound_tables(c, select_tables, out),
-        }
+        stamp_body_tables(&s.body, select_tables, out);
         for c in &s.subplans {
             stamp_subplan_tables(c, select_tables, out);
+        }
+    }
+    fn stamp_body_tables(
+        b: &SubBody,
+        select_tables: &impl Fn(&SelectPlan, &mut Vec<u32>),
+        out: &mut Vec<u32>,
+    ) {
+        match b {
+            SubBody::Select(sp) => select_tables(sp, out),
+            SubBody::Compound(c) => stamp_compound_tables(c, select_tables, out),
+            SubBody::Derived(dp) => stamp_derived_tables(dp, select_tables, out),
+        }
+    }
+    // Body ‖ outer ‖ the lifts the body owns (format 52) — missing any of them
+    // would let the plan keep serving a since-tightened table.
+    fn stamp_derived_tables(
+        dp: &DerivedPlan,
+        select_tables: &impl Fn(&SelectPlan, &mut Vec<u32>),
+        out: &mut Vec<u32>,
+    ) {
+        stamp_body_tables(&dp.body, select_tables, out);
+        select_tables(&dp.outer, out);
+        for s in &dp.body_subplans {
+            stamp_subplan_tables(s, select_tables, out);
         }
     }
     // A compound's arms AND the lifts those arms own (format 56).
@@ -682,16 +711,7 @@ pub(crate) fn plan_statement(
             match arm {
                 crate::plan::CompoundArm::Select(sp) => select_tables(sp, out),
                 crate::plan::CompoundArm::Derived(dp) => {
-                    match &dp.body {
-                        SubBody::Select(sp) => select_tables(sp, out),
-                        SubBody::Compound(inner) => {
-                            stamp_compound_tables(inner, select_tables, out)
-                        }
-                    }
-                    select_tables(&dp.outer, out);
-                    for s in &dp.body_subplans {
-                        stamp_subplan_tables(s, select_tables, out);
-                    }
+                    stamp_derived_tables(dp, select_tables, out)
                 }
             }
         }
@@ -723,18 +743,7 @@ pub(crate) fn plan_statement(
         // A materialized derived table reads its body's tables (every arm of a
         // compound body) plus the outer's; stamp each (the working table itself
         // is filtered out below).
-        PlanStmt::Derived(dp) => {
-            match &dp.body {
-                SubBody::Select(sp) => select_tables(sp, &mut stamped),
-                SubBody::Compound(c) => stamp_compound_tables(c, &select_tables, &mut stamped),
-            }
-            // The BODY's own lifts read tables too (format 52) — missing their
-            // stamp would let the plan keep serving a since-tightened table.
-            for s in &dp.body_subplans {
-                stamp_subplan_tables(s, &select_tables, &mut stamped);
-            }
-            select_tables(&dp.outer, &mut stamped);
-        }
+        PlanStmt::Derived(dp) => stamp_derived_tables(dp, &select_tables, &mut stamped),
         PlanStmt::Insert { table, .. }
         | PlanStmt::Update { table, .. }
         | PlanStmt::Delete { table, .. } => stamped.push(*table),
@@ -1043,13 +1052,7 @@ fn plan_compound(
                          the whole chain",
                     ));
                 }
-                let body_slots = dp.body_subplans.len() as u16
-                    + match &dp.body {
-                        SubBody::Compound(inner) => {
-                            inner.n_arm_slots() + inner.n_derived_body_slots()
-                        }
-                        SubBody::Select(_) => 0,
-                    };
+                let body_slots = dp.reserved_slots();
                 (
                     crate::plan::CompoundArm::Derived(dp),
                     ptypes,

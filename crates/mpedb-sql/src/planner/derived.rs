@@ -11,6 +11,17 @@
 use super::recursive::{into_select, unify_param_types};
 use super::*;
 
+/// How deep `FROM (SELECT … FROM (SELECT …))` may nest in the PLANNER.
+///
+/// The view expander walks the same chain and refuses at the same depth, so on
+/// the ordinary bind path it trips first (measured: sqlite reports "parser
+/// stack overflow" on the same input, so both engines refuse — neither
+/// crashes). This is the planner's own backstop for any caller that reaches
+/// `plan_derived_select` without it. ONE constant, because two would drift and
+/// the drift would only ever show up as a stack overflow. Django's deepest
+/// emitted shape is 2.
+const MAX_DERIVED_NEST: usize = crate::view::MAX_VIEW_DEPTH;
+
 /// Plan `SELECT … FROM (<body>) [AS] alias …` by materialization.
 ///
 /// Stage 1 mirrors the recursive CTE's parameter discipline: lifted subqueries
@@ -18,6 +29,9 @@ use super::*;
 /// `[user]` only. The body is planned with the alias NOT in scope, so a body
 /// that references an outer table (LATERAL) fails as an unknown table/column —
 /// the same error sqlite gives (sqlite has no LATERAL either).
+///
+/// RECURSIVE (format 65): a body whose own `FROM` is a derived table routes
+/// back here, so the materialization nests as deep as `MAX_DERIVED_NEST`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_derived_select(
     s: &ast::SelectStmt,
@@ -36,8 +50,38 @@ pub(super) fn plan_derived_select(
     // be referenced by one.
     let name = s.alias.clone().unwrap_or_else(|| "(derived table)".to_string());
 
+    // Guard the PLANNING recursion below. The parser's budget is measured
+    // against PARSE frames, and nested parens cost it well under 1 KB each —
+    // a planning frame for a derived table is far fatter, so a nest the parser
+    // happily accepts could still exhaust the stack here. Bounded by name,
+    // counted on the AST before any of it is planned.
+    {
+        let mut depth = 0usize;
+        let mut cur = body_ast;
+        while let ast::SubqueryBody::Select(bs) = cur {
+            match bs.from_derived.as_deref() {
+                Some(inner) => {
+                    depth += 1;
+                    if depth > MAX_DERIVED_NEST {
+                        return Err(bind_err(format!(
+                            "derived tables nested more than {MAX_DERIVED_NEST} deep are not                              supported"
+                        )));
+                    }
+                    cur = inner;
+                }
+                None => break,
+            }
+        }
+    }
     // 1. The body, planned as a standalone statement.
     let (b_stmt, b_ptypes, b_ctx, _b_list, b_out, b_subs) = match body_ast {
+        // The body's OWN `FROM` is a derived table (format 65): materialize it
+        // the same way, one level down. Django's prefetch-with-limit emits
+        // exactly this — a pass-through `SELECT *` wrapping a window-function
+        // body wrapped again to filter on the window column.
+        ast::SubqueryBody::Select(bs) if bs.from_derived.is_some() => plan_derived_select(
+            bs, schema, n_params, catalog, mode, host_udfs, row_count, consts,
+        )?,
         ast::SubqueryBody::Select(bs) => {
             plan_select(bs, schema, n_params, catalog, mode, host_udfs, row_count, consts, None)?
         }
@@ -49,6 +93,7 @@ pub(super) fn plan_derived_select(
     let body = match b_stmt {
         PlanStmt::Select(sp) => SubBody::Select(sp),
         PlanStmt::Compound(c) => SubBody::Compound(c),
+        PlanStmt::Derived(dp) => SubBody::Derived(Box::new(dp)),
         _ => return Err(Error::Internal("body planning produced a non-select".into())),
     };
     // The body OWNS its lifts (design/DESIGN-DERIVED-TABLES.md §5.5): they
@@ -65,6 +110,7 @@ pub(super) fn plan_derived_select(
         + match &body {
             SubBody::Compound(c) => c.n_arm_slots(),
             SubBody::Select(_) => 0,
+            SubBody::Derived(inner) => inner.reserved_slots(),
         };
 
     // 2. The synthetic working-table def: the body's output columns. Types come
@@ -185,15 +231,40 @@ fn reject_context(name: &str, which: &str, ctx: &[String]) -> Result<()> {
 /// first arm (sqlite's and PG's rule); a select body's ORDER-BY junk columns
 /// are not output and are excluded.
 fn body_output_names(body: &SubBody, schema: &Schema) -> Vec<String> {
-    let (arm, junk) = match body {
-        SubBody::Select(sp) => (sp, sp.order_junk as usize),
+    // `base` names the FIRST operand when it is a materialized working table
+    // rather than a schema table — `schema` has no entry for `CTE_TABLE`, so
+    // without it every `Projection::Column` of a derived body would come back
+    // as `colN` and an outer `SELECT x` would not resolve.
+    let (arm, junk, base): (&SelectPlan, usize, Option<&[String]>) = match body {
+        SubBody::Select(sp) => (sp, sp.order_junk as usize, None),
         // Compound arms carry no junk (validate enforces it); arm 0 names the
         // output.
-        SubBody::Compound(c) => (c.arms[0].output_select(), 0),
+        SubBody::Compound(c) => match &c.arms[0] {
+            crate::plan::CompoundArm::Select(sp) => (sp, 0, None),
+            crate::plan::CompoundArm::Derived(dp) => (&dp.outer, 0, Some(&dp.columns)),
+        },
+        // Format 65: this body is itself a materialized derived table.
+        SubBody::Derived(dp) => (
+            &dp.outer,
+            dp.outer.order_junk as usize,
+            Some(&dp.columns),
+        ),
     };
     let name_slot = |slot: usize| -> String {
         let mut i = slot;
-        for id in std::iter::once(arm.table).chain(arm.joins.iter().map(|j| j.table)) {
+        if let Some(b) = base {
+            if i < b.len() {
+                return b[i].clone();
+            }
+            i -= b.len();
+        }
+        // With a `base`, `arm.table` IS that working table — already consumed.
+        let chain: Vec<u32> = if base.is_some() {
+            arm.joins.iter().map(|j| j.table).collect()
+        } else {
+            std::iter::once(arm.table).chain(arm.joins.iter().map(|j| j.table)).collect()
+        };
+        for id in chain {
             let Some(t) = schema.table(id) else { break };
             if i < t.columns.len() {
                 return t.columns[i].name.clone();

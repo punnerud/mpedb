@@ -494,7 +494,7 @@ const MAX_JOINS: usize = 63;
 //     Python source. The integer SEMANTICS are untouched (0 = the current row,
 //     negative looks the other way — both already matched sqlite); only where
 //     the integer comes from is new.
-const PLAN_FORMAT: u8 = 64;
+const PLAN_FORMAT: u8 = 65;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -729,6 +729,11 @@ pub struct SubPlan {
 pub enum SubBody {
     Select(SelectPlan),
     Compound(CompoundPlan),
+    /// A subquery whose FROM is a non-flattenable DERIVED table, materialized
+    /// (format 65). The compound ARM case has carried one since format 58 for
+    /// the same reason; nothing about the subplan boundary makes the
+    /// materialization harder, since the body is planned standalone either way.
+    Derived(Box<DerivedPlan>),
 }
 
 impl SubBody {
@@ -745,6 +750,13 @@ impl SubBody {
         match self {
             SubBody::Select(sp) => sp.projection.len().saturating_sub(sp.order_junk as usize),
             SubBody::Compound(c) => c.arms.first().map_or(0, |a| a.output_arity()),
+            // The derived plan's OUTER select is what it emits; its junk rule is
+            // the plain-select one, since `outer` is an ordinary select.
+            SubBody::Derived(dp) => dp
+                .outer
+                .projection
+                .len()
+                .saturating_sub(dp.outer.order_junk as usize),
         }
     }
 
@@ -754,7 +766,7 @@ impl SubBody {
     pub fn as_select(&self) -> Option<&SelectPlan> {
         match self {
             SubBody::Select(sp) => Some(sp),
-            SubBody::Compound(_) => None,
+            SubBody::Compound(_) | SubBody::Derived(_) => None,
         }
     }
 }
@@ -862,13 +874,7 @@ impl CompiledPlan {
     pub fn n_subplan_slots(&self) -> u16 {
         self.subplans.len() as u16
             + match &self.stmt {
-                PlanStmt::Derived(dp) => {
-                    dp.body_subplans.len() as u16
-                        + match &dp.body {
-                            SubBody::Compound(c) => c.n_arm_slots() + c.n_derived_body_slots(),
-                            SubBody::Select(_) => 0,
-                        }
-                }
+                PlanStmt::Derived(dp) => dp.reserved_slots(),
                 PlanStmt::Compound(c) => c.n_arm_slots() + c.n_derived_body_slots(),
                 _ => 0,
             }
@@ -1393,13 +1399,7 @@ impl CompoundPlan {
             .iter()
             .map(|a| match a {
                 CompoundArm::Select(_) => 0,
-                CompoundArm::Derived(dp) => {
-                    dp.body_subplans.len() as u16
-                        + match &dp.body {
-                            SubBody::Compound(c) => c.n_arm_slots() + c.n_derived_body_slots(),
-                            SubBody::Select(_) => 0,
-                        }
-                }
+                CompoundArm::Derived(dp) => dp.reserved_slots(),
             })
             .sum()
     }
@@ -1541,6 +1541,19 @@ pub struct DerivedPlan {
 }
 
 impl DerivedPlan {
+    /// Every reserved parameter slot this derived plan owns: its own body lifts
+    /// plus whatever its BODY reserves in turn (a compound body's arms, or —
+    /// format 65 — a nested derived body). One recursive definition, so the
+    /// three places that need the width cannot disagree about a nesting.
+    pub fn reserved_slots(&self) -> u16 {
+        self.body_subplans.len() as u16
+            + match &self.body {
+                SubBody::Select(_) => 0,
+                SubBody::Compound(c) => c.n_arm_slots() + c.n_derived_body_slots(),
+                SubBody::Derived(dp) => dp.reserved_slots(),
+            }
+    }
+
     /// The synthetic [`TableDef`] the materialized body presents to the binder,
     /// validator, executor and EXPLAIN — the same working-table shape as
     /// [`RecursiveCtePlan::cte_def`].
@@ -2144,6 +2157,8 @@ const STMT_DERIVED: u8 = 13;
 // compound. Written by `encode_subplan` right before the body.
 const SUBBODY_SELECT: u8 = 0;
 const SUBBODY_COMPOUND: u8 = 1;
+/// A materialized DERIVED table as a subquery/derived BODY (format 65).
+const SUBBODY_DERIVED: u8 = 2;
 
 const ACCESS_FULL: u8 = 0;
 const ACCESS_PK_POINT: u8 = 1;
@@ -2338,20 +2353,18 @@ fn select_has_host_call(sp: &SelectPlan) -> bool {
         })
 }
 
+/// Does any part of a materialized derived plan call a HOST function? Its
+/// outer, its body (to any nesting), and the lifts it owns.
+fn derived_has_host_call(dp: &DerivedPlan) -> bool {
+    select_has_host_call(&dp.outer)
+        || subbody_has_host_call(&dp.body)
+        || dp.body_subplans.iter().any(|s| subbody_has_host_call(&s.body))
+}
+
 fn compound_has_host_call(c: &CompoundPlan) -> bool {
     c.arms.iter().any(|a| match a {
         CompoundArm::Select(sp) => select_has_host_call(sp),
-        CompoundArm::Derived(dp) => {
-            select_has_host_call(&dp.outer)
-                || match &dp.body {
-                    SubBody::Select(sp) => select_has_host_call(sp),
-                    SubBody::Compound(inner) => compound_has_host_call(inner),
-                }
-                || dp.body_subplans.iter().any(|s| match &s.body {
-                    SubBody::Select(sp) => select_has_host_call(sp),
-                    SubBody::Compound(inner) => compound_has_host_call(inner),
-                })
-        }
+        CompoundArm::Derived(dp) => derived_has_host_call(dp),
     })
         // The compound's OWN `ORDER BY` may name a host collating sequence —
         // and it is the only one the arms cannot carry, since the trailing
@@ -2363,6 +2376,7 @@ fn subbody_has_host_call(b: &SubBody) -> bool {
     match b {
         SubBody::Select(sp) => select_has_host_call(sp),
         SubBody::Compound(c) => compound_has_host_call(c),
+        SubBody::Derived(dp) => derived_has_host_call(dp),
     }
 }
 
@@ -2464,18 +2478,22 @@ fn select_has_spell_call(sp: &SelectPlan) -> bool {
 fn compound_has_spell_call(c: &CompoundPlan) -> bool {
     c.arms.iter().any(|a| match a {
         CompoundArm::Select(sp) => select_has_spell_call(sp),
-        CompoundArm::Derived(dp) => {
-            select_has_spell_call(&dp.outer)
-                || subbody_has_spell_call(&dp.body)
-                || dp.body_subplans.iter().any(subplan_has_spell_call)
-        }
+        CompoundArm::Derived(dp) => derived_has_spell_call(dp),
     })
+}
+
+/// The spell twin of [`derived_has_host_call`].
+fn derived_has_spell_call(dp: &DerivedPlan) -> bool {
+    select_has_spell_call(&dp.outer)
+        || subbody_has_spell_call(&dp.body)
+        || dp.body_subplans.iter().any(subplan_has_spell_call)
 }
 
 fn subbody_has_spell_call(b: &SubBody) -> bool {
     match b {
         SubBody::Select(sp) => select_has_spell_call(sp),
         SubBody::Compound(c) => compound_has_spell_call(c),
+        SubBody::Derived(dp) => derived_has_spell_call(dp),
     }
 }
 

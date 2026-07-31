@@ -612,8 +612,21 @@ impl Lift<'_> {
         // slot per correlation arg. Its context keys are refused (the
         // reserved-slot layouts would have to be reconciled across levels).
         let inner_n = self.n_params + outer_args.len() as u16;
-        let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) =
-            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.host_udfs, self.row_count, self.consts, None)?;
+        // A subquery whose FROM is a non-flattenable DERIVED table is
+        // materialized, exactly as a compound ARM already is: `plan_select`
+        // refuses one it did not intercept, and the intercept only ever ran at
+        // the outermost FROM. Nothing about the subplan boundary makes the
+        // materialization harder — the body is planned standalone either way —
+        // so the refusal here was a missing route, not a missing capability.
+        let planned = if rewritten.from_derived.is_some() {
+            super::derived::plan_derived_select(
+                &rewritten, self.schema, inner_n, self.catalog, self.mode, self.host_udfs,
+                self.row_count, self.consts,
+            )?
+        } else {
+            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.host_udfs, self.row_count, self.consts, None)?
+        };
+        let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) = planned;
         // #73 §3 stage 3: a nested subquery may correlate to its IMMEDIATE
         // parent (stage 2), to a MIDDLE scope, or to the OUTERMOST scope. A
         // reference to a non-immediate ancestor was captured above as a TRANSIT
@@ -631,8 +644,19 @@ impl Lift<'_> {
                 "current_setting() inside a subquery is not supported yet",
             ));
         }
-        let PlanStmt::Select(plan) = stmt else {
-            return Err(Error::Internal("subquery planned to a non-select".into()));
+        // The body is a plain SELECT, or — when the subquery's own FROM had to
+        // be materialized — a whole DerivedPlan (format 65). Everything below
+        // reads the shape through `out_sel`: a derived's OUTER select is what
+        // the subquery projects, exactly as a compound's first arm is.
+        let body = match stmt {
+            PlanStmt::Select(sp) => SubBody::Select(sp),
+            PlanStmt::Derived(dp) => SubBody::Derived(Box::new(dp)),
+            _ => return Err(Error::Internal("subquery planned to a non-select".into())),
+        };
+        let plan: &SelectPlan = match &body {
+            SubBody::Select(sp) => sp,
+            SubBody::Derived(dp) => &dp.outer,
+            SubBody::Compound(_) => unreachable!("compound is not planned here"),
         };
         // The inner binder saw each correlation slot in real use — a type it
         // pinned must MATCH the outer column feeding the slot.
@@ -679,7 +703,7 @@ impl Lift<'_> {
         // at `inner_n + i` — exactly the "results after user + trailing reserved"
         // shape the top level uses one layer up.
         self.subplans.push(SubPlan {
-            body: SubBody::Select(plan),
+            body,
             outer_args,
             kind,
             subplans: inner_subs,

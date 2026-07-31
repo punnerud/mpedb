@@ -448,19 +448,33 @@ fn refusals_and_error_parity() {
         &[],
     )
     .expect("nested derived compound arm");
-    // A filtering consumer over a nested derived is still not a compound-arm
-    // materialise — refuse by name.
-    let e = d
-        .query(
-            "SELECT count(*) FROM (SELECT x FROM (SELECT a AS x FROM t) i GROUP BY x) o",
-            &[],
-        )
-        .unwrap_err();
-    assert!(
-        e.to_string().contains("outermost FROM"),
-        "unexpected refusal text: {e}"
+    // A filtering consumer over a NESTED derived materialises too (format 65):
+    // the body routes back through the same planner one level down.
+    check(
+        &d,
+        "SELECT count(*) FROM (SELECT x FROM (SELECT a AS x FROM t) i GROUP BY x) o",
     );
-    // Nested derived inside a lifted subquery body (not a compound arm).
+    // A derived table inside a LIFTED SUBQUERY body is no longer refused
+    // (format 65) — the body materializes exactly as a compound arm's does.
+    // These are the shapes that refusal used to cover; every one is now
+    // answered, and `check` is the strict oracle (an mpedb error where sqlite
+    // answers is a failure, not a pass).
+    for sql in [
+        "SELECT id FROM t WHERE EXISTS \
+         (SELECT 1 FROM (SELECT b FROM u GROUP BY b) x WHERE x.b > 1) ORDER BY id",
+        "SELECT id FROM t WHERE a IN (SELECT y FROM (SELECT b AS y FROM u GROUP BY b)) \
+         ORDER BY id",
+        "SELECT (SELECT max(y) FROM (SELECT b AS y FROM u GROUP BY b)) AS m",
+        // Nested one level further: a derived body whose own FROM is derived.
+        "SELECT id FROM t WHERE a IN \
+         (SELECT z FROM (SELECT y AS z FROM (SELECT b AS y FROM u GROUP BY b) i)) ORDER BY id",
+    ] {
+        check(&d, sql);
+    }
+    // What the materialization boundary still refuses BY NAME: a subquery in
+    // the derived's OUTER statement. The body is planned standalone, so the
+    // outer has no reserved region to lift into — a different missing route,
+    // and the error says so rather than answering differently.
     let e = d
         .query(
             "SELECT id FROM t WHERE EXISTS \
@@ -469,8 +483,8 @@ fn refusals_and_error_parity() {
         )
         .unwrap_err();
     assert!(
-        e.to_string().contains("outermost FROM"),
-        "expected the nested-derived refusal, got: {e}"
+        e.to_string().contains("a subquery in the outer statement"),
+        "expected the outer-subquery refusal, got: {e}"
     );
     d.verify().unwrap();
 }

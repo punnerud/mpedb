@@ -48,16 +48,17 @@ impl RiskEstimate {
         fn sel(sp: &SelectPlan) -> bool {
             !sp.joins.is_empty()
         }
+        fn body_sel(b: &mpedb_sql::SubBody) -> bool {
+            match b {
+                mpedb_sql::SubBody::Select(sp) => sel(sp),
+                mpedb_sql::SubBody::Compound(c) => c.arms.iter().any(arm_sel),
+                mpedb_sql::SubBody::Derived(dp) => sel(&dp.outer) || body_sel(&dp.body),
+            }
+        }
         fn arm_sel(a: &mpedb_sql::CompoundArm) -> bool {
             match a {
                 mpedb_sql::CompoundArm::Select(sp) => sel(sp),
-                mpedb_sql::CompoundArm::Derived(dp) => {
-                    sel(&dp.outer)
-                        || match &dp.body {
-                            mpedb_sql::SubBody::Select(sp) => sel(sp),
-                            mpedb_sql::SubBody::Compound(c) => c.arms.iter().any(arm_sel),
-                        }
-                }
+                mpedb_sql::CompoundArm::Derived(dp) => sel(&dp.outer) || body_sel(&dp.body),
             }
         }
         let subs_correlated = |subs: &[SubPlan]| subs.iter().any(|s| !s.outer_args.is_empty());
@@ -74,11 +75,7 @@ impl RiskEstimate {
             // A materialized derived table multiplies only where its components
             // do — a join in the body or in the outer statement.
             PlanStmt::Derived(dp) => {
-                let body_joins = match &dp.body {
-                    mpedb_sql::SubBody::Select(sp) => sel(sp),
-                    mpedb_sql::SubBody::Compound(c) => c.arms.iter().any(arm_sel),
-                };
-                body_joins || sel(&dp.outer) || subs_correlated(&plan.subplans)
+                body_sel(&dp.body) || sel(&dp.outer) || subs_correlated(&plan.subplans)
             }
             PlanStmt::Begin
             | PlanStmt::Commit
@@ -357,6 +354,18 @@ fn estimate_body(
     match body {
         SubBody::Select(sp) => estimate_select(sp, subplans, schema, rc),
         SubBody::Compound(c) => estimate_compound(c, subplans, schema, rc),
+        // Format 65: the body materializes a derived table of its own. Worst
+        // case is the larger of what it materializes and what its outer then
+        // reads out of it — the same rule the top-level `PlanStmt::Derived`
+        // arm applies.
+        SubBody::Derived(dp) => {
+            let mut acc = estimate_body(&dp.body, subplans, schema, rc);
+            let outer = estimate_select(&dp.outer, subplans, schema, rc);
+            let r = outer.rows;
+            let e = outer.into_estimate();
+            acc.consider(r, || e.dominant);
+            acc
+        }
     }
 }
 

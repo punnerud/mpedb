@@ -298,36 +298,10 @@ impl CompiledPlan {
                 return Err(corrupt("derived-table body carries a post-filter"));
             }
         }
-        // The body cannot reference the working table it DEFINES.
-        let body_reads_cte = match &dp.body {
-            SubBody::Select(sp) => reads_cte(sp),
-            SubBody::Compound(c) => c
-                .arms
-                .iter()
-                .map(|a| match a {
-                    crate::plan::CompoundArm::Select(sp) => reads_cte(sp),
-                    // A nested derived arm defines its own working table; its
-                    // outer may read CTE_TABLE, which is that arm's, not this
-                    // derived's — still refuse if the body Select of the nest
-                    // somehow names this level's CTE (planner never produces it).
-                    crate::plan::CompoundArm::Derived(inner) => {
-                        reads_cte(&inner.outer)
-                            + match &inner.body {
-                                SubBody::Select(sp) => reads_cte(sp),
-                                SubBody::Compound(c2) => c2
-                                    .arms
-                                    .iter()
-                                    .map(|a2| reads_cte(a2.output_select()))
-                                    .sum::<usize>(),
-                            }
-                    }
-                })
-                .sum(),
-        };
-        // For a compound body's nested Derived arms, CTE_TABLE in the arm
-        // outer is the nested derived's own working table — not this dp's.
-        // Only refuse if a plain Select arm (or nested body select) names it.
-        // Re-check with a simpler rule: only Select arms of this body.
+        // The body cannot reference the working table it DEFINES. A nested
+        // Derived body (format 65) or a compound's Derived arm defines its OWN
+        // working table, and its outer reads THAT one — so only a plain Select
+        // reaching this level's CTE_TABLE is a violation.
         let plain_body_cte = match &dp.body {
             SubBody::Select(sp) => reads_cte(sp),
             SubBody::Compound(c) => c
@@ -336,8 +310,8 @@ impl CompiledPlan {
                 .filter_map(|a| a.as_select())
                 .map(reads_cte)
                 .sum(),
+            SubBody::Derived(_) => 0,
         };
-        let _ = body_reads_cte;
         if plain_body_cte != 0 {
             return Err(corrupt("derived-table body references the working table"));
         }
@@ -363,10 +337,20 @@ impl CompiledPlan {
                 dp.body_sub_base as usize,
                 budget,
             )?,
+            // Format 65: a derived table whose own FROM is a derived table.
+            // Spends budget — this is a recursion the caller did not already
+            // pay for, and a forged chain of them must end in `Corrupt`.
+            SubBody::Derived(inner) => {
+                if *budget == 0 {
+                    return Err(corrupt("plan nesting budget exhausted"));
+                }
+                *budget -= 1;
+                self.validate_derived(inner, schema, ptypes, budget)?;
+            }
         }
         let working = dp.derived_def();
         self.validate_select_cte(&dp.outer, schema, ptypes, Some(&working))?;
-        self.validate_body_subplans(dp, schema, budget)?;
+        self.validate_body_subplans(dp, schema, ptypes.len(), budget)?;
         Ok(())
     }
 
@@ -382,6 +366,7 @@ impl CompiledPlan {
         &self,
         dp: &DerivedPlan,
         schema: &Schema,
+        space: usize,
         budget: &mut usize,
     ) -> Result<()> {
         // Reserved slots the body owns: its own lifts, or — for a compound body
@@ -391,13 +376,19 @@ impl CompiledPlan {
                 (c.n_arm_slots() + c.n_derived_body_slots()) as usize
             }
             SubBody::Select(_) => 0,
+            SubBody::Derived(inner) => inner.reserved_slots() as usize,
         };
         let base = dp.body_sub_base as usize;
         let end = base + dp.body_subplans.len() + arm_slots;
+        // `space` is the parameter level THIS derived lives in. At the
+        // statement level that is `param_types` (decoded to exactly `n_params`
+        // entries); inside a subplan body (format 65) it is the subplan's own
+        // `[user ‖ correlation ‖ reserved]` level, which extends past the
+        // statement's `n_params` and is what the caller hands down.
         // Top-level Derived fills [user ‖ body slots] to n_params. Nested
         // Derived as a compound arm occupies a MID slice of a wider buffer —
         // only require the region fits, do not demand it is the whole tail.
-        if end > self.n_params as usize {
+        if end > space {
             return Err(corrupt(
                 "derived-table body subplan slots out of the reserved parameter region",
             ));
@@ -1381,6 +1372,23 @@ impl CompiledPlan {
                     return Err(corrupt("compound subplan with nested lifts"));
                 }
                 self.validate_compound(c, schema, &inner_types, s.sub_base as usize, budget)?;
+            }
+            // Format 65: the subquery's FROM was a non-flattenable derived
+            // table. Like a compound body it is UNCORRELATED-uncorrelated in
+            // the sense that matters here — the derived owns its lifts in
+            // `body_subplans`, so this subplan carries none of its own.
+            SubBody::Derived(dp) => {
+                if !s.subplans.is_empty() {
+                    return Err(corrupt("derived-body subplan with nested lifts"));
+                }
+                // The derived owns its lifts, and their slots sit right after
+                // this subplan's `[user ‖ correlation]` level — the executor
+                // widens the buffer to match, so validate must see the same
+                // width or every derived-with-lifts body reads as corrupt.
+                let mut level = inner_types.clone();
+                level.extend(dp.body_subplans.iter().map(|c| c.slot_type));
+                level.resize(inner_types.len() + dp.reserved_slots() as usize, None);
+                self.validate_derived(dp, schema, &level, budget)?;
             }
             SubBody::Select(sp) => {
                 // A `post_filter` is applied per row only when this subplan HAS

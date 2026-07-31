@@ -59,6 +59,10 @@ fn encode_subplan(s: &SubPlan, buf: &mut Vec<u8>) {
             buf.push(SUBBODY_COMPOUND);
             encode_compound(c, buf);
         }
+        SubBody::Derived(dp) => {
+            buf.push(SUBBODY_DERIVED);
+            encode_derived_plan(dp, buf);
+        }
     }
     buf.push(s.subplans.len() as u8);
     for c in &s.subplans {
@@ -86,6 +90,10 @@ fn encode_derived_plan(dp: &crate::plan::DerivedPlan, buf: &mut Vec<u8>) {
         SubBody::Compound(c) => {
             buf.push(SUBBODY_COMPOUND);
             encode_compound(c, buf);
+        }
+        SubBody::Derived(dp) => {
+            buf.push(SUBBODY_DERIVED);
+            encode_derived_plan(dp, buf);
         }
     }
     encode_select(&dp.outer, buf);

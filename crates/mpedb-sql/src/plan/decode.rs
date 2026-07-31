@@ -202,6 +202,17 @@ fn decode_subplan(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<Sub
     let body = match r_u8(buf, pos)? {
         SUBBODY_SELECT => SubBody::Select(decode_select(buf, pos)?),
         SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos, budget)?),
+        // Format 65. This is the ONLY derived recursion that is not already
+        // behind `decode_subplan`'s decrement, so it spends budget itself —
+        // otherwise a corrupt byte string of nested SUBBODY_DERIVED tags
+        // recurses to a stack overflow instead of an `Error::Corrupt`.
+        SUBBODY_DERIVED => {
+            if *budget == 0 {
+                return Err(corrupt("plan nesting budget exhausted"));
+            }
+            *budget -= 1;
+            SubBody::Derived(Box::new(decode_derived_plan(buf, pos, budget)?))
+        }
         t => return Err(corrupt(format!("bad subplan body tag {t}"))),
     };
     let n_children = r_u8(buf, pos)? as usize;
@@ -551,6 +562,13 @@ fn decode_derived_plan_tail(
     let body = match r_u8(buf, pos)? {
         SUBBODY_SELECT => SubBody::Select(decode_select(buf, pos)?),
         SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos, budget)?),
+        SUBBODY_DERIVED => {
+            if *budget == 0 {
+                return Err(corrupt("plan nesting budget exhausted"));
+            }
+            *budget -= 1;
+            SubBody::Derived(Box::new(decode_derived_plan(buf, pos, budget)?))
+        }
         t => return Err(corrupt(format!("bad derived-table body tag {t}"))),
     };
     let outer = decode_select(buf, pos)?;

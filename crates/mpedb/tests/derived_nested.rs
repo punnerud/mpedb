@@ -166,21 +166,6 @@ fn both_refuse(db: &Database, sql: &str) {
     }
 }
 
-/// mpedb refuses BY NAME where sqlite answers: a narrower engine, never a
-/// different one. Also asserts sqlite really does answer, so the case does not
-/// silently stop being a gap.
-fn refused_narrower(db: &Database, sql: &str, needle: &str) {
-    let e = match mpedb_rows(db, sql) {
-        Err(e) => e,
-        Ok(rows) => panic!("expected a refusal on `{sql}`, got {rows:?}"),
-    };
-    assert!(
-        e.to_string().contains(needle),
-        "expected a refusal mentioning `{needle}` on `{sql}`, got: {e}"
-    );
-    sqlite_rows(sql).unwrap_or_else(|e| panic!("sqlite no longer answers `{sql}`: {e}"));
-}
-
 // --------------------------------------------------- a pass-through arm -----
 
 /// `SELECT * FROM (<body>)` as a compound arm — Django's `test_union_nested`
@@ -338,24 +323,49 @@ fn passthrough_subquery_body_matches_sqlite() {
     d.verify().unwrap();
 }
 
-// --------------------------------------------- the boundary that stays ------
+// ------------------------------------------- the boundary that remains ------
 
-/// The nested positions the wrapper rewrite does NOT reach keep their refusal
-/// by name (design/DESIGN-DERIVED-TABLES.md §5.7): a derived table whose
-/// consumer is not a pass-through still needs a real `SelectPlan`-owned derived
-/// source, which is a plan-format and executor change.
+/// The nested positions the wrapper rewrite does NOT reach used to keep a
+/// refusal by name (design/DESIGN-DERIVED-TABLES.md §5.7): a derived table
+/// whose consumer is not a pass-through needed a plan-format and executor
+/// change. Format 65 is that change — `SubBody::Derived` lets a subquery body
+/// and a derived body each hold a whole materialized derived plan, so these
+/// shapes ANSWER. What remains bounded is the DEPTH.
 #[test]
-fn genuinely_nested_derived_still_refuses() {
+fn genuinely_nested_derived_materializes_and_the_depth_is_bounded() {
     let d = db();
-    let nested = "only supported in a statement's outermost FROM";
+    // A filtering (not pass-through) consumer inside a SUBQUERY body is no
+    // longer nested-in-the-refused-sense: format 65 materializes it there the
+    // way format 58 already did for a compound arm. It must ANSWER, and answer
+    // sqlite's rows — a refusal that quietly became an acceptance is exactly
+    // how a gap turns into a wrong answer.
     for q in [
-        // A filtering (not pass-through) consumer inside a subquery body.
-        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT b FROM u GROUP BY b) x WHERE x.b > 10)",
-        // A filtering consumer inside a derived body.
-        "SELECT count(*) FROM (SELECT x FROM (SELECT a AS x FROM t) i GROUP BY x) o",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT b FROM u GROUP BY b) x WHERE x.b > 10) ORDER BY id",
+        "SELECT id FROM t WHERE a IN (SELECT x.b FROM (SELECT b FROM u GROUP BY b) x WHERE x.b > 10) ORDER BY id",
     ] {
-        refused_narrower(&d, q, nested);
+        same(&d, q);
     }
+    // A filtering consumer inside a DERIVED body is materialized too — the
+    // body routes back through the same planner one level down. Django's
+    // prefetch-with-limit is this exact shape: a pass-through `SELECT *`
+    // around a filter around a window-function body.
+    for q in [
+        "SELECT count(*) FROM (SELECT x FROM (SELECT a AS x FROM t) i GROUP BY x) o",
+        "SELECT * FROM (SELECT * FROM (SELECT b, count(*) AS n FROM u GROUP BY b) q \
+         WHERE n >= 1) m ORDER BY 1",
+        "SELECT x FROM (SELECT x FROM (SELECT a AS x FROM t GROUP BY a) i WHERE x > 1) o \
+         ORDER BY x",
+    ] {
+        same(&d, q);
+    }
+    // Nesting is BOUNDED, and the bound is a named error — not a stack
+    // overflow. sqlite refuses the same input ("parser stack overflow"), so
+    // `both_refuse` is the right oracle: a narrower engine at the same place.
+    let mut deep = "SELECT a AS x FROM t GROUP BY a".to_string();
+    for i in 0..24 {
+        deep = format!("SELECT x FROM ({deep}) w{i} WHERE x > 0");
+    }
+    both_refuse(&d, &deep);
     d.verify().unwrap();
 }
 

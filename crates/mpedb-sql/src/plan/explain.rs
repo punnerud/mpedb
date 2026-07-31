@@ -57,10 +57,7 @@ impl CompiledPlan {
                     dp.columns.join(", "),
                 ));
                 out.push_str("body:\n");
-                match &dp.body {
-                    SubBody::Select(sp) => self.render_select(sp, schema, &mut out),
-                    SubBody::Compound(c) => self.render_compound(c, schema, &mut out),
-                }
+                self.render_subbody(&dp.body, schema, &mut out);
                 out.push_str("outer:\n");
                 self.render_select(&dp.outer, schema, &mut out);
                 // The body's OWN lifts (format 52), rendered under the body
@@ -113,12 +110,24 @@ impl CompiledPlan {
                 format!("correlated on outer slots {:?} (per row)", s.outer_args)
             }
         ));
-        match &s.body {
-            SubBody::Select(sp) => self.render_select(sp, schema, out),
-            SubBody::Compound(c) => self.render_compound(c, schema, out),
-        }
+        self.render_subbody(&s.body, schema, out);
         for (k, c) in s.subplans.iter().enumerate() {
             self.render_subplan(c, schema, out, &format!("{label}.{}", k + 1));
+        }
+    }
+
+    /// Render whichever shape a subquery/derived BODY took. Three callers had a
+    /// copy of this match, and format 65's new arm had to be added to each —
+    /// exactly the drift the encoder avoids by sharing `encode_derived_plan`.
+    fn render_subbody(&self, body: &SubBody, schema: &Schema, out: &mut String) {
+        match body {
+            SubBody::Select(sp) => self.render_select(sp, schema, out),
+            SubBody::Compound(c) => self.render_compound(c, schema, out),
+            SubBody::Derived(dp) => {
+                out.push_str(&format!("  derived \"{}\"\n", dp.name));
+                self.render_subbody(&dp.body, schema, out);
+                self.render_select(&dp.outer, schema, out);
+            }
         }
     }
 
@@ -139,10 +148,7 @@ impl CompiledPlan {
                 crate::plan::CompoundArm::Select(sp) => self.render_select(sp, schema, out),
                 crate::plan::CompoundArm::Derived(dp) => {
                     out.push_str(&format!("  arm{} derived \"{}\"\n", k + 1, dp.name));
-                    match &dp.body {
-                        SubBody::Select(sp) => self.render_select(sp, schema, out),
-                        SubBody::Compound(inner) => self.render_compound(inner, schema, out),
-                    }
+                    self.render_subbody(&dp.body, schema, out);
                     self.render_select(&dp.outer, schema, out);
                 }
             }

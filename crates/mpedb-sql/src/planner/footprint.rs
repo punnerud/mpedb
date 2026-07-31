@@ -168,18 +168,7 @@ pub(crate) fn compute_footprint(
 fn union_subplan_reads(s: &SubPlan, schema: &Schema, fp: &mut Footprint) -> Result<()> {
     // A compound body reads the union of what its arms read (#56, format 31); a
     // plain select body reads itself.
-    match &s.body {
-        SubBody::Select(sp) => {
-            let sf = select_footprint(sp, schema)?;
-            fp.tables_read.union_with(&sf.tables_read);
-            fp.indexes_used |= sf.indexes_used;
-        }
-        SubBody::Compound(c) => {
-            for arm in &c.arms {
-                union_compound_arm_footprint(arm, schema, fp)?;
-            }
-        }
-    }
+    union_subbody_reads(&s.body, schema, fp)?;
     // A compound body's arms OWN their lifts (format 56); those read tables
     // too, and leaving them out is the same `conflicts_with` leak the
     // statement-level walk closes.
@@ -208,26 +197,45 @@ fn union_compound_arm_reads(
         if let crate::plan::CompoundArm::Derived(dp) = arm {
             // Body + outer tables of the nested derived (Select lifts already
             // walked above when present on arm_subplans).
-            match &dp.body {
-                SubBody::Select(sp) => {
-                    let sf = select_footprint(sp, schema)?;
-                    fp.tables_read.union_with(&sf.tables_read);
-                    fp.indexes_used |= sf.indexes_used;
-                }
-                SubBody::Compound(inner) => {
-                    for a in &inner.arms {
-                        union_compound_arm_footprint(a, schema, fp)?;
-                    }
-                    union_compound_arm_reads(inner, schema, fp)?;
-                }
-            }
-            let of = select_footprint(&dp.outer, schema)?;
-            fp.tables_read.union_with(&of.tables_read);
-            fp.indexes_used |= of.indexes_used;
-            for s in &dp.body_subplans {
-                union_subplan_reads(s, schema, fp)?;
-            }
+            union_derived_reads(dp, schema, fp)?;
         }
+    }
+    Ok(())
+}
+
+/// Union whatever a subquery/derived BODY reads. The three shapes a body can
+/// take each had their own copy of this walk; format 65 (a derived body) makes
+/// the recursion real, so it is one function.
+fn union_subbody_reads(b: &SubBody, schema: &Schema, fp: &mut Footprint) -> Result<()> {
+    match b {
+        SubBody::Select(sp) => {
+            let sf = select_footprint(sp, schema)?;
+            fp.tables_read.union_with(&sf.tables_read);
+            fp.indexes_used |= sf.indexes_used;
+        }
+        SubBody::Compound(c) => {
+            for arm in &c.arms {
+                union_compound_arm_footprint(arm, schema, fp)?;
+            }
+            union_compound_arm_reads(c, schema, fp)?;
+        }
+        SubBody::Derived(dp) => union_derived_reads(dp, schema, fp)?,
+    }
+    Ok(())
+}
+
+/// Body ‖ outer ‖ the lifts the body owns.
+fn union_derived_reads(
+    dp: &crate::plan::DerivedPlan,
+    schema: &Schema,
+    fp: &mut Footprint,
+) -> Result<()> {
+    union_subbody_reads(&dp.body, schema, fp)?;
+    let of = select_footprint(&dp.outer, schema)?;
+    fp.tables_read.union_with(&of.tables_read);
+    fp.indexes_used |= of.indexes_used;
+    for s in &dp.body_subplans {
+        union_subplan_reads(s, schema, fp)?;
     }
     Ok(())
 }
@@ -244,25 +252,7 @@ fn union_compound_arm_footprint(
             fp.indexes_used |= sf.indexes_used;
         }
         crate::plan::CompoundArm::Derived(dp) => {
-            match &dp.body {
-                SubBody::Select(sp) => {
-                    let sf = select_footprint(sp, schema)?;
-                    fp.tables_read.union_with(&sf.tables_read);
-                    fp.indexes_used |= sf.indexes_used;
-                }
-                SubBody::Compound(c) => {
-                    for a in &c.arms {
-                        union_compound_arm_footprint(a, schema, fp)?;
-                    }
-                    union_compound_arm_reads(c, schema, fp)?;
-                }
-            }
-            let of = select_footprint(&dp.outer, schema)?;
-            fp.tables_read.union_with(&of.tables_read);
-            fp.indexes_used |= of.indexes_used;
-            for s in &dp.body_subplans {
-                union_subplan_reads(s, schema, fp)?;
-            }
+            union_derived_reads(dp, schema, fp)?;
         }
     }
     Ok(())
@@ -332,19 +322,7 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                 key_access: KeyAccess::Full,
                 read_only: true,
             };
-            match &dp.body {
-                SubBody::Select(sp) => {
-                    let f = select_footprint(sp, schema)?;
-                    fp.tables_read.union_with(&f.tables_read);
-                    fp.indexes_used |= f.indexes_used;
-                }
-                SubBody::Compound(c) => {
-                    for arm in &c.arms {
-                        union_compound_arm_footprint(arm, schema, &mut fp)?;
-                    }
-                    union_compound_arm_reads(c, schema, &mut fp)?;
-                }
-            }
+            union_subbody_reads(&dp.body, schema, &mut fp)?;
             {
                 let f = select_footprint(&dp.outer, schema)?;
                 fp.tables_read.union_with(&f.tables_read);

@@ -39,7 +39,7 @@ pub fn catalog_has(cat: &ViewCatalog, name: &str) -> bool {
     catalog_get(cat, name).is_some()
 }
 
-const MAX_VIEW_DEPTH: usize = 16;
+pub(crate) const MAX_VIEW_DEPTH: usize = 16;
 
 fn bind_err(msg: impl Into<String>) -> Error {
     Error::Bind(msg.into())

@@ -1436,6 +1436,8 @@ fn exec_subbody(
     match body {
         SubBody::Select(sp) => exec_select(ctx, schema, plan, params, sp),
         SubBody::Compound(c) => exec_compound(ctx, schema, plan, params, c),
+        // Format 65: the subquery's FROM was a non-flattenable derived table.
+        SubBody::Derived(dp) => recursive::exec_derived(ctx, schema, plan, params, dp),
     }
 }
 
@@ -2587,6 +2589,10 @@ fn correlated_survivors(
     let corr_table = correlated.first().and_then(|(_, s)| match &s.body {
         SubBody::Select(sp) => Some(sp.table),
         SubBody::Compound(c) => c.arms.first().map(|a| a.output_select().table),
+        // A derived body's own scans charge through the scan layer; naming its
+        // WORKING table here would attribute the driver to a table that does
+        // not exist in the schema, so leave the attribution to those.
+        SubBody::Derived(_) => None,
     });
     let mut out = Vec::new();
     for row in rows {

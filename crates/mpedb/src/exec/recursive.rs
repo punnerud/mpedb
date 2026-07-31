@@ -263,9 +263,19 @@ pub(super) fn exec_derived(
     // inside the body, and `f` is just a materialised column by the time the
     // outer filters on it.
     let base = dp.body_sub_base as usize;
+    // At the statement level the caller's buffer already spans every reserved
+    // slot. As a SUBQUERY body (format 65) it does not: `exec_subbody` hands
+    // down exactly the `[user ‖ correlation]` prefix, and this derived's own
+    // slots start where that prefix ends. Widen rather than index past it.
+    let need = base + dp.reserved_slots() as usize;
     let filled;
-    let params: &[Value] = if dp.body_subplans.iter().any(|s| s.outer_args.is_empty()) {
+    let params: &[Value] = if params.len() < need
+        || dp.body_subplans.iter().any(|s| s.outer_args.is_empty())
+    {
         let mut buf = params.to_vec();
+        if buf.len() < need {
+            buf.resize(need, Value::Null);
+        }
         for (i, sub) in dp.body_subplans.iter().enumerate() {
             if !sub.outer_args.is_empty() {
                 continue;
@@ -290,6 +300,15 @@ pub(super) fn exec_derived(
         // `exec_compound` fills them per arm, so nothing is left to do here.
         mpedb_sql::SubBody::Compound(c) => {
             match exec_compound(&mut *ctx, schema, plan, params, c)? {
+                ExecResult::Rows { rows, .. } => rows,
+                _ => return Err(internal("derived-table body produced no row set")),
+            }
+        }
+        // Format 65: the body's own FROM was a derived table. It materializes
+        // itself the same way, owns its own lifts, and hands up ROWS — the
+        // recursion needs nothing this level does not already do.
+        mpedb_sql::SubBody::Derived(inner) => {
+            match exec_derived(&mut *ctx, schema, plan, params, inner)? {
                 ExecResult::Rows { rows, .. } => rows,
                 _ => return Err(internal("derived-table body produced no row set")),
             }
