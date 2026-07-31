@@ -1100,63 +1100,68 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
     }
 }
 
-/// Qualify every UNQUALIFIED column of `e` with the name the OUTER scope
-/// addresses its table by, so the expression keeps meaning what it meant once
-/// it is spliced into an inner query's scope.
+/// Qualify every unqualified column of the PROBE against the OUTER scope, and
+/// collect the table qualifiers the result carries — in ONE walk.
 ///
-/// A name the outer scope does not bind, or binds ambiguously, is left as it
-/// is: the binder reports both cases far better than a guess here would, and
-/// silently inventing a qualifier is exactly the class of mistake this exists
-/// to prevent.
-fn qualify_against(e: &ast::Expr, outer: &Scope<'_>) -> Result<ast::Expr> {
+/// One walk, not two, because the two halves have OPPOSITE safety polarities:
+/// the qualifier must cover every node kind or a column slips through bare, and
+/// the collector must cover every node kind or the shadow test under-reports.
+/// Two lists to keep in sync is precisely the drift this file has been bitten
+/// by; a node kind can now only be missing from both at once, which the
+/// whitelist below turns into a refusal.
+///
+/// `Ok(None)` means the probe cannot be spliced safely and the CALLER MUST
+/// REFUSE BY NAME. Two ways to get there, and both were measured answering
+/// where sqlite refuses:
+///
+///  * a bare column the outer scope does not bind UNIQUELY. `Scope::owner_name`
+///    reports unknown and ambiguous the same way, which is exactly right here:
+///    leaving such a name bare lets the SUBQUERY resolve it. With r(a,b) joined
+///    to s(a,c), `(a, r.b) IN (SELECT q.a,q.b FROM q)` returned rows where
+///    sqlite says "ambiguous column name: a"; with q carrying a column the
+///    outer lacks, `(zz, r.b) IN (…)` returned rows where sqlite says "no such
+///    column: zz". Both spellings refuse correctly OUTSIDE a row value, so the
+///    leak is this splice and nothing else.
+///  * any node kind not on the whitelist. The catch-all used to clone the node
+///    and trust the shadow test to notice — but the shadow test only sees
+///    qualifiers a probe already CARRIES, and an unqualified column inside an
+///    unwalked node carries none. A whitelist cannot have that hole: a node
+///    this does not understand is a refusal, and adding a kind is a deliberate
+///    act with a measurement behind it.
+fn qualify_probe(
+    e: &ast::Expr,
+    outer: &Scope<'_>,
+    quals: &mut Vec<String>,
+) -> Option<ast::Expr> {
     use ast::Expr as E;
-    Ok(match e {
-        E::Col(name) => match outer.owner_name(name) {
-            Some(q) => E::Qualified(q.to_string(), name.clone()),
-            None => e.clone(),
-        },
-        E::Binary(op, a, b) => E::Binary(
-            *op,
-            Box::new(qualify_against(a, outer)?),
-            Box::new(qualify_against(b, outer)?),
-        ),
-        E::Unary(op, a) => E::Unary(*op, Box::new(qualify_against(a, outer)?)),
-        E::Func(n, args) => E::Func(
-            n.clone(),
-            args.iter()
-                .map(|a| qualify_against(a, outer))
-                .collect::<Result<Vec<_>>>()?,
-        ),
-        E::Cast(a, t) => E::Cast(Box::new(qualify_against(a, outer)?), t.clone()),
-        E::Collate(a, c) => E::Collate(Box::new(qualify_against(a, outer)?), c.clone()),
-        // A probe containing anything else — a subquery, a CASE, a row value —
-        // is left alone and the shadow check below decides. Leaving it is safe
-        // in the direction that matters: an unqualified name inside it still
-        // reaches the shadow test through `outer_qualifiers`, which reports
-        // nothing for it, so the rewrite proceeds only when no qualifier could
-        // collide at all.
-        other => other.clone(),
-    })
-}
-
-/// Every table qualifier appearing in `e`, for the shadow test.
-fn outer_qualifiers(e: &ast::Expr) -> Vec<String> {
-    let mut out = Vec::new();
-    fn walk(e: &ast::Expr, out: &mut Vec<String>) {
-        use ast::Expr as E;
-        match e {
-            E::Qualified(q, _) => out.push(q.clone()),
-            E::Binary(_, a, b) => {
-                walk(a, out);
-                walk(b, out);
-            }
-            E::Unary(_, a) | E::Cast(a, _) | E::Collate(a, _) => walk(a, out),
-            E::Func(_, args) => args.iter().for_each(|a| walk(a, out)),
-            _ => {}
+    let sub = |a: &ast::Expr, q: &mut Vec<String>| qualify_probe(a, outer, q);
+    Some(match e {
+        E::Col(name) => {
+            let owner = outer.owner_name(name)?;
+            quals.push(owner.to_string());
+            E::Qualified(owner.to_string(), name.clone())
         }
-    }
-    walk(e, &mut out);
-    out
+        E::Qualified(q, n) => {
+            quals.push(q.clone());
+            E::Qualified(q.clone(), n.clone())
+        }
+        // Column-free by construction: nothing to qualify, nothing to shadow.
+        E::Lit(_) | E::Param(_) => e.clone(),
+        E::Binary(op, a, b) => {
+            E::Binary(*op, Box::new(sub(a, quals)?), Box::new(sub(b, quals)?))
+        }
+        E::Unary(op, a) => E::Unary(*op, Box::new(sub(a, quals)?)),
+        E::Cast(a, t) => E::Cast(Box::new(sub(a, quals)?), t.clone()),
+        E::Collate(a, c) => E::Collate(Box::new(sub(a, quals)?), c.clone()),
+        E::Func(n, args) => {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                out.push(sub(a, quals)?);
+            }
+            E::Func(n.clone(), out)
+        }
+        _ => return None,
+    })
 }
 
 /// `(a, b) [NOT] IN (SELECT x, y FROM s WHERE p)` as the two correlated
@@ -1227,10 +1232,24 @@ fn row_value_in_subquery(
     //
     // because `a = a` is trivially true and `a = b AND b = a` trivially false
     // once BOTH sides bind inside q. Only the fully-qualified spelling escaped.
-    let qualified: Vec<Expr> = probe
-        .iter()
-        .map(|p| qualify_against(p, outer))
-        .collect::<Result<Vec<_>>>()?;
+    let mut probe_quals: Vec<String> = Vec::new();
+    let mut qualified: Vec<Expr> = Vec::with_capacity(probe.len());
+    for p in probe {
+        match qualify_probe(p, outer, &mut probe_quals) {
+            Some(q) => qualified.push(q),
+            // Cannot be qualified safely — see `qualify_probe`. Refusing by
+            // name is the only answer that is not a guess.
+            None => {
+                return Err(bind_err(
+                    "a row value compared with a subquery must name outer columns \
+                     the outer query binds unambiguously — an unqualified name that \
+                     the outer query does not resolve would be resolved INSIDE the \
+                     subquery instead, which silently changes what is compared"
+                        .to_string(),
+                ))
+            }
+        }
+    }
     // Qualification cannot save a probe whose outer table is ADDRESSED by the
     // same name inside the subquery (`FROM r` in both). Refuse the rewrite —
     // the ordinary path then reports the row-value limit by name, which is the
@@ -1246,11 +1265,9 @@ fn row_value_in_subquery(
                 .map(|j| j.alias.as_deref().unwrap_or(j.table.as_str())),
         )
         .collect();
-    let shadowed = qualified.iter().any(|e| {
-        outer_qualifiers(e)
-            .iter()
-            .any(|q| inner_names.iter().any(|n| mpedb_types::ident_eq(n, q)))
-    });
+    let shadowed = probe_quals
+        .iter()
+        .any(|q| inner_names.iter().any(|n| mpedb_types::ident_eq(n, q)));
     if shadowed {
         return Err(bind_err(
             "a row value cannot be compared with a subquery that reads a table \

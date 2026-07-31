@@ -464,4 +464,36 @@ fn a_row_value_probe_is_not_captured_by_the_subquerys_own_columns() {
         format!("{e}").contains("SAME name"),
         "expected the same-name refusal, got {e}"
     );
+
+    // A bare name the OUTER query does not bind UNIQUELY must refuse, not be
+    // left bare — left bare it is resolved INSIDE the subquery, which is the
+    // same capture by another route and answers where sqlite refuses.
+    // Measured: sqlite says "ambiguous column name: a" / "no such column: zz",
+    // and both spellings already refuse correctly OUTSIDE a row value, so the
+    // leak was this splice and nothing else.
+    d.query("CREATE TABLE s2 (id INTEGER PRIMARY KEY, a TEXT, c TEXT)", &[]).unwrap();
+    for bad in [
+        // `a` is on both r and s2 — ambiguous in the outer scope.
+        "SELECT r.id FROM r JOIN s2 ON s2.id = r.id WHERE (a, r.b) IN (SELECT a, b FROM q)",
+        // `zz` is on neither.
+        "SELECT id FROM r WHERE (zz, r.b) IN (SELECT a, b FROM q)",
+    ] {
+        let e = d.query(bad, &[]).unwrap_err();
+        assert!(
+            format!("{e}").contains("unambiguously"),
+            "`{bad}` must refuse, got {e}"
+        );
+    }
+    // And a probe node kind the qualifier does not understand refuses rather
+    // than being cloned through: the shadow test only sees qualifiers a probe
+    // already CARRIES, so an unqualified column inside an unwalked node would
+    // carry none and slip past. A whitelist cannot have that hole.
+    let e = d
+        .query(
+            "SELECT id FROM r WHERE (CASE WHEN id > 0 THEN a ELSE b END, b) \
+             IN (SELECT a, b FROM q)",
+            &[],
+        )
+        .unwrap_err();
+    assert!(format!("{e}").contains("unambiguously"), "{e}");
 }
