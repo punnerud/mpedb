@@ -178,10 +178,34 @@ ids_of() {  # $@ = logs -> sorted dotted test ids
         | sed -E 's/^(FAIL|ERROR): [^ ]+ \(([^)]*)\).*/\2/' \
         | sort -u
 }
+# A group that never REACHED its tests reports zero failures, which reads
+# exactly like a clean run. That is not a hypothetical: `field_defaults` died in
+# Django's own migration step (a column DEFAULT calling a host-registered UDF),
+# taking the eleven labels sharing its group down with it, and the sweep
+# reported "SHIM-ONLY (0)" over 849 tests that were never executed. Emptiness
+# was already guarded; a log with a TRACEBACK and no `Ran` line was not.
+#
+# Compare the two arms' totals as well. Equal failure counts over unequal test
+# counts is the same lie in a subtler form.
+missing=0
+for arm in stock shim; do
+    for f in "$OUT"/${arm}_g*.txt; do
+        [ -e "$f" ] || continue
+        if ! grep -q '^Ran ' "$f"; then
+            echo "  !! NO 'Ran' LINE: $f — the suite never reached its tests. \
+Anything this group would have measured is MISSING, not passing."
+            sed -n '$p' "$f" | sed 's/^/     last line: /'
+            missing=1
+        fi
+    done
+done
 for arm in stock shim; do
     ls "$OUT"/${arm}_g*.txt >/dev/null 2>&1 || continue
     ids_of "$OUT"/${arm}_g*.txt > "$OUT/${arm}_ids.txt"
+    n=$(grep -hE '^Ran ' "$OUT"/${arm}_g*.txt 2>/dev/null | awk '{s+=$2} END {print s+0}')
+    echo "$arm ran $n tests"
 done
+[ "$missing" = 1 ] && echo "  !! the SHIM-ONLY count below is measured over an INCOMPLETE run."
 if [ -f "$OUT/stock_ids.txt" ] && [ -f "$OUT/shim_ids.txt" ]; then
     comm -13 "$OUT/stock_ids.txt" "$OUT/shim_ids.txt" > "$OUT/shim_only_ids.txt"
     comm -23 "$OUT/stock_ids.txt" "$OUT/shim_ids.txt" > "$OUT/stock_only_ids.txt"
