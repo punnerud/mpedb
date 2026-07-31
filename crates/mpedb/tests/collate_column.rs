@@ -348,6 +348,47 @@ fn agree(stmts: &[&str]) {
     }
 }
 
+/// WHICH member of a collated group the KEY reports: sqlite reads it from the
+/// min/max WITNESS row, exactly as it reads a bare column.
+///
+/// Under BINARY every member is byte-identical, so the choice is unobservable
+/// — under NOCASE/RTRIM it is not, and mpedb reported the group's FIRST row.
+/// `SELECT k, max(v) … GROUP BY k` on a NOCASE `k` answered 'a' where sqlite
+/// answers 'A', which is a wrong answer with nothing to hint at it. With no
+/// min/max there is no witness and BOTH engines report the first row, so the
+/// aggregate set is what decides.
+#[test]
+fn a_collated_group_key_reports_the_witness_row() {
+    let d = db();
+    for q in [
+        // A single min/max: the key follows the extremum's row.
+        "SELECT name, max(id) FROM t GROUP BY name ORDER BY name",
+        "SELECT name, min(id) FROM t GROUP BY name ORDER BY name",
+        "SELECT code, max(id) FROM t GROUP BY code ORDER BY code",
+        "SELECT code, min(id) FROM t GROUP BY code ORDER BY code",
+        // Two keys at once, and a key next to a bare column — one capture, so
+        // they cannot come from different rows.
+        "SELECT name, code, max(id) FROM t GROUP BY name, code ORDER BY name, code",
+        "SELECT name, max(id), plain FROM t GROUP BY name ORDER BY name",
+        // No min/max ⇒ no witness ⇒ the first row, in both engines.
+        "SELECT name, count(*) FROM t GROUP BY name ORDER BY name",
+        "SELECT name, sum(id) FROM t GROUP BY name ORDER BY name",
+        // TWO min/max ⇒ sqlite's pick is order-dependent and it falls back to
+        // the first row; mpedb must do the same rather than pick one extremum.
+        "SELECT name, max(id), min(id) FROM t GROUP BY name ORDER BY name",
+        // The witness follows a FILTERED extremum.
+        "SELECT name, max(id) FILTER (WHERE id > 2) FROM t GROUP BY name ORDER BY name",
+        // …and it survives HAVING, DISTINCT and a window over the group.
+        "SELECT name, max(id) FROM t GROUP BY name HAVING max(id) > 1 ORDER BY name",
+        "SELECT DISTINCT name, max(id) FROM t GROUP BY name ORDER BY name",
+        "SELECT name, max(id), rank() OVER (ORDER BY max(id)) FROM t GROUP BY name ORDER BY name",
+        // The BINARY control column: unobservable either way, and must not move.
+        "SELECT plain, max(id) FROM t GROUP BY plain ORDER BY plain",
+    ] {
+        assert_eq!(mpedb_rows(&d, q), sqlite_rows(q), "mismatch on `{q}`");
+    }
+}
+
 /// A WINDOW's `PARTITION BY` and `ORDER BY` compare under the column's declared
 /// collation — sqlite's precedence rung 2 reaches them like every other clause.
 ///

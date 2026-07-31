@@ -310,6 +310,16 @@ pub(super) struct Folder<'a> {
     table: u32,
     group_collations: Vec<Collation>,
     has_bare: bool,
+    /// `(key position, base-row column)` for every GROUP BY key that is a
+    /// COLLATED base column.
+    ///
+    /// A group's members are byte-identical under BINARY, so which one the key
+    /// slot reports is unobservable — under NOCASE/RTRIM it is not, and sqlite
+    /// reports the member from the min/max WITNESS row, exactly as it reports a
+    /// bare column. `SELECT k, max(v) … GROUP BY k` on a NOCASE `k` answers
+    /// 'A' where the group's first row said 'a'. So a collated key needs the
+    /// same witness a bare column does, even when there are no bare columns.
+    collated_keys: Vec<(usize, u16)>,
     /// The single min/max aggregate that governs the bare-column witness, if
     /// the aggregate set has exactly one (see [`exec_aggregate`]).
     mm: Option<(&'a AggCall, mpedb_types::AggFn)>,
@@ -424,6 +434,22 @@ impl<'a> Folder<'a> {
             schema,
             table,
             has_bare: !agg.bare_cols.is_empty(),
+            collated_keys: agg
+                .group_by
+                .iter()
+                .enumerate()
+                .filter_map(|(i, k)| match k {
+                    GroupKey::Col(c)
+                        if !matches!(
+                            base_colls.get(*c as usize).copied().unwrap_or(Collation::Binary),
+                            Collation::Binary
+                        ) =>
+                    {
+                        Some((i, *c))
+                    }
+                    _ => None,
+                })
+                .collect(),
             group_collations,
             mm,
             fast_args: agg
@@ -562,7 +588,7 @@ impl<'a> Folder<'a> {
                     })
                     .collect();
                 drop(expr_it);
-                let witness = if !self.has_bare {
+                let witness = if !self.has_bare && self.collated_keys.is_empty() {
                     None
                 } else if self.mm.is_some() {
                     Some(Witness::MinMax { extreme: None, bare: Vec::new() })
@@ -639,11 +665,14 @@ impl<'a> Folder<'a> {
         }
         // Update the bare-column witness, reproducing sqlite's rule EXACTLY.
         if let Some(w) = entry.2.as_mut() {
+            // `[collated key values ‖ bare column values]` — one capture, so
+            // the key and the bare column can never come from different rows.
             let capture = || -> Vec<Value> {
-                self.agg
-                    .bare_cols
+                self.collated_keys
                     .iter()
-                    .map(|&c| row.get(c as usize).cloned().unwrap_or(Value::Null))
+                    .map(|&(_, c)| c)
+                    .chain(self.agg.bare_cols.iter().copied())
+                    .map(|c| row.get(c as usize).cloned().unwrap_or(Value::Null))
                     .collect()
             };
             match w {
@@ -1579,6 +1608,9 @@ pub(super) fn exec_aggregate(
         }
     }
 
+    // The collated group-key SLOTS, taken before the folder is consumed: the
+    // witness overwrites these with the extremum row's spelling below.
+    let collated_keys: Vec<usize> = folder.collated_keys.iter().map(|&(i, _)| i).collect();
     let Folder { groups, .. } = folder;
 
     // (grouped tuple, first-row param scratch for correlated HAVING/projection)
@@ -1605,16 +1637,24 @@ pub(super) fn exec_aggregate(
     }
     for (_, (keys, accs, witness, scratch)) in groups {
         let mut tuple = keys;
+        // The witness carries `[collated key values ‖ bare column values]`; the
+        // key half OVERWRITES what the group's first row put there, because a
+        // collated key's members can differ and sqlite reports the witness
+        // row's spelling. `n_ck` is how many, and it is fixed for the plan.
+        let n_ck = collated_keys.len();
         for a in accs {
             tuple.push(a.finish()?);
         }
-        // Every group has at least one row, so the witness `bare` is populated;
+        // Every group has at least one row, so the witness is populated;
         // extend the grouped tuple to `[keys ‖ aggs ‖ bare]`.
         if let Some(w) = witness {
-            let bare = match w {
+            let captured = match w {
                 Witness::MinMax { bare, .. } | Witness::MinRowid { bare, .. } => bare,
             };
-            tuple.extend(bare);
+            for (slot, v) in collated_keys.iter().zip(captured.iter().take(n_ck)) {
+                tuple[*slot] = v.clone();
+            }
+            tuple.extend(captured.into_iter().skip(n_ck));
         }
         out.push((tuple, scratch));
     }
