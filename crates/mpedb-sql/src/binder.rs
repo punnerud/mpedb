@@ -1629,10 +1629,49 @@ impl<'a> Binder<'a> {
                     bound.push(self.bind_expr(a)?);
                 }
                 self.suppress_fold = outer;
+                // A bare parameter among the arms must NOT be pinned by its
+                // siblings. `coalesce` returns one branch VERBATIM — it never
+                // combines them — so the parameter has no storage requirement
+                // and its only consumer is whatever reads the result. Letting a
+                // sibling pin it is how Django's `Concat` broke: it wraps every
+                // operand in `COALESCE(expr, '')`, so binding `''` against an
+                // `IntegerField` arm demanded an int and refused the empty
+                // string.
+                //
+                // Recorded BEFORE unification and restored after, because
+                // `unify_param` only writes `param_types` — it does not wrap the
+                // expression — so releasing the slot leaves nothing
+                // inconsistent. Narrow on purpose: only a param NOTHING ELSE has
+                // already pinned, and only here.
+                let free_params: Vec<u16> = bound
+                    .iter()
+                    .filter_map(|(e, _)| match e {
+                        BExpr::Param(i)
+                            if self
+                                .param_types
+                                .get(*i as usize)
+                                .copied()
+                                .flatten()
+                                .is_none() =>
+                        {
+                            Some(*i)
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 // All branches are the one result, so they must unify — same
-                // rule as CASE, and for the same reason.
+                // rule as CASE, and for the same reason. The unification still
+                // runs, so `coalesce(int_col, text_col)` is still refused.
                 let (bound, ty) = self.unify_result_arms(bound, "mix coalesce() argument types")?;
-                Ok((self.fold_coalesce(bound)?, ty))
+                if free_params.is_empty() {
+                    return Ok((self.fold_coalesce(bound)?, ty));
+                }
+                for i in &free_params {
+                    self.param_types[*i as usize] = None;
+                }
+                // The result is decided per value at runtime, like any other
+                // untyped expression.
+                Ok((self.fold_coalesce(bound)?, Some(ColumnType::Any)))
             }
             ast::Expr::Func(name, args) => self.bind_func(name, args),
             ast::Expr::Binary(op, l, r) => self.bind_binary(*op, l, r),
