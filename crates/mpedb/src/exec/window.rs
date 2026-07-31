@@ -52,23 +52,17 @@ pub(super) fn exec_select_windowed(
         gather_rows(ctx, sp.table, &sp.access, sp.filter.as_ref(), plan, params, None)?
     };
 
-    // The collating sequence of each window's ARGUMENT — the declared collation
-    // of the bare column it names (`min(x) OVER (…)` on a NOCASE column folds
-    // NOCASE, as sqlite's minmaxStep does; probed against the bundled 3.45.0).
-    // A computed argument carries none, and an explicit COLLATE in argument
-    // position is refused at bind, so the PushCol shape is the whole rule.
+    // Declared collations of the base row, from which every window clause's
+    // collation follows (see `program_coll`).
     let base_colls = base_row_collations(schema, plan, sp.table, &sp.joins);
-    let arg_colls: Vec<Collation> = sp
-        .windows
-        .iter()
-        .map(|w| match w.arg.as_ref().map(|p| p.instrs.as_slice()) {
-            Some([mpedb_types::Instr::PushCol(i)]) => {
-                base_colls.get(*i as usize).copied().unwrap_or(Collation::Binary)
-            }
-            _ => Collation::Binary,
-        })
-        .collect();
-    compute_windows(&mut rows, &sp.windows, &arg_colls, params, ctx.host_aggs())?;
+    compute_windows(
+        &mut rows,
+        &sp.windows,
+        &base_colls,
+        params,
+        ctx.host_fns(),
+        ctx.host_aggs(),
+    )?;
 
     // Project over the extended rows `[base ‖ w0..wk]`. DISTINCT dedups the
     // projected tuples AFTER the window phase (the same key encoding the plain
@@ -118,16 +112,46 @@ pub(super) fn exec_select_windowed(
 
 /// Compute every window over the materialized rows, extending each row with one
 /// result value per window (at `base_width + k`). Rows are never reordered — the
+/// One window ORDER BY key's comparison inputs: DESCENDING, and the COLLATION.
+/// Bundled because every peer test, every sort and every frame boundary must
+/// use the same pair — carrying them as two parallel slices is how the
+/// collation went missing from three of the four comparison sites.
+type OrdKey = (bool, Collation);
+
+/// The collating sequence an expression compares under: the DECLARED collation
+/// of the bare column it names, and BINARY for anything computed.
+///
+/// This is sqlite's rule and the one `min(x) OVER (…)` already used for a
+/// window ARGUMENT (probed against the bundled 3.45.0). An explicit `COLLATE`
+/// inside a window clause is refused at bind, so a `PushCol` is the whole rule.
+fn program_coll(p: Option<&ExprProgram>, base_colls: &[Collation]) -> Collation {
+    match p.map(|p| p.instrs.as_slice()) {
+        Some([mpedb_types::Instr::PushCol(i)]) => {
+            base_colls.get(*i as usize).copied().unwrap_or(Collation::Binary)
+        }
+        _ => Collation::Binary,
+    }
+}
+
 /// index vector is sorted and each result is written back at the row's ORIGINAL
 /// index — so the base rows stay in gather order for the outer sort.
 pub(super) fn compute_windows(
     rows: &mut [Vec<Value>],
     windows: &[WindowSpec],
-    // Per window: the argument's collating sequence (see `exec_select_windowed`),
-    // read only by a `WindowFunc::Agg` min/max. May be shorter than `windows`
-    // (defensive): missing entries are Binary.
-    arg_colls: &[Collation],
+    // The DECLARED collation of each base-row column, from which every window
+    // clause's collation follows (`program_coll`). May be shorter than the row
+    // (defensive): a missing entry is Binary.
+    base_colls: &[Collation],
     params: &[Value],
+    // The connection's HOST SCALAR functions. A window's PARTITION BY, its
+    // ORDER BY, its argument and a lag/lead default are all ordinary
+    // expressions and may call one — `PARTITION BY django_date_extract('year',
+    // d)` is what Django's ORM writes for `.annotate(…, partition_by=…__year)`.
+    // These four evaluations used `eval` (no host), so every such window
+    // failed with "host function …() is not in scope for this execution" while
+    // the SAME call in the projection, in GROUP BY and in the statement's
+    // ORDER BY worked.
+    host_fns: Option<&dyn HostFns>,
     // The connection's HOST window-aggregate registry, for
     // `WindowFunc::Host` (design/DESIGN-UDF.md stage 4). `None` wherever no
     // host registration can be in scope — the mechanism stays inert.
@@ -146,6 +170,19 @@ pub(super) fn compute_windows(
     let n = rows.len();
 
     for (k, w) in windows.iter().enumerate() {
+        // A window's PARTITION BY and ORDER BY compare under the DECLARED
+        // collation of a bare column, exactly as the statement's ORDER BY and
+        // GROUP BY do — `PARTITION BY s` on a `TEXT COLLATE NOCASE` column puts
+        // 'A' and 'a' in ONE partition, and `ORDER BY s` makes them peers.
+        // Both used BINARY, which was not a refusal but a WRONG ANSWER: a
+        // different partitioning and a different rank than sqlite's.
+        // A computed key carries no declared collation (the `[PushCol]` rule
+        // `arg_colls` already uses), and an explicit `COLLATE` in a window
+        // clause is refused at bind — so this is the whole rule.
+        let part_colls: Vec<Collation> =
+            w.partition_by.iter().map(|p| program_coll(Some(p), base_colls)).collect();
+        let ord_colls: Vec<Collation> =
+            w.order_by.iter().map(|(p, _)| program_coll(Some(p), base_colls)).collect();
         // Per-row partition key, ordering values, and (for an aggregate window)
         // the argument value — all evaluated over the base row.
         let mut part_key: Vec<Vec<u8>> = Vec::with_capacity(n);
@@ -157,23 +194,23 @@ pub(super) fn compute_windows(
         for row in rows.iter() {
             let mut pk = Vec::with_capacity(w.partition_by.len());
             for p in &w.partition_by {
-                pk.push(p.eval(row, params)?);
+                pk.push(p.eval_host(row, params, host_fns)?);
             }
             // NULLs group together (SQL's PARTITION BY rule) and so do `1`
             // and `1.0` (partition membership is sqlite's comparison) — the
             // total, NULL-equal GROUP key is exactly the GROUP BY keying.
-            part_key.push(keycode::encode_group_key(&pk, &[]));
+            part_key.push(keycode::encode_group_key(&pk, &part_colls));
             let mut ov = Vec::with_capacity(w.order_by.len());
             for (p, _) in &w.order_by {
-                ov.push(p.eval(row, params)?);
+                ov.push(p.eval_host(row, params, host_fns)?);
             }
             order_vals.push(ov);
             arg_vals.push(match &w.arg {
                 None => None,
-                Some(p) => Some(p.eval(row, params)?),
+                Some(p) => Some(p.eval_host(row, params, host_fns)?),
             });
             default_vals.push(match &w.default {
-                Some(p) => p.eval(row, params)?,
+                Some(p) => p.eval_host(row, params, host_fns)?,
                 None => Value::Null,
             });
         }
@@ -181,12 +218,17 @@ pub(super) fn compute_windows(
         // Stable sort of indices by (partition key, window ORDER BY). Stability
         // keeps ties in gather (PK/scan) order — matching row_number's tiebreak
         // and the top-K path's tiebreak elsewhere in the executor.
-        let dirs: Vec<bool> = w.order_by.iter().map(|(_, d)| *d).collect();
+        let ord_keys: Vec<OrdKey> = w
+            .order_by
+            .iter()
+            .enumerate()
+            .map(|(k, (_, d))| (*d, ord_colls.get(k).copied().unwrap_or(Collation::Binary)))
+            .collect();
         let mut idx: Vec<usize> = (0..n).collect();
         idx.sort_by(|&a, &b| {
             part_key[a]
                 .cmp(&part_key[b])
-                .then_with(|| order_cmp(&order_vals[a], &order_vals[b], &dirs))
+                .then_with(|| order_cmp(&order_vals[a], &order_vals[b], &ord_keys))
         });
 
         assign_window(
@@ -203,12 +245,12 @@ pub(super) fn compute_windows(
                 Some(f) => resolve_frame_offsets(f, params)?,
                 None => FrameOffsets { start: 0, end: 0 },
             },
-            arg_colls.get(k).copied().unwrap_or(Collation::Binary),
+            program_coll(w.arg.as_ref(), base_colls),
             &part_key,
             &order_vals,
             &arg_vals,
             &default_vals,
-            &dirs,
+            &ord_keys,
             host_aggs,
         )?;
     }
@@ -240,7 +282,7 @@ fn assign_window(
     order_vals: &[Vec<Value>],
     arg_vals: &[Option<Value>],
     default_vals: &[Value],
-    dirs: &[bool],
+    ord_keys: &[OrdKey],
     host_aggs: Option<&dyn HostAggs>,
 ) -> Result<()> {
     let slot = base_width + k;
@@ -249,7 +291,7 @@ fn assign_window(
     // row rank 1 / dense_rank 1); with ORDER BY, peers are rows equal on all
     // keys. The aggregate cumulative branch only consults this when `has_order`.
     let peers = |i: usize, j: usize| -> bool {
-        !has_order || order_cmp(&order_vals[i], &order_vals[j], dirs) == Ordering::Equal
+        !has_order || order_cmp(&order_vals[i], &order_vals[j], ord_keys) == Ordering::Equal
     };
 
     let mut p = 0usize;
@@ -277,7 +319,7 @@ fn assign_window(
                 fo,
                 arg_vals,
                 order_vals,
-                dirs,
+                ord_keys,
                 has_order,
                 w.host.as_deref(),
                 host_aggs,
@@ -579,7 +621,7 @@ fn assign_framed(
     fo: FrameOffsets,
     arg_vals: &[Option<Value>],
     order_vals: &[Vec<Value>],
-    dirs: &[bool],
+    ord_keys: &[OrdKey],
     has_order: bool,
     host: Option<&str>,
     host_aggs: Option<&dyn HostAggs>,
@@ -589,7 +631,7 @@ fn assign_framed(
     // per row: it SLIDES (see `assign_host_framed`).
     if matches!(func, WindowFunc::Host) {
         return assign_host_framed(
-            slot, part, rows, frame, fo, arg_vals, order_vals, dirs, has_order, host, host_aggs,
+            slot, part, rows, frame, fo, arg_vals, order_vals, ord_keys, has_order, host, host_aggs,
         );
     }
     // Peer-group structure is needed for GROUPS/RANGE (they count / span peer
@@ -600,7 +642,7 @@ fn assign_framed(
     {
         (Vec::new(), Vec::new())
     } else {
-        build_groups(part, order_vals, dirs, has_order)
+        build_groups(part, order_vals, ord_keys, has_order)
     };
     for off in 0..len {
         let (lo, hi) = frame_bounds(off, len, frame, fo, &group_of, &group_starts);
@@ -690,7 +732,7 @@ fn assign_host_framed(
     fo: FrameOffsets,
     arg_vals: &[Option<Value>],
     order_vals: &[Vec<Value>],
-    dirs: &[bool],
+    ord_keys: &[OrdKey],
     has_order: bool,
     host: Option<&str>,
     host_aggs: Option<&dyn HostAggs>,
@@ -701,7 +743,7 @@ fn assign_host_framed(
     {
         (Vec::new(), Vec::new())
     } else {
-        build_groups(part, order_vals, dirs, has_order)
+        build_groups(part, order_vals, ord_keys, has_order)
     };
     let arg_at = |p: usize| arg_vals[part[p]].clone().unwrap_or(Value::Null);
     // `EXCLUDE` (format 66) punches a HOLE in the frame, so the slide below —
@@ -803,7 +845,7 @@ fn assign_host_default(
 fn build_groups(
     part: &[usize],
     order_vals: &[Vec<Value>],
-    dirs: &[bool],
+    ord_keys: &[OrdKey],
     has_order: bool,
 ) -> (Vec<usize>, Vec<usize>) {
     let mut group_of = Vec::with_capacity(part.len());
@@ -815,7 +857,7 @@ fn build_groups(
         } else {
             let prev = part[pos - 1];
             let same = !has_order
-                || order_cmp(&order_vals[i], &order_vals[prev], dirs) == Ordering::Equal;
+                || order_cmp(&order_vals[i], &order_vals[prev], ord_keys) == Ordering::Equal;
             if !same {
                 g += 1;
                 group_starts.push(pos);
@@ -1008,12 +1050,12 @@ fn push_arg(acc: &mut Accum, arg: &Option<Value>) -> Result<()> {
 /// Total order over two rows' window ORDER BY values: `Value::sql_cmp` per key,
 /// NULLS FIRST ascending, reversed for a descending key — the exact `cmp_order`
 /// semantics `sort_rows` uses, so the window ORDER BY matches sqlite's default.
-fn order_cmp(a: &[Value], b: &[Value], dirs: &[bool]) -> Ordering {
-    for (k, &desc) in dirs.iter().enumerate() {
+fn order_cmp(a: &[Value], b: &[Value], ord_keys: &[OrdKey]) -> Ordering {
+    for (k, &(desc, coll)) in ord_keys.iter().enumerate() {
         let (Some(x), Some(y)) = (a.get(k), b.get(k)) else {
             continue;
         };
-        let ord = value_cmp(x, y);
+        let ord = value_cmp(x, y, coll);
         if ord != Ordering::Equal {
             return if desc { ord.reverse() } else { ord };
         }
@@ -1021,10 +1063,10 @@ fn order_cmp(a: &[Value], b: &[Value], dirs: &[bool]) -> Ordering {
     Ordering::Equal
 }
 
-fn value_cmp(a: &Value, b: &Value) -> Ordering {
+fn value_cmp(a: &Value, b: &Value, coll: Collation) -> Ordering {
     // Storage-class order, as `ORDER BY` uses: a window key can be an `any`
     // column, which really does hold more than one class.
-    match a.sort_cmp(b, mpedb_types::Collation::Binary) {
+    match a.sort_cmp(b, coll) {
         Some(o) => o,
         // NULL involved: NULLS FIRST in ascending order (two NULLs are peers).
         None => match (a.is_null(), b.is_null()) {

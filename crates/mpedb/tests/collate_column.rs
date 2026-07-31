@@ -348,6 +348,51 @@ fn agree(stmts: &[&str]) {
     }
 }
 
+/// A WINDOW's `PARTITION BY` and `ORDER BY` compare under the column's declared
+/// collation — sqlite's precedence rung 2 reaches them like every other clause.
+///
+/// They did not, and it was a WRONG ANSWER rather than a refusal: `PARTITION BY
+/// name` on a NOCASE column put 'Alice' and 'alice' in DIFFERENT partitions and
+/// `ORDER BY name` ranked them as distinct, so `row_number`, `rank`,
+/// `group_concat` over the partition and every frame that spans peers all
+/// disagreed with sqlite while looking perfectly plausible.
+#[test]
+fn window_clauses_use_the_declared_collation() {
+    let d = db();
+    for q in [
+        // PARTITION BY: the NOCASE classes are ONE partition each.
+        "SELECT id, count(*) OVER (PARTITION BY name) FROM t ORDER BY id",
+        "SELECT id, group_concat(id) OVER (PARTITION BY name) FROM t ORDER BY id",
+        // RTRIM likewise — 'x', 'x ', 'x  ' are one class.
+        "SELECT id, count(*) OVER (PARTITION BY code) FROM t ORDER BY id",
+        // The BINARY control column must NOT collapse.
+        "SELECT id, count(*) OVER (PARTITION BY plain) FROM t ORDER BY id",
+        // ORDER BY: the classes are PEERS, which `rank`/`dense_rank` see and
+        // `row_number` does not.
+        "SELECT id, rank() OVER (ORDER BY name) FROM t ORDER BY id",
+        "SELECT id, dense_rank() OVER (ORDER BY name) FROM t ORDER BY id",
+        "SELECT id, row_number() OVER (ORDER BY name) FROM t ORDER BY id",
+        "SELECT id, rank() OVER (ORDER BY code) FROM t ORDER BY id",
+        "SELECT id, rank() OVER (ORDER BY plain) FROM t ORDER BY id",
+        // Peer-based frames read the same peer groups.
+        "SELECT id, group_concat(id) OVER (ORDER BY name \
+         RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        "SELECT id, group_concat(id) OVER (ORDER BY name \
+         GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        // …including the exclusion, whose peer group is the collated one.
+        "SELECT id, count(*) OVER (ORDER BY name \
+         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) \
+         FROM t ORDER BY id",
+        // Both at once, and the offset functions that read peer order.
+        "SELECT id, lag(id) OVER (PARTITION BY code ORDER BY name) FROM t ORDER BY id",
+        "SELECT id, first_value(id) OVER (PARTITION BY name ORDER BY id) FROM t ORDER BY id",
+        // A COMPUTED key carries no declared collation — BINARY, in both engines.
+        "SELECT id, count(*) OVER (PARTITION BY substr(name, 1, 3)) FROM t ORDER BY id",
+    ] {
+        assert_eq!(mpedb_rows(&d, q), sqlite_rows(q), "mismatch on `{q}`");
+    }
+}
+
 /// A collated UNIQUE / secondary index / PRIMARY KEY now builds folded on-disk
 /// keys — verified to behave exactly like sqlite: case-variant duplicates are
 /// rejected, case-variant probes resolve, and ordering collapses the classes.

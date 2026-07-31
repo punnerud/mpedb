@@ -123,6 +123,65 @@ fn seed(db: &Database, rows: &[(i64, &str, i64)]) {
     }
 }
 
+/// A HOST SCALAR function is callable from every clause of a window — its
+/// `PARTITION BY`, its `ORDER BY`, the window function's ARGUMENT, and a
+/// `lag`/`lead` DEFAULT.
+///
+/// It was not: those four expressions were evaluated with `eval` rather than
+/// `eval_host`, so each failed with "host function …() is not in scope for
+/// this execution" — while the SAME call in the projection, in `GROUP BY` and
+/// in the statement's `ORDER BY` worked. Django's ORM writes
+/// `PARTITION BY django_date_extract('year', d)` for `partition_by=…__year`,
+/// which is how the gap was found.
+#[test]
+fn a_host_scalar_is_in_scope_in_every_window_clause() {
+    let db = db();
+    // `tens(v)` = v / 10, so it collapses 10 and 19 into one class.
+    db.register_host_function("tens", 1, |args: &[Value]| match args[0] {
+        Value::Int(n) => Ok(Value::Int(n / 10)),
+        _ => Ok(Value::Null),
+    });
+    seed(&db, &[(1, "a", 10), (2, "a", 19), (3, "b", 25), (4, "b", 31)]);
+
+    // PARTITION BY: {1,2} share tens=1, {3} tens=2, {4} tens=3.
+    let r = db
+        .query("SELECT id, count(*) OVER (PARTITION BY tens(y)) FROM t ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(ints(&r), [2, 2, 1, 1]);
+
+    // Window ORDER BY: 1 and 2 are PEERS under tens(), so rank ties them.
+    let r = db
+        .query("SELECT id, rank() OVER (ORDER BY tens(y)) FROM t ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(ints(&r), [1, 1, 3, 4]);
+
+    // The window function's ARGUMENT.
+    let r = db
+        .query("SELECT id, sum(tens(y)) OVER (ORDER BY id) FROM t ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(ints(&r), [1, 2, 4, 7]);
+
+    // A lag DEFAULT, which is evaluated at the CURRENT row. A host function's
+    // result type is `any`, and a rigid engine will not silently pick one — so
+    // the CAST the error message asks for is part of the shape here.
+    let r = db
+        .query(
+            "SELECT id, lag(y, 1, CAST(tens(y) AS INTEGER)) OVER (ORDER BY id) \
+             FROM t ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(ints(&r), [1, 10, 19, 25]);
+    // Without the CAST it is refused for the TYPE, not for scope — the two
+    // refusals are different gaps and must not be confused for one another.
+    let e = db
+        .query("SELECT id, lag(y, 1, tens(y)) OVER (ORDER BY id) FROM t", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("differs from the value type"), "unexpected: {e}");
+    assert!(!e.contains("not in scope"), "still a scope failure: {e}");
+}
+
 /// sqlite's own worked example for `create_window_function`, answer for answer:
 /// `sumint(y) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)`.
 #[test]
