@@ -121,6 +121,50 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
       en subquery i den avledede tabellens YTRE setning.
 
 
+1a-ter. SESJON 31/7 (S8–S9) — VINDU OVER GRUPPE, OG ET GALT SVAR TIL
+----------------------------------------------------------------------
+
+    db036c6  S8: vindusfunksjon over et GRUPPERT resultat. Fasen kjører
+             ETTER grupperingen, over de grupperte radene; vinduets egne
+             klausuler bindes mot `[keys ‖ aggs ‖ bare]`.
+    73b5f15  S9: en KOLLERT gruppenøkkel rapporteres fra min/max-VITNERADEN,
+             ikke fra gruppens første rad. GALT SVAR i sendt kode.
+
+  Sveipgruppa: 24 → 22 (vindus-i-WHERE-klyngen 4 → 0). Samlet S4–S9: 48 → 22.
+  Uendret: Django G1+G2 831/831, CPython 459/466, SQLAlchemy 1274/1277,
+  korpus 7 420 638 records / 0 gale svar.
+
+  S8s to funn kom av differensialen, ikke av resonnementet:
+    * eksekvereren rutet til den vanlige vindus-stien FØR den sjekket
+      aggregat, så fasen kjørte over UGRUPPERTE rader og projeksjonen svarte
+      på et annet spørsmål — hele basisrader, uten feilmelding.
+    * `SELECT DISTINCT` over et gruppert vindu er en ANDRE konstruksjon av
+      samme plan i aggregatplanleggeren, og den slapp vinduene på gulvet.
+
+  S9 er sesjonens andre gale svar, og igjen funnet ved å utvide en probe:
+  et GROUP BY-batteri skrevet for å teste vinduer hadde én rad med
+  case-variant data, og KONTROLL-linjen uten vindu var uenig med sqlite.
+  Regelen er målt, ikke lest: `max(v)` → ekstremumets rad, `min(v)` → den
+  andre, `sum(v)` → ingen vitne, første rad, `max+min` → to ekstrema, ingen
+  entydig vitne, første rad. Nøyaktig bar-kolonne-regelen mpedb allerede
+  hadde — så fiksen er at en kollert nøkkelkolonne blir med i SAMME
+  `capture()` som de bare kolonnene.
+
+  RESTEN I SVEIPGRUPPA (22):
+     2  korrelert subquery i `DELETE … WHERE` / `UPDATE … WHERE`. NESTE, og
+        størst: hele familien nektes (EXISTS, NOT EXISTS, skalar, IN med en
+        korrelert kropp, og UPDATE SET fra en korrelert skalar). Løftet
+        PRODUSERER allerede korrelerte subplaner; det som mangler er per-rad-
+        fyllet, som bare SELECT-stien gjør. Krever samme `split_correlated`
+        SELECT bruker (ellers kan en tilgangssti binde seg til en ufylt
+        korrelert slot = galt svar), et `post_filter`-felt på `Delete` og
+        `Update` i planformatet, og fyllet i begge eksekveringsløkkene.
+     2  `cannot compare int64 and text` — typerigiditet. Djangos generiske
+        relasjoner lagrer FK-en som TEXT og joiner den mot en INTEGER-pk;
+        sqlite matcher via affinitet. DESIGNGRENSE, ikke hull.
+    18  assertion-feil uten OperationalError — umålt kategori.
+
+
 1b. SESJON 30–31/7 — SQLALCHEMY 965 → 1274, CPYTHON 459 → 460, DJANGO +106
 --------------------------------------------------------------------------
 
