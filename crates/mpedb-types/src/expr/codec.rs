@@ -75,6 +75,8 @@ const OP_GLOB_DYN: u8 = 60;
 // The collated scalar-call twin (min()/max() under a column's collation).
 const OP_CALL_COLL: u8 = 61;
 const OP_SPELL_CALL: u8 = 62;
+/// The collated twin of [`OP_IN_PARAM`] — see [`Instr::InParamColl`].
+const OP_IN_PARAM_COLL: u8 = 63;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -205,6 +207,11 @@ impl ExprProgram {
                 }
                 Instr::InListColl(x, coll) => {
                     buf.push(OP_IN_LIST_COLL);
+                    buf.extend_from_slice(&x.to_le_bytes());
+                    buf.push(coll as u8);
+                }
+                Instr::InParamColl(x, coll) => {
+                    buf.push(OP_IN_PARAM_COLL);
                     buf.extend_from_slice(&x.to_le_bytes());
                     buf.push(coll as u8);
                 }
@@ -357,6 +364,14 @@ impl ExprProgram {
                     let coll = Collation::from_tag(c)
                         .ok_or_else(|| Error::Corrupt("bad collation tag".into()))?;
                     Instr::InListColl(x, coll)
+                }
+                OP_IN_PARAM_COLL => {
+                    let x = read_u16_arg()?;
+                    let c = *buf.get(*pos).ok_or_else(err)?;
+                    *pos += 1;
+                    let coll = Collation::from_tag(c)
+                        .ok_or_else(|| Error::Corrupt("bad collation tag".into()))?;
+                    Instr::InParamColl(x, coll)
                 }
                 OP_AFFINITY => {
                     let t = *buf.get(*pos).ok_or_else(err)?;
@@ -519,7 +534,7 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     }
                     // Pops the probe scalar, pushes the 3VL result; the list comes
                     // from a param slot, not the stack, so the arity is not here.
-                    Instr::InParam(_) => (1, 1),
+                    Instr::InParam(_) | Instr::InParamColl(..) => (1, 1),
                     Instr::Cast(_) | Instr::Affinity(_) => (1, 1),
                     Instr::Concat => (2, 1),
                     // n list elements plus the probe beneath them. n == 0 is the

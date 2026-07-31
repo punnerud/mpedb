@@ -604,3 +604,52 @@ fn a_declared_collation_crosses_a_subquery_boundary_like_sqlite() {
         "SELECT id FROM nc WHERE a = (SELECT x FROM nq) ORDER BY id",
     ]);
 }
+
+/// `x IN (SELECT …)` compares under the PROBE's collation, like every other
+/// comparison — and like the literal-list form already did.
+///
+/// The subquery form went through `BExpr::InParam`, which carried no collation
+/// at all, so a `COLLATE NOCASE` column compared BYTEWISE. Measured against
+/// 3.45.1 before the fix, with `a` NOCASE holding 'AB' and the subquery
+/// yielding 'ab': `IN` returned NO rows where sqlite returns the row, and
+/// `NOT IN` returned BOTH rows where sqlite returns one — the negation makes it
+/// a wrong answer in both directions at once.
+///
+/// The NULL and empty-set rules must be untouched, which is why the collated
+/// and uncollated paths share ONE 3VL core rather than having a second copy:
+/// `Collation::Binary` makes the collated comparison byte-identical to the
+/// plain one, so the uncollated callers pay nothing.
+#[test]
+fn an_in_subquery_compares_under_the_probes_collation() {
+    let setup = [
+        "CREATE TABLE nc (id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE, b TEXT)",
+        "CREATE TABLE rt (id INTEGER PRIMARY KEY, r TEXT COLLATE RTRIM)",
+        "CREATE TABLE nq (x TEXT)",
+        "CREATE TABLE nqn (x TEXT)",
+        "CREATE TABLE emp (x TEXT)",
+        "INSERT INTO nc VALUES (1,'AB','AB'),(2,'cd','cd')",
+        "INSERT INTO rt VALUES (1,'ab  '),(2,'zz')",
+        "INSERT INTO nq VALUES ('ab')",
+        "INSERT INTO nqn VALUES ('ab'),(NULL)",
+    ];
+    for q in [
+        "SELECT id FROM nc WHERE a IN (SELECT x FROM nq) ORDER BY id",
+        "SELECT id FROM nc WHERE a NOT IN (SELECT x FROM nq) ORDER BY id",
+        // A NULL in the subquery must still make a non-match UNKNOWN.
+        "SELECT id FROM nc WHERE a IN (SELECT x FROM nqn) ORDER BY id",
+        "SELECT id FROM nc WHERE a NOT IN (SELECT x FROM nqn) ORDER BY id",
+        // The empty set is FALSE for every probe — and that rule must precede
+        // the NULL-probe rule, which is why one shared core matters.
+        "SELECT id FROM nc WHERE a IN (SELECT x FROM emp) ORDER BY id",
+        "SELECT id FROM nc WHERE a NOT IN (SELECT x FROM emp) ORDER BY id",
+        // RTRIM folds trailing spaces, not case.
+        "SELECT id FROM rt WHERE r IN (SELECT 'ab') ORDER BY id",
+        "SELECT id FROM rt WHERE r IN (SELECT 'ab  ') ORDER BY id",
+        // A BINARY column beside the collated one must NOT pick up NOCASE.
+        "SELECT id FROM nc WHERE b IN (SELECT x FROM nq) ORDER BY id",
+    ] {
+        let mut stmts: Vec<&str> = setup.to_vec();
+        stmts.push(q);
+        agree(&stmts);
+    }
+}

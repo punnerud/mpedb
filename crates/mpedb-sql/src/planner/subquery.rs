@@ -1077,7 +1077,9 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
         | BExpr::ClassCmp(_, a, bx, _, _) => {
             refs_correlated(a, sub_base, correlated) || refs_correlated(bx, sub_base, correlated)
         }
-        BExpr::InParam(a, i) => is_corr(*i) || refs_correlated(a, sub_base, correlated),
+        BExpr::InParam(a, i) | BExpr::InParamColl(a, i, _) => {
+            is_corr(*i) || refs_correlated(a, sub_base, correlated)
+        }
         BExpr::InList(a, xs) | BExpr::InListColl(a, xs, _) => {
             refs_correlated(a, sub_base, correlated)
                 || xs.iter().any(|x| refs_correlated(x, sub_base, correlated))

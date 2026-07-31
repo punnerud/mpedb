@@ -31,7 +31,7 @@ pub use datetime::{sqlite_now_parts, sqlite_now_string};
 pub use scalar::ScalarFn;
 
 use ops::{
-    bit_i64, bitwise, escape_char, glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl,
+    bit_i64, bitwise, escape_char, glob_match, in_items_3vl, in_list_3vl,
     like_match, like_match_cs, regexp_match, CrossClass,
 };
 use scalar::{call_scalar, call_scalar_collated};
@@ -117,6 +117,16 @@ pub enum Instr {
     /// compiled plan serves every session (§4.1). Baking the list into the
     /// const pool would mint a plan per distinct membership set.
     InParam(u16),
+    /// The collated twin of [`Instr::InParam`] — `<probe> IN (<subquery>)` where
+    /// the comparison runs under a COLLATION rather than bytewise.
+    ///
+    /// Emitted only for a non-Binary collation, so an ordinary `IN (SELECT …)`
+    /// keeps the plain opcode and identical bytes. The failure it prevents is a
+    /// wrong answer, not a missing feature: with `a TEXT COLLATE NOCASE`
+    /// holding 'AB' and the subquery yielding 'ab', `a IN (SELECT x FROM q)`
+    /// returned NO rows where sqlite returns the row, and `NOT IN` returned
+    /// BOTH rows where sqlite returns one.
+    InParamColl(u16, Collation),
     /// `<scalar> IN (<e1>, …, <en>)` — set membership against `n` values taken
     /// from the STACK (general SQL `IN`, task #21). Pops `n` list elements plus
     /// the probe beneath them, pushes the 3VL verdict.
@@ -811,7 +821,17 @@ impl ExprProgram {
                     let list = params.get(pi as usize).ok_or_else(|| {
                         Error::Corrupt("IN list parameter index out of range".into())
                     })?;
-                    stack.push(in_list_3vl(&probe, list)?);
+                    stack.push(in_list_3vl(&probe, list, Collation::Binary)?);
+                }
+                Instr::InParamColl(pi, coll) => {
+                    let probe = stack.pop().expect("validated");
+                    // The bounds check is what keeps a hostile slot index from
+                    // panicking — `validate` bounds `PushParam` but not this —
+                    // so it is copied verbatim rather than shortened.
+                    let list = params.get(pi as usize).ok_or_else(|| {
+                        Error::Corrupt("IN list parameter index out of range".into())
+                    })?;
+                    stack.push(in_list_3vl(&probe, list, coll)?);
                 }
                 Instr::InList(n) => {
                     // The verifier proved depth >= n+1, so both splits are safe.
@@ -820,7 +840,12 @@ impl ExprProgram {
                     let probe = stack.pop().expect("validated");
                     // Items are SQL expressions evaluated per row, so a
                     // cross-class pair is sqlite's clean FALSE, not a refusal.
-                    stack.push(in_items_3vl(&probe, &items, CrossClass::NonMatch)?);
+                    stack.push(in_items_3vl(
+                        &probe,
+                        &items,
+                        CrossClass::NonMatch,
+                        Collation::Binary,
+                    )?);
                 }
                 Instr::JumpIfNotTrue(t) => {
                     // Jump on FALSE *and* on NULL: an unknown WHEN must not be
@@ -897,7 +922,7 @@ impl ExprProgram {
                     let at = stack.len() - n as usize;
                     let items: Vec<Value> = stack.split_off(at);
                     let probe = stack.pop().expect("validated");
-                    stack.push(in_items_3vl_collated(&probe, &items, coll)?);
+                    stack.push(in_items_3vl(&probe, &items, CrossClass::NonMatch, coll)?);
                 }
                 Instr::HostCall(name_idx, argc) => {
                     // The name lives in the const pool; validate proved the index

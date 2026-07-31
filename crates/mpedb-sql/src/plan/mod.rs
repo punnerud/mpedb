@@ -494,7 +494,15 @@ const MAX_JOINS: usize = 63;
 //     Python source. The integer SEMANTICS are untouched (0 = the current row,
 //     negative looks the other way — both already matched sqlite); only where
 //     the integer comes from is new.
-const PLAN_FORMAT: u8 = 68;
+//  69: `Instr::InParamColl` — the collated twin of `InParam`, so
+//     `<probe> IN (SELECT …)` compares under the probe's collation instead of
+//     bytewise. Not a new capability but a WRONG ANSWER closed: with a
+//     `COLLATE NOCASE` column holding 'AB' and the subquery yielding 'ab',
+//     `a IN (…)` returned no rows where sqlite returns the row, and
+//     `a NOT IN (…)` returned both rows where sqlite returns one. Emitted only
+//     for a non-Binary collation, so every plan that was already right keeps
+//     byte-identical bytes and the same hash.
+const PLAN_FORMAT: u8 = 69;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

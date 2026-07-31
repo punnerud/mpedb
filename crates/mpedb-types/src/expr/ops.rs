@@ -178,7 +178,7 @@ fn shift(a: i64, count: i64, left: bool) -> i64 {
 /// The `IS NOT DISTINCT FROM` reading (NULL matching NULL) is deliberately NOT
 /// used: standard `IN` compares with `=`, and a context list containing NULL
 /// must not silently make NULL-keyed rows visible.
-pub(super) fn in_list_3vl(probe: &Value, list: &Value) -> Result<Value> {
+pub(super) fn in_list_3vl(probe: &Value, list: &Value, coll: Collation) -> Result<Value> {
     let items = match list {
         Value::List(items) => items,
         Value::Null => {
@@ -195,7 +195,7 @@ pub(super) fn in_list_3vl(probe: &Value, list: &Value) -> Result<Value> {
     };
     // A BOUND list against a typed probe: a cross-class element is the caller's
     // error, not "no rows". See [`CrossClass::Refuse`].
-    in_items_3vl(probe, items, CrossClass::Refuse)
+    in_items_3vl(probe, items, CrossClass::Refuse, coll)
 }
 
 /// What a cross-STORAGE-CLASS pair inside an IN list means. The 3VL rules above
@@ -225,7 +225,12 @@ pub(super) enum CrossClass {
 /// two forms cannot drift apart on the NULL rules above — which decide whether
 /// a policy admits a row. They diverge on ONE axis only, spelled out in
 /// [`CrossClass`]: what a text-vs-integer pair means.
-pub(super) fn in_items_3vl(probe: &Value, items: &[Value], cross: CrossClass) -> Result<Value> {
+pub(super) fn in_items_3vl(
+    probe: &Value,
+    items: &[Value],
+    cross: CrossClass,
+    coll: Collation,
+) -> Result<Value> {
     // `x IN ()` — membership in the EMPTY set — is FALSE for any `x`, NULL
     // included: nothing is a member of nothing (SQL 3VL). This MUST precede the
     // null-probe short-circuit below, or `NULL IN (<empty subquery>)` wrongly
@@ -246,7 +251,11 @@ pub(super) fn in_items_3vl(probe: &Value, items: &[Value], cross: CrossClass) ->
         }
         // sql_cmp decides same-class and int/float pairs. It REFUSES a
         // cross-class pair; what that refusal means is the caller's call.
-        match probe.sql_cmp(it) {
+        // `Collation::Binary` makes this byte-identical to `sql_cmp`: the
+        // Text/Text arm of `sql_cmp_collated` becomes `a.as_bytes().cmp(b)` and
+        // every other pair delegates straight through. So the uncollated
+        // callers pay nothing and behave exactly as before.
+        match probe.sql_cmp_collated(it, coll) {
             Ok(Some(std::cmp::Ordering::Equal)) => return Ok(Value::Bool(true)),
             Ok(_) => continue,
             Err(e) => match cross {
@@ -255,40 +264,6 @@ pub(super) fn in_items_3vl(probe: &Value, items: &[Value], cross: CrossClass) ->
                 CrossClass::NonMatch => continue,
                 CrossClass::Refuse => return Err(e),
             },
-        }
-    }
-    Ok(if saw_null { Value::Null } else { Value::Bool(false) })
-}
-
-/// The 3VL core for `x COLLATE <coll> IN (…)` — identical to [`in_items_3vl`]
-/// except text membership is decided under an explicit collation. Every NULL /
-/// empty-set rule above is preserved verbatim; only the equality test changes.
-///
-/// Its only caller is [`Instr::InListColl`](super::Instr::InListColl) — a
-/// `COLLATE` can only be written on a literal IN list — so it is fixed at
-/// [`CrossClass::NonMatch`]; there is no collated `InParam` form.
-pub(super) fn in_items_3vl_collated(
-    probe: &Value,
-    items: &[Value],
-    coll: Collation,
-) -> Result<Value> {
-    if items.is_empty() {
-        return Ok(Value::Bool(false));
-    }
-    if probe.is_null() {
-        return Ok(Value::Null);
-    }
-    let mut saw_null = false;
-    for it in items {
-        if it.is_null() {
-            saw_null = true;
-            continue;
-        }
-        match probe.sql_cmp_collated(it, coll) {
-            Ok(Some(std::cmp::Ordering::Equal)) => return Ok(Value::Bool(true)),
-            Ok(_) => continue,
-            // Cross-class under sqlite's class order: never Equal, so non-match.
-            Err(_) => continue,
         }
     }
     Ok(if saw_null { Value::Null } else { Value::Bool(false) })

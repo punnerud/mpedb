@@ -69,6 +69,10 @@ pub(crate) enum BExpr {
     RegexpDyn(Box<BExpr>, Box<BExpr>),
     /// `LHS IN (<context list at reserved param n>)` (DESIGN-MULTIDB §2.6).
     InParam(Box<BExpr>, u16),
+    /// The collated twin of [`BExpr::InParam`] — see [`Instr::InParamColl`].
+    /// Built only for a non-Binary collation, so an ordinary subquery IN keeps
+    /// the plain node and identical plan bytes.
+    InParamColl(Box<BExpr>, u16, Collation),
     /// `LHS IN (e1, …, en)` — a general value list (task #21).
     InList(Box<BExpr>, Vec<BExpr>),
     /// `CASE WHEN c THEN r … ELSE e END`. `else_` is None for a missing ELSE
@@ -830,6 +834,22 @@ impl<'a> Binder<'a> {
     /// on every root binder it constructs, so a UDF call resolves in queries,
     /// join operands, aggregate arguments, and (via `rescope`) the grouped tuple.
     /// Cheap: the set is a small `(name, arity)` vector cloned once per compile.
+    /// sqlite's collation rung 2: the DECLARED collation behind an operand,
+    /// or `None` for one that has none (a literal, an expression result).
+    ///
+    /// A correlation PARAM answers for the outer column it stands in for —
+    /// reading only `Col` made every comparison across a subquery boundary
+    /// fall to BINARY. Shared by the comparison arm and the two `IN` arms;
+    /// three copies of this would drift, and the `IN`-subquery arm not having
+    /// it at all is exactly how that form shipped a wrong answer.
+    fn operand_collation(&self, e: &BExpr) -> Option<Collation> {
+        match e {
+            BExpr::Col(idx) => Some(self.scope.column_collation(*idx)),
+            BExpr::Param(i) => self.param_colls.get(*i as usize).copied().flatten(),
+            _ => None,
+        }
+    }
+
     pub fn set_host_udfs(&mut self, set: &HostUdfSet) {
         self.host_udfs = set.clone();
     }
@@ -1724,11 +1744,26 @@ impl<'a> Binder<'a> {
             // runtime; membership is the same runtime-typed 3VL core the
             // session-context lists use, so the lhs binds free.
             ast::Expr::InParamSlot(lhs, slot, negated) => {
-                let (l, _lt) = self.bind_expr(lhs)?;
-                Ok((
-                    maybe_not(BExpr::InParam(Box::new(l), *slot), *negated),
-                    Some(ColumnType::Bool),
-                ))
+                // `x IN (SELECT …)` compares under the LEFT operand's
+                // collation, exactly as the literal-list form above does:
+                // an explicit `COLLATE` on the probe (rung 1), else the probe
+                // COLUMN's declared one (rung 2), else BINARY. This arm read
+                // neither, so a `COLLATE NOCASE` column compared BYTEWISE and
+                // answered wrongly — measured against 3.45.1 with `a` holding
+                // 'AB' and the subquery yielding 'ab': `a IN (…)` gave NO rows
+                // where sqlite gives the row, and `a NOT IN (…)` gave BOTH
+                // rows where sqlite gives one.
+                let (lhs_ast, lhs_coll) = peel_collate(lhs)?;
+                let (l, _lt) = self.bind_expr(lhs_ast)?;
+                let coll = lhs_coll
+                    .or_else(|| self.operand_collation(&l))
+                    .unwrap_or_default();
+                let node = if coll == Collation::Binary {
+                    BExpr::InParam(Box::new(l), *slot)
+                } else {
+                    BExpr::InParamColl(Box::new(l), *slot, coll)
+                };
+                Ok((maybe_not(node, *negated), Some(ColumnType::Bool)))
             }
             ast::Expr::InSubquery(..) => Err(bind_err(
                 "an IN subquery here was not lifted — this expression position \
@@ -1944,15 +1979,10 @@ impl<'a> Binder<'a> {
                 // answer for the column it replaces. Reading only `Col` made
                 // every comparison across a subquery boundary fall to BINARY,
                 // which is a wrong answer wherever the outer column is NOCASE.
-                let col_coll = |e: &BExpr| match e {
-                    BExpr::Col(idx) => Some(self.scope.column_collation(*idx)),
-                    BExpr::Param(i) => self.param_colls.get(*i as usize).copied().flatten(),
-                    _ => None,
-                };
                 let coll = l_coll
                     .or(r_coll)
-                    .or_else(|| col_coll(&l))
-                    .or_else(|| col_coll(&r))
+                    .or_else(|| self.operand_collation(&l))
+                    .or_else(|| self.operand_collation(&r))
                     .unwrap_or_default();
                 // Comparison affinity + storage-class order. Equality against a
                 // typed column deliberately does NOT take ClassCmp (keeps the
@@ -3961,7 +3991,7 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
         BExpr::Regexp(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Cast(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         // Never foldable: the list is a session value, not a literal.
-        BExpr::InParam(..) => false,
+        BExpr::InParam(..) | BExpr::InParamColl(..) => false,
         // A CASE is branching control flow, not a value-in/value-out node; the
         // fold path evaluates whole programs and has no business here.
         BExpr::Case(..) => false,
@@ -4153,6 +4183,10 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
         BExpr::InParam(a, idx) => {
             emit(a, instrs, consts)?;
             instrs.push(Instr::InParam(*idx));
+        }
+        BExpr::InParamColl(a, idx, coll) => {
+            emit(a, instrs, consts)?;
+            instrs.push(Instr::InParamColl(*idx, *coll));
         }
         BExpr::Case(arms, else_) => {
             // WHEN c JumpIfNotTrue next; THEN r; Jump end; … ELSE e; end:
