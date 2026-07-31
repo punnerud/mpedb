@@ -361,14 +361,16 @@ fn stage1_refusals() {
     assert!(err("SELECT rank(val) OVER (ORDER BY val) FROM t")
         .to_lowercase()
         .contains("argument"));
-    // Explicit frames now ship (see `window_frames.rs`); the brittle/ignored
-    // shapes stay refused. A `RANGE` value-offset frame is refused (its
-    // DESC/NULL value arithmetic is version-brittle).
+    // Explicit frames now ship, RANGE value offsets included (their DESC and
+    // NULL arithmetic is measured against sqlite in `window_frames.rs`). What
+    // a RANGE offset still needs is EXACTLY ONE ORDER BY key — the bound is
+    // that key's value ± the offset, so zero or several is refused BY NAME,
+    // in sqlite's own words.
     assert!(err(
-        "SELECT sum(amt) OVER (ORDER BY val RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
+        "SELECT sum(amt) OVER (ORDER BY val, id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
     )
     .to_lowercase()
-    .contains("range"));
+    .contains("one order by expression"));
     // A frame on a ranking function (which sqlite silently ignores) is refused.
     assert!(err(
         "SELECT rank() OVER (ORDER BY val ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"

@@ -475,7 +475,7 @@ pub(super) fn plan_window_select(
             None => None,
             Some(fa) => {
                 let f = resolve_frame(fa);
-                f.check(func, !order_by.is_empty()).map_err(bind_err)?;
+                f.check(func, order_by.len()).map_err(bind_err)?;
                 Some(f)
             }
         };

@@ -806,7 +806,7 @@ impl CompiledPlan {
                         // Explicit frame legality — the same rule set the planner
                         // and decoder apply, re-checked here on the semantic pass.
                         if let Some(f) = &w.frame {
-                            f.check(w.func, !w.order_by.is_empty()).map_err(corrupt)?;
+                            f.check(w.func, w.order_by.len()).map_err(corrupt)?;
                         }
                         if let Some(a) = &w.arg {
                             self.check_program_width(a, base_width, ptypes)?;

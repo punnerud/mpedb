@@ -352,6 +352,99 @@ fn float_aggregates_under_frames_match_sqlite() {
     }
 }
 
+/// `RANGE` with a `PRECEDING`/`FOLLOWING` offset: the boundary is the ORDER BY
+/// key's VALUE shifted by the offset, not a row or peer-group count.
+///
+/// Three rules, all MEASURED against sqlite 3.45 before implementing, and all
+/// exercised here because each is a wrong answer if guessed:
+///   * DESC flips the sign — `n PRECEDING` is EARLIER in window order, which
+///     under DESC is a LARGER value;
+///   * a NON-NUMERIC current value (this table has NULLs in `val`) degenerates
+///     each OFFSET bound to that value's peer group, PER BOUND — so
+///     `n PRECEDING AND UNBOUNDED FOLLOWING` on a NULL row still runs to the
+///     partition's end;
+///   * the comparison is the SORT's, so a numeric interval never reaches a
+///     row of another storage class.
+#[test]
+fn range_offset_frames_match_sqlite() {
+    let d = db();
+    let frames = [
+        "RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+        "RANGE BETWEEN 5 PRECEDING AND CURRENT ROW",
+        "RANGE BETWEEN CURRENT ROW AND 10 FOLLOWING",
+        "RANGE BETWEEN 0 PRECEDING AND 0 FOLLOWING",
+        "RANGE BETWEEN UNBOUNDED PRECEDING AND 5 FOLLOWING",
+        "RANGE BETWEEN 5 PRECEDING AND UNBOUNDED FOLLOWING",
+        // Both edges on the same side of the current row.
+        "RANGE BETWEEN 10 PRECEDING AND 5 PRECEDING",
+        "RANGE BETWEEN 5 FOLLOWING AND 10 FOLLOWING",
+        // A huge offset must saturate to the partition edge, not overflow.
+        "RANGE BETWEEN 9223372036854775807 PRECEDING AND 9223372036854775807 FOLLOWING",
+    ];
+    for f in frames {
+        for dir in ["ASC", "DESC"] {
+            for agg in ["sum(amt)", "count(*)", "group_concat(id)"] {
+                assert_same(
+                    &d,
+                    &format!("SELECT id, {agg} OVER (ORDER BY val {dir} {f}) FROM t ORDER BY id"),
+                );
+            }
+            // Partitioned, and with the value functions whose answer is a
+            // position inside the value window.
+            assert_same(
+                &d,
+                &format!(
+                    "SELECT id, group_concat(id) OVER \
+                     (PARTITION BY grp ORDER BY val {dir} {f}) FROM t ORDER BY id"
+                ),
+            );
+            for vf in ["first_value(amt)", "last_value(amt)", "nth_value(amt, 2)"] {
+                assert_same(
+                    &d,
+                    &format!("SELECT id, {vf} OVER (ORDER BY val {dir} {f}) FROM t ORDER BY id"),
+                );
+            }
+        }
+        // With an exclusion on top — the hole is punched in the value window.
+        for e in ["EXCLUDE CURRENT ROW", "EXCLUDE GROUP", "EXCLUDE TIES"] {
+            assert_same(
+                &d,
+                &format!(
+                    "SELECT id, group_concat(id) OVER (ORDER BY val {f} {e}) FROM t ORDER BY id"
+                ),
+            );
+        }
+    }
+    // A TEXT key with a numeric offset: every offset bound collapses to the
+    // peer group, in both engines.
+    assert_same(
+        &d,
+        "SELECT id, group_concat(id) OVER \
+         (ORDER BY grp RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id",
+    );
+    // The offset may be a PARAMETER, exactly as for ROWS/GROUPS.
+    let got = mpedb_rows(
+        &d,
+        "SELECT id, count(*) OVER (ORDER BY val RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+         FROM t ORDER BY id",
+    );
+    match d
+        .query(
+            "SELECT id, count(*) OVER (ORDER BY val RANGE BETWEEN ? PRECEDING AND ? FOLLOWING) \
+             FROM t ORDER BY id",
+            &[Value::Int(1), Value::Int(1)],
+        )
+        .unwrap()
+    {
+        ExecResult::Rows { rows, .. } => {
+            let via_param: Vec<Vec<String>> =
+                rows.iter().map(|r| r.iter().map(render).collect()).collect();
+            assert_eq!(got, via_param, "a parameter offset must equal the literal one");
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
 /// Frame EXCLUSION (format 66): `EXCLUDE {NO OTHERS | CURRENT ROW | GROUP |
 /// TIES}`. Django emits it (`expressions_window`'s `test_row_range_rank_*`),
 /// and it is the one frame feature that makes the frame NON-CONTIGUOUS — a
@@ -457,9 +550,14 @@ fn malformed_exclusions_are_refused() {
 fn brittle_and_unsupported_frames_are_refused() {
     let d = db();
     for q in [
-        // RANGE with a PRECEDING/FOLLOWING offset — value arithmetic refused.
-        "SELECT id, sum(amt) OVER (ORDER BY val RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
-        "SELECT id, sum(amt) OVER (ORDER BY val RANGE BETWEEN CURRENT ROW AND 5 FOLLOWING) FROM t",
+        // A RANGE offset needs EXACTLY ONE ORDER BY key — the bound is that
+        // key's value ± the offset, so zero leaves nothing to offset from and
+        // several leave no single value. sqlite refuses both, same reason.
+        "SELECT id, sum(amt) OVER (ORDER BY val, id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        "SELECT id, sum(amt) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        // A NON-INTEGER offset: `WinInt` is integral, so this is a named parse
+        // error where sqlite computes a fractional value window.
+        "SELECT id, sum(amt) OVER (ORDER BY val RANGE BETWEEN 0.5 PRECEDING AND CURRENT ROW) FROM t",
         // A frame on a function that does not take one.
         "SELECT id, row_number() OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
         "SELECT id, rank() OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",

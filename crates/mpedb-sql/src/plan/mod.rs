@@ -1123,10 +1123,17 @@ impl Frame {
     ///    here so a frame never quietly changes nothing);
     ///  - the start cannot be `UNBOUNDED FOLLOWING`, the end cannot be
     ///    `UNBOUNDED PRECEDING`, and the end cannot precede the start;
-    ///  - `RANGE` with a `PRECEDING`/`FOLLOWING` offset is refused (its value
-    ///    arithmetic with DESC/NULL ordering is not reproduced exactly);
+    ///  - `RANGE` with a `PRECEDING`/`FOLLOWING` offset needs EXACTLY ONE
+    ///    `ORDER BY` expression, since the bound is that expression's value
+    ///    ± the offset (sqlite refuses zero or several for the same reason,
+    ///    with the message reproduced here);
     ///  - an order-dependent frame needs an ORDER BY.
-    pub(crate) fn check(&self, func: WindowFunc, has_order_by: bool) -> std::result::Result<(), String> {
+    pub(crate) fn check(
+        &self,
+        func: WindowFunc,
+        n_order_by: usize,
+    ) -> std::result::Result<(), String> {
+        let has_order_by = n_order_by > 0;
         if !matches!(
             func,
             WindowFunc::Agg(_)
@@ -1153,11 +1160,13 @@ impl Frame {
         if matches!(self.mode, FrameMode::Range)
             && (matches!(self.start, FrameBound::Preceding(_) | FrameBound::Following(_))
                 || matches!(self.end, FrameBound::Preceding(_) | FrameBound::Following(_)))
+            && n_order_by != 1
         {
+            // sqlite's own wording — the bound is `<the one ORDER BY value> ±
+            // offset`, so zero keys leaves nothing to offset FROM and several
+            // leaves no single value to offset.
             return Err(
-                "RANGE with a PRECEDING/FOLLOWING offset is not supported — use ROWS or GROUPS \
-                 for an offset frame, or RANGE with UNBOUNDED/CURRENT ROW bounds"
-                    .into(),
+                "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression".into(),
             );
         }
         if !has_order_by && !self.order_independent() {

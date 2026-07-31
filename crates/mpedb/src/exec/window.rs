@@ -644,8 +644,22 @@ fn assign_framed(
     } else {
         build_groups(part, order_vals, ord_keys, has_order)
     };
+    // A RANGE offset boundary is a VALUE, so it needs the single ORDER BY key
+    // at each POSITION (not each row) and the sort direction. Built only for
+    // that frame shape; `check` has refused any other key count.
+    let range_keys: Vec<Value> = if matches!(frame.mode, FrameMode::Range) && frame_has_offset(frame)
+    {
+        part.iter()
+            .map(|&i| order_vals[i].first().cloned().unwrap_or(Value::Null))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let range_desc = ord_keys.first().is_some_and(|k| k.0);
     for off in 0..len {
-        let (lo, hi) = frame_bounds(off, len, frame, fo, &group_of, &group_starts);
+        let (lo, hi) = frame_bounds(
+            off, len, frame, fo, &group_of, &group_starts, &range_keys, range_desc,
+        );
         let keep = exclusion(off, len, frame.exclude, &group_of, &group_starts);
         let target = part[off];
         rows[target][slot] = match func {
@@ -752,9 +766,23 @@ fn assign_host_framed(
     // LEFT EDGE only; there is no callback for "remove a row from the middle".
     // Rebuild per row instead: still `xStep`/`xValue` in window order over
     // exactly the frame's rows, just without the incremental saving.
+    // A RANGE offset boundary is a VALUE, so it needs the single ORDER BY key
+    // at each POSITION (not each row) and the sort direction. Built only for
+    // that frame shape; `check` has refused any other key count.
+    let range_keys: Vec<Value> = if matches!(frame.mode, FrameMode::Range) && frame_has_offset(frame)
+    {
+        part.iter()
+            .map(|&i| order_vals[i].first().cloned().unwrap_or(Value::Null))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let range_desc = ord_keys.first().is_some_and(|k| k.0);
     if !matches!(frame.exclude, FrameExclude::NoOthers) {
         for off in 0..len {
-            let (lo, hi) = frame_bounds(off, len, frame, fo, &group_of, &group_starts);
+            let (lo, hi) = frame_bounds(
+                off, len, frame, fo, &group_of, &group_starts, &range_keys, range_desc,
+            );
             let keep = exclusion(off, len, frame.exclude, &group_of, &group_starts);
             let mut st = new_host_state(host, host_aggs)?;
             for p in (lo..hi).filter(|&p| keep(p)) {
@@ -768,7 +796,9 @@ fn assign_host_framed(
     let mut state = new_host_state(host, host_aggs)?;
     let (mut cur_lo, mut cur_hi) = (0usize, 0usize);
     for off in 0..len {
-        let (lo, hi) = frame_bounds(off, len, frame, fo, &group_of, &group_starts);
+        let (lo, hi) = frame_bounds(
+            off, len, frame, fo, &group_of, &group_starts, &range_keys, range_desc,
+        );
         if lo < cur_lo || hi < cur_hi {
             // Not monotone: start this row's frame from an empty state.
             state = new_host_state(host, host_aggs)?;
@@ -957,6 +987,7 @@ fn exclusion(
 /// peer-group structure (`group_of`/`group_starts`). Offsets and positions are
 /// computed in i64 with saturating/clamping arithmetic, so a huge constant
 /// offset simply pins the boundary to the partition edge.
+#[allow(clippy::too_many_arguments)]
 fn frame_bounds(
     off: usize,
     len: usize,
@@ -964,8 +995,17 @@ fn frame_bounds(
     fo: FrameOffsets,
     group_of: &[usize],
     group_starts: &[usize],
+    // The single ORDER BY key's value at each POSITION, and whether the sort is
+    // descending — read only by RANGE with an offset bound, whose boundary is a
+    // VALUE (`x ± offset`) rather than a count. `check` has already refused a
+    // RANGE offset with anything but exactly one key.
+    keys: &[Value],
+    desc: bool,
 ) -> (usize, usize) {
     let n = len as i64;
+    if matches!(frame.mode, FrameMode::Range) && frame_has_offset(frame) {
+        return range_offset_bounds(off, len, frame, fo, group_of, group_starts, keys, desc);
+    }
     match frame.mode {
         FrameMode::Rows => {
             let off = off as i64;
@@ -1035,6 +1075,134 @@ fn frame_bounds(
             (lo as usize, hi as usize)
         }
     }
+}
+
+/// Does either boundary carry an offset? (`UNBOUNDED`/`CURRENT ROW` do not.)
+fn frame_has_offset(frame: &Frame) -> bool {
+    matches!(frame.start, FrameBound::Preceding(_) | FrameBound::Following(_))
+        || matches!(frame.end, FrameBound::Preceding(_) | FrameBound::Following(_))
+}
+
+/// `RANGE BETWEEN <n> PRECEDING AND <m> FOLLOWING` and friends: the boundary is
+/// the current row's ORDER BY VALUE shifted by the offset, and the frame is
+/// every row whose value falls in that interval.
+///
+/// MEASURED against sqlite 3.45.1 before implementing; three rules are not what
+/// the shape suggests:
+///
+///   * DESCENDING FLIPS THE SIGN. `n PRECEDING` means "earlier in window
+///     order", which under DESC is a LARGER value. The interval is the same
+///     `[x - n, x + m]` only when the frame is symmetric.
+///   * A NON-NUMERIC CURRENT VALUE (NULL, TEXT, BLOB) degenerates each OFFSET
+///     bound to that value's PEER GROUP — `x ± n` is not a value of its class,
+///     so nothing outside the peers can be inside the interval. Applied PER
+///     BOUND: `RANGE BETWEEN 2 PRECEDING AND UNBOUNDED FOLLOWING` on a NULL row
+///     still runs to the partition's end.
+///   * The comparison is the SORT's, storage classes and all, so a numeric
+///     interval can never reach a TEXT row even though `'x' > 5` is false under
+///     ordinary comparison — TEXT simply sorts past the interval's top.
+#[allow(clippy::too_many_arguments)]
+fn range_offset_bounds(
+    off: usize,
+    len: usize,
+    frame: &Frame,
+    fo: FrameOffsets,
+    group_of: &[usize],
+    group_starts: &[usize],
+    keys: &[Value],
+    desc: bool,
+) -> (usize, usize) {
+    let peer = |p: usize| -> (usize, usize) {
+        match group_of.get(p) {
+            Some(&g) => (
+                group_starts.get(g).copied().unwrap_or(0),
+                group_starts.get(g + 1).copied().unwrap_or(len),
+            ),
+            None => (p, p + 1),
+        }
+    };
+    let (peer_lo, peer_hi) = peer(off);
+    let x = keys.get(off).unwrap_or(&Value::Null);
+    // `shift(o)`: the boundary VALUE `x` displaced by `o` in the direction the
+    // sort runs. `None` where the displacement is meaningless (non-numeric).
+    let shift = |o: i64, earlier: bool| -> Option<Value> {
+        // "earlier in window order" is DOWN in value for ASC, UP for DESC.
+        let sign: i64 = if earlier == desc { 1 } else { -1 };
+        match x {
+            Value::Int(v) => Some(Value::Int(v.saturating_add(sign.saturating_mul(o)))),
+            Value::Float(v) => Some(Value::Float(v + (sign as f64) * (o as f64))),
+            // Everything else — NULL, TEXT, BLOB, BOOL, TIMESTAMP — has no
+            // meaningful `± offset`. sqlite (which has no timestamp type; the
+            // C-API shim's date columns arrive as TEXT) gives exactly the peer
+            // group for those, and so does this.
+            _ => None,
+        }
+    };
+    // Positions are sorted by `keys` under the window's direction, so a
+    // boundary is a partition point — found by scanning from the peer group
+    // outward, which is O(frame) and needs no total order on mixed classes.
+    let inside = |p: usize, bound: &Value, lower: bool| -> bool {
+        let v = keys.get(p).unwrap_or(&Value::Null);
+        match v.sort_cmp(bound, Collation::Binary) {
+            // `sort_cmp` is None when either side is NULL: a NULL row is never
+            // inside a numeric interval.
+            None => false,
+            Some(o) => {
+                // For ASC, "lower" means value >= bound; DESC reverses it.
+                let o = if desc { o.reverse() } else { o };
+                if lower {
+                    o != Ordering::Less
+                } else {
+                    o != Ordering::Greater
+                }
+            }
+        }
+    };
+    let lo = match frame.start {
+        FrameBound::UnboundedPreceding => 0,
+        FrameBound::CurrentRow => peer_lo,
+        FrameBound::Preceding(_) | FrameBound::Following(_) => {
+            let earlier = matches!(frame.start, FrameBound::Preceding(_));
+            match shift(fo.start, earlier) {
+                None => peer_lo,
+                Some(bound) => {
+                    // Walk out from the peer group while rows stay inside, then
+                    // in while they do not — one pass, both directions covered.
+                    let mut p = peer_lo;
+                    while p > 0 && inside(p - 1, &bound, true) {
+                        p -= 1;
+                    }
+                    while p < len && !inside(p, &bound, true) {
+                        p += 1;
+                    }
+                    p
+                }
+            }
+        }
+        FrameBound::UnboundedFollowing => len,
+    };
+    let hi = match frame.end {
+        FrameBound::UnboundedPreceding => 0,
+        FrameBound::CurrentRow => peer_hi,
+        FrameBound::Preceding(_) | FrameBound::Following(_) => {
+            let earlier = matches!(frame.end, FrameBound::Preceding(_));
+            match shift(fo.end, earlier) {
+                None => peer_hi,
+                Some(bound) => {
+                    let mut p = peer_hi;
+                    while p < len && inside(p, &bound, false) {
+                        p += 1;
+                    }
+                    while p > 0 && !inside(p - 1, &bound, false) {
+                        p -= 1;
+                    }
+                    p
+                }
+            }
+        }
+        FrameBound::UnboundedFollowing => len,
+    };
+    (lo.min(len), hi.clamp(lo.min(len), len))
 }
 
 /// Push one row's argument into an aggregate accumulator. `None` is `count(*)`

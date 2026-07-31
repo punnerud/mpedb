@@ -1034,7 +1034,7 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
     // planner's rule set, applied here so a hostile blob cannot smuggle a shape
     // `prepare` would never emit.
     if let Some(f) = &frame {
-        f.check(func, !order_by.is_empty()).map_err(corrupt)?;
+        f.check(func, order_by.len()).map_err(corrupt)?;
     }
     Ok(WindowSpec {
         func,
