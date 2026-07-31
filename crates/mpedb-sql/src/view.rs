@@ -196,9 +196,16 @@ fn flatten_select(
     // views use the strip-name splice and have no alias to resolve `v.col`
     // against, so folding them into a join is out of scope here.
     let outer_has_items = s.items.is_some();
+    // Every column the OUTER statement addresses through a qualifier, so the
+    // splice can prove the CTE actually PROJECTS each one. Without it the outer
+    // reaches straight through to the spliced base table and reads a column the
+    // CTE hid — measured: `WITH c AS (SELECT a FROM t) SELECT u.id, c.b FROM u
+    // JOIN c ON c.a = u.id` answered three rows of fabricated `b` where sqlite
+    // says `no such column: c.b`.
+    let outer_refs = qualified_refs_of(s);
     for j in &mut s.joins {
         if catalog_has(ctes, &j.table) {
-            flatten_cte_join(j, views, ctes, depth, outer_has_items)?;
+            flatten_cte_join(j, views, ctes, depth, outer_has_items, &outer_refs)?;
         } else if catalog_has(views, &j.table) {
             return Err(bind_err(format!(
                 "view `{}` used in a JOIN is not supported yet",
@@ -685,6 +692,7 @@ fn flatten_cte_join(
     ctes: &ViewCatalog,
     depth: usize,
     outer_has_items: bool,
+    outer_refs: &[(String, String)],
 ) -> Result<()> {
     let tname = j.table.clone();
     if !matches!(j.kind, JoinKind::Inner | JoinKind::Left) {
@@ -717,6 +725,34 @@ fn flatten_cte_join(
         )));
     }
 
+    // The outer may address ONLY what the body PROJECTS. After the splice the
+    // join reads the BASE table under the CTE's name, so an outer `c.b` that
+    // the body never selected resolves against the base and reads a hidden
+    // column — a fabricated value, not an error. sqlite says `no such column`.
+    //
+    // The `SELECT *` guard above is the same rule for the case where the outer
+    // names nothing explicitly; this is the case where it names too much.
+    if let Some(items) = &body.items {
+        let projects = |name: &str| {
+            items.iter().any(|(e, alias)| match alias {
+                Some(a) => mpedb_types::ident_eq(a, name),
+                None => matches!(e, Expr::Col(c) if mpedb_types::ident_eq(c, name))
+                    || matches!(e, Expr::Qualified(_, c) if mpedb_types::ident_eq(c, name)),
+            })
+        };
+        if let Some((_, col)) = outer_refs
+            .iter()
+            .find(|(q, c)| mpedb_types::ident_eq(q, &ref_alias) && !projects(c))
+        {
+            return Err(bind_err(format!(
+                "`{ref_alias}.{col}`: the CTE `{tname}` does not select `{col}`. \
+                 Joining a CTE splices its base table in under the CTE's name, so \
+                 a column the CTE hid would be read from the base instead of \
+                 refused — add it to the CTE's select list."
+            )));
+        }
+    }
+
     // Rename the body's own qualifier to the reference alias, so its WHERE reads
     // under the same name the outer query and ON clause use.
     let from_name = body
@@ -734,10 +770,71 @@ fn flatten_cte_join(
     j.table = body.table.take().expect("check_simple guarantees a FROM table");
     j.alias = Some(ref_alias);
     if let Some(cw) = body_where {
+        // A `USING`/`NATURAL` join DISCARDS `on`: the planner rebuilds it from
+        // the column list once it has the schema (`plan_join_select` uses
+        // `jc.on` only when `jc.using` is empty). Merging the CTE's WHERE in
+        // here would therefore silently DROP the filter — measured: a CTE with
+        // `WHERE a > 1` joined `USING (b)` returned the filtered-out row.
+        // Qualifying the USING columns needs the schema, so this cannot be
+        // desugared here; refuse by name instead.
+        if !j.using.is_empty() {
+            return Err(bind_err(format!(
+                "CTE `{tname}` has a WHERE and is joined with USING/NATURAL, whose \
+                 join condition is built later from the column list — the CTE's \
+                 filter would be dropped. Write the join with an explicit ON."
+            )));
+        }
         let existing = j.on.clone();
         j.on = Expr::Binary(crate::ast::BinOp::And, Box::new(existing), Box::new(cw));
     }
     Ok(())
+}
+
+/// Every `qualifier.column` pair the statement addresses, anywhere an
+/// expression can appear. Used to prove a joined CTE projects what the outer
+/// reads; see `flatten_cte_join`.
+fn qualified_refs_of(s: &SelectStmt) -> Vec<(String, String)> {
+    fn walk(e: &Expr, out: &mut Vec<(String, String)>) {
+        match e {
+            Expr::Qualified(q, c) => out.push((q.clone(), c.clone())),
+            Expr::Binary(_, a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            Expr::Unary(_, a) | Expr::Cast(a, _) | Expr::Collate(a, _) | Expr::IsNull(a, _) => {
+                walk(a, out)
+            }
+            Expr::Func(_, args) | Expr::Coalesce(args) => args.iter().for_each(|a| walk(a, out)),
+            Expr::Case(arms, els) => {
+                for (w, t) in arms {
+                    walk(w, out);
+                    walk(t, out);
+                }
+                if let Some(e) = els {
+                    walk(e, out);
+                }
+            }
+            // Anything else either carries no column reference or carries one
+            // this splice cannot reason about; the projecting-body guard is a
+            // whitelist, so an unwalked node simply contributes nothing and the
+            // outer reference it hides is caught by the binder instead.
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(items) = &s.items {
+        items.iter().for_each(|(e, _)| walk(e, &mut out));
+    }
+    s.joins.iter().for_each(|j| walk(&j.on, &mut out));
+    if let Some(w) = &s.where_clause {
+        walk(w, &mut out);
+    }
+    s.group_by.iter().for_each(|e| walk(e, &mut out));
+    if let Some(h) = &s.having {
+        walk(h, &mut out);
+    }
+    s.order_by.iter().for_each(|(e, _)| walk(e, &mut out));
+    out
 }
 
 /// Splice a derived table `FROM (SELECT …) t` onto its base (#74, Stage B) —

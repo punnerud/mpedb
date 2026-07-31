@@ -219,6 +219,41 @@ fn cte_in_join_operand() {
         vec![Value::Text("u5".into()), Value::Int(50)],
         vec![Value::Text("u6".into()), Value::Int(60)],
     ]);
+    // A column the CTE does NOT select must be REFUSED, not read from the base.
+    //
+    // Splicing the CTE onto its base under the CTE's own name is what makes
+    // `c.col` resolve at all — and it also puts every column of the BASE within
+    // reach, including the ones the CTE hid. Measured against 3.45.1:
+    // `WITH c AS (SELECT a FROM t) SELECT u.id, c.b FROM u JOIN c ON …`
+    // answered three rows of fabricated `b` where sqlite says `no such column:
+    // c.b`. The `SELECT *` guard beside this one covers the case where the
+    // outer names nothing; this is the case where it names too much.
+    let e = db
+        .query(
+            "WITH c AS (SELECT id FROM t WHERE a > 4) SELECT u.x, c.c FROM u JOIN c ON c.id = u.oid",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("does not select `c`"), "{e}");
+
+    // A CTE with a WHERE, joined with USING: refused by name. `plan_join_select`
+    // rebuilds the join condition from the column list and DISCARDS `on`, so the
+    // CTE's filter — which the splice folds into `on` — would be silently
+    // dropped. Measured: it returned the filtered-out row. Qualifying the USING
+    // columns needs the schema, so it cannot be desugared at this layer.
+    let e = db
+        .query(
+            "WITH c AS (SELECT oid FROM t2 WHERE oid > 1) SELECT u.x FROM u JOIN c USING (oid)",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("USING/NATURAL") || e.contains("no such table"),
+        "{e}"
+    );
+
     // A no-WHERE CTE body joined: every u matches (c has all ids). (sqlite: u1..u6.)
     let got = rows(db.query(
         "WITH c AS (SELECT id FROM t) SELECT u.x FROM u JOIN c ON c.id = u.oid ORDER BY u.x",
