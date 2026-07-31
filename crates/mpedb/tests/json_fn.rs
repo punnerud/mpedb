@@ -562,14 +562,62 @@ fn json_bad_paths_are_errors() {
             "bad JSON path",
         );
     }
-    // A backslash in a path key is the one place mpedb refuses where sqlite
-    // answers — sqlite compares a DECODED document label against a VERBATIM
-    // path key, and that asymmetry is not reproduced.
+    // An EMPTY UNQUOTED key is malformed — `$..x`, `$.` and `$.a..b` are all
+    // errors in sqlite. mpedb used to read them as a step named "" and ANSWER
+    // NULL, which is the wrong direction: answering where the oracle refuses.
+    // (The QUOTED empty key is a different thing and stays legal — see
+    // `json_path_keys_are_decoded_like_the_labels`.)
+    for p in ["$..x", "$.", "$.a..b", "$.a."] {
+        refuses(
+            &db,
+            &format!("SELECT json_extract('{{\"a\":1}}', '{p}')"),
+            "bad JSON path",
+        );
+    }
+    // The ONE escape mpedb still refuses. sqlite before 3.47 does not parse it
+    // consistently — `$."quo\"te"` matches nothing there while the unquoted
+    // `$.quo"te` does match — and Django skips its own test for this shape on
+    // sqlite by name, for the same reason.
     refuses(
         &db,
         r#"SELECT json_extract('{"a":1}', '$."a\"b"')"#,
-        "backslash",
+        "3.47",
     );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A path key carrying an ESCAPE is DECODED, exactly as the document label
+/// already was — `$."back\\slash"` names the key `back\slash`.
+///
+/// Leaving the path side verbatim while decoding the label side was the
+/// asymmetry, and it is not an exotic one: Django writes the document and the
+/// path with the SAME `json.dumps`, so every `JSONField` lookup on a key
+/// holding a backslash or a non-ASCII character (which `json.dumps` escapes to
+/// `\uXXXX`) failed with "bad JSON path".
+#[test]
+fn json_path_keys_are_decoded_like_the_labels() {
+    let (db, path) = mpedb_db();
+    // Written the way Django writes it — `json.dumps` with `ensure_ascii`, so
+    // the stored text carries the same escapes the path does.
+    let doc = r#"{"back\\slash":1,"emo🤡":2,"tab\tchar":3,"":4,"nest":{"in\\ner":5}}"#;
+    let mut qs = Vec::new();
+    for p in [
+        r#"$."back\\slash""#,
+        r#"$."emo🤡""#,
+        r#"$."tab\tchar""#,
+        // The empty QUOTED key is legal and names the `""` member — the
+        // counterpart to the empty UNQUOTED key, which is a malformed path.
+        r#"$."""#,
+        r#"$."nest"."in\\ner""#,
+        r#"$.nest."in\\ner""#,
+        // A miss still reads as a miss, not an error.
+        r#"$."no\\such""#,
+    ] {
+        qs.push(format!("SELECT json_extract('{doc}', '{p}')"));
+        qs.push(format!("SELECT json_type('{doc}', '{p}')"));
+    }
+    cross_check_batch(&db, &qs);
     drop(db);
     let _ = std::fs::remove_file(&path);
 }

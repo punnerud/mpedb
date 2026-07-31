@@ -1113,9 +1113,25 @@ pub fn pragma(
                         Value::Int(id),
                         Value::Int(seq as i64),
                         Value::Text(fk.parent.clone()),
-                        Value::Text(
-                            t.columns.get(c as usize).map(|c| c.name.clone()).unwrap_or_default(),
-                        ),
+                        // An out-of-range ordinal here is a CORRUPT SCHEMA, not
+                        // a missing name: `fk.columns` addresses the row by
+                        // position, and if it points past the row then FK
+                        // ENFORCEMENT is reading the wrong column too. This was
+                        // `unwrap_or_default()`, and the empty string it
+                        // produced is why S14a — a drop that silently disabled
+                        // enforcement — surfaced as a confusing dict instead of
+                        // an alarm. Fail loudly so the next one cannot hide.
+                        Value::Text(match t.columns.get(c as usize) {
+                            Some(col) => col.name.clone(),
+                            None => {
+                                return Err(DbError::Corrupt(format!(
+                                    "foreign key on \"{}\" names column ordinal {c}, but the \
+                                     table has {} column(s)",
+                                    t.name,
+                                    t.columns.len()
+                                )))
+                            }
+                        }),
                         // An empty parent list means "the parent's PRIMARY
                         // KEY", which sqlite reports as NULL here rather than
                         // resolving — the parent may not exist yet.

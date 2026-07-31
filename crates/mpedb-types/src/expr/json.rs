@@ -561,8 +561,11 @@ fn parse_path(p: &str) -> Result<Vec<Step>> {
                 let key = if b.get(i) == Some(&b'"') {
                     i += 1;
                     let start = i;
+                    // Honour `\` escapes while scanning, or the closing quote of
+                    // `$."a\"b"` is found one character early and the rest of
+                    // the path is parsed as garbage.
                     while i < b.len() && b[i] != b'"' {
-                        i += 1;
+                        i += if b[i] == b'\\' { 2 } else { 1 };
                     }
                     if i >= b.len() {
                         return Err(bad_path(p));
@@ -575,18 +578,47 @@ fn parse_path(p: &str) -> Result<Vec<Step>> {
                     while i < b.len() && b[i] != b'.' && b[i] != b'[' {
                         i += 1;
                     }
+                    // An EMPTY unquoted key is a malformed path — `$..x`, `$.`
+                    // and `$.a..b` are all errors in sqlite. mpedb read them as
+                    // a step named "" and ANSWERED NULL, which is the wrong
+                    // direction: answering where the oracle refuses. The QUOTED
+                    // empty key is a different thing and stays legal — `$.""`
+                    // matches the key `""`, measured.
+                    if i == start {
+                        return Err(bad_path(p));
+                    }
                     &p[start..i]
                 };
-                if key.contains('\\') {
-                    return Err(Error::TypeMismatch(format!(
-                        "bad JSON path: '{p}' — mpedb refuses a path key containing a \
-                         backslash. sqlite 3.45 compares a path key against the DECODED \
-                         document label but takes the path key itself verbatim, so `$.\"a\\\"b\"` \
-                         matches nothing while `$.a\"b` matches {{\"a\\\"b\":1}}; that asymmetry \
-                         is not reproduced"
-                    )));
-                }
-                steps.push(Step::Key(key.to_string()));
+                // A path key is DECODED, exactly as the document label already
+                // is (`label_eq` → `decode_string`). Leaving the path side
+                // verbatim was the asymmetry: `$."back\\slash"` could never
+                // match the key `back\slash`, which is what Django's ORM emits
+                // for a JSONField lookup (`json.dumps(key)`).
+                //
+                // The ONE shape still refused is a key containing `\"`. sqlite
+                // <3.47 provably gets that one wrong — `$."quo\"te"` matches
+                // nothing there while `$.quo"te` matches {"quo\"te":1} — and
+                // Django skips its own test for it BY NAME on sqlite
+                // (`sqlite3/features.py`, "SQLite does not parse escaped double
+                // quotes in the JSON path notation"). Reproducing an
+                // inconsistency is worse than naming it.
+                let key = if key.contains('\\') {
+                    if key.contains("\\\"") {
+                        return Err(Error::TypeMismatch(format!(
+                            "bad JSON path: '{p}' — a path key containing `\\\"` is refused. \
+                             sqlite before 3.47 does not parse it consistently (it matches \
+                             nothing there, while the unquoted `$.a\"b` does match \
+                             {{\"a\\\"b\":1}}), and Django skips its own test for this shape \
+                             on sqlite for the same reason"
+                        )));
+                    }
+                    // `decode_string` takes the QUOTED token, which is what the
+                    // path spelled before the quotes were stripped.
+                    decode_string(&format!("\"{key}\""))?
+                } else {
+                    key.to_string()
+                };
+                steps.push(Step::Key(key));
             }
             b'[' => {
                 i += 1;

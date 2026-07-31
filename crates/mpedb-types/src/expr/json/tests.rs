@@ -125,8 +125,8 @@ fn string_escapes_decode_or_refuse() {
     }
 }
 
-/// A path key is compared against the DECODED document label, and a backslash
-/// in the path itself is refused rather than guessed.
+/// BOTH sides are decoded: the document label was already, and now the path
+/// key is too. `$."back\\slash"` names the key `back\slash`.
 #[test]
 fn path_keys_compare_against_decoded_labels() {
     let ex = |doc: &str, p: &str| json_extract(&[t(doc), t(p)]).unwrap();
@@ -134,10 +134,23 @@ fn path_keys_compare_against_decoded_labels() {
     assert_eq!(ex(r#"{"a\"b":1}"#, r#"$.a"b"#), Value::Int(1));
     assert_eq!(ex(r#"{"a.b":1}"#, r#"$."a.b""#), Value::Int(1));
     assert_eq!(ex(r#"{"a.b":1}"#, "$.a.b"), Value::Null);
+    // The escapes Django's `json.dumps` produces, on both sides.
+    assert_eq!(ex(r#"{"back\\slash":1}"#, r#"$."back\\slash""#), Value::Int(1));
+    assert_eq!(ex(r#"{"tab\tchar":1}"#, r#"$."tab\tchar""#), Value::Int(1));
+    assert_eq!(ex(r#"{"emo🤡":1}"#, r#"$."emo🤡""#), Value::Int(1));
+    // An empty QUOTED key names the `""` member …
+    assert_eq!(ex(r#"{"":1}"#, r#"$."""#), Value::Int(1));
+    // … while an empty UNQUOTED key is a malformed path, as in sqlite.
+    for bad in ["$..x", "$.", "$.a."] {
+        let e = json_extract(&[t(r#"{"a":1}"#), t(bad)]).unwrap_err().to_string();
+        assert!(e.contains("bad JSON path"), "{bad}: {e}");
+    }
+    // The one escape still refused, and the message names the sqlite version
+    // that fixed it rather than just saying "backslash".
     let e = json_extract(&[t(r#"{"a":1}"#), t(r#"$."a\"b""#)])
         .unwrap_err()
         .to_string();
-    assert!(e.contains("backslash"), "{e}");
+    assert!(e.contains("3.47"), "{e}");
 }
 
 /// A path index is bounded: a huge one saturates and simply finds nothing,
