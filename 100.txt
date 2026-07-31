@@ -64,106 +64,76 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
   clippy, begge ws       rene
 
 
-1b. SESJON 30/7 — SQLALCHEMY-FLATEN, 965 → 1246
------------------------------------------------
+1b. SESJON 30–31/7 — SQLALCHEMY 965 → 1274, CPYTHON 459 → 460, DJANGO +106
+--------------------------------------------------------------------------
 
-Tolv commits på s0-baseline, hver med full port (workspace 208 + capi +
-clippy ×2 + CPython + Django G1+G2) og M3 verifisert:
+  Tjuetre commits på s0-baseline. Hver med full port (workspace 208 + capi +
+  clippy ×2 + CPython + Django G1+G2, og full korpus for hver format- eller
+  binder-endring) og M3 verifisert.
 
-  1bbfecd  S3:  temp views er tilkoblings-lokal TEKST                965 → 990
-  49ff38c  S3b: en katalogpost hører til SITT skjema; et view svarer
-                på table_info                                        990 → 1101
-  3e776a5  S3c: temp view inlines ved RUTING; temp skygger pragma-navn
-                                                                    1101 → 1115
-  ab7fdb0  S3d: FROM-løs avledet tabell flater ut; pragma-arg med `)`
-                                                                    1115 → 1137
-  889fbd3  S3e: attachet indeks beholder NAVNET; master-referanse kan
-                nevne to kataloger                                  1137 → 1171
-  0c68c99  S3f: CREATE TABLE IF NOT EXISTS; skrivingers BETINGELSE
-                flater også ut                                      1171 → 1177
-  b95a5fd  S3g: `(a, b) IN ((x, y), …)` + VALUES-stavemåten          1177 → 1186
-  530664e  S3h: KONSTANT uttrykk er lovlig LIMIT/OFFSET              1186 → 1191
-  c5cac27  S3i: `WITH c(p, q) AS …`, VALUES-kropp, compound-kropp    1191 → 1195
-  8f535dc  S3j: `<schema>.sqlite_temp_master` er en FEIL             1195 → 1229
-  8cc50a0  S3k: indeks på TEMP-tabell beholder navnet                1229 → 1238
-  8f01b73  S3l: DEFAULT CURRENT_TIMESTAMP; dflt_value er DDL-TEKSTEN
-                (skjema v15)                                        1238 → 1246
+  SLUTTSTATUS, MÅLT:
+    SQLAlchemy dialect   1274 / 1277   (var 965)
+    CPython test_sqlite3  460 / 466    (var 459)
+    Django G1+G2          831 / 831, 0 shim-only
+    Django g6/g7/g9       126 OK / 92 med 1 feil / 108 med 2 — g9 kjørte
+                          0 tester før S3u
+    korpus, FULL          621 filer, 7 419 202 records, 0 gale svar,
+                          0 error-mismatch, kjørt på sluttkoden
+    M3                    208 suiter på hver commit
 
-  SQLAlchemy dialect-suite:  965 → 1246 av 1277 (+281)
-  CPython test_sqlite3:      459/466 hele veien (uendret, 7 igjen)
-  Django G1+G2:              831/831 OK, 0 shim-only, hele veien
-  korpus, FULL:              621 filer, 78 chunks, 7 419 202 records —
-                             0 gale svar, 0 error-mismatch, hver chunk
-                             100,0 %. Kjørt på en binær bygget fra
-                             SLUTTKODEN; en tidligere full kjøring var
-                             bygget før fiksene og ble forkastet.
-  M3:                        208 suiter OK på hver commit
+  MÅLET ER IKKE NÅDD. Ingen av suitene er på 100 %. Restene, klassifisert:
 
-  FEM GALE SVAR (ikke bare mangler) lukket:
-    * Ett navn i to skjemaer, ÉN post: `CREATE TABLE other.users` skrev over
-      mains, så `main.users` meldte det ATTACHEDE skjemaets CHECK. Gjaldt
-      indeks-postene like fullt.
-    * `<schema>.sqlite_master` listet MAINS views og triggere — og skjulte
-      samtidig at kvalifisert `CREATE VIEW other.v` HELE TIDEN landet riktig.
-    * En `IF NOT EXISTS`-no-op skrev sin tekst over den stående.
-    * `CREATE TEMP VIEW`, `CREATE INDEX other.ix` og `CREATE INDEX ix ON
-      <temp-tabell>` var stille no-ops eller navnetap.
-    * `<schema>.sqlite_temp_master` svarte TOMT der sqlite feiler — og
-      SQLAlchemy AVHENGER av feilen for å falle tilbake. Én linje nekting
-      ga +34 tester. «Fail-safe er per konsument», i sin skarpeste form.
+  SQLAlchemy (3):
+    2  READ UNCOMMITTED-rundtur. mpedb KAN ikke gi det — MVCC-lesere ser
+       aldri ucommittet data — og å lagre-og-ekko verdien ville fortalt en
+       konsument at skitne lesninger er mulig. Samme regel `synchronous`
+       følger. mpedb kjører strengere enn bedt om og melder nivået den gir,
+       som PostgreSQL også gjør. IKKE et hull.
+    1  Avledet tabell som JOIN-operand med en ikke-flatbar kropp
+       (`JOIN (SELECT … JOIN …) AS a ON …`). Ekte hull; krever
+       join-planlegger-arbeid.
 
-  TRE METODE-LÆRDOMMER, alle målt:
-    1. Flytt ALDRI én halvdel av et par. Lesesiden flyttet til det attachede
-       medlemmet uten skrivesiden kostet 42 tester; baseline-remålingen fant
-       det på én kjøring. Når et tall går feil vei: re-mål baselinen FØR du
-       forklarer det.
-    2. En vakt du fjerner for å få noe til å passere, fjerner også testen som
-       fanget noe annet. Å tømme CTE-kroppens projeksjon for å gjøre splicen
-       lovlig tok aggregatet ut av `check_simple`s synsfelt, og
-       `WITH c AS (SELECT count(*) …)` ble stilltiende godtatt.
-    3. «2 av 3 med endringen, 4 av 4 uten» er overbevisende og kan likevel
-       være galt. Korpus-løkken min slettet /dev/shm mellom chunks, og
-       ring_stmt_atomicity legger databasen sin der. 8 av 8 grønne så snart
-       ryddingen ikke gikk samtidig.
+  CPython (6):
+    1  test_dump_autoincrement_create_new_db — dumpen SKRIVER til
+       sqlite_sequence (DELETE + INSERT) og leser den tilbake med WHERE.
+       Den syntetiserte tabellen er read-only og ufiltrert. IMPLEMENTERBAR.
+    1  test_progress — sidetallet. mpedbs fil forhåndsreserverer sider, så
+       «pagecount» er filgeometri, ikke sidene sqlite ville brukt. Antall
+       progress-kall følger av det. STRUKTURELL.
+    1  test_modifying_progress — trenger serialize. STRUKTURELL.
+    1  test_serialize_deserialize — sqlites bildeformat. STRUKTURELL.
+    1  test_dump_virtual_tables — fts4. STRUKTURELL (kun fts5).
+    1  test_error_msg_decode_error — byte-basert TEXT. STRUKTURELL
+       (`Value::Text` er en Rust-String; ugyldig UTF-8 nektes).
 
-  ATTRIBUSJON, ÆRLIG: i S3l fjernet både tidsnøkkelordene og bool-defaulten
-  en reell feilklasse hver, og flyttet NULL tester alene — testene som traff
-  dem trengte også `dflt_value`. Hele +8 tilhører den tredje halvdelen.
+  Django: G1+G2 er 12 av 215 labels. g6/g7/g9 er målt. RESTEN AV LABELENE
+  ER FORTSATT UMÅLT — det er den største kjente usikkerheten, og det var
+  nettopp der S3u-funnet lå. `field_defaults` er blokkert av en DEFAULT som
+  kaller `django_datetime_extract()`, en VERTSREGISTRERT UDF: en lagret
+  default som navngir en tilkoblings-lokal funksjon er bare evaluerbar der
+  funksjonen er registrert, hvilket et fil-autoritativt skjema ikke kan love.
+  Designspørsmål, ikke hull.
 
-  RESTEN AV SQLALCHEMY (31), rangert:
-     9  json_quote(json_extract(…)) — sqlite avgjør JSON-subtypen ved
-        KJØRING; mpedb har ingen subtype-bit på verdier. Å lukke det er en
-        verdi-subtype gjennom evaluatoren, ikke en parser-fiks.
-     4  `WITH c AS (…)`-kropp som er en INSERT/UPDATE/DELETE
-     4  `(a, b) IN (SELECT x, y …)` — rad-verdi mot en SUBSPØRRING; lista er
-        lukket (S3g), subspørringen nektes fortsatt ved navn. SEMANTIKKEN ER
-        ALLEREDE MÅLT og trenger ingen ny analyse: 3VL-en følger av NØYAKTIG
-        samme desugar som lista — OR over radene av (a1=b1 AND a2=b2), og
-        `NOT IN` er negasjonen av hele disjunksjonen. Orakelet, med
-        t=(1,5,10),(2,NULL,10),(3,5,NULL),(4,9,9):
-            IN  (5,10),(9,9)      → 1,4        NOT IN → (tom)
-            IN  (5,10),(NULL,7)   → 1          NOT IN → 4
-            IN  (tomt sett)       → (tom)      NOT IN → 1,2,3,4
-        Arbeidet er derfor EKSEKVERER-side (materialiser subspørringens rader
-        og sammenlign tupler), ikke semantisk design.
-     4  CTE-kropp med parametere (`WITH c AS (… WHERE x IN (?, ?))`) —
-        kroppen fanges som kilde og re-parses, og nummereringen er ikke
-        gjennomgående
-     2  cross-file SELECT inne i en åpen skrivetransaksjon
-     -  resten er enkelttilfeller
+  SEKS GALE SVAR lukket i økten. To av dem ble bare fanget fordi en test ble
+  UTVIDET til tilfellet fiksen skulle fortsette å nekte:
+    * `FROM t JOIN other.u` videresendt til medlemmet, som har sin egen `t`
+      — feil tabell, 0 rader, stille. Den smale testen ville passert.
+    * `sqlite_sequence` matchet inne i en STRENGLITTERAL i Djangos
+      tabell-listing, så listen ble erstattet av sekvens-tabellen og Django
+      prøvde å lage `django_migrations` to ganger. Alle Django-labels gikk
+      til null tester; SQLAlchemy-suiten rørte seg ikke. DJANGO-PORTEN
+      FANGET DEN.
 
-  DJANGOS field_defaults er fortsatt blokkert, og av noe annet enn antatt:
-  den skriver `DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))` — et LAGRET
-  uttrykk som må evalueres per setning, ikke et nøkkelord. Skjemaet bærer nå
-  de tre nøkkelordene; den generelle formen (uttrykk + kompilert program,
-  som `generated`) er neste steg, og `'now'`-nektelsen i den konstant-folderen
-  må da gjelde CHECK og indeksuttrykk, ikke DEFAULT.
-
-  KJENT OG IKKE LUKKET (bevisst): `table_info` melder `notnull` 1 for en
-  PK-kolonne som ikke er DEKLARERT NOT NULL, der sqlite melder 0. mpedb
-  håndhever NOT NULL på hver PK-kolonne, så 1 er sant om mpedb. Å lukke det
-  betyr å lagre det deklarerte flagget separat (kanonisk-bytes v15), og ingen
-  målt test henger på det.
+  METODE-LÆRDOMMER, alle målt:
+    1. Flytt aldri én halvdel av et par (leseside uten skriveside: −42).
+    2. En vakt du fjerner for å få noe til å passere, fjerner også det den
+       fanget (aggregatet ut av `check_simple`).
+    3. «2 av 3 med, 4 av 4 uten» kan være galt: korpus-løkken slettet
+       /dev/shm under en test.
+    4. En DELVIS avlest logg er ikke en port. M3 leste 58, så 178, så 203 —
+       kjøringen skrev fortsatt. Vent til den er ferdig.
+    5. Den bredeste suiten fanger det de smale ikke ser. To gale svar denne
+       økten ble fanget av Django-porten alene.
 
 
 1c. FORSLAG: SYNLIG QUIRKS-REGISTER (Mortens, 30/7) — VURDERT MOT MÅLING
