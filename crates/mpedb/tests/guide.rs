@@ -463,10 +463,11 @@ fn the_sqlite_differences_that_bite() {
         "FROM-less SELECT evaluates over one synthetic row"
     );
 
-    // 6. CASE/COALESCE arms MAY mix int64 and float64 — sqlite types the
-    // winning arm per row, and so does mpedb: the arms keep their own values
-    // (no widening cast) and the expression types as `any`. coalesce(30, 1.5)
-    // is the INTEGER 30, exactly sqlite's answer — never 30.0.
+    // 6. CASE/COALESCE arms MAY mix any sqlite STORAGE CLASS — int64, float64
+    // and text — because sqlite types the winning arm per row, and so does
+    // mpedb: the arms keep their own values (no widening cast) and the
+    // expression types as `any`. coalesce(30, 1.5) is the INTEGER 30, exactly
+    // sqlite's answer — never 30.0.
     assert_eq!(
         rows(db.query("SELECT coalesce(30, 1.5)", &[]).unwrap()),
         vec![vec![Value::Int(30)]]
@@ -476,9 +477,30 @@ fn the_sqlite_differences_that_bite() {
         vec![vec![Value::Text("integer".into())]]
     );
     assert!(db.query("SELECT coalesce(CAST(30 AS REAL), 1.5)", &[]).is_ok());
-    // A non-numeric arm mix is still refused, and the CAST in the message works.
-    let err = db.query("SELECT coalesce(30, 'x')", &[]).unwrap_err();
+    // TEXT joined that set when Django's `GeneratedField` turned out to compile
+    // `Concat` to `COALESCE("name",'') || COALESCE("num",'')` — an int64/text
+    // mix in every generated column built from a text and a numeric field.
+    // Measured against 3.45.1: value AND typeof agree.
+    assert_eq!(
+        rows(db.query("SELECT coalesce(30, 'x'), typeof(coalesce(30, 'x'))", &[]).unwrap()),
+        vec![vec![Value::Int(30), Value::Text("integer".into())]]
+    );
+    assert_eq!(
+        rows(db.query("SELECT coalesce(NULL, 'x'), typeof(coalesce(NULL, 'x'))", &[]).unwrap()),
+        vec![vec![Value::Text("x".into()), Value::Text("text".into())]]
+    );
+    // `bool` and `timestamp` stay OUT: they are mpedb's own types with no
+    // sqlite storage class, so a per-row rule over them would be inventing
+    // semantics rather than reproducing sqlite's. The CAST hint still works.
+    let err = db.query("SELECT coalesce(30, TRUE)", &[]).unwrap_err();
     assert!(format!("{err}").contains("CAST"), "{err}");
+    // What the widening moved, and the one place it is narrower than sqlite:
+    // COMPARING the mixed result against a literal of the other class is a
+    // runtime refusal here where sqlite answers false. A refusal, never a
+    // wrong answer — the direction this project accepts.
+    assert!(db.query("SELECT coalesce(30, 'x') = 30", &[]).is_ok());
+    let err = db.query("SELECT coalesce(30, 'x') = '30'", &[]).unwrap_err();
+    assert!(format!("{err}").contains("compare"), "{err}");
 
     // 3. Every join kind works two-table (RIGHT plans as a swapped LEFT;
     // FULL NULL-extends both sides); only a RIGHT/FULL inside a multi-join

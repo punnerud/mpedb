@@ -3585,10 +3585,24 @@ impl<'a> Binder<'a> {
         if kinds.len() <= 1 {
             return self.unify_many(operands, verb);
         }
-        let numeric = |t: &ColumnType| {
-            matches!(t, ColumnType::Int64 | ColumnType::Float64 | ColumnType::Any)
+        // Every type that HAS a sqlite storage class. `Bool` and `Timestamp`
+        // are deliberately absent: they are mpedb's own, so a per-row rule
+        // over them would be inventing semantics rather than reproducing
+        // sqlite's, and the rigid refusal stays right for them.
+        //
+        // TEXT is here because Django's `GeneratedField` compiles `Concat` to
+        // `COALESCE("name",'') || COALESCE("rider_id",'')` — an int64/text mix
+        // in every generated column built from a text and a numeric field.
+        // sqlite types that per row, and `||` consumes the result to TEXT
+        // regardless, so the widening does not leak an `Any` into the column.
+        let storage_class = |t: &ColumnType| {
+            matches!(
+                t,
+                ColumnType::Int64 | ColumnType::Float64 | ColumnType::Text | ColumnType::Any
+            )
         };
-        if self.sqlite_dialect() && (kinds.iter().all(numeric) || kinds.contains(&ColumnType::Any))
+        if self.sqlite_dialect()
+            && (kinds.iter().all(storage_class) || kinds.contains(&ColumnType::Any))
         {
             // Mixed arms, typed per row. A bare parameter among them has
             // nothing to adopt (there is no one target type), and is left
@@ -4623,11 +4637,14 @@ mod tests {
 
     #[test]
     fn coalesce_arguments_must_unify() {
-        // A non-numeric mix stays refused (sqlite would rank number-vs-text
-        // by storage class downstream, which mpedb refuses everywhere), and
-        // the message names both types and the CAST fix.
-        let msg = bind_err_msg("coalesce(id, 'x')");
-        assert!(msg.contains("coalesce") && msg.contains("CAST"), "{msg}");
+        // int64/text is ACCEPTED now: both are sqlite storage classes, and the
+        // result is typed per row like every other mixed arm set. Django's
+        // `GeneratedField` compiles `Concat` to exactly this shape.
+        let (_, ty) = bind_ok("coalesce(id, 'x')");
+        assert_eq!(ty, Some(ColumnType::Any));
+        // A type with NO sqlite storage class stays refused — `bool` is
+        // mpedb's own, so a per-row rule over it would be invented rather than
+        // reproduced — and the message still names the CAST fix.
         assert!(bind_err_msg("coalesce(name, active)").contains("CAST"));
         // Explicitly casting every arm to one type still yields that type.
         let (_, ty) = bind_ok("coalesce(CAST(id AS REAL), 1.5)");

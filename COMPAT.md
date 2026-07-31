@@ -56,7 +56,7 @@ each differential-tested against its engine:
 | Bare column in `GROUP BY` query | picked from the lowest-rowid row of the group (sqlite's rule) | refused: `must appear in GROUP BY or be inside an aggregate` |
 | `LIKE` | case-INsensitive; non-text operand coerces to text | case-SENSITIVE (`Instr::LikeCs`); non-text operand refused |
 | Non-boolean in a boolean position (`WHERE 1`, `CASE WHEN 1 …`) | truthy-tested exactly as `sqlite3VdbeBooleanValue` | refused: rigid boolean typing |
-| Mixed numeric `CASE`/`COALESCE` arm types | per-row winning-arm typing (`COALESCE(NULL,1,2.5)` is the integer 1) | refused — PG *promotes statically* (`COALESCE(30,1.5)/35` ≈ 0.857 in PG vs 0 in sqlite), so either engine's answer is wrong for the other |
+| Mixed `CASE`/`COALESCE` arm types | per-row winning-arm typing over every sqlite STORAGE CLASS — int64, float64 and text (`COALESCE(NULL,1,2.5)` is the integer 1; `COALESCE(30,'x')` is the integer 30). `bool`/`timestamp` stay out: they have no storage class, so a per-row rule over them would be invented rather than reproduced | refused — PG *promotes statically* (`COALESCE(30,1.5)/35` ≈ 0.857 in PG vs 0 in sqlite), so either engine's answer is wrong for the other |
 | Constant coerced into a column slot | sqlite's affinity-style acceptance | rigid |
 
 The switch exists because these are the rows where matching one engine *means*
