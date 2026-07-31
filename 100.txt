@@ -553,6 +553,119 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
   de to.
 
 
+1e. STATUS 31/7 KVELD — S18..S24, OG HVA SOM STÅR IGJEN
+--------------------------------------------------------
+
+  MÅLT, hver rad med kontrollarm:
+
+    korpus                 7 420 638 records, 0 gale svar, 0 error-mismatch
+                           — nå på BÅDE x86-64 og arm64 (se «mapfile» under)
+    Django, alle 215 lbl   2 shim-only av 17 207 målte
+    Django migrations      784/784
+    Django field_defaults  17/17   (kunne ikke kjøre i det hele tatt før S20)
+    SQLAlchemy compliance  1276/1277  (= test/dialect/test_suite.py)
+    CPython test_sqlite3   460/466
+
+  NI COMMITS. Fem av dem lukket GALE SVAR SOM ALLEREDE VAR SHIPPET, og ingen av
+  dem ble funnet av en suite — de ble funnet av at motstander-agenter fikk i
+  oppdrag å MOTBEVISE et design og så målte nabo-formen mot orakelet. Én av dem
+  var kode som ble shippet noen timer tidligere samme dag.
+
+    S18  ALTER TABLE slutter å nekte det sqlite tillater (migrations 12 → 1)
+    S19  filen bestemmer dialekten; en plan kan ikke krysse dialekter
+    S20  tre shippede gale svar i sammenligninger + DEFAULT med verts-UDF
+    S21  CASE/COALESCE-armer kan blande TEXT (migrations 784/784)
+    S22  radverdi-probens kvalifiserer hadde et ANDRE hull
+    S23  en joinet CTE kunne lese kolonnene den skjulte, og miste sitt filter
+    S24  `x IN (SELECT …)` sammenligner under probens kollasjon (PLAN_FORMAT 69)
+    +    djsuite-vakten, og 100.txt §1d
+
+  GJENSTÅENDE, i prioritert rekkefølge. Alle er rotårsaket; ingen er gjetning.
+
+  (1) GALT SVAR — rung 4, høyre sides implisitte kollasjon.
+      `'ab' IN (SELECT a FROM nc)` der proben ikke har kollasjon og subqueryens
+      utgangskolonne har. Målt [(1,)] mot []. Overlever ALIAS og parenteser,
+      går tapt gjennom et uttrykk, en compound og en VALUES-kropp (målt).
+      Krever at subplanens utgangskollasjon rapporteres opp til binderen —
+      egen plumbing, IKKE en variant av S24. `Lift` har allerede
+      `slot_types: Vec<Ty>` parallelt med subplanene; en `slot_colls` speiler
+      den. Presedensen er sidefølsom: probens egen kolonne slår subqueryens.
+
+  (2) GALT SVAR — virtuell tabell med POSITIV rootpage leses som vanlig tabell.
+      `mpedb dump` svarer NULL der sqlite svarer ekte data. Skjules i dag av at
+      samme kodesti kaller hele filen korrupt (punkt 6 under). Diskriminatoren
+      MÅ være SQL-TEKSTEN, sjekket FØR rootpage — sqlite validerer den
+      rootpagen, og å gjøre den uleselig for vtab-rader gjør at mpedb svarer
+      der sqlite nekter hele skjemaet.
+
+  (3) Radverdi `=` mot subquery — composite_pk, siste Django utenfor migrations.
+      Ren AST-omskriving i lift-en, INGEN formatbump (verifisert). MEN:
+      motbevisningen fant at `=` IKKE kan bruke EXISTS-desugaringen som `IN`
+      bruker — `=` må FEILE på mer enn én rad der EXISTS svarer TRUE — og at
+      en AGGREGAT-probe (`HAVING (max(a),max(b)) = (SELECT …)`) blir et galt
+      svar fordi projeksjons-desugaringen flytter proben inn i en posisjon der
+      aggregater er lovlige. Begge må håndteres.
+
+  (4) Avledet tabell som JOIN-operand — SQLAlchemys siste, 1276/1277.
+      Ingen formatbump. MEN motbevisningen viste at gjenbruk av
+      `flatten_cte_join` innfører tre gale svar — og TO av dem er nettopp de
+      S23 lukket, så gjenbruken må skje ETTER S23 og med de vaktene. Tredje:
+      LATERAL-argumentet i designet er målt feil. Tre dispatch-steder, ikke ett:
+      planner/mod.rs:591, :1032 (compound-arm) og subquery.rs:624.
+
+  (5) `sqlite_sequence` skrivbar (2 CPython + 1 Django) og `serialize` (1
+      CPython). Ingen formatbump. serialize er MINDRE enn ventet: testen
+      trenger ikke et ekte sqlite-filbilde (målt i CPythons C-kilde). For
+      sqlite_sequence er den posisjonelle FROM-gjenkjenneren bærende — slakkes
+      den, gjenskapes django_migrations to ganger, som skjedde 30/7.
+
+  (6) Virtuell tabell = «korrupt». Rammer `mpedb dump`, SqliteAttach og
+      SqliteOverlay — hele migrering-inn-veien — og gjelder fts5 også, som
+      mpedb støtter nativt. Tre kallsteder, ikke to (sqlite_overlay.rs:1067 i
+      read_marker er det tredje). fts4 skriver skyggetabell-DDL med
+      ENKELTFNUTTEDE identifikatorer, som `take_identifier` ikke håndterer —
+      utilgjengelig i dag, reachable i det øyeblikket fiksen lander.
+
+  IKKE LUKKBART — fire, uendret, men nå MÅLT bort framfor antatt bort:
+  test_progress og test_modifying_progress (overlay-veien finnes ikke fra
+  shimmet, og test_backup.py er `:memory:` i alle 16 tilfellene),
+  test_dump_virtual_tables (krever fem skyggetabeller med sqlites eksakte
+  kolonnelister), test_error_msg_decode_error (ny kjernerepresentasjon).
+
+  ÅPENT, IKKE FUNKSJONALITET:
+
+    map_collide-fuzzen feilet TO ganger under full workspace-last
+    (`no valid meta page (both checksums invalid)` første gang) og gikk 23/23
+    isolert og under ren CPU-last. Sannsynlig forklaring er nå kjent — se OOM
+    under — men det er en HYPOTESE, ikke en måling, og det er en
+    krasjsikkerhetstest. Kjør den på M3 under last før den avskrives.
+
+  DRIFT — fire ting som kostet tid i dag og ikke bør koste det igjen:
+
+    MASKINDELINGEN BØR STÅ PERMANENT. M3 har 36 GB og 11 kjerner mot
+    Linux-boksens 7,7 GB og 2, og den har korpuset. M3 tar workspace + clippy
+    + korpus; Linux beholder forbrukersuitene (Django/CPython/SQLAlchemy med
+    sine venv-er på /mnt/xfs) og Windows-krysslinten. Da går verifiseringen
+    både raskere og på to arkitekturer.
+
+    DRAPENE ER MINNE, IKKE DISK. OOM-killeren tar hele tmux-scope-et, så ALLE
+    bakgrunnsjobber dør samtidig og ingen etterlater en feilmelding — det ser
+    ut som ingenting. `-j 1` demper det på Linux; å ikke bygge tungt der er den
+    ekte fiksen. `setsid nohup … & disown` gjør at arbeidet overlever at
+    jobb-livssyklusen ryddes (og `setsid` finnes IKKE i zsh på macOS).
+
+    KORPUSET HAR ALDRI KJØRT PÅ arm64 FØR I DAG. `corpus.sh` bruker `mapfile`,
+    som kom i bash 4; macOS har bash 3.2. Portabel form er en
+    `while IFS= read` -løkke. Det var ikke et valg, det var en skallforskjell
+    ingen hadde lagt merke til.
+
+    DELT ARBEIDSTRE: fil-nivå staging HOLDER IKKE. S20 committet seks linjer av
+    et parallelt wasm-arbeid fordi konflikten lå INNI to filer jeg også hadde
+    endret, og HEAD bygde da ikke i en ren utsjekk. Bare M3 fanget det. Så
+    lenge to skrivere deler treet: verifiser hver commit i en REN utsjekk
+    (`git worktree add` + eget CARGO_TARGET_DIR) før den regnes som god.
+
+
 2. HVA S3 ER
 ------------
 
@@ -660,13 +773,12 @@ MERK at #101 sto som lukket. Den var det ikke. Vakten fantes, men sto på et
 tall maskinen aldri nådde, på en sti som hadde den slått av.
 
 
-5. GJENSTÅR
------------
+5. GJENSTÅR (S3-EPOKEN — HISTORISK, SE §1e FOR HVA SOM FAKTISK STÅR IGJEN)
+--------------------------------------------------------------------------
 
-  a) M3 (ssh m3) full gate FØR push — stående regel. IKKE KJØRT.
-  b) Deretter er S3 + §4 + §5 klar til commit. Vurder tre commits, ikke én:
-     de er uavhengige og §5 rører planlegger og runtime-standarder, ikke FK.
-     Ingenting er committet — Morten bestemmer.
+  a) og b) under er UTFØRT: S3 + §4 + §5 er committet for lengst, og M3 har
+     kjørt på hver commit siden. Avsnittet står igjen for hastighetsmålingen
+     under, som fortsatt er gyldig og ikke er gjentatt noe annet sted.
 
   §6c (hastighetsklausulen) er GJORT. Kontrollarm: 568bb97 bygget i
   /mnt/xfs/wt-pre-s3 med eget CARGO_TARGET_DIR (401 MB; /mnt/xfs forsvinner
