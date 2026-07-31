@@ -165,6 +165,48 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
     18  assertion-feil uten OperationalError — umålt kategori.
 
 
+1a-quater. SESJON 31/7 (S10) — KORRELERT SUBQUERY I DELETE/UPDATE, OG
+           HVA SVEIPTALLET EGENTLIG TELLER
+----------------------------------------------------------------------
+
+    9a30498  S10: korrelert subquery i `DELETE`/`UPDATE … WHERE`
+             (format 67). Splitten er det bærende: en korrelert slot er
+             tom til raden er i hånd, så konjunktene må IKKE nå
+             `extract_access` — et `IndexPoint` på en ufylt slot er et
+             GALT SVAR, ikke en nekting. `split_correlated` (samme
+             funksjon som SELECT bruker) kjører før tilgangsstien velges,
+             og den korrelerte halvdelen blir `post_filter` på planen.
+             Eksekvereren bruker `correlated_survivors` på det GATHREDE
+             settet, før første rad røres — så en subquery som leser
+             måltabellen ser PRE-write-tilstanden (Halloween).
+
+  Sveipgruppa: 21 → 20. Samlet S4–S10: 48 → 20, og den ENESTE navngitte
+  feilen igjen i gruppa er int64/text-typegrensa (2).
+
+  MEN TALLET OVERDRIVER. Kjørt LABEL FOR LABEL isolert (stock = 0 feil på
+  alle):
+
+      expressions_window   75 tester, 0 feil   ← 100 %, var 27
+      expressions_case     89 tester, 0 feil
+      delete_regress       22 tester, 0 feil
+      prefetch_related    121 tester, 1 feil   (int64/text-grensa)
+      db_functions        363 tester, 4 feil
+      bulk_create          52 tester, 16 feil  ← ALLE ER KASKADER
+
+  BULK_CREATE-FUNNET, bisektert ved å pare hver forgjenger med offeret:
+  alle 16 er `TransactionManagementError: An error occurred in the current
+  transaction`, og ÉN test forgifter resten — `test_long_non_ascii_text`
+  (bulk_create av én rad med 3000 ikke-ASCII tegn). Den PASSERER selv;
+  neste test kommer ikke i gang. Django setter `needs_rollback` bare når
+  en SAVEPOINT-operasjon feiler, så mistanken er savepoint-håndtering
+  etter det innslaget — men en direkte probe av
+  BEGIN/insert/SAVEPOINT/RELEASE/ROLLBACK på nøyaktig de dataene er
+  IDENTISK med sqlite, så det er ikke den enkle formen. NESTE.
+
+  Lærdommen for målingen: en gruppert kjøring teller kaskader som gap.
+  Kjør isolert før du klassifiserer.
+
+
 1b. SESJON 30–31/7 — SQLALCHEMY 965 → 1274, CPYTHON 459 → 460, DJANGO +106
 --------------------------------------------------------------------------
 
