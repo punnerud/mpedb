@@ -787,6 +787,76 @@ pub(crate) fn add_column_from_spec(
     Ok((col, fill))
 }
 
+/// The rewritten `AS (…)` sources an `ALTER TABLE … RENAME COLUMN` needs, each
+/// one PROVEN to mean what it meant before.
+///
+/// A generated column names its inputs in source text. The compiled program
+/// reads ordinals and a rename does not move them, so evaluation would survive
+/// untouched — but the stored source would keep naming a column that no longer
+/// exists, and a dump replayed from it would fail. sqlite rewrites the text, so
+/// mpedb must too, and this used to be a flat refusal for lack of an
+/// expression printer.
+///
+/// Two halves, and the second is what makes the first safe:
+///
+///  1. [`mpedb_sql::rename_identifier`] replaces the identifier TOKEN, so
+///     `'pink'` in a string literal and `pinkish` as a longer name are left
+///     alone. It is still only lexical: it does not know that a token in
+///     function position is not a column reference.
+///  2. Both sources are then COMPILED — the old one against the old table, the
+///     new one against the table as the rename leaves it — and the two
+///     programs must be equal. That is the whole safety argument: a rewrite is
+///     a rename only if it means the same thing, and anything that changes the
+///     meaning, for a reason anticipated here or not, is refused instead of
+///     silently altering what the column computes.
+///
+/// Comparing two FRESH compilations rather than one against the stored program
+/// is deliberate: it asks exactly "did the rewrite change the meaning", and
+/// does not also depend on the stored program having been built by today's
+/// binder.
+pub(crate) fn rename_generated_srcs(
+    t: &mpedb_types::TableDef,
+    column: &str,
+    new_name: &str,
+) -> Result<Vec<(u16, String)>> {
+    if !t.has_generated() {
+        return Ok(Vec::new());
+    }
+    // The table as the rename leaves it. Only a name changes, so the ordinals
+    // both sides address are identical and the comparison is meaningful.
+    let mut after = t.clone();
+    match after
+        .columns
+        .iter_mut()
+        .find(|c| mpedb_types::ident_eq(&c.name, column))
+    {
+        Some(c) => c.name = new_name.to_string(),
+        // Unknown column: let the schema evolver report it, in its words.
+        None => return Ok(Vec::new()),
+    }
+    let mut out = Vec::new();
+    for (i, c) in t.columns.iter().enumerate() {
+        let Some(g) = &c.generated else { continue };
+        let src = mpedb_sql::rename_identifier(&g.expr, column, new_name)?;
+        let refuse = |why: String| {
+            Error::Schema(format!(
+                "cannot rename column `{column}` of `{}`: the generated column `{}` \
+                 would become `{src}`, which {why}",
+                t.name, c.name
+            ))
+        };
+        let before = mpedb_sql::compile_value_expr(&g.expr, t)
+            .map_err(|e| refuse(format!("cannot be checked — `{}` does not compile: {e}", g.expr)))?;
+        let after_prog = mpedb_sql::compile_value_expr(&src, &after)
+            .map_err(|e| refuse(format!("does not compile: {e}")))?;
+        if before != after_prog {
+            return Err(refuse("computes something different".into()));
+        }
+        out.push((i as u16, src));
+    }
+    Ok(out)
+}
+
 /// Resolve `CREATE INDEX` column names to ordinals against `t`. Shared by the
 /// autocommit facade and an in-transaction session (#95).
 pub(crate) fn resolve_index_columns(
@@ -1048,6 +1118,7 @@ impl Database {
         unique: bool,
         predicate: Option<String>,
         name: Option<String>,
+        if_not_exists: bool,
     ) -> Result<ExecResult> {
         self.engine.refresh_schema_if_stale()?;
         let bundle = self.engine.schema();
@@ -1075,14 +1146,42 @@ impl Database {
                 }
             }
         }
-        // Idempotent by shape: an identical index already present is a no-op.
-        // The expressions are part of the shape — two indexes over the same
-        // column through different functions are different indexes.
-        if t.indexes.iter().any(|ix| {
-            ix.columns == cols && ix.unique == unique && ix.predicate == predicate
-                && ix.exprs == exprs && ix.collations == collations
-        }) {
-            return Ok(ExecResult::Affected(0));
+        // A NAMED index is identified by its NAME, not by its shape.
+        //
+        // This used to be "idempotent by shape": any index with the same
+        // columns/uniqueness/predicate/expressions was treated as already
+        // present and the statement became a silent no-op. That made
+        // `CREATE INDEX` LIE in two directions at once, both of which Django's
+        // migrations walk into:
+        //
+        //   * `CREATE UNIQUE INDEX u ON t(c)` where `c` is already UNIQUE
+        //     reported success and created nothing, so the following
+        //     `DROP INDEX u` failed with "no such index" — which is exactly
+        //     `remove_unique_together` on a unique field;
+        //   * a duplicate NAME with a different shape was accepted and
+        //     ignored, where sqlite says "index u already exists".
+        //
+        // Shape-based idempotence survives only for an UNNAMED index, which
+        // has no name to collide on.
+        match &name {
+            Some(n) => {
+                if t.indexes.iter().any(|ix| {
+                    ix.name.as_deref().is_some_and(|e| mpedb_types::ident_eq(e, n))
+                }) {
+                    if if_not_exists {
+                        return Ok(ExecResult::Affected(0));
+                    }
+                    return Err(Error::Bind(format!("index `{n}` already exists")));
+                }
+            }
+            None => {
+                if t.indexes.iter().any(|ix| {
+                    ix.columns == cols && ix.unique == unique && ix.predicate == predicate
+                        && ix.exprs == exprs && ix.collations == collations
+                }) {
+                    return Ok(ExecResult::Affected(0));
+                }
+            }
         }
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.create_index(id, cols, exprs.to_vec(), collations.to_vec(), unique, predicate, name) {
@@ -1118,8 +1217,16 @@ impl Database {
                 return self.apply_alter_rename(&table, |w, id| w.alter_rename_table(id, &new_name));
             }
             DdlStmt::AlterRenameColumn { table, column, new_name } => {
+                let srcs = {
+                    let bundle = self.schema();
+                    let id = bundle.schema.table_id(&table).ok_or_else(|| {
+                        Error::Bind(format!("ALTER TABLE: no such table `{table}`"))
+                    })?;
+                    let t = bundle.schema.table(id).expect("table_id resolved");
+                    rename_generated_srcs(t, &column, &new_name)?
+                };
                 return self.apply_alter_rename(&table, |w, id| {
-                    w.alter_rename_column(id, &column, &new_name)
+                    w.alter_rename_column(id, &column, &new_name, &srcs)
                 });
             }
             DdlStmt::AlterAddColumn { table, column } => {
@@ -1136,10 +1243,13 @@ impl Database {
                 collations,
                 unique,
                 where_clause,
+                if_not_exists,
                 ..
             } => {
-                return self
-                    .apply_create_index(&table, &columns, &exprs, &collations, unique, where_clause, Some(name));
+                return self.apply_create_index(
+                    &table, &columns, &exprs, &collations, unique, where_clause, Some(name),
+                    if_not_exists,
+                );
             }
             DdlStmt::DropIndex { name, if_exists } => {
                 return self.apply_drop_index(&name, if_exists);

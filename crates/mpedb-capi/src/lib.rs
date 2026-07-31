@@ -90,9 +90,16 @@ fn fk_pragma(
             Ok(Some((Vec::new(), Vec::new())))
         }
         "foreign_key_check" => {
-            let rows = c
-                .db
-                .foreign_key_check(arg.as_deref())?
+            // Through the SESSION when one is open, like every other catalog
+            // surface here. A fresh read snapshot cannot see the transaction's
+            // own uncommitted rows, and a DEFERRED violation lives exactly
+            // there until COMMIT settles it — so answering from `db` reported
+            // a clean database to a caller looking straight at a broken one.
+            let rows = match c.txn.as_mut() {
+                Some(s) => s.foreign_key_check(arg.as_deref())?,
+                None => c.db.foreign_key_check(arg.as_deref())?,
+            };
+            let rows = rows
                 .into_iter()
                 .map(|(table, pk, parent, fkid)| {
                     vec![
@@ -128,6 +135,11 @@ pub struct Sqlite3 {
     /// in for an in-memory database (which is removed again on close).
     backing: Backing,
     busy_timeout_ms: c_int,
+    /// Pragmas stored and echoed per connection, never honoured. PER
+    /// CONNECTION and not per database: `read_uncommitted` is an isolation
+    /// setting, and a fresh connection must report the default even when a
+    /// sibling has raised it.
+    echo_pragmas: introspect::EchoPragmas,
     /// Set by `sqlite3_interrupt` (possibly from another thread); polled by the
     /// running statement at step entry and during the busy-retry wait. An
     /// atomic so the interrupting thread touches ONLY this field, never the
@@ -613,7 +625,14 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             let idx = sqlite_index_records_of(c, qualifier.as_deref());
             let fk_on = c.db.fk_enforced();
             let (columns, rows) =
-                introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms, &fk_on, &idx)?;
+                introspect::pragma(
+                    &bundle,
+                    sqltext,
+                    &mut c.busy_timeout_ms,
+                    &fk_on,
+                    &idx,
+                    &mut c.echo_pragmas,
+                )?;
             // `PRAGMA busy_timeout = N` may have moved the knob — mirror it
             // into the engine's writer-lock deadline (#109), same as
             // `sqlite3_busy_timeout`. Unconditional: an atomic store, cheap.
@@ -785,6 +804,9 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             if res.is_ok() {
                 if let Some(t) = &ddl_target {
                     record_object_ddl(c, sqltext, t, idx_before);
+                }
+                if let Some((sch, old, new)) = introspect::alter_rename_target(sqltext) {
+                    move_table_ddl_record(c, sch.as_deref(), &old, &new);
                 }
             }
             // Drain the rowid the engine recorded for this statement (facade
@@ -1229,6 +1251,93 @@ fn put_record(c: &mut Sqlite3, member: Option<&str>, ns: &str, key: &[u8], val: 
                 None => c.db.sys_record_put(ns, key, val),
             };
         }
+    }
+}
+
+/// Carry a table's verbatim DDL — and its indexes' table attribution — across
+/// an `ALTER TABLE … RENAME TO`.
+///
+/// sqlite keeps the original `CREATE TABLE` text forever and only retargets its
+/// name, so everything the reconstruction cannot express survives a rename:
+/// a column's declared `COLLATE` spelling, the exact type words, a named CHECK.
+/// The records here are keyed by table NAME, so without this the rename simply
+/// orphaned them and `sqlite_master` fell back to reconstructing — which is why
+/// `COLLATE nocase` came back as `COLLATE NOCASE` and Django's
+/// `assertColumnCollation` failed on a string compare.
+///
+/// It matters beyond that one assertion: Django implements nearly every
+/// `AlterField` on sqlite by building `new__<table>` and renaming it into
+/// place, so this is the ordinary path, not an exotic one.
+///
+/// The index records keep their own (name) keys — a table rename does not
+/// rename its indexes — but the fingerprint inside each VALUE leads with the
+/// table name, and `forget_table_index_records` matches on it. Left stale, the
+/// eventual `DROP TABLE` would not forget them and a later table of the old
+/// name would inherit index names nobody created.
+fn move_table_ddl_record(c: &mut Sqlite3, member: Option<&str>, old: &str, new: &str) {
+    if c.readonly {
+        return;
+    }
+    let (ns, old_key) = introspect::ddl_key(old);
+    let recs = sqlite_master_records_of(c, member);
+    if let Some(rec) = recs.get(old).filter(|v| !v.is_empty()).cloned() {
+        // The record is `fingerprint ‖ NUL ‖ verbatim`. Both halves name the
+        // table, and the fingerprint is a `create_ddl` reconstruction that
+        // `sqlite_master` recomputes from the LIVE table — so it has to be
+        // re-derived under the new name, not textually patched, or the record
+        // would read as permanently stale and never be used.
+        let moved = introspect::ddl_record_verbatim(&rec)
+            .and_then(|verbatim| mpedb::rename_table_in_ddl(verbatim, old, new).ok().flatten());
+        if let Some(verbatim) = moved {
+            let schema = match member {
+                Some(m) => c.db.attached_schema_or_empty(m),
+                None => match c.txn.as_ref() {
+                    Some(s) => s.schema(),
+                    None => c.db.schema(),
+                },
+            };
+            let idx = sqlite_index_records_of(c, member);
+            if let Some(t) = introspect::exact_table_name(&schema, new)
+                .and_then(|e| introspect::table_by_exact_name(&schema, &e))
+            {
+                let (_, new_key) = introspect::ddl_key(&t.name);
+                let rec = introspect::ddl_record(t, &idx, &verbatim);
+                put_record(c, member, ns, &new_key, &rec);
+            }
+        }
+    }
+    // Whatever happened above, the OLD key must not keep answering: a table of
+    // that name created later would otherwise inherit this text.
+    put_record(c, member, ns, &old_key, &[]);
+    retable_index_records(c, member, old, new);
+}
+
+/// Re-attribute every index record whose fingerprint names `old` to `new`.
+fn retable_index_records(c: &mut Sqlite3, member: Option<&str>, old: &str, new: &str) {
+    let ns = introspect::IDX_NS;
+    let all = match member {
+        Some(m) => c.db.attached_sys_record_scan(m, ns),
+        None => match c.txn.as_mut() {
+            Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
+            None => c.db.sys_record_scan(ns).unwrap_or_default(),
+        },
+    };
+    for (k, v) in all {
+        let Some(fp) = introspect::index_record_fingerprint(&v) else { continue };
+        if introspect::fingerprint_table(fp) != old {
+            continue;
+        }
+        let Some(rest) = fp.strip_prefix(old) else { continue };
+        // The verbatim `CREATE INDEX … ON <old>` is retargeted too, exactly as
+        // sqlite retargets it. If it cannot be (see `rename_table_in_ddl`), the
+        // old text is kept: an index record has no reconstruction to fall back
+        // to, so stale-but-parseable beats absent.
+        let verbatim = introspect::ddl_record_verbatim(&v).unwrap_or_default();
+        let verbatim = mpedb::rename_table_in_ddl(verbatim, old, new)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| verbatim.to_string());
+        put_record(c, member, ns, &k, &introspect::index_record(&format!("{new}{rest}"), &verbatim));
     }
 }
 
@@ -1936,6 +2045,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         path,
         backing: kind,
         busy_timeout_ms: 0,
+        echo_pragmas: introspect::EchoPragmas::default(),
         interrupted: AtomicBool::new(false),
         err_code: SQLITE_OK,
         err_ext: SQLITE_OK,

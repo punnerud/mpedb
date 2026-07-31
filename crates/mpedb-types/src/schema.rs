@@ -562,6 +562,20 @@ impl TableDef {
         for fk in &mut self.foreign_keys {
             fk.columns.iter_mut().for_each(&shift);
         }
+        // A generated column's COMPILED program is a fourth ordinal list, and
+        // it shifts for exactly the same reason. `Instr::PushCol` is the only
+        // instruction that touches the row, which is what makes this complete
+        // rather than a best effort. The `AS (…)` SOURCE beside it needs no
+        // rewrite: it names its inputs, and neither adding nor dropping a
+        // column renames anything.
+        for c in &mut self.columns {
+            let Some(g) = &mut c.generated else { continue };
+            for ins in &mut g.program.instrs {
+                if let Instr::PushCol(x) = ins {
+                    shift(x);
+                }
+            }
+        }
     }
 
     /// The tombstone that replaces a dropped table's slot (#47 stage 4). Keeps
@@ -1036,16 +1050,20 @@ impl Schema {
                 )));
             }
         }
-        if slot.indexes.iter().any(|ix| {
-            ix.columns == index.columns
-                && ix.unique == index.unique
-                && ix.predicate == index.predicate
-        }) {
-            return Err(Error::Schema(format!(
-                "an identical index already exists on table `{}`",
-                slot.name
-            )));
-        }
+        // Two indexes of the same SHAPE are LEGAL. They are redundant — the
+        // second answers no probe the first cannot — but redundant is not
+        // illegal, sqlite builds both, and `remove_unique_together` on an
+        // already-unique field is Django emitting exactly such a pair.
+        //
+        // This was a refusal until the shim stopped keying an index's name
+        // record by its shape (`index_fingerprint_of`). Under a shape key two
+        // same-shape indexes collided onto one record and `PRAGMA index_list`
+        // reported a duplicate name — a wrong answer. The records are keyed by
+        // NAME now, so the collision has nowhere left to happen.
+        //
+        // What is still refused is a duplicate NAME, and that is checked by
+        // the two `CREATE INDEX` appliers rather than here: this function also
+        // serves flag-derived indexes, which have no name at all.
         slot.indexes.push(index);
         let schema = Schema { tables };
         schema.validate()?;
@@ -1199,19 +1217,33 @@ impl Schema {
                 slot.name
             )));
         }
-        // A generated column's compiled program addresses its inputs by ORDINAL,
-        // and a drop shifts every ordinal after it — a program renumbered wrong
-        // reads a DIFFERENT column and silently stores a different value, which
-        // is the one failure mode this feature must not have. Renumbering the
-        // program is mechanical but the expression SOURCE text (see
-        // `with_renamed_column`) cannot follow, so the whole shape is refused.
-        // sqlite refuses the interesting half of this too ("error in table t
-        // after drop column"); mpedb refuses the rest rather than answer wrong.
-        if slot.has_generated() {
+        // What a drop genuinely cannot survive is a SURVIVING generated column
+        // that READS the dropped one: its expression would name a column that
+        // is gone. sqlite refuses that too ("error in table t after drop
+        // column"), so this is the same line, not a stricter one.
+        //
+        // It used to be `slot.has_generated()` — table-wide, and checked before
+        // the removal. That refused the ordinary case as well: dropping the
+        // table's only generated column, where after the removal there is no
+        // program left to renumber and the danger cannot arise. Django's
+        // `RemoveField` on a `GeneratedField` is exactly that, and so is the
+        // cleanup half of `AddField`.
+        //
+        // Everything else is mechanical: ordinals shift (`renumber_columns`
+        // moves the compiled programs with the other three lists) and the
+        // `AS (…)` source needs no rewrite, because a drop renames nothing.
+        if let Some(reader) = slot.columns.iter().enumerate().find(|(j, c)| {
+            *j != idx
+                && c.generated.as_ref().is_some_and(|g| {
+                    g.program
+                        .instrs
+                        .iter()
+                        .any(|ins| matches!(ins, Instr::PushCol(x) if *x == i))
+                })
+        }) {
             return Err(Error::Schema(format!(
-                "cannot drop a column of `{}`: it has a generated column whose \
-                 expression addresses its inputs by position, and a drop shifts them",
-                slot.name
+                "cannot drop column `{}` of `{}`: the generated column `{}` reads it",
+                slot.columns[idx].name, slot.name, reader.1.name
             )));
         }
         slot.columns.remove(idx);
@@ -1230,36 +1262,81 @@ impl Schema {
     /// metadata: the column keeps its position and type, so no row image is
     /// touched. Errors if the column is unknown or the new name collides with a
     /// sibling column.
+    ///
+    /// `generated_srcs` supplies the `AS (…)` SOURCE text for each generated
+    /// column of the table, already rewritten to name `new_name`, as
+    /// `(column ordinal, source)`. This crate deliberately holds no SQL lexer,
+    /// so the rewrite belongs to the caller — and the caller MUST verify it by
+    /// re-compiling each new source against the resulting table and checking
+    /// the program is unchanged. A rewrite is only a rename if it means the
+    /// same thing; anything else is a schema that computes something new
+    /// without saying so. `crates/mpedb/src/ddl_apply.rs::rename_generated_srcs`
+    /// is the one place that does both halves.
     pub fn with_renamed_column(
         &self,
         table_id: u32,
         column: &str,
         new_name: &str,
+        generated_srcs: &[(u16, String)],
     ) -> Result<Schema> {
         let mut tables = self.tables.clone();
         let slot = tables
             .get_mut(table_id as usize)
             .filter(|t| t.id == table_id && !t.dead)
             .ok_or_else(|| Error::Schema(format!("no live table with id {table_id}")))?;
-        if slot.columns.iter().any(|c| ident_eq(&c.name, new_name)) {
+        // The duplicate check must SKIP the column being renamed. Identifier
+        // comparison is case-insensitive, so without that exclusion
+        // `RENAME COLUMN field TO FiElD` — a case-only rename, which sqlite
+        // performs and Django's `test_rename_field_case` migration does —
+        // collided with the very column it was renaming. So did renaming a
+        // column to its own name, which sqlite treats as a no-op.
+        let target = slot.columns.iter().position(|c| ident_eq(&c.name, column));
+        if slot
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| Some(i) != target && ident_eq(&c.name, new_name))
+        {
             return Err(Error::Schema(format!(
                 "column `{new_name}` already exists in table `{}`",
                 slot.name
             )));
         }
         // A generated column's EXPRESSION names its inputs in SOURCE text. The
-        // compiled program reads ordinals, so a rename would keep computing the
-        // right value — but the source (the DDL a dump replays, the text an
-        // error message quotes) would still name the old column, and a replayed
-        // dump would then fail. sqlite rewrites the text; mpedb has no
-        // expression printer, so it refuses by name instead of shipping a
-        // schema whose declared form and behaviour disagree.
-        if slot.has_generated() {
-            return Err(Error::Schema(format!(
-                "cannot rename a column of `{}`: it has a generated column, whose \
-                 expression names its inputs as text that mpedb cannot rewrite",
-                slot.name
-            )));
+        // compiled program reads ordinals, so evaluation would keep working
+        // after a rename — but the source (the DDL a dump replays, the text an
+        // error message quotes) would still name the old column, and the
+        // replayed dump would fail. sqlite rewrites the text.
+        //
+        // mpedb has no expression printer and this crate has no SQL lexer, so
+        // the rewritten sources arrive as DATA in `generated_srcs`, keyed by
+        // column ordinal. A generated column with no entry is still refused —
+        // shipping a schema whose declared form and behaviour disagree is the
+        // failure this guard exists for, and silence is not consent.
+        for (i, c) in slot.columns.iter().enumerate() {
+            if c.generated.is_some() && !generated_srcs.iter().any(|(o, _)| *o as usize == i) {
+                return Err(Error::Schema(format!(
+                    "cannot rename a column of `{}`: the generated column `{}` names its \
+                     inputs as text, and no rewritten expression was supplied",
+                    slot.name, c.name
+                )));
+            }
+        }
+        for (o, src) in generated_srcs {
+            let Some(c) = slot.columns.get_mut(*o as usize) else {
+                return Err(Error::Schema(format!(
+                    "rewritten generated expression for column ordinal {o}, which \
+                     table `{}` does not have",
+                    slot.name
+                )));
+            };
+            let Some(g) = &mut c.generated else {
+                return Err(Error::Schema(format!(
+                    "rewritten generated expression for `{}.{}`, which is not generated",
+                    slot.name, c.name
+                )));
+            };
+            g.expr = src.clone();
         }
         let col = slot
             .columns
@@ -1549,29 +1626,52 @@ impl Schema {
                     })?;
                     // `any` IS allowed here. See `ANY_KEY_COLUMNS` below.
                 }
-                // A PARTIAL index over the PK column is not the PK tree: it
-                // holds only the rows its predicate admits, so it answers a
-                // question the PK tree cannot (`UNIQUE(pk) WHERE …` is how
-                // Django writes a conditional constraint over the pk). Only a
-                // whole-table one is the duplicate this rejects.
-                if ix.predicate.is_none()
-                    && ix.columns.len() == 1
-                    && t.primary_key.len() == 1
-                    && t.primary_key[0] == ix.columns[0]
-                {
-                    return Err(Error::Schema(format!(
-                        "index on `{}` duplicates the primary key tree (index 0)",
-                        t.name
-                    )));
-                }
+                // An index whose columns ARE the primary key used to be refused
+                // here as a duplicate of the PK tree. It is redundant — the PK
+                // tree already answers every probe it could — but redundant is
+                // not illegal, and sqlite builds it. Django's
+                // `remove_unique_together` on a pk (or unique) field emits
+                // exactly this, so the refusal blocked a migration that has
+                // nothing wrong with it.
+                //
+                // Allowed rather than made a no-op ON PURPOSE: an index entry
+                // that carries no tree would be a new concept for the write
+                // path, the planner, fsck and the verifier to agree about, and
+                // that is how a special case becomes a bug. Building the tree
+                // costs exactly what sqlite costs and adds no new mechanism.
+                //
+                // (The PARTIAL case was already carved out for the same
+                // reason and stays: `UNIQUE(pk) WHERE …` holds only the rows
+                // its predicate admits, so it answers a question the PK tree
+                // cannot.)
             }
             for i in 0..t.indexes.len() {
                 for j in i + 1..t.indexes.len() {
+                    // Full equality, NAME included. Two indexes of the same
+                    // shape under different names are legal and redundant; two
+                    // entries alike in every field are one index written twice.
                     if t.indexes[i] == t.indexes[j] {
                         return Err(Error::Schema(format!(
                             "duplicate index shape on `{}`",
                             t.name
                         )));
+                    }
+                    // A duplicate NAME, though, is refused whatever the shapes.
+                    // The name is an index's IDENTITY: the C-API shim files a
+                    // `CREATE INDEX` record under it and `PRAGMA index_list`
+                    // reports it, so two indexes sharing one would resolve to a
+                    // single record and report a duplicate row. Both appliers
+                    // already refuse it on the way in; it belongs here too,
+                    // because this is the chokepoint a decoded blob and a
+                    // config-seeded schema also pass through, and they do not
+                    // go through an applier.
+                    if let (Some(a), Some(b)) = (&t.indexes[i].name, &t.indexes[j].name) {
+                        if ident_eq(a, b) {
+                            return Err(Error::Schema(format!(
+                                "duplicate index name `{a}` on `{}`",
+                                t.name
+                            )));
+                        }
                     }
                 }
             }
@@ -2557,10 +2657,13 @@ mod tests {
             .push(IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() });
         assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
 
-        // An index equal to the whole single-column PK duplicates index 0.
-        let mut evil = base.clone();
-        evil.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() }];
-        assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
+        // An index equal to the whole single-column PK is REDUNDANT, not
+        // illegal: the PK tree answers every probe it could, but sqlite builds
+        // it and Django's `remove_unique_together` on a pk field emits exactly
+        // this. Refusing it blocked a migration with nothing wrong in it.
+        let mut redundant = base.clone();
+        redundant.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() }];
+        Schema::from_canonical_bytes(&redundant.canonical_bytes()).unwrap();
 
         // v1 bytes (version byte 1) refuse by name — no migration exists.
         let mut v1ish = base.canonical_bytes();
@@ -3176,28 +3279,35 @@ mod tests {
         assert!(format!("{err}").contains("DEFAULT"), "{err}");
     }
 
-    /// DROP COLUMN shifts ordinals and RENAME COLUMN invalidates the expression
-    /// TEXT; a generated column's program addresses inputs by position, so both
-    /// are refused on a table that has one. Narrower than sqlite, never wrong.
+    /// DROP COLUMN shifts ordinals; RENAME COLUMN invalidates the expression
+    /// TEXT. So a drop is legal and RENUMBERS the generated program, unless a
+    /// SURVIVING generated column reads the column being dropped — which is
+    /// where sqlite refuses too. A rename needs the rewritten `AS (…)` source
+    /// handed in, and refuses without it; a drop never needs one, because it
+    /// renames nothing.
     #[test]
-    fn drop_and_rename_column_refuse_on_a_generated_table() {
+    fn drop_renumbers_a_generated_program_and_rename_needs_a_rewritten_source() {
         use crate::expr::Instr;
         let plain = |n: &str, ty, nullable| ColumnDef { generated: None, default_text: None, decl: None,
             name: n.into(), ty, nullable, unique: false, indexed: false,
             default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ty),
         };
+        // `g` reads `b`, which is column 2 — so dropping `a` in front of it
+        // MUST move the program to 1. Reading 2 afterwards would be `g`
+        // silently computing from itself.
         let mut g = plain("g", ColumnType::Int64, true);
         g.generated = Some(GeneratedCol {
-            expr: "a".into(),
+            expr: "b".into(),
             kind: GeneratedKind::Stored,
-            program: ExprProgram::new(vec![Instr::PushCol(0)], vec![]).unwrap(),
+            program: ExprProgram::new(vec![Instr::PushCol(2)], vec![]).unwrap(),
         });
         let s = Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),
             columns: vec![
-                plain("a", ColumnType::Int64, false),
+                plain("id", ColumnType::Int64, false),
+                plain("a", ColumnType::Int64, true),
                 plain("b", ColumnType::Int64, true),
                 g,
             ],
@@ -3210,9 +3320,55 @@ mod tests {
         }])
         .unwrap();
 
+        // A surviving generated column reads `b`: refused, and the message
+        // names both sides so the caller knows what to drop first.
         let err = s.with_dropped_column(0, "b").unwrap_err();
-        assert!(format!("{err}").contains("by position"), "{err}");
-        let err = s.with_renamed_column(0, "a", "z").unwrap_err();
-        assert!(format!("{err}").contains("cannot rewrite"), "{err}");
+        let err = format!("{err}");
+        assert!(err.contains("`b`") && err.contains("`g`"), "{err}");
+
+        // Dropping `a`, which nothing generated reads, is legal — and `g`'s
+        // program follows its input down from ordinal 2 to 1.
+        let after = s.with_dropped_column(0, "a").unwrap();
+        let t = after.table(0).unwrap();
+        assert_eq!(
+            t.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["id", "b", "g"]
+        );
+        assert_eq!(
+            t.columns[2].generated.as_ref().unwrap().program.instrs,
+            vec![Instr::PushCol(1)]
+        );
+        // The primary key moved with it, and the result validates.
+        assert_eq!(t.primary_key, vec![0]);
+
+        // Dropping the ONLY generated column is the ordinary case — there is
+        // no program left to renumber. This was refused table-wide before.
+        let after = s.with_dropped_column(0, "g").unwrap();
+        assert!(!after.table(0).unwrap().has_generated());
+
+        // A rename with NO rewritten source is refused: the `AS (…)` text would
+        // keep naming a column that no longer exists. Silence is not consent.
+        let err = s.with_renamed_column(0, "b", "z", &[]).unwrap_err();
+        assert!(format!("{err}").contains("no rewritten expression"), "{err}");
+
+        // Supplied, it is taken — and the ordinal must be the generated
+        // column's own, not the renamed one's.
+        let after = s.with_renamed_column(0, "b", "z", &[(3, "z".into())]).unwrap();
+        let t = after.table(0).unwrap();
+        assert_eq!(t.columns[2].name, "z");
+        assert_eq!(t.columns[3].generated.as_ref().unwrap().expr, "z");
+        // …and the program is untouched: a rename moves no ordinals.
+        assert_eq!(
+            t.columns[3].generated.as_ref().unwrap().program.instrs,
+            vec![Instr::PushCol(2)]
+        );
+
+        // An ordinal that is not a generated column is a caller bug, not a
+        // silent no-op. (Ordinal 3 is supplied too, so this trips the entry
+        // check and not the completeness one above it.)
+        let err = s
+            .with_renamed_column(0, "b", "z", &[(3, "z".into()), (1, "z".into())])
+            .unwrap_err();
+        assert!(format!("{err}").contains("not generated"), "{err}");
     }
 }

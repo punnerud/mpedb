@@ -659,3 +659,66 @@ fn insert_or_replace_probes_a_unique_generated_index() {
         "SELECT id, a, s FROM t ORDER BY id",
     );
 }
+
+// ------------------------------------------- ALTER TABLE … RENAME COLUMN
+
+/// A rename REWRITES the generated expression's source, as sqlite does.
+///
+/// The compiled program addresses ordinals and a rename moves none of them, so
+/// evaluation was never at risk — but the stored `AS (…)` text kept naming the
+/// old column, so a dump replayed from it would fail. mpedb refused the whole
+/// shape rather than ship that; it now rewrites the identifier TOKEN and proves
+/// the rewrite by recompiling both sides and comparing the programs.
+///
+/// Django's `RenameField` on a model with a `GeneratedField` is this exact
+/// statement, and the refusal stopped the migration before the assertion the
+/// test was actually about.
+#[test]
+fn renaming_a_column_rewrites_a_generated_expression_like_sqlite() {
+    let setup = &[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, pink INTEGER, \
+         modified_pink INTEGER GENERATED ALWAYS AS (pink + pink) STORED)",
+        "INSERT INTO t (id, pink) VALUES (1, 3)",
+        "ALTER TABLE t RENAME COLUMN pink TO renamed_pink",
+        "INSERT INTO t (id, renamed_pink) VALUES (2, 5)",
+    ];
+    // The VALUE still computes, for rows written before and after the rename.
+    assert_same(setup, "SELECT id, renamed_pink, modified_pink FROM t ORDER BY id");
+    // …and the new name is the one that resolves.
+    assert_same(setup, "SELECT id FROM t WHERE renamed_pink = 5");
+}
+
+/// A rewrite is accepted only when it MEANS the same thing, and the check is a
+/// recompile — not a promise. A generated expression whose text contains the
+/// renamed column inside a STRING LITERAL must come through untouched: the
+/// literal is data, and rewriting it would change what the column computes.
+#[test]
+fn a_rename_leaves_a_string_literal_alone() {
+    assert_same(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, pink INTEGER, \
+             tag TEXT GENERATED ALWAYS AS ('pink=' || pink) STORED)",
+            "INSERT INTO t (id, pink) VALUES (1, 7)",
+            "ALTER TABLE t RENAME COLUMN pink TO blue",
+        ],
+        "SELECT id, blue, tag FROM t",
+    );
+}
+
+/// The rename still refuses when the rewrite cannot be PROVEN equivalent.
+/// A generated column that reads another column named like a function is the
+/// shape a purely lexical rewrite gets wrong; both engines must not silently
+/// change what the column computes. sqlite rejects this rename outright
+/// (the generated expression would become ambiguous), and so does mpedb.
+#[test]
+fn a_rename_that_would_change_the_meaning_is_refused_by_both() {
+    assert_both_refuse(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \
+             s INTEGER GENERATED ALWAYS AS (a + 1) STORED)",
+        ],
+        // Renaming `a` onto the name of the generated column itself: the
+        // rewritten source would read `s + 1`, i.e. the column defining itself.
+        "ALTER TABLE t RENAME COLUMN a TO s",
+    );
+}

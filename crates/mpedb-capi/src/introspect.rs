@@ -61,11 +61,20 @@ fn q(name: &str) -> String {
 /// shim has a `CREATE UNIQUE INDEX` record for is not a column constraint.
 fn create_ddl(t: &mpedb::TableDef, idx: &IndexRecords) -> String {
     let hidden_pk = t.hidden_rowid_col();
-    let by_statement: Vec<u16> = table_index_rows(t, idx)
-        .into_iter()
-        .filter(|r| r.origin == "c" && r.unique && r.columns.len() == 1)
-        .map(|r| r.columns[0])
-        .collect();
+    let rows = table_index_rows(t, idx);
+    let single_unique = |origin: &str| -> Vec<u16> {
+        rows.iter()
+            .filter(|r| r.origin == origin && r.unique && r.columns.len() == 1)
+            .map(|r| r.columns[0])
+            .collect()
+    };
+    let by_statement = single_unique("c");
+    // …unless the column ALSO carries an independent constraint index. Two
+    // same-shape indexes are legal now, so `UNIQUE` in the declaration and a
+    // named `CREATE UNIQUE INDEX` over the same column can both exist — and
+    // suppressing the inline word then drops a real constraint from the
+    // reconstruction, which replays as a table missing an index it had.
+    let by_constraint = single_unique("u");
     let mut cols: Vec<String> = t
         .visible_columns()
         .iter()
@@ -75,8 +84,18 @@ fn create_ddl(t: &mpedb::TableDef, idx: &IndexRecords) -> String {
             if !c.nullable {
                 s.push_str(" NOT NULL");
             }
-            if c.unique && !by_statement.contains(&(i as u16)) {
+            let i = i as u16;
+            if c.unique && (!by_statement.contains(&i) || by_constraint.contains(&i)) {
                 s.push_str(" UNIQUE");
+            }
+            // A declared collation is part of the column, not decoration: it
+            // decides comparison and index ordering, so a reconstruction that
+            // dropped it replays as a BINARY column. It is also the only thing
+            // a caller can read the collation back from — `PRAGMA table_info`
+            // has no column for it, which is why Django looks for the token in
+            // `sqlite_master.sql`.
+            if c.collation != mpedb::Collation::Binary {
+                s.push_str(&format!(" COLLATE {}", c.collation.name()));
             }
             // A GENERATED column MUST carry its clause: without it the replayed
             // statement makes an ordinary column, and the dump's INSERTs — which
@@ -142,6 +161,45 @@ pub(crate) fn ddl_record(t: &mpedb::TableDef, idx: &IndexRecords, verbatim: &str
 /// The namespace + key a table's verbatim-DDL record lives under.
 pub(crate) fn ddl_key(table: &str) -> (&'static str, Vec<u8>) {
     (DDL_NS, table.as_bytes().to_vec())
+}
+
+/// The VERBATIM half of a DDL record (everything after the fingerprint's NUL),
+/// or `None` when the record is malformed or a tombstone. The fingerprint half
+/// is never portable — it is re-derived from the live table — so a caller
+/// moving a record must take only this and rebuild the rest.
+pub(crate) fn ddl_record_verbatim(rec: &[u8]) -> Option<&str> {
+    let cut = rec.iter().position(|&b| b == 0)?;
+    let text = std::str::from_utf8(&rec[cut + 1..]).ok()?;
+    (!text.is_empty() && cut > 0).then_some(text)
+}
+
+/// `ALTER TABLE [<schema>.]<old> RENAME TO <new>` → `(schema, old, new)`.
+///
+/// Only the whole-table rename; `RENAME COLUMN` keeps the table's name and so
+/// keeps its record. Word-level rather than a parse, like the other detectors
+/// in this file: the statement has already been executed successfully by the
+/// time this runs, so the shape is known-good and the only job is to read the
+/// two names back out of it.
+pub(crate) fn alter_rename_target(sql: &str) -> Option<(Option<String>, String, String)> {
+    let mut w = DdlWords::new(crate::sql::strip_leading_trivia(sql));
+    let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    if !eq(&w.word()?.0, "alter") || !eq(&w.word()?.0, "table") {
+        return None;
+    }
+    let mut schema = None;
+    let mut old = w.word()?.0;
+    if w.peek_dot() {
+        w.word()?; // the `.`
+        schema = Some(old);
+        old = w.word()?.0;
+    }
+    // `RENAME TO <new>` and nothing else — `RENAME COLUMN` keeps the table's
+    // name, so it keeps its record and must not land here.
+    if !eq(&w.word()?.0, "rename") || !eq(&w.word()?.0, "to") {
+        return None;
+    }
+    let new = w.word()?.0;
+    (!old.is_empty() && !new.is_empty()).then_some((schema, old, new))
 }
 
 /// The `sql` text for a table: the caller's own statement when a record for it
@@ -488,12 +546,26 @@ pub(crate) fn fingerprint_table(fp: &str) -> &str {
     fp.split('\u{1}').next().unwrap_or("")
 }
 
-/// The shim's `CREATE INDEX` records, keyed by SHAPE so a live `IndexDef` can
-/// find its own name. Built once per introspection statement from one scan.
-pub(crate) type IndexRecords = std::collections::HashMap<String, (String, String)>;
+/// The shim's `CREATE INDEX` records, keyed by index NAME — the same key they
+/// are STORED and tombstoned under — mapping to the verbatim `CREATE INDEX`.
+/// Built once per introspection statement from one scan.
+///
+/// Keyed by name rather than by shape (`index_fingerprint_of`), which is what
+/// this used to do, because the shape is not an identity:
+///
+/// * `ALTER TABLE … RENAME COLUMN` changes the shape of every index over the
+///   renamed column, orphaning a record that is perfectly valid. The index then
+///   reads back as a `constraint` row with a NULL `sql` and consumers that need
+///   the text — Django's introspection among them — silently skip it.
+/// * Two indexes of the same shape are legal (merely redundant) and sqlite
+///   builds both; under a shape key they collide onto one record.
+///
+/// The fingerprint stays in the record's VALUE, where `forget_table_index_records`
+/// reads it to attribute a record to its table during the `DROP TABLE` sweep.
+pub(crate) type IndexRecords = std::collections::HashMap<String, String>;
 
 /// Fold a raw `IDX_NS` scan (`name → fingerprint ‖ NUL ‖ sql`) into the
-/// shape-keyed map the readers below use. Empty values are tombstones.
+/// name-keyed map the readers below use. Empty values are tombstones.
 pub(crate) fn index_records(raw: Vec<(Vec<u8>, Vec<u8>)>) -> IndexRecords {
     let mut out = IndexRecords::new();
     for (k, v) in raw {
@@ -508,10 +580,12 @@ pub(crate) fn index_records(raw: Vec<(Vec<u8>, Vec<u8>)>) -> IndexRecords {
         ) else {
             continue;
         };
+        // A record with no fingerprint is malformed — the `DROP TABLE` sweep
+        // could not attribute it — so it is not trusted for reading either.
         if fp.is_empty() || sql.is_empty() {
             continue;
         }
-        out.insert(fp.to_string(), (name, sql.to_string()));
+        out.insert(name, sql.to_string());
     }
     out
 }
@@ -572,7 +646,7 @@ fn pk_index_columns(t: &mpedb::TableDef) -> Option<Vec<u16>> {
 fn table_index_rows(t: &mpedb::TableDef, recs: &IndexRecords) -> Vec<IndexRow> {
     let mut constraint: Vec<IndexRow> = Vec::new();
     let mut created: Vec<IndexRow> = Vec::new();
-    for (at, ix) in t.indexes.iter().enumerate() {
+    for ix in t.indexes.iter() {
         let row = IndexRow {
             name: String::new(),
             unique: ix.unique,
@@ -581,9 +655,12 @@ fn table_index_rows(t: &mpedb::TableDef, recs: &IndexRecords) -> Vec<IndexRow> {
             sql: None,
             columns: ix.columns.clone(),
         };
-        match index_fingerprint_of(t, at).and_then(|fp| recs.get(&fp)) {
+        // An index is `CREATE INDEX`-origin exactly when it carries a name AND
+        // the shim holds a record under that name. A flag-derived index has no
+        // name, so it lands in `constraint` — which is where it belongs.
+        match ix.name.as_deref().and_then(|n| recs.get(n).map(|sql| (n, sql))) {
             Some((name, sql)) => created.push(IndexRow {
-                name: name.clone(),
+                name: name.to_string(),
                 origin: "c",
                 sql: Some(sql.clone()),
                 ..row
@@ -897,18 +974,76 @@ pub(crate) fn pragma_cols(names: &[&str]) -> Vec<String> {
 ///
 /// `busy_timeout_ms` is the connection's live busy timeout, passed in by
 /// reference because `PRAGMA busy_timeout = N` is the ONE setter pragma the
-/// shim can actually honour: it is the same knob `sqlite3_busy_timeout()` sets
-/// and the retry loop in `lib.rs` reads. Every other setter stays a no-op *and
-/// its getter keeps reporting what mpedb really does* — `synchronous` and
-/// `cache_size` are deliberately NOT stored-and-echoed, because answering "3"
-/// to a durability probe mpedb does not honour is a different answer rather
-/// than an error, which is the one thing this shim must never do.
+/// shim actually HONOURS: it is the same knob `sqlite3_busy_timeout()` sets and
+/// the retry loop in `lib.rs` reads. `echo` holds the three that are stored and
+/// echoed without being honoured — see [`EchoPragmas`] for the line that
+/// separates those from the setters that stay silent no-ops.
+/// The connection-local pragmas the shim STORES AND ECHOES.
+///
+/// The rule these three live under is not "echo whatever the caller sets" —
+/// that would be the wrong answer this shim exists to avoid. It is: *echo a
+/// setting that implies no behaviour the oracle's own default configuration
+/// exhibits; refuse anything else by name.*
+///
+/// `read_uncommitted` qualifies outright. sqlite honours it only under shared
+/// cache, and this shim does not export `sqlite3_enable_shared_cache`, so on
+/// the stock 3.45.1 the consumers here link against it is already pure
+/// store-and-echo (measured). Echoing it claims exactly nothing.
+///
+/// `synchronous` and `cache_size` are the harder call, and they moved to this
+/// side of the line for a concrete reason: NOT answering was never neutral.
+/// sqlite always returns one row, so a caller doing `fetchone()[0]` — Django's
+/// `test_init_command` does — got `None` and a TypeError. A crash is not a
+/// narrower answer than an echo; it is a worse one. Neither value has an
+/// observable consequence a caller can catch us on: they name a page-cache size
+/// and an fsync policy for a rollback journal mpedb does not have, and mpedb's
+/// real durability is set in its own config and reported by its own surfaces.
+pub struct EchoPragmas {
+    synchronous: i64,
+    cache_size: i64,
+    read_uncommitted: i64,
+}
+
+impl Default for EchoPragmas {
+    /// sqlite 3.45.1's own defaults, measured.
+    fn default() -> Self {
+        Self { synchronous: 2, cache_size: -2000, read_uncommitted: 0 }
+    }
+}
+
+/// sqlite's `getSafetyLevel`: a bare integer passes through, the named levels
+/// map, and anything unrecognised becomes 1 — its default, NOT an error and
+/// NOT the previous value (measured: `PRAGMA synchronous = bogus` yields 1).
+fn safety_level(a: &str) -> i64 {
+    let a = a.trim();
+    if let Ok(n) = a.parse::<i64>() {
+        return n;
+    }
+    match a.to_ascii_lowercase().as_str() {
+        "off" | "false" | "no" => 0,
+        "full" => 2,
+        "extra" => 3,
+        _ => 1,
+    }
+}
+
+/// sqlite's `sqlite3GetBoolean`: any non-zero number is 1, the true-words are
+/// 1, everything else — unrecognised included — is 0.
+fn pragma_boolean(a: &str) -> i64 {
+    let a = a.trim();
+    if let Ok(n) = a.parse::<i64>() {
+        return i64::from(n != 0);
+    }
+    i64::from(matches!(a.to_ascii_lowercase().as_str(), "yes" | "true" | "on"))
+}
+
 pub fn pragma(
     schema: &mpedb::Schema,
     sql: &str,
     busy_timeout_ms: &mut i32,
     fk_on: &bool,
     idx: &IndexRecords,
+    echo: &mut EchoPragmas,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>), DbError> {
     let (name, arg) = parse_pragma(sql);
     match name.to_ascii_lowercase().as_str() {
@@ -1180,8 +1315,31 @@ pub fn pragma(
         "schema_version" if arg.is_none() => {
             Ok((cols(&["schema_version"]), vec![vec![Value::Int(0)]]))
         }
-        // Every other pragma (synchronous, cache_size, foreign_keys=on, …) is a
-        // no-op with no result — the common database-setup pragmas.
+        // Stored and echoed per connection — see `EchoPragmas` for why these
+        // three, and only these three. Getter: one row named after the pragma.
+        // Setter: no rows, and the stored value is the one sqlite's own parser
+        // would land on, not the caller's raw text.
+        n @ ("synchronous" | "cache_size" | "read_uncommitted") => {
+            let slot = match n {
+                "synchronous" => &mut echo.synchronous,
+                "cache_size" => &mut echo.cache_size,
+                _ => &mut echo.read_uncommitted,
+            };
+            if let Some(a) = arg.as_deref() {
+                *slot = match n {
+                    "synchronous" => safety_level(a),
+                    // `cache_size` takes the integer verbatim, sign and all
+                    // (negative = kibibytes rather than pages); an unparsable
+                    // one leaves the setting alone.
+                    "cache_size" => a.trim().parse::<i64>().unwrap_or(*slot),
+                    _ => pragma_boolean(a),
+                };
+                return Ok((Vec::new(), Vec::new()));
+            }
+            Ok((cols(&[n]), vec![vec![Value::Int(*slot)]]))
+        }
+        // Every other pragma (foreign_keys=on, …) is a no-op with no result —
+        // the common database-setup pragmas.
         _ => Ok((Vec::new(), Vec::new())),
     }
 }

@@ -110,18 +110,80 @@ fn unique_index_build_rejects_existing_duplicate() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `IF NOT EXISTS` is about the NAME, and a duplicate name is an error without
+/// it — both MEASURED against sqlite 3.45.
+///
+/// This test used to assert that a second index with the same COLUMNS was "a
+/// no-op, not an error", under two DIFFERENT names. That encoded a
+/// misunderstanding: sqlite creates both (they are merely redundant), and the
+/// no-op meant `CREATE INDEX also_a …` reported success while creating
+/// nothing — so the matching `DROP INDEX also_a` then failed with "no such
+/// index". Django's `remove_unique_together` on a unique field does exactly
+/// that pair.
 #[test]
-fn create_index_if_not_exists_is_idempotent() {
+fn create_index_name_rules_match_sqlite() {
     let (db, path) = open("idem");
-    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT)", &[]).unwrap();
-    db.query("INSERT INTO t (id, a) VALUES (1, 1)", &[]).unwrap();
+    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT)", &[]).unwrap();
+    db.query("INSERT INTO t (id, a, b) VALUES (1, 1, 1)", &[]).unwrap();
     db.query("CREATE INDEX idx_a ON t (a)", &[]).unwrap();
-    // A second identical index (same columns) is a no-op, not an error.
-    db.query("CREATE INDEX IF NOT EXISTS idx_a2 ON t (a)", &[]).unwrap();
+
+    // The SAME NAME with `IF NOT EXISTS` is the no-op — that is what
+    // idempotence means here.
+    db.query("CREATE INDEX IF NOT EXISTS idx_a ON t (a)", &[]).unwrap();
+    // …and without it, a duplicate name is an error, as in sqlite.
+    for sql in [
+        "CREATE INDEX idx_a ON t (a)",
+        // Same name, DIFFERENT shape — still just "already exists".
+        "CREATE INDEX idx_a ON t (b)",
+    ] {
+        let e = db.query(sql, &[]).unwrap_err().to_string();
+        assert!(e.contains("already exists"), "`{sql}`: {e}");
+    }
+
+    // A DIFFERENT name over the same columns is a distinct — merely redundant —
+    // index, and sqlite builds it. This was a refusal while the C-API shim
+    // keyed an index's name record by its SHAPE, because two same-shape
+    // indexes then collided onto one record; the records are keyed by NAME
+    // now, so it is legal here too.
     db.query("CREATE INDEX also_a ON t (a)", &[]).unwrap();
+    // Both stand, and each drops under its own name.
+    db.query("DROP INDEX also_a", &[]).unwrap();
+    db.query("DROP INDEX idx_a", &[]).unwrap();
+    db.query("CREATE INDEX idx_a ON t (a)", &[]).unwrap();
+
     // Unknown table / column errors.
     assert!(db.query("CREATE INDEX x ON nope (a)", &[]).is_err());
     assert!(db.query("CREATE INDEX x ON t (nope)", &[]).is_err());
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same rules INSIDE a write session, which is a second, separate applier.
+///
+/// This is the path that actually mattered: Django runs migrations under
+/// `atomic=True`, so its `CREATE INDEX` never reaches the autocommit applier
+/// above. The session arm was still idempotent-by-shape long after the
+/// autocommit one was fixed, so a redundant index reported success and created
+/// nothing and the migration's own `DROP INDEX` then failed.
+#[test]
+fn create_index_name_rules_hold_inside_a_transaction() {
+    let (db, path) = open("idem_txn");
+    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT)", &[]).unwrap();
+    db.query("INSERT INTO t (id, a, b) VALUES (1, 1, 1)", &[]).unwrap();
+
+    let mut s = db.begin().unwrap();
+    s.query("CREATE INDEX idx_a ON t (a)", &[]).unwrap();
+    // Redundant shape, new name: legal, exactly as in autocommit.
+    s.query("CREATE INDEX also_a ON t (a)", &[]).unwrap();
+    // Duplicate name: refused without IF NOT EXISTS, a no-op with it.
+    let e = s.query("CREATE INDEX idx_a ON t (b)", &[]).unwrap_err().to_string();
+    assert!(e.contains("already exists"), "{e}");
+    s.query("CREATE INDEX IF NOT EXISTS idx_a ON t (a)", &[]).unwrap();
+    s.commit().unwrap();
+
+    // Both survive the commit under their own names.
+    db.query("DROP INDEX also_a", &[]).unwrap();
+    db.query("DROP INDEX idx_a", &[]).unwrap();
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }

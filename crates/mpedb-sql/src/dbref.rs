@@ -302,6 +302,131 @@ struct Edit {
     text: String,
 }
 
+/// Rewrite every bare reference to identifier `old` as `new`, keeping every
+/// other byte of `sql`.
+///
+/// Identifier TOKENS only, which is the whole point of doing this on the
+/// tokenizer rather than with a string replace: `'pink'` in a string literal,
+/// `pinkish` as a longer name, and `pink` inside a comment are all left alone,
+/// and a quoted `"pink"` is matched because it denotes the same column. The
+/// replacement is always emitted double-quoted, so a new name that collides
+/// with a keyword still parses.
+///
+/// This deliberately does NOT know what the surrounding SQL means — an
+/// identifier used as a function name or a table alias would be rewritten too.
+/// That is safe only because every caller re-compiles the result and compares
+/// it against what it had before accepting it; see
+/// `Schema::with_renamed_column`'s contract. Do not use it without that check.
+pub fn rename_identifier(sql: &str, old: &str, new: &str) -> Result<String> {
+    let toks = token::tokenize(sql)?;
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut cut = 0usize;
+    for t in &toks {
+        let hit = match &t.tok {
+            Tok::Ident(s) | Tok::QuotedIdent(s) => mpedb_types::ident_eq(s, old),
+            _ => false,
+        };
+        if !hit {
+            continue;
+        }
+        out.push_str(&sql[cut..t.pos]);
+        out.push('"');
+        out.push_str(&new.replace('"', "\"\""));
+        out.push('"');
+        cut = t.end;
+    }
+    out.push_str(&sql[cut..]);
+    Ok(out)
+}
+
+/// Retarget a stored `CREATE TABLE <old> …` — or a `CREATE INDEX … ON <old>` —
+/// at `new`, changing nothing else. That is what sqlite's `ALTER TABLE … RENAME
+/// TO` does to the text it keeps in `sqlite_master.sql`, and keeping the text
+/// is what preserves everything a reconstruction cannot express: a column's
+/// declared `COLLATE` spelling, the exact type words, a named CHECK.
+///
+/// `None` means "do not use this text", and the caller falls back to whatever
+/// it did before. Three ways to get there:
+///
+///  * the statement is neither shape, or its table is not `old`;
+///  * `old` occurs again LATER as an identifier. sqlite rewrites those too — a
+///    self-referencing `REFERENCES old(x)` becomes `REFERENCES new(x)` — but
+///    here the same token could equally be a COLUMN called `old`, and this
+///    function cannot tell the two apart. Emitting text that points at a table
+///    that no longer exists would turn a faithful record into a broken one,
+///    which is worse than the normalized reconstruction it falls back to.
+///
+/// Deliberately NOT [`rename_identifier`], which rewrites every matching token:
+/// a table and one of its columns may share a name, and only the header is
+/// being retargeted here.
+pub fn rename_table_in_ddl(sql: &str, old: &str, new: &str) -> Result<Option<String>> {
+    let toks = token::tokenize(sql)?;
+    // Match a structural word against the SOURCE SPAN, not against `Tok::Ident`.
+    // Several of the words this walks are RESERVED — `ON` is `Kw::On` — and an
+    // `is_word` check silently never matches those, so the whole `CREATE INDEX`
+    // arm would fall through and the rewrite would quietly not happen. A
+    // quoted identifier keeps its delimiters in the span and so cannot be
+    // mistaken for the bare keyword, which is the behaviour we want.
+    let at = |i: usize, w: &str| {
+        toks.get(i)
+            .is_some_and(|t| sql[t.pos..t.end].eq_ignore_ascii_case(w))
+    };
+    if !at(0, "CREATE") {
+        return Ok(None);
+    }
+    // `CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] <name>`. A stored record
+    // has neither qualifier in practice, but skipping them costs two lines and
+    // guessing wrong costs a wrong answer.
+    let mut i = 1;
+    if at(i, "TEMP") || at(i, "TEMPORARY") {
+        i += 1;
+    }
+    if at(i, "UNIQUE") {
+        i += 1;
+    }
+    let is_index = at(i, "INDEX");
+    if !is_index && !at(i, "TABLE") {
+        return Ok(None);
+    }
+    i += 1;
+    if at(i, "IF") {
+        i += 3;
+    }
+    // `CREATE TABLE <name>` names the table directly; `CREATE INDEX <name> ON
+    // <table>` names it after ON. sqlite retargets both on a table rename.
+    if is_index {
+        i += 1;
+        if !at(i, "ON") {
+            return Ok(None);
+        }
+        i += 1;
+    }
+    let Some(name_tok) = toks.get(i) else {
+        return Ok(None);
+    };
+    let names_old = match &name_tok.tok {
+        Tok::Ident(s) | Tok::QuotedIdent(s) => mpedb_types::ident_eq(s, old),
+        _ => false,
+    };
+    if !names_old {
+        return Ok(None);
+    }
+    let recurs = toks[i + 1..].iter().any(|t| match &t.tok {
+        Tok::Ident(s) | Tok::QuotedIdent(s) => mpedb_types::ident_eq(s, old),
+        _ => false,
+    });
+    if recurs {
+        return Ok(None);
+    }
+    let mut out = String::with_capacity(sql.len() + 8);
+    out.push_str(&sql[..name_tok.pos]);
+    out.push('"');
+    out.push_str(&new.replace('"', "\"\""));
+    out.push('"');
+    out.push_str(&sql[name_tok.end..]);
+    Ok(Some(out))
+}
+
 /// `CREATE TEMP[ORARY] <thing> …` → `CREATE <thing> temp.…`, or `None` when the
 /// statement is not one.
 ///

@@ -1763,10 +1763,12 @@ fn introspection_hides_the_implicit_rowid() {
             ["CREATE TABLE beta (id INTEGER PRIMARY KEY, v TEXT)"]
         );
 
-        // A RENAME moves the table off the name its recorded text is filed
-        // under, so the answer falls back to the RECONSTRUCTION — and that is
-        // the path this test is really about: it must still elide the hidden
-        // rowid, column AND primary key.
+        // A RENAME carries the recorded text over, retargeted — which for this
+        // already-quoted statement is character-for-character what the
+        // reconstruction would have produced anyway. Either way the hidden
+        // rowid must stay elided, which is the path this test is about.
+        // (`rename_carries_the_verbatim_ddl_like_sqlite` covers the case where
+        // the two DIFFER.)
         assert_eq!(exec(db, "ALTER TABLE \"alpha\" RENAME TO alpha2"), SQLITE_OK);
         assert_eq!(
             collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'alpha2'"),
@@ -2340,5 +2342,65 @@ fn introspection_sees_what_the_previous_statement_committed() {
         assert_eq!(sqlite3_close(a), SQLITE_OK);
         assert_eq!(sqlite3_close(b), SQLITE_OK);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// `ALTER TABLE … RENAME TO` CARRIES the verbatim `CREATE` text, retargeted —
+/// for the table and for every index over it, exactly as sqlite does.
+///
+/// The records are keyed by table name, so a rename used to orphan them and
+/// `sqlite_master` fell back to reconstructing from the live schema. That loses
+/// everything the catalog does not keep verbatim: here, a column's declared
+/// `COLLATE nocase` came back as `COLLATE NOCASE`, and Django's
+/// `assertColumnCollation` — a plain string compare against the token in
+/// `sqlite_master.sql` — failed on the case alone.
+///
+/// It is not an exotic path: Django implements nearly every `AlterField` on
+/// sqlite by building `new__<table>` and renaming it into place.
+#[test]
+fn rename_carries_the_verbatim_ddl_like_sqlite() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE a (x TEXT COLLATE nocase, y int)"),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "CREATE INDEX ix ON a(y)"), SQLITE_OK);
+        assert_eq!(exec(db, "ALTER TABLE a RENAME TO b"), SQLITE_OK);
+
+        // Both texts are what the 3.45.1 binary produces for this script.
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'b'"),
+            ["CREATE TABLE \"b\" (x TEXT COLLATE nocase, y int)"]
+        );
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'ix'"),
+            ["CREATE INDEX ix ON \"b\"(y)"]
+        );
+        // The index's TABLE attribution moved too, so `index_list` still finds
+        // it under the new name and reports it as `CREATE INDEX`-origin.
+        assert_eq!(collect_text_col(db, "SELECT tbl_name FROM sqlite_master WHERE name = 'ix'"), ["b"]);
+
+        // The old name answers nothing, and a NEW table taking it does not
+        // inherit the moved text.
+        assert!(collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'a'").is_empty());
+        assert_eq!(exec(db, "CREATE TABLE a (z int)"), SQLITE_OK);
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'a'"),
+            ["CREATE TABLE a (z int)"]
+        );
+
+        // A SELF-REFERENCE is the one shape the retarget refuses: the same
+        // token could be a column of that name, so rather than emit text
+        // pointing at a table that no longer exists, it falls back to the
+        // reconstruction — which is correct, just not verbatim.
+        assert_eq!(
+            exec(db, "CREATE TABLE p (id INTEGER PRIMARY KEY, up INT REFERENCES p(id))"),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "ALTER TABLE p RENAME TO q"), SQLITE_OK);
+        let sql = collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'q'");
+        assert!(sql[0].contains("\"q\"") && !sql[0].contains("REFERENCES p"), "{sql:?}");
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }

@@ -475,6 +475,42 @@ fn foreign_key_check_finds_what_was_written_with_enforcement_off() {
     assert!(t.db.foreign_key_check(None).unwrap().is_empty());
 }
 
+/// The audit must see the transaction's OWN uncommitted rows.
+///
+/// This is the shape Django's `TestCase` runs: one transaction open for the
+/// whole test, deferred keys, `check_constraints` called from inside it. The
+/// pragma used to answer from a fresh read snapshot, so the violating row was
+/// structurally invisible and a broken database reported clean — a wrong
+/// answer, not a missing feature. Every earlier test here runs in autocommit,
+/// where the two snapshots agree, which is why none of them caught it.
+#[test]
+fn foreign_key_check_sees_the_open_transactions_own_writes() {
+    let t = open();
+    t.db.set_fk_enforced(false);
+    t.db.query("CREATE TABLE p (id INTEGER PRIMARY KEY)", &[]).unwrap();
+    t.db.query(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p INTEGER REFERENCES p (id))",
+        &[],
+    )
+    .unwrap();
+
+    let mut s = t.db.begin().unwrap();
+    s.query("INSERT INTO c (id, p) VALUES (1, 42)", &[]).unwrap();
+    let bad = s.foreign_key_check(None).unwrap();
+    assert_eq!(bad.len(), 1, "uncommitted violation must be visible: {bad:?}");
+    assert_eq!(bad[0].0, "c");
+    assert_eq!(s.foreign_key_check(Some("c")).unwrap().len(), 1);
+    assert!(s.foreign_key_check(Some("p")).unwrap().is_empty());
+    // Unknown table: an empty set, not an error — sqlite's answer.
+    assert!(s.foreign_key_check(Some("nope")).unwrap().is_empty());
+
+    // Supplying the parent in the SAME transaction clears it, without a commit.
+    s.query("INSERT INTO p (id) VALUES (42)", &[]).unwrap();
+    assert!(s.foreign_key_check(None).unwrap().is_empty());
+    s.commit().unwrap();
+    assert!(t.db.foreign_key_check(None).unwrap().is_empty());
+}
+
 /// A key-free schema must not pay for the machinery, and the flag must not
 /// change any answer where there is no key.
 #[test]

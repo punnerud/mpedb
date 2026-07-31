@@ -517,6 +517,24 @@ pub(crate) fn settle_deferred(
 /// parent table name, index of the key on the child)` — sqlite's four columns.
 pub type FkCheckRow = (String, Vec<Value>, String, usize);
 
+/// Resolve `PRAGMA foreign_key_check`'s optional table argument against a
+/// schema: `Some(None)` = audit everything, `Some(Some(id))` = one table.
+///
+/// The outer `None` means the name matched nothing. That is not an error —
+/// sqlite answers an empty set for an unknown table — so the caller returns no
+/// rows instead of failing. Shared so the autocommit and in-transaction entry
+/// points cannot drift on which names they accept.
+pub(crate) fn check_scope(schema: &Schema, table: Option<&str>) -> Option<Option<u32>> {
+    match table {
+        None => Some(None),
+        Some(name) => schema
+            .tables
+            .iter()
+            .find(|t| !t.dead && t.name.eq_ignore_ascii_case(name))
+            .map(|t| Some(t.id)),
+    }
+}
+
 /// Every foreign-key violation standing in the database right now — `PRAGMA
 /// foreign_key_check`.
 pub(crate) fn check_all(

@@ -1956,14 +1956,22 @@ impl<'e> WriteTxn<'e> {
 
     /// ALTER TABLE ... RENAME [COLUMN] (#47 stage 5). Pure metadata: the column
     /// keeps its position and type, so no row is touched.
+    /// `generated_srcs` carries the rewritten `AS (…)` sources — see
+    /// [`mpedb_types::Schema::with_renamed_column`], which documents the
+    /// verification the CALLER owes. This crate only passes them through: it
+    /// has no SQL lexer either.
     pub fn alter_rename_column(
         &mut self,
         table_id: u32,
         column: &str,
         new_name: &str,
+        generated_srcs: &[(u16, String)],
     ) -> Result<()> {
         let bundle = Arc::clone(&self.bundle);
-        let new_schema = bundle.schema.with_renamed_column(table_id, column, new_name)?;
+        let new_schema =
+            bundle
+                .schema
+                .with_renamed_column(table_id, column, new_name, generated_srcs)?;
         self.publish_schema(&new_schema)
     }
 

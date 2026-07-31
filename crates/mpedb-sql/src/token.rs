@@ -185,11 +185,15 @@ fn keyword(word: &str) -> Option<Kw> {
     })
 }
 
-/// A token plus the byte offset of its first character in the source.
+/// A token plus its byte SPAN in the source: `pos` is the offset of its first
+/// character, `end` one past its last. The span covers the token AS WRITTEN —
+/// a quoted identifier's delimiters and doubled escapes included — so a
+/// rewriter can splice over it without re-deriving where the token stopped.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SpTok {
     pub tok: Tok,
     pub pos: usize,
+    pub end: usize,
 }
 
 fn perr(pos: usize, msg: impl Into<String>) -> Error {
@@ -474,7 +478,7 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                 return Err(perr(start, format!("unexpected character `{ch}`")));
             }
         };
-        out.push(SpTok { tok, pos: start });
+        out.push(SpTok { tok, pos: start, end: i });
     }
     Ok(out)
 }

@@ -118,8 +118,8 @@ pub use mpedb_types::model::WorkloadModel;
 /// each solved it differently.
 pub use mpedb_types::toml_escape;
 pub use mpedb_types::{
-    BudgetKind, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, FkAction, Footprint,
-    ForeignKeyDef,
+    BudgetKind, Collation, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, FkAction,
+    Footprint, ForeignKeyDef,
     HostAggState, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema,
     TableDef, TableSet, Value, INDEX_EXPR_COL, MAX_DB_SIZE_MB,
 };
@@ -129,7 +129,7 @@ pub use exec::take_last_insert_rowid;
 pub use fk::FkCheckRow;
 /// Re-exported for the C-API shim, which has to know whether a DDL statement
 /// targets the TEMP schema before it can file the statement's text there.
-pub use mpedb_sql::rewrite_temp_ddl;
+pub use mpedb_sql::{rename_table_in_ddl, rewrite_temp_ddl};
 use mpedb_core::{CheckPrograms, Engine, SchemaPrograms, WriteTxn};
 use mpedb_sql::{CompiledPlan, HostUdfSet, PlanStmt};
 use registry::{decode_registry_plan, patched_last_used, plan_subkey};
@@ -2434,24 +2434,17 @@ impl Database {
     /// Read-only and independent of [`Database::fk_enforced`]: the whole point
     /// is to audit a database that was filled with enforcement OFF, which is
     /// exactly what Django's migration runner does.
+    ///
+    /// This audits the last COMMITTED state. A caller holding an open write
+    /// session must use [`WriteSession::foreign_key_check`] instead — see the
+    /// note there for why the difference is a wrong answer and not a nuance.
     pub fn foreign_key_check(
         &self,
         table: Option<&str>,
     ) -> Result<Vec<FkCheckRow>> {
         let bundle = self.schema();
-        let only = match table {
-            None => None,
-            Some(name) => match bundle
-                .schema
-                .tables
-                .iter()
-                .find(|t| !t.dead && t.name.eq_ignore_ascii_case(name))
-            {
-                Some(t) => Some(t.id),
-                // sqlite answers an empty set for an unknown table rather than
-                // erroring.
-                None => return Ok(Vec::new()),
-            },
+        let Some(only) = fk::check_scope(&bundle.schema, table) else {
+            return Ok(Vec::new());
         };
         let txn = self.engine.begin_read()?;
         let mut ctx = exec::ReadCtx(&txn, None, None, None, exec::ChargeMode::PerRow);
@@ -3150,6 +3143,30 @@ impl WriteSession<'_> {
     /// Schema as seen by this open write txn (includes uncommitted DDL).
     pub fn schema(&self) -> std::sync::Arc<mpedb_core::engine::SchemaBundle> {
         self.txn.schema_bundle()
+    }
+
+    /// `PRAGMA foreign_key_check` over THIS transaction — the same audit
+    /// [`Database::foreign_key_check`] performs, but against the rows the
+    /// session has written and not yet committed.
+    ///
+    /// The distinction is not a nuance, it is the difference between an answer
+    /// and a wrong answer. Django's `TestCase` holds one open transaction for a
+    /// whole test and calls `check_constraints` inside it; its foreign keys are
+    /// DEFERRABLE INITIALLY DEFERRED, so a violating row is accepted at INSERT
+    /// (in sqlite too) and settled only at COMMIT. Auditing a fresh read
+    /// snapshot cannot see that row, so the pragma reported a clean database
+    /// and the test's expected `IntegrityError` never came.
+    ///
+    /// Deliberately independent of the DEFERRED queue `commit` settles: the
+    /// pragma's contract is "what is standing in the data", which includes
+    /// violations written with enforcement off and therefore never queued.
+    pub fn foreign_key_check(&mut self, table: Option<&str>) -> Result<Vec<FkCheckRow>> {
+        let bundle = self.schema();
+        let Some(only) = fk::check_scope(&bundle.schema, table) else {
+            return Ok(Vec::new());
+        };
+        let mut ctx = exec::WriteCtx::new(&mut self.txn, None, None, None);
+        fk::check_all(&mut ctx, &bundle.schema, only)
     }
 
     /// Views visible in this txn (committed + uncommitted `CREATE VIEW`).
@@ -4071,7 +4088,9 @@ impl WriteSession<'_> {
             }
             DdlStmt::AlterRenameColumn { table, column, new_name } => {
                 let id = resolve(&table)?;
-                self.txn.alter_rename_column(id, &column, &new_name)?;
+                let t = schema.schema.table(id).expect("resolve() returned a live id");
+                let srcs = crate::ddl_apply::rename_generated_srcs(t, &column, &new_name)?;
+                self.txn.alter_rename_column(id, &column, &new_name, &srcs)?;
             }
             DdlStmt::AlterAddColumn { table, column } => {
                 let id = resolve(&table)?;
@@ -4094,6 +4113,7 @@ impl WriteSession<'_> {
                 collations,
                 unique,
                 where_clause,
+                if_not_exists,
                 ..
             } => {
                 let id = schema
@@ -4123,12 +4143,22 @@ impl WriteSession<'_> {
                         }
                     }
                 }
-                // Idempotent by shape: an identical index already present is a no-op.
+                // Identified by NAME, not by shape — the same rule the
+                // autocommit applier uses, and it has to be here too because
+                // this is the path Django's migrations actually take: they run
+                // under `atomic=True`, so every `CREATE INDEX` in a migration
+                // arrives in a session. Shape-idempotence reported success and
+                // created nothing whenever an index of that shape existed, so
+                // the migration's own `DROP INDEX` then failed with "no such
+                // index". Every name in this arm is explicit — the parser gives
+                // `name: String` — so there is no unnamed case to fall back to.
                 if t.indexes.iter().any(|ix| {
-                    ix.columns == cols && ix.unique == unique && ix.predicate == where_clause
-                        && ix.exprs == exprs && ix.collations == collations
+                    ix.name.as_deref().is_some_and(|e| mpedb_types::ident_eq(e, &name))
                 }) {
-                    return Ok(ExecResult::Affected(0));
+                    if if_not_exists {
+                        return Ok(ExecResult::Affected(0));
+                    }
+                    return Err(Error::Bind(format!("index `{name}` already exists")));
                 }
                 self.txn
                     .create_index(id, cols, exprs, collations, unique, where_clause, Some(name))?;
