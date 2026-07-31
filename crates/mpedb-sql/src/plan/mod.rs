@@ -494,7 +494,7 @@ const MAX_JOINS: usize = 63;
 //     Python source. The integer SEMANTICS are untouched (0 = the current row,
 //     negative looks the other way — both already matched sqlite); only where
 //     the integer comes from is new.
-const PLAN_FORMAT: u8 = 66;
+const PLAN_FORMAT: u8 = 67;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1671,6 +1671,12 @@ pub enum PlanStmt {
         table: u32,
         access: AccessPath,
         filter: Option<ExprProgram>,
+        /// The CORRELATED residual (format 67): the WHERE conjuncts that read a
+        /// correlated subplan slot, applied PER ROW after that slot is filled
+        /// from the row. Split out of `filter` so the access path can never
+        /// bind to a slot that is still empty — which would not be a refusal
+        /// but a wrong answer.
+        post_filter: Option<ExprProgram>,
         /// column index -> value expression
         set: Vec<(u16, ExprProgram)>,
         /// RLS `WITH CHECK` gate on the post-image row (see `Insert::with_check`).
@@ -1682,6 +1688,12 @@ pub enum PlanStmt {
         table: u32,
         access: AccessPath,
         filter: Option<ExprProgram>,
+        /// The CORRELATED residual (format 67): the WHERE conjuncts that read a
+        /// correlated subplan slot, applied PER ROW after that slot is filled
+        /// from the row. Split out of `filter` so the access path can never
+        /// bind to a slot that is still empty — which would not be a refusal
+        /// but a wrong answer.
+        post_filter: Option<ExprProgram>,
         /// `RETURNING` over the row as it was BEFORE deletion — there is no
         /// post-image to project.
         returning: Option<Vec<Projection>>,

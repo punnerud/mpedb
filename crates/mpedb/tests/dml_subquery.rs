@@ -148,6 +148,52 @@ fn agree(tag: &str, dml: &str, indexed: bool) {
 
 /// Every shape, run with and without an index on the probed columns.
 const CASES: &[(&str, &str)] = &[
+    // --- CORRELATED (the WHERE's correlated half runs PER ROW) --------------
+    // Each of these reads a subplan slot that only exists once a row is in
+    // hand, so the planner splits the WHERE and the executor fills per row.
+    // Running the whole block twice — indexed and not — is the check that
+    // matters: the split decides what the ACCESS PATH may bind to, and binding
+    // an index probe to an unfilled correlated slot would be a wrong answer,
+    // not a refusal.
+    ("corr_exists", "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)"),
+    ("corr_not_exists", "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)"),
+    // A bare inner name only the OUTER row can supply is a correlation too.
+    ("corr_bare_name", "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tk = k)"),
+    ("corr_scalar", "DELETE FROM t WHERE t.v > (SELECT max(u.w) FROM u WHERE u.tk = t.k)"),
+    ("corr_in", "DELETE FROM t WHERE t.id IN (SELECT u.id FROM u WHERE u.w < t.k)"),
+    // Correlated AND an INDEX-ELIGIBLE uncorrelated conjunct: the split must
+    // keep the index probe and still apply the correlated half.
+    ("corr_and_indexed",
+     "DELETE FROM t WHERE t.k = 10 AND EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)"),
+    ("corr_and_pk",
+     "DELETE FROM t WHERE t.id = 1 AND EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)"),
+    ("indexed_and_corr",
+     "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tk = t.k) AND t.k = 40"),
+    // OR cannot be split — the whole predicate becomes the residual.
+    ("corr_or", "DELETE FROM t WHERE t.k = 20 OR EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)"),
+    // A correlated and an UNCORRELATED subquery in one WHERE: two slots, one
+    // filled once and one per row.
+    ("corr_plus_uncorr",
+     "DELETE FROM t WHERE t.v < (SELECT max(u.w) * 100 FROM u) \
+      AND EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)"),
+    // The Halloween case, correlated: the subquery reads the TARGET table, and
+    // the pre-write snapshot is what decides.
+    ("corr_self", "DELETE FROM t WHERE EXISTS (SELECT 1 FROM t x WHERE x.k = t.k AND x.id <> t.id)"),
+    ("corr_self_scalar", "DELETE FROM t WHERE t.v > (SELECT min(x.v) FROM t x WHERE x.k = t.k)"),
+    // Matching nothing, and NULLs on both sides of the correlation.
+    ("corr_empty", "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tk = t.k AND u.w > 100)"),
+    ("corr_null_both",
+     "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tk = t.k AND u.w > t.v)"),
+    // UPDATE, same shapes.
+    ("corr_upd_exists",
+     "UPDATE t SET v = 0 WHERE EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)"),
+    ("corr_upd_scalar",
+     "UPDATE t SET v = v + 1 WHERE t.v > (SELECT max(u.w) FROM u WHERE u.tk = t.k)"),
+    ("corr_upd_indexed",
+     "UPDATE t SET s = 'z' WHERE t.k = 10 AND EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)"),
+    ("corr_upd_self",
+     "UPDATE t SET v = 9 WHERE EXISTS (SELECT 1 FROM t x WHERE x.k = t.k AND x.id <> t.id)"),
+
     // --- IN (SELECT …) ------------------------------------------------------
     // Duplicate-producing inner (tk = 10 twice): membership, not a join, so
     // the two matching `t` rows must be deleted ONCE each.
@@ -223,9 +269,9 @@ fn dml_subquery_matches_sqlite() {
     }
 }
 
-/// The refusals that STAY, each by name. A correlated DML subquery would need
-/// the per-row fill the write path does not have; answering it approximately is
-/// the failure mode this whole family exists to avoid.
+/// The refusals that STAY, each by name. Correlation in the WHERE is no longer
+/// among them (see the `corr_*` cases above); what is left is the SET list,
+/// which is not lifted at all.
 #[test]
 fn documented_refusals() {
     let (db, path) = mpedb_open("refuse", false);
@@ -236,34 +282,23 @@ fn documented_refusals() {
             .to_string();
         assert!(e.contains(needle), "wrong refusal for `{sql}`: {e}");
     };
-    // Correlated to the DELETE target.
-    refuse(
-        "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)",
-        "a correlated subquery in DELETE … WHERE is not supported yet",
-    );
-    // Correlated to the UPDATE target.
-    refuse(
-        "UPDATE t SET v = 1 WHERE t.k > (SELECT max(u.w) FROM u WHERE u.id = t.id)",
-        "a correlated subquery in UPDATE … WHERE is not supported yet",
-    );
-    // A bare inner name that only the OUTER row can supply is a correlation
-    // too — refused by the same rule, not silently resolved.
-    refuse(
-        "DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tk = k)",
-        "a correlated subquery in DELETE … WHERE is not supported yet",
-    );
-    // A subquery in the SET list is still refused (only the WHERE is lifted).
+    // A subquery in the SET list — only the WHERE is lifted, so this is a
+    // different missing route and says so.
     refuse(
         "UPDATE t SET v = (SELECT max(u.w) FROM u) WHERE t.id = 1",
+        "subquer",
+    );
+    refuse(
+        "UPDATE t SET v = (SELECT max(u.w) FROM u WHERE u.tk = t.k) WHERE t.id = 1",
         "subquer",
     );
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
 
-/// A forged plan must not slip a CORRELATED subplan onto a write statement:
-/// `exec_stmt_impl` fills only uncorrelated slots before dispatch, so the write
-/// path would read an unfilled hole. `validate` rejects it as corrupt.
+/// A CORRELATED subplan on an UPDATE/DELETE is legitimate (format 67) and
+/// round-trips; on an INSERT it is not, because there is no per-row outer for
+/// it to correlate to.
 #[test]
 fn correlated_write_subplan_is_corrupt() {
     // Reached structurally: the planner refuses it (asserted above), so this
@@ -276,6 +311,13 @@ fn correlated_write_subplan_is_corrupt() {
     // decode + validate on the wire blob.
     db.execute_detached(&d, &[]).expect("round-trips through validate");
     assert_eq!(mpedb_image(&db).len(), 3);
+    // The CORRELATED twin does too — through the same decode + validate, so
+    // the guard that used to refuse it is genuinely gone and not merely
+    // bypassed by the in-process plan cache.
+    let c = db
+        .prepare_detached("DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tk = t.k)")
+        .expect("plans");
+    db.execute_detached(&c, &[]).expect("round-trips through validate");
     drop(db);
     let _ = std::fs::remove_file(&path);
 }

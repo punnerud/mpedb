@@ -1747,8 +1747,17 @@ fn plan_update(
     // The UPDATE policy restricts the target set, and (read-via-write) the
     // SELECT policy is folded in too — see `read_policy`.
     let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Update)?;
-    let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
+    // A CORRELATED subplan's slot is empty until the row is in hand, so its
+    // conjuncts must NOT reach the access-path extractor — an `IndexPoint` on
+    // an unfilled slot would be a wrong answer, not a refusal. Split first,
+    // exactly as the SELECT path does, and hand the correlated half to the
+    // executor as a per-row residual.
+    let correlated: Vec<bool> = subplans.iter().map(|s| !s.outer_args.is_empty()).collect();
+    let (gather_pred, corr_pred) =
+        subquery::split_correlated(merge_and(bound_where, policy), n_params, &correlated);
+    let (access, residual) = extract_access(gather_pred, table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
+    let post_filter = corr_pred.map(|e| compile_program(&e)).transpose()?;
 
     // WITH CHECK gates the post-image (falls back to USING per PG rule).
     let with_check = write_check(&mut binder, catalog, table_id, &table.name, PolicyCmd::Update)?
@@ -1762,6 +1771,7 @@ fn plan_update(
             table: table_id,
             access,
             filter,
+            post_filter,
             set,
             with_check,
         },
@@ -1829,8 +1839,17 @@ fn plan_delete(
         .map(|e| binder.bind_predicate(e))
         .transpose()?;
     let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Delete)?;
-    let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
+    // A CORRELATED subplan's slot is empty until the row is in hand, so its
+    // conjuncts must NOT reach the access-path extractor — an `IndexPoint` on
+    // an unfilled slot would be a wrong answer, not a refusal. Split first,
+    // exactly as the SELECT path does, and hand the correlated half to the
+    // executor as a per-row residual.
+    let correlated: Vec<bool> = subplans.iter().map(|s| !s.outer_args.is_empty()).collect();
+    let (gather_pred, corr_pred) =
+        subquery::split_correlated(merge_and(bound_where, policy), n_params, &correlated);
+    let (access, residual) = extract_access(gather_pred, table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
+    let post_filter = corr_pred.map(|e| compile_program(&e)).transpose()?;
     let returning = plan_returning(s.returning.as_ref(), &mut binder, table)?;
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
@@ -1839,6 +1858,7 @@ fn plan_delete(
             table: table_id,
             access,
             filter,
+            post_filter,
         },
         param_types,
         context_keys,

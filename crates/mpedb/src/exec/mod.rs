@@ -1325,6 +1325,40 @@ fn exec_stmt_impl(
     }
 }
 
+
+/// The rows a DML statement's WHERE keeps, with the CORRELATED half applied.
+///
+/// `filter` (the uncorrelated conjuncts) is already pushed into the gather;
+/// what is left reads a subplan slot that only exists once a row is in hand.
+/// This is the SELECT path's per-row fill (`correlated_survivors`) applied to
+/// the rows a DELETE/UPDATE has collected — the same function, so the two can
+/// never disagree about when a slot is filled or what it is filled from.
+fn dml_survivors(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    rows: Vec<Vec<Value>>,
+    post_filter: Option<&ExprProgram>,
+) -> Result<Vec<Vec<Value>>> {
+    let correlated: Vec<(usize, &SubPlan)> = plan
+        .subplans
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.outer_args.is_empty())
+        .collect();
+    if correlated.is_empty() && post_filter.is_none() {
+        return Ok(rows);
+    }
+    let base = plan.subplan_base() as usize;
+    Ok(
+        correlated_survivors(ctx, schema, plan, params, base, rows, &correlated, post_filter)?
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect(),
+    )
+}
+
 /// A subquery's rows, reduced to the VALUE its reserved slot carries.
 pub(super) fn subplan_value(r: ExecResult, kind: mpedb_sql::SubPlanKind) -> Result<Value> {
     use mpedb_sql::SubPlanKind as K;
@@ -3068,14 +3102,20 @@ fn exec_stmt_rest(
             table,
             access,
             filter,
+            post_filter,
             set,
             with_check,
             returning,
         } => {
             let t = table_def(schema, plan, *table)?;
             // Collect-then-mutate: gather the matching CURRENT rows first
-            // (read-only; a failure here has no effects).
+            // (read-only; a failure here has no effects). The CORRELATED half
+            // of the WHERE is applied to those rows before any of them is
+            // touched, so the read that decides and the write that follows see
+            // the same snapshot.
             let old_rows = gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?;
+            let old_rows =
+                dml_survivors(ctx, schema, plan, params, old_rows, post_filter.as_ref())?;
             // The UPDATE's SET target columns — an `UPDATE OF <cols>` trigger
             // fires only when one of its columns is among these (sqlite
             // semantics). Statement-wide, so computed once.
@@ -3247,12 +3287,18 @@ fn exec_stmt_rest(
             table,
             access,
             filter,
+            post_filter,
             returning,
         } => {
             let t = table_def(schema, plan, *table)?;
             // Gather full old rows (the residual filter needs them), then
-            // delete by PK values extracted from each row.
+            // delete by PK values extracted from each row. The CORRELATED half
+            // of the WHERE runs over the gathered set BEFORE the first delete,
+            // so a subquery that reads the target table sees the PRE-write
+            // state — SQL's rule, and sqlite's.
             let old_rows = gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?;
+            let old_rows =
+                dml_survivors(ctx, schema, plan, params, old_rows, post_filter.as_ref())?;
             let mut affected = 0u64;
             let mut out: Vec<Vec<Value>> = Vec::new();
             for old in &old_rows {

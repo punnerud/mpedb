@@ -1147,6 +1147,7 @@ fn decode_stmt_rest(tag: u8, buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             let table = r_u32(buf, pos)?;
             let access = decode_access(buf, pos)?;
             let filter = decode_opt_program(buf, pos)?;
+            let post_filter = decode_opt_program(buf, pos)?;
             let n_set = r_u16(buf, pos)? as usize;
             if n_set > crate::parser::MAX_SET_ITEMS {
                 return Err(corrupt("too many SET assignments in plan"));
@@ -1163,6 +1164,7 @@ fn decode_stmt_rest(tag: u8, buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 table,
                 access,
                 filter,
+                post_filter,
                 set,
                 with_check,
                 returning,
@@ -1172,11 +1174,13 @@ fn decode_stmt_rest(tag: u8, buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             let table = r_u32(buf, pos)?;
             let access = decode_access(buf, pos)?;
             let filter = decode_opt_program(buf, pos)?;
+            let post_filter = decode_opt_program(buf, pos)?;
             let returning = decode_opt_projection(buf, pos)?;
             Ok(PlanStmt::Delete {
                 table,
                 access,
                 filter,
+                post_filter,
                 returning,
             })
         }

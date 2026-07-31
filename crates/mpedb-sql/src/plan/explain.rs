@@ -674,6 +674,7 @@ impl CompiledPlan {
                 table,
                 access,
                 filter,
+                post_filter,
                 set,
                 with_check,
                 returning,
@@ -693,6 +694,10 @@ impl CompiledPlan {
                 if let Some(f) = filter {
                     out.push_str(&format!("  filter: {}\n", render_program(f, &name)));
                 }
+                // The correlated half, applied per gathered row (format 67).
+                if let Some(f) = post_filter {
+                    out.push_str(&format!("  post-filter: {}\n", render_program(f, &name)));
+                }
                 let items: Vec<String> = set
                     .iter()
                     .map(|(c, p)| format!("{} = {}", name(*c), render_program(p, &name)))
@@ -703,6 +708,7 @@ impl CompiledPlan {
                 table,
                 access,
                 filter,
+                post_filter,
                 returning,
             } => {
                 let name = col_namer(*table);
@@ -716,6 +722,10 @@ impl CompiledPlan {
                 ));
                 if let Some(f) = filter {
                     out.push_str(&format!("  filter: {}\n", render_program(f, &name)));
+                }
+                // The correlated half, applied per gathered row (format 67).
+                if let Some(f) = post_filter {
+                    out.push_str(&format!("  post-filter: {}\n", render_program(f, &name)));
                 }
             }
             PlanStmt::Begin => out.push_str("Begin\n"),

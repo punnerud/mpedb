@@ -940,6 +940,7 @@ impl CompiledPlan {
                 table,
                 access,
                 filter,
+                post_filter,
                 set,
                 with_check,
                 returning,
@@ -951,6 +952,17 @@ impl CompiledPlan {
                 self.check_access(access, t, None, ptypes)?;
                 if let Some(f) = filter {
                     self.check_program(f, t, ptypes)?;
+                }
+                // The correlated residual reads the SAME row `filter` does; the
+                // difference is only WHEN, so the bound is identical.
+                if let Some(f) = post_filter {
+                    self.check_program(f, t, ptypes)?;
+                }
+                // A residual with nothing to fill it would be silently dropped
+                // by the executor's leaf path — refuse the shape instead.
+                if post_filter.is_some() && !self.subplans.iter().any(|s| !s.outer_args.is_empty())
+                {
+                    return Err(corrupt("UPDATE post-filter without a correlated subplan"));
                 }
                 if let Some(w) = with_check {
                     self.check_program(w, t, ptypes)?;
@@ -978,6 +990,7 @@ impl CompiledPlan {
                 table,
                 access,
                 filter,
+                post_filter,
                 returning,
             } => {
                 let t = get_table(*table)?;
@@ -987,6 +1000,13 @@ impl CompiledPlan {
                 }
                 if let Some(f) = filter {
                     self.check_program(f, t, ptypes)?;
+                }
+                if let Some(f) = post_filter {
+                    self.check_program(f, t, ptypes)?;
+                }
+                if post_filter.is_some() && !self.subplans.iter().any(|s| !s.outer_args.is_empty())
+                {
+                    return Err(corrupt("DELETE post-filter without a correlated subplan"));
                 }
             }
             PlanStmt::Begin
@@ -1022,11 +1042,25 @@ impl CompiledPlan {
         // registry: works in-process from the local cache, `UnknownPlan` from
         // every other process. The regression test is
         // `insert_with_scalar_subquery_round_trips`.)
+        // A DML target's row is an outer row too (format 67): `DELETE FROM t
+        // WHERE EXISTS (SELECT … WHERE u.k = t.k)` correlates to `t`, and the
+        // executor fills the slot per gathered row before applying the
+        // statement's `post_filter`. So UPDATE/DELETE name their target table
+        // here and their `outer_args` bounds-check against ITS columns.
+        //
+        // INSERT does not: its statement-level subplans come from the VALUES
+        // expressions and the ON CONFLICT SET/filter, and there is no per-row
+        // outer for them to correlate to.
+        let dml_target: Option<u32> = match &self.stmt {
+            PlanStmt::Update { table, .. } | PlanStmt::Delete { table, .. } => Some(*table),
+            _ => None,
+        };
         let outer = match &self.stmt {
             PlanStmt::Select(outer) => Some(outer),
-            PlanStmt::Insert { .. } | PlanStmt::Update { .. } | PlanStmt::Delete { .. } => {
+            PlanStmt::Update { .. } | PlanStmt::Delete { .. } => None,
+            PlanStmt::Insert { .. } => {
                 if self.subplans.iter().any(|s| !s.outer_args.is_empty()) {
-                    return Err(corrupt("correlated subplan on a write statement"));
+                    return Err(corrupt("correlated subplan on an INSERT"));
                 }
                 None
             }
@@ -1053,9 +1087,13 @@ impl CompiledPlan {
                 .ok_or_else(|| corrupt(format!("table id {id} out of range")))
         };
         // The outer base row: `[table0 ‖ … ‖ tableN]` types, for outer_args.
-        // EMPTY for a write statement — nothing may correlate to it, and the
+        // The row a subplan's `outer_args` index into: a SELECT's base row, or
+        // — for UPDATE/DELETE — the target table's. EMPTY for an INSERT, so the
         // bounds check below turns a forged `outer_arg` into `corrupt`.
         let mut outer_types: Vec<ColumnType> = Vec::new();
+        if let Some(id) = dml_target {
+            outer_types.extend(get_table(id)?.columns.iter().map(|c| c.ty));
+        }
         if let Some(outer) = outer {
             for id in std::iter::once(outer.table).chain(outer.joins.iter().map(|j| j.table)) {
                 // A FROM-less outer contributes zero columns — nothing can

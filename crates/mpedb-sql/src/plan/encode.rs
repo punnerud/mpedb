@@ -697,6 +697,7 @@ fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             table,
             access,
             filter,
+            post_filter,
             set,
             with_check,
             returning,
@@ -705,6 +706,8 @@ fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&table.to_le_bytes());
             encode_access(access, buf);
             encode_opt_program(filter.as_ref(), buf);
+            // Format 67, right after `filter` — the two are one split.
+            encode_opt_program(post_filter.as_ref(), buf);
             w_u16(buf, set.len() as u16);
             for (c, program) in set {
                 w_u16(buf, *c);
@@ -717,12 +720,14 @@ fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             table,
             access,
             filter,
+            post_filter,
             returning,
         } => {
             buf.push(STMT_DELETE);
             buf.extend_from_slice(&table.to_le_bytes());
             encode_access(access, buf);
             encode_opt_program(filter.as_ref(), buf);
+            encode_opt_program(post_filter.as_ref(), buf);
             encode_opt_projection(returning.as_deref(), buf);
         }
         PlanStmt::Begin => buf.push(STMT_BEGIN),

@@ -260,13 +260,12 @@ pub(super) fn lift_dml_where<'a>(
         subplans: Vec::new(),
         slot_types: Vec::new(),
     };
+    let _ = op;
+    // A CORRELATED subplan is no longer refused here: the caller splits the
+    // bound predicate with `split_correlated` — the same function the SELECT
+    // path uses — so the correlated conjuncts become a per-row residual and
+    // never reach the access-path extractor.
     let rewritten = lift.rewrite(where_clause)?;
-    if lift.subplans.iter().any(|s| !s.outer_args.is_empty()) {
-        return Err(bind_err(format!(
-            "a correlated subquery in {op} … WHERE is not supported yet — the \
-             correlated value is filled per row, which only the SELECT path does"
-        )));
-    }
     Ok((rewritten, lift.subplans, lift.slot_types))
 }
 
