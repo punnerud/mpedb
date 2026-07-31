@@ -2849,11 +2849,17 @@ impl<'e> WriteTxn<'e> {
             schema_gen_bump: self.schema_gen_bump,
             written_tables: self.written_tables,
             commit_point: self.commit_point,
-            extent_map_root: self.extent_map_root,
-            ext_edits: self.pending_map_edits.len(),
-            ext_freed_runs: self.freed_runs.len(),
-            ext_taken_runs: self.taken_runs.len(),
-            ext_dirty: self.extent_dirty.len(),
+            ext: ExtentSnapshot {
+                map_root: self.extent_map_root,
+                run_pool: self.run_pool.clone(),
+                taken_runs: self.taken_runs.clone(),
+                freed_runs: self.freed_runs.clone(),
+                allocated_runs: self.allocated_runs.clone(),
+                pending_map_edits: self.pending_map_edits.clone(),
+                dirty: self.extent_dirty.clone(),
+                buf: self.extent_buf.clone(),
+                buf_off: self.extent_buf_off,
+            },
         })
     }
 
@@ -2861,25 +2867,29 @@ impl<'e> WriteTxn<'e> {
     /// accounting via [`rollback_to`](Self::rollback_to), then the captured
     /// dirty-page contents and working-set scalars.
     ///
-    /// Refuses (a clean [`Error::Unsupported`]) when a large-value **extent**
-    /// write (the out-of-tree blob allocator, `vkind=2`) happened since the
-    /// savepoint: that allocator's state is not snapshotted here, and undoing it
-    /// silently would corrupt the extent map / leak pages. Inline values never
-    /// touch extents, and btree overflow chains ARE ordinary dirty pages (so
-    /// they are covered by the page-image restore) — only genuinely large blob
-    /// columns can trip this, and they trip it cleanly rather than wrongly.
+    /// A large-value **extent** write in the scope is undone too: the whole
+    /// allocator working set was captured at savepoint time and is restored
+    /// here. The PAYLOAD BYTES already pwritten to the file are left where they
+    /// are — those pages return to the pool or below `high_water` (the base
+    /// savepoint's job) and nothing references them, exactly as for a
+    /// rolled-back page allocation. This used to be a clean refusal, which was
+    /// correct-but-narrow: on Linux `extent_threshold` is 4 KiB, so it fired
+    /// for an ordinary text column, not just for "genuinely large blobs".
     pub fn rollback_to_full(&mut self, sp: TxnSavepointFull) -> Result<()> {
-        if self.extent_map_root != sp.extent_map_root
-            || self.pending_map_edits.len() != sp.ext_edits
-            || self.freed_runs.len() != sp.ext_freed_runs
-            || self.taken_runs.len() != sp.ext_taken_runs
-            || self.extent_dirty.len() != sp.ext_dirty
-        {
-            return Err(Error::Unsupported(
-                "ROLLBACK TO across a large blob/overflow-extent write is not supported".into(),
-            ));
-        }
         self.rollback_to_inner(sp.base);
+        // Restore the extent allocator BEFORE the page images: the map's own
+        // pages live in the page store, so the image restore must be the last
+        // word on their contents.
+        let ext = sp.ext;
+        self.extent_map_root = ext.map_root;
+        self.run_pool = ext.run_pool;
+        self.taken_runs = ext.taken_runs;
+        self.freed_runs = ext.freed_runs;
+        self.allocated_runs = ext.allocated_runs;
+        self.pending_map_edits = ext.pending_map_edits;
+        self.extent_dirty = ext.dirty;
+        self.extent_buf = ext.buf;
+        self.extent_buf_off = ext.buf_off;
         self.schema_gen_bump = sp.schema_gen_bump;
         self.written_tables = sp.written_tables;
         self.commit_point = sp.commit_point;
@@ -2962,13 +2972,44 @@ pub struct TxnSavepointFull {
     schema_gen_bump: bool,
     written_tables: u64,
     commit_point: Option<(u32, u64)>,
-    extent_map_root: u64,
-    // Append-only extent-activity counters — a change means a large-value
-    // extent write happened in the scope, which `rollback_to_full` refuses.
-    ext_edits: usize,
-    ext_freed_runs: usize,
-    ext_taken_runs: usize,
-    ext_dirty: usize,
+    /// The WHOLE extent-allocator working set, captured by value.
+    ///
+    /// This used to be four LENGTHS, compared on rollback so that any extent
+    /// activity in the scope was refused. Refusing was the honest thing while
+    /// the state was not snapshotted — but on Linux `extent_threshold` is
+    /// 4 KiB, so "a large blob" is an ordinary text column, and `ROLLBACK TO`
+    /// failed for every one of them. Django's `TestCase` puts each test in a
+    /// savepoint, so one 6 KiB value broke every following test in the class.
+    ///
+    /// Copying the state is exact BY CONSTRUCTION — no reasoning about which
+    /// collections happen to be append-only, which is the kind of premise that
+    /// is true until someone adds a compaction pass. It rides alongside
+    /// `page_images`, which already clones 4 KiB per dirty page, so the cost is
+    /// noise next to what the savepoint already pays.
+    ext: ExtentSnapshot,
+}
+
+/// The extent allocator's per-transaction working set (DESIGN-BLOBEXTENT).
+/// Everything `alloc_run`/`free_run`/the payload writer touch, so restoring it
+/// wholesale returns the allocator to exactly its savepoint state. The page
+/// side — `high_water`, `reusable`, `taken`, `freed` — is the BASE savepoint's
+/// and is restored by `rollback_to_inner`.
+#[derive(Clone)]
+struct ExtentSnapshot {
+    map_root: u64,
+    run_pool: Vec<extent::PoolRun>,
+    taken_runs: Vec<extent::TakenRunEntry>,
+    freed_runs: Vec<(u64, u32)>,
+    allocated_runs: std::collections::HashMap<u64, u32>,
+    pending_map_edits: Vec<super::extent::MapEdit>,
+    dirty: Vec<(u64, u32)>,
+    /// The coalescing buffer and its file offset. Bytes buffered BEFORE the
+    /// savepoint belong to runs allocated before it, which are still owned, so
+    /// re-flushing them writes the same bytes to the same offsets — idempotent.
+    /// Bytes buffered after are dropped along with the map edits that would
+    /// have referenced them.
+    buf: Vec<u8>,
+    buf_off: u64,
 }
 
 fn table_column_name(eng: &Engine, table_id: u32, col: u16) -> String {

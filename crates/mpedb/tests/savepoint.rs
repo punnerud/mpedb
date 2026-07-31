@@ -447,3 +447,108 @@ fn heavy_allocation_inside_savepoints_keeps_accounting_exact() {
     }
     db.verify().unwrap();
 }
+
+/// A savepoint spanning an EXTENT write — the out-of-tree allocator for values
+/// above `extent_threshold` (4 KiB on Linux, so an ordinary text column).
+///
+/// `ROLLBACK TO` used to REFUSE this by name: the allocator's working set was
+/// not snapshotted, so undoing it would have corrupted the extent map. The
+/// refusal was correct and far too broad — Django's `TestCase` puts every test
+/// in a savepoint, so a single 6 KiB value made every following test in the
+/// class fail with `TransactionManagementError`.
+///
+/// What this pins is not that the call SUCCEEDS but that the rows come BACK,
+/// across every shape that moves the allocator (insert, update into and out of
+/// an extent, delete, and a mix), and that the page accounting is exact
+/// afterwards — `verify()` is what would catch a leaked or double-owned run.
+#[test]
+fn savepoints_span_extent_writes_and_the_accounting_stays_exact() {
+    let dir = mpedb_testkit::scratch_base_str();
+    let path = format!(
+        "{dir}/mpedb-savepoint-ext-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-wal"));
+    // A TEXT column, because on Linux the extent threshold is 4 KiB and the
+    // point of the fix is that this is not an exotic type.
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 32\nmax_readers = 8\n\n\
+         [[table]]\nname = \"e\"\nprimary_key = [\"id\"]\n\
+         [[table.column]]\nname = \"id\"\ntype = \"int64\"\n\
+         [[table.column]]\nname = \"d\"\ntype = \"text\"\nnullable = true\n"
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    struct G(String);
+    impl Drop for G {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(format!("{}-wal", self.0));
+        }
+    }
+    let _g = G(path.clone());
+
+    let big = "\u{416}".repeat(3000); // 6000 bytes — above the threshold
+    let huge = "z".repeat(200_000);
+    let count = |db: &Database| match db.query("SELECT count(*) FROM e", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => render(&rows[0][0]),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    // A committed baseline that itself lives in an extent, so the rollbacks
+    // below have something extent-shaped to NOT disturb.
+    {
+        let mut s = db.begin().unwrap();
+        s.query(&format!("INSERT INTO e VALUES(1, '{}')", "k".repeat(9000)), &[]).unwrap();
+        s.query("INSERT INTO e VALUES(2, 'small')", &[]).unwrap();
+        s.commit().unwrap();
+    }
+    assert_eq!(count(&db), "2");
+    db.verify().unwrap();
+
+    for round in 0..3 {
+        let mut s = db.begin().unwrap();
+        s.query("SAVEPOINT sp", &[]).unwrap();
+        // Insert several extent-sized values …
+        for i in 0..8 {
+            let id = 100 + round * 100 + i;
+            s.query(&format!("INSERT INTO e VALUES({id}, '{big}')"), &[]).unwrap();
+        }
+        // … one far larger …
+        s.query(&format!("INSERT INTO e VALUES({}, '{huge}')", 900 + round), &[]).unwrap();
+        // … move a committed row INTO an extent and another OUT of one …
+        s.query(&format!("UPDATE e SET d = '{big}' WHERE id = 2"), &[]).unwrap();
+        s.query("UPDATE e SET d = 'tiny' WHERE id = 1", &[]).unwrap();
+        // … and delete an extent-backed row.
+        s.query("DELETE FROM e WHERE id = 1", &[]).unwrap();
+        s.query("ROLLBACK TO sp", &[]).unwrap();
+        s.query("RELEASE sp", &[]).unwrap();
+        s.commit().unwrap();
+        assert_eq!(count(&db), "2", "round {round}: the rollback did not restore");
+        db.verify().unwrap();
+    }
+
+    // The committed extent value is intact after all that churn, byte for byte.
+    match db.query("SELECT d FROM e WHERE id = 1", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => {
+            assert_eq!(render(&rows[0][0]), "k".repeat(9000))
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // And a COMMIT after a rolled-back extent write still persists new ones.
+    {
+        let mut s = db.begin().unwrap();
+        s.query("SAVEPOINT sp", &[]).unwrap();
+        s.query(&format!("INSERT INTO e VALUES(500, '{huge}')"), &[]).unwrap();
+        s.query("ROLLBACK TO sp", &[]).unwrap();
+        s.query(&format!("INSERT INTO e VALUES(501, '{big}')"), &[]).unwrap();
+        s.query("RELEASE sp", &[]).unwrap();
+        s.commit().unwrap();
+    }
+    assert_eq!(count(&db), "3");
+    match db.query("SELECT d FROM e WHERE id = 501", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => assert_eq!(render(&rows[0][0]).len(), big.len()),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    db.verify().unwrap();
+}
