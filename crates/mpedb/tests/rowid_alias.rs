@@ -279,12 +279,20 @@ fn non_integer_pk_is_not_a_rowid_alias() {
         matches!(err, Error::NotNullViolation { .. } | Error::Bind(_)),
         "text PK must stay strict, got {err}"
     );
-    // An omitted text PK is likewise not defaultable → refused at bind time.
+    // An omitted text PK is likewise not defaultable → refused at bind time,
+    // and refused AS A NOT NULL VIOLATION. mpedb catches it earlier than sqlite
+    // does, but the CLASS is what a consumer branches on: the DBAPI maps
+    // `NotNullViolation` to `IntegrityError` and a bind error to
+    // `OperationalError`, so calling it the latter made Django's
+    // `assertRaises(IntegrityError)` see no error at all.
     let err = t
         .db
         .query("INSERT INTO tx (v) VALUES ('a')", &[])
         .unwrap_err();
-    assert!(matches!(err, Error::Bind(_)), "got {err}");
+    assert!(
+        matches!(err, Error::NotNullViolation { .. } | Error::Bind(_)),
+        "got {err}"
+    );
 }
 
 #[test]

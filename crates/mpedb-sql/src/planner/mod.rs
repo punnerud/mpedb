@@ -1423,10 +1423,13 @@ fn plan_insert(
             && col.generated.is_none()
             && Some(ci as u16) != rowid_col
         {
-            return Err(bind_err(format!(
-                "column `{}` is NOT NULL without a default and must be inserted",
-                col.name
-            )));
+            // The same reasoning as the assignment site: detected at bind,
+            // but it IS a NOT NULL violation and must carry that class, or a
+            // consumer catching `IntegrityError` sees nothing.
+            return Err(Error::NotNullViolation {
+                table: table.name.clone(),
+                column: col.name.clone(),
+            });
         }
     }
 
@@ -1508,10 +1511,14 @@ fn plan_insert(
                                 coerce_const(v, col.ty, binder.sqlite_dialect())
                             };
                             if v.is_null() && !col.nullable {
-                                return Err(bind_err(format!(
-                                    "cannot insert NULL into NOT NULL column `{}`",
-                                    col.name
-                                )));
+                                // Third of the three bind-time NOT NULL sites,
+                                // and it carries the same class for the same
+                                // reason: `IntegrityError`, not
+                                // `OperationalError`.
+                                return Err(Error::NotNullViolation {
+                                    table: table.name.clone(),
+                                    column: col.name.clone(),
+                                });
                             }
                             if !v.fits(col.ty) {
                                 // Name the reason when `coerce_const` TRIED and

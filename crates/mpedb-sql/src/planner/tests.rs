@@ -480,9 +480,12 @@ fn update_rejects_pk_and_bad_types() {
         prepare("UPDATE users SET age = 'x'", &s),
         Err(Error::Bind(_))
     ));
+    // A NOT NULL violation carries THAT class even though it is caught at
+    // bind — the DBAPI maps it to `IntegrityError`, and a bind error would map
+    // to `OperationalError`, which is a different thing to a consumer.
     assert!(matches!(
         prepare("UPDATE users SET email = NULL", &s),
-        Err(Error::Bind(_))
+        Err(Error::NotNullViolation { .. })
     ));
     // A column assigned more than once keeps only the rightmost occurrence
     // (sqlite R-34751-18293) — accepted, not an error, and it compiles to ONE
@@ -505,15 +508,17 @@ fn update_rejects_pk_and_bad_types() {
 #[test]
 fn insert_binding_rules() {
     let s = test_schema();
-    // Omitting a NOT NULL column without default is a bind error.
+    // Omitting a NOT NULL column without default is a NOT NULL VIOLATION —
+    // caught at bind, but named for what it is, because the DBAPI class is
+    // what a consumer branches on.
     match prepare("INSERT INTO users (id) VALUES (1)", &s) {
-        Err(Error::Bind(m)) => assert!(m.contains("email")),
-        other => panic!("expected bind error, got {other:?}"),
+        Err(Error::NotNullViolation { column, .. }) => assert_eq!(column, "email"),
+        other => panic!("expected a NOT NULL violation, got {other:?}"),
     }
     // Explicit NULL into NOT NULL column.
     assert!(matches!(
         prepare("INSERT INTO users (id, email) VALUES (1, NULL)", &s),
-        Err(Error::Bind(_))
+        Err(Error::NotNullViolation { .. })
     ));
     // Type mismatch.
     assert!(matches!(

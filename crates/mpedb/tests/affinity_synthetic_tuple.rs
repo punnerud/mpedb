@@ -271,3 +271,103 @@ fn the_affinities_survive_a_plan_round_trip() {
     }
     d.verify().unwrap();
 }
+
+/// COLUMN vs COLUMN across the numeric/text divide: sqlite applies NUMERIC
+/// affinity to both sides when one is numeric and the other TEXT, so an
+/// INTEGER primary key joined against a `varchar` foreign key MATCHES. mpedb
+/// refused it — "cannot compare int64 and text" — which is what Django's
+/// generic relations do on every query (`GenericForeignKey.object_id` is a
+/// CharField joined to an AutoField pk).
+///
+/// The FENCE is the other half of this test and matters more than the feature:
+/// the rule must NOT widen to a column against a parameter or a constant.
+/// `as_col_cmp` matches `ClassCmp`, so `id = '007'` would build a `PkPoint` on
+/// the UNCONVERTED text, probe for `Text("007")`, miss, and return no rows
+/// where sqlite returns row 7. That is a wrong answer; the refusal is not.
+#[test]
+fn a_numeric_column_compares_with_a_text_column() {
+    let dir = mpedb_testkit::scratch_base_str();
+    let path = format!(
+        "{dir}/mpedb-numtext-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-wal"));
+    let toml = format!("[database]\npath = \"{path}\"\nsize_mb = 16\ndurability = \"none\"\n");
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    struct G(String);
+    impl Drop for G {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(format!("{}-wal", self.0));
+        }
+    }
+    let _g = G(path.clone());
+
+    // Django's shape: an integer pk and a `varchar` column holding its text.
+    let ddl = [
+        "CREATE TABLE p (id integer PRIMARY KEY, nm varchar(20))",
+        "CREATE TABLE c (id integer PRIMARY KEY, object_id varchar(100), val varchar(20))",
+    ];
+    let seed = [
+        "INSERT INTO p VALUES (1,'a')",
+        "INSERT INTO p VALUES (2,'b')",
+        "INSERT INTO p VALUES (7,'g')",
+        // '007' must match 7, 'nope' and NULL must match nothing — the three
+        // cases `numerify` decides.
+        "INSERT INTO c VALUES (1,'1','x')",
+        "INSERT INTO c VALUES (2,'007','y')",
+        "INSERT INTO c VALUES (3,'2','z')",
+        "INSERT INTO c VALUES (4,'nope','w')",
+        "INSERT INTO c VALUES (5,NULL,'v')",
+    ];
+    for s in ddl.iter().chain(seed.iter()) {
+        db.query(s, &[]).unwrap_or_else(|e| panic!("{s}: {e}"));
+    }
+    let mut script = String::new();
+    for s in ddl.iter().chain(seed.iter()) {
+        script.push_str(s);
+        script.push_str(";\n");
+    }
+    for q in [
+        "SELECT p.id, c.val FROM p JOIN c ON p.id = c.object_id ORDER BY p.id, c.val",
+        "SELECT p.id FROM p JOIN c ON c.object_id = p.id ORDER BY p.id",
+        "SELECT count(*) FROM p, c WHERE p.id = c.object_id",
+        "SELECT p.id, c.val FROM p LEFT JOIN c ON p.id = c.object_id ORDER BY p.id, c.val",
+        // Inequality across the divide, and the reverse operand order.
+        "SELECT count(*) FROM p JOIN c ON p.id > c.object_id",
+        "SELECT count(*) FROM p JOIN c ON c.object_id <= p.id",
+        // A non-numeric text and a NULL never match a number.
+        "SELECT count(*) FROM c WHERE c.object_id = c.id",
+    ] {
+        let mut sc = script.clone();
+        sc.push_str(q);
+        sc.push_str(";\n");
+        let want: Vec<Vec<String>> = sqlite_oracle::script_stdout(&sc, "")
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('|').map(str::to_string).collect())
+            .collect();
+        assert_eq!(mpedb_rows(&db, q), want, "mismatch on `{q}`");
+    }
+
+    // THE FENCE. Every one of these has a non-column on one side and must stay
+    // refused — sqlite answers them, so mpedb is narrower here ON PURPOSE.
+    for q in [
+        "SELECT id FROM p WHERE id = '007'",
+        "SELECT id FROM p WHERE id = '1'",
+        "SELECT id FROM p WHERE '1' = id",
+        "SELECT id FROM p WHERE id > '1'",
+        "SELECT val FROM c WHERE object_id = 1",
+        // A scalar subquery is not a column either.
+        "SELECT c.id FROM c WHERE c.object_id = (SELECT id FROM p WHERE nm = 'a')",
+    ] {
+        assert!(
+            db.query(q, &[]).is_err(),
+            "the numeric/text rule must not reach `{q}` — an access path built on \
+             unconverted text is a wrong answer"
+        );
+    }
+    db.verify().unwrap();
+}

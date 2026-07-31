@@ -489,6 +489,17 @@ impl<'a> Scope<'a> {
     /// construction (INSERT's target, RLS policy binding, `excluded.`).
     /// Panics if the scope is wider — a caller that reaches for "the" table of a
     /// join has a bug that must not be papered over with an arbitrary choice.
+    /// The single table's NAME when there is one, else empty. Unlike
+    /// [`Self::only`] this never asserts — it exists for ERROR paths, where
+    /// panicking on a shape the caller did not expect would replace a
+    /// diagnosable message with a crash.
+    pub fn sole_table_name(&self) -> String {
+        match self.tables.as_slice() {
+            [t] => t.name.clone(),
+            _ => String::new(),
+        }
+    }
+
     pub fn only(&self) -> &'a TableDef {
         assert_eq!(
             self.tables.len(),
@@ -1089,10 +1100,18 @@ impl<'a> Binder<'a> {
             None => {
                 if let BExpr::Const(v) = &b {
                     if v.is_null() && !col.nullable {
-                        return Err(bind_err(format!(
-                            "cannot assign NULL to NOT NULL column `{}`",
-                            col.name
-                        )));
+                        // `NotNullViolation`, not a bind error, even though it
+                        // is caught at BIND: the CLASS is what a consumer
+                        // branches on. sqlite raises this at run time and the
+                        // DBAPI maps it to `IntegrityError`; a bind error maps
+                        // to `OperationalError`, so Django's
+                        // `assertRaises(IntegrityError)` saw no error at all.
+                        // Catching it earlier than sqlite is a feature; calling
+                        // it something else is not.
+                        return Err(Error::NotNullViolation {
+                            table: self.scope.sole_table_name(),
+                            column: col.name.clone(),
+                        });
                     }
                 }
                 Ok(b)
@@ -1805,7 +1824,27 @@ impl<'a> Binder<'a> {
                 // remains a PkPoint/IndexPoint. Inequality leaves the param free
                 // (ClassCmp+Numeric) so `year >= 1942.1` is exact numeric compare.
                 let is_eq = matches!(op, BinOp::Eq | BinOp::Ne);
-                let (l, r, unified) = if is_eq {
+                // COLUMN vs COLUMN across the numeric/text divide, decided
+                // BEFORE unification because `unify_types` errors on
+                // `(Int64, Text)` and `class_cmp_affinity` is never reached.
+                //
+                // sqlite applies NUMERIC affinity to both sides when one has a
+                // numeric affinity and the other TEXT, so an INTEGER pk joined
+                // against a `varchar` FK matches — which is exactly what
+                // Django's generic relations do (`object_id` is a CharField).
+                // mpedb refused it as "cannot compare int64 and text".
+                //
+                // STRICTLY column-vs-column. It must never widen to a
+                // parameter or a constant: `as_col_cmp` matches `ClassCmp`, so
+                // `id = '007'` would build a `PkPoint` on the UNCONVERTED text,
+                // probe for `Text("007")`, miss, and return no rows where
+                // sqlite returns row 7 — a wrong answer, not a refusal.
+                // Column-vs-column is safe because `as_atom` rejects a `Col`
+                // on the other side, so no single-table access path forms.
+                let numeric_text_cols = self.numeric_vs_text_columns(&l, &r);
+                let (l, r, unified) = if numeric_text_cols {
+                    (l, r, Some(ColumnType::Any))
+                } else if is_eq {
                     self.unify_compare_eq(l, lt, r, rt)?
                 } else {
                     self.unify_compare_operands(l, lt, r, rt)?
@@ -1832,7 +1871,11 @@ impl<'a> Binder<'a> {
                 // Comparison affinity + storage-class order. Equality against a
                 // typed column deliberately does NOT take ClassCmp (keeps the
                 // Binary probe). See `class_cmp_affinity`.
-                let node = match self.class_cmp_affinity(unified, &l, &r, is_eq) {
+                let node = match if numeric_text_cols {
+                    Some(Affinity::Numeric)
+                } else {
+                    self.class_cmp_affinity(unified, &l, &r, is_eq)
+                } {
                     Some(aff) => BExpr::ClassCmp(op, Box::new(l), Box::new(r), coll, aff),
                     None if coll == Collation::Binary => {
                         BExpr::Binary(op, Box::new(l), Box::new(r))
@@ -2278,6 +2321,27 @@ impl<'a> Binder<'a> {
     /// and ordering by class WITHOUT the affinity is the wrong answer this
     /// rule exists to avoid (`price < '40.0'` would say "every number is
     /// smaller than a text" where sqlite compares against 40.0).
+    /// Both operands are BARE COLUMNS, exactly one carrying a numeric affinity
+    /// (`Integer`/`Real`/`Numeric`) and the other `Text`.
+    ///
+    /// That is the one shape where sqlite's `sqlite3CompareAffinity` applies
+    /// NUMERIC to both sides and mpedb's rigid unification refuses. Restricted
+    /// to columns on BOTH sides deliberately — see the call site for why a
+    /// parameter or constant on either side would be a wrong answer.
+    fn numeric_vs_text_columns(&self, l: &BExpr, r: &BExpr) -> bool {
+        let aff = |e: &BExpr| match e {
+            BExpr::Col(i) => self.scope.column_shape(*i).map(|(_, a)| a),
+            _ => None,
+        };
+        let (Some(la), Some(ra)) = (aff(l), aff(r)) else {
+            return false;
+        };
+        let num = |a: Affinity| {
+            matches!(a, Affinity::Integer | Affinity::Real | Affinity::Numeric)
+        };
+        (num(la) && ra == Affinity::Text) || (la == Affinity::Text && num(ra))
+    }
+
     fn class_cmp_affinity(
         &self,
         unified: Ty,

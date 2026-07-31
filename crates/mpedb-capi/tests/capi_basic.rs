@@ -654,6 +654,48 @@ fn constraint_error_maps_to_sqlite_constraint() {
     }
 }
 
+/// A NOT NULL violation is `SQLITE_CONSTRAINT_NOTNULL` no matter WHEN mpedb
+/// notices it.
+///
+/// mpedb catches three of these at BIND, earlier than sqlite does — which is a
+/// feature. Reporting them as a plain error was not: the DBAPI maps
+/// `SQLITE_CONSTRAINT` to `IntegrityError` and everything else to
+/// `OperationalError`, so Django's `assertRaises(IntegrityError)` around
+/// `loaddata` saw no error at all and three fixture tests failed with
+/// "IntegrityError not raised" — for a constraint that WAS being enforced.
+#[test]
+fn not_null_is_a_constraint_error_however_early_it_is_caught() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, e TEXT NOT NULL)"),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "INSERT INTO t (id, e) VALUES (1, 'a')"), SQLITE_OK);
+        for sql in [
+            // Caught at RUN time, like sqlite.
+            "INSERT INTO t (id, e) VALUES (2, NULL)",
+            // Caught at BIND — the three that reported the wrong class.
+            "INSERT INTO t (id) VALUES (3)",
+            "UPDATE t SET e = NULL",
+        ] {
+            let mut errmsg: *mut c_char = ptr::null_mut();
+            let s = cs(sql);
+            let rc = sqlite3_exec(db, s.as_ptr(), None, ptr::null_mut(), &mut errmsg);
+            assert_eq!(rc, SQLITE_CONSTRAINT, "`{sql}` must be SQLITE_CONSTRAINT");
+            assert_eq!(
+                sqlite3_extended_errcode(db),
+                SQLITE_CONSTRAINT_NOTNULL,
+                "`{sql}` must carry the NOTNULL subcode"
+            );
+            if !errmsg.is_null() {
+                sqlite3_free(errmsg as *mut c_void);
+            }
+        }
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
 
 #[test]
 fn exec_callback_receives_rows() {
