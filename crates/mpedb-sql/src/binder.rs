@@ -523,6 +523,30 @@ impl<'a> Scope<'a> {
     /// Resolve an UNQUALIFIED column name. Ambiguity is an error, never a
     /// silent pick: with one table it cannot happen, and the day it can, a
     /// wrong guess is a wrong-table read.
+    /// The NAME this scope addresses the table owning bare column `name` by —
+    /// its alias when the query gave one, else the table's own name.
+    ///
+    /// Exists so a rewrite that SPLICES an outer expression into an inner
+    /// query's scope can qualify it first. An unqualified column moved into a
+    /// subquery is resolved there, and if the inner query happens to have a
+    /// column of that name the outer reference is silently CAPTURED — which is
+    /// a wrong answer, not an error (see `row_value_in_subquery`).
+    ///
+    /// `None` for a name this scope does not bind, or binds ambiguously: both
+    /// are cases the caller must not paper over with a guess.
+    pub fn owner_name(&self, name: &str) -> Option<&str> {
+        let mut found: Option<&str> = None;
+        for (k, t) in self.tables.iter().enumerate() {
+            if t.column_index(name).or_else(|| t.rowid_name_col(name)).is_some() {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(self.names[k].as_str());
+            }
+        }
+        found
+    }
+
     pub fn resolve(&self, name: &str) -> Result<(u16, ColumnType)> {
         let mut found: Option<(u16, ColumnType)> = None;
         for (k, t) in self.tables.iter().enumerate() {
@@ -698,6 +722,21 @@ pub(crate) struct Binder<'a> {
     /// `ctx_keys` order). `current_setting()` refs bind to `Param(n_user + pos)`
     /// and are filled from the session at execute time (design/DESIGN-MULTIDB.md §2).
     pub param_types: Vec<Ty>,
+    /// The DECLARED collation behind each parameter slot, where the slot stands
+    /// in for an outer COLUMN — a correlation argument.
+    ///
+    /// Without it a comparison across a subquery boundary silently fell to
+    /// BINARY: `col_coll` reads `BExpr::Col`, and a correlated reference is
+    /// rewritten to a PARAM before the inner binder ever sees it, so the outer
+    /// column's `COLLATE NOCASE` vanished. Measured wrong answers, not missing
+    /// features — with `nc.a` declared NOCASE holding 'AB' and `nq.x` holding
+    /// 'ab', both `a IN (SELECT x FROM nq)` and
+    /// `EXISTS (SELECT 1 FROM nq WHERE nc.a = nq.x)` returned NO rows where
+    /// sqlite returns one.
+    ///
+    /// Indexed by parameter slot; a slot that is an ordinary user parameter has
+    /// no entry, because a bound value carries no declared collation.
+    pub param_colls: Vec<Option<Collation>>,
     /// Number of caller-facing parameters; reserved context slots start here.
     n_user_params: u16,
     /// Distinct session-context keys, in first-reference order; index `p` maps
@@ -764,6 +803,7 @@ impl<'a> Binder<'a> {
             suppress_fold: false,
             scope,
             param_types: vec![None; n_params as usize],
+            param_colls: vec![None; n_params as usize],
             n_user_params: n_params,
             ctx_keys: Vec::new(),
             ctx_list_keys: std::collections::BTreeSet::new(),
@@ -826,6 +866,7 @@ impl<'a> Binder<'a> {
         Binder {
             scope,
             param_types: self.param_types,
+            param_colls: self.param_colls,
             n_user_params: self.n_user_params,
             ctx_keys: self.ctx_keys,
             ctx_list_keys: self.ctx_list_keys,
@@ -1898,8 +1939,14 @@ impl<'a> Binder<'a> {
                 // so an index/PK equality on it is untouched). Collation degrades
                 // to bytewise for non-text at runtime, so emitting it for any
                 // statically-unpinned operand is safe.
+                // A correlation PARAM stands in for an outer column, and rung 2
+                // is about the COLUMN's declared collation — so the param must
+                // answer for the column it replaces. Reading only `Col` made
+                // every comparison across a subquery boundary fall to BINARY,
+                // which is a wrong answer wherever the outer column is NOCASE.
                 let col_coll = |e: &BExpr| match e {
                     BExpr::Col(idx) => Some(self.scope.column_collation(*idx)),
+                    BExpr::Param(i) => self.param_colls.get(*i as usize).copied().flatten(),
                     _ => None,
                 };
                 let coll = l_coll

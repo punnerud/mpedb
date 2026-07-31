@@ -408,11 +408,39 @@ pub fn compile_value_expr(expr_src: &str, table: &TableDef) -> Result<ExprProgra
 /// parameters, which is what lets the executor evaluate the program with a
 /// one-element array and no numbering to reconcile.
 pub fn compile_default_expr(expr_src: &str, table: &TableDef) -> Result<(ExprProgram, bool)> {
+    compile_default_expr_with_udfs(expr_src, table, &HostUdfSet::default())
+}
+
+/// [`compile_default_expr`] with the compiling connection's host-registered
+/// UDFs in scope.
+///
+/// A DEFAULT may call one, and sqlite is the reason: it accepts
+/// `DEFAULT (f(x))` for an f it has never heard of and resolves the name at
+/// INSERT, so a connection that registers f afterwards makes the column work
+/// (measured against 3.45.1). Django's sqlite backend registers its whole
+/// function set — `django_datetime_extract` among them — when the connection
+/// opens, which is before any migration runs, so the narrow rule "resolve
+/// against the UDFs this connection has" is enough to accept every DEFAULT
+/// Django writes, without adopting sqlite's deferred-name resolution.
+///
+/// Safe here in a way it is NOT for a generated column, and the difference is
+/// worth stating because the two look alike: a generated column must be
+/// RECOMPUTABLE by every reader — index membership depends on it — so a value
+/// only one connection can produce would corrupt an index. A DEFAULT is
+/// evaluated once, at INSERT, and stored as an ordinary value. A writer without
+/// the function gets a named error on its own INSERT; nothing already written
+/// changes meaning. That is exactly sqlite's bargain.
+pub fn compile_default_expr_with_udfs(
+    expr_src: &str,
+    table: &TableDef,
+    host_udfs: &HostUdfSet,
+) -> Result<(ExprProgram, bool)> {
     let (expr, n_params) = parser::parse_expr_only(expr_src)?;
     if n_params > 0 {
         return Err(Error::Bind("parameters are not allowed in a DEFAULT".into()));
     }
     let mut binder = binder::Binder::new_default_expr(table);
+    binder.set_host_udfs(host_udfs);
     let (bound, _ty) = binder.bind_expr(&expr)?;
     let uses_instant = binder.uses_statement_instant();
     Ok((binder::compile_program(&bound)?, uses_instant))

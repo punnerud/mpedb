@@ -1379,9 +1379,27 @@ impl Database {
     ) -> Option<(HostFnTable, HostAggTable, HostCollTable)> {
         // Spell-bearing plans need the table too (their gate is the same
         // seam); a plan with neither keeps the registry locks off its path.
-        (plan.contains_host_call() || plan.contains_spell_call()).then(|| {
-            (self.host_fn_table(plan), self.host_agg_table(), self.host_coll_table())
-        })
+        //
+        // A plan that WRITES a table whose column DEFAULT calls a host UDF
+        // needs it as well, and this is the case the plan alone cannot report:
+        // the call is in the SCHEMA's default program, not in the plan bytes,
+        // so `contains_host_call()` is false. Missing it did not degrade to a
+        // refusal — it made every such INSERT store NULL, which is exactly the
+        // wrong answer the eval site's "not in scope" error exists to prevent.
+        let default_needs_host = || {
+            let bundle = self.schema();
+            bundle.schema.tables.iter().any(|t| {
+                !t.dead
+                    && plan.footprint.writes_table(t.id)
+                    && t.columns.iter().any(|c| {
+                        matches!(&c.default, Some(mpedb_types::DefaultExpr::Expr(d))
+                            if d.program.has_host_call())
+                    })
+            })
+        };
+        (plan.contains_host_call() || plan.contains_spell_call() || default_needs_host()).then(
+            || (self.host_fn_table(plan), self.host_agg_table(), self.host_coll_table()),
+        )
     }
 
     /// Compile `sql` with this database's RLS policies injected (loaded from the
@@ -4141,7 +4159,7 @@ impl WriteSession<'_> {
         };
         match ddl {
             DdlStmt::CreateTable(spec) => {
-                let def = crate::ddl_apply::table_def_from_spec(spec)?;
+                let def = crate::ddl_apply::table_def_from_spec(spec, &self.db.host_udf_set())?;
                 self.txn.create_table(def)?;
             }
             DdlStmt::CreateVirtualTable(spec) => {

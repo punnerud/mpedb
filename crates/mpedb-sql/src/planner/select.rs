@@ -284,6 +284,16 @@ pub(super) fn plan_select<'s>(
     // `FROM <name>` matching it binds to the working table (id `CTE_TABLE`,
     // FullScan-only). `None` for every ordinary statement.
     cte: Option<CteRef<'s>>,
+    // DECLARED collation of each CORRELATION parameter, in slot order starting
+    // at the first correlation slot (`n_params - corr_colls.len()`). Empty for
+    // every uncorrelated statement.
+    //
+    // A correlated reference is rewritten to a bare `Param` before this binder
+    // ever sees it, so the outer column's `COLLATE NOCASE` was invisible and
+    // the comparison fell to BINARY — a wrong answer, measured: with `nc.a`
+    // NOCASE holding 'AB' and `nq.x` holding 'ab', `a IN (SELECT x FROM nq)`
+    // returned nothing where sqlite returns the row.
+    corr_colls: &[mpedb_types::Collation],
 ) -> Result<PlannedStmt> {
     // A derived table the view-inline pass could not flatten is MATERIALIZED —
     // but only at the top level (`plan_derived_select` intercepts it there). One
@@ -368,6 +378,15 @@ pub(super) fn plan_select<'s>(
     };
     binder.set_dialect(mode);
     binder.set_host_udfs(host_udfs);
+    // The correlation slots sit at the TOP of this statement's parameter space
+    // (`inner_n = outer n_params + one per correlation arg`), so they are the
+    // last `corr_colls.len()` of them.
+    let corr_base = n_params as usize - corr_colls.len();
+    for (j, c) in corr_colls.iter().enumerate() {
+        if let Some(slot) = binder.param_colls.get_mut(corr_base + j) {
+            *slot = Some(*c);
+        }
+    }
     for (i, ty) in slot_types.iter().enumerate() {
         binder.pin_param(n_params + i as u16, *ty);
     }

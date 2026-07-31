@@ -2479,13 +2479,22 @@ fn stmt_has_host_call(stmt: &PlanStmt) -> bool {
                 || dp.body_subplans.iter().any(subplan_has_host_call)
         }
         PlanStmt::Insert {
+            rows,
             from_select,
             with_check,
             on_conflict,
             returning,
             ..
         } => {
-            from_select.as_ref().is_some_and(|s| select_has_host_call(&s.plan))
+            // `rows` is load-bearing here, not completeness for its own sake:
+            // this predicate decides BOTH whether the executor gets the host
+            // table AND whether the plan may enter the shared registry. A
+            // `VALUES (myfn(1))` cell that this walk did not see would be a
+            // connection-local call published for every process to execute.
+            rows.iter()
+                .flatten()
+                .any(|s| matches!(s, InsertSource::Expr(p) if p.has_host_call()))
+                || from_select.as_ref().is_some_and(|s| select_has_host_call(&s.plan))
                 || opt_prog_host_call(with_check)
                 || returning.as_ref().is_some_and(|r| projection_host_call(r))
                 || on_conflict_host_call(on_conflict)

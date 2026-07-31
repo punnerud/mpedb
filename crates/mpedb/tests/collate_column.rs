@@ -560,3 +560,47 @@ fn column_collation_semantics_direct() {
     // One group of 3 (alice*), one of 2 (bob*), four of 1.
     assert_eq!(distinct, vec![3, 2, 1, 1, 1, 1]);
 }
+
+// ------------------------------- collation across a SUBQUERY boundary ------
+
+/// A declared collation must survive a comparison that crosses into a subquery.
+///
+/// It did not, and that was a shipped WRONG ANSWER in entirely ordinary SQL: a
+/// correlated reference is rewritten to a bare `Param` before the inner binder
+/// sees it, and the binder's rung-2 lookup read `BExpr::Col` only — so
+/// `nc.a COLLATE NOCASE` compared BYTEWISE inside the subquery and matched
+/// nothing. The correlation slots carry the outer column's collation now.
+///
+/// The FLIPPED case is the control, and it is why the fix could not simply wrap
+/// the parameter in an explicit `COLLATE`: sqlite's precedence is SIDE-SENSITIVE
+/// — the left operand's column collation wins — so `nq.x = nc.a` legitimately
+/// answers nothing, and an explicit `COLLATE` on the right would have turned
+/// that correct answer into a wrong one.
+#[test]
+fn a_declared_collation_crosses_a_subquery_boundary_like_sqlite() {
+    agree(&[
+        "CREATE TABLE nc (id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE)",
+        "CREATE TABLE nq (x TEXT)",
+        "INSERT INTO nc (id,a) VALUES (1,'AB'),(2,'cd')",
+        "INSERT INTO nq (x) VALUES ('ab')",
+        // Correlated, outer column on the LEFT: NOCASE governs, one row.
+        "SELECT id FROM nc WHERE EXISTS (SELECT 1 FROM nq WHERE nc.a = nq.x) ORDER BY id",
+    ]);
+    // The control: outer column on the RIGHT, so the INNER column's (BINARY)
+    // collation governs and the answer is empty in both engines.
+    agree(&[
+        "CREATE TABLE nc (id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE)",
+        "CREATE TABLE nq (x TEXT)",
+        "INSERT INTO nc (id,a) VALUES (1,'AB'),(2,'cd')",
+        "INSERT INTO nq (x) VALUES ('ab')",
+        "SELECT id FROM nc WHERE EXISTS (SELECT 1 FROM nq WHERE nq.x = nc.a) ORDER BY id",
+    ]);
+    // A scalar subquery on the right takes the outer column's collation too.
+    agree(&[
+        "CREATE TABLE nc (id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE)",
+        "CREATE TABLE nq (x TEXT)",
+        "INSERT INTO nc (id,a) VALUES (1,'AB'),(2,'cd')",
+        "INSERT INTO nq (x) VALUES ('ab')",
+        "SELECT id FROM nc WHERE a = (SELECT x FROM nq) ORDER BY id",
+    ]);
+}

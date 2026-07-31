@@ -270,6 +270,16 @@ fn host_call_plans_never_reach_the_shared_registry() {
     }
     // (d) a prepared read
     let h_read = db.prepare("SELECT plus1(n) FROM t").unwrap();
+    // (e) a UDF in a MULTI-ROW VALUES cell. This was a planner refusal until
+    // `build_insert_row` gained host scope, and lifting it is only safe
+    // because `stmt_has_host_call` walks these cells too — its Insert arm used
+    // `..` and never looked at `rows`, so such a plan would have been
+    // published for every process to execute a connection-local closure.
+    db.query(
+        "INSERT INTO t (id, n) VALUES (20, plus1(1)), (21, plus1(2))",
+        &[],
+    )
+    .unwrap();
 
     // Everything a UDF-bearing plan could have been stored under:
     let hashes = vec![
@@ -287,6 +297,9 @@ fn host_call_plans_never_reach_the_shared_registry() {
             .unwrap()
             .hash,
         db.prepare_detached("SELECT sumplus(n) FROM t").unwrap().hash,
+        db.prepare_detached("INSERT INTO t (id, n) VALUES (20, plus1(1)), (21, plus1(2))")
+            .unwrap()
+            .hash,
     ];
 
     // A fresh handle onto the same file: empty local cache, no UDFs. Any of
@@ -479,14 +492,20 @@ fn insert_values_carries_an_expression_host_udf_included() {
             vec![Value::Int(2), Value::Int(5)]
         ]
     );
-    // A MULTI-row VALUES with an expression is still refused by name: it would
-    // need a `UNION ALL` source, which INSERT ... SELECT refuses.
-    let e = db
-        .query("INSERT INTO t (id, n) VALUES (3, 1), (4, plus1(4))", &[])
-        .unwrap_err();
-    assert!(
-        matches!(&e, Error::Bind(m) if m.contains("literals or parameters")),
-        "expected the multi-row limit, got {e:?}"
+    // A MULTI-row VALUES carries one too. It was refused while
+    // `build_insert_row` had no host scope — the cell is a dual-row program
+    // evaluated there, not through the INSERT … SELECT path a single row takes
+    // — and the refusal at least said why instead of failing at execute with
+    // "not in scope". Django's `bulk_create` over a column whose value is a
+    // registered function is exactly this statement.
+    db.query("INSERT INTO t (id, n) VALUES (3, 1), (4, plus1(4))", &[])
+        .expect("a host UDF in a multi-row VALUES cell");
+    assert_eq!(
+        rows(db.query("SELECT id, n FROM t WHERE id IN (3, 4) ORDER BY id", &[]).unwrap()),
+        vec![
+            vec![Value::Int(3), Value::Int(1)],
+            vec![Value::Int(4), Value::Int(5)]
+        ]
     );
     // and the long-standing working form still works
     db.query("INSERT INTO t (id, n) SELECT 5, plus1(n) FROM t WHERE id = 1", &[])
@@ -564,4 +583,66 @@ primary_key = ["id"]
     );
     drop(db2);
     db.verify().expect("page accounting");
+}
+
+// -------------------------------------------- a DEFAULT calling a host UDF
+
+/// `DEFAULT (f(…))` for a HOST-registered f is legal, and evaluated per INSERT
+/// against the inserting connection's function set.
+///
+/// This was a DDL refusal — `fold_default_expr` compiled the expression against
+/// a closed table with no host functions in scope, so the CREATE TABLE failed
+/// with "is not a constant: unknown function". sqlite accepts the DDL even for
+/// a function it has never heard of and resolves the name at INSERT (measured
+/// against 3.45.1), and Django's sqlite backend registers its whole function
+/// set when the connection opens, so `DEFAULT (django_datetime_extract(…))`
+/// arrives with the function already there. The refusal took Django's
+/// `field_defaults` label down entirely — and, because Django installs a
+/// group's labels into one database, the eleven labels sharing its group.
+///
+/// Safe for a DEFAULT where it would NOT be for a generated column: a generated
+/// value must be recomputable by every reader (index membership depends on it),
+/// while a DEFAULT is evaluated once and stored as an ordinary value.
+#[test]
+fn a_default_may_call_a_host_udf_and_is_evaluated_per_insert() {
+    let (db, _g) = test_db("default-udf");
+    register_plus1(&db);
+    db.query(
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER DEFAULT (plus1(41)))",
+        &[],
+    )
+    .expect("a DEFAULT naming a registered host UDF");
+
+    // Omitted: the default runs. Supplied: it does not.
+    db.query("INSERT INTO d (id) VALUES (1)", &[]).unwrap();
+    db.query("INSERT INTO d (id, v) VALUES (2, 7)", &[]).unwrap();
+    assert_eq!(
+        rows(db.query("SELECT id, v FROM d ORDER BY id", &[]).unwrap()),
+        vec![
+            vec![Value::Int(1), Value::Int(42)],
+            vec![Value::Int(2), Value::Int(7)]
+        ]
+    );
+
+    // A connection WITHOUT the function gets a named error on its own INSERT,
+    // not a silent NULL. That distinction is the whole safety argument: the
+    // eval used to swallow the failure with `unwrap_or(Value::Null)`, which
+    // turned a missing function into a wrong answer.
+    let db2 = Database::open_from_file(&_g.0).expect("second handle, no UDFs");
+    let e = db2.query("INSERT INTO d (id) VALUES (3)", &[]).unwrap_err();
+    // The wording differs by which layer notices first ("not registered" from
+    // the host table, "not in scope" from the eval site); what must hold is
+    // that it NAMES the function and is an error at all.
+    let msg = format!("{e}");
+    assert!(
+        msg.contains("plus1") && (msg.contains("not registered") || msg.contains("not in scope")),
+        "a writer without the function must be told, got {e:?}"
+    );
+    // …and nothing was written.
+    assert_eq!(
+        rows(db2.query("SELECT count(*) FROM d", &[]).unwrap()),
+        vec![vec![Value::Int(2)]]
+    );
+    drop(db2);
+    db.verify().expect("page accounting after a UDF default");
 }

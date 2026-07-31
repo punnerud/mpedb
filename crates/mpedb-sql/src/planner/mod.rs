@@ -592,7 +592,7 @@ pub(crate) fn plan_statement(
             derived::plan_derived_select(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
         }
         ast::Stmt::Select(s) => {
-            plan_select(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts, None)?
+            plan_select(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts, None, &[])?
         }
         ast::Stmt::Compound(c) => {
             plan_compound(c, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
@@ -1065,6 +1065,7 @@ fn plan_compound(
             } else {
                 let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) = plan_select(
                     arm_ast, schema, arm_base, catalog, mode, host_udfs, row_count, consts, None,
+                    &[],
                 )?;
                 let PlanStmt::Select(sp) = stmt else {
                     return Err(Error::Internal("plan_select produced a non-select".into()));
@@ -1443,7 +1444,7 @@ fn plan_insert(
     let mut sel_subplans: Vec<SubPlan> = Vec::new();
     if let Some(sel_stmt) = &s.select {
         let (sp_stmt, sp_pt, sp_ctx, sp_list, _sp_agg, sp_sub) =
-            plan_select(sel_stmt, schema, n_params, catalog, mode, host_udfs, row_count, consts, None)?;
+            plan_select(sel_stmt, schema, n_params, catalog, mode, host_udfs, row_count, consts, None, &[])?;
         let PlanStmt::Select(sp) = sp_stmt else {
             return Err(bind_err(
                 "INSERT … SELECT: a compound (UNION/EXCEPT/INTERSECT) source is not supported",
@@ -1570,24 +1571,18 @@ fn plan_insert(
                         // literals). Evaluated over the dual row at insert time.
                         other => {
                             let program = compile_program(&other)?;
-                            // A HOST-registered UDF cannot be one of these
-                            // cells. A single-row `VALUES (…)` is planned as
-                            // `INSERT … SELECT`, whose executor carries the
-                            // connection's host table; a multi-row VALUES cell
-                            // is instead a dual-row program evaluated inside
-                            // `build_insert_row`, which has no host scope — so
-                            // it would compile here and only fail at execute
-                            // with "host function …() is not in scope". Refuse
-                            // it where the caller can still see why.
-                            if program.has_host_call() {
-                                return Err(bind_err(
-                                    "INSERT values must be literals or parameters, or an \
-                                     expression of built-in functions: a host-registered \
-                                     function is connection-local and cannot be evaluated \
-                                     in a multi-row VALUES cell — use INSERT … SELECT"
-                                        .to_string(),
-                                ));
-                            }
+                            // A HOST-registered UDF used to be refused here:
+                            // `build_insert_row` had no host scope, so the cell
+                            // would compile and then fail at execute with
+                            // "host function …() is not in scope", and refusing
+                            // early at least said why. It has one now, and
+                            // `stmt_has_host_call` walks these cells, so the
+                            // plan both reaches the executor with the table in
+                            // scope and stays OUT of the shared registry — the
+                            // second half being the one that matters, since a
+                            // connection-local call must never be published.
+                            // Django's `bulk_create` over a column whose value
+                            // is a registered function is this exact shape.
                             InsertSource::Expr(program)
                         }
                     }

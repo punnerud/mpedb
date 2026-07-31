@@ -41,18 +41,29 @@ std::thread_local! {
 /// Record the rowid of a row just inserted into a rowid-alias table (facade hook
 /// for `sqlite3_last_insert_rowid`). Called from the INSERT loop after each
 /// successful `insert_row`, so the final call reflects the last inserted row.
-pub(crate) fn default_cell(default: Option<&DefaultExpr>, now: i64, now_micros: i64) -> Value {
-    match default {
+pub(crate) fn default_cell(
+    default: Option<&DefaultExpr>,
+    now: i64,
+    now_micros: i64,
+    host: Option<&dyn HostFns>,
+) -> Result<Value> {
+    Ok(match default {
         Some(DefaultExpr::Const(v)) => v.clone(),
         Some(DefaultExpr::Now) => Value::Timestamp(now),
         // An instant-dependent expression default is EVALUATED here, once per
         // statement's worth of rows like the keyword forms — the instant sits
         // in parameter slot 0, which is the only slot a default can have (it
         // takes no user parameters).
-        Some(DefaultExpr::Expr(d)) => d
-            .program
-            .eval(&[], &[Value::Text(mpedb_types::sqlite_now_string(now_micros))])
-            .unwrap_or(Value::Null),
+        // `host` is what lets a DEFAULT call a host-registered UDF, which
+        // sqlite resolves per INSERT (see `fold_default_expr`). Without it the
+        // program would error on `Instr::HostCall` and the column would fall to
+        // NULL — a wrong answer where an error belongs, which is why the
+        // resolver is threaded here rather than defaulted away.
+        Some(DefaultExpr::Expr(d)) => d.program.eval_host(
+            &[],
+            &[Value::Text(mpedb_types::sqlite_now_string(now_micros))],
+            host,
+        )?,
         Some(k @ (DefaultExpr::CurrentTimestamp | DefaultExpr::CurrentDate | DefaultExpr::CurrentTime)) => {
             let (ts, date, time) = mpedb_types::sqlite_now_parts(now_micros);
             Value::Text(match k {
@@ -62,7 +73,7 @@ pub(crate) fn default_cell(default: Option<&DefaultExpr>, now: i64, now_micros: 
             })
         }
         None => Value::Null,
-    }
+    })
 }
 
 pub(crate) fn record_last_insert_rowid(rowid: i64) {
@@ -1270,7 +1281,7 @@ pub(crate) fn exec_stmt_triggered(
     // against execute()'s wall clock and nothing hides between the phases.
     #[cfg(feature = "leakstat")]
     {
-        let t0 = std::time::Instant::now();
+        let t0 = mpedb_core::Instant::now();
         let r = exec_stmt_impl(ctx, schema, plan, params, partial, triggers, depth);
         mpedb_core::engine::leakstat::add(
             &mpedb_core::engine::leakstat::EXEC_NS_STMT,
@@ -2736,6 +2747,10 @@ fn exec_stmt_rest(
                     ExecResult::Rows { rows, .. } => rows,
                     _ => return Err(internal("INSERT … SELECT source produced no row set")),
                 };
+                // The connection's host-registered UDFs, for a DEFAULT that
+                // calls one (`fold_default_expr`). Taken AFTER the source
+                // select, which needs `ctx` mutably.
+                let host = ctx.host_fns();
                 let mut built = Vec::with_capacity(src.len());
                 for srow in src {
                     let mut row = Vec::with_capacity(t.columns.len());
@@ -2745,16 +2760,17 @@ fn exec_stmt_rest(
                                 srow.get(si as usize).cloned().unwrap_or(Value::Null),
                                 col.ty,
                             ),
-                            None => default_cell(col.default.as_ref(), now, now_micros()),
+                            None => default_cell(col.default.as_ref(), now, now_micros(), host)?,
                         });
                     }
                     built.push(std::borrow::Cow::Owned(row));
                 }
                 built
             } else {
+                let host = ctx.host_fns();
                 let mut built = Vec::with_capacity(rows.len());
                 for row_spec in rows {
-                    built.push(build_insert_row(&t, plan, params, row_spec, now)?);
+                    built.push(build_insert_row(&t, plan, params, row_spec, now, host)?);
                 }
                 built
             };
@@ -3843,13 +3859,14 @@ fn build_insert_row<'a>(
     params: &'a [Value],
     row_spec: &[InsertSource],
     now: i64,
+    host: Option<&dyn HostFns>,
 ) -> Result<std::borrow::Cow<'a, [Value]>> {
     // #40 instrument: this is per ROW, so the timing only exists under the
     // leakstat feature — an unconditional Instant here would tax bulk loads.
     #[cfg(feature = "leakstat")]
     {
-        let t0 = std::time::Instant::now();
-        let r = build_insert_row_impl(t, plan, params, row_spec, now);
+        let t0 = mpedb_core::Instant::now();
+        let r = build_insert_row_impl(t, plan, params, row_spec, now, host);
         mpedb_core::engine::leakstat::add(
             &mpedb_core::engine::leakstat::EXEC_NS_BUILDROW,
             t0.elapsed().as_nanos() as u64,
@@ -3857,7 +3874,7 @@ fn build_insert_row<'a>(
         r
     }
     #[cfg(not(feature = "leakstat"))]
-    build_insert_row_impl(t, plan, params, row_spec, now)
+    build_insert_row_impl(t, plan, params, row_spec, now, host)
 }
 
 fn build_insert_row_impl<'a>(
@@ -3866,6 +3883,7 @@ fn build_insert_row_impl<'a>(
     params: &'a [Value],
     row_spec: &[InsertSource],
     now: i64,
+    host: Option<&dyn HostFns>,
 ) -> Result<std::borrow::Cow<'a, [Value]>> {
     // The identity fast path: the common single-row INSERT where every column
     // comes straight from the caller's params, in declaration order — borrow
@@ -3897,11 +3915,14 @@ fn build_insert_row_impl<'a>(
             InsertSource::Default => {
                 let col = t.columns.get(ci).ok_or_else(|| internal("insert col"))?;
                 // plan-validated: a column with no default is nullable
-                default_cell(col.default.as_ref(), now, now_micros())
+                default_cell(col.default.as_ref(), now, now_micros(), host)?
             }
             InsertSource::Expr(prog) => {
                 // Dual row: empty tuple. Program carries its own const pool.
-                prog.eval(&[], params)?
+                // `host` is what makes a cell calling a registered UDF legal
+                // (Django's `bulk_create` over such a column); the planner
+                // used to refuse it precisely because this call had no scope.
+                prog.eval_host(&[], params, host)?
             }
         });
     }

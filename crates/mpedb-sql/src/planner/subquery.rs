@@ -346,7 +346,9 @@ impl Lift<'_> {
                 // correlated `EXISTS` that ARE its 3-valued definition. No plan
                 // format and no executor change: the pieces already exist.
                 if let E::RowValue(_) = lhs.as_ref() {
-                    if let Some(rewritten) = row_value_in_subquery(lhs, inner, *negated)? {
+                    if let Some(rewritten) =
+                        row_value_in_subquery(lhs, inner, *negated, &self.outer_scope)?
+                    {
                         return self.rewrite(&rewritten);
                     }
                 }
@@ -459,6 +461,7 @@ impl Lift<'_> {
             n_params: self.n_params,
             outer_args: Vec::new(),
             arg_types: Vec::new(),
+            arg_colls: Vec::new(),
         };
         let mut rewritten = cs.clone();
         for arm in &mut rewritten.arms {
@@ -574,6 +577,7 @@ impl Lift<'_> {
             n_params: self.n_params,
             outer_args: Vec::new(),
             arg_types: Vec::new(),
+            arg_colls: Vec::new(),
         };
         // MPEE-style pruning: cap each subplan to the minimum rows its CONSUMER
         // can possibly read, so the LIMIT pushdown stops the scan there instead
@@ -623,7 +627,7 @@ impl Lift<'_> {
                 self.row_count, self.consts,
             )?
         } else {
-            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.host_udfs, self.row_count, self.consts, None)?
+            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.host_udfs, self.row_count, self.consts, None, &corr.arg_colls)?
         };
         let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) = planned;
         // #73 §3 stage 3: a nested subquery may correlate to its IMMEDIATE
@@ -738,6 +742,12 @@ struct Correlate<'a, 'b> {
     /// Outer base-row slots, one per correlation parameter, in slot order.
     outer_args: Vec<u16>,
     arg_types: Vec<ColumnType>,
+    /// The DECLARED collation of the outer column behind each correlation slot,
+    /// parallel to `arg_types`. Handed to the inner binder so a comparison
+    /// against the slot keeps the collation the column has — without it the
+    /// inner binder sees a bare parameter and the comparison falls to BINARY,
+    /// which is a wrong answer for a NOCASE column and not a refusal.
+    arg_colls: Vec<Collation>,
 }
 
 impl<'a> Correlate<'a, '_> {
@@ -753,6 +763,7 @@ impl<'a> Correlate<'a, '_> {
             None => {
                 self.outer_args.push(outer_slot);
                 self.arg_types.push(ty);
+                self.arg_colls.push(self.outer_scope.column_collation(outer_slot));
                 self.outer_args.len() - 1
             }
         };
@@ -1089,6 +1100,65 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
     }
 }
 
+/// Qualify every UNQUALIFIED column of `e` with the name the OUTER scope
+/// addresses its table by, so the expression keeps meaning what it meant once
+/// it is spliced into an inner query's scope.
+///
+/// A name the outer scope does not bind, or binds ambiguously, is left as it
+/// is: the binder reports both cases far better than a guess here would, and
+/// silently inventing a qualifier is exactly the class of mistake this exists
+/// to prevent.
+fn qualify_against(e: &ast::Expr, outer: &Scope<'_>) -> Result<ast::Expr> {
+    use ast::Expr as E;
+    Ok(match e {
+        E::Col(name) => match outer.owner_name(name) {
+            Some(q) => E::Qualified(q.to_string(), name.clone()),
+            None => e.clone(),
+        },
+        E::Binary(op, a, b) => E::Binary(
+            *op,
+            Box::new(qualify_against(a, outer)?),
+            Box::new(qualify_against(b, outer)?),
+        ),
+        E::Unary(op, a) => E::Unary(*op, Box::new(qualify_against(a, outer)?)),
+        E::Func(n, args) => E::Func(
+            n.clone(),
+            args.iter()
+                .map(|a| qualify_against(a, outer))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        E::Cast(a, t) => E::Cast(Box::new(qualify_against(a, outer)?), t.clone()),
+        E::Collate(a, c) => E::Collate(Box::new(qualify_against(a, outer)?), c.clone()),
+        // A probe containing anything else — a subquery, a CASE, a row value —
+        // is left alone and the shadow check below decides. Leaving it is safe
+        // in the direction that matters: an unqualified name inside it still
+        // reaches the shadow test through `outer_qualifiers`, which reports
+        // nothing for it, so the rewrite proceeds only when no qualifier could
+        // collide at all.
+        other => other.clone(),
+    })
+}
+
+/// Every table qualifier appearing in `e`, for the shadow test.
+fn outer_qualifiers(e: &ast::Expr) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(e: &ast::Expr, out: &mut Vec<String>) {
+        use ast::Expr as E;
+        match e {
+            E::Qualified(q, _) => out.push(q.clone()),
+            E::Binary(_, a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            E::Unary(_, a) | E::Cast(a, _) | E::Collate(a, _) => walk(a, out),
+            E::Func(_, args) => args.iter().for_each(|a| walk(a, out)),
+            _ => {}
+        }
+    }
+    walk(e, &mut out);
+    out
+}
+
 /// `(a, b) [NOT] IN (SELECT x, y FROM s WHERE p)` as the two correlated
 /// `EXISTS` that are its definition:
 ///
@@ -1113,6 +1183,7 @@ fn row_value_in_subquery(
     lhs: &ast::Expr,
     inner: &ast::SubqueryBody,
     negated: bool,
+    outer: &Scope<'_>,
 ) -> Result<Option<ast::Expr>> {
     use ast::{BinOp, Expr, SubqueryBody, UnOp};
     let Expr::RowValue(probe) = lhs else {
@@ -1145,11 +1216,64 @@ fn row_value_in_subquery(
     if items.iter().any(|(e, _)| crate::view::expr_aggregates(e)) {
         return Ok(None);
     }
-    // `x = a AND y = b`, over the inner row's scope — which is why the items
-    // move into the WHERE rather than the other way round.
+    // THE PROBE MOVES INTO THE INNER SCOPE, so every unqualified column in it
+    // must be QUALIFIED against the outer scope first — otherwise the inner
+    // query resolves it, and a column of the same name there silently captures
+    // the outer reference. That is a wrong answer, not an error, and it was a
+    // shipped one: measured against 3.45.1 with r(a,b) and q(a,b),
+    //
+    //   (a,b) IN (SELECT a,b FROM q)  ->  oracle {y,z}, mpedb {x,y,z}
+    //   (a,b) IN (SELECT b,a FROM q)  ->  oracle {y,z}, mpedb {}
+    //
+    // because `a = a` is trivially true and `a = b AND b = a` trivially false
+    // once BOTH sides bind inside q. Only the fully-qualified spelling escaped.
+    let qualified: Vec<Expr> = probe
+        .iter()
+        .map(|p| qualify_against(p, outer))
+        .collect::<Result<Vec<_>>>()?;
+    // Qualification cannot save a probe whose outer table is ADDRESSED by the
+    // same name inside the subquery (`FROM r` in both). Refuse the rewrite —
+    // the ordinary path then reports the row-value limit by name, which is the
+    // right answer where this one cannot be given safely.
+    let inner_names: Vec<&str> = sel
+        .alias
+        .as_deref()
+        .into_iter()
+        .chain(if sel.alias.is_none() { sel.table.as_deref() } else { None })
+        .chain(
+            sel.joins
+                .iter()
+                .map(|j| j.alias.as_deref().unwrap_or(j.table.as_str())),
+        )
+        .collect();
+    let shadowed = qualified.iter().any(|e| {
+        outer_qualifiers(e)
+            .iter()
+            .any(|q| inner_names.iter().any(|n| mpedb_types::ident_eq(n, q)))
+    });
+    if shadowed {
+        return Err(bind_err(
+            "a row value cannot be compared with a subquery that reads a table \
+             addressed by the SAME name as the outer one — qualifying the probe \
+             is what keeps the outer columns from being resolved inside the \
+             subquery, and it cannot distinguish two identical names. Alias one \
+             of them."
+                .to_string(),
+        ));
+    }
+    // `a = x AND b = y`, over the inner row's scope — the items move into the
+    // WHERE rather than the other way round.
+    //
+    // THE PROBE GOES ON THE LEFT, and that is not cosmetic. sqlite resolves a
+    // comparison's collation from the LEFT operand when it has a declared one,
+    // and the left operand of `IN` is the row value — the OUTER columns. Built
+    // the other way round the inner column's collation won, and a
+    // `COLLATE NOCASE` probe stopped matching: measured, nc(a,b) NOCASE holding
+    // ('AB','CD') against nq holding ('ab','cd') gave the oracle one row and
+    // mpedb none. A wrong answer, in both the bare and the qualified spelling.
     let mut eq: Option<Expr> = None;
-    for ((item, _), p) in items.iter().zip(probe) {
-        let cmp = Expr::Binary(BinOp::Eq, Box::new(item.clone()), Box::new(p.clone()));
+    for ((item, _), p) in items.iter().zip(&qualified) {
+        let cmp = Expr::Binary(BinOp::Eq, Box::new(p.clone()), Box::new(item.clone()));
         eq = Some(match eq {
             None => cmp,
             Some(prev) => Expr::Binary(BinOp::And, Box::new(prev), Box::new(cmp)),

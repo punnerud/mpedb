@@ -1080,11 +1080,29 @@ fn optimistic_prep_inner(
                         None => return Prep::Fallback,
                     },
                     InsertSource::Default => match db.schema().table(table).and_then(|t| t.columns.get(ci)) {
-                        Some(c) => crate::exec::default_cell(
+                        // A DEFAULT that calls a host-registered UDF needs the
+                        // ORIGINATING connection's function set, which the ring
+                        // leader does not have — it is committing on behalf of
+                        // someone else. Fall back to the ordinary writer, the
+                        // same answer `InsertSource::Expr` already gives one
+                        // line below and for the same reason.
+                        Some(c)
+                            if matches!(
+                                c.default.as_ref(),
+                                Some(mpedb_types::DefaultExpr::Expr(d)) if d.program.has_host_call()
+                            ) =>
+                        {
+                            return Prep::Fallback
+                        }
+                        Some(c) => match crate::exec::default_cell(
                             c.default.as_ref(),
                             now,
                             crate::session::now_micros(),
-                        ),
+                            None,
+                        ) {
+                            Ok(v) => v,
+                            Err(_) => return Prep::Fallback,
+                        },
                         None => return Prep::Fallback,
                     },
                     // Expression cells need the dual-row eval path; fall back

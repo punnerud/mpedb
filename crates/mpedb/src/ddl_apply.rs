@@ -270,6 +270,7 @@ fn fold_default_expr(
     src: &str,
     table: &str,
     column: &str,
+    host_udfs: &mpedb_sql::HostUdfSet,
 ) -> Result<mpedb_types::DefaultExpr> {
     let closed = mpedb_types::TableDef {
         id: 0,
@@ -287,9 +288,29 @@ fn fold_default_expr(
             "DEFAULT ({src}) on `{table}`.`{column}` is not a constant: {why}"
         ))
     };
-    let (prog, uses_instant) =
-        mpedb_sql::compile_default_expr(src, &closed).map_err(|e| bad(e.to_string()))?;
-    if uses_instant {
+    let (prog, uses_instant) = mpedb_sql::compile_default_expr_with_udfs(src, &closed, host_udfs)
+        .map_err(|e| bad(e.to_string()))?;
+    // A DEFAULT that calls a host-registered UDF is DEFERRED for the same
+    // reason `'now'` is: there is no single value to fold to. It is evaluated
+    // per INSERT, against the inserting connection's function set — which is
+    // exactly what sqlite does (measured: it accepts the DDL for a function it
+    // has never heard of, errors on INSERT while the name is missing, and works
+    // the moment `create_function` supplies it).
+    //
+    // Django's `DEFAULT (django_datetime_extract(…))` is this shape, and the
+    // refusal took not just its own 17 tests but the eleven labels that share
+    // its test group.
+    //
+    // This puts a program that depends on a PER-CONNECTION function into the
+    // shared schema, which is the opposite of the rule `has_host_call` was
+    // written for: a PLAN carrying one is kept out of the shared registry,
+    // because another process would decode it and be unable to run it. The
+    // difference is what "unable to run it" costs. A registry plan is looked up
+    // by hash and must execute; a DEFAULT is only reached by a connection
+    // inserting into this table, and one without the function gets a named
+    // error on its own INSERT while every row already written keeps its value.
+    // sqlite makes precisely this trade, and Django is built on it.
+    if uses_instant || prog.has_host_call() {
         return Ok(mpedb_types::DefaultExpr::Expr(Box::new(
             mpedb_types::DefaultProgram { src: src.to_string(), program: prog },
         )));
@@ -337,6 +358,7 @@ fn coerce_default(
 /// the merged schema.
 pub(crate) fn table_def_from_spec(
     spec: mpedb_sql::CreateTableSpec,
+    host_udfs: &mpedb_sql::HostUdfSet,
 ) -> Result<mpedb_types::TableDef> {
     // Resolve the PK: exactly one declaration form.
     let inline_pk: Vec<&str> = spec
@@ -437,7 +459,7 @@ pub(crate) fn table_def_from_spec(
             // has the same value for every row that will ever be inserted.
             let folded = match &c.default_src {
                 None => None,
-                Some(src) => Some(fold_default_expr(src, &spec.name, &c.name)?),
+                Some(src) => Some(fold_default_expr(src, &spec.name, &c.name, host_udfs)?),
             };
             let default = match folded.as_ref().or(c.default.as_ref()) {
                 Some(mpedb_types::DefaultExpr::Const(v)) => {
@@ -897,7 +919,7 @@ impl Database {
         {
             return Ok(ExecResult::Affected(0));
         }
-        let def = table_def_from_spec(spec)?;
+        let def = table_def_from_spec(spec, &self.host_udf_set())?;
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.create_table(def) {
             Ok(_tid) => w.commit()?,

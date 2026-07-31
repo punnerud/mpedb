@@ -405,3 +405,63 @@ fn a_row_value_in_a_subquery_matches_sqlite_including_nulls() {
         assert_eq!(got, want, "`{q}`");
     }
 }
+
+// ---------------------------------------------- name capture in the desugar
+
+/// The desugar SPLICES the outer probe into the subquery's scope, so an
+/// unqualified column in it must be qualified against the OUTER scope first.
+///
+/// It was not, and the result was a shipped WRONG ANSWER — not a refusal.
+/// `(a,b) IN (SELECT a,b FROM q)` became `q.a = q.a AND q.b = q.b`, trivially
+/// true, so every outer row matched; `(a,b) IN (SELECT b,a FROM q)` became
+/// `q.a = q.b AND q.b = q.a`, trivially false, so none did. Only the fully
+/// qualified spelling escaped, which is why nothing noticed: every test written
+/// for this feature happened to use distinct names.
+#[test]
+fn a_row_value_probe_is_not_captured_by_the_subquerys_own_columns() {
+    let setup = [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+        "CREATE TABLE q (a TEXT, b TEXT)",
+        "INSERT INTO r (id,a,b) VALUES (1,'x','y'),(2,'y','z'),(3,'z','y'),(4,NULL,'y')",
+        "INSERT INTO q (a,b) VALUES ('y','z'),('z','y')",
+    ];
+    let d = db();
+    let mut script = String::new();
+    for s in setup {
+        d.query(s, &[]).unwrap();
+        script.push_str(s);
+        script.push_str(";\n");
+    }
+    for q in [
+        // The colliding-name forms: `a` and `b` exist on BOTH sides.
+        "SELECT id FROM r WHERE (a,b) IN (SELECT a,b FROM q) ORDER BY id",
+        "SELECT id FROM r WHERE (a,b) IN (SELECT b,a FROM q) ORDER BY id",
+        "SELECT id FROM r WHERE (a,b) NOT IN (SELECT a,b FROM q) ORDER BY id",
+        // Reversed probe, same collision.
+        "SELECT id FROM r WHERE (b,a) IN (SELECT a,b FROM q) ORDER BY id",
+        // A literal beside a captured name, and an expression around one.
+        "SELECT id FROM r WHERE (a,'y') IN (SELECT a,b FROM q) ORDER BY id",
+        "SELECT id FROM r WHERE (upper(a),b) IN (SELECT upper(a),b FROM q) ORDER BY id",
+        // Already qualified — the one spelling that was right before.
+        "SELECT id FROM r WHERE (r.a,r.b) IN (SELECT q.a,q.b FROM q) ORDER BY id",
+        // Aliased outer, colliding inner.
+        "SELECT id FROM r r2 WHERE (r2.a,r2.b) IN (SELECT a,b FROM q) ORDER BY id",
+        // The subquery's own WHERE still survives alongside the qualification.
+        "SELECT id FROM r WHERE (a,b) IN (SELECT a,b FROM q WHERE a > 'a') ORDER BY id",
+    ] {
+        let got = mpedb_rows(&d, q);
+        let want = sqlite_rows(&format!("{script}{q};\n"));
+        assert_eq!(got, want, "`{q}`");
+    }
+
+    // The one shape qualification cannot save: the subquery reads a table
+    // ADDRESSED BY THE SAME NAME as the outer one, so `r.a` is ambiguous on
+    // both sides. A named refusal, because the alternative is a guess.
+    let e = d
+        .query("SELECT id FROM r WHERE (a,b) IN (SELECT a,b FROM r)", &[])
+        .unwrap_err();
+    assert!(
+        format!("{e}").contains("SAME name"),
+        "expected the same-name refusal, got {e}"
+    );
+}

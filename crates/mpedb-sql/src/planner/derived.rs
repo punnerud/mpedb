@@ -83,7 +83,7 @@ pub(super) fn plan_derived_select(
             bs, schema, n_params, catalog, mode, host_udfs, row_count, consts,
         )?,
         ast::SubqueryBody::Select(bs) => {
-            plan_select(bs, schema, n_params, catalog, mode, host_udfs, row_count, consts, None)?
+            plan_select(bs, schema, n_params, catalog, mode, host_udfs, row_count, consts, None, &[])?
         }
         ast::SubqueryBody::Compound(bc) => {
             plan_compound(bc, schema, n_params, catalog, mode, host_udfs, row_count, consts)?
@@ -156,7 +156,7 @@ pub(super) fn plan_derived_select(
         )));
     }
     let (o_stmt, o_ptypes, o_ctx, _o_list, o_out, o_subs) =
-        plan_select(&outer_ast, schema, n_params, catalog, mode, host_udfs, row_count, consts, Some(cte))?;
+        plan_select(&outer_ast, schema, n_params, catalog, mode, host_udfs, row_count, consts, Some(cte), &[])?;
     reject_context(&name, "outer statement", &o_ctx)?;
     // Unreachable — `has_subquery` refused above — but a silent slot collision
     // would be worse than a redundant check: the outer numbers ITS lifts from
