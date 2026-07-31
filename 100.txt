@@ -286,6 +286,61 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
   er å reprodusere en inkonsistens; nektingen står, og den er navngitt.
 
 
+1a-sexies. SESJON 31/7 (S14–S17) — HELE DJANGO MÅLT, 20 → 16 SHIM-ONLY
+----------------------------------------------------------------------
+
+    b49656a  S14a: DROP COLUMN slo stille AV fremmednøkkel-håndhevingen.
+             `with_dropped_column` renummererte primary_key og indekser,
+             ikke `foreign_keys`. `fk.rs` slår opp per ORDINAL, så sjekken
+             leste en ANNEN kolonne — og når ordinalen falt utenfor raden,
+             sluttet den å avvise foreldreløse rader helt. MÅLT: en rad med
+             `parent_id = 999` uten forelder gikk inn og BLE stående.
+             Tre ordinal-lister flyttes nå ett sted (`renumber_columns`).
+    8d35812  S14b: deklarert affinitet inn i HVERT syntetisk tuppel
+             (format 68) — 6 gale svar. Samme klasse som S6/S9.
+    296562d  S15: JSON-path-nøkkel DEKODES, som etiketten alltid har blitt.
+             12 tester. Pluss to naboer: tom USITERT nøkkel svarte NULL der
+             sqlite feiler, og pragmaens `unwrap_or_default()` gjorde en
+             korrupt ordinal til tom streng — nå `Error::Corrupt`.
+    06a7296  S16: (a) en NOT NULL-krenkelse BÆRER den klassen selv om den
+             fanges ved bind — tre former ga `OperationalError` der sqlite
+             gir `IntegrityError`, så Djangos `assertRaises(IntegrityError)`
+             så INGEN feil for en constraint som VAR håndhevet.
+             (b) kolonne-mot-kolonne over numerisk/tekst-skillet.
+    5183c1d  S17: coalesce lar ikke én arm pinne en annens bare parameter.
+
+  HELE DJANGO MÅLT, FØRSTE GANG: alle 215 labels, begge armer, 16 358
+  tester i shim-armen. **16 shim-only.**
+
+     12  migrations — genererte felt (7), unique_together-fjerning (2),
+         rename-field case, db_collation på pk/fk, index_together-rename.
+         DDL/ALTER. STØRST GJENVÆRENDE.
+      2  fixtures/FK: «IntegrityError not raised» for en ugyldig
+         fremmednøkkel via Djangos `check_constraints()`. ROTÅRSAK IKKE
+         FUNNET — de fire åpenbare kandidatene er ELIMINERT ved måling og
+         er alle identiske med sqlite: `PRAGMA foreign_key_check`,
+         `PRAGMA foreign_key_list` indeksert på fk_index, `SELECT … WHERE
+         rowid = ?`, og read-back av `PRAGMA foreign_keys` inne i en
+         transaksjon (som sqlite ignorerer). Neste sted å se er selve
+         loaddata-stien, ikke pragmaene.
+      1  contenttypes: «a scalar subquery must select exactly one column».
+      1  admin/auth `test_init_command`: `TypeError: NoneType not
+         subscriptable` — shimmet gir None der en rad ventes.
+
+  IKKE VÅRE, avgjort av kontrollarmen: `gis_tests` (krever GDAL) og
+  `README.rst` (ikke en label) er tomme på BEGGE armer.
+
+  FELLE I MÅLINGEN, verdt å huske: første re-sveip rapporterte «0
+  shim-only». Den var usann — disk-vakten hadde avbrutt kjøringen etter at
+  `rm -rf` tømte loggkatalogen, og sammenligningsskriptet leste tomme
+  filer som «ingen feil». Skriptet sier nå fra når en logg mangler. En
+  manglende måling er ikke et grønt resultat.
+
+  RESSURS: `/` gikk fra 95 % til 98 % under kjøringen. 1,7 GB lå i
+  `crates/mpedb-capi/target` fra 24/7 — foreldet, fra før target-dir-
+  konfigurasjonen; dagens bygg går til /mnt/xfs. Slettet.
+
+
 1b. SESJON 30–31/7 — SQLALCHEMY 965 → 1274, CPYTHON 459 → 460, DJANGO +106
 --------------------------------------------------------------------------
 
