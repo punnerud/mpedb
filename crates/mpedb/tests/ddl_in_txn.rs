@@ -233,21 +233,35 @@ fn create_index_in_session() {
 /// not restore the captured schema bundle, so a `ROLLBACK TO` before the DDL
 /// could not undo it) — and the session stays usable.
 #[test]
-fn ddl_after_savepoint_is_refused() {
+fn ddl_inside_a_savepoint_rolls_back_with_it() {
     let (cfg, _g) = config("savepoint");
     let db = Database::open_with_config(cfg).unwrap();
 
     let mut s = db.begin().unwrap();
-    s.query("SAVEPOINT sp", &[]).unwrap();
-    match s.query("CREATE TABLE t(id INTEGER PRIMARY KEY, v)", &[]) {
-        Err(Error::Unsupported(_)) => {}
-        other => panic!("expected refusal, got {other:?}"),
-    }
-    // The refusal left the session usable: release the savepoint and continue.
-    s.query("RELEASE sp", &[]).unwrap();
     s.query("INSERT INTO base VALUES(1, 1)", &[]).unwrap();
+    s.query("SAVEPOINT sp", &[]).unwrap();
+    // DDL inside a savepoint was refused for as long as `ROLLBACK TO` could
+    // not revert the txn's captured schema BUNDLE — the engine restores
+    // catalog PAGES, and the bundle is derived from them. The rollback path
+    // rebuilds it from those pages now, which is the same call the DDL path
+    // already made after a successful mutation.
+    s.query("CREATE TABLE t(id INTEGER PRIMARY KEY, v)", &[]).unwrap();
+    s.query("INSERT INTO t VALUES(1, 9)", &[]).unwrap();
+    s.query("ROLLBACK TO sp", &[]).unwrap();
+    // The table is gone with the savepoint — and the session still describes
+    // the catalog correctly, which is the part the refusal was guarding.
+    assert!(s.query("SELECT v FROM t", &[]).is_err(), "the table must be gone");
+
+    // The session is usable: more DDL after the rollback, and it commits.
+    s.query("CREATE TABLE kept(id INTEGER PRIMARY KEY, v)", &[]).unwrap();
+    s.query("INSERT INTO kept VALUES(2, 7)", &[]).unwrap();
+    s.query("RELEASE sp", &[]).unwrap();
     s.commit().unwrap();
+
     assert_eq!(one_i64(db.query("SELECT n FROM base WHERE id = 1", &[]).unwrap()), 1);
+    assert_eq!(one_i64(db.query("SELECT v FROM kept WHERE id = 2", &[]).unwrap()), 7);
+    assert!(db.query("SELECT v FROM t", &[]).is_err(), "the rolled-back table must not commit");
+    db.verify().unwrap();
 }
 
 /// A DDL statement that fails (here: two columns each marked inline PRIMARY KEY)

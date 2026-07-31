@@ -3912,7 +3912,24 @@ impl WriteSession<'_> {
         // name. A refusal (a large-blob extent write in the scope) leaves the
         // stack intact and surfaces cleanly.
         let snap = self.savepoints[idx].snap.clone();
-        self.txn.rollback_to_full(snap)
+        self.txn.rollback_to_full(snap)?;
+        // The rollback restored the catalog PAGES; the txn's captured schema
+        // BUNDLE is derived from them and has to be rebuilt, or a DDL undone
+        // here would leave the session describing a table the catalog no longer
+        // has. That rebuild is the same call the DDL path already makes after a
+        // successful mutation — which is why DDL inside a savepoint was refused
+        // for want of it, and why it no longer has to be.
+        //
+        // A failure here means reading back the catalog we just restored did
+        // not work: the txn view is stale, so the session is poisoned rather
+        // than left to commit something nobody can describe.
+        if let Err(e) = self.txn.reload_bundle_from_catalog() {
+            self.poisoned = true;
+            return Err(e);
+        }
+        // A cached plan may reference the catalog as it was BEFORE the rollback.
+        self.db.cache.write().expect(POISON).clear();
+        Ok(())
     }
 
     /// Apply a parsed DDL statement THROUGH this session's transaction (#95).
@@ -3941,17 +3958,14 @@ impl WriteSession<'_> {
         if self.poisoned {
             return Err(poisoned_err());
         }
-        // A SAVEPOINT is open: a `ROLLBACK TO` it would have to revert the txn's
-        // captured schema bundle too, which the engine's savepoint snapshot does
-        // NOT restore (it captures catalog PAGES, not the in-memory bundle).
-        // Refuse cleanly rather than risk a bundle/catalog desync (#95).
-        if !self.savepoints.is_empty() {
-            return Err(Error::Unsupported(
-                "DDL inside a SAVEPOINT is not supported by mpedb; RELEASE or \
-                 ROLLBACK the savepoint first"
-                    .into(),
-            ));
-        }
+        // DDL inside a SAVEPOINT used to be refused here: a `ROLLBACK TO` would
+        // have to revert the txn's captured schema bundle too, and the engine's
+        // savepoint restores catalog PAGES, not the in-memory bundle. The
+        // rollback path now rebuilds the bundle from those pages — the same call
+        // this function makes after a successful mutation — so the desync the
+        // refusal guarded against cannot happen. Django's migration executor
+        // wraps every DDL step in a savepoint, so this was most of its schema
+        // surface.
         // No-op DDL never touches the catalog — nothing to snapshot or reload.
         if matches!(ddl, DdlStmt::Analyze { .. } | DdlStmt::Reindex { .. }) {
             return Ok(ExecResult::Affected(0));
