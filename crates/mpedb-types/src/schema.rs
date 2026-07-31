@@ -541,6 +541,29 @@ pub struct ForeignKeyDef {
 }
 
 impl TableDef {
+    /// Apply `shift` to EVERY column ordinal this table holds.
+    ///
+    /// There are exactly three such lists — `primary_key`, each index's
+    /// `columns`, and each FOREIGN KEY's `columns` — and they must move
+    /// together. They did not: `with_dropped_column` renumbered the first two
+    /// and left the third, so after an `ALTER TABLE … DROP COLUMN` the FK read
+    /// a DIFFERENT column's value. That is not a cosmetic pragma bug —
+    /// enforcement silently stopped rejecting orphans (`fk.rs` addresses rows
+    /// by ordinal: `key_of(row, &fk.columns)`), which is a wrong answer with
+    /// nothing in the output to hint at it.
+    ///
+    /// `parent_columns` is deliberately absent: it holds NAMES, and they belong
+    /// to the parent table, which this evolution does not touch.
+    fn renumber_columns(&mut self, shift: impl Fn(&mut u16)) {
+        self.primary_key.iter_mut().for_each(&shift);
+        for ix in &mut self.indexes {
+            ix.columns.iter_mut().for_each(&shift);
+        }
+        for fk in &mut self.foreign_keys {
+            fk.columns.iter_mut().for_each(&shift);
+        }
+    }
+
     /// The tombstone that replaces a dropped table's slot (#47 stage 4). Keeps
     /// the id, frees the name for re-CREATE, holds no data.
     pub fn tombstone(id: u32) -> TableDef {
@@ -1125,11 +1148,13 @@ impl Schema {
         if slot.implicit_rowid {
             let at = slot.columns.len() - 1;
             slot.columns.insert(at, col);
-            for k in &mut slot.primary_key {
-                if *k as usize >= at {
-                    *k += 1;
+            // Everything at or past the insertion point moves up — the same
+            // three lists as the DROP path, for the same reason.
+            slot.renumber_columns(|c: &mut u16| {
+                if *c as usize >= at {
+                    *c += 1;
                 }
-            }
+            });
         } else {
             slot.columns.push(col);
         }
@@ -1191,15 +1216,11 @@ impl Schema {
         }
         slot.columns.remove(idx);
         // Renumber references to columns that shifted down (index > i → -1).
-        let shift = |c: &mut u16| {
+        slot.renumber_columns(|c: &mut u16| {
             if *c > i {
                 *c -= 1;
             }
-        };
-        slot.primary_key.iter_mut().for_each(shift);
-        for ix in &mut slot.indexes {
-            ix.columns.iter_mut().for_each(shift);
-        }
+        });
         let schema = Schema { tables };
         schema.validate()?;
         Ok(schema)

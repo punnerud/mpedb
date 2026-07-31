@@ -488,3 +488,77 @@ fn a_key_free_schema_behaves_identically_with_enforcement_on() {
     ];
     assert_same(setup, "SELECT id, v FROM a ORDER BY id");
 }
+
+// ------------------------------------------------- ordinals after a DDL -----
+
+/// `ALTER TABLE … DROP COLUMN` must renumber the FOREIGN KEY's column ordinals,
+/// not just the primary key's and the indexes'.
+///
+/// It did not, and the consequence was not a cosmetic pragma: `fk.rs` addresses
+/// a row BY ORDINAL (`key_of(row, &fk.columns)`), so after a drop the check read
+/// a DIFFERENT column — and when the stale ordinal fell past the end of the row,
+/// enforcement stopped rejecting orphans ENTIRELY, with nothing in the output to
+/// say so. A row with no parent went in and stayed.
+#[test]
+fn dropping_a_column_keeps_the_foreign_key_pointing_at_its_own_column() {
+    // The FK column sits AFTER the dropped one, so its ordinal must move.
+    assert_both_refuse(&[
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, filler TEXT, pid INTEGER REFERENCES p(id))",
+        "INSERT INTO p (id) VALUES (1)",
+        "ALTER TABLE c DROP COLUMN filler",
+        // No parent 999 — this must still be refused, on the RIGHT column.
+        "INSERT INTO c (id, pid) VALUES (2, 999)",
+    ]);
+    // …and a live parent still goes in, i.e. the renumbering did not simply
+    // break the check in the other direction.
+    assert_same(
+        &[
+            "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, filler TEXT, pid INTEGER REFERENCES p(id))",
+            "INSERT INTO p (id) VALUES (1)",
+            "ALTER TABLE c DROP COLUMN filler",
+            "INSERT INTO c (id, pid) VALUES (2, 1)",
+        ],
+        "SELECT id, pid FROM c ORDER BY id",
+    );
+}
+
+/// The same, for a COMPOSITE key across TWO drops — and with an index behind the
+/// dropped columns, so all three ordinal lists move together.
+#[test]
+fn two_drops_keep_a_composite_key_and_its_indexes_aligned() {
+    let base: &[&str] = &[
+        "CREATE TABLE p (a INTEGER, b INTEGER, PRIMARY KEY (a, b))",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, junk TEXT, more TEXT, \
+         ca INTEGER, cb INTEGER, tag TEXT, FOREIGN KEY (ca, cb) REFERENCES p(a, b))",
+        "CREATE INDEX c_tag ON c(tag)",
+        "INSERT INTO p (a, b) VALUES (1, 2)",
+        "ALTER TABLE c DROP COLUMN junk",
+        "ALTER TABLE c DROP COLUMN more",
+    ];
+    let mut refuse = base.to_vec();
+    refuse.push("INSERT INTO c (id, ca, cb, tag) VALUES (2, 9, 9, 'z')");
+    assert_both_refuse(&refuse);
+
+    let mut ok = base.to_vec();
+    ok.push("INSERT INTO c (id, ca, cb, tag) VALUES (3, 1, 2, 'z')");
+    // The index moved too: this probe reads `tag`, whose ordinal shifted by 2.
+    assert_same(&ok, "SELECT id, ca, cb FROM c WHERE tag = 'z' ORDER BY id");
+}
+
+/// A column ADDED to an implicit-rowid table shifts the trailing rowid, and the
+/// same three lists have to follow. The add path renumbered only the primary
+/// key — an index or foreign key naming that rowid would have gone stale the
+/// same way.
+#[test]
+fn adding_a_column_to_an_implicit_rowid_table_keeps_the_key_aligned() {
+    assert_both_refuse(&[
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        // No declared PK: #94's implicit rowid, which ADD COLUMN inserts before.
+        "CREATE TABLE c (pid INTEGER REFERENCES p(id), note TEXT)",
+        "INSERT INTO p (id) VALUES (1)",
+        "ALTER TABLE c ADD COLUMN extra TEXT",
+        "INSERT INTO c (pid, note) VALUES (999, 'x')",
+    ]);
+}
