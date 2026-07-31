@@ -472,6 +472,87 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
   finnes noe å telle.
 
 
+1d. FORSLAGET MÅLT PÅ NYTT 31/7 — TO PÅSTANDER I 1c ER FEIL
+------------------------------------------------------------
+
+  Forslaget kom tilbake 31/7 i åtte punkter, og ble målt med tre utforskere.
+  Det lukket NULL gjenstående tester. Men det avdekket fire ekte defekter, og
+  to av dem var verre enn noe som stod igjen på testlista. Rett de to
+  påstandene i 1c som målingen felte:
+
+  (a) «`bare_group_by` viser at det er gjørbart [å delta i plan-hashen]».
+      NEI. Dialekten var IKKE i planens kanoniske bytes og IKKE i hashen —
+      `plan/encode.rs:6-35` og `plan/mod.rs:2333-2340` bærer ingen dialekt-
+      byte. 1c hadde altså rett i at betingelsen er hard, og tok feil i at
+      den var oppfylt. Verre: `decode_registry_plan` porterte ikke på
+      dialekt, så en `postgres`-konfigurert prosess kunne `execute(hash)` en
+      plan en `sqlite`-prosess publiserte. Strengheten var et PREPARE-filter,
+      og `execute` går ikke gjennom prepare. LUKKET i S19: registerposten
+      bærer skriverens dialekt (ikke planen — hashen er identitet og må ikke
+      splittes), og lastestien nekter ved navn.
+
+  (b) «pk_nullable_rowid» som gjenstående quirk. Målt 31/7: `INTEGER PRIMARY
+      KEY` med `NULL` auto-tildeler rowid KORREKT i mpedb allerede, i alle tre
+      innsettingsformer (`(id) VALUES (NULL)`, `VALUES (NULL)`, `DEFAULT
+      VALUES`), til tross for at pragmaen melder `notnull=1`. Pragmaverdien og
+      innsettingsstien er frikoblet. Den EKTE håndhevingsforskjellen er en
+      annen: `NULL` i en ikke-INTEGER eller SAMMENSATT PK — sqlite godtar,
+      mpedb nekter. Ingen av 1250 innsamlede tester ser noen av delene.
+
+  Og `declared_notnull_only` er målt til å være kosmetisk: 6 pragma-rader over
+  6 tabellformer, allerede dokumentert i C-API-COMPAT.md:139, og observert av
+  null tester. Registeret ville altså hatt NULL medlemmer som skylder noe, ikke
+  to.
+
+  DET SOM FAKTISK BLE BYGGET (S19), og hvorfor det ikke er et register:
+
+    `[compat]` overlevde ikke `open_from_file` — den hardkodet begge
+    dialektknottene til den løse standarden, og det er stien CLI-en, `dump`,
+    C-API-shimmet og mirror-daemonen alle går. En PG-født mirror ble derfor
+    lempelig neste gang noe rørte filen. Begge ligger nå i `tune`-posten ved
+    siden av `recursive_triggers`, som ALLEREDE var en lagret sqlite-
+    relaksasjon av samme grunn. `tune` ER registeret; det har fire oppføringer
+    nå i stedet for to. Ingen ny mekanisme, ingen nye id-er.
+
+  DE ANDRE TO DEFEKTENE, ikke lukket ennå:
+
+    virtuell tabell = «korrupt»   `mpedb-sqlitefmt/src/lib.rs:215-218` avviser
+                                  en sqlite_master-rad med rootpage=0, som er
+                                  nøyaktig hva sqlite skriver for en virtuell
+                                  tabell. Hele skanningen avbrytes med
+                                  Error::Corrupt. Rammer `mpedb dump`,
+                                  SqliteAttach og SqliteOverlay — altså hele
+                                  migrering-inn-veien — og gjelder fts5 også,
+                                  som mpedb støtter nativt. Diagnosen er feil:
+                                  filen er ikke ødelagt.
+    dobbelt feilprefiks           «NOT NULL constraint failed: NOT NULL
+                                  violation: t.b» mot sqlites «NOT NULL
+                                  constraint failed: t.b».
+
+  PUNKTENE SOM FALT, så de ikke undersøkes igjen:
+
+    pragma-ekko (punkt 4)   ALLEREDE LANDET 31/7, med den justerte doktrinen
+                            ordrett i koden.
+    overlay for test_progress / test_modifying_progress (5, 6)
+                            UMULIG, og ikke bare ubygd: C-API-shimmet har
+                            NULL kobling til SqliteOverlay — ingen suffiks-
+                            sjekk, ingen env-variabel, ingen magic-sniff — og
+                            CPythons test_backup.py bruker `:memory:` i alle
+                            16 tilfellene. Det finnes ingen `.db` å legge et
+                            overlay over.
+    fts4 legacy-lesing (7)  Lukker ikke test_dump_virtual_tables, som krever at
+                            dumpen gjengir fem skyggetabeller med sqlites
+                            eksakte kolonnelister.
+    rå bytes i TEXT (8)     Forslaget anbefaler selv å beholde streng modell.
+
+  OG EN MÅLEKORREKSJON: «SQLAlchemy dialect 1274/1277» er
+  `test/dialect/test_suite.py` — compliance-suiten. Den står 31/7 på
+  1276/1277, med derived-som-JOIN-operand som eneste rest.
+  `test/dialect/sqlite` er en ANNEN suite (257 tester, 93 shim-only mot stock,
+  uendret ved HEAD uten dagens arbeid). Den har aldri vært målet; ikke forveksle
+  de to.
+
+
 2. HVA S3 ER
 ------------
 
