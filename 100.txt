@@ -229,6 +229,63 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
   Kjør isolert før du klassifiserer.
 
 
+1a-quinquies. SESJON 31/7 (S11–S13) — SAVEPOINT OVER 4 KiB, substr, TALL
+              + 38 NYE DJANGO-LABELS MÅLT
+----------------------------------------------------------------------
+
+    a5c0854  S11: `ROLLBACK TO` over en extent-skriving. Nektingen var
+             ekte men altfor bred — `extent_threshold` er 4 KiB på Linux,
+             så den slo inn for en helt vanlig tekstkolonne. Hele
+             allokator-arbeidssettet snapshottes nå BY VALUE (ikke fire
+             lengder): eksakt ved konstruksjon, ingen antakelse om at
+             samlingene er append-only. VERIFISERT som commit-path:
+             crash --blob-kb, crash --extent-kb, powerloss (20 runder),
+             stress 5,28 M ops, og `verify()` etter hver runde i en ny
+             savepoint-test. → bulk_create 52/52 (var 16 feil).
+    7b9a785  S12: `substr()` med negativ start ELLER negativ lengde var
+             GALT SVAR. `substr('abcdef',-2)` ga 'abcdef' (skal være 'ef');
+             `substr('abcdef',2,-1)` ga '' (skal være 'a'). Django
+             kompilerer `Right(x,n)` til nettopp `SUBSTR(x,-n)`.
+             105 kombinasjoner målt; klemme-regelen er den en
+             hånd-utledning bommer på (`-8,3` er 'a', ikke '') — jeg bommet
+             selv på to linjer i testen, motoren hadde rett.
+    6452342  S13: `.5`, `5.`, `.5e2`, hex-heltall, og i64-overflow → REAL.
+             Og en nekting som manglet: `SELECT 1e` SVARTE 1, fordi `1e`
+             lekset som `1` + identifikatoren `e` og `SELECT 1 e` er
+             `1 AS e`. sqlite sier «unrecognized token». Korpuset (7,4 M)
+             er dommeren for en tokenizer-endring og ble kjørt som det.
+
+  SVEIPGRUPPA: 48 → 5 (S4–S13). Labels isolert, alle med ren stock-arm:
+      expressions_window 75/75   expressions_case 89/89
+      delete_regress     22/22   bulk_create      52/52
+      db_functions      362/363  prefetch_related 120/121
+
+  38 NYE LABELS MÅLT (~2 150 tester), første gang:
+      RENE: force_insert_update, get_earliest_or_latest, get_object_or_404,
+            get_or_create, lookup, m2m_and_m2o, m2m_intermediary,
+            m2m_multiple, many_to_many, many_to_one, many_to_one_null,
+            one_to_one, or_lookups, order_with_respect_to, select_related,
+            select_related_onetoone, select_related_regress, annotations,
+            constraints, custom_lookups, dates, datetimes, defer,
+            defer_regress, delete, distinct_on_fields, extra_regress,
+            filtered_relation
+            — inkludert `queries`: 493 TESTER, 0 FEIL. Den største
+              ORM-labelen er rein.
+      REST: model_fields 12 (JSON-path med escapes — én testfamilie),
+            aggregation_regress 6 (betinget aggregat med FILTER/CASE over
+            OR/XOR), generic_relations 2 (int64/text-grensa),
+            introspection 1.
+      IKKE VÅRE: null_fk* og string_lookups/timezones feiler på STOCK òg.
+
+  JSON-PATH-NEKTINGEN, RE-MÅLT: den er en dokumentert beslutning fra en
+  tidligere økt, og dagens måling gjør den mer berettiget, ikke mindre.
+  sqlite er SELVMOTSIGENDE her: `$."back\\slash"` TREFFER nøkkelen
+  `back\slash` (altså sammenlignet mot den RÅ, JSON-kodede etiketten),
+  mens `$."quo\"te"` IKKE treffer `quo"te` — som den samme modellen sier
+  den skulle. Ingen av de to modellene forklarer begge. Å reprodusere det
+  er å reprodusere en inkonsistens; nektingen står, og den er navngitt.
+
+
 1b. SESJON 30–31/7 — SQLALCHEMY 965 → 1274, CPYTHON 459 → 460, DJANGO +106
 --------------------------------------------------------------------------
 
