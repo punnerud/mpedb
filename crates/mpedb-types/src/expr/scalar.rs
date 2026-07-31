@@ -623,26 +623,50 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
             Value::Float(r)
         }
         ScalarFn::Substr => {
-            // sqlite/PostgreSQL agree here: 1-based, and a start below 1 counts
-            // toward the string rather than erroring.
+            // 1-based, in CHARACTERS. Two rules beyond that, both MEASURED
+            // against sqlite 3.45 (105 combinations) after each was found to be
+            // a WRONG ANSWER here — not a refusal, a different string:
+            //
+            //   * A NEGATIVE START counts from the END: `substr('abcdef', -2)`
+            //     is 'ef'. This ignored the sign and returned the whole string.
+            //     Django compiles `Right(x, n)` to exactly `SUBSTR(x, -n)`.
+            //   * A NEGATIVE LENGTH takes the |n| characters BEFORE the start,
+            //     moving the window left: `substr('abcdef', 2, -1)` is 'a'.
+            //     This returned the empty string.
+            //
+            // Then the clamp: a window starting before position 1 is TRUNCATED
+            // there, it does not slide right — `substr('abcdef', 0, 2)` is 'a',
+            // not 'ab', because position 0 is a real position that holds
+            // nothing. Doing the clamp by moving `begin` alone would have given
+            // 'ab' and looked entirely reasonable.
             let s: Vec<char> = text(&args[0])?.chars().collect();
-            let start = int(&args[1])?;
-            let begin = if start < 1 { 0usize } else { (start - 1) as usize };
-            let end = match args.len() {
-                3 => {
-                    let n = int(&args[2])?;
-                    if n <= 0 {
-                        begin
-                    } else {
-                        // saturating: begin+n can exceed usize on a hostile plan
-                        begin.saturating_add(n as usize).min(s.len())
-                    }
-                }
-                _ => s.len(),
+            let len = s.len() as i64;
+            // A negative start is `len + start + 1`, so -1 is the last
+            // character. i128 throughout: `start` is a user i64 and may be
+            // i64::MIN, where the negation and the additions below would
+            // otherwise overflow.
+            let mut y = i128::from(int(&args[1])?);
+            if y < 0 {
+                y += i128::from(len) + 1;
+            }
+            let mut z: i128 = match args.len() {
+                3 => i128::from(int(&args[2])?),
+                // No length: to the end. From a start left of 1 that is still
+                // just "the rest", so the count is measured from `y`.
+                _ => i128::from(len) - y + 1,
             };
-            let begin = begin.min(s.len());
-            let end = end.max(begin).min(s.len());
-            Value::Text(s[begin..end].iter().collect())
+            if z < 0 {
+                y += z;
+                z = -z;
+            }
+            if y < 1 {
+                // The part of the window left of position 1 is lost, not moved.
+                z += y - 1;
+                y = 1;
+            }
+            let begin = (y - 1).clamp(0, i128::from(len)) as usize;
+            let end = (y - 1 + z.max(0)).clamp(0, i128::from(len)) as usize;
+            Value::Text(s[begin..end.max(begin)].iter().collect())
         }
         ScalarFn::Replace => {
             let s = text(&args[0])?;

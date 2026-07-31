@@ -138,3 +138,76 @@ fn scalars_compose_and_filter_over_rows() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+/// `substr(X, Y[, Z])` — the two rules that were WRONG ANSWERS, not refusals.
+///
+/// A NEGATIVE START counts from the END (`substr('abcdef', -2)` is 'ef'); the
+/// sign was ignored and the whole string came back. A NEGATIVE LENGTH takes
+/// the |Z| characters BEFORE the start (`substr('abcdef', 2, -1)` is 'a'); the
+/// empty string came back. Django compiles `Right(x, n)` to exactly
+/// `SUBSTR(x, -n)`, which is how it surfaced.
+///
+/// Every value here is from a 105-combination sweep run against sqlite 3.45
+/// BEFORE the rewrite. The clamp is the third rule and the least obvious: a
+/// window starting left of position 1 is TRUNCATED there rather than sliding
+/// right, so `substr('abcdef', 0, 2)` is 'a' and not 'ab'.
+#[test]
+fn substr_negative_start_and_length_match_sqlite() {
+    let (db, path) = db();
+    let cases: &[(&str, &str)] = &[
+        // Negative start: from the end, 1-based, clamped at the front.
+        ("SELECT substr('abcdef', -1)", "f"),
+        ("SELECT substr('abcdef', -2)", "ef"),
+        ("SELECT substr('abcdef', -5)", "bcdef"),
+        ("SELECT substr('abcdef', -6)", "abcdef"),
+        ("SELECT substr('abcdef', -8)", "abcdef"),
+        ("SELECT substr('abc', -2)", "bc"),
+        ("SELECT substr('', -2)", ""),
+        // Zero and positive starts are unchanged.
+        ("SELECT substr('abcdef', 0)", "abcdef"),
+        ("SELECT substr('abcdef', 1)", "abcdef"),
+        ("SELECT substr('abcdef', 3)", "cdef"),
+        ("SELECT substr('abcdef', 7)", ""),
+        // Negative LENGTH: the window moves left of the start.
+        ("SELECT substr('abcdef', 2, -1)", "a"),
+        ("SELECT substr('abcdef', 4, -2)", "bc"),
+        ("SELECT substr('abcdef', -2, -1)", "d"),
+        ("SELECT substr('abcdef', 1, -3)", ""),
+        // The clamp: what falls left of position 1 is LOST, not shifted. These
+        // two are the ones a hand-derived expectation gets wrong (`-8, 3` is
+        // 'a', not '') — every value in this list came off a sweep against
+        // sqlite, including after the engine was already passing it.
+        ("SELECT substr('abcdef', 0, 2)", "a"),
+        ("SELECT substr('abcdef', -8, 3)", "a"),
+        ("SELECT substr('abcdef', -7, 3)", "ab"),
+        // Both together, and the alias.
+        ("SELECT substr('abcdef', -3, 2)", "de"),
+        ("SELECT substr('abcdef', -3, 5)", "def"),
+        ("SELECT substring('abcdef', -2)", "ef"),
+        ("SELECT substring('abcdef', 2, -1)", "a"),
+        // CHARACTERS, not bytes — the negative start counts codepoints.
+        ("SELECT substr('Ж日本語', -2)", "本語"),
+        ("SELECT substr('Ж日本語', -3, 2)", "日本"),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(one(&db, sql), txt(want), "{sql}");
+    }
+    // NULL in any argument propagates.
+    for sql in [
+        "SELECT substr(NULL, 1)",
+        "SELECT substr('abc', NULL)",
+        "SELECT substr('abc', 1, NULL)",
+    ] {
+        assert_eq!(one(&db, sql), Value::Null, "{sql}");
+    }
+    // A length far past the end is just "to the end". sqlite's own answer
+    // DEGENERATES above 2^31 — 'cdef' up to 1e9, then 'ab' at 2^31, '' at
+    // 2^62, 'b' at i64::MAX — which is 32-bit overflow inside its C, not a
+    // rule. mpedb computes in i128 and keeps the arithmetic answer; the two
+    // agree for every value a caller would actually pass.
+    assert_eq!(one(&db, "SELECT substr('abcdef', 3, 1000000000)"), txt("cdef"));
+    assert_eq!(one(&db, "SELECT substr('abcdef', 3, 9223372036854775807)"), txt("cdef"));
+
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
