@@ -60,7 +60,14 @@ pub(super) fn plan_recursive_cte(
 
     // 2. Recursive term — planned WITH the working table in scope. Must reference
     //    it exactly once, in a FROM/JOIN operand (§3), and agree on arity/types.
-    let cte_def = crate::plan::cte_working_table_def(name, &rc.columns, &col_types);
+    // The working table's columns are the ANCHOR's projection, so they carry
+    // the anchor's declared affinities — same rule, same walk as a derived
+    // body's. Without them a `decimal` column carried through a recursive CTE
+    // compared by storage class and `WHERE p > '50'` answered nothing.
+    let col_affinities =
+        super::derived::select_output_affinities(&anchor, anchor.order_junk as usize, None, schema);
+    let cte_def =
+        crate::plan::cte_working_table_def(name, &rc.columns, &col_types, &col_affinities);
     let cte = CteRef { name, def: &cte_def };
     let (r_stmt, r_ptypes, r_ctx, _r_list, r_out, r_subs) =
         plan_select(&rc.recursive, schema, n_params, catalog, mode, host_udfs, row_count, consts, Some(cte))?;
@@ -112,6 +119,7 @@ pub(super) fn plan_recursive_cte(
         name: rc.name.clone(),
         columns: rc.columns.clone(),
         col_types,
+        col_affinities,
         union_all: rc.union_all,
         anchor,
         recursive,

@@ -477,6 +477,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<PlanSt
             }
             let mut columns = Vec::with_capacity(n_cols.min(1024));
             let mut col_types = Vec::with_capacity(n_cols.min(1024));
+            let mut col_affinities = Vec::with_capacity(n_cols.min(1024));
             for _ in 0..n_cols {
                 columns.push(r_str(buf, pos)?);
                 let tag = r_u8(buf, pos)?;
@@ -484,6 +485,10 @@ fn decode_stmt(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<PlanSt
                     ColumnType::from_tag(tag)
                         .ok_or_else(|| corrupt(format!("bad recursive CTE column type tag {tag}")))?,
                 );
+                let atag = r_u8(buf, pos)?;
+                col_affinities.push(mpedb_types::Affinity::from_tag(atag).ok_or_else(|| {
+                    corrupt(format!("bad column affinity tag {atag}"))
+                })?);
             }
             let union_all = match r_u8(buf, pos)? {
                 0 => false,
@@ -497,6 +502,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<PlanSt
                 name,
                 columns,
                 col_types,
+                col_affinities,
                 union_all,
                 anchor,
                 recursive,
@@ -513,15 +519,20 @@ fn decode_stmt(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<PlanSt
             }
             let mut columns = Vec::with_capacity(n_cols.min(1024));
             let mut col_types = Vec::with_capacity(n_cols.min(1024));
+            let mut col_affinities = Vec::with_capacity(n_cols.min(1024));
             for _ in 0..n_cols {
                 columns.push(r_str(buf, pos)?);
                 let tag = r_u8(buf, pos)?;
                 col_types.push(ColumnType::from_tag(tag).ok_or_else(|| {
                     corrupt(format!("bad derived-table column type tag {tag}"))
                 })?);
+                let atag = r_u8(buf, pos)?;
+                col_affinities.push(mpedb_types::Affinity::from_tag(atag).ok_or_else(|| {
+                    corrupt(format!("bad column affinity tag {atag}"))
+                })?);
             }
             Ok(PlanStmt::Derived(decode_derived_plan_tail(
-                name, columns, col_types, buf, pos, budget,
+                name, columns, col_types, col_affinities, buf, pos, budget,
             )?))
         }
         other => decode_stmt_rest(other, buf, pos),
@@ -541,20 +552,26 @@ fn decode_derived_plan(
     }
     let mut columns = Vec::with_capacity(n_cols);
     let mut col_types = Vec::with_capacity(n_cols);
+    let mut col_affinities = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
         columns.push(r_str(buf, pos)?);
         let tag = r_u8(buf, pos)?;
         col_types.push(ColumnType::from_tag(tag).ok_or_else(|| {
             corrupt(format!("bad derived-table column type tag {tag}"))
         })?);
+        let atag = r_u8(buf, pos)?;
+        col_affinities.push(mpedb_types::Affinity::from_tag(atag).ok_or_else(|| {
+            corrupt(format!("bad column affinity tag {atag}"))
+        })?);
     }
-    decode_derived_plan_tail(name, columns, col_types, buf, pos, budget)
+    decode_derived_plan_tail(name, columns, col_types, col_affinities, buf, pos, budget)
 }
 
 fn decode_derived_plan_tail(
     name: String,
     columns: Vec<String>,
     col_types: Vec<ColumnType>,
+    col_affinities: Vec<mpedb_types::Affinity>,
     buf: &[u8],
     pos: &mut usize,
     budget: &mut usize,
@@ -585,6 +602,7 @@ fn decode_derived_plan_tail(
         name,
         columns,
         col_types,
+        col_affinities,
         body,
         body_subplans,
         body_sub_base,

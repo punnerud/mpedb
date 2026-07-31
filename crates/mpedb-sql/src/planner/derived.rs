@@ -127,7 +127,9 @@ pub(super) fn plan_derived_select(
 
     // 3. The outer statement, planned with the alias resolving to the working
     //    table (FullScan-only; `plan_select` guards its access extraction).
-    let def = crate::plan::cte_working_table_def(&name, &columns, &col_types);
+    let col_affinities = body_output_affinities(&body, schema);
+    let def =
+        crate::plan::cte_working_table_def(&name, &columns, &col_types, &col_affinities);
     let cte = CteRef { name: &name, def: &def };
     let outer_ast = ast::SelectStmt {
         table: Some(name.clone()),
@@ -191,6 +193,7 @@ pub(super) fn plan_derived_select(
         name,
         columns,
         col_types,
+        col_affinities,
         body,
         body_subplans: b_subs,
         body_sub_base,
@@ -230,6 +233,84 @@ fn reject_context(name: &str, which: &str, ctx: &[String]) -> Result<()> {
 /// resolve the way they do in sqlite. A compound body's names come from its
 /// first arm (sqlite's and PG's rule); a select body's ORDER-BY junk columns
 /// are not output and are excluded.
+/// One AFFINITY per output column of a materialized body — the twin of
+/// [`body_output_names`], walking the same projection with the same slot chain.
+///
+/// The rule is the one the window path already uses for a collation
+/// (`program_coll`): a projection that IS a bare column carries that column's
+/// DECLARED affinity; anything computed carries `implied_by`, i.e. none worth
+/// having. MEASURED against sqlite 3.45, which agrees at both ends —
+/// `HAVING max(price) > '50'` and `HAVING price + 0 > '50'` are empty there,
+/// so an aggregate result and an expression genuinely have no affinity.
+///
+/// Without this, `Affinity::implied_by` collapsed `decimal(10,2)` — declared
+/// as `(Any, Numeric)` — to `Blob`, and a materialized body's `WHERE price >
+/// '50'` answered nothing where the identical predicate over the base table
+/// answered correctly.
+fn body_output_affinities(body: &SubBody, schema: &Schema) -> Vec<mpedb_types::Affinity> {
+    let (arm, junk, base): (&SelectPlan, usize, Option<&[mpedb_types::Affinity]>) = match body {
+        SubBody::Select(sp) => (sp, sp.order_junk as usize, None),
+        SubBody::Compound(c) => match &c.arms[0] {
+            crate::plan::CompoundArm::Select(sp) => (sp, 0, None),
+            crate::plan::CompoundArm::Derived(dp) => (&dp.outer, 0, Some(&dp.col_affinities)),
+        },
+        SubBody::Derived(dp) => (
+            &dp.outer,
+            dp.outer.order_junk as usize,
+            Some(&dp.col_affinities),
+        ),
+    };
+    select_output_affinities(arm, junk, base, schema)
+}
+
+/// One SELECT's output affinities. Shared by a derived body and a recursive
+/// CTE's anchor — both fix a working table's columns from a projection, so
+/// giving them separate walks is how one of them would silently keep
+/// `implied_by`.
+pub(super) fn select_output_affinities(
+    arm: &SelectPlan,
+    junk: usize,
+    base: Option<&[mpedb_types::Affinity]>,
+    schema: &Schema,
+) -> Vec<mpedb_types::Affinity> {
+    let aff_slot = |slot: usize| -> Option<mpedb_types::Affinity> {
+        let mut i = slot;
+        if let Some(b) = base {
+            if i < b.len() {
+                return b.get(i).copied();
+            }
+            i -= b.len();
+        }
+        let chain: Vec<u32> = if base.is_some() {
+            arm.joins.iter().map(|j| j.table).collect()
+        } else {
+            std::iter::once(arm.table).chain(arm.joins.iter().map(|j| j.table)).collect()
+        };
+        for id in chain {
+            let Some(t) = schema.table(id) else { break };
+            if i < t.columns.len() {
+                return Some(t.columns[i].affinity);
+            }
+            i -= t.columns.len();
+        }
+        None
+    };
+    arm.projection
+        .iter()
+        .take(arm.projection.len() - junk)
+        .map(|p| match p {
+            Projection::Column(i) => aff_slot(*i as usize),
+            // A single `PushCol` IS a bare column wearing an alias — the same
+            // shape `program_coll` recognises for a collation.
+            Projection::Expr { program, .. } => match program.instrs.as_slice() {
+                [mpedb_types::Instr::PushCol(i)] => aff_slot(*i as usize),
+                _ => None,
+            },
+        })
+        .map(|a| a.unwrap_or(mpedb_types::Affinity::Blob))
+        .collect()
+}
+
 fn body_output_names(body: &SubBody, schema: &Schema) -> Vec<String> {
     // `base` names the FIRST operand when it is a materialized working table
     // rather than a schema table — `schema` has no entry for `CTE_TABLE`, so

@@ -78,9 +78,12 @@ fn encode_subplan(s: &SubPlan, buf: &mut Vec<u8>) {
 fn encode_derived_plan(dp: &crate::plan::DerivedPlan, buf: &mut Vec<u8>) {
     w_str(buf, &dp.name);
     w_u16(buf, dp.columns.len() as u16);
-    for (name, ty) in dp.columns.iter().zip(&dp.col_types) {
+    // Format 68: the affinity rides beside the type, one byte each, in the
+    // same loop so the two can never be written a different number of times.
+    for ((name, ty), aff) in dp.columns.iter().zip(&dp.col_types).zip(&dp.col_affinities) {
         w_str(buf, name);
         buf.push(*ty as u8);
+        buf.push(*aff as u8);
     }
     match &dp.body {
         SubBody::Select(sp) => {
@@ -358,9 +361,12 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             w_str(buf, &rc.name);
             // The declared columns paired with their types (equal length).
             w_u16(buf, rc.columns.len() as u16);
-            for (name, ty) in rc.columns.iter().zip(&rc.col_types) {
+            for ((name, ty), aff) in
+                rc.columns.iter().zip(&rc.col_types).zip(&rc.col_affinities)
+            {
                 w_str(buf, name);
                 buf.push(*ty as u8);
+                buf.push(*aff as u8);
             }
             buf.push(rc.union_all as u8);
             encode_select(&rc.anchor, buf);

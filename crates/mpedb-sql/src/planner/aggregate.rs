@@ -98,12 +98,12 @@ fn lift_aggs(
     // sqlite bare columns: `(base-row slot, type)`, deduped by slot. A bare
     // column becomes `__b{j}` where `j` is its index here; the planner resolves
     // those names against the extended grouped tuple `[keys ‖ aggs ‖ bare]`.
-    bare: &mut Vec<(u16, ColumnType)>,
+    bare: &mut Vec<(u16, ColumnType, mpedb_types::Affinity)>,
 ) -> Result<ast::Expr> {
     use ast::Expr as E;
     let rec = |x: &ast::Expr,
                aggs: &mut Vec<AggSpec>,
-               bare: &mut Vec<(u16, ColumnType)>| lift_aggs(x, keys, scope, mode, aggs, bare);
+               bare: &mut Vec<(u16, ColumnType, mpedb_types::Affinity)>| lift_aggs(x, keys, scope, mode, aggs, bare);
     let group_by = keys.asts;
     // A selected/ordered expression that IS a group key — `SELECT a+1 …
     // GROUP BY a+1` — names that key's slot in the grouped tuple. Checked
@@ -171,10 +171,19 @@ fn lift_aggs(
                         )))
                     }
                     BareGroupBy::Sqlite => {
-                        let j = match bare.iter().position(|(c, _)| *c == idx) {
+                        let j = match bare.iter().position(|(c, _, _)| *c == idx) {
                             Some(j) => j,
                             None => {
-                                bare.push((idx, ty));
+                                // The base column's DECLARED affinity travels
+                                // with it: a bare column IS that column, read
+                                // from the group's witness row.
+                                let aff = scope
+                                    .column_shape(idx)
+                                    .map_or_else(
+                                        || mpedb_types::Affinity::implied_by(ty),
+                                        |(_, a)| a,
+                                    );
+                                bare.push((idx, ty, aff));
                                 bare.len() - 1
                             }
                         };
@@ -290,11 +299,29 @@ fn synthetic_grouped_table(
     // One collation per GROUP BY key — a bare column's declared collation, so an
     // `ORDER BY <grouped-key>` over this synthetic tuple inherits it.
     key_collations: &[Collation],
+    // One AFFINITY per GROUP BY key, on exactly the same rule as the collation
+    // beside it: a bare column carries its DECLARED affinity, anything computed
+    // carries none.
+    //
+    // This was `Affinity::implied_by(ty)`, which cannot reproduce a declared
+    // one — `decimal(10,2)` is `(Any, Numeric)` and `implied_by(Any)` is `Blob`
+    // (value.rs). So `HAVING price > '50'` compared REAL against TEXT by
+    // storage class and was FALSE for every row, where the identical `WHERE`
+    // over the base row answered correctly. A wrong answer, and the collation
+    // one line up had been threaded all along.
+    //
+    // MEASURED against sqlite 3.45 for the neighbouring regions, which is why
+    // only the keys get one: `HAVING max(price) > '50'` and
+    // `HAVING price + 0 > '50'` are BOTH empty there — an aggregate result and
+    // a computed key have no affinity either.
+    key_affinities: &[mpedb_types::Affinity],
     aggs: &[AggSpec],
     agg_types: &[Option<ColumnType>],
-    // sqlite bare columns `(base slot, type)`: the tuple's tail
-    // `[keys ‖ aggs ‖ bare]`, named `__b{j}`. Empty in postgres mode.
-    bare: &[(u16, ColumnType)],
+    // sqlite bare columns `(base slot, type, declared affinity)`: the tuple's
+    // tail `[keys ‖ aggs ‖ bare]`, named `__b{j}`. Empty in postgres mode. A
+    // bare column IS a base column, carried from the witness row, so it keeps
+    // its affinity for the same reason a key does.
+    bare: &[(u16, ColumnType, mpedb_types::Affinity)],
 ) -> TableDef {
     let mut out: Vec<mpedb_types::ColumnDef> =
         Vec::with_capacity(key_types.len() + aggs.len() + bare.len());
@@ -308,7 +335,10 @@ fn synthetic_grouped_table(
             default: None,
             check: None,
             collation: key_collations.get(k).copied().unwrap_or(Collation::Binary),
-            affinity: mpedb_types::Affinity::implied_by(ty),
+            affinity: key_affinities
+                .get(k)
+                .copied()
+                .unwrap_or_else(|| mpedb_types::Affinity::implied_by(ty)),
         });
     }
     for (i, (f, _, _, _, _)) in aggs.iter().enumerate() {
@@ -346,7 +376,7 @@ fn synthetic_grouped_table(
     // The bare region: named `__b{j}` (the names `lift_aggs` emitted), typed by
     // the base column. Always nullable — a bare column is carried from a witness
     // row that may hold NULL, and an empty group yields NULL.
-    for (j, (_, ty)) in bare.iter().enumerate() {
+    for (j, (_, ty, aff)) in bare.iter().enumerate() {
         out.push(mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
             name: format!("__b{j}"),
             ty: *ty,
@@ -356,7 +386,7 @@ fn synthetic_grouped_table(
             default: None,
             check: None,
             collation: Collation::Binary,
-            affinity: mpedb_types::Affinity::implied_by(*ty),
+            affinity: *aff,
         });
     }
     TableDef {
@@ -424,6 +454,9 @@ pub(super) fn plan_aggregate_select(
     // BINARY for a computed key. Rides into the synthetic grouped tuple so an
     // `ORDER BY <key>` over the grouped row picks it up.
     let mut key_collations: Vec<Collation> = Vec::with_capacity(s.group_by.len());
+    // Parallel to `key_collations`, and threaded for the same reason.
+    let mut key_affinities: Vec<mpedb_types::Affinity> =
+        Vec::with_capacity(s.group_by.len());
     let mut key_asts: Vec<ast::Expr> = Vec::with_capacity(s.group_by.len());
     for g in &s.group_by {
         // `GROUP BY 2` is an OUTPUT ordinal in sqlite and PostgreSQL, so the
@@ -470,6 +503,13 @@ pub(super) fn plan_aggregate_select(
                 key_cols.push(Some(i));
                 key_types.push(ty);
                 key_collations.push(base_scope.column_collation(i));
+                // The DECLARED affinity, from the same place the collation
+                // comes from. `implied_by` cannot reproduce it.
+                key_affinities.push(
+                    base_scope
+                        .column_shape(i)
+                        .map_or_else(|| mpedb_types::Affinity::implied_by(ty), |(_, a)| a),
+                );
             }
             expr => {
                 // Same rule as repeated columns: redundant, not wrong.
@@ -483,6 +523,11 @@ pub(super) fn plan_aggregate_select(
                 // honest "decided per value" column type.
                 key_types.push(ty.unwrap_or(ColumnType::Any));
                 key_collations.push(Collation::Binary);
+                // A COMPUTED key has no declared affinity — measured: sqlite's
+                // `HAVING price + 0 > '50'` is empty too.
+                key_affinities.push(mpedb_types::Affinity::implied_by(
+                    ty.unwrap_or(ColumnType::Any),
+                ));
             }
         }
         key_asts.push(g.clone());
@@ -495,7 +540,7 @@ pub(super) fn plan_aggregate_select(
     let keys = GroupKeys { asts: &key_asts, cols: &key_cols };
     let mut agg_specs: Vec<AggSpec> =
         Vec::new();
-    let mut bare: Vec<(u16, ColumnType)> = Vec::new();
+    let mut bare: Vec<(u16, ColumnType, mpedb_types::Affinity)> = Vec::new();
     // WINDOW functions over a GROUPED result. The window phase runs AFTER
     // grouping, so a window call is lifted out FIRST — leaving a `__w{k}`
     // placeholder that `lift_aggs` passes through — and its own subexpressions
@@ -631,7 +676,14 @@ pub(super) fn plan_aggregate_select(
     //    in a dead branch (`COALESCE(-24, col)`) drops out and never reaches a
     //    program.
     let grouped =
-        synthetic_grouped_table(&key_types, &key_collations, &agg_specs, &agg_types, &bare);
+        synthetic_grouped_table(
+            &key_types,
+            &key_collations,
+            &key_affinities,
+            &agg_specs,
+            &agg_types,
+            &bare,
+        );
     let mut binder = binder.rescope(Scope::single(&grouped));
     // Each window's own subexpressions bind against the GROUPED tuple — that is
     // what makes `PARTITION BY dept` name a group key and `ORDER BY count(*)`
@@ -815,7 +867,7 @@ pub(super) fn plan_aggregate_select(
         // grouped-tuple slot positions the projection was bound against stay put;
         // the executor fills them all from the group's witness row — the single
         // min/max extremum, or the lowest-rowid row — inferred from the aggregate set.
-        Ok(bare.iter().map(|(c, _)| *c).collect())
+        Ok(bare.iter().map(|(c, _, _)| *c).collect())
     };
 
     // 5. ORDER BY. Preferred form: every key is a bare column of the GROUPED

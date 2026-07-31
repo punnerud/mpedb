@@ -494,7 +494,7 @@ const MAX_JOINS: usize = 63;
 //     Python source. The integer SEMANTICS are untouched (0 = the current row,
 //     negative looks the other way — both already matched sqlite); only where
 //     the integer comes from is new.
-const PLAN_FORMAT: u8 = 67;
+const PLAN_FORMAT: u8 = 68;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1485,6 +1485,18 @@ pub struct RecursiveCtePlan {
     /// to `columns`. A rigid engine fixes them here; the recursive term's
     /// projection must agree (arity AND type).
     pub col_types: Vec<ColumnType>,
+    /// One AFFINITY per output column (format 68), on the same rule the window
+    /// path uses for a collation: a projection that IS a bare column carries
+    /// that column's DECLARED affinity, anything computed carries none.
+    ///
+    /// It has to live in the PLAN rather than be recomputed after decode,
+    /// because the compile-time and validate-time working-table defs must not
+    /// drift (see `cte_working_table_def`). Without it, `Affinity::implied_by`
+    /// turned `decimal(10,2)` — which is `(Any, Numeric)` — into `Blob`, and a
+    /// materialized body's `WHERE price > '50'` compared REAL against TEXT by
+    /// storage class and answered NOTHING where the same predicate over the
+    /// base table answered correctly.
+    pub col_affinities: Vec<mpedb_types::Affinity>,
     /// `UNION ALL` keeps every recursive row; `UNION` deduplicates each step's
     /// output against the full accumulated result (on the whole tuple).
     pub union_all: bool,
@@ -1504,7 +1516,7 @@ impl RecursiveCtePlan {
     /// typed by `col_types`, no PK and no indexes (so every access over it is a
     /// FullScan). Never registered in a schema; never reaches the row/key layer.
     pub fn cte_def(&self) -> TableDef {
-        cte_working_table_def(&self.name, &self.columns, &self.col_types)
+        cte_working_table_def(&self.name, &self.columns, &self.col_types, &self.col_affinities)
     }
 }
 
@@ -1551,6 +1563,18 @@ pub struct DerivedPlan {
     /// The body's output column types, aligned to `columns`. An output the body
     /// leaves untyped (a bare NULL) is `any`, decided per value at runtime.
     pub col_types: Vec<ColumnType>,
+    /// One AFFINITY per output column (format 68), on the same rule the window
+    /// path uses for a collation: a projection that IS a bare column carries
+    /// that column's DECLARED affinity, anything computed carries none.
+    ///
+    /// It has to live in the PLAN rather than be recomputed after decode,
+    /// because the compile-time and validate-time working-table defs must not
+    /// drift (see `cte_working_table_def`). Without it, `Affinity::implied_by`
+    /// turned `decimal(10,2)` — which is `(Any, Numeric)` — into `Blob`, and a
+    /// materialized body's `WHERE price > '50'` compared REAL against TEXT by
+    /// storage class and answered NOTHING where the same predicate over the
+    /// base table answered correctly.
+    pub col_affinities: Vec<mpedb_types::Affinity>,
     /// The materialized body — a plain `SELECT` or a whole compound. Never
     /// references [`CTE_TABLE`] (a derived table cannot see itself).
     pub body: SubBody,
@@ -1592,7 +1616,7 @@ impl DerivedPlan {
     /// validator, executor and EXPLAIN — the same working-table shape as
     /// [`RecursiveCtePlan::cte_def`].
     pub fn derived_def(&self) -> TableDef {
-        cte_working_table_def(&self.name, &self.columns, &self.col_types)
+        cte_working_table_def(&self.name, &self.columns, &self.col_types, &self.col_affinities)
     }
 }
 
@@ -1608,6 +1632,9 @@ pub(crate) fn cte_working_table_def(
     name: &str,
     columns: &[String],
     col_types: &[ColumnType],
+    // Parallel to `col_types`. Shorter (or empty) falls back to
+    // `implied_by`, which is what every caller did before format 68.
+    col_affinities: &[mpedb_types::Affinity],
 ) -> TableDef {
     TableDef {
         id: CTE_TABLE,
@@ -1615,7 +1642,8 @@ pub(crate) fn cte_working_table_def(
         columns: columns
             .iter()
             .zip(col_types)
-            .map(|(name, &ty)| mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
+            .enumerate()
+            .map(|(i, (name, &ty))| mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
                 name: name.clone(),
                 ty,
                 nullable: true,
@@ -1624,7 +1652,10 @@ pub(crate) fn cte_working_table_def(
                 default: None,
                 check: None,
                 collation: mpedb_types::Collation::Binary,
-                affinity: mpedb_types::Affinity::implied_by(ty),
+                affinity: col_affinities
+                    .get(i)
+                    .copied()
+                    .unwrap_or_else(|| mpedb_types::Affinity::implied_by(ty)),
             })
             .collect(),
         primary_key: Vec::new(),
