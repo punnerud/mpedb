@@ -227,8 +227,17 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                 i += 1;
                 Tok::Semicolon
             }
-            // A standalone `.` (a `.5`-style float is lexed inside the digit
-            // arm, so this only fires for a qualifier dot like `alias.table`).
+            // A `.5`-style float — a fraction with NO leading digit, which is
+            // what Django's ORM writes for `price * .5`. The digit arm cannot
+            // see it (there is no leading digit), so the dispatch happens here.
+            // A dot NOT followed by a digit stays a qualifier dot, so
+            // `alias.table` is unaffected and a lone `.` still reaches the
+            // parser's error, as in sqlite.
+            b'.' if sql.as_bytes().get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                let (tok, next) = lex_number(sql, i)?;
+                i = next;
+                tok
+            }
             b'.' => {
                 i += 1;
                 Tok::Dot
@@ -541,15 +550,48 @@ fn lex_bracket_ident(sql: &str, start: usize) -> Result<(String, usize)> {
     Err(perr(start, "unterminated quoted identifier"))
 }
 
-/// Lex an integer or float literal starting at a digit.
+/// Lex an integer or float literal starting at a digit or at a `.` that is
+/// followed by one.
+///
+/// Every form MEASURED against sqlite 3.45 rather than assumed, because the
+/// permissive ones look like typos and the refused ones look legal:
+///
+/// ```text
+///   .5  5.  .5e2  5.e2  1.        accepted, all REAL
+///   0x1F  0X1f                    accepted, INTEGER
+///   9223372036854775808           accepted, REAL (past i64 it is a float)
+///   ..5  .  .e2  1e  0b101  1_000 refused
+/// ```
 fn lex_number(sql: &str, start: usize) -> Result<(Tok, usize)> {
     let b = sql.as_bytes();
     let mut i = start;
+    // Hex integers (`0x1F`). sqlite takes them as INTEGER; the digits are
+    // required, so a bare `0x` falls through to the decimal path and lexes as
+    // `0` followed by the identifier `x`, which the parser then rejects.
+    if b[i] == b'0'
+        && matches!(b.get(i + 1), Some(b'x' | b'X'))
+        && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+    {
+        let hstart = i + 2;
+        i = hstart;
+        while i < b.len() && b[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        // sqlite wraps a hex literal that overflows into the i64 bit pattern
+        // (it reads exactly 16 significant hex digits); anything longer is
+        // refused rather than silently truncated.
+        let text = &sql[hstart..i];
+        let v = u64::from_str_radix(text, 16)
+            .map_err(|_| perr(start, "hex integer literal out of range"))?;
+        return Ok((Tok::Int(v as i64), i));
+    }
     while i < b.len() && b[i].is_ascii_digit() {
         i += 1;
     }
     let mut is_float = false;
-    if i < b.len() && b[i] == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+    // A `.` makes it a float whether or not fraction digits follow: `5.` is
+    // 5.0 in sqlite. The leading-dot form arrives here with `i == start`.
+    if i < b.len() && b[i] == b'.' {
         is_float = true;
         i += 1;
         while i < b.len() && b[i].is_ascii_digit() {
@@ -571,17 +613,50 @@ fn lex_number(sql: &str, start: usize) -> Result<(Tok, usize)> {
             }
         }
     }
+    // A numeric literal may not run straight into an identifier character.
+    // Without this, `1e` lexed as `1` followed by the identifier `e` — and
+    // `SELECT 1 e` is legal SQL meaning `1 AS e`, so `SELECT 1e` ANSWERED 1
+    // where sqlite says "unrecognized token". Same for `0b101` (→ 0 AS b101)
+    // and `1_000` (→ 1 AS _000). A space still makes the alias, which is the
+    // form anyone actually writes.
+    if i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        return Err(perr(start, "malformed numeric literal"));
+    }
     let text = &sql[start..i];
     if is_float {
-        let v: f64 = text
+        // Rust's `f64::from_str` rejects the bare-dot forms Rust itself has no
+        // literal for (`.5`, `5.`, `5.e2`), so the text is normalised before
+        // parsing rather than each form being special-cased downstream.
+        let mut norm = String::with_capacity(text.len() + 2);
+        if text.starts_with('.') {
+            norm.push('0');
+        }
+        norm.push_str(text);
+        if let Some(p) = norm.find(['e', 'E']) {
+            if norm[..p].ends_with('.') {
+                norm.insert(p, '0');
+            }
+        } else if norm.ends_with('.') {
+            norm.push('0');
+        }
+        let v: f64 = norm
             .parse()
             .map_err(|_| perr(start, "invalid float literal"))?;
         Ok((Tok::Float(v), i))
     } else {
-        let v: i64 = text
-            .parse()
-            .map_err(|_| perr(start, "integer literal out of range"))?;
-        Ok((Tok::Int(v), i))
+        match text.parse::<i64>() {
+            Ok(v) => Ok((Tok::Int(v), i)),
+            // Past i64 sqlite keeps the value as a REAL rather than failing —
+            // `SELECT 9223372036854775808` is 9.223372036854776e+18 there.
+            // Refusing would have been a narrower engine on a literal a
+            // generated query can legitimately contain.
+            Err(_) => {
+                let v: f64 = text
+                    .parse()
+                    .map_err(|_| perr(start, "integer literal out of range"))?;
+                Ok((Tok::Float(v), i))
+            }
+        }
     }
 }
 
@@ -651,12 +726,37 @@ mod tests {
         assert_eq!(toks("1.5"), vec![Tok::Float(1.5)]);
         assert_eq!(toks("1e3"), vec![Tok::Float(1000.0)]);
         assert_eq!(toks("2.5e-1"), vec![Tok::Float(0.25)]);
-        // i64::MAX ok; one more overflows with an error, not a panic.
+        // i64::MAX stays an integer; one more becomes a REAL, which is what
+        // sqlite does (`SELECT 9223372036854775808` is 9.223372036854776e+18
+        // there). Refusing was a narrower engine on a literal a generated
+        // query can legitimately contain.
         assert_eq!(toks("9223372036854775807"), vec![Tok::Int(i64::MAX)]);
-        assert!(matches!(
-            tokenize("9223372036854775808"),
-            Err(Error::Parse { pos: 0, .. })
-        ));
+        assert_eq!(toks("9223372036854775808"), vec![Tok::Float(9223372036854775808.0)]);
+
+        // The bare-dot forms, all REAL — `.5` is what Django's ORM writes for
+        // `price * .5`, and every one of these was a parse error.
+        assert_eq!(toks(".5"), vec![Tok::Float(0.5)]);
+        assert_eq!(toks("5."), vec![Tok::Float(5.0)]);
+        assert_eq!(toks(".5e2"), vec![Tok::Float(50.0)]);
+        assert_eq!(toks("5.e2"), vec![Tok::Float(500.0)]);
+        assert_eq!(toks(".5E-2"), vec![Tok::Float(0.005)]);
+        // Hex integers.
+        assert_eq!(toks("0x1F"), vec![Tok::Int(31)]);
+        assert_eq!(toks("0X1f"), vec![Tok::Int(31)]);
+        // A dot NOT followed by a digit is still a qualifier dot.
+        assert_eq!(toks("a.b"), vec![Tok::Ident("a".into()), Tok::Dot, Tok::Ident("b".into())]);
+        // A literal running straight into an identifier character is
+        // malformed, as in sqlite — without this `1e` lexed as `1` plus the
+        // identifier `e`, and `SELECT 1e` ANSWERED 1 (an alias) where sqlite
+        // says "unrecognized token".
+        for bad in ["1e", "1e+", "0b101", "1_000", "1x", "0xZZ"] {
+            assert!(
+                tokenize(bad).is_err(),
+                "`{bad}` must not lex as a number followed by an identifier"
+            );
+        }
+        // …but a SPACE still makes the alias.
+        assert_eq!(toks("1 e"), vec![Tok::Int(1), Tok::Ident("e".into())]);
     }
 
     #[test]
