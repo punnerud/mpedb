@@ -430,14 +430,18 @@ fn stale_plan_surfaces_plan_invalidated() {
     let foreign = mpedb_sql::prepare(sql, &other_schema).unwrap();
 
     // Forge the registry record under the proc's plan hash: the facade
-    // exposes no raw registry writes, so attach a second engine directly
-    // (registry record layout: sql_len ‖ sql ‖ blob_len ‖ blob ‖ last_used).
+    // exposes no raw registry writes, so attach a second engine directly.
+    // Layout: sql_len ‖ sql ‖ blob_len ‖ blob ‖ dialect ‖ last_used. The
+    // dialect byte must be the one THIS process compiles under (0 = sqlite,
+    // the default), or the load path refuses on the dialect before it ever
+    // reaches the schema check this test is about.
     let blob = foreign.encode();
     let mut rec = Vec::new();
     rec.extend_from_slice(&(sql.len() as u32).to_le_bytes());
     rec.extend_from_slice(sql.as_bytes());
     rec.extend_from_slice(&(blob.len() as u32).to_le_bytes());
     rec.extend_from_slice(&blob);
+    rec.push(0);
     rec.extend_from_slice(&1u64.to_le_bytes());
     let mut key = b"plan/".to_vec();
     key.extend_from_slice(&h.0);

@@ -216,13 +216,24 @@ pub(crate) fn create_mirror_db(
             require_policy: Default::default(),
             // sqlite import → lenient (sqlite) bare columns; PostgreSQL import →
             // strict (postgres), so a query PG refused keeps being refused here.
+            // NAMED, so it is written into the file's `tune` record: the
+            // strictness has to survive the next config-free attach, and it did
+            // not — `dump`, the mirror daemon and the CLI all reopened a
+            // PostgreSQL mirror lenient.
             bare_group_by,
+            bare_group_by_named: true,
             // A mirror applier writes rows in the order the SOURCE's log gives
             // them, which is not a dependency order: a child can legitimately
             // land before its parent and be reconciled by the next batch.
             // Enforcing keys here would refuse a faithful mirror. `mirror` also
             // runs below policies for the same reason (§0).
+            //
+            // NOT named: this is what THIS HANDLE needs, not a claim about the
+            // database. The target may well want enforcement for ordinary
+            // callers, and stamping `false` into the file would take that away.
+            // The applier's own exemption is re-asserted after open, below.
             foreign_keys: false,
+            foreign_keys_named: false,
             // A mirror target's relationship to its SOURCE is the mirror's own
             // state machine (§7 authority/epoch); the `[sync]` role is about
             // mpedb⇄mpedb links and is orthogonal.
@@ -236,7 +247,13 @@ pub(crate) fn create_mirror_db(
         },
         schema,
     };
-    Database::open_with_config(config)
+    let db = Database::open_with_config(config)?;
+    // Per CONNECTION, and deliberately after open: the file may record that
+    // this database enforces foreign keys, and the record is authoritative for
+    // ordinary callers. The applier is not one — see the note on the option
+    // above — so it opts its own handle out.
+    db.set_fk_enforced(false);
+    Ok(db)
 }
 
 /// Stream one table's rows from the snapshot into mpedb in bounded batches,

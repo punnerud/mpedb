@@ -267,14 +267,26 @@ pub struct DbOptions {
     /// GROUP BY column-strictness dialect ([`BareGroupBy`], COMPAT.md). Set from
     /// `[compat] bare_group_by` (default [`BareGroupBy::Sqlite`]); a PostgreSQL
     /// `mirror import` overrides it to [`BareGroupBy::Postgres`] so the strictness
-    /// travels with the data's origin. A per-process compilation option like
-    /// `durability`, so it lives here rather than in the file-frozen schema.
+    /// travels with the data's origin.
+    ///
+    /// **The FILE is authoritative** — this is what a config may SEED it with.
+    /// It used to be per-process like `durability`, and that was a silent
+    /// loosening bug: `Database::open_from_file` (the mirror daemon, `dump`,
+    /// the C-API shim, `mpedb <file>`) has no `[compat]` to read, so a
+    /// PostgreSQL-born file reopened lenient. The database records it now.
     pub bare_group_by: BareGroupBy,
-    /// Initial `PRAGMA foreign_keys` for connections opened from this config
+    /// Initial `PRAGMA foreign_keys` for connections to this database
     /// (`[compat] foreign_keys`, default false — sqlite's default). A
-    /// per-process option like `durability`: the FILE never records whether
-    /// keys were enforced, only that they were declared.
+    /// connection may still flip it at runtime, as sqlite's pragma is
+    /// per-connection; the FILE decides where it starts. Same authority and
+    /// the same reason as `bare_group_by`.
     pub foreign_keys: bool,
+    /// Whether the CONFIG named each of the two above, as opposed to taking
+    /// the default. See [`CompatOptions`]: a config that names a value the
+    /// stored record contradicts is a named refusal, one that names nothing
+    /// defers to the file.
+    pub bare_group_by_named: bool,
+    pub foreign_keys_named: bool,
     /// This process's role in a sync topology (`[sync] role`, #157):
     /// `standalone` (default), `replica` or `authority`.
     ///
@@ -424,6 +436,16 @@ struct RawCompat {
 pub struct CompatOptions {
     pub bare_group_by: BareGroupBy,
     pub foreign_keys: bool,
+    /// Whether the section NAMED each value, as opposed to taking the default.
+    ///
+    /// It matters because the FILE now records these two (the `tune` record),
+    /// and the file is authoritative. A config that names a value the file
+    /// contradicts is a refusal rather than a silent override; a config that
+    /// names nothing simply defers. Without this bit the two cases are
+    /// indistinguishable, and every config-free-shaped attach would look like
+    /// a caller demanding `sqlite`.
+    pub bare_group_by_named: bool,
+    pub foreign_keys_named: bool,
 }
 
 impl RawCompat {
@@ -440,6 +462,8 @@ impl RawCompat {
         Ok(CompatOptions {
             bare_group_by,
             foreign_keys: this.and_then(|c| c.foreign_keys).unwrap_or(false),
+            bare_group_by_named: this.is_some_and(|c| c.bare_group_by.is_some()),
+            foreign_keys_named: this.is_some_and(|c| c.foreign_keys.is_some()),
         })
     }
 }
@@ -832,6 +856,8 @@ fn raw_to_config(
                 require_policy,
                 bare_group_by: compat.bare_group_by,
                 foreign_keys: compat.foreign_keys,
+                bare_group_by_named: compat.bare_group_by_named,
+                foreign_keys_named: compat.foreign_keys_named,
                 sync_role: sync_role.unwrap_or_else(|| "standalone".to_string()),
                 sync_upstream,
             },

@@ -127,8 +127,12 @@ impl Database {
                 max_work_rows: DEFAULT_MAX_WORK_ROWS,
                 max_join_cells: DEFAULT_MAX_JOIN_CELLS,
                 // A cold tier holds ONE drained table; a foreign key would have
-                // nothing on this side to point at.
+                // nothing on this side to point at. Not NAMED, so it neither
+                // seeds the file's record nor argues with one it already has —
+                // a cold tier is created here, so there is nothing to argue with.
                 foreign_keys: false,
+                foreign_keys_named: false,
+                bare_group_by_named: false,
                 max_query_threads: 0,
                 require_policy: Default::default(),
                 bare_group_by: Default::default(),

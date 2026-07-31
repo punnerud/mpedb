@@ -917,7 +917,7 @@ impl Database {
         // the engine loads from the catalog — including one a peer process
         // creates while we are attached.
         engine.set_check_compiler(std::sync::Arc::new(compile_schema_checks))?;
-        Ok(Database {
+        let db = Database {
             engine,
             cache: RwLock::new(HashMap::new()),
             text_memo: RwLock::new(MemoMap::default()),
@@ -925,10 +925,9 @@ impl Database {
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             conn_id: next_conn_id(),
             rules_cache: RwLock::new(None),
-            // No config, so sqlite's own default: OFF. A tool that attaches a
-            // file config-free has not asked for enforcement, and turning it on
-            // would change what `dump` and the mirror daemon are allowed to
-            // write mid-import.
+            // Placeholders — the stored `tune` record decides both, and is read
+            // below. They cannot be read before this point because reading a
+            // sys record needs the handle.
             fk_enforce: std::sync::atomic::AtomicBool::new(false),
             path: path.to_path_buf(),
             storage: mpedb_types::StorageKind::File,
@@ -937,10 +936,6 @@ impl Database {
             // config-free attach enforces what the FILE carries, and
             // `require_policy` is a config-declared deployment assertion.
             require_policy: std::collections::HashSet::new(),
-            // A config-free attach (mirror daemon/CLI, dump) has no `[compat]`
-            // section to read, so it takes the lenient sqlite default — the same
-            // default any config without `[compat]` gets. A PostgreSQL mirror
-            // instead opens via `open_with_config` with the flag already set.
             bare_group_by: mpedb_types::BareGroupBy::default(),
             role: crate::sync::Role::Standalone,
             host_udfs: RwLock::new(HashMap::new()),
@@ -952,7 +947,31 @@ impl Database {
             temp_views: RwLock::new(Default::default()),
             cross_cache: RwLock::new(HashMap::new()),
             cross_cache_live: std::sync::atomic::AtomicBool::new(false),
-        })
+        };
+        db.with_stored_compat()
+    }
+
+    /// Adopt the dialect and FK setting the FILE records (the `tune` record).
+    ///
+    /// This is the whole point of storing them. A config-free attach — `dump`,
+    /// the mirror daemon, the C-API shim, `mpedb <file>` — has no `[compat]`
+    /// section, and used to fall to the lenient sqlite default for both. A
+    /// PostgreSQL mirror is imported STRICT and then reopened LENIENT by the
+    /// very next tool that touched it, with nothing in the output to say so.
+    ///
+    /// A database with no record reads `Tunables::default()`, which is exactly
+    /// the pair of defaults this code used before — so nothing that exists
+    /// today changes behaviour.
+    ///
+    /// A corrupt record is an ERROR, not a fallback: silently opening lenient
+    /// because the record would not parse is the same wrong answer by a
+    /// different route.
+    fn with_stored_compat(mut self) -> Result<Database> {
+        let t = self.tunables()?;
+        self.bare_group_by = t.bare_group_by;
+        self.fk_enforce
+            .store(t.foreign_keys, std::sync::atomic::Ordering::Relaxed);
+        Ok(self)
     }
 
     /// Open a **process-private in-memory** database (config `path = ":memory:"`).
@@ -1008,7 +1027,7 @@ impl Database {
         // instead of landing in the catalog as a constraint that is stored and
         // never enforced.
         engine.set_check_compiler(std::sync::Arc::new(compile_schema_checks))?;
-        Ok(Database {
+        let mut db = Database {
             engine,
             cache: RwLock::new(HashMap::new()),
             text_memo: RwLock::new(MemoMap::default()),
@@ -1031,7 +1050,73 @@ impl Database {
             temp_views: RwLock::new(Default::default()),
             cross_cache: RwLock::new(HashMap::new()),
             cross_cache_live: std::sync::atomic::AtomicBool::new(false),
-        })
+        };
+        db.reconcile_stored_compat(&config.options)?;
+        Ok(db)
+    }
+
+    /// Settle the config's `[compat]` against the FILE's stored record.
+    ///
+    /// Three cases, and the shape follows from the file being authoritative:
+    ///
+    /// * **No record yet, and the config NAMES a non-default value** — seed it.
+    ///   Every database is written once here, and from then on `open_from_file`
+    ///   answers the same as the config did. This is the one write, and it is
+    ///   what carries a PostgreSQL `mirror import`'s strictness into the file.
+    /// * **A record exists and the config NAMES something else** — refuse, by
+    ///   name, with both values. Silently preferring either one is how the bug
+    ///   this fixes was born; a database that means `postgres` must not be
+    ///   opened as `sqlite` because a stale TOML said so. `mpedb tune set` is
+    ///   the way to change it, and the message says so.
+    /// * **Anything else** — the record wins (or the shared defaults do).
+    ///
+    /// A config that names NOTHING never writes and never refuses. That is
+    /// deliberate: most configs have no `[compat]` at all, and treating their
+    /// silence as a demand for `sqlite` would make every such attach refuse a
+    /// PostgreSQL database.
+    fn reconcile_stored_compat(&mut self, o: &mpedb_types::DbOptions) -> Result<()> {
+        let stored = self.tunables()?;
+        let have_record = self.sys_record_get(crate::costlayer::NS_TUNE, b"current")?.is_some();
+        let mut want = stored.clone();
+
+        if o.bare_group_by_named {
+            if have_record && stored.bare_group_by != o.bare_group_by {
+                return Err(Error::Config(format!(
+                    "compat.bare_group_by = `{}` but the database records `{}`. The FILE \
+                     decides the dialect — it travels with the data, and a config that \
+                     silently overrode it is what let a PostgreSQL mirror reopen lenient. \
+                     Change it deliberately with `mpedb tune set <db> bare_group_by={}`, \
+                     or drop the config key.",
+                    crate::costlayer::dialect_name(o.bare_group_by),
+                    crate::costlayer::dialect_name(stored.bare_group_by),
+                    crate::costlayer::dialect_name(o.bare_group_by),
+                )));
+            }
+            want.bare_group_by = o.bare_group_by;
+        }
+        if o.foreign_keys_named {
+            if have_record && stored.foreign_keys != o.foreign_keys {
+                return Err(Error::Config(format!(
+                    "compat.foreign_keys = {} but the database records {}. The FILE decides \
+                     where enforcement starts; change it with \
+                     `mpedb tune set <db> foreign_keys={}`, or drop the config key.",
+                    o.foreign_keys, stored.foreign_keys, o.foreign_keys
+                )));
+            }
+            want.foreign_keys = o.foreign_keys;
+        }
+
+        // Seed only when there is nothing recorded AND the config asked for
+        // something other than the shared default. A default-valued config key
+        // writes nothing, so an ordinary sqlite database never grows a record
+        // it does not need.
+        if !have_record && want != crate::costlayer::Tunables::default() {
+            self.put_gen_bumped(crate::costlayer::NS_TUNE, &want.encode_public())?;
+        }
+        self.bare_group_by = want.bare_group_by;
+        self.fk_enforce
+            .store(want.foreign_keys, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// How this handle is backed ([`mpedb_types::StorageKind`]).
@@ -2733,7 +2818,7 @@ impl Database {
                 Some(self.engine.begin_write()?)
             };
             if let Some(mut w) = w {
-                match registry::insert_plan(&mut w, &hash, sql, &blob) {
+                match registry::insert_plan(&mut w, &hash, sql, &blob, self.bare_group_by) {
                     Ok(true) => w.commit()?,
                     Ok(false) => w.abort(),
                     Err(e) => {
@@ -2772,7 +2857,7 @@ impl Database {
             r.finish()?;
             rec.ok_or(Error::UnknownPlan(*hash))?
         };
-        let plan = Arc::new(decode_registry_plan(&record, hash, &self.schema())?);
+        let plan = Arc::new(decode_registry_plan(&record, hash, &self.schema(), self.bare_group_by)?);
         self.cache
             .write()
             .expect(POISON)
@@ -3777,7 +3862,12 @@ impl WriteSession<'_> {
         let Some(record) = self.txn.sys_get(&subkey)? else {
             return Err(Error::UnknownPlan(*hash));
         };
-        let plan = Arc::new(decode_registry_plan(&record, hash, &self.db.schema())?);
+        let plan = Arc::new(decode_registry_plan(
+            &record,
+            hash,
+            &self.db.schema(),
+            self.db.bare_group_by,
+        )?);
         // last_used_txn refresh rides on this transaction (commits or rolls
         // back with it — best-effort bookkeeping either way). A failed put
         // (e.g. DbFull) leaves the record as it was and must never fail the
@@ -4912,7 +5002,7 @@ primary_key = ["id"]
         let other = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1 AND id > 0", &db.schema())
             .unwrap();
         assert_ne!(other.hash(), h);
-        let rec = registry::encode_record("mismatch", &other.encode(), 1);
+        let rec = registry::encode_record("mismatch", &other.encode(), mpedb_types::BareGroupBy::Sqlite, 1);
         let mut w = db.engine.begin_write().unwrap();
         w.sys_put(&plan_subkey(&h), &rec).unwrap();
         w.commit().unwrap();
@@ -4947,7 +5037,7 @@ primary_key = ["id"]
         .unwrap();
         let foreign = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1", &other_schema).unwrap();
         let fh = foreign.hash();
-        let rec = registry::encode_record("foreign", &foreign.encode(), 1);
+        let rec = registry::encode_record("foreign", &foreign.encode(), mpedb_types::BareGroupBy::Sqlite, 1);
         let mut w = db.engine.begin_write().unwrap();
         w.sys_put(&plan_subkey(&fh), &rec).unwrap();
         w.commit().unwrap();
@@ -4979,10 +5069,10 @@ primary_key = ["id"]
         for garbage in [
             &b""[..],
             &b"short"[..],
-            &registry::encode_record("sql", b"not a plan blob", 3)[..],
+            &registry::encode_record("sql", b"not a plan blob", mpedb_types::BareGroupBy::Sqlite, 3)[..],
         ] {
             assert!(matches!(
-                decode_registry_plan(garbage, &h, &db.schema()),
+                decode_registry_plan(garbage, &h, &db.schema(), mpedb_types::BareGroupBy::Sqlite),
                 Err(Error::UnknownPlan(x)) if x == h
             ));
         }
@@ -5161,7 +5251,7 @@ primary_key = ["id"]
             let key = plan_subkey(&hashes[i]);
             assert!(present.contains(&key), "plan #{i} should have survived");
             let rec = r.sys_get(&key).unwrap().expect("survivor record present");
-            decode_registry_plan(&rec, &hashes[i], &schema)
+            decode_registry_plan(&rec, &hashes[i], &schema, mpedb_types::BareGroupBy::Sqlite)
                 .unwrap_or_else(|e| panic!("survivor plan #{i} must cold-load, got {e:?}"));
         }
         // An evicted hash leaves no record, so the cold path reports UnknownPlan.

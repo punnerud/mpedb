@@ -58,22 +58,56 @@ pub struct Tunables {
     /// an error. ON restores full recursion under the depth cap and the work
     /// meter.
     pub recursive_triggers: bool,
+    /// The SQL dialect this database is compiled under (COMPAT.md's
+    /// sqlite-vs-PostgreSQL switch: bare grouped columns, LIKE case folding,
+    /// truthiness, the bool↔int bridge, mixed CASE/COALESCE arms, constant
+    /// coercion into a column slot).
+    ///
+    /// It lives here rather than only in `[compat]` because a config value is
+    /// per process and this one decides what a database MEANS. A PostgreSQL
+    /// mirror is imported strict, and every config-free attach after that —
+    /// `dump`, the mirror daemon, the C-API shim, `mpedb <file>` — reopened it
+    /// LENIENT, because `open_from_file` had no `[compat]` to read and fell to
+    /// the default. Recorded here, the file answers instead.
+    pub bare_group_by: mpedb_types::BareGroupBy,
+    /// Whether `PRAGMA foreign_keys` starts ON for connections to this
+    /// database. Same argument as `bare_group_by`, same silent-loosening bug:
+    /// a file whose keys were declared and enforced became unenforced the
+    /// moment a tool opened it without the config that said so.
+    ///
+    /// A connection may still flip it at runtime — sqlite's pragma is
+    /// per-connection — so this is the INITIAL value, not a lock.
+    pub foreign_keys: bool,
 }
 
 impl Default for Tunables {
+    /// Every default here is what the code did BEFORE the switch existed, so a
+    /// database with no stored record — which is every database written until
+    /// now — behaves exactly as it did.
     fn default() -> Self {
         Tunables {
             ndv_discount: true,
             recursive_triggers: false,
+            bare_group_by: mpedb_types::BareGroupBy::Sqlite,
+            foreign_keys: false,
         }
     }
 }
 
 impl Tunables {
+    /// `encode` for callers outside this module (the compat reconciliation in
+    /// `Database::open_with_config`, which seeds the record).
+    pub fn encode_public(&self) -> Vec<u8> {
+        self.encode()
+    }
+
     fn encode(&self) -> Vec<u8> {
         format!(
-            "ndv_discount={}\nrecursive_triggers={}\n",
-            self.ndv_discount, self.recursive_triggers
+            "ndv_discount={}\nrecursive_triggers={}\nbare_group_by={}\nforeign_keys={}\n",
+            self.ndv_discount,
+            self.recursive_triggers,
+            dialect_name(self.bare_group_by),
+            self.foreign_keys
         )
         .into_bytes()
     }
@@ -99,10 +133,19 @@ impl Tunables {
                 Some(("recursive_triggers", v)) => {
                     t.recursive_triggers = parse_bool("recursive_triggers", v)?
                 }
+                Some(("bare_group_by", v)) => {
+                    t.bare_group_by = parse_dialect(v).ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "tunable bare_group_by has unknown value `{v}` — \
+                             known: sqlite, postgres"
+                        ))
+                    })?
+                }
+                Some(("foreign_keys", v)) => t.foreign_keys = parse_bool("foreign_keys", v)?,
                 _ => {
                     return Err(Error::Corrupt(format!(
                         "unknown tunable line `{line}` — known: ndv_discount, \
-                         recursive_triggers"
+                         recursive_triggers, bare_group_by, foreign_keys"
                     )))
                 }
             }
@@ -129,11 +172,39 @@ impl Tunables {
                 self.recursive_triggers = parse_bool("recursive_triggers", v)?;
                 Ok(())
             }
+            Some(("bare_group_by", v)) => {
+                self.bare_group_by = parse_dialect(v).ok_or_else(|| {
+                    Error::Unsupported(format!("bare_group_by takes sqlite|postgres, got `{v}`"))
+                })?;
+                Ok(())
+            }
+            Some(("foreign_keys", v)) => {
+                self.foreign_keys = parse_bool("foreign_keys", v)?;
+                Ok(())
+            }
             _ => Err(Error::Unsupported(format!(
                 "unknown tunable `{assignment}` — known: ndv_discount=true|false, \
-                 recursive_triggers=true|false"
+                 recursive_triggers=true|false, bare_group_by=sqlite|postgres, \
+                 foreign_keys=true|false"
             ))),
         }
+    }
+}
+
+/// The stored spelling of a dialect — the SAME two words `[compat]` uses, so a
+/// config and a `tune set` cannot disagree about how to say the same thing.
+pub fn dialect_name(d: mpedb_types::BareGroupBy) -> &'static str {
+    match d {
+        mpedb_types::BareGroupBy::Sqlite => "sqlite",
+        mpedb_types::BareGroupBy::Postgres => "postgres",
+    }
+}
+
+fn parse_dialect(v: &str) -> Option<mpedb_types::BareGroupBy> {
+    match v {
+        "sqlite" => Some(mpedb_types::BareGroupBy::Sqlite),
+        "postgres" => Some(mpedb_types::BareGroupBy::Postgres),
+        _ => None,
     }
 }
 
@@ -305,7 +376,7 @@ impl crate::Database {
 
     // ---------------- shared write helper ----------------
 
-    fn put_gen_bumped(&self, ns: &str, value: &[u8]) -> Result<()> {
+    pub(crate) fn put_gen_bumped(&self, ns: &str, value: &[u8]) -> Result<()> {
         let key = crate::sys_record_subkey(ns, KEY)?;
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         let res = (|| {

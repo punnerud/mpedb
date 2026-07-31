@@ -528,3 +528,67 @@ fn a_compound_orders_by_name_over_a_derived_arm() {
                UNION SELECT b.id FROM (SELECT users.id AS id FROM users) AS b ORDER BY nope";
     assert!(prepare(sql, &s).is_err(), "an unknown ORDER BY name must refuse");
 }
+
+// ------------------------------------------------ the dialect gates diverge
+
+/// For every sqlite-vs-PostgreSQL gate, the two dialects must either DISAGREE
+/// about whether the statement compiles, or produce DIFFERENT plan bytes.
+///
+/// This is the invariant the registry's dialect gate rests on, and it was
+/// derived rather than enforced: nothing said the two arms could not both
+/// accept a statement, emit identical bytes, and MEAN different things. A plan
+/// is content-hashed, so identical bytes are the same hash — and the same hash
+/// meaning two things is the one failure a content-addressed plan store cannot
+/// survive.
+///
+/// **Maintenance obligation, stated because a test cannot enforce it:** a new
+/// dialect gate in `binder.rs` belongs in this table. A gate whose two arms
+/// both accept and emit the same bytes is a bug, not a row to add.
+#[test]
+fn every_dialect_gate_either_refuses_or_changes_the_plan() {
+    use mpedb_types::BareGroupBy;
+    let s = schema();
+    let compile = |sql: &str, d: BareGroupBy| {
+        mpedb_sql::prepare_maybe_explain_with_views(
+            sql,
+            &s,
+            &mpedb_sql::PolicyCatalog::empty(),
+            &mpedb_sql::ViewCatalog::new(),
+            d,
+            &mpedb_sql::HostUdfSet::default(),
+            mpedb_sql::NO_ROW_COUNTS,
+        )
+        .map(|(p, _)| p.hash())
+    };
+
+    // Each row exercises one gate. `binder.rs` / `planner/mod.rs` line notes
+    // name where the two arms part.
+    let gates = [
+        ("bare grouped column", "SELECT id, email FROM users GROUP BY id"),
+        ("LIKE case folding", "SELECT id FROM users WHERE email LIKE 'A%'"),
+        ("LIKE with ESCAPE", r"SELECT id FROM users WHERE email LIKE 'a\%' ESCAPE '\'"),
+        ("GLOB operand coercion", "SELECT id FROM users WHERE age GLOB '1*'"),
+        ("truthiness", "SELECT id FROM users WHERE 1"),
+        ("bool/int bridge", "SELECT id FROM users WHERE active = 1"),
+        ("mixed COALESCE arms", "SELECT COALESCE(age, email) FROM users"),
+        ("mixed CASE arms", "SELECT CASE WHEN id > 0 THEN age ELSE email END FROM users"),
+        ("constant into a bool slot", "SELECT id FROM users WHERE active = 1 AND id = 2"),
+    ];
+
+    for (what, sql) in gates {
+        let lite = compile(sql, BareGroupBy::Sqlite);
+        let pg = compile(sql, BareGroupBy::Postgres);
+        match (lite, pg) {
+            // One refuses: the dialects cannot be confused, which is the point.
+            (Ok(_), Err(_)) | (Err(_), Ok(_)) | (Err(_), Err(_)) => {}
+            (Ok(a), Ok(b)) => assert_ne!(
+                a, b,
+                "`{what}` compiles under BOTH dialects to the SAME plan hash. \
+                 If the two arms genuinely mean the same thing, this row does not \
+                 belong here; if they do not, the registry's dialect gate is the \
+                 only thing standing between them and a wrong answer — and a \
+                 shared hash defeats it. sql: {sql}"
+            ),
+        }
+    }
+}

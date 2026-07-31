@@ -537,3 +537,82 @@ fn explicit_postgres_config_is_strict() {
         .is_err());
     let _ = std::fs::remove_file(path);
 }
+
+// ------------------------------------------- the FILE records the dialect
+
+/// The dialect survives a CONFIG-FREE reopen, because the file records it.
+///
+/// It did not. `[compat]` was per process, and `Database::open_from_file` — the
+/// constructor `dump`, the mirror daemon, the C-API shim and `mpedb <file>` all
+/// use — hardcoded the lenient default. So a PostgreSQL mirror was imported
+/// strict and then silently reopened lenient by the very next tool that touched
+/// it, with nothing in any output to say the meaning of the database had
+/// changed. The record is in the sys keyspace beside `recursive_triggers`,
+/// which was already a stored compatibility switch for the same reason.
+#[test]
+fn the_dialect_is_recorded_in_the_file_and_survives_a_config_free_reopen() {
+    let (db, path) = open("stored", Some("postgres"));
+    db.query("INSERT INTO t (id, g, x, name) VALUES (1, 1, 1, 'a')", &[]).unwrap();
+    // Strict here, as the config asked.
+    let e = db.query("SELECT g, name FROM t GROUP BY g", &[]).unwrap_err();
+    assert!(format!("{e}").contains("GROUP BY"), "{e}");
+    drop(db);
+
+    // Config-free: the FILE decides, and it says postgres.
+    let db = Database::open_from_file(&path).unwrap();
+    let e = db.query("SELECT g, name FROM t GROUP BY g", &[]).unwrap_err();
+    assert!(
+        format!("{e}").contains("GROUP BY"),
+        "a config-free reopen must not silently loosen the dialect: {e}"
+    );
+    drop(db);
+
+    // A config that NAMES the other dialect is a refusal, not a silent
+    // override — that silence is what the bug was made of.
+    let toml = format!(
+        "[database]\npath = \"{}\"\nsize_mb = 16\nmax_readers = 16\n\
+         \n[compat]\nbare_group_by = \"sqlite\"\n{}",
+        path.display(),
+        SCHEMA
+    );
+    let e = match Database::open_with_config(Config::from_toml_str(&toml).unwrap()) {
+        Ok(_) => panic!("a config naming the other dialect must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains("records `postgres`") && e.contains("tune set"), "{e}");
+
+    // A config that names NOTHING defers to the file — most configs have no
+    // `[compat]` at all, and treating their silence as a demand for sqlite
+    // would make every one of them refuse this database.
+    let (db2, _) = {
+        let toml = format!(
+            "[database]\npath = \"{}\"\nsize_mb = 16\nmax_readers = 16\n{}",
+            path.display(),
+            SCHEMA
+        );
+        (
+            Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap(),
+            (),
+        )
+    };
+    let e = db2.query("SELECT g, name FROM t GROUP BY g", &[]).unwrap_err();
+    assert!(format!("{e}").contains("GROUP BY"), "{e}");
+    drop(db2);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An ORDINARY sqlite database grows no record at all: the config named
+/// nothing beyond the defaults, so there is nothing to write down. This is what
+/// keeps every database written before this change byte-identical in behaviour.
+#[test]
+fn a_default_config_writes_no_compat_record() {
+    let (db, path) = open("norecord", None);
+    assert_eq!(db.tunables().unwrap(), Default::default());
+    drop(db);
+    // …and the config-free reopen agrees, lenient as it always was.
+    let db = Database::open_from_file(&path).unwrap();
+    db.query("INSERT INTO t (id, g, x, name) VALUES (1, 1, 1, 'a')", &[]).unwrap();
+    db.query("SELECT g, name FROM t GROUP BY g", &[]).unwrap();
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}

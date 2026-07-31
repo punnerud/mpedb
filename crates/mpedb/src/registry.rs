@@ -5,7 +5,7 @@
 //! Record layout under subkey `b"plan/" ++ hash bytes (32)`, all little-endian:
 //!
 //! ```text
-//! u32 sql_len ‖ sql ‖ u32 blob_len ‖ blob ‖ u64 last_used_txn
+//! u32 sql_len ‖ sql ‖ u32 blob_len ‖ blob ‖ u8 dialect ‖ u64 last_used_txn
 //! ```
 //!
 //! where `blob = CompiledPlan::encode()`.
@@ -51,15 +51,45 @@ pub(crate) struct Record<'a> {
     #[allow(dead_code)]
     pub sql: &'a str,
     pub blob: &'a [u8],
+    /// The SQL dialect the WRITER compiled under (COMPAT.md's sqlite-vs-PG
+    /// switch), `0` = sqlite, `1` = postgres.
+    ///
+    /// It rides the RECORD rather than the plan, deliberately: the plan's
+    /// canonical bytes are its identity and its hash, and two processes that
+    /// compiled the same statement must agree on that hash. What differs is
+    /// who may RUN it, which is a property of the publication, not of the plan.
+    ///
+    /// Why it has to exist at all: strictness was a PREPARE-time filter only.
+    /// `execute(hash, params)` decodes straight out of the shared registry, so
+    /// a process configured `postgres` could run a plan a `sqlite` process
+    /// published — bare grouped columns, case-folded LIKE and all — and get the
+    /// lenient answer its own config had refused to compile.
+    pub dialect: mpedb_types::BareGroupBy,
     pub last_used_txn: u64,
 }
 
-pub(crate) fn encode_record(sql: &str, blob: &[u8], last_used_txn: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + sql.len() + 4 + blob.len() + 8);
+fn dialect_byte(d: mpedb_types::BareGroupBy) -> u8 {
+    match d {
+        mpedb_types::BareGroupBy::Sqlite => 0,
+        mpedb_types::BareGroupBy::Postgres => 1,
+    }
+}
+
+pub(crate) fn encode_record(
+    sql: &str,
+    blob: &[u8],
+    dialect: mpedb_types::BareGroupBy,
+    last_used_txn: u64,
+) -> Vec<u8> {
+    // `last_used_txn` stays LAST: `patched_last_used` rewrites the trailing
+    // eight bytes in place, and moving them would turn that into a silent
+    // corruption rather than a compile error.
+    let mut out = Vec::with_capacity(4 + sql.len() + 4 + blob.len() + 9);
     out.extend_from_slice(&(sql.len() as u32).to_le_bytes());
     out.extend_from_slice(sql.as_bytes());
     out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
     out.extend_from_slice(blob);
+    out.push(dialect_byte(dialect));
     out.extend_from_slice(&last_used_txn.to_le_bytes());
     out
 }
@@ -78,6 +108,12 @@ pub(crate) fn parse_record(bytes: &[u8]) -> Option<Record<'_>> {
     let sql = std::str::from_utf8(take(bytes, &mut pos, sql_len)?).ok()?;
     let blob_len = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().ok()?) as usize;
     let blob = take(bytes, &mut pos, blob_len)?;
+    let dialect = match take(bytes, &mut pos, 1)?[0] {
+        0 => mpedb_types::BareGroupBy::Sqlite,
+        1 => mpedb_types::BareGroupBy::Postgres,
+        // Untrusted shared memory: an unknown dialect is not a plan.
+        _ => return None,
+    };
     let last_used_txn = u64::from_le_bytes(take(bytes, &mut pos, 8)?.try_into().ok()?);
     if pos != bytes.len() {
         return None;
@@ -85,6 +121,7 @@ pub(crate) fn parse_record(bytes: &[u8]) -> Option<Record<'_>> {
     Some(Record {
         sql,
         blob,
+        dialect,
         last_used_txn,
     })
 }
@@ -108,14 +145,30 @@ pub(crate) fn patched_last_used(bytes: &[u8], last_used_txn: u64) -> Option<Vec<
 /// - `PlanInvalidated` (schema changed) propagates so the caller re-prepares;
 ///   every other failure is reported as `UnknownPlan` — nothing is deleted,
 ///   a later `prepare` overwrites the entry.
+/// - The record's DIALECT must equal this process's. Strictness used to be a
+///   prepare-time filter only, which `execute(hash, params)` walked straight
+///   past: a `postgres` process could run a plan a `sqlite` process published.
 pub(crate) fn decode_registry_plan(
     record_bytes: &[u8],
     hash: &PlanHash,
     schema: &Schema,
+    dialect: mpedb_types::BareGroupBy,
 ) -> Result<CompiledPlan> {
     let Some(rec) = parse_record(record_bytes) else {
         return Err(Error::UnknownPlan(*hash));
     };
+    if rec.dialect != dialect {
+        // Named, not `UnknownPlan`: the plan exists and is perfectly valid —
+        // it just does not belong to a process compiling under this dialect,
+        // and running it anyway is the wrong answer this gate exists to stop.
+        return Err(Error::Unsupported(format!(
+            "plan {hash} was compiled under the `{}` dialect and this database is \
+             `{}` — the two accept different SQL, so running it here would answer \
+             a question this process refused to compile. Re-prepare the statement.",
+            crate::costlayer::dialect_name(rec.dialect),
+            crate::costlayer::dialect_name(dialect),
+        )));
+    }
     let plan = match CompiledPlan::decode(rec.blob, schema) {
         Ok(p) => p,
         Err(Error::PlanInvalidated) => return Err(Error::PlanInvalidated),
@@ -135,15 +188,20 @@ pub(crate) fn insert_plan(
     hash: &PlanHash,
     sql: &str,
     blob: &[u8],
+    dialect: mpedb_types::BareGroupBy,
 ) -> Result<bool> {
     let subkey = plan_subkey(hash);
     let existing = txn.sys_get(&subkey)?;
     if let Some(cur) = &existing {
-        if parse_record(cur).is_some_and(|r| r.blob == blob) {
+        // Identical content INCLUDES the dialect: a record published by a
+        // sqlite process is not the record a postgres process would publish,
+        // even for the same plan bytes, and leaving it would keep the load
+        // gate refusing.
+        if parse_record(cur).is_some_and(|r| r.blob == blob && r.dialect == dialect) {
             return Ok(false); // already published with identical content
         }
     }
-    let record = encode_record(sql, blob, txn.meta.txn_id + 1);
+    let record = encode_record(sql, blob, dialect, txn.meta.txn_id + 1);
     if existing.is_some() {
         // Overwrite in place: the entry count does not move, so neither the
         // eviction check nor the counter has anything to do.
@@ -257,15 +315,64 @@ mod tests {
 
     #[test]
     fn record_roundtrip() {
-        let rec = encode_record("SELECT 1", b"blobby", 42);
+        let rec = encode_record("SELECT 1", b"blobby", mpedb_types::BareGroupBy::Sqlite, 42);
         let parsed = parse_record(&rec).unwrap();
         assert_eq!(parsed.sql, "SELECT 1");
         assert_eq!(parsed.blob, b"blobby");
         assert_eq!(parsed.last_used_txn, 42);
 
+        assert_eq!(parsed.dialect, mpedb_types::BareGroupBy::Sqlite);
+
+        // `patched_last_used` rewrites the TRAILING eight bytes in place, so
+        // the dialect byte sitting in front of them must survive untouched.
+        // Putting the dialect last instead would have made this a silent
+        // corruption rather than a compile error.
         let patched = patched_last_used(&rec, 99).unwrap();
         assert_eq!(parse_record(&patched).unwrap().last_used_txn, 99);
         assert_eq!(parse_record(&patched).unwrap().blob, b"blobby");
+        assert_eq!(
+            parse_record(&patched).unwrap().dialect,
+            mpedb_types::BareGroupBy::Sqlite
+        );
+
+        let pg = encode_record("SELECT 1", b"blobby", mpedb_types::BareGroupBy::Postgres, 42);
+        assert_eq!(
+            parse_record(&pg).unwrap().dialect,
+            mpedb_types::BareGroupBy::Postgres
+        );
+        // An unknown dialect byte is not a plan — shared memory is hostile.
+        let mut evil = pg.clone();
+        let at = evil.len() - 9;
+        evil[at] = 7;
+        assert!(parse_record(&evil).is_none());
+    }
+
+    /// A plan published under one dialect must not RUN under the other.
+    ///
+    /// Strictness was a prepare-time filter, and `execute(hash, params)` never
+    /// goes through prepare: it decodes straight out of the shared registry.
+    /// So a `postgres` process could run a plan a `sqlite` process published —
+    /// bare grouped columns and case-folded LIKE included — and get the lenient
+    /// answer its own configuration had refused to compile. The two dialects
+    /// accept different SQL; a plan is only interchangeable within one.
+    #[test]
+    fn a_plan_from_the_other_dialect_is_refused_by_name() {
+        use mpedb_types::BareGroupBy;
+        // The blob is nonsense on purpose: the dialect gate must come BEFORE
+        // decode, so this never reaches the validator.
+        let rec = encode_record("SELECT 1", b"not a plan", BareGroupBy::Sqlite, 1);
+        let schema = Schema::new(Vec::new()).unwrap();
+        let h = PlanHash([0u8; 32]);
+        let e = decode_registry_plan(&rec, &h, &schema, BareGroupBy::Postgres).unwrap_err();
+        let e = e.to_string();
+        assert!(
+            e.contains("`sqlite` dialect") && e.contains("`postgres`"),
+            "the refusal must name BOTH sides: {e}"
+        );
+        // Matching dialect gets past the gate and fails on the blob instead,
+        // which is what proves the gate is not simply refusing everything.
+        let e = decode_registry_plan(&rec, &h, &schema, BareGroupBy::Sqlite).unwrap_err();
+        assert!(matches!(e, Error::UnknownPlan(_)), "{e}");
     }
 
     /// #124: the family bound and the counter's placement outside it are the
@@ -294,11 +401,11 @@ mod tests {
         evil.extend_from_slice(b"x");
         assert!(parse_record(&evil).is_none());
         // trailing garbage
-        let mut rec = encode_record("s", b"b", 1);
+        let mut rec = encode_record("s", b"b", mpedb_types::BareGroupBy::Sqlite, 1);
         rec.push(0);
         assert!(parse_record(&rec).is_none());
         // every truncation fails cleanly
-        let rec = encode_record("SELECT 1", b"blob", 7);
+        let rec = encode_record("SELECT 1", b"blob", mpedb_types::BareGroupBy::Sqlite, 7);
         for cut in 0..rec.len() {
             assert!(parse_record(&rec[..cut]).is_none(), "cut at {cut}");
         }
