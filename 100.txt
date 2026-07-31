@@ -64,6 +64,63 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
   clippy, begge ws       rene
 
 
+1a-bis. SESJON 31/7 (S4–S7) — VINDUER OG AVLEDEDE TABELLER, 4 COMMITS
+----------------------------------------------------------------------
+
+  Fire commits, hver med full port (workspace 208 + capi + clippy ×3
+  inkludert Windows-krysslint + CPython + SQLAlchemy + Django G1+G2 + FULL
+  korpus) og M3 verifisert per commit.
+
+    e8bb3de  S4: avledet tabell materialiserer OVERALT en kropp kan stå
+             (format 65) — `SubBody::Derived`. Var: bare i setningens
+             ytterste FROM. Django prefetch-med-LIMIT er formen.
+    8153f07  S5: ramme-EXCLUDE (format 66) — den ene rammeformen som IKKE
+             er sammenhengende. 85 tilfeller målt mot sqlite FØR koden.
+    a1f1d23  S6: vindusstiens to blindsoner — host-scope og DEKLARERT
+             KOLLERING. Den andre var et GALT SVAR i sendt kode.
+    b2bd291  S7: RANGE med verdioffset — DESC snur fortegnet, ikke-numerisk
+             kollapser til peer-gruppa.
+
+  MÅLT, sveipgruppa (prefetch_related expressions_case | expressions_window
+  bulk_create db_functions delete_regress, 722 tester, stock = 0 feil):
+
+      shim-only feil   48  →  24
+        derived-i-kropp        28 → 0   (S4)
+        window-spec-parse      10 → 0   (S5)
+        host ute av scope      10 → 0   (S6)
+        RANGE-offset            4 → 0   (S7, dukket opp bak S5)
+
+  Uendret gjennom alle fire: Django G1+G2 831/831, CPython 459/466,
+  SQLAlchemy 1274/1277, korpus 7 420 638 records / 0 gale svar.
+
+  DET VIKTIGSTE FUNNET er ikke en av de fire klyngene. Det er at S6-buggen —
+  vinduets PARTITION BY/ORDER BY ignorerte kolonnens DEKLARERTE kollering —
+  var et GALT SVAR som hadde stått i sendt kode, og den ble funnet ved å
+  UTVIDE en probe til nabokoden, ikke av noen suite. `PARTITION BY name` på
+  en NOCASE-kolonne la 'Alice' og 'alice' i ulike partisjoner. Ingen av de
+  fire suitene fanget det.
+
+  RESTEN I SVEIPGRUPPA (24), klassifisert:
+     4  vindusfunksjon SAMMEN MED GROUP BY/aggregat i én SELECT. Ekte,
+        veldefinert trekk: vindusfasen kjører ETTER grupperingen, over de
+        grupperte radene. Nektes i dag ved bind. STØRST GJENVÆRENDE.
+     2  `cannot compare int64 and text` — typerigiditet.
+     2  korrelert subquery i `DELETE … WHERE`.
+    16  assertion-feil uten OperationalError (umålt kategori — krever
+        per-test-lesing, ikke en feilmeldingsklynge).
+
+  NABOHULL SOM PROBENE NAVNGA, alle rene nektinger (aldri galt svar):
+    * navngitt `WINDOW w AS (…)`-klausul (`OVER w`) — stage-3, allerede
+      pinnet av en test.
+    * eksplisitt `COLLATE` inne i en vindusklausul.
+    * en REGISTRERT host-kollering utenfor setningens ORDER BY: `WHERE`,
+      `GROUP BY` og vinduer svarer alle «no such collation sequence».
+    * ikke-heltalls rammeoffset (`0.5 PRECEDING`) — `WinInt` er heltallig og
+      deles med lag/lead, der sqlites brøkregel er en ANNEN.
+    * korrelasjon gjennom materialiseringsgrensa til en avledet tabell, og
+      en subquery i den avledede tabellens YTRE setning.
+
+
 1b. SESJON 30–31/7 — SQLALCHEMY 965 → 1274, CPYTHON 459 → 460, DJANGO +106
 --------------------------------------------------------------------------
 
