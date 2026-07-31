@@ -193,15 +193,37 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
       db_functions        363 tester, 4 feil
       bulk_create          52 tester, 16 feil  ← ALLE ER KASKADER
 
-  BULK_CREATE-FUNNET, bisektert ved å pare hver forgjenger med offeret:
-  alle 16 er `TransactionManagementError: An error occurred in the current
-  transaction`, og ÉN test forgifter resten — `test_long_non_ascii_text`
-  (bulk_create av én rad med 3000 ikke-ASCII tegn). Den PASSERER selv;
-  neste test kommer ikke i gang. Django setter `needs_rollback` bare når
-  en SAVEPOINT-operasjon feiler, så mistanken er savepoint-håndtering
-  etter det innslaget — men en direkte probe av
-  BEGIN/insert/SAVEPOINT/RELEASE/ROLLBACK på nøyaktig de dataene er
-  IDENTISK med sqlite, så det er ikke den enkle formen. NESTE.
+  BULK_CREATE-FUNNET, ROTÅRSAKET. Bisektert ved å pare hver forgjenger med
+  offeret: alle 16 er `TransactionManagementError`, og ÉN test forgifter
+  resten — `test_long_non_ascii_text` (bulk_create av én rad med 3000
+  ikke-ASCII tegn = 6000 bytes). Den PASSERER selv; neste test kommer ikke
+  i gang, fordi Django setter `needs_rollback` når en SAVEPOINT-operasjon
+  feiler, og TestCase legger HVER test i et savepoint.
+
+  Den feilende operasjonen, målt:
+
+      ROLLBACK TO across a large blob/overflow-extent write is not supported
+
+  og terskelen er nøyaktig `extent_threshold` — 4 KiB på Linux:
+
+      text 1000 / 2000 / 4000 B  → ROLLBACK TO ok
+      text 4096 B og oppover     → NEKTET     (sqlite: ok på alle)
+      blob 4000 B ok, 5000 B     → NEKTET
+
+  `rollback_to_full` (write.rs) sammenligner fem extent-allokator-felt mot
+  savepointet — `extent_map_root`, `pending_map_edits`, `freed_runs`,
+  `taken_runs`, `extent_dirty` — og NEKTER hvis noe har flyttet seg, fordi
+  allokatorens tilstand ikke snapshottes der. Savepointet LAGRER allerede
+  lengdene (den sammenligner mot `sp.ext_*`); det som mangler er å
+  GJENOPPRETTE dem. Kommentaren i koden sier «only genuinely large blob
+  columns can trip this» — på Linux er «genuinely large» 4 KiB, altså en
+  helt vanlig tekstkolonne.
+
+  Dette er en NEKTING, aldri et galt svar. Men det treffer enhver konsument
+  som skriver en verdi over 4 KiB inne i et savepoint, og Django gjør det i
+  hver eneste test. NESTE, og det er commit-path-kode: DESIGN.md-regelen
+  og verifiserings-kalibreringen (full adversarial review for commit-path)
+  gjelder.
 
   Lærdommen for målingen: en gruppert kjøring teller kaskader som gap.
   Kjør isolert før du klassifiserer.
