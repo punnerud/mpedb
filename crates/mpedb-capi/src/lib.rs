@@ -635,6 +635,15 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // is an EMPTY catalog — not an error, and not main's contents.
             // `<schema>.sqlite_master` reads THAT database's catalog — how
             // SQLAlchemy lists an attached schema's views.
+            // `sqlite_sequence` is synthesised from the catalog's AUTOINCREMENT
+            // counters, the way `sqlite_master` is synthesised from the schema.
+            // Answered before the master arms because it is a different table
+            // with its own columns.
+            if introspect::references_sqlite_sequence(sqltext) {
+                let seqs = c.db.rowid_sequences().unwrap_or_default();
+                let (columns, rows) = introspect::sqlite_sequence_rows(&seqs);
+                return Ok(Outcome::Rows { columns, rows });
+            }
             let master_q_name = introspect::master_schema(sqltext)
                 .filter(|q| !q.eq_ignore_ascii_case("main"));
             // `<schema>.sqlite_temp_master` does not exist — the temp schema is

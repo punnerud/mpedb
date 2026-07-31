@@ -41,7 +41,7 @@ pub(crate) fn test_schema() -> Schema {
         primary_key: vec![0],
         indexes: vec![],
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     };
@@ -57,7 +57,7 @@ pub(crate) fn test_schema() -> Schema {
         primary_key: vec![0, 1],
         indexes: vec![],
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     };
@@ -75,7 +75,7 @@ pub(crate) fn test_schema() -> Schema {
         primary_key: vec![0],
         indexes: vec![],
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     };
@@ -124,7 +124,7 @@ fn secondary_index_numbering() {
         primary_key: vec![0, 1],
         indexes: vec![],
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     };
@@ -657,7 +657,7 @@ fn a_three_column_pk_pins_two_equalities_and_ranges_the_third() {
         primary_key: vec![0, 1, 2],
         indexes: vec![],
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     };

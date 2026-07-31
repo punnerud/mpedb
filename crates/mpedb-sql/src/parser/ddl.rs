@@ -99,6 +99,11 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
 /// come back (an external reference, an audit trail, a resumable cursor);
 /// handing them a reused id is wrong data, not a missing feature. So it refuses,
 /// says what it cannot promise, and says what to use instead.
+/// `AUTOINCREMENT` anywhere but directly after `PRIMARY KEY` — sqlite's own
+/// rule ("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY").
+const AUTOINCREMENT_REFUSAL_PLACE: &str =
+    "AUTOINCREMENT is only allowed immediately after INTEGER PRIMARY KEY";
+
 const AUTOINCREMENT_REFUSAL: &str =
     "AUTOINCREMENT is not supported — mpedb keeps no persisted rowid high-water \
      counter, so it cannot promise that an id is never reused after a delete, and \
@@ -598,7 +603,7 @@ impl<'a> Parser<'a> {
             pk: false,
             default: None,
             default_src: None,
-            default_text: None,
+            default_text: None, autoincrement: false,
             check: None,
             collation: Collation::Binary,
             generated: None,
@@ -633,10 +638,11 @@ impl<'a> Parser<'a> {
                 col.pk = true;
                 self.conflict_clause("a PRIMARY KEY constraint")?;
                 if self.eat_word("AUTOINCREMENT") {
-                    return Err(self.err_here(AUTOINCREMENT_REFUSAL));
+                    col.autoincrement = true;
                 }
             } else if self.eat_word("AUTOINCREMENT") {
-                return Err(self.err_here(AUTOINCREMENT_REFUSAL));
+                // Only ever legal directly after `PRIMARY KEY`, as in sqlite.
+                return Err(self.err_here(AUTOINCREMENT_REFUSAL_PLACE));
             } else if self.eat_word("COLLATE") {
                 col.collation = self.parse_collation_name()?;
             } else if self.eat_word("DEFAULT") {
@@ -809,6 +815,22 @@ impl<'a> Parser<'a> {
         Ok(DdlStmt::CreateTable(crate::ddl::CreateTableSpec {
             name,
             if_not_exists,
+            // The table is AUTOINCREMENT when its rowid-alias column is.
+            autoincrement: {
+                // sqlite's rule: only on an INTEGER PRIMARY KEY. Anywhere else
+                // it is a syntax error there, and accepting it would promise a
+                // never-reused id on a key mpedb does not assign.
+                if let Some(c) = columns.iter().find(|c| c.autoincrement) {
+                    if c.ty != crate::ColumnType::Int64 {
+                        return Err(self.err_here(format!(
+                            "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY; \
+                             `{}` is {}",
+                            c.name, c.ty
+                        )));
+                    }
+                }
+                columns.iter().any(|c| c.autoincrement)
+            },
             columns,
             table_pk,
             uniques,
@@ -1366,7 +1388,7 @@ impl<'a> Parser<'a> {
                 pk: false,
                 default: None,
                 default_src: None,
-                default_text: None,
+                default_text: None, autoincrement: false,
                 check: None,
                 collation: Collation::Binary,
                 generated: None,

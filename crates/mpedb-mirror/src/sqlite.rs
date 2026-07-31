@@ -305,7 +305,7 @@ pub fn to_table_def(src: &SourceTable) -> Result<TableDef> {
         primary_key,
         indexes: vec![],
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     })

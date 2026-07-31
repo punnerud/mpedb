@@ -1310,15 +1310,37 @@ impl<'e> WriteTxn<'e> {
     /// caller checked `rowid_alias_col`); a non-integer key here is a bug.
     pub fn next_rowid(&mut self, table_id: u32) -> Result<i64> {
         let (root, _) = self.tree_root(table_id, 0)?;
-        match btree::max_key(self, root)? {
-            None => Ok(1),
+        let from_tree = match btree::max_key(self, root)? {
+            None => 0,
             Some(key) => match keycode::decode_key(&key, &[ColumnType::Int64])?.into_iter().next() {
-                Some(Value::Int(m)) => Ok(m.saturating_add(1)),
-                _ => Err(Error::Internal(
-                    "rowid-alias primary key is not an integer".into(),
-                )),
+                Some(Value::Int(m)) => m,
+                _ => {
+                    return Err(Error::Internal(
+                        "rowid-alias primary key is not an integer".into(),
+                    ))
+                }
             },
+        };
+        // Without AUTOINCREMENT the answer is `max(rowid) + 1`, so deleting the
+        // top row hands its id back — sqlite's behaviour without the keyword,
+        // and mpedb's until now.
+        if !self.bundle.schema.tables[table_id as usize].autoincrement {
+            return Ok(from_tree.saturating_add(1));
         }
+        // WITH it, the id must never come back, which needs a HIGH-WATER that
+        // survives the delete that emptied the tree. Kept in the catalog's sys
+        // keyspace and written in THIS transaction — the same one the row goes
+        // in — so a crash between the two is impossible and a peer process
+        // reads the same counter through the same snapshot discipline as every
+        // other catalog record.
+        let key = rowid_seq_key(table_id);
+        let stored = match self.sys_get(&key)? {
+            Some(b) if b.len() == 8 => i64::from_le_bytes(b[..8].try_into().expect("len 8")),
+            _ => 0,
+        };
+        let next = stored.max(from_tree).saturating_add(1);
+        self.sys_put(&key, &next.to_le_bytes())?;
+        Ok(next)
     }
 
     /// Delete by primary key; returns whether the row existed.
@@ -2976,4 +2998,15 @@ fn index_constraint_name(eng: &Engine, table_id: u32, cols: &[u16]) -> String {
         .map(|&c| table_column_name(eng, table_id, c))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The sys-keyspace key holding one table's AUTOINCREMENT high-water mark.
+///
+/// Keyed by table ID — stable, and dense in this format window — rather than by
+/// name, so a rename cannot lose the counter and two tables cannot collide.
+/// The value is the last id HANDED OUT, little-endian i64.
+pub fn rowid_seq_key(table_id: u32) -> Vec<u8> {
+    let mut k = b"rowidseq/".to_vec();
+    k.extend_from_slice(&table_id.to_be_bytes());
+    k
 }

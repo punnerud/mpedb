@@ -342,7 +342,7 @@ fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableDef {
         primary_key: vec![0],
         indexes: Vec::new(),
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     }

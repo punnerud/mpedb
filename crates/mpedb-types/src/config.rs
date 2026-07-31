@@ -799,7 +799,7 @@ fn raw_to_config(
                 primary_key,
                 indexes,
                 dead: false,
-                implicit_rowid: false,
+                implicit_rowid: false, autoincrement: false,
                 // Config-defined tables are always ordinary; FTS tables are
                 // created live via `CREATE VIRTUAL TABLE` (design/DESIGN-FTS.md).
                 kind: crate::schema::TableKind::Standard,

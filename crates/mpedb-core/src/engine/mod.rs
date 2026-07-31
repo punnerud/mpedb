@@ -115,7 +115,7 @@ mod debug_tests;
 mod tests;
 
 pub use read::{FoldOpts, FoldStop, ReadTxn, RowCursor};
-pub use write::{TxnSavepoint, TxnSavepointFull, WriteTxn};
+pub use write::{rowid_seq_key, TxnSavepoint, TxnSavepointFull, WriteTxn};
 use write::DirtySet;
 
 /// Deferred-fsync interval for `durability = async` (§5.4.2), env-overridable

@@ -280,7 +280,7 @@ impl SqliteAttach {
                         primary_key: vec![ipk as u16],
                         indexes: vec![],
                         dead: false,
-                        implicit_rowid: false,
+                        implicit_rowid: false, autoincrement: false,
                         kind: mpedb_types::TableKind::Standard,
                         foreign_keys: Vec::new(),
                     },
@@ -323,7 +323,7 @@ impl SqliteAttach {
                         primary_key: vec![i as u16],
                         indexes: vec![],
                         dead: false,
-                        implicit_rowid: false,
+                        implicit_rowid: false, autoincrement: false,
                         kind: mpedb_types::TableKind::Standard,
                         foreign_keys: Vec::new(),
                     },
@@ -355,7 +355,7 @@ impl SqliteAttach {
                         // Leaving it visible made `SELECT *` yield one column
                         // MORE than sqlite does: wrong result arity, which is a
                         // wrong answer and not a cosmetic difference.
-                        implicit_rowid: true,
+                        implicit_rowid: true, autoincrement: false,
                         kind: mpedb_types::TableKind::Standard,
                         foreign_keys: Vec::new(),
                     },

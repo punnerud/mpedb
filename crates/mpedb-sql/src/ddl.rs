@@ -55,6 +55,8 @@ pub struct CreateColumnSpec {
     /// one value and sqlite prints them differently, and `DEFAULT (3+5)` prints
     /// as `3+5` rather than `8`.
     pub default_text: Option<String>,
+    /// `PRIMARY KEY AUTOINCREMENT` on THIS column.
+    pub autoincrement: bool,
     /// `CHECK (<expr>)` declared on the column, captured as SOURCE text (like a
     /// policy predicate or a view body) because the parser does not yet know the
     /// column list to bind against. The facade compiles it against the finished
@@ -89,6 +91,8 @@ pub struct CreateTableSpec {
     /// unrunnable, so a schema that already existed could not even be
     /// re-declared.
     pub if_not_exists: bool,
+    /// `INTEGER PRIMARY KEY AUTOINCREMENT` — the never-reuse promise.
+    pub autoincrement: bool,
     pub columns: Vec<CreateColumnSpec>,
     /// Table-level `PRIMARY KEY (…)`; empty when a column carries the
     /// inline `PRIMARY KEY` flag instead.
@@ -804,16 +808,29 @@ mod tests {
     /// the same production — is accepted and its direction dropped, as in
     /// sqlite.
     #[test]
-    fn autoincrement_refuses_by_name_everywhere() {
+    fn autoincrement_parses_where_sqlite_allows_it() {
+        // Honoured now — the never-reuse promise is a persisted high-water mark
+        // (schema v17). The flag rides on the TABLE, since that is what the
+        // counter is keyed by.
         for sql in [
             "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)",
             "CREATE TABLE t (id INTEGER PRIMARY KEY ASC AUTOINCREMENT, x INT)",
+        ] {
+            match parse_ddl(sql).unwrap().unwrap() {
+                DdlStmt::CreateTable(spec) => assert!(spec.autoincrement, "{sql}"),
+                other => panic!("{sql}: {other:?}"),
+            }
+        }
+        // Only immediately after PRIMARY KEY, and only on an INTEGER one —
+        // sqlite's own two rules.
+        for sql in [
             "CREATE TABLE t (id integer AUTOINCREMENT PRIMARY KEY)",
+            "CREATE TABLE t (id TEXT PRIMARY KEY AUTOINCREMENT)",
+            // ADD COLUMN cannot carry it: there is no rowid alias to add.
             "ALTER TABLE t ADD COLUMN id INTEGER PRIMARY KEY AUTOINCREMENT",
         ] {
             let e = parse_ddl(sql).unwrap_err().to_string();
             assert!(e.contains("AUTOINCREMENT"), "{sql}: {e}");
-            assert!(e.contains("reused"), "the refusal must say WHY — {sql}: {e}");
         }
         // Without the keyword the same column definitions are fine, direction
         // and all.

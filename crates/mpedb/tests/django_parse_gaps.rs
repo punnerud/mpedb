@@ -261,46 +261,36 @@ fn a_declared_size_is_not_a_length_limit_in_either_engine() {
 /// (non-AUTOINCREMENT) rowid exactly — INCLUDING the reuse after deleting the
 /// top row, which is precisely the behaviour AUTOINCREMENT would have to change.
 #[test]
-fn autoincrement_refuses_by_name() {
+fn autoincrement_never_reuses_an_id() {
     let t = open();
-    let e = t
+    // The keyword is HONOURED now: a persisted per-table high-water mark, in
+    // the same transaction as the row it hands an id to. It was refused for as
+    // long as mpedb had no such counter, because accepting it and reusing an id
+    // is wrong data rather than a missing feature.
+    t.db.query("CREATE TABLE ai (id INTEGER PRIMARY KEY AUTOINCREMENT, x INT)", &[])
+        .unwrap();
+    for v in 1..=3 {
+        t.db.query("INSERT INTO ai (x) VALUES ($1)", &[Value::Int(v)]).unwrap();
+    }
+    t.db.query("DELETE FROM ai WHERE id = 3", &[]).unwrap();
+    t.db.query("INSERT INTO ai (x) VALUES (4)", &[]).unwrap();
+    let ids = mpedb_rows(&t.db, "SELECT id FROM ai ORDER BY id");
+    assert_eq!(ids, vec![vec!["1"], vec!["2"], vec!["4"]]);
+
+    // WITHOUT the keyword the id IS reused, exactly as sqlite does it.
+    t.db.query("CREATE TABLE plain (id INTEGER PRIMARY KEY, x INT)", &[]).unwrap();
+    t.db.query("INSERT INTO plain (x) VALUES (1)", &[]).unwrap();
+    t.db.query("INSERT INTO plain (x) VALUES (2)", &[]).unwrap();
+    t.db.query("DELETE FROM plain WHERE id = 2", &[]).unwrap();
+    t.db.query("INSERT INTO plain (x) VALUES (3)", &[]).unwrap();
+    let ids = mpedb_rows(&t.db, "SELECT id FROM plain ORDER BY id");
+    assert_eq!(ids, vec![vec!["1"], vec!["2"]]);
+
+    // Only on an INTEGER PRIMARY KEY, as in sqlite.
+    assert!(t
         .db
-        .query("CREATE TABLE ai (id INTEGER PRIMARY KEY AUTOINCREMENT, x INT)", &[])
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("AUTOINCREMENT"), "{e}");
-    assert!(e.contains("reused"), "the refusal must say WHY: {e}");
-    // sqlite ACCEPTS it — the gap is real, and this pins that it is a gap and
-    // not a shared refusal.
-    assert!(sqlite_try(&["CREATE TABLE ai (id INTEGER PRIMARY KEY AUTOINCREMENT)"], "SELECT 1")
-        .is_ok());
-
-    // Without the keyword: identical to sqlite, ids auto-assigned AND reused
-    // after the top row is deleted.
-    let setup: &[&str] = &[
-        "CREATE TABLE ai (id INTEGER PRIMARY KEY, x INT)",
-        "INSERT INTO ai (x) VALUES (1)",
-        "INSERT INTO ai (x) VALUES (2)",
-        "INSERT INTO ai (x) VALUES (3)",
-        "DELETE FROM ai WHERE id = 3",
-        "INSERT INTO ai (x) VALUES (4)",
-    ];
-    assert_same(setup, "SELECT id, x FROM ai ORDER BY id");
-    // Said out loud: the id that came back is 3, the one AUTOINCREMENT forbids.
-    assert_eq!(
-        mpedb_state(setup, "SELECT MAX(id) FROM ai"),
-        vec![vec!["3".to_string()]]
-    );
-
-    // `PRIMARY KEY ASC|DESC` — the same production — is accepted, direction
-    // dropped, exactly as sqlite does with it.
-    assert_same(
-        &[
-            "CREATE TABLE d (id INTEGER PRIMARY KEY ASC, x INT)",
-            "INSERT INTO d (x) VALUES (7)",
-        ],
-        "SELECT id, x FROM d",
-    );
+        .query("CREATE TABLE bad (a TEXT PRIMARY KEY AUTOINCREMENT)", &[])
+        .is_err());
 }
 
 // ---------------------------------------------------------------- item 4 ----

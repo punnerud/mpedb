@@ -430,6 +430,14 @@ pub struct TableDef {
     /// shape: an explicit `CREATE TABLE t(rowid INTEGER PRIMARY KEY)` has the
     /// same columns but a VISIBLE rowid, so the flag must be stored.
     pub implicit_rowid: bool,
+    /// `INTEGER PRIMARY KEY AUTOINCREMENT` — an id is NEVER reused, even after
+    /// the top row is deleted. Without it, mpedb (like sqlite) assigns
+    /// `max(rowid) + 1`, so deleting the highest row hands its id to the next
+    /// insert. The promise costs a PERSISTED high-water mark per table, written
+    /// in the same transaction as the row it hands an id to (canonical bytes
+    /// v17) — which is the whole of what the keyword adds and the whole of what
+    /// it costs.
+    pub autoincrement: bool,
     /// FOREIGN KEYs declared on this table, in declaration order. Empty for
     /// almost every table — and the write path's first question is
     /// `is_empty()`, so a table without one pays NOTHING for the feature.
@@ -545,6 +553,7 @@ impl TableDef {
             dead: true,
             kind: TableKind::Standard,
             implicit_rowid: false,
+            autoincrement: false,
             foreign_keys: Vec::new(),
         }
     }
@@ -1658,7 +1667,7 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(16u8); // schema encoding version (v16: expression defaults)
+        buf.push(17u8); // schema encoding version (v17: AUTOINCREMENT)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -1674,6 +1683,8 @@ impl Schema {
             // Hidden implicit-rowid flag (v5, #94). Always 0 for a dead slot or
             // an FTS table (validate enforces it).
             buf.push(t.implicit_rowid as u8);
+            // AUTOINCREMENT (v17): the never-reuse promise.
+            buf.push(t.autoincrement as u8);
             write_str(&mut buf, &t.name);
             buf.extend_from_slice(&(t.columns.len() as u16).to_le_bytes());
             for c in &t.columns {
@@ -1838,7 +1849,7 @@ impl Schema {
         // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name;
         // v12 = TableDef.foreign_keys; v13 = IndexDef.exprs.
         // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if !(9..=16).contains(&version) {
+        if !(9..=17).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
@@ -1883,6 +1894,12 @@ impl Schema {
                 0 => false,
                 1 => true,
                 _ => return Err(Error::Corrupt("bad implicit_rowid flag".into())),
+            };
+            pos += 1;
+            let autoincrement = match *buf.get(pos).ok_or_else(err)? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::Corrupt("bad autoincrement flag".into())),
             };
             pos += 1;
             let name = read_str(buf, &mut pos)?;
@@ -2212,6 +2229,7 @@ impl Schema {
                 dead,
                 kind,
                 implicit_rowid,
+                autoincrement,
                 foreign_keys,
             });
         }
@@ -2311,7 +2329,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap()
@@ -2346,7 +2364,7 @@ mod tests {
                         }],
                         primary_key: vec![0],
                         indexes: vec![],
-                        dead: false, kind: TableKind::Standard, implicit_rowid: false,
+                        dead: false, kind: TableKind::Standard, implicit_rowid: false, autoincrement: false,
                         foreign_keys: Vec::new(),
                     })
                     .collect(),
@@ -2375,7 +2393,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }]);
         assert!(bad.is_err());
@@ -2395,7 +2413,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }]);
         assert!(bad.is_err());
@@ -2415,7 +2433,7 @@ mod tests {
                 affinity: Affinity::implied_by(ColumnType::Int64),
             nullable: false, unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
         let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
-            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard, implicit_rowid: false, autoincrement: false,
                 foreign_keys: Vec::new(),
             };
 
@@ -2455,7 +2473,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() }],
-            dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         };
         // The single-PK column's flags are noise and must normalize away.
@@ -2498,7 +2516,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new() }],
-            dead: false, kind: TableKind::Standard, implicit_rowid: false,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap();
@@ -2544,7 +2562,7 @@ mod tests {
         };
         TableDef { id: 0, name: n.into(), columns: vec![col("id")],
             primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard,
-            implicit_rowid: false, foreign_keys: Vec::new() }
+            implicit_rowid: false, autoincrement: false, foreign_keys: Vec::new() }
     }
 
     #[test]
@@ -2638,7 +2656,7 @@ mod tests {
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
         // The version byte is 9.
-        assert_eq!(s.canonical_bytes()[0], 16);
+        assert_eq!(s.canonical_bytes()[0], 17);
         // A v8 file refuses cleanly (no misread of the new generated bytes).
         let mut v8 = s.canonical_bytes();
         v8[0] = 8;
@@ -2711,7 +2729,7 @@ mod tests {
             indexes: vec![],
             dead: false,
             kind: TableKind::Standard,
-            implicit_rowid: true,
+            implicit_rowid: true, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap();
@@ -2746,7 +2764,7 @@ mod tests {
             indexes: vec![],
             dead: false,
             kind: TableKind::Standard,
-            implicit_rowid: false,
+            implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap();
@@ -2760,7 +2778,7 @@ mod tests {
             indexes: vec![],
             dead: false,
             kind: TableKind::Standard,
-            implicit_rowid: false,
+            implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap();
@@ -2769,7 +2787,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 16);
+        assert_eq!(s.canonical_bytes()[0], 17);
 
         // Truncation at every offset is Corrupt, never a panic.
         let bytes = s.canonical_bytes();
@@ -2812,7 +2830,7 @@ mod tests {
             indexes: vec![],
             dead: false,
             kind: TableKind::Standard,
-            implicit_rowid: false,
+            implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap();
@@ -2828,7 +2846,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 16);
+        assert_eq!(s.canonical_bytes()[0], 17);
         // The text is part of the schema identity: `f float` and `f REAL` are
         // the same storage and DIFFERENT schemas, because a consumer keying
         // converters off the decltype sees two different columns.
@@ -2878,7 +2896,7 @@ mod tests {
             indexes: vec![],
             dead: false,
             kind: TableKind::Standard,
-            implicit_rowid: false,
+            implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap();
@@ -2888,7 +2906,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 16);
+        assert_eq!(s.canonical_bytes()[0], 17);
 
         // The collation changes the hash: a BINARY `name` is a different schema.
         let mut plain = s.clone();
@@ -2936,7 +2954,7 @@ mod tests {
                 indexes: vec![],
                 dead: false,
                 kind: TableKind::Standard,
-                implicit_rowid: false,
+                implicit_rowid: false, autoincrement: false,
                 foreign_keys: Vec::new(),
             }])
         };
@@ -2957,7 +2975,7 @@ mod tests {
             indexes: vec![],
             dead: false,
             kind: TableKind::Standard,
-            implicit_rowid: false,
+            implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .is_ok());
@@ -2980,7 +2998,7 @@ mod tests {
             indexes: vec![],
             dead: false,
             kind: TableKind::Standard,
-            implicit_rowid: false,
+            implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap_err();
@@ -3037,7 +3055,7 @@ mod tests {
             indexes: vec![],
             dead: false,
             kind: TableKind::Standard,
-            implicit_rowid: false,
+            implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap();
@@ -3045,7 +3063,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "the compiled program survives byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 16);
+        assert_eq!(s.canonical_bytes()[0], 17);
 
         // It computes, in declaration order, through the decoded schema.
         let mut row = vec![Value::Int(21), Value::Null];
@@ -3087,7 +3105,7 @@ mod tests {
                 indexes: vec![],
                 dead: false,
                 kind: TableKind::Standard,
-                implicit_rowid: false,
+                implicit_rowid: false, autoincrement: false,
                 foreign_keys: Vec::new(),
             }])
         };
@@ -3166,7 +3184,7 @@ mod tests {
             indexes: vec![],
             dead: false,
             kind: TableKind::Standard,
-            implicit_rowid: false,
+            implicit_rowid: false, autoincrement: false,
             foreign_keys: Vec::new(),
         }])
         .unwrap();

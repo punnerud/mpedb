@@ -571,7 +571,7 @@ pub(crate) fn ensure_lineage_tables(
 pub(crate) fn spec_col(name: &str, ty: ColumnType) -> mpedb_sql::CreateColumnSpec {
     mpedb_sql::CreateColumnSpec {
         default_src: None,
-        default_text: None,
+        default_text: None, autoincrement: false,
         name: name.into(),
         ty,
         affinity: mpedb_types::Affinity::implied_by(ty),
@@ -595,6 +595,7 @@ pub(crate) fn create_bookkeeping(
 ) -> Result<()> {
     s.apply_ddl(mpedb_sql::DdlStmt::CreateTable(mpedb_sql::CreateTableSpec {
         if_not_exists: false,
+        autoincrement: false,
         name: name.into(),
         columns,
         table_pk: pk.iter().map(|c| (*c).to_string()).collect(),

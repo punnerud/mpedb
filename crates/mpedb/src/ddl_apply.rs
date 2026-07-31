@@ -43,6 +43,29 @@ impl Database {
 
     /// Every stored view as `(name, select_source)` — used by the C-API
     /// `sqlite_master` dump and by [`load_view_catalog`].
+    /// Every AUTOINCREMENT table's high-water mark as `(table name, last id)`
+    /// — sqlite's `sqlite_sequence` contents.
+    ///
+    /// Only tables that have HANDED OUT an id appear, which is sqlite's rule
+    /// too: the row exists once the first id is assigned, not when the table is
+    /// created.
+    pub fn rowid_sequences(&self) -> Result<Vec<(String, i64)>> {
+        let bundle = self.schema();
+        let r = self.engine.begin_read()?;
+        let mut out = Vec::new();
+        for t in bundle.tables.iter().filter(|t| !t.dead && t.autoincrement) {
+            let key = mpedb_core::engine::rowid_seq_key(t.id);
+            if let Ok(Some(b)) = r.sys_get(&key) {
+                if b.len() == 8 {
+                    let v = i64::from_le_bytes(b[..8].try_into().expect("len 8"));
+                    out.push((t.name.clone(), v));
+                }
+            }
+        }
+        r.finish()?;
+        Ok(out)
+    }
+
     pub fn list_views(&self) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
         let r = self.engine.begin_read()?;
@@ -256,7 +279,7 @@ fn fold_default_expr(
         indexes: Vec::new(),
         dead: false,
         kind: mpedb_types::TableKind::Standard,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         foreign_keys: Vec::new(),
     };
     let bad = |why: String| {
@@ -565,6 +588,7 @@ pub(crate) fn table_def_from_spec(
         indexes,
         dead: false,
         implicit_rowid,
+        autoincrement: spec.autoincrement,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys,
     };
@@ -654,7 +678,7 @@ pub(crate) fn virtual_table_def_from_spec(
         primary_key: vec![0],
         indexes: Vec::new(),
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer },
         // An FTS shadow table is engine-owned; user DDL never attaches a key
         // to it.

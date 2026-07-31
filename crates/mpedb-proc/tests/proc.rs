@@ -422,7 +422,7 @@ fn stale_plan_surfaces_plan_invalidated() {
         primary_key: vec![0],
         indexes: vec![],
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     }])

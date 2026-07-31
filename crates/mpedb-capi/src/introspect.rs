@@ -1178,7 +1178,59 @@ const MASTER_COLS: [&str; 5] = ["type", "name", "tbl_name", "rootpage", "sql"];
 /// Does `sql` read `sqlite_master`/`sqlite_schema`? (identifier match, so a
 /// string literal containing the word does not trigger it).
 pub fn references_sqlite_master(sql: &str) -> bool {
-    master_reference(sql).is_some()
+    master_reference(sql).is_some() || references_sqlite_sequence(sql)
+}
+
+/// Does the statement SELECT FROM `sqlite_sequence`?
+///
+/// sqlite's AUTOINCREMENT counters live in a real internal table; mpedb keeps
+/// them in the catalog's sys keyspace, so the table is SYNTHESISED on read the
+/// way `sqlite_master` is. CPython's `iterdump` reads it by name after finding
+/// it listed in `sqlite_master`, which is the whole of what needs to work.
+///
+/// The FROM position specifically, and that is not fussiness. Django's table
+/// listing is `SELECT name, type FROM sqlite_master WHERE type IN ('table',
+/// 'view') AND NOT name='sqlite_sequence'` — the name appears as a string
+/// LITERAL. Matching it anywhere (which is what the catalog scan next door
+/// does, boundary checks and all) answered that query with the two-column
+/// sequence table instead of the master listing, so Django stopped seeing its
+/// own `django_migrations` and tried to create it twice. A wrong answer, and
+/// the Django gate is what caught it: the SQLAlchemy suite never moved.
+pub fn references_sqlite_sequence(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("from") {
+        let at = from + pos;
+        from = at + 4;
+        // A whole word, not the tail of one.
+        if lower[..at].chars().last().is_some_and(ident) {
+            continue;
+        }
+        let rest = lower[from..].trim_start();
+        // Any of sqlite's quotings, or none.
+        let rest = rest
+            .strip_prefix('"')
+            .or_else(|| rest.strip_prefix('`'))
+            .or_else(|| rest.strip_prefix('['))
+            .unwrap_or(rest);
+        if let Some(tail) = rest.strip_prefix("sqlite_sequence") {
+            if !tail.chars().next().is_some_and(ident) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The rows of the synthesised `sqlite_sequence`, as `(name, seq)`.
+pub fn sqlite_sequence_rows(seqs: &[(String, i64)]) -> (Vec<String>, Vec<Vec<Value>>) {
+    (
+        cols(&["name", "seq"]),
+        seqs.iter()
+            .map(|(n, v)| vec![Value::Text(n.clone()), Value::Int(*v)])
+            .collect(),
+    )
 }
 
 /// Which catalog a statement reads: `Some(false)` for the main one,
@@ -1401,6 +1453,18 @@ pub fn sqlite_master(
                 sql: r.sql.unwrap_or_default(),
             });
         }
+    }
+    // sqlite creates `sqlite_sequence` the moment the first AUTOINCREMENT
+    // table exists, and lists it like any other table — which is how
+    // `iterdump` finds it. Emitted after the user tables, where sqlite's
+    // creation order puts it.
+    if sources.iter().any(|src| user_tables(src.schema).iter().any(|t| t.autoincrement)) {
+        rows.push(MasterRow {
+            ty: "table",
+            name: "sqlite_sequence".into(),
+            tbl_name: "sqlite_sequence".into(),
+            sql: "CREATE TABLE sqlite_sequence(name,seq)".into(),
+        });
     }
     for (name, tbl, create_sql) in triggers {
         let sql = object_ddl_text(verbatim.get(name)).unwrap_or_else(|| create_sql.clone());

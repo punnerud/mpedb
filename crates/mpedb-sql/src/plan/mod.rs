@@ -526,7 +526,7 @@ pub fn dual_def() -> &'static mpedb_types::TableDef {
         primary_key: Vec::new(),
         indexes: Vec::new(),
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     })
@@ -1583,7 +1583,7 @@ pub(crate) fn cte_working_table_def(
         primary_key: Vec::new(),
         indexes: Vec::new(),
         dead: false,
-        implicit_rowid: false,
+        implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     }

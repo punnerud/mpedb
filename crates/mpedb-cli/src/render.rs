@@ -165,7 +165,7 @@ mod tests {
                 indexes: vec![],
                 dead: false,
                 kind: TableKind::Standard,
-                implicit_rowid: false,
+                implicit_rowid: false, autoincrement: false,
                 foreign_keys: Vec::new(),
             })
             .collect();

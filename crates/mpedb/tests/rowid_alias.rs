@@ -288,20 +288,28 @@ fn non_integer_pk_is_not_a_rowid_alias() {
 }
 
 #[test]
-fn autoincrement_is_refused_by_name() {
+fn autoincrement_survives_a_reopen() {
+    // The never-reuse promise is a PERSISTED high-water mark (schema v17), so
+    // the case that matters is the one a session cannot answer from the tree:
+    // delete the top row, close, reopen, insert.
     let t = open();
-    let err = t
-        .db
-        .query(
-            "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
-            &[],
-        )
-        .unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("AUTOINCREMENT"),
-        "AUTOINCREMENT should be refused by name, got: {msg}"
-    );
+    t.db.query("CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)", &[])
+        .unwrap();
+    t.db.query("INSERT INTO a (v) VALUES ('x')", &[]).unwrap();
+    t.db.query("INSERT INTO a (v) VALUES ('y')", &[]).unwrap();
+    t.db.query("DELETE FROM a", &[]).unwrap();
+    // A SECOND handle on the same file: the counter has to come off the
+    // catalog, not out of the first handle's memory.
+    let db = Database::open_from_file(std::path::Path::new(&t.path)).unwrap();
+    db.query("INSERT INTO a (v) VALUES ('z')", &[]).unwrap();
+    match db.query("SELECT id FROM a", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => assert_eq!(
+            rows[0][0],
+            Value::Int(3),
+            "the counter must survive the reopen — an emptied tree says nothing"
+        ),
+        other => panic!("expected rows, got {other:?}"),
+    }
 }
 
 #[test]
