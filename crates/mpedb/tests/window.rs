@@ -397,10 +397,9 @@ fn stage1_refusals() {
     assert!(err("SELECT id FROM t WHERE row_number() OVER (ORDER BY val) = 1")
         .to_lowercase()
         .contains("window"));
-    // Window + aggregate in one SELECT is refused.
-    assert!(err("SELECT count(*), row_number() OVER (ORDER BY val) FROM t")
-        .to_lowercase()
-        .contains("window"));
+    // Window + aggregate in one SELECT now SHIPS — the window phase runs after
+    // grouping, over the grouped rows (see `window_over_group.rs`). What stays
+    // refused is a window in WHERE, above.
     // DISTINCT inside a window aggregate is refused (sqlite refuses it too).
     assert!(err("SELECT sum(DISTINCT amt) OVER (ORDER BY val) FROM t")
         .to_lowercase()

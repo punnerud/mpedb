@@ -557,13 +557,10 @@ fn plan_join_select_inner<'s>(
         .as_ref()
         .is_some_and(|i| i.iter().any(|(e, _)| contains_window(e)))
         || s.order_by.iter().any(|(e, _)| contains_window(e));
+    // (`has_agg` returned above, window or not — a window over a GROUPED join
+    // is the aggregate planner's job, and it runs the window phase over the
+    // grouped rows.)
     if has_window {
-        if has_agg {
-            return Err(bind_err(
-                "window functions together with GROUP BY / aggregates in one SELECT \
-                 are not supported yet (window stage 2+)",
-            ));
-        }
         if post_filter.is_some() || correlated.iter().any(|&c| c) {
             return Err(bind_err(
                 "a window function together with a correlated subquery is not supported yet",

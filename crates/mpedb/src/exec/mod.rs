@@ -1682,7 +1682,12 @@ fn exec_select(
     // Window functions are their own phase: materialize the base rows, compute
     // each window, project over the extended rows, then sort/trim/bound. Kept in
     // its own function so this executor's other paths stay untouched.
-    if !sp.windows.is_empty() {
+    //
+    // An AGGREGATE plan that also carries windows runs the phase over the
+    // GROUPED tuple instead, inside `exec_aggregate` — the rows this path would
+    // hand the window phase are the ungrouped ones, and projecting them would
+    // answer the wrong question rather than fail.
+    if !sp.windows.is_empty() && sp.aggregate.is_none() {
         return window::exec_select_windowed(ctx, schema, plan, params, sp);
     }
     // Micro-executor: single-table PK point probe with column-only projection.
@@ -2513,6 +2518,7 @@ fn run_aggregate(
     // per-row scratch is exactly what the workers do not carry.
     let parallel_shape = correlated.is_empty()
         && post_filter.is_none()
+        && sp.windows.is_empty()
         && mpedb_sql::parallel_fold_shape(sp, schema);
     exec_aggregate(
         ctx,
@@ -2538,6 +2544,11 @@ fn run_aggregate(
         post_filter,
         prune.as_ref(),
         parallel_shape,
+        // A WINDOW over the grouped result: the phase runs between HAVING and
+        // the projection, so the grouped tuple is widened to
+        // `[keys ‖ aggs ‖ bare ‖ w0..wk]` before anything reads it.
+        &sp.windows,
+        window::grouped_collations(schema, plan, sp, agg),
     )
 }
 

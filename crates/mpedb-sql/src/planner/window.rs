@@ -48,19 +48,19 @@ pub(super) fn contains_window(e: &ast::Expr) -> bool {
 /// identical windows (`rank() OVER w` selected AND ordered-by) share one slot,
 /// so the window is computed once — exactly `lift_aggs`' aggregate reuse.
 #[derive(PartialEq)]
-struct WindowCollect {
-    func: ast::WindowFunc,
-    arg: Option<ast::Expr>,
+pub(super) struct WindowCollect {
+    pub(super) func: ast::WindowFunc,
+    pub(super) arg: Option<ast::Expr>,
     /// Trailing arguments (stage 2): lag/lead `[offset[, default]]`, nth_value
     /// `[n]`. Part of the structural key so two lag calls with different offsets
     /// do not share a slot.
-    extra_args: Vec<ast::Expr>,
-    distinct: bool,
-    partition_by: Vec<ast::Expr>,
-    order_by: Vec<(ast::Expr, bool)>,
+    pub(super) extra_args: Vec<ast::Expr>,
+    pub(super) distinct: bool,
+    pub(super) partition_by: Vec<ast::Expr>,
+    pub(super) order_by: Vec<(ast::Expr, bool)>,
     /// Explicit frame (`None` = default). Part of the structural key so two
     /// windows differing only by frame do not share a result slot.
-    frame: Option<Box<ast::FrameAst>>,
+    pub(super) frame: Option<Box<ast::FrameAst>>,
 }
 
 /// Lift every window function out of `e`, replacing each with a reference to its
@@ -68,7 +68,7 @@ struct WindowCollect {
 /// windows into `specs`. The window's OWN sub-expressions (arg, PARTITION BY,
 /// ORDER BY) are NOT rewritten — they bind over the base row, like aggregate
 /// arguments.
-fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Expr> {
+pub(super) fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Expr> {
     use ast::Expr as E;
     let rec = |x: &ast::Expr, s: &mut Vec<WindowCollect>| lift_windows(x, s);
     Ok(match e {
@@ -316,11 +316,95 @@ fn unify_value_default(
     }
 }
 
+/// The compiled windows plus, per window, its result `(type, nullable)` — what
+/// [`synthetic_window_table`] needs to give `__w{k}` a column.
+pub(super) type CompiledWindows = (Vec<WindowSpec>, Vec<(ColumnType, bool)>);
+
+/// Compile a lifted window's sub-expressions — argument, `PARTITION BY`,
+/// `ORDER BY`, frame — against whatever tuple `binder` is scoped to, and
+/// resolve the function itself.
+///
+/// The scope is the caller's choice and that is the whole point: the plain
+/// window path binds these over the BASE row, and the aggregate path binds the
+/// SAME specs over the GROUPED tuple, where `PARTITION BY dept` names a group
+/// key and `ORDER BY count(*)` names an aggregate slot. Two copies of this
+/// block would have drifted on the first frame rule that changed.
+pub(super) fn bind_window_specs(
+    specs: &[WindowCollect],
+    binder: &mut Binder<'_>,
+) -> Result<CompiledWindows> {
+    let mut windows: Vec<WindowSpec> = Vec::with_capacity(specs.len());
+    let mut win_types: Vec<(ColumnType, bool)> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if spec.distinct {
+            return Err(bind_err(
+                "DISTINCT is not allowed in a window aggregate (sqlite refuses it too)",
+            ));
+        }
+        // ntile assigns buckets along the window order, so without an ORDER BY the
+        // bucket numbers depend on the (arbitrary) scan order — a version-brittle,
+        // non-reproducible answer. Refuse it cleanly rather than guess (the
+        // 0-wrong-answer contract). `percent_rank`/`cume_dist` are well-defined
+        // without ORDER BY (one peer group ⇒ 0.0 / 1.0), so they are allowed.
+        if matches!(spec.func, ast::WindowFunc::Ntile) && spec.order_by.is_empty() {
+            return Err(bind_err(
+                "ntile() requires an ORDER BY in its OVER clause",
+            ));
+        }
+        let (arg_prog, arg_ty) = match &spec.arg {
+            None => (None, None),
+            Some(a) => {
+                let (b, ty) = binder.bind_expr(a)?;
+                (Some(compile_program(&b)?), ty)
+            }
+        };
+        let mut partition_by = Vec::with_capacity(spec.partition_by.len());
+        for p in &spec.partition_by {
+            let (b, _) = binder.bind_expr(p)?;
+            partition_by.push(compile_program(&b)?);
+        }
+        let mut order_by = Vec::with_capacity(spec.order_by.len());
+        for (p, desc) in &spec.order_by {
+            let (b, _) = binder.bind_expr(p)?;
+            order_by.push((compile_program(&b)?, *desc));
+        }
+        let (func, default, ty, nullable) =
+            resolve_window_func(binder, &spec.func, arg_ty, &spec.extra_args)?;
+        // Resolve and validate any explicit frame against the plan-level function
+        // and whether the window has an ORDER BY. `Frame::check` is the single
+        // source of the frame rules (shared with decode/validate); a bad shape is
+        // a clean bind error, never a wrong answer.
+        let frame = match &spec.frame {
+            None => None,
+            Some(fa) => {
+                let f = resolve_frame(fa);
+                f.check(func, order_by.len()).map_err(bind_err)?;
+                Some(f)
+            }
+        };
+        win_types.push((ty, nullable));
+        windows.push(WindowSpec {
+            host: match &spec.func {
+                ast::WindowFunc::Host(n) => Some(n.clone()),
+                _ => None,
+            },
+            func,
+            arg: arg_prog,
+            distinct: false,
+            partition_by,
+            order_by,
+            default,
+            frame,
+        });
+    }
+    Ok((windows, win_types))
+}
+
 /// A synthetic `TableDef` describing JUST the window result columns `__w{k}`,
 /// appended after the base tables to form the extended scope. Never reaches the
 /// row/key layer — it exists only so the ordinary binder can resolve `__w{k}`
 /// and type-check the projection over the extended tuple.
-fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableDef {
+pub(super) fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableDef {
     let columns = win_types
         .iter()
         .enumerate()
@@ -430,70 +514,7 @@ pub(super) fn plan_window_select(
     }
 
     // 2. Compile each window's sub-expressions over the BASE row.
-    let mut windows: Vec<WindowSpec> = Vec::with_capacity(specs.len());
-    let mut win_types: Vec<(ColumnType, bool)> = Vec::with_capacity(specs.len());
-    for spec in &specs {
-        if spec.distinct {
-            return Err(bind_err(
-                "DISTINCT is not allowed in a window aggregate (sqlite refuses it too)",
-            ));
-        }
-        // ntile assigns buckets along the window order, so without an ORDER BY the
-        // bucket numbers depend on the (arbitrary) scan order — a version-brittle,
-        // non-reproducible answer. Refuse it cleanly rather than guess (the
-        // 0-wrong-answer contract). `percent_rank`/`cume_dist` are well-defined
-        // without ORDER BY (one peer group ⇒ 0.0 / 1.0), so they are allowed.
-        if matches!(spec.func, ast::WindowFunc::Ntile) && spec.order_by.is_empty() {
-            return Err(bind_err(
-                "ntile() requires an ORDER BY in its OVER clause",
-            ));
-        }
-        let (arg_prog, arg_ty) = match &spec.arg {
-            None => (None, None),
-            Some(a) => {
-                let (b, ty) = binder.bind_expr(a)?;
-                (Some(compile_program(&b)?), ty)
-            }
-        };
-        let mut partition_by = Vec::with_capacity(spec.partition_by.len());
-        for p in &spec.partition_by {
-            let (b, _) = binder.bind_expr(p)?;
-            partition_by.push(compile_program(&b)?);
-        }
-        let mut order_by = Vec::with_capacity(spec.order_by.len());
-        for (p, desc) in &spec.order_by {
-            let (b, _) = binder.bind_expr(p)?;
-            order_by.push((compile_program(&b)?, *desc));
-        }
-        let (func, default, ty, nullable) =
-            resolve_window_func(&mut binder, &spec.func, arg_ty, &spec.extra_args)?;
-        // Resolve and validate any explicit frame against the plan-level function
-        // and whether the window has an ORDER BY. `Frame::check` is the single
-        // source of the frame rules (shared with decode/validate); a bad shape is
-        // a clean bind error, never a wrong answer.
-        let frame = match &spec.frame {
-            None => None,
-            Some(fa) => {
-                let f = resolve_frame(fa);
-                f.check(func, order_by.len()).map_err(bind_err)?;
-                Some(f)
-            }
-        };
-        win_types.push((ty, nullable));
-        windows.push(WindowSpec {
-            host: match &spec.func {
-                ast::WindowFunc::Host(n) => Some(n.clone()),
-                _ => None,
-            },
-            func,
-            arg: arg_prog,
-            distinct: false,
-            partition_by,
-            order_by,
-            default,
-            frame,
-        });
-    }
+    let (windows, win_types) = bind_window_specs(&specs, &mut binder)?;
 
     // 3. Rescope the binder to the EXTENDED tuple: base tables ‖ the `__w{k}`
     //    window table. Slot `base_width + k` is window `k`'s result. Two copies

@@ -461,13 +461,11 @@ pub(super) fn plan_select<'s>(
         || s.order_by.iter().any(|(e, _)| contains_agg(e))
         || !s.group_by.is_empty();
 
-    if has_window {
-        if has_agg {
-            return Err(bind_err(
-                "window functions together with GROUP BY / aggregates in one SELECT \
-                 are not supported yet (window stage 2+)",
-            ));
-        }
+    // A window over a GROUPED result is planned by the AGGREGATE path — the
+    // window phase runs after grouping, over the grouped rows, so the window's
+    // own clauses resolve against the grouped tuple. Falling through to the
+    // aggregate planner is the whole routing change.
+    if has_window && !has_agg {
         // A correlated subquery makes the executor fill slots per row on a path
         // that does not run the window phase — refuse the combination for now.
         // (Uncorrelated subqueries are fine: filled once, before the phase.)

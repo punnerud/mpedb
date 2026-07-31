@@ -601,13 +601,6 @@ impl CompiledPlan {
                     // The OUTER's policy/residual, over the outer row alone.
                     self.check_program(f, t, ptypes)?;
                 }
-                // Windows and aggregation are mutually exclusive (stage 1): the
-                // window phase runs over base rows, the aggregate over grouped
-                // tuples — one tuple model per plan. A blob claiming both is
-                // forged (the planner refuses the SQL in-process).
-                if aggregate.is_some() && !sp.windows.is_empty() {
-                    return Err(corrupt("windows together with an aggregate"));
-                }
                 if let Some(a) = aggregate {
                     // GROUP BY columns and aggregate ARGUMENTS index the BASE
                     // row — which for a join is the JOINED row, hence
@@ -704,21 +697,35 @@ impl CompiledPlan {
                     if let Some(h) = &a.having {
                         self.check_program_width(h, out_width, ptypes)?;
                     }
+                    // A WINDOW over a grouped result runs its phase over the
+                    // GROUPED tuple, so its sub-programs bound by `out_width`
+                    // and the projection then reaches `out_width + k`. Reading
+                    // them against the BASE row instead would be the one width
+                    // confusion this plan shape makes available.
+                    self.check_window_specs(&sp.windows, out_width, ptypes)?;
+                    let proj_width = out_width + sp.windows.len();
                     for p in projection {
                         match p {
                             Projection::Column(i) => {
-                                if *i as usize >= out_width {
+                                if *i as usize >= proj_width {
                                     return Err(corrupt(
                                         "projection column out of the grouped tuple",
                                     ));
                                 }
                             }
                             Projection::Expr { program, .. } => {
-                                self.check_program_width(program, out_width, ptypes)?
+                                self.check_program_width(program, proj_width, ptypes)?
                             }
                         }
                     }
-                    let w = order_width(projection.len(), Some(out_width));
+                    // With windows the sort MUST follow the phase, so it indexes
+                    // the projection whatever `order_over` claims — the same
+                    // rule the plain windowed branch applies.
+                    let w = if sp.windows.is_empty() {
+                        order_width(projection.len(), Some(out_width))
+                    } else {
+                        projection.len()
+                    };
                     for (c, _, _) in order_by {
                         if *c as usize >= w {
                             return Err(corrupt("order-by column out of range"));
@@ -733,95 +740,8 @@ impl CompiledPlan {
                 // ORDER BY may reach the window slots, so they bound by
                 // `proj_width` — exactly as the aggregate branch widens the
                 // projection to the grouped tuple's width.
+                self.check_window_specs(&sp.windows, base_width, ptypes)?;
                 let win = &sp.windows;
-                if !win.is_empty() {
-                    if win.len() > super::MAX_WINDOWS {
-                        return Err(corrupt("too many windows in plan"));
-                    }
-                    for w in win {
-                        use super::WindowFunc as WF;
-                        if w.distinct {
-                            return Err(corrupt("DISTINCT window aggregate is not supported"));
-                        }
-                        // A ranking/distribution function has no argument (the row
-                        // is the input; ntile's bucket count rides in its tag). An
-                        // aggregate window MAY carry one (`sum(x)`) or not
-                        // (`count(*)`). Every value/offset function REQUIRES its
-                        // value `expr`.
-                        let is_ranking = matches!(
-                            w.func,
-                            WF::RowNumber
-                                | WF::Rank
-                                | WF::DenseRank
-                                | WF::Ntile(_)
-                                | WF::PercentRank
-                                | WF::CumeDist
-                        );
-                        let is_value = matches!(
-                            w.func,
-                            WF::Lag(_)
-                                | WF::Lead(_)
-                                | WF::FirstValue
-                                | WF::LastValue
-                                | WF::NthValue(_)
-                        );
-                        if w.arg.is_some() && is_ranking {
-                            return Err(corrupt("ranking window function carries an argument"));
-                        }
-                        if w.arg.is_none() && is_value {
-                            return Err(corrupt("value window function requires an argument"));
-                        }
-                        // Format 55: the host window aggregate's NAME and its
-                        // tag must agree in both directions, so a plan can
-                        // neither name a host function it does not call nor
-                        // call one it does not name.
-                        if matches!(w.func, WF::Host) != w.host.is_some() {
-                            return Err(corrupt(
-                                "window host name present without the host tag (or vice versa)",
-                            ));
-                        }
-                        if matches!(w.func, WF::Host) && w.arg.is_none() {
-                            return Err(corrupt("host window aggregate requires an argument"));
-                        }
-                        // A LITERAL that is not positive is a corrupt blob. A
-                        // PARAMETER is only knowable once bound, so the executor
-                        // raises there instead — which is also where sqlite
-                        // raises (MEASURED: `nth_value(a, 0)` and `ntile(0)` are
-                        // both runtime errors, not parse errors).
-                        if let WF::NthValue(n) = w.func {
-                            if matches!(n, WinInt::Lit(v) if v < 1) {
-                                return Err(corrupt("nth_value n must be a positive integer"));
-                            }
-                        }
-                        if let WF::Ntile(n) = w.func {
-                            if matches!(n, WinInt::Lit(v) if v < 1) {
-                                return Err(corrupt("ntile bucket count must be a positive integer"));
-                            }
-                        }
-                        // `default` is a lag/lead-only field (the out-of-range
-                        // value); anything else carrying one is malformed.
-                        if w.default.is_some() && !matches!(w.func, WF::Lag(_) | WF::Lead(_)) {
-                            return Err(corrupt("only lag/lead carry a default expression"));
-                        }
-                        // Explicit frame legality — the same rule set the planner
-                        // and decoder apply, re-checked here on the semantic pass.
-                        if let Some(f) = &w.frame {
-                            f.check(w.func, w.order_by.len()).map_err(corrupt)?;
-                        }
-                        if let Some(a) = &w.arg {
-                            self.check_program_width(a, base_width, ptypes)?;
-                        }
-                        if let Some(d) = &w.default {
-                            self.check_program_width(d, base_width, ptypes)?;
-                        }
-                        for p in &w.partition_by {
-                            self.check_program_width(p, base_width, ptypes)?;
-                        }
-                        for (p, _) in &w.order_by {
-                            self.check_program_width(p, base_width, ptypes)?;
-                        }
-                    }
-                }
                 let proj_width = base_width + win.len();
                 for p in projection {
                     match p {
@@ -1419,6 +1339,115 @@ impl CompiledPlan {
                 for c in &s.subplans {
                     self.validate_subplan_rec(schema, c, child_base, &child_outer, budget)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+
+    /// Every WIDTH-INDEPENDENT rule a window spec must satisfy, plus its
+    /// sub-programs bounded by the row they read.
+    ///
+    /// `row_width` is that row, and it is the caller's to say: a plain windowed
+    /// plan runs the phase over the BASE row, and a windowed AGGREGATE runs it
+    /// over the GROUPED tuple `[keys ‖ aggs ‖ bare]`. One function, because a
+    /// second copy would be the one that forgot a rule.
+    fn check_window_specs(
+        &self,
+        win: &[WindowSpec],
+        row_width: usize,
+        ptypes: &[Option<ColumnType>],
+    ) -> Result<()> {
+        if win.is_empty() {
+            return Ok(());
+        }
+        if win.len() > super::MAX_WINDOWS {
+            return Err(corrupt("too many windows in plan"));
+        }
+        if win.len() > super::MAX_WINDOWS {
+            return Err(corrupt("too many windows in plan"));
+        }
+        for w in win {
+            use super::WindowFunc as WF;
+            if w.distinct {
+                return Err(corrupt("DISTINCT window aggregate is not supported"));
+            }
+            // A ranking/distribution function has no argument (the row
+            // is the input; ntile's bucket count rides in its tag). An
+            // aggregate window MAY carry one (`sum(x)`) or not
+            // (`count(*)`). Every value/offset function REQUIRES its
+            // value `expr`.
+            let is_ranking = matches!(
+                w.func,
+                WF::RowNumber
+                    | WF::Rank
+                    | WF::DenseRank
+                    | WF::Ntile(_)
+                    | WF::PercentRank
+                    | WF::CumeDist
+            );
+            let is_value = matches!(
+                w.func,
+                WF::Lag(_)
+                    | WF::Lead(_)
+                    | WF::FirstValue
+                    | WF::LastValue
+                    | WF::NthValue(_)
+            );
+            if w.arg.is_some() && is_ranking {
+                return Err(corrupt("ranking window function carries an argument"));
+            }
+            if w.arg.is_none() && is_value {
+                return Err(corrupt("value window function requires an argument"));
+            }
+            // Format 55: the host window aggregate's NAME and its
+            // tag must agree in both directions, so a plan can
+            // neither name a host function it does not call nor
+            // call one it does not name.
+            if matches!(w.func, WF::Host) != w.host.is_some() {
+                return Err(corrupt(
+                    "window host name present without the host tag (or vice versa)",
+                ));
+            }
+            if matches!(w.func, WF::Host) && w.arg.is_none() {
+                return Err(corrupt("host window aggregate requires an argument"));
+            }
+            // A LITERAL that is not positive is a corrupt blob. A
+            // PARAMETER is only knowable once bound, so the executor
+            // raises there instead — which is also where sqlite
+            // raises (MEASURED: `nth_value(a, 0)` and `ntile(0)` are
+            // both runtime errors, not parse errors).
+            if let WF::NthValue(n) = w.func {
+                if matches!(n, WinInt::Lit(v) if v < 1) {
+                    return Err(corrupt("nth_value n must be a positive integer"));
+                }
+            }
+            if let WF::Ntile(n) = w.func {
+                if matches!(n, WinInt::Lit(v) if v < 1) {
+                    return Err(corrupt("ntile bucket count must be a positive integer"));
+                }
+            }
+            // `default` is a lag/lead-only field (the out-of-range
+            // value); anything else carrying one is malformed.
+            if w.default.is_some() && !matches!(w.func, WF::Lag(_) | WF::Lead(_)) {
+                return Err(corrupt("only lag/lead carry a default expression"));
+            }
+            // Explicit frame legality — the same rule set the planner
+            // and decoder apply, re-checked here on the semantic pass.
+            if let Some(f) = &w.frame {
+                f.check(w.func, w.order_by.len()).map_err(corrupt)?;
+            }
+            if let Some(a) = &w.arg {
+                self.check_program_width(a, row_width, ptypes)?;
+            }
+            if let Some(d) = &w.default {
+                self.check_program_width(d, row_width, ptypes)?;
+            }
+            for p in &w.partition_by {
+                self.check_program_width(p, row_width, ptypes)?;
+            }
+            for (p, _) in &w.order_by {
+                self.check_program_width(p, row_width, ptypes)?;
             }
         }
         Ok(())

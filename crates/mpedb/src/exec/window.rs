@@ -112,6 +112,39 @@ pub(super) fn exec_select_windowed(
 
 /// Compute every window over the materialized rows, extending each row with one
 /// result value per window (at `base_width + k`). Rows are never reordered — the
+/// The DECLARED collation of each slot of the GROUPED tuple
+/// `[keys ‖ aggs ‖ bare]`, so a window over a grouped result compares the same
+/// way the ungrouped one does.
+///
+/// A key that IS a base column carries that column's collation (`GROUP BY
+/// dept` on a NOCASE column, then `PARTITION BY dept`); a computed key does
+/// not. A bare column likewise carries the column it is read from. An
+/// AGGREGATE result carries none — it is a computed value, and sqlite gives a
+/// computed expression BINARY.
+pub(super) fn grouped_collations(
+    schema: &Schema,
+    plan: &CompiledPlan,
+    sp: &mpedb_sql::SelectPlan,
+    agg: &mpedb_sql::Aggregation,
+) -> Vec<Collation> {
+    if sp.windows.is_empty() {
+        return Vec::new();
+    }
+    let base = super::base_row_collations(schema, plan, sp.table, &sp.joins);
+    let at = |i: u16| base.get(i as usize).copied().unwrap_or(Collation::Binary);
+    let mut out: Vec<Collation> = agg
+        .group_by
+        .iter()
+        .map(|k| match k {
+            mpedb_sql::GroupKey::Col(i) => at(*i),
+            mpedb_sql::GroupKey::Expr(_) => Collation::Binary,
+        })
+        .collect();
+    out.resize(out.len() + agg.aggs.len(), Collation::Binary);
+    out.extend(agg.bare_cols.iter().map(|&i| at(i)));
+    out
+}
+
 /// One window ORDER BY key's comparison inputs: DESCENDING, and the COLLATION.
 /// Bundled because every peer test, every sort and every frame boundary must
 /// use the same pair — carrying them as two parallel slices is how the

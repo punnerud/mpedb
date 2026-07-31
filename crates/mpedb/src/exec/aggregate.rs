@@ -1318,6 +1318,12 @@ pub(super) fn exec_aggregate(
     // The parallel fold's SHAPE gate (`mpedb_sql::parallel_fold_shape`),
     // computed by `run_aggregate` where the whole SelectPlan is in hand.
     parallel_shape: bool,
+    // WINDOW functions over the GROUPED result: the phase runs between HAVING
+    // and the projection, widening each grouped tuple to
+    // `[keys ‖ aggs ‖ bare ‖ w0..wk]`. Empty for every plain aggregate.
+    windows: &[mpedb_sql::WindowSpec],
+    // The grouped tuple's declared collations, for that phase.
+    grouped_colls: Vec<mpedb_types::Collation>,
 ) -> Result<ExecResult> {
     let mut folder = Folder::new(&*ctx, schema, plan, t, table, joins, agg);
 
@@ -1624,6 +1630,28 @@ pub(super) fn exec_aggregate(
             }
         }
         out = keep;
+    }
+
+    // THE WINDOW PHASE, between HAVING and everything that follows.
+    //
+    // Its position is the semantics: after HAVING (a window sees the groups
+    // that survived), before ORDER BY and LIMIT (a window result may be sorted
+    // on, and `LIMIT 3` must not shrink the partition the window ran over).
+    // Each tuple widens from `[keys ‖ aggs ‖ bare]` to `… ‖ w0..wk`, which is
+    // the width the projection was bound against.
+    if !windows.is_empty() {
+        let mut tuples: Vec<Vec<Value>> = out.iter().map(|(t, _)| t.clone()).collect();
+        super::window::compute_windows(
+            &mut tuples,
+            windows,
+            &grouped_colls,
+            params,
+            ctx.host_fns(),
+            ctx.host_aggs(),
+        )?;
+        for ((t, _), widened) in out.iter_mut().zip(tuples) {
+            *t = widened;
+        }
     }
 
     // Sort the GROUPED tuple only when the indices refer to it; otherwise the

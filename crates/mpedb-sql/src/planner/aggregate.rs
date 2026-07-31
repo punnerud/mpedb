@@ -144,6 +144,14 @@ fn lift_aggs(
         // `Sqlite` gives it a slot in the grouped tuple's `bare` region and lets
         // the planner decide — after constant folding — whether it is genuinely
         // used (must then be fixed by a single min()/max()) or folds away.
+        // A WINDOW RESULT placeholder (`__w{k}`), put there by `lift_windows`
+        // before this ran. It names a slot of the extended tuple `[grouped ‖
+        // windows]`, which does not exist yet — so it must pass through
+        // untouched rather than be resolved against the base row, where it
+        // would be reported as an unknown column.
+        E::Col(n) if n.starts_with("__w") && n[3..].bytes().all(|b| b.is_ascii_digit()) => {
+            e.clone()
+        }
         E::Col(_) | E::Qualified(..) => {
             let (idx, ty) = match e {
                 E::Col(n) => scope.resolve(n)?,
@@ -488,9 +496,16 @@ pub(super) fn plan_aggregate_select(
     let mut agg_specs: Vec<AggSpec> =
         Vec::new();
     let mut bare: Vec<(u16, ColumnType)> = Vec::new();
+    // WINDOW functions over a GROUPED result. The window phase runs AFTER
+    // grouping, so a window call is lifted out FIRST — leaving a `__w{k}`
+    // placeholder that `lift_aggs` passes through — and its own subexpressions
+    // then go through `lift_aggs` in turn, because `rank() OVER (ORDER BY
+    // count(*))` orders by a GROUPING aggregate, not a window one.
+    let mut win_specs: Vec<super::window::WindowCollect> = Vec::new();
     let mut rewritten = Vec::with_capacity(items.len());
     for (item, _alias) in items {
-        rewritten.push(lift_aggs(item, &keys, base_scope, mode, &mut agg_specs, &mut bare)?);
+        let lifted = super::window::lift_windows(item, &mut win_specs)?;
+        rewritten.push(lift_aggs(&lifted, &keys, base_scope, mode, &mut agg_specs, &mut bare)?);
     }
     let rewritten_having = match &s.having {
         Some(h) => Some(lift_aggs(h, &keys, base_scope, mode, &mut agg_specs, &mut bare)?),
@@ -504,12 +519,43 @@ pub(super) fn plan_aggregate_select(
     // ordering by an aggregate that IS selected does not compute it twice.
     let mut rewritten_order = Vec::with_capacity(s.order_by.len());
     for (e, desc) in &s.order_by {
+        // Alias substitution first, against the ORIGINAL items: `ORDER BY r`
+        // where `r` names `rank() OVER (…) AS r` must become the window CALL,
+        // so lifting it dedups onto the projection's spec instead of adding a
+        // second identical window.
         let e = subst_output_alias(e, items, base_scope);
+        let e = super::window::lift_windows(&e, &mut win_specs)?;
         rewritten_order.push((
             lift_aggs(&e, &keys, base_scope, mode, &mut agg_specs, &mut bare)?,
             *desc,
         ));
     }
+
+    // A window's OWN subexpressions are lifted LAST, because they may name
+    // aggregates that nothing else does: `rank() OVER (ORDER BY count(*))`
+    // orders by a GROUPING aggregate — one value per group — not by a window
+    // one. Lifting them here gives that `count(*)` a grouped-tuple slot, and
+    // `bind_window_specs` then binds `__g{j}` against that tuple. Appending to
+    // `agg_specs` cannot disturb the slots already handed out.
+    let win_specs = {
+        let mut lifted = Vec::with_capacity(win_specs.len());
+        for mut spec in win_specs {
+            if let Some(a) = &spec.arg {
+                spec.arg = Some(lift_aggs(a, &keys, base_scope, mode, &mut agg_specs, &mut bare)?);
+            }
+            for e in &mut spec.extra_args {
+                *e = lift_aggs(e, &keys, base_scope, mode, &mut agg_specs, &mut bare)?;
+            }
+            for e in &mut spec.partition_by {
+                *e = lift_aggs(e, &keys, base_scope, mode, &mut agg_specs, &mut bare)?;
+            }
+            for (e, _) in &mut spec.order_by {
+                *e = lift_aggs(e, &keys, base_scope, mode, &mut agg_specs, &mut bare)?;
+            }
+            lifted.push(spec);
+        }
+        lifted
+    };
 
     // 3. Bind each aggregate ARGUMENT and FILTER over the BASE row. The FILTER
     //    is bound BEFORE the binder is rescoped to the grouped tuple (below), so
@@ -587,6 +633,22 @@ pub(super) fn plan_aggregate_select(
     let grouped =
         synthetic_grouped_table(&key_types, &key_collations, &agg_specs, &agg_types, &bare);
     let mut binder = binder.rescope(Scope::single(&grouped));
+    // Each window's own subexpressions bind against the GROUPED tuple — that is
+    // what makes `PARTITION BY dept` name a group key and `ORDER BY count(*)`
+    // an aggregate slot. Same function the plain window path uses, so the frame
+    // rules and refusals cannot fork.
+    let (windows, win_types) = super::window::bind_window_specs(&win_specs, &mut binder)?;
+    // …and the projection/HAVING/ORDER BY then bind against `[grouped ‖
+    // windows]`, where `__w{k}` finally has a slot.
+    let window_table = super::window::synthetic_window_table(&win_types);
+    let mut binder = if windows.is_empty() {
+        binder
+    } else {
+        binder.rescope(Scope::joined_named(vec![
+            ("$grouped".to_string(), &grouped),
+            ("$window".to_string(), &window_table),
+        ])?)
+    };
 
     let mut out_types: Vec<Option<ColumnType>> = Vec::with_capacity(rewritten.len());
     let mut projection: Vec<Projection> = Vec::with_capacity(rewritten.len());
@@ -798,7 +860,13 @@ pub(super) fn plan_aggregate_select(
                     bare_cols,
                     over_index,
                 }),
-                windows: Vec::new(),
+                // The DISTINCT branch is a SECOND construction of the same
+                // plan, and it dropped the windows on the floor: the projection
+                // is bound against `[grouped ‖ windows]` either way, so the
+                // executor then read a slot the tuple no longer had. Only
+                // `SELECT DISTINCT` over a grouped WINDOW hit it — a shape with
+                // no test until now.
+                windows,
             }),
             param_types,
             context_keys,
@@ -926,7 +994,7 @@ pub(super) fn plan_aggregate_select(
                 bare_cols,
                 over_index,
             }),
-            windows: Vec::new(),
+            windows,
         }),
         param_types,
         context_keys,
