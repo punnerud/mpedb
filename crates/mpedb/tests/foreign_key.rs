@@ -598,3 +598,73 @@ fn adding_a_column_to_an_implicit_rowid_table_keeps_the_key_aligned() {
         "INSERT INTO c (pid, note) VALUES (999, 'x')",
     ]);
 }
+
+// ---------------------------------------- FK retargeting on RENAME ----------
+
+/// Renaming the PARENT table retargets every child key that named it.
+///
+/// `ForeignKeyDef.parent` is a NAME resolved at check time, and the rename
+/// used to leave it alone. That was not a dangling pointer but something
+/// worse: enforcement kept working against whatever table NEXT took the old
+/// name, and `PRAGMA foreign_key_list` reported a parent that no longer
+/// existed — Django's `assertForeignKeyExists` reads exactly that pragma, and
+/// its schema editor renames tables as its NORMAL alter strategy. sqlite
+/// rewrites dependent references on RENAME.
+#[test]
+fn renaming_the_parent_table_retargets_child_keys() {
+    assert_both_refuse(&[
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p INTEGER REFERENCES p (id))",
+        "INSERT INTO p (id) VALUES (1)",
+        "ALTER TABLE p RENAME TO q",
+        // The key now guards against q — a child naming a missing parent row
+        // must still refuse, THROUGH the rename.
+        "INSERT INTO c (id, p) VALUES (1, 99)",
+    ]);
+    assert_same(
+        &[
+            "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, p INTEGER REFERENCES p (id))",
+            "INSERT INTO p (id) VALUES (1)",
+            "ALTER TABLE p RENAME TO q",
+            "INSERT INTO c (id, p) VALUES (1, 1)",
+        ],
+        "SELECT id, p FROM c ORDER BY id",
+    );
+    // A SELF-referential key follows its own table's rename.
+    assert_both_refuse(&[
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, up INTEGER REFERENCES n (id))",
+        "INSERT INTO n (id, up) VALUES (1, NULL)",
+        "ALTER TABLE n RENAME TO m",
+        "INSERT INTO m (id, up) VALUES (2, 77)",
+    ]);
+}
+
+/// Renaming a PARENT COLUMN retargets `parent_columns` in every child key.
+///
+/// Those are NAMES (the parent may not exist when the key is declared), and
+/// `renumber_columns` deliberately leaves them alone because no ordinal moves
+/// under a rename — but a rename is precisely the event that changes what the
+/// names MEAN. Without the walk, the child's key kept naming a column that
+/// was gone. Django's `test_rename_referenced_field` is this exact shape.
+#[test]
+fn renaming_a_parent_column_retargets_child_keys() {
+    // The child references a UNIQUE column by name; rename it in the parent.
+    assert_both_refuse(&[
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, tag INTEGER UNIQUE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, t INTEGER REFERENCES p (tag))",
+        "INSERT INTO p (id, tag) VALUES (1, 10)",
+        "ALTER TABLE p RENAME COLUMN tag TO label",
+        "INSERT INTO c (id, t) VALUES (1, 999)",
+    ]);
+    assert_same(
+        &[
+            "CREATE TABLE p (id INTEGER PRIMARY KEY, tag INTEGER UNIQUE)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, t INTEGER REFERENCES p (tag))",
+            "INSERT INTO p (id, tag) VALUES (1, 10)",
+            "ALTER TABLE p RENAME COLUMN tag TO label",
+            "INSERT INTO c (id, t) VALUES (1, 10)",
+        ],
+        "SELECT id, t FROM c ORDER BY id",
+    );
+}

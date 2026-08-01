@@ -1137,7 +1137,28 @@ impl Schema {
             .get_mut(id as usize)
             .filter(|t| t.id == id && !t.dead)
             .ok_or_else(|| Error::Schema(format!("no live table with id {id} to rename")))?;
-        slot.name = new_name.to_string();
+        let old_name = std::mem::replace(&mut slot.name, new_name.to_string());
+        // Every OTHER table's foreign keys that referenced the old name follow
+        // the rename, self-references included — `ForeignKeyDef.parent` is a
+        // NAME, resolved at check time, so leaving it was not a dangling
+        // pointer but something worse: enforcement kept working against
+        // whatever table NEXT took the old name, and `PRAGMA foreign_key_list`
+        // reported a parent that no longer existed. sqlite rewrites dependent
+        // references on RENAME (legacy_alter_table off, the default), and
+        // Django's schema editor renames tables as its normal ALTER strategy,
+        // so this is the ordinary path.
+        //
+        // A key that FORWARD-references a table not created yet is untouched
+        // unless it named the OLD name — and one that already named the NEW
+        // name now resolves to the renamed table, which is exactly sqlite's
+        // check-time name resolution too.
+        for t in tables.iter_mut().filter(|t| !t.dead) {
+            for fk in &mut t.foreign_keys {
+                if ident_eq(&fk.parent, &old_name) {
+                    fk.parent = new_name.to_string();
+                }
+            }
+        }
         let schema = Schema { tables };
         schema.validate()?;
         Ok(schema)
@@ -1351,6 +1372,28 @@ impl Schema {
                 Error::Schema(format!("no column `{column}` in table `{}`", slot.name))
             })?;
         col.name = new_name.to_string();
+        let owner = slot.name.clone();
+        // Foreign keys in EVERY table that reference the renamed column BY
+        // NAME follow it. `parent_columns` holds names (the parent may not
+        // even exist when the key is declared), and `renumber_columns`
+        // deliberately leaves them alone — they belong to the parent, and no
+        // ordinal moved. But a RENAME is precisely the event that changes what
+        // those names mean: without this walk the child's key kept naming a
+        // column that was gone, `foreign_key_list` reported it, and the next
+        // enforcement lookup failed on a schema that was perfectly healthy.
+        // Self-references are covered — the walk includes the owner itself.
+        for t in tables.iter_mut().filter(|t| !t.dead) {
+            for fk in &mut t.foreign_keys {
+                if !ident_eq(&fk.parent, &owner) {
+                    continue;
+                }
+                for pc in &mut fk.parent_columns {
+                    if ident_eq(pc, column) {
+                        *pc = new_name.to_string();
+                    }
+                }
+            }
+        }
         let schema = Schema { tables };
         schema.validate()?;
         Ok(schema)
