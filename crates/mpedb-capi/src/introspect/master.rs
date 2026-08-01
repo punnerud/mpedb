@@ -173,10 +173,8 @@ fn parse_seq_target(sql: &str) -> Option<(SeqVerb, usize)> {
         (SeqVerb::Update, n)
     } else if let Some(n) = take(s, "insert") {
         (SeqVerb::Insert, n)
-    } else if let Some(n) = take(s, "delete") {
-        (SeqVerb::Delete, n)
     } else {
-        return None;
+        (SeqVerb::Delete, take(s, "delete")?)
     };
     at += skip_ws(&s[at..]);
     // `UPDATE OR ROLLBACK …` / `INSERT OR REPLACE INTO …` — conflict clauses
