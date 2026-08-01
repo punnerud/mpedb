@@ -739,7 +739,7 @@ pub(crate) fn virtual_table_def_from_spec(
         indexes: Vec::new(),
         dead: false,
         implicit_rowid: true, autoincrement: false,
-        kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer },
+        kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer, module: spec.module },
         // An FTS shadow table is engine-owned; user DDL never attaches a key
         // to it.
         foreign_keys: Vec::new(),
@@ -917,6 +917,75 @@ pub(crate) fn rename_generated_srcs(
     Ok(out)
 }
 
+/// sqlite's five fts4 SHADOW tables (plan §7), as REAL Standard tables —
+/// created and dropped WITH the virtual table so the catalog lists exactly
+/// what sqlite would (`test_content/_docsize/_segdir/_segments/_stat`).
+/// Shapes mirror sqlite's own shadow DDL (measured, 3.45.1): typeless
+/// payload columns are `Any` (mpedb's typeless), `docid`/`blockid`/`id` are
+/// INTEGER-PK rowid aliases, `_segdir` has the composite PK(level, idx).
+/// Their CONTENT stays empty when the vtab holds data — mpedb indexes in
+/// its own inverted tree; a dump with data replays correctly through the
+/// vtab's own INSERT rows (a documented narrowing, never a wrong answer).
+pub(crate) fn fts4_shadow_defs(
+    vtab: &str,
+    content_cols: &[String],
+) -> Vec<mpedb_types::TableDef> {
+    let col = |name: &str, ty, nullable| mpedb_types::ColumnDef {
+        generated: None,
+        default_text: None,
+        decl: None,
+        name: name.to_string(),
+        ty,
+        nullable,
+        unique: false,
+        indexed: false,
+        default: None,
+        check: None,
+        collation: mpedb_types::Collation::Binary,
+        affinity: mpedb_types::Affinity::implied_by(ty),
+    };
+    use mpedb_types::ColumnType::{Any, Int64};
+    let table = |suffix: &str, columns: Vec<mpedb_types::ColumnDef>, pk: Vec<u16>| {
+        mpedb_types::TableDef {
+            id: 0,
+            name: format!("{vtab}{suffix}"),
+            columns,
+            primary_key: pk,
+            indexes: Vec::new(),
+            dead: false,
+            implicit_rowid: false,
+            autoincrement: false,
+            kind: mpedb_types::TableKind::Standard,
+            foreign_keys: Vec::new(),
+        }
+    };
+    vec![
+        table("_content", {
+            // `c0<name>, c1<name>, …` — sqlite's own content-column spelling.
+            let mut cs = vec![col("docid", Int64, false)];
+            for (i, c) in content_cols.iter().enumerate() {
+                cs.push(col(&format!("c{i}{c}"), Any, true));
+            }
+            cs
+        }, vec![0]),
+        table("_docsize", vec![col("docid", Int64, false), col("size", Any, true)], vec![0]),
+        table(
+            "_segdir",
+            vec![
+                col("level", Int64, false),
+                col("idx", Int64, false),
+                col("start_block", Int64, true),
+                col("leaves_end_block", Int64, true),
+                col("end_block", Int64, true),
+                col("root", Any, true),
+            ],
+            vec![0, 1],
+        ),
+        table("_segments", vec![col("blockid", Int64, false), col("block", Any, true)], vec![0]),
+        table("_stat", vec![col("id", Int64, false), col("value", Any, true)], vec![0]),
+    ]
+}
+
 /// Rewritten CHECK sources for a column rename — `rename_generated_srcs`'s
 /// twin, same contract: the rename arrives as DATA (ordinal, new source),
 /// verified by compiling BOTH spellings against before/after tables and
@@ -1037,10 +1106,22 @@ impl Database {
                 spec.name
             )));
         }
+        let shadows = matches!(spec.module, mpedb_types::FtsModule::Fts4)
+            .then(|| fts4_shadow_defs(&spec.name, &spec.columns));
         let def = virtual_table_def_from_spec(spec)?;
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        match w.create_table(def) {
-            Ok(_tid) => w.commit()?,
+        // One txn for the vtab AND (fts4) its five shadows: a name collision
+        // on ANY of them aborts the whole create — sqlite refuses the same
+        // way, and half a shadow set is not a state the dump may ever see.
+        let res = (|| {
+            w.create_table(def)?;
+            for sh in shadows.into_iter().flatten() {
+                w.create_table(sh)?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => w.commit()?,
             Err(e) => {
                 w.abort();
                 return Err(e);
@@ -1091,10 +1172,35 @@ impl Database {
                 }
             }
         }
+        // An fts4 vtab owns its five shadow tables: DROP takes all six in ONE
+        // commit (gated on the MODULE tag — never guessed from names for
+        // Standard/fts5 tables). Resolved before the write txn opens.
+        let shadow_ids: Vec<u32> = {
+            let bundle = self.engine.schema();
+            let sc = &bundle.schema;
+            match sc.tables.iter().find(|t| t.id == id && !t.dead).map(|t| t.kind) {
+                Some(mpedb_types::TableKind::Fts {
+                    module: mpedb_types::FtsModule::Fts4,
+                    ..
+                }) => ["_content", "_docsize", "_segdir", "_segments", "_stat"]
+                    .iter()
+                    .filter_map(|sfx| sc.table_id(&format!("{name}{sfx}")))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         // Cascade: a dropped table's triggers are dead — remove their records in
         // the same commit (DESIGN-TRIGGERS §3.1).
-        let res = crate::trigger::cascade_drop_triggers(&mut w, id).and_then(|()| w.drop_table(id));
+        let res = (|| {
+            crate::trigger::cascade_drop_triggers(&mut w, id)?;
+            w.drop_table(id)?;
+            for sid in shadow_ids {
+                crate::trigger::cascade_drop_triggers(&mut w, sid)?;
+                w.drop_table(sid)?;
+            }
+            Ok(())
+        })();
         match res {
             Ok(()) => w.commit()?,
             Err(e) => {

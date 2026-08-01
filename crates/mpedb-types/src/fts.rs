@@ -13,6 +13,28 @@ use crate::error::{Error, Result};
 /// The tokenizer frozen into an FTS table's schema bytes (design/DESIGN-FTS.md
 /// §2). The choice is content-hashed with the plan, so a query can never
 /// tokenize differently than the index was built with.
+/// Which fts MODULE a virtual table was declared with (plan §7). The
+/// runtime machinery is ONE implementation (mpedb's own inverted index);
+/// the module decides the CATALOG shape: an `fts4` table carries sqlite's
+/// five shadow tables (created and dropped with it) so a dump reads back
+/// exactly what sqlite would list, an `fts5` table stands alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FtsModule {
+    Fts5 = 0,
+    Fts4 = 1,
+}
+
+impl FtsModule {
+    pub fn from_tag(t: u8) -> Option<FtsModule> {
+        match t {
+            0 => Some(FtsModule::Fts5),
+            1 => Some(FtsModule::Fts4),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Tokenizer {

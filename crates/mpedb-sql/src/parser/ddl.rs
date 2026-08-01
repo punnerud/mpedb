@@ -856,12 +856,20 @@ impl<'a> Parser<'a> {
         let name = self.ident("virtual table name")?;
         self.expect_word("USING")?;
         let module = self.ident("virtual-table module")?;
-        if !module.eq_ignore_ascii_case("fts5") {
+        let module = if module.eq_ignore_ascii_case("fts5") {
+            mpedb_types::FtsModule::Fts5
+        } else if module.eq_ignore_ascii_case("fts4") {
+            // Same engine underneath (mpedb's inverted index); the module tag
+            // makes the facade lay down sqlite's five shadow tables so the
+            // CATALOG reads back as sqlite's would (plan §7).
+            mpedb_types::FtsModule::Fts4
+        } else {
             return Err(self.err_here(format!(
-                "only `fts5` virtual tables are supported (got `{module}`); fts3/fts4/rtree \
-                 and custom modules are a deliberate non-goal (mpedb has no extension ABI)"
+                "only `fts5` and `fts4` virtual tables are supported (got `{module}`); \
+                 fts3/rtree and custom modules are a deliberate non-goal (mpedb has no \
+                 extension ABI)"
             )));
-        }
+        };
         self.expect(&Tok::LParen, "(")?;
         let mut columns: Vec<String> = Vec::new();
         let mut tokenizer = mpedb_types::Tokenizer::Unicode61;
@@ -930,6 +938,7 @@ impl<'a> Parser<'a> {
             name,
             columns,
             tokenizer,
+            module,
             if_not_exists,
         }))
     }

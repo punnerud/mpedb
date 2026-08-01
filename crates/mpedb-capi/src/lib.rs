@@ -1189,6 +1189,17 @@ fn record_object_ddl(
             Some(r) => r.replacen("temp.", "", 1),
             None => verbatim,
         };
+        // A virtual table stores the WHOLE statement (sqlite keeps
+        // `CREATE VIRTUAL TABLE t USING …` verbatim); `ddl_verbatim` rebuilt
+        // the ordinary-table head, so put the real one back.
+        let verbatim = if target.virtual_table {
+            match verbatim.strip_prefix("CREATE TABLE ") {
+                Some(tail) => format!("CREATE VIRTUAL TABLE {tail}"),
+                None => verbatim,
+            }
+        } else {
+            verbatim
+        };
         match kind {
             introspect::DdlKind::Table => {
                 // Re-resolve against the schema the statement just produced —
@@ -1243,6 +1254,38 @@ fn record_object_ddl(
             if !already {
                 put_record(c, member.as_deref(), ns, &key, &rec);
             }
+            // fts4 (plan §7): the five shadow tables were created in the same
+            // statement — file each one's record with sqlite's EXACT
+            // single-quoted, typeless DDL as the verbatim half. Both halves
+            // are ours, so the fingerprint mechanism carries them unchanged.
+            if target.virtual_table {
+                let schema = match member.as_deref() {
+                    Some(m) => c.db.attached_schema_or_empty(m),
+                    None => match c.txn.as_ref() {
+                        Some(s) => s.schema(),
+                        None => c.db.schema(),
+                    },
+                };
+                let is_fts4 = introspect::table_by_exact_name(&schema, &exact).is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        mpedb::TableKind::Fts { module: mpedb::FtsModule::Fts4, .. }
+                    )
+                });
+                if is_fts4 {
+                    let content: Vec<String> = introspect::table_by_exact_name(&schema, &exact)
+                        .map(|t| t.visible_columns().iter().map(|c| c.name.clone()).collect())
+                        .unwrap_or_default();
+                    for (sname, ssql) in introspect::fts4_shadow_sql(&exact, &content) {
+                        let Some(st) = introspect::table_by_exact_name(&schema, &sname) else {
+                            continue;
+                        };
+                        let srec = introspect::ddl_record(st, &idx, &ssql);
+                        let (sns, skey) = introspect::ddl_key(&sname);
+                        put_record(c, member.as_deref(), sns, &skey, &srec);
+                    }
+                }
+            }
         }
         // DROP: forget the text. The facade has no delete outside a session, so
         // autocommit writes an EMPTY record instead — a tombstone, since
@@ -1260,6 +1303,29 @@ fn record_object_ddl(
             // failure the fingerprint exists to prevent.
             if kind == introspect::DdlKind::Table {
                 forget_table_index_records(c, member.as_deref(), &exact);
+                // A dropped fts4 vtab took its five shadows with it (same
+                // txn). Their records tombstone here too — but ONLY when the
+                // table is genuinely gone: a real user table that merely
+                // shares the suffix keeps its record.
+                let schema = match member.as_deref() {
+                    Some(m) => c.db.attached_schema_or_empty(m),
+                    None => match c.txn.as_ref() {
+                        Some(s) => s.schema(),
+                        None => c.db.schema(),
+                    },
+                };
+                for sfx in ["_content", "_docsize", "_segdir", "_segments", "_stat"] {
+                    let sname = format!("{exact}{sfx}");
+                    if introspect::table_by_exact_name(&schema, &sname).is_none() {
+                        let has_rec = sqlite_master_records_of(c, member.as_deref())
+                            .get(&sname)
+                            .is_some_and(|v| !v.is_empty());
+                        if has_rec {
+                            let (sns, skey) = introspect::ddl_key(&sname);
+                            put_record(c, member.as_deref(), sns, &skey, &[]);
+                        }
+                    }
+                }
             }
         }
     }

@@ -440,3 +440,47 @@ fn streaming_insert_into_fts_is_refused() {
     let e = r.expect_err("streaming insert into an FTS table must be refused");
     assert!(format!("{e}").contains("FTS"), "expected an FTS refusal, got {e}");
 }
+
+/// fts4 (plan §7): the module tag lays down sqlite's five SHADOW tables with
+/// the vtab — one txn each way — so the catalog lists exactly what sqlite
+/// would. The vtab itself shares the fts5 machinery (readable, insertable,
+/// hidden rowid); the shadows are ordinary empty tables.
+#[test]
+fn fts4_carries_its_shadow_tables_through_create_and_drop() {
+    let path = fresh_path();
+    let _ = std::fs::remove_file(&path);
+    let db = open(&path);
+    db.query("CREATE VIRTUAL TABLE test USING fts4(example)", &[]).unwrap();
+    let names = |db: &Database| -> Vec<String> {
+        let mut v: Vec<String> =
+            db.schema().tables.iter().filter(|t| !t.dead).map(|t| t.name.clone()).collect();
+        v.sort();
+        v
+    };
+    let got = names(&db);
+    for want in
+        ["test", "test_content", "test_docsize", "test_segdir", "test_segments", "test_stat"]
+    {
+        assert!(got.iter().any(|n| n == want), "{want} missing from {got:?}");
+    }
+    // The vtab reads and writes through the fts5 machinery.
+    db.query("INSERT INTO test VALUES ('hello world')", &[]).unwrap();
+    match db.query("SELECT example FROM test", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("{other:?}"),
+    }
+    // A shadow-name collision refuses the WHOLE create (stock refuses too).
+    db.query("CREATE TABLE clash_content (x INTEGER PRIMARY KEY)", &[]).unwrap();
+    assert!(db.query("CREATE VIRTUAL TABLE clash USING fts4(a)", &[]).is_err());
+    assert!(!names(&db).iter().any(|n| n == "clash"), "half a create must not survive");
+    // DROP cascades all six — and ONLY for the fts4 module.
+    db.query("DROP TABLE test", &[]).unwrap();
+    let after = names(&db);
+    for gone in
+        ["test", "test_content", "test_docsize", "test_segdir", "test_segments", "test_stat"]
+    {
+        assert!(!after.iter().any(|n| n == gone), "{gone} survived the drop: {after:?}");
+    }
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}

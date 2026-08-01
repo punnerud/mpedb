@@ -154,7 +154,7 @@ impl AggTarget {
 }
 
 pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash, TableSet};
-pub use fts::{Doclist, Tokenizer};
+pub use fts::{Doclist, FtsModule, Tokenizer};
 pub use policy::{PolicyCmd, PolicyDef};
 pub use schema::{
     store_into, ColumnDef, DefaultExpr, DefaultProgram, FkAction, ForeignKeyDef, GeneratedCol, GeneratedKind,

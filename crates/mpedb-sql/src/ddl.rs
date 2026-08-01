@@ -143,6 +143,10 @@ pub struct CreateVirtualTableSpec {
     pub name: String,
     pub columns: Vec<String>,
     pub tokenizer: mpedb_types::Tokenizer,
+    /// `fts5` or `fts4` (plan §7). One runtime (mpedb's inverted index);
+    /// the module decides the CATALOG shape — fts4 carries sqlite's five
+    /// shadow tables so a dump lists exactly what sqlite would.
+    pub module: mpedb_types::FtsModule,
     pub if_not_exists: bool,
 }
 

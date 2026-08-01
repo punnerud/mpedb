@@ -382,7 +382,7 @@ pub enum TableKind {
     /// An ordinary user table.
     Standard,
     /// An FTS5 content + inverted-index table, with its frozen tokenizer.
-    Fts { tokenizer: crate::fts::Tokenizer },
+    Fts { tokenizer: crate::fts::Tokenizer, module: crate::fts::FtsModule },
 }
 
 impl TableKind {
@@ -391,7 +391,7 @@ impl TableKind {
     }
     pub fn fts_tokenizer(self) -> Option<crate::fts::Tokenizer> {
         match self {
-            TableKind::Fts { tokenizer } => Some(tokenizer),
+            TableKind::Fts { tokenizer, .. } => Some(tokenizer),
             TableKind::Standard => None,
         }
     }

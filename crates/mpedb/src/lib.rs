@@ -119,9 +119,9 @@ pub use mpedb_types::model::WorkloadModel;
 pub use mpedb_types::toml_escape;
 pub use mpedb_types::{
     BudgetKind, Collation, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, FkAction,
-    Footprint, ForeignKeyDef,
+    Footprint, ForeignKeyDef, FtsModule,
     HostAggState, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema,
-    TableDef, TableSet, Value, INDEX_EXPR_COL, MAX_DB_SIZE_MB,
+    TableDef, TableKind, TableSet, Value, INDEX_EXPR_COL, MAX_DB_SIZE_MB,
 };
 
 use exec::{exec_stmt, ChargeMode, ReadCtx};
@@ -4172,8 +4172,15 @@ impl WriteSession<'_> {
                         spec.name
                     )));
                 }
+                let shadows = matches!(spec.module, mpedb_types::FtsModule::Fts4)
+                    .then(|| crate::ddl_apply::fts4_shadow_defs(&spec.name, &spec.columns));
                 let def = crate::ddl_apply::virtual_table_def_from_spec(spec)?;
                 self.txn.create_table(def)?;
+                // fts4: the five shadows ride the SAME txn (plan §7) — a name
+                // collision on any of them fails the whole statement, as stock.
+                for sh in shadows.into_iter().flatten() {
+                    self.txn.create_table(sh)?;
+                }
             }
             DdlStmt::DropTable { name, if_exists } => {
                 let id = match schema.schema.table_id(&name) {
@@ -4185,10 +4192,32 @@ impl WriteSession<'_> {
                         return Err(Error::Bind(format!("DROP TABLE: no such table `{name}`")));
                     }
                 };
+                // An fts4 vtab owns its five shadows — all six drop in this
+                // txn (gated on the MODULE tag, never guessed from names).
+                let shadow_ids: Vec<u32> = match schema
+                    .schema
+                    .tables
+                    .iter()
+                    .find(|t| t.id == id && !t.dead)
+                    .map(|t| t.kind)
+                {
+                    Some(mpedb_types::TableKind::Fts {
+                        module: mpedb_types::FtsModule::Fts4,
+                        ..
+                    }) => ["_content", "_docsize", "_segdir", "_segments", "_stat"]
+                        .iter()
+                        .filter_map(|sfx| schema.schema.table_id(&format!("{name}{sfx}")))
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 // Cascade: a dropped table's triggers are dead — remove their
                 // records in the same commit (DESIGN-TRIGGERS §3.1).
                 crate::trigger::cascade_drop_triggers(&mut self.txn, id)?;
                 self.txn.drop_table(id)?;
+                for sid in shadow_ids {
+                    crate::trigger::cascade_drop_triggers(&mut self.txn, sid)?;
+                    self.txn.drop_table(sid)?;
+                }
             }
             DdlStmt::AlterRenameTable { table, new_name } => {
                 let id = resolve(&table)?;

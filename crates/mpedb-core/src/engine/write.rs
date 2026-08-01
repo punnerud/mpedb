@@ -1861,6 +1861,12 @@ impl<'e> WriteTxn<'e> {
             self.catalog_root = out.new_root;
         }
         self.schema_gen_bump = true;
+        // Refresh the txn's CAPTURED bundle from the pages just written: a
+        // SECOND create in the same txn (an fts4 vtab lays down its five
+        // shadow tables in one statement — plan §7) must derive the NEXT id,
+        // not re-derive this one from the stale capture — the InsertOnly
+        // seed above turned that mistake into a loud Corrupt.
+        self.reload_bundle_from_catalog()?;
         Ok(tid)
     }
 
@@ -1971,6 +1977,12 @@ impl<'e> WriteTxn<'e> {
         self.clear_columnar_watermark(table_id)?;
 
         self.schema_gen_bump = true;
+        // Same refresh as `create_table`, and MORE load-bearing here: the fts4
+        // cascade drops six tables in one txn, each drop publishing the WHOLE
+        // canonical schema derived from the captured bundle — without the
+        // refresh, drop N+1 would re-publish tables drop N just tombstoned,
+        // silently resurrecting them.
+        self.reload_bundle_from_catalog()?;
         Ok(())
     }
 

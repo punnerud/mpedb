@@ -132,6 +132,43 @@ fn create_ddl(t: &mpedb::TableDef, idx: &IndexRecords) -> String {
     format!("CREATE TABLE {} ({})", q(&t.name), cols.join(", "))
 }
 
+/// sqlite's EXACT shadow-table DDL for an fts4 virtual table (measured on
+/// 3.45.1, byte for byte — single-quoted names, typeless content columns,
+/// `PRIMARY KEY(level, idx)` spacing included). These are the `sql` texts
+/// iterdump re-emits, stored as the VERBATIM half of each shadow's record.
+pub(crate) fn fts4_shadow_sql(vtab: &str, content_cols: &[String]) -> Vec<(String, String)> {
+    let cols: String = content_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!(", 'c{i}{c}'"))
+        .collect();
+    vec![
+        (
+            format!("{vtab}_content"),
+            format!("CREATE TABLE '{vtab}_content'(docid INTEGER PRIMARY KEY{cols})"),
+        ),
+        (
+            format!("{vtab}_docsize"),
+            format!("CREATE TABLE '{vtab}_docsize'(docid INTEGER PRIMARY KEY, size BLOB)"),
+        ),
+        (
+            format!("{vtab}_segdir"),
+            format!(
+                "CREATE TABLE '{vtab}_segdir'(level INTEGER,idx INTEGER,start_block INTEGER,\
+leaves_end_block INTEGER,end_block INTEGER,root BLOB,PRIMARY KEY(level, idx))"
+            ),
+        ),
+        (
+            format!("{vtab}_segments"),
+            format!("CREATE TABLE '{vtab}_segments'(blockid INTEGER PRIMARY KEY, block BLOB)"),
+        ),
+        (
+            format!("{vtab}_stat"),
+            format!("CREATE TABLE '{vtab}_stat'(id INTEGER PRIMARY KEY, value BLOB)"),
+        ),
+    ]
+}
+
 // ------------------------------------------- verbatim CREATE TABLE text (#118)
 
 /// System-record namespace holding the shim's verbatim `CREATE …` text,
@@ -287,6 +324,10 @@ pub(crate) struct DdlTarget {
     /// `CREATE INDEX … ON <table>`: the table the index is built over. `None`
     /// for every other kind (and for `DROP INDEX`, which does not name one).
     pub on_table: Option<String>,
+    /// `CREATE VIRTUAL TABLE …` (plan §7): the stored `sql` is the WHOLE
+    /// statement (sqlite keeps `CREATE VIRTUAL TABLE t USING …` verbatim),
+    /// and — for fts4 — five shadow-table records ride along.
+    pub virtual_table: bool,
 }
 
 /// The text sqlite would store in `sqlite_master.sql` for a CREATE.
@@ -413,9 +454,14 @@ pub(crate) fn schema_ddl_target(sql: &str) -> Option<DdlTarget> {
     if create && (kw == "temp" || kw == "temporary") {
         kw = w.word()?.0.to_ascii_lowercase();
     }
-    // `CREATE VIRTUAL TABLE` is not an ordinary table (and has no reconstruction).
+    // `CREATE VIRTUAL TABLE`: a real target since plan §7 — the record is
+    // the whole statement, and the sqlite_master row is what iterdump's
+    // vtab branch replays. `kw` advances onto `table`, the shared tail
+    // then reads the name.
+    let mut virtual_table = false;
     if create && kw == "virtual" {
-        return None;
+        virtual_table = true;
+        kw = w.word()?.0.to_ascii_lowercase();
     }
     let mut unique = false;
     if create && kw == "unique" {
@@ -466,7 +512,7 @@ pub(crate) fn schema_ddl_target(sql: &str) -> Option<DdlTarget> {
     } else {
         None
     };
-    Some(DdlTarget { kind, create, name, schema, name_at: at, on_table })
+    Some(DdlTarget { kind, create, name, schema, name_at: at, on_table, virtual_table })
 }
 
 /// A view/trigger verbatim record: no shape fingerprint (there is no

@@ -8,17 +8,19 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(17u8); // schema encoding version (v17: AUTOINCREMENT)
+        buf.push(18u8); // schema encoding version (v18: fts MODULE tag)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
             buf.push(t.dead as u8); // tombstone marker; a dead slot's rest is empty
-            // Table-kind discriminant (v4): 0 = Standard, 1 = FTS ‖ tokenizer.
+            // Table-kind discriminant (v4): 0 = Standard, 1 = FTS ‖ tokenizer
+            // ‖ module (v18 — Fts4 carries sqlite's shadow-table catalog).
             match t.kind {
                 TableKind::Standard => buf.push(0),
-                TableKind::Fts { tokenizer } => {
+                TableKind::Fts { tokenizer, module } => {
                     buf.push(1);
                     buf.push(tokenizer as u8);
+                    buf.push(module as u8);
                 }
             }
             // Hidden implicit-rowid flag (v5, #94). Always 0 for a dead slot or
@@ -190,7 +192,7 @@ impl Schema {
         // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name;
         // v12 = TableDef.foreign_keys; v13 = IndexDef.exprs.
         // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if !(9..=17).contains(&version) {
+        if !(9..=18).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
@@ -201,6 +203,7 @@ impl Schema {
         let has_foreign_keys = version >= 12;
         let has_index_exprs = version >= 13;
         let has_index_collations = version >= 14;
+        let has_fts_module = version >= 18;
         let ntables = read_u32(buf, &mut pos)? as usize;
         if ntables > MAX_TABLES {
             return Err(Error::Corrupt("table count out of range".into()));
@@ -227,7 +230,15 @@ impl Schema {
                     let tok = crate::fts::Tokenizer::from_tag(*buf.get(pos).ok_or_else(err)?)
                         .ok_or_else(|| Error::Corrupt("bad fts tokenizer tag".into()))?;
                     pos += 1;
-                    TableKind::Fts { tokenizer: tok }
+                    let module = if has_fts_module {
+                        let m = crate::fts::FtsModule::from_tag(*buf.get(pos).ok_or_else(err)?)
+                            .ok_or_else(|| Error::Corrupt("bad fts module tag".into()))?;
+                        pos += 1;
+                        m
+                    } else {
+                        crate::fts::FtsModule::Fts5
+                    };
+                    TableKind::Fts { tokenizer: tok, module }
                 }
                 _ => return Err(Error::Corrupt("bad table kind tag".into())),
             };
