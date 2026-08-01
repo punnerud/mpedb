@@ -979,7 +979,7 @@ Released under the [mpedb License 1.0](LICENSE) — source-available, and
 exception: a corporate group whose consolidated revenue **or** valuation
 exceeds **USD 5 billion** (2026 dollars, whichever is higher; ownership
 chains count in both directions, non-profits included) owes a **one-time
-NOK 0.07 per physical device** (2026 kroner) running the software — for
+USD 0.07 per physical device** (2026 dollars) running the software — for
 server deployments, per physical device connected, whichever count is
 higher. Crossing the threshold once keeps the obligation for the five
 following years. Ambiguities resolve in favor of the project. The license
