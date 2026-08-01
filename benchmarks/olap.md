@@ -9,7 +9,7 @@ other general-purpose SQL engines — SQLite, PostgreSQL, MySQL — mpedb wins t
 precomputed and point-shaped work outright, often by one to two orders of
 magnitude.
 
-Harness: [`crates/mpedb-olapbench`](crates/mpedb-olapbench). Every engine runs
+Harness: [`crates/mpedb-olapbench`](../crates/mpedb-olapbench). Every engine runs
 **the same SQL text**, and the harness compares canonically rendered results
 across all engines before it believes any timing. Every row below is marked
 `agree: yes`; a disagreement strikes the row out. A fast wrong answer is a bug

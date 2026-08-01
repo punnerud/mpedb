@@ -5,6 +5,60 @@
 [![Windows](https://github.com/punnerud/mpedb/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/windows.yml)
 [![Pages](https://github.com/punnerud/mpedb/actions/workflows/pages.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/pages.yml)
 
+**An embedded, multi-process, shared-memory database in Rust — a measured
+drop-in for sqlite3, with PostgreSQL-grade concurrency on top.**
+
+> ### Four suites, four 100 % scores — measured, not claimed
+>
+> Every number below is **differential**: the same statements run against real
+> sqlite, and the ecosystem suites run twice — stock sqlite vs mpedb — so a
+> pass means *identical behaviour*, not "no crash". As of 2026-08-01:
+>
+> | suite | scale | result |
+> |---|---|---|
+> | sqlite's own **sqllogictest corpus**, record by record against sqlite | 7,420,638 records | **100 % — 0 wrong answers, 0 error mismatches**, on x86-64 AND arm64 |
+> | **Django 5.2** — the ENTIRE suite, every label, mpedb as the database | 18,214 tests per arm | **0 shim-only failures** — the 13 failing IDs are identical under stock sqlite |
+> | **SQLAlchemy 2.0** — the dialect suite | 1,544 collected | **1277 passed / 0 failed** — exact stock parity, skips included |
+> | **CPython's `test_sqlite3`** — the authoritative DB-API test | 466 tests | **466/466** through the C-API shim |
+>
+> What mpedb does not support is a **named refusal** — a clean error message,
+> never a silent wrong answer. The full ledgers: [COMPAT.md](COMPAT.md) (the
+> SQL surface, feature by feature), [C-API-COMPAT.md](C-API-COMPAT.md) (the
+> libsqlite3 shim), [benchmarks/README.md](benchmarks/README.md) (every
+> measured comparison), [INNOVATIONS.md](INNOVATIONS.md) (what is new here —
+> and what was measured and rejected), and [design/](design/) (the
+> load-bearing contracts).
+
+**The drop-in is ABI-level, not a porting guide.** `crates/mpedb-capi` builds
+`libmpedb_sqlite3.so`, a cdylib exporting sqlite3's C-API: `LD_PRELOAD` it (or
+link it as libsqlite3) and a libsqlite3 consumer — **CPython's own `sqlite3`
+module, unchanged** — runs against mpedb. That binary is what the CPython,
+Django and SQLAlchemy scores above go through. In Python, `import mpedb as
+sqlite3` (the native PyO3 wheel) is the one-line alternative, and
+`mpedb data.db` opens an existing sqlite file directly.
+
+**And compatibility is the floor, not the product.** MPEdb keeps sqlite's
+operational model — no server; processes `mmap` a shared file and attach
+directly, and any process may be `SIGKILL`ed at any instant without corrupting
+the database — and adds what sqlite lacks:
+
+- **PostgreSQL-grade concurrency** — MVCC snapshots over a copy-on-write
+  B+tree, and lock-free readers that never block (and are never blocked by)
+  the writer. Writes take a single writer lock, as in sqlite — but readers
+  keep reading at full speed while they happen, group commit batches durable
+  writes, and any attached process may write, with no server and no
+  busy-polling `SQLITE_BUSY` storms.
+- **Rigid schema & integrity validation** — typed columns, NOT NULL / UNIQUE /
+  CHECK, and a file-authoritative schema that hard-errors on config drift.
+  (With one deliberate, per-column escape hatch: `type = "any"` accepts any
+  scalar in that column — sqlite-style flexibility where you ask for it,
+  rigidity everywhere else. An `any` column cannot be a key.)
+- **Content-hashed compiled plans** — SQL compiles once; the hot path is
+  `execute(hash, params)` with zero parsing, and plans carry precomputed
+  read/write footprints.
+- **Measured performance** — every comparison has a control arm and lives in
+  [`benchmarks/`](benchmarks/README.md), sqlite and PostgreSQL included.
+
 > **[Run mpedb in your browser →](https://punnerud.github.io/mpedb/)** — the
 > **real engine** compiled to `wasm32`, not a simulation: write SQL against a
 > live in-memory database and see the plan, its content hash, the precomputed
@@ -12,8 +66,6 @@
 > refusals sqlite would have coerced. The page is explicit about the one thing
 > it cannot show you: multi-process writers (see
 > [DESIGN-WASM-MULTIWRITER.md](design/DESIGN-WASM-MULTIWRITER.md)).
-
-**An embedded, multi-process, shared-memory database in Rust.**
 
 ## Install
 
@@ -33,6 +85,19 @@ import mpedb as sqlite3   # existing sqlite3 code runs unchanged
 `connect("app.db")` reads your existing sqlite file and keeps it in sync;
 `connect("app.mpedb")` is the native engine. Details:
 [crates/mpedb-py](crates/mpedb-py/README.md).
+
+**Any libsqlite3 consumer** — build the ABI-level shim and preload it; the
+program's own sqlite3 calls land in mpedb:
+
+```sh
+cargo build --release --manifest-path crates/mpedb-capi/Cargo.toml
+LD_PRELOAD=$PWD/crates/mpedb-capi/target/release/libmpedb_sqlite3.so \
+    python3 app.py    # CPython's own sqlite3 module, unchanged
+```
+
+This is the binary CPython's `test_sqlite3` (466/466) and the Django and
+SQLAlchemy suites run through. Per-function status, macOS interposition, and
+the refusal list: [C-API-COMPAT.md](C-API-COMPAT.md).
 
 **CLI** — the `mpedb` binary (REPL, dump, stress/crash harnesses, benchmarks,
 sqlite mirror/checkpoint). On macOS and Linux, from the tap:
@@ -55,19 +120,6 @@ tests. macOS and Windows run nightly, Linux on every change.
 > each engine can even be asked to do, and speed on operations an application
 > actually runs. Both directions plotted: 4000× ahead on indexed `min`/`max`,
 > 0.40× on a single-row INSERT.
-
-MPEdb combines three things that normally don't come together:
-
-- **sqlite's operational model** — no server; processes `mmap` a shared file and
-  attach directly, and any process may be `SIGKILL`ed at any instant without
-  corrupting the database.
-- **PostgreSQL-grade concurrency** — MVCC snapshots over a copy-on-write B+tree,
-  lock-free readers that never block writers, and group-commit for durable writes.
-- **Rigid schema & integrity validation** that sqlite lacks — typed columns,
-  NOT NULL / UNIQUE / CHECK, and a file-authoritative schema that hard-errors on
-  config drift. (With one deliberate, per-column escape hatch: `type = "any"`
-  accepts any scalar in that column — sqlite-style flexibility where you ask
-  for it, rigidity everywhere else. An `any` column cannot be a key.)
 
 **It opens an existing sqlite `.db` file directly** — just `mpedb data.db`, no
 flags, no import. Writes land in a `<db>.overlay.mpedb` **write-ahead delta**
@@ -103,7 +155,7 @@ did not move:
 
 The equivalence is checked rather than argued: under `MPEDB_VERIFY_PLAN_MEMO=1`
 (and in every debug build) each hit is recompiled and the hashes compared, which
-turns every test, all 5.9M sqllogictest records and every Django statement into
+turns every test, all 7.4M sqllogictest records and every Django statement into
 an invalidation test. It found two invalidation bugs on its first run, neither
 of which was on the list that motivated it.
 
@@ -169,15 +221,13 @@ aggregate, registered through the libsqlite3 C-API shim — CPython's own
 `sqlite3` module loads it via `LD_PRELOAD`), secondary/composite indexes
 (including partial `CREATE INDEX … WHERE`, stored P1), and live multi-process
 DDL — verified against sqlite's own 7.4M-record test corpus with **zero wrong
-answers**. As of 2026-08-01: **Django's ENTIRE suite — every label, 18,214
-tests per arm — has zero shim-only failures** (the 13 failing test IDs are
-identical under stock sqlite), **SQLAlchemy's dialect suite is 1277/1277**
-(exact stock parity), and CPython's `test_sqlite3` is **466/466** — every
-suite that measures this surface passes completely
-([`C-API-COMPAT.md`](C-API-COMPAT.md)). What is still missing is short — attached-database *writes*
-(`ATTACH` + cross-file SELECT work), loadable extensions (non-goal), and a few
-honesty refusals (AUTOINCREMENT, fts4 layout, serialize-as-sqlite-image) — each
-a clean error, never a wrong answer. And on one axis mpedb goes *past* sqlite:
+answers**, and every ecosystem suite that measures this surface — Django,
+SQLAlchemy, CPython's `test_sqlite3` — passes completely through the C-API
+shim: the four-suite scoreboard at the top of this page is the measured
+answer, and [`C-API-COMPAT.md`](C-API-COMPAT.md) is the per-function ledger
+behind it. What is still missing is short — attached-database *writes*
+(`ATTACH` + cross-file SELECT work) and loadable extensions (non-goal) — each
+a named refusal: a clean error, never a wrong answer. And on one axis mpedb goes *past* sqlite:
 its own `.mpedb` WAL gives PostgreSQL-style **concurrent multi-process writes**
 (MVCC snapshots, lock-free readers) where sqlite serializes every writer. See
 [SQL support](#sql-support) for the exact surface, measured against the binary.
@@ -381,10 +431,12 @@ is locked".
 | `mpedb-types` | Shared, dependency-light: values/types, schema + canonical bytes + blake3 hash, config, memcmp key encoding, expression IR (SQL 3VL), plan footprints, RLS policy defs. |
 | `mpedb-core` | The engine: page store, COW B+tree, row codec, shared-memory layer (mmap, meta double-buffer, reader table, WAL), read/write transactions, catalog. |
 | `mpedb-sql` | Tokenizer → parser → binder (rigid typing, param unification, const folding) → planner (access-path selection + footprints) → content-hashed compiled plans. |
+| `mpedb-sqlitefmt` | Native reader for the sqlite file format (no sqlite library in the path), differentially verified against sqlite — what `mpedb data.db`, the overlay and `dump` read through. |
 | `mpedb` | Facade: `Database`/`Workspace`, prepare/execute/query, write sessions, session context, RLS policy storage + injection, shared plan registry. |
 | `mpedb-sdk` | Caching client session. |
 | `mpedb-proc` | PySpell-style Python/Rust → budgeted IR stored procedures, streaming cursors. |
 | `mpedb-py` | PyO3 module (`abi3-py312`), GIL released around engine calls. |
+| `mpedb-capi` | The libsqlite3 ABI shim: a cdylib exporting sqlite3's C-API (`libmpedb_sqlite3.so`), `LD_PRELOAD`ed or linked by any libsqlite3 consumer — CPython's `sqlite3`, language bindings, tools. Its own workspace; status in [C-API-COMPAT.md](C-API-COMPAT.md). |
 | `mpedb-mirror` | Bidirectional sqlite3/PostgreSQL ⇄ mpedb mirroring: import, incremental diff-pull under load, write-back, epoch-fenced authority switch. Round-trip differential export/diff is sqlite-only; the CLI drives sqlite only (PostgreSQL is library-level today). |
 | `mpedb-cli` | The `mpedb` binary: repl / exec / prepare / call / dump / stress / crash / powerloss / bench / proc / mirror. |
 | `mpedb-testkit` | sqllogictest harness + 3-way differential testing vs sqlite3 and PostgreSQL. |

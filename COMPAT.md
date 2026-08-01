@@ -15,21 +15,16 @@ Two things make this page different from a typical compatibility list:
 
 1. **Every ✅ is measured, not remembered.** The `sqlite_corpus` runner
    (`crates/mpedb-testkit`) executes sqlite's own sqllogictest corpus
-   differentially against the bundled sqlite. Measured 2026-07-20 at commit
-   `b41b713` over the **full 7.4M-record corpus (621 of 622 files; 5,938,278
-   records attempted after the mysql/mssql-only ones are skipped): 5,936,882
-   pass = 99.9765%, with zero error mismatches and zero genuine wrong answers**
-   (the 4 flagged divergences are cascades from a preceding unsupported
-   statement, not answer bugs; 955,237 of the queries are checked against
-   sqlite's own md5 result hash). Re-confirmed 2026-07-21 after schema v10 /
-   P1 on a **469 953-record subset** (select1–5 + 40 random SLT files + index
-   DDL probes): **0 wrong results, 0 error mismatches**. Put the other way: of
-   everything mpedb *accepts*, essentially 100% matches sqlite. Of the 1,392
-   records that do not pass on the full run, **1,365 are artifacts of the
-   runner's synthetic-`rowid_` shim and 27 are engine gaps** — the timing-less
-   legacy `CREATE TRIGGER` form (23), `DROP INDEX`/`REINDEX <name>` (2), and two
-   deliberate `min()`/`max()` cast cases. Discounting the artifacts, the
-   engine's ceiling on this corpus is 99.99955%. The full ranked blocker table
+   differentially against the bundled sqlite. As of 2026-08-01 the corpus is
+   at **100%: 7,420,638 records, 0 wrong answers, 0 error mismatches — on
+   x86-64 AND arm64**, re-measured at every binder/planner/format change
+   (955,237 of the queries are checked against sqlite's own md5 result
+   hash). The gap classes the 2026-07-20 run still carried — the runner's
+   synthetic-`rowid_` shim artifacts, the timing-less legacy `CREATE
+   TRIGGER` form, `DROP INDEX`/`REINDEX <name>`, and the `min()`/`max()`
+   cast cases — have all since been closed or measured-and-matched (the
+   corpus shim itself was deleted; sqlite's own ≥2-argument `min()`/`max()`
+   rule is honoured). The full ranked blocker table
    and the hand-verified root causes are in
    [design/CORPUS-STATUS.md](design/CORPUS-STATUS.md). (`select5.test`'s
    17-way-join runaway, formerly an OOM abort, is now a clean

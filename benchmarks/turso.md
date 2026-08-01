@@ -9,7 +9,7 @@ classes as SQLite and PostgreSQL. This page is the curated comparison; the full
 generated tables live in the per-machine results files
 ([Linux](../crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md),
 [M3](../crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md)), and the
-three-engine campaign methodology lives in [head-to-head.md](../head-to-head.md).
+four-engine campaign methodology lives in [head-to-head.md](head-to-head.md).
 
 Version measured: **turso 0.7.0** (crates.io, embedded via its Rust API).
 Turso is beta software by its own description; the compatibility notes below

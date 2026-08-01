@@ -55,9 +55,9 @@ implemented, retargeted from the batch to the query graph.
 
 Morten's constraint: `row_count` is the simple input, "smart cost analysis is
 the central input but that part can be kept simpler", and — the sharpening that
-shaped the whole model — *"row_count er bare en simpel måte, eks LIKE søk osv
-vil variere basert på type data og kan ikke alltid vite slikt før man har kjørt
-det."* `row_count` says how many rows **exist**, never how many a predicate
+shaped the whole model — *"row_count is just a simple approach; e.g. LIKE
+searches etc. will vary based on the type of data, and you cannot always know
+such things before you have run it."* `row_count` says how many rows **exist**, never how many a predicate
 **lets through**. So predicates are classified, and the class decides what the
 solver is allowed to assume:
 
@@ -232,10 +232,10 @@ N×N matrix is materialized.
 
 ### 4.1 Extremal sampling and progressive refinement — how far the road analogy carries
 
-Morten's search strategy from the route engine: *"ta helt sør, så helt nord, så
-helt vest og øst — sannsynligheten er stor for at den 4×4-matrisen finner
-hovedveier/knutepunkter. Legg til én til mellom alle … og da trenger man ofte
-ikke kalkulere hele N×N."* Sample the extremes, solve the tiny matrix among
+Morten's search strategy from the route engine: *"take the far south, then the
+far north, then the far west and east — the probability is high that the 4×4
+matrix finds main roads/junctions. Add one more between all of them … and then
+you often do not need to calculate the whole N×N."* Sample the extremes, solve the tiny matrix among
 them, insert the points between, repeat; stop when a round stops changing the
 decision.
 
@@ -359,9 +359,9 @@ their exact previous hashes for every non-join statement.
 
 ## 7. Refusals — and which of them became constraints (#116)
 
-Morten's framing for v2: *"Left join, where etc er som constraints i
-vehicle-optimalisering, og samme gjelder her og inngår da i N×N-kost-analysene
-FØR solver kjører."* In vehicle routing a time window, a capacity or a
+Morten's framing for v2: *"Left join, where etc. are like constraints in
+vehicle optimization, and the same applies here, and they then go into the
+N×N cost analyses BEFORE the solver runs."* In vehicle routing a time window, a capacity or a
 forbidden turn is not a reason to abandon the route — it is a constraint the
 solver prices and searches the feasible region under. v1's eligibility list was
 a list of situations where the solver gave up. v2 converts the three that
@@ -533,9 +533,9 @@ Three things about that line, each deliberate:
 
 ## 9. The loop — hooked, not built (#88 / DESIGN-MPEE-COST.md)
 
-Morten: *"PLUSS at vi kan lagre ned query-historikk, slik at gjentatte LIKE kan
-ta vare på historisk kost og gradvis optimalisere queries"* → *"loop med kost vs
-MPEE-iterasjon for raskere queries."*
+Morten: *"PLUS that we can store query history, so that repeated LIKEs can
+keep historical cost and gradually optimize queries"* → *"loop with cost vs
+MPEE iteration for faster queries."*
 
 The loop is **solve → execute → measure → feed back → re-solve on the next
 compile**, and it is the only thing that can ever price the **UNKNOWN** class of
@@ -645,9 +645,9 @@ Not built. Written down so that when it is, it does not reach for the plan bytes
 
 ### 9.5 The compile-time ping-pong — BUILT (#116)
 
-Morten: *"ved å slå sammen N×N/kost og solver, kan den dynamisk teste og løse
-bedre ruter … gir ekstra verdi til N×N-streaming, for valg av N kan da gjøres
-med MPEE-styring."*
+Morten: *"by merging N×N/cost and the solver, it can dynamically test and solve
+better routes … gives extra value to N×N streaming, because the choice of N can
+then be made with MPEE steering."*
 
 v1 streamed the *step costs* on demand inside the DP but bought every table's
 `row_count` **eagerly, up front**, before the search started. Fusing cost and

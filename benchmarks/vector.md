@@ -1,7 +1,7 @@
 # Vector: mpedb exact vs Qdrant HNSW
 
 mpedb has no vector index. What it has, as of stage D
-([design/DESIGN-MPEE-GENERAL.md](design/DESIGN-MPEE-GENERAL.md)): embeddings
+([design/DESIGN-MPEE-GENERAL.md](../design/DESIGN-MPEE-GENERAL.md)): embeddings
 as BLOBs of little-endian f32 (no schema-format change), `vec_l2` /
 `vec_cosine` scalars with strict shape refusals, and an exact-kNN executor
 path — `ORDER BY vec_l2(emb, $q) LIMIT k` runs a k-sized heap with
@@ -16,7 +16,7 @@ exactness. A bare "X× faster" in either direction would be a category error —
 HNSW answers *probably-nearest*, a scan answers *nearest*. The honest frame is
 the pair (latency, recall), side by side.
 
-Harness: [`crates/mpedb-vecbench`](crates/mpedb-vecbench) (std-only Qdrant
+Harness: [`crates/mpedb-vecbench`](../crates/mpedb-vecbench) (std-only Qdrant
 REST client — no new dependencies). Machine: Apple M3 Pro. Qdrant 1.18,
 default HNSW parameters. Data: 100,000 × 128-dim f32, **clustered** (64
 centroids + noise — uniform noise would be an adversarial dataset for HNSW,

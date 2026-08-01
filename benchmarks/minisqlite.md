@@ -2,7 +2,7 @@
 
 ## Two SQL engines, one weekend, and the boring number nobody publishes
 
-![What each engine can be asked to do](docs/img/scope.svg)
+![What each engine can be asked to do](../docs/img/scope.svg)
 
 **mpedb runs Django and CPython's own `sqlite3` test suite. Cursor's minisqlite
 cannot be asked to.** Not "fails" — *cannot be asked*: it ships no C-API, so no
@@ -124,7 +124,7 @@ minisqlite suite makeup (for scale): ~2964 facade `conformance_*.rs` tests (SQL 
 | Field | Value |
 |---|---|
 | Corpus | [grahn/sqllogictest](https://github.com/grahn/sqllogictest) `test/**/*.test` |
-| Files | **621 / 622** (`select5.test` excluded — same as mpedb [CORPUS-STATUS.md](design/CORPUS-STATUS.md)) |
+| Files | **621 / 622** (`select5.test` excluded — same as mpedb [CORPUS-STATUS.md](../design/CORPUS-STATUS.md)) |
 | Harness (this round) | same SLT parser + MD5 + I/R/T rendering; engines answer as `sqlite` in `skipif`/`onlyif` |
 | stock SQLite | rusqlite **bundled 3.45.0** (`sqlite_corpus`) — Linux |
 | minisqlite | `minisqlite_corpus` — **M3 + Linux** (identical totals) |
@@ -301,7 +301,7 @@ Same schema `users(id PK, name, age)`, n=50k, batch=100. mpedb `path = ":memory:
 
 **Honest residual:** PreparedSelect is still ~0.7× stock SQLite (owned `Value`/`String` + pin per call vs VDBE registers). Autocommit INSERT ~0.4× (catalog/freelist/undo vs pure in-place B-tree). **Batch amortizes commit and beats sqlite string-batch on both hosts.** Prefer `prepare_select` + `execute_prepared_select` for reads and multi-row `WriteSession` for writes.
 
-Sources: `~/mpedb-measure-results/imem-bench-linux-post-push.log`, `imem-bench-m3-7fb0d53.log`. Plan notes: [design/notes/SELECT-HOTPATH-PLAN.md](design/notes/SELECT-HOTPATH-PLAN.md).
+Sources: `~/mpedb-measure-results/imem-bench-linux-post-push.log`, `imem-bench-m3-7fb0d53.log`. Plan notes: [design/notes/SELECT-HOTPATH-PLAN.md](../design/notes/SELECT-HOTPATH-PLAN.md).
 ---
 
 ## 6. Architecture (brief)

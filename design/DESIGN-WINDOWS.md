@@ -21,8 +21,8 @@ wrong is the more useful record.
 
 ## 0. The claim this corrects
 
-> "Full engine er Unix-only pga. mmap/flock/PROCESS_SHARED//proc. Kun portable
-> crates kjører der."
+> "The full engine is Unix-only because of mmap/flock/PROCESS_SHARED//proc.
+> Only the portable crates run there."
 
 The first half is accurate. The conclusion people draw from it — that a port is
 impractical — does not survive two measurements.

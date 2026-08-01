@@ -147,7 +147,7 @@ converges on:
   the elegant simplification: multi-master *scale* without the multi-master *problem*.
 - **Sharding is the unit of parallelism for serving AND sync.** Servers own different shards' masters;
   load spreads; a shard is small, so bounded lag (§2a `max_lag`) is easy to hold — a follower never
-  hangs far behind, so it is always safely promotable ("aldri henge lenge etter").
+  hangs far behind, so it is always safely promotable ("never lag far behind").
 - **MPEE on sync = precompute on sync.** A shard's root content-hash answers "is this shard dirty?"
   in O(1); ship only dirty shards' deltas, prioritized by staleness/cost — the same cost broker that
   routes SQL batches (#73) routes replication. Sharding turns "what changed?" into O(dirty shards),

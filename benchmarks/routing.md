@@ -1,7 +1,7 @@
 # Routing: exact (mpedb + the kernel) vs the original MPEE solver
 
 The last domain of the generic-solver program (stage M4,
-[design/DESIGN-MPEE-GENERAL.md](design/DESIGN-MPEE-GENERAL.md) §9.2): real
+[design/DESIGN-MPEE-GENERAL.md](../design/DESIGN-MPEE-GENERAL.md) §9.2): real
 road-network sequencing, with the two engines this project bridges — **mpedb's
 kernel grown a `(subset, last)` exact mode** (Held-Karp,
 `mpedb_sql::sequence`), and **brooom**, the original MPEE vehicle-routing
@@ -13,7 +13,7 @@ optimum is *known*, so brooom's answer gets a measured gap-to-optimum, not a
 shrug. Past the cap the exact side **declines** — never a silent fallback that
 stops being exact — and the heuristic's regime is reported as its own.
 
-Harness: [`crates/mpedb-routebench`](crates/mpedb-routebench) (std-only;
+Harness: [`crates/mpedb-routebench`](../crates/mpedb-routebench) (std-only;
 brooom invoked as a subprocess). Instance: brooom's bundled real-map San
 Francisco set — `sf_s11_n80_osrm.json`, 81 locations, OSRM road durations.
 Machine: the 2-core Linux dev box (gap is machine-independent; wall times are

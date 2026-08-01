@@ -5,12 +5,12 @@ measurement half is a new census mode on the #117 harness
 (`sqlite_corpus --index-census`), and it is the thing that decides whether the rest is
 worth building.
 
-Morten's premise: *"Vanlig er å måtte designe masse indekser, men hvorfor ikke ta inn
-modell/SQL — eks modellen brukt i Django — så kjøre test av SQLene og lage indeks basert på
-det. Ikke sikkert hele tabellen skal ha indeks heller, men deler av dataene på tvers. …
-Nye versjoner bør ikke rebygge indekser."* And the objection to the obvious alternative:
-*"Alternativet er å bygge indeks under MPEE-bruk, men da blir det forsinkelse basert på
-bruk."*
+Morten's premise: *"The usual thing is having to design lots of indexes, but why not take in
+the model/SQL — e.g. the model used in Django — then run a test of the SQL statements and build
+indexes based on that. Not certain the whole table should have an index either, but parts of
+the data across it. … New versions should not rebuild indexes."* And the objection to the
+obvious alternative: *"The alternative is to build indexes during MPEE use, but then there is
+delay based on use."*
 
 Reads with: [DESIGN-MPEE-COST.md](DESIGN-MPEE-COST.md) (#88 — the cost catalog and the
 recommend-only staging this doc inherits), [FOOTPRINT-INDEX-MEASURED.md](FOOTPRINT-INDEX-MEASURED.md)
@@ -131,7 +131,7 @@ Two consequences that are already exactly what #118 asks for:
   `CREATE INDEX ix_order_customer ON orders(customer_id)` under a new name **does not rebuild**
   today.
 
-So "nye versjoner bør ikke rebygge indekser" is already true for whole-table indexes. What is
+So "new versions should not rebuild indexes" is already true for whole-table indexes. What is
 missing is that the shape is (a) **ordinal-based**, not name-based, and (b) has no room for a
 predicate or a collation. Both break the moment §5 lands or DROP INDEX lands.
 
@@ -638,7 +638,7 @@ number is assumed (§8).
 
 ### 6.2 (B) — adaptive, and where it attaches
 
-Morten's objection is exact: *"da blir det forsinkelse basert på bruk"* — the first N queries
+Morten's objection is exact: *"then there is delay based on use"* — the first N queries
 pay, and the build itself adds latency. The composition answers both halves separately:
 
 - **The first-N-queries cost is removed by (A)**, for everything the suite covered. (B) never
@@ -790,9 +790,9 @@ gated on P3 (DROP INDEX) per §7.
 
 ## 9. Responses that name the method — writing for the reader who is a model
 
-Morten: *"Fordi de fleste (alle?) nå bruker LLMer kan vi bygge inn feedback som peker på
-… smartere indeks-bygging, enn klassisk indeks."* Then, correcting the first instinct:
-*"Eks bare peke på interne APIer og funksjoner, dokumentasjon finner som regel LLMer selv?"*
+Morten: *"Because most (all?) now use LLMs we can build in feedback that points to
+… smarter index building than classic indexes."* Then, correcting the first instinct:
+*"E.g. just point to internal APIs and functions — documentation LLMs usually find on their own?"*
 
 The second version is the right one, and the reason is worth writing down so it does not get
 "improved" back into URLs later.

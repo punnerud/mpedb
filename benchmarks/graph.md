@@ -7,7 +7,7 @@ point of the comparison: how far does a relational engine get on graph
 questions **before** any graph-native machinery exists, and where exactly does
 the native representation start to win?
 
-Harness: [`crates/mpedb-graphbench`](crates/mpedb-graphbench) — a workspace
+Harness: [`crates/mpedb-graphbench`](../crates/mpedb-graphbench) — a workspace
 member with **zero new dependencies** (the Neo4j client is ~300 lines of std:
 HTTP/1.0 so the server never chunks, a minimal JSON parser, base64 by hand).
 Machine: Apple M3 Pro, macOS 26.6. Neo4j 5.26.0, community, 4 GB heap + 4 GB

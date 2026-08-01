@@ -1,7 +1,7 @@
 # DESIGN-MIRROR-DDL — bidirectional table add/drop through the mirror
 
-**Status: design draft.** Answers Morten's steer (2026-07-17): "det som gir best
-toveis sync" — schema changes, not just data, should flow both ways across the
+**Status: design draft.** Answers Morten's steer (2026-07-17): "what gives the
+best two-way sync" — schema changes, not just data, should flow both ways across the
 sqlite/PG ⇄ mpedb mirror, now that mpedb has in-band `CREATE TABLE` (#47 stage
 2) and a designed `DROP TABLE` (stage 4). This is the mirror-side integration;
 it depends on #47's engine DDL but adds no new engine format.

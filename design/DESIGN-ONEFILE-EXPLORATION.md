@@ -118,19 +118,19 @@ overlay, with LOCKED / OPTIMISTIC / UNLOCKED-OFFLINE modes and a checkpoint.
 
 ## 1. The six approaches
 
-Each is quoted verbatim (Morten, 2026-07-17, Norwegian), then measured
+Each is quoted (Morten, 2026-07-17; translated from the Norwegian original), then measured
 against the hard questions: (a) contiguity, (b) relocation, (c) tool
 compatibility, (d) mpedb's invariants, (e) write interleaving vs the
 two-file reference, (f) durability.
 
 ### 1.1 A1 — fixed blob region + dual access — **VIABLE-WITH-CONSTRAINTS**
 
-> Fast allokert BLOB-region + dual access: forhåndsallokerte store BLOB-er;
-> hele mpedbs sideområde (meta, reader-table, COW-sider, freelist) inne i
-> BLOB-regionen; prosesser regner fysiske fil-offsets og mmap-er direkte;
-> liten SQLite-kontrolltabell med epoch/root-pekere/høyeste offset; commit =
-> COW-oppdatering i mappet region + kort SQLite-txn som bare oppdaterer
-> epoch+root.
+> Fixed pre-allocated BLOB region + dual access: pre-allocated large BLOBs;
+> mpedb's entire page area (meta, reader table, COW pages, freelist) inside
+> the BLOB region; processes compute physical file offsets and mmap directly;
+> a small SQLite control table with epoch/root pointers/highest offset;
+> commit = COW update in the mapped region + a short SQLite txn that only
+> updates epoch+root.
 
 **(a) Contiguity — dead as literally stated, alive after two amendments.**
 "Processes compute physical file offsets" over a linear region assumes the
@@ -229,10 +229,10 @@ per-chunk at best, FrozenDb's one-Range-request property dies.
 
 ### 1.2 A2 — custom VFS with page ownership — **DEAD**
 
-> Custom VFS med side-eierskap: VFS tar over page-I/O; «mpedb-eide»
-> sideintervaller serveres fra mpedbs COW-lag; flush tilbake til
-> SQLite-pageren ved commit; reader-tabell/intent-ring i shared memory
-> utenfor fila.
+> Custom VFS with page ownership: the VFS takes over page I/O; "mpedb-owned"
+> page intervals are served from mpedb's COW layer; flush back to the
+> SQLite pager at commit; reader table/intent ring in shared memory
+> outside the file.
 
 Three killers, each sufficient:
 
@@ -257,10 +257,10 @@ A1/A5 don't already contain.
 
 ### 1.3 A3 — epoch-fenced dual mapping, reserved high region — **DEAD as stated**
 
-> Epoch-fenced dual mapping: alle prosesser mapper hele .db; reservert høyt
-> område til COW-struktur; SQLite-authority-tabell med current_epoch/root;
-> lesere henter epoch via SQL, bytter til direkte minnetilgang; writers
-> publiserer med én atomisk SQLite-oppdatering.
+> Epoch-fenced dual mapping: all processes map the whole .db; a reserved
+> high area for the COW structure; SQLite authority table with
+> current_epoch/root; readers fetch the epoch via SQL, switch to direct
+> memory access; writers publish with one atomic SQLite update.
 
 The killer is F1: **sqlite has no notion of a "reserved high area".** The
 candidate homes for it all fail by the format's own rules:
@@ -282,10 +282,10 @@ table and mpedb's meta flip. The idea's contribution survives; the
 
 ### 1.4 A4 — append-only blob log + materialization — **DEAD as a distinct approach**
 
-> Append-only BLOB-logg + materialisering: BLOB-er som append-only logg av
-> COW-/intent-records; append-offset koordinert via SQLite; leader
-> materialiserer konsistent tilstand til en «clean» BLOB; nye writes til ny
-> epoch under materialisering.
+> Append-only BLOB log + materialization: BLOBs as an append-only log of
+> COW/intent records; append offset coordinated via SQLite; a leader
+> materializes consistent state into a "clean" BLOB; new writes go to a new
+> epoch during materialization.
 
 Two readings, both fail:
 
@@ -307,9 +307,9 @@ A1/A5, not an architecture.
 
 ### 1.5 A5 — hybrid metadata + data blob — **VIABLE-WITH-CONSTRAINTS** (the strongest shape)
 
-> Hybrid metadata + data-BLOB: vanlig relasjonsdata i SQLite-tabeller;
-> MVCC-dataene i store BLOB-er; SQL-views/virtuelle tabeller eksponerer
-> snapshot fra BLOB via epoch; synk ved epoch-bytte.
+> Hybrid metadata + data BLOB: ordinary relational data in SQLite tables;
+> the MVCC data in large BLOBs; SQL views/virtual tables expose a snapshot
+> from the BLOB via epoch; sync at epoch switch.
 
 This is DESIGN-SQLITE-BACKED's overlay **moved inside the base**: real rows
 in real sqlite tables (readable by every tool at last-checkpoint freshness —
@@ -357,9 +357,9 @@ list in §2.
 
 ### 1.6 A6 — page ownership via extension/hooks — **DEAD**
 
-> Side-eierskap via extension/hooks: loadable extension m/ pre-update
-> hooks/authorizer markerer mpedb-eide sider/tabeller; hindrer
-> gjenbruk/flytting; mpedb mapper og administrerer akkurat de sidene.
+> Page ownership via extension/hooks: a loadable extension with pre-update
+> hooks/authorizer marks mpedb-owned pages/tables; prevents
+> reuse/relocation; mpedb maps and manages exactly those pages.
 
 Three killers:
 
@@ -371,7 +371,7 @@ Three killers:
 2. **There is no sqlite API to pin a page's physical location.** The pager
    has no concept of it; hooks operate at row/statement altitude, and
    ptrmap-driven relocation (G4) happens below anything a hook observes.
-   "Hindrer gjenbruk/flytting" names an operation the extension surface
+   "Prevents reuse/relocation" names an operation the extension surface
    cannot express.
 3. **VACUUM's internal page traffic fires no preupdate hooks**; an
    authorizer can veto the VACUUM *statement* in its own connection only.

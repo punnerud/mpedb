@@ -4,10 +4,16 @@ Every measured comparison in one place. They were accumulating at the repo
 root and there are enough of them now that a reader could not tell which was
 the main event.
 
+These are speed comparisons standing on top of a compatibility surface that is
+100 % differentially verified against sqlite — zero wrong answers, zero error
+mismatches across sqlite's own 7.4-million-record corpus. The summary is in
+[../README.md](../README.md#differential-testing-vs-sqlite3--postgresql); the
+feature-by-feature status is [../COMPAT.md](../COMPAT.md).
+
 | Cell | Against | What it measures |
 |---|---|---|
 | [head-to-head.md](head-to-head.md) | sqlite3, PostgreSQL, Turso | The main campaign: inserts, selects, joins, blobs, durability classes, on Linux + M3 |
-| [olap.md](olap.md) | DuckDB | Star schemas, scans, aggregation, the NDV cost input |
+| [olap.md](olap.md) | DuckDB, sqlite3, PostgreSQL, MySQL | Star schemas, scans, aggregation, the NDV cost input |
 | [vector.md](vector.md) | Qdrant | Filtered kNN and abandonment |
 | [graph.md](graph.md) | Neo4j | Traversal at a converged frontier |
 | [routing.md](routing.md) | the original MPEE solver | Exact sequencing against the generic solver |

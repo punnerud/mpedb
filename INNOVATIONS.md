@@ -20,6 +20,17 @@ one may be [I]. Where a claim rests on an assumption we have not measured, the
 entry says so. Section 9 is the negative results — things built, measured, and
 rejected — and it is deliberately as long as the successes.
 
+One dated fact frames the rest. As of 2026-08-01 the method these entries keep
+returning to — differential testing against a pinned oracle, and a named refusal
+wherever agreement cannot be proven — has carried **every suite that measures
+the sqlite surface to 100 %**: sqlite's own corpus (7,420,638 records, 0 wrong
+answers, on x86-64 *and* arm64), CPython's `test_sqlite3` (**466/466**, zero
+failures, zero errors), Django's entire suite (18,214 tests per arm, **0
+shim-only failures** — the 13 failing IDs are identical under stock), and
+SQLAlchemy's dialect suite (**1277/1277**, exact stock parity). The evidence
+lives in `C-API-COMPAT.md` and `COMPAT.md`; §5.x and §5.y are the innovations
+that closed the last distance.
+
 ---
 
 ## 1. Surviving sudden death
@@ -966,6 +977,69 @@ c`, a row-set identity) where materialization already existed. The planner
 never sees a new construct. Evidence: SQLAlchemy's dialect suite at exact
 stock parity, 1277/1277.
 
+### 5.y The file-format plane of the same campaign: real sqlite bytes (2026-08-01, all differentially tested)
+
+The rewrites above closed the SQL plane; these four closed the *file-format*
+plane — the last distance between "answers like sqlite" and "hands out bytes
+sqlite owns". Three of CPython's last four tests fell to them (the fourth,
+the decode error, is `ConcatN` above), landing 466/466.
+
+**A sqlite-format writer, ported differentially against stock.**
+`mpedb-sqlitefmt` gains `write_image`: logical content serialized as a real
+sqlite image whose header is the byte-exact stock-3.45.1 shape — payload
+fractions 64/32/32, schema format 4, change counter equal to
+version-valid-for at offset 92, the equality the crate's own *reader*
+root-bound rule keys on. Everything outside the v1 scope is `Unsupported` BY
+NAME, never an amputated image. What it buys is **honest geometry**:
+`backup(pages=N)` paces its progress meter over the real sqlite image of the
+content, so `foo` plus 2 rows IS 2 pages — no number is invented — and
+`serialize()` emits genuine sqlite bytes; out-of-scope shapes answer NULL,
+the named refusal, never a foreign format under sqlite's name. Evidence: a
+unit test pins the reference image byte for byte (8,192 bytes, master cell
+included),
+and the differential port (`tests/write_differential.rs`) has **stock** open
+the image — `integrity_check` = ok, `.dump` carrying every CREATE text and
+the rows, `page_count` matching — with every value class (NULL, floats,
+blobs, empty and negative strings/ints, a payload at exactly the leaf
+ceiling, a quoted `'PRIMARY KEY'` default that must survive the scope sniff)
+reading back value-for-value.
+
+**sqlite's backup restart, reproduced from one meta read.** Mid-backup,
+sqlite invalidates the copy and starts over if the source is written;
+CPython pins that as journal `[1, 1, 0]` — three steps for a two-page
+database, the extra step being the restart — with the mid-backup row
+required IN the destination. mpedb reproduces it with one number instead of
+page-level bookkeeping: between steps the source's commit counter
+(`snapshot_txn` — a single meta read) is compared against the counter the
+image was captured at; a mismatch re-captures and rewinds. Evidence: journal
+`[1, 1, 0]` measured, new row present in the destination — the exact
+assertion of `test_modifying_progress`. Found on the way: the temp path was
+deterministic per destination, so the OLD image's Drop deleted the FRESH
+capture and the install renamed a ghost; `restart_from` defuses it.
+
+**Deserialize under a double magic.** `sqlite3_deserialize` accepts both
+formats and dispatches on the magic alone: mpedb bytes adopt as before;
+genuine sqlite bytes (`SQLite format 3\0`) go through mpedb's own **native**
+format reader — tables re-created, rows re-inserted into a fresh blank, then
+adopted — so real sqlite images round-trip through the shim with no sqlite
+library anywhere in the dependency graph. Evidence: the round trip on real
+bytes, the declared-PK refusal and the restart rule are pinned in
+`capi_serialize` (3/3), and the serialize pair passes inside the 466/466.
+
+**fts4 as a catalog form on the fts5 engine.** The exploration collapsed the
+scope: the engine's fts table was *already* everything `dump.py` scans —
+what was missing was the CATALOG sqlite would list. `USING fts4` becomes a
+module *tag* on the one existing engine (canonical bytes v17 → v18, older
+images defaulting to fts5 on decode); CREATE lays down sqlite's five shadow
+tables in the SAME transaction, their catalog records carrying sqlite's
+EXACT single-quoted, typeless DDL text — measured byte-for-byte — through
+the fingerprint mechanism that already existed; DROP cascades all six, gated
+on the module tag and never guessed from names. Named narrowing: shadow
+*content* stays empty while the vtab holds data — a dump still replays
+correctly through the vtab's own INSERT rows. Evidence:
+`test_dump_virtual_tables` closes byte-for-byte against iterdump's expected
+list; the corpus re-measured at 7,420,638 records, 0 wrong.
+
 ---
 
 ## 6. Method as technique
@@ -1014,12 +1088,14 @@ in opposite directions under the same pressure:
   support is subtly wrong. Under a single pass count that looks like a small win.
   Under the split it is a stop-the-line event.
 
-The budget for wrong answers is **zero**. Current standing, measured at one
-commit on one machine: Django 826/831 with **0 FAIL / 5 ERROR**, `queries`
-488/493 with 0 FAIL, CPython's own suite 450/474 whose 6 FAILs each reduce to a
-refusal or a metadata string. The only deliberate FAILs anywhere are three
-honesty positions where passing would mean claiming foreign-key enforcement that
-does not exist.
+The budget for wrong answers is **zero**. Standing at one mid-campaign commit
+on one machine: Django 826/831 with **0 FAIL / 5 ERROR**, `queries` 488/493
+with 0 FAIL, CPython's own suite 450/474 whose 6 FAILs each reduce to a refusal
+or a metadata string; the only deliberate FAILs at that commit were three
+honesty positions where passing would mean claiming foreign-key enforcement
+that does not exist. The 2026-08-01 endpoint of the same discipline — every
+remaining ERROR either converted to a pass or refused by name, and none
+converted into a FAIL — is the 100 % milestone in the introduction.
 
 ### 6.3 Widening can create wrong answers — probe on VALUE *and* type [I]
 

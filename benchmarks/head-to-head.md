@@ -1,6 +1,6 @@
 # mpedb benchmarks
 
-Head-to-head throughput and latency for **mpedb vs SQLite vs PostgreSQL** — same
+Head-to-head throughput and latency for **mpedb vs SQLite vs PostgreSQL vs Turso** — same
 machine, same workloads, same measurement loop. This page is the curated
 cross-machine comparison; each machine's full generated tables (every cell, both
 durability classes, all latency percentiles) live in its own file.
