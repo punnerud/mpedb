@@ -162,7 +162,21 @@ genuine corruption). The loop is cheap to prove: replace it with a single
 `newest_meta_gated(durable_txn.load(Acquire))` and `cargo run -p mpedb-bench -- --only
 mpedb` reports spurious retries within seconds — measured 2026-07-15, 3 with it disabled
 against 0 as shipped on the same flags. `mpedb-bench`'s `SPURIOUS_CORRUPT_RETRIES`
-counter is the tripwire for that regression.
+ counter is the tripwire for that regression.
+
+⚠ **The UNGATED read has a twin loop, for a different tear** (2026-08-01,
+found by `map-collide` at `durability = none`, ~4 % of runs on a loaded box).
+There is no gate to go stale in `none`/`async` — but the read itself can tear
+twice over: `read_meta_slot` loads the checksum and then the body, commits
+alternate slots and cost microseconds without an msync, so a reader
+descheduled inside one `newest_meta` call can have slot A torn by commit N+1
+and slot B by commit N+2, and a single pass reports a healthy file as
+`Corrupt("both checksums invalid")`. The shadow-paging induction above rules
+out both slots being GENUINELY torn while a valid commit chain exists, which
+is what licenses the cure: retry while the observed `(txn_id, checksum)`
+words of the two slots MOVE, and give up only when a pass sees the same
+four words as the pass before — the same termination argument as the gated
+loop (unchanged state admits nothing new, so the failure is genuine).
 
 ### 4.1a Power-loss simulation for `durability = commit` (#121)
 

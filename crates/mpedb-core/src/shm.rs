@@ -1415,7 +1415,41 @@ impl Shm {
             return Ok(self.load_priv_meta());
         }
         if !matches!(self.durability, Durability::Commit | Durability::Wal) {
-            return self.newest_meta_gated(u64::MAX);
+            // Ungated modes read whatever is newest — but the READ itself can
+            // tear twice over: `read_meta_slot` loads the checksum, then the
+            // body, and a reader descheduled inside one call can straddle two
+            // consecutive commits (slots alternate, and at `none` a commit is
+            // microseconds — no msync). Slot A then tears against commit N+1
+            // and slot B against N+2, and a single pass reports a HEALTHY
+            // file as "both checksums invalid" — measured at ~4 % per
+            // map-collide run on a loaded box, no SIGKILL required; the
+            // shadow-paging induction (§4.1) rules out both slots being
+            // GENUINELY torn while a valid commit chain exists. Same cure and
+            // same termination argument as the gated loop below: retry while
+            // the observed slot state MOVES; a state unchanged between two
+            // passes admits nothing new, so the failure is genuine.
+            let mut last: Option<(u64, u64, u64, u64)> = None;
+            for _ in 0..64 {
+                match self.newest_meta_gated(u64::MAX) {
+                    Ok(m) => return Ok(m),
+                    Err(e) => {
+                        let a = Self::meta_off(META_PAGE_A);
+                        let b = Self::meta_off(META_PAGE_B);
+                        let state = (
+                            self.atomic_u64(a + M_TXN_ID).load(Ordering::Acquire),
+                            self.atomic_u64(a + M_CHECKSUM).load(Ordering::Acquire),
+                            self.atomic_u64(b + M_TXN_ID).load(Ordering::Acquire),
+                            self.atomic_u64(b + M_CHECKSUM).load(Ordering::Acquire),
+                        );
+                        if last == Some(state) {
+                            return Err(e); // stable: genuine corruption
+                        }
+                        last = Some(state);
+                    }
+                }
+                std::hint::spin_loop();
+            }
+            return Err(Error::Corrupt("no stable meta page after retries".into()));
         }
         // The durable gate is monotone, but a reader racing two consecutive
         // durable commits can load a STALE gate and then find both slots
