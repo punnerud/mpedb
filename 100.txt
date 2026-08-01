@@ -562,8 +562,9 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
                            re-målt ved S28, S31 og S32 — obligatorisk for
                            binder/planner-endringer)
     SQLAlchemy compliance  1277/1277 — I MÅL ved S32 (eksakt stock-paritet)
-    CPython test_sqlite3   462/466 (var 460); rest = NØYAKTIG planens fire:
-                           progress-paret (§11), fts4-dump (§7), decode (§8)
+    CPython test_sqlite3   466/466 — I MÅL 1/8 (S37 decode, S38 fts4,
+                           S39a/b bildeskriveren + restart-semantikken).
+                           ALLE FIRE FLATER ER PÅ 100 %.
     Django, ALLE labels   18 214 tester per arm (fikset label-liste,
                            __init__.py-filteret) — 0 SHIM-ONLY, 13 feil-IDer
                            IDENTISKE i begge armer (stock-Djangos egne).

@@ -42,6 +42,7 @@
 //! truth about its volatile state.
 
 use crate::Database;
+use mpedb_sqlitefmt as fmtx;
 use mpedb_types::{Error, Result, PAGE_SIZE};
 use std::path::{Path, PathBuf};
 
@@ -56,6 +57,11 @@ pub struct BackupImage {
     dest: PathBuf,
     page_count: u64,
     done: u64,
+    /// The source's commit counter at capture (`Database::snapshot_txn`, one
+    /// meta read). The C-API's backup_step compares it per step: a moved
+    /// counter means the source committed mid-backup, and sqlite's contract
+    /// there is invalidate-and-restart (plan §11).
+    source_txn: u64,
 }
 
 impl Database {
@@ -98,7 +104,83 @@ impl Database {
             dest: dest.to_path_buf(),
             page_count: content_pages.min(file_pages.max(1)).max(1),
             done: 0,
+            source_txn: self.snapshot_txn(),
         })
+    }
+
+    /// The logical content as a REAL sqlite image (plan §11) — geometry no
+    /// consumer can call fabricated: `page_count` over THIS is the number of
+    /// 4096-byte pages sqlite itself would use for the content (the CPython
+    /// progress pair's whole complaint). `None` when any live table falls
+    /// outside the writer's v1 scope — hidden-rowid Standard tables (the
+    /// shim's `CREATE TABLE` shape, which IS a sqlite rowid table), no
+    /// secondary indexes, scalar values only — in which case backup keeps
+    /// mpedb's own honest geometry and serialize refuses by name.
+    ///
+    /// `skip` names tables that are the CALLER's bookkeeping (the C-API's
+    /// seed table), not content.
+    pub fn sqlite_image(&self, skip: &[&str]) -> Result<Option<Vec<u8>>> {
+        let bundle = self.schema();
+        let r = self.engine.begin_read()?;
+        let mut tables: Vec<fmtx::ImageTable> = Vec::new();
+        for t in bundle.tables.iter().filter(|t| !t.dead) {
+            if skip.iter().any(|s| mpedb_types::ident_eq(s, &t.name)) {
+                continue;
+            }
+            let Some(hid) = t.hidden_rowid_col() else { return Ok(None) };
+            if !matches!(t.kind, mpedb_types::TableKind::Standard) || !t.indexes.is_empty() {
+                return Ok(None);
+            }
+            let cols: Vec<String> = t
+                .visible_columns()
+                .iter()
+                .map(|c| {
+                    let ty = match c.ty {
+                        mpedb_types::ColumnType::Int64 => " INTEGER",
+                        mpedb_types::ColumnType::Float64 => " REAL",
+                        mpedb_types::ColumnType::Text => " TEXT",
+                        mpedb_types::ColumnType::Blob => " BLOB",
+                        mpedb_types::ColumnType::Bool => " BOOLEAN",
+                        _ => "",
+                    };
+                    format!("\"{}\"{}",  c.name.replace('"', "\"\""), ty)
+                })
+                .collect();
+            let sql = format!(
+                "CREATE TABLE \"{}\" ({})",
+                t.name.replace('"', "\"\""),
+                cols.join(", ")
+            );
+            let mut rows: Vec<Vec<fmtx::Value>> = Vec::new();
+            let mut cur = r.scan(t.id, None, None)?;
+            while let Some(row) = cur.next()? {
+                let mut out = Vec::with_capacity(row.len().saturating_sub(1));
+                for (i, v) in row.into_iter().enumerate() {
+                    if i == hid as usize {
+                        continue; // the hidden rowid is the tree key, not content
+                    }
+                    out.push(match v {
+                        mpedb_types::Value::Null => fmtx::Value::Null,
+                        mpedb_types::Value::Int(x) => fmtx::Value::Int(x),
+                        mpedb_types::Value::Float(f) => fmtx::Value::Float(f),
+                        mpedb_types::Value::Text(s) => fmtx::Value::Text(s),
+                        mpedb_types::Value::Blob(b) => fmtx::Value::Blob(b),
+                        mpedb_types::Value::Bool(b) => fmtx::Value::Int(b as i64),
+                        _ => return Ok(None),
+                    });
+                }
+                rows.push(out);
+            }
+            tables.push(fmtx::ImageTable { name: t.name.clone(), sql, rows });
+        }
+        r.finish()?;
+        match fmtx::write_image(&tables, 4096) {
+            Ok(img) => Ok(Some(img)),
+            // The writer names what it cannot represent; for backup that is
+            // the honest fall-back-to-mpedb-geometry signal, not an error.
+            Err(fmtx::Error::Unsupported(_)) => Ok(None),
+            Err(e) => Err(Error::Internal(format!("sqlite image writer: {e}"))),
+        }
     }
 }
 
@@ -138,6 +220,34 @@ impl BackupImage {
     /// Pages not yet accounted for by [`BackupImage::step`].
     pub fn remaining(&self) -> u64 {
         self.page_count - self.done
+    }
+
+    /// The source commit counter this image was captured at (plan §11).
+    pub fn source_txn(&self) -> u64 {
+        self.source_txn
+    }
+
+    /// Repace the progress meter over a REAL sqlite-image geometry: the
+    /// content of the captured source measured in sqlite's own pages. The
+    /// INSTALL half is untouched — the mpedb copy in `tmp` is what lands on
+    /// the destination — this only makes `page_count`/`remaining` numbers no
+    /// consumer can call fabricated.
+    pub fn set_sqlite_geometry(&mut self, image_len: usize) {
+        self.page_count = ((image_len / 4096) as u64).max(1);
+        self.done = self.done.min(self.page_count);
+    }
+
+    /// Restart after a mid-backup source commit (sqlite's own semantics —
+    /// the C-API step calls this when `source_txn` moved): adopt the fresh
+    /// capture, rewind the meter.
+    pub fn restart_from(&mut self, fresh: BackupImage) {
+        let old = std::mem::replace(self, fresh);
+        // `tmp_path` is DETERMINISTIC per destination, so the fresh capture
+        // already deleted and rewrote the very file the old value's Drop
+        // would now remove — letting it run deleted the NEW copy and the
+        // install renamed a ghost (measured: journal [1,1,0] perfect, then
+        // SQLITE_IOERR and an empty destination). Defuse it.
+        std::mem::forget(old);
     }
 
     /// Account `pages` more pages of the image, or all of them when `pages` is

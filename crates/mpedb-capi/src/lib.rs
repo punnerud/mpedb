@@ -4331,9 +4331,14 @@ pub unsafe extern "C" fn sqlite3_serialize(
     if !is_main || c.txn.is_some() {
         return ptr::null_mut();
     }
-    let bytes = match c.db.serialize_image() {
-        Ok(b) => b,
-        Err(_) => return ptr::null_mut(),
+    // Plan §11: the image is a REAL sqlite file of the logical content —
+    // interop no consumer can call a differ. Out of the writer's v1 scope
+    // (declared PKs, indexes, non-scalar values) -> NULL, which CPython
+    // reports as `unable to serialize` — a named refusal, never a foreign
+    // format under sqlite's name.
+    let bytes = match c.db.sqlite_image(&[SEED_TABLE]) {
+        Ok(Some(b)) => b,
+        _ => return ptr::null_mut(),
     };
     let p = sqlite3_malloc64(bytes.len() as u64) as *mut c_uchar;
     if p.is_null() {
@@ -4406,6 +4411,96 @@ pub unsafe extern "C" fn sqlite3_deserialize(
         let rc = fail(c, SQLITE_BUSY, "database is locked");
         free_buf();
         return rc;
+    }
+    // A REAL sqlite image (what serialize now emits, and what any sqlite
+    // producer hands us): imported through the NATIVE reader — tables
+    // re-created, rows re-inserted into a fresh blank database, then adopted
+    // exactly like the mpedb-format path below. No sqlite library anywhere.
+    if sz >= 16 && std::slice::from_raw_parts(data, 16) == b"SQLite format 3\0" {
+        let bytes = std::slice::from_raw_parts(data, sz as usize);
+        let staged = ephemeral_path();
+        let rc = (|| -> Result<(), c_int> {
+            std::fs::write(&staged, bytes).map_err(|_| SQLITE_IOERR)?;
+            let f = mpedb_sqlitefmt::SqliteFile::open(&staged).map_err(|_| SQLITE_NOTADB)?;
+            let tables = f.tables().map_err(|_| SQLITE_NOTADB)?;
+            let (newdb, newpath) = open_blank_database().map_err(|_| SQLITE_IOERR)?;
+            for t in &tables {
+                let cols: Vec<String> = t
+                    .columns
+                    .iter()
+                    .zip(&t.decl_types)
+                    .map(|(n, d)| {
+                        let q = n.replace('"', "\"\"");
+                        if d.is_empty() {
+                            format!("\"{q}\"")
+                        } else {
+                            format!("\"{q}\" {d}")
+                        }
+                    })
+                    .collect();
+                let create = format!(
+                    "CREATE TABLE \"{}\" ({})",
+                    t.name.replace('"', "\"\""),
+                    cols.join(", ")
+                );
+                newdb.query(&create, &[]).map_err(|_| SQLITE_NOTADB)?;
+                let placeholders: Vec<String> =
+                    (1..=t.columns.len()).map(|i| format!("${i}")).collect();
+                let ins = format!(
+                    "INSERT INTO \"{}\" VALUES ({})",
+                    t.name.replace('"', "\"\""),
+                    placeholders.join(", ")
+                );
+                let mut err = false;
+                f.scan_table(t, &mut |_rowid, vals| {
+                    let params: Vec<Value> = vals
+                        .into_iter()
+                        .map(|v| match v {
+                            mpedb_sqlitefmt::Value::Null => Value::Null,
+                            mpedb_sqlitefmt::Value::Int(i) => Value::Int(i),
+                            mpedb_sqlitefmt::Value::Float(x) => Value::Float(x),
+                            mpedb_sqlitefmt::Value::Text(s) => Value::Text(s),
+                            mpedb_sqlitefmt::Value::Blob(b) => Value::Blob(b),
+                        })
+                        .collect();
+                    if newdb.query(&ins, &params).is_err() {
+                        err = true;
+                    }
+                    Ok(())
+                })
+                .map_err(|_| SQLITE_NOTADB)?;
+                if err {
+                    return Err(SQLITE_NOTADB);
+                }
+            }
+            adopt_reopened(c, newdb);
+            let old_path = std::mem::replace(&mut c.path, newpath);
+            match std::mem::replace(&mut c.backing, Backing::Ephemeral) {
+                Backing::Ephemeral => {
+                    let _ = std::fs::remove_file(&old_path);
+                }
+                Backing::NamedMemory => {
+                    if named_memory_release(&old_path) {
+                        let _ = std::fs::remove_file(&old_path);
+                    }
+                }
+                Backing::File => {}
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&staged);
+        free_buf();
+        return match rc {
+            Ok(()) => SQLITE_OK,
+            Err(code) => {
+                let msg = if code == SQLITE_NOTADB {
+                    "file is not a database"
+                } else {
+                    "could not stage the deserialized image"
+                };
+                fail(c, code, msg)
+            }
+        };
     }
     // Bytes that are not an mpedb image at all: sqlite's own words and code
     // (CPython's `test_deserialize_corrupt_database` asserts the message; the

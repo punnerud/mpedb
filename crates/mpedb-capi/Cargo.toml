@@ -22,4 +22,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 mpedb = { path = "../mpedb" }
+mpedb-sqlitefmt = { path = "../mpedb-sqlitefmt" }
 libc = "0.2"

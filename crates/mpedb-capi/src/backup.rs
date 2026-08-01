@@ -62,6 +62,11 @@ pub struct Sqlite3Backup {
     /// makes `sqlite3_close` refuse while a backup is outstanding — so this
     /// pointer cannot dangle.
     dst: *mut Sqlite3,
+    /// The SOURCE connection when the source schema was `main` — the restart
+    /// check reads its commit counter per step (sqlite requires the source
+    /// stay valid until `finish`, the same contract). Null for temp/attached
+    /// sources, which keep the no-restart behaviour.
+    src_main: *mut Sqlite3,
     image: Option<mpedb::backup::BackupImage>,
     /// Set once the image has been installed over the destination: further
     /// steps are `SQLITE_DONE` no-ops, and `finish` has nothing to undo.
@@ -183,7 +188,18 @@ pub unsafe extern "C" fn sqlite3_backup_init(
             // would deadlock against it. sqlite reports exactly this as BUSY.
             return fail(d, SQLITE_BUSY, "source database is locked".into());
         }
-        s.db.backup_capture(&dest_path)
+        let img = s.db.backup_capture(&dest_path);
+        // Plan §11: pace the meter over the REAL sqlite-image geometry of the
+        // content when the writer's v1 scope covers it (the shim's ordinary
+        // CREATE TABLE shape). foo + 2 rows IS 2 pages — no number is chosen.
+        if let Ok(mut i) = img {
+            if let Ok(Some(bytes)) = s.db.sqlite_image(&[crate::SEED_TABLE]) {
+                i.set_sqlite_geometry(bytes.len());
+            }
+            Ok(i)
+        } else {
+            img
+        }
     } else {
         // An ATTACHed schema name: capture that member's file (CPython
         // `test_database_source_name` backs up `attached_db` after ATTACH).
@@ -215,6 +231,7 @@ pub unsafe extern "C" fn sqlite3_backup_init(
     };
     let b = Box::new(Sqlite3Backup {
         dst,
+        src_main: if src_is_main { src } else { std::ptr::null_mut() },
         page_count: image.page_count(),
         remaining: image.page_count(),
         image: Some(image),
@@ -244,6 +261,33 @@ pub unsafe extern "C" fn sqlite3_backup_step(b: *mut c_void, n: c_int) -> c_int 
     let Some(image) = bk.image.as_mut() else {
         return SQLITE_MISUSE;
     };
+    // Restart on a mid-backup source commit (plan §11) — sqlite invalidates
+    // the partial copy and starts over; the measured trace is journal
+    // [1, 1, 0] with the new row IN the destination. Checked per step, one
+    // meta read; an open source txn defers to its commit.
+    if let Some(sc) = conn(bk.src_main) {
+        if sc.txn.is_none() && sc.db.snapshot_txn() != image.source_txn() {
+            let dest_path = match conn(bk.dst) {
+                Some(d) => d.path.clone(),
+                None => return SQLITE_MISUSE,
+            };
+            match sc.db.backup_capture(&dest_path) {
+                Ok(mut fresh) => {
+                    if let Ok(Some(bytes)) = sc.db.sqlite_image(&[crate::SEED_TABLE]) {
+                        fresh.set_sqlite_geometry(bytes.len());
+                    }
+                    image.restart_from(fresh);
+                    bk.page_count = image.page_count();
+                }
+                Err(e) => {
+                    if let Some(d) = conn(bk.dst) {
+                        d.set_error(SQLITE_IOERR, SQLITE_IOERR, &format!("backup restart failed: {e}"));
+                    }
+                    return SQLITE_IOERR;
+                }
+            }
+        }
+    }
     let done = image.step(n as i64);
     bk.remaining = image.remaining();
     if !done {

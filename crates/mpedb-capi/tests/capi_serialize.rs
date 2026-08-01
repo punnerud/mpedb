@@ -1,8 +1,11 @@
-//! `sqlite3_serialize` / `sqlite3_deserialize` (plan §5), driven through the
-//! exported C API. The image is mpedb's OWN format — the pair round-trips
-//! it; nothing else adopts it. CPython's `SerializeTests` is the governing
-//! spec; this pins the shim-level pieces it exercises plus the ownership
-//! rule its harness cannot show.
+//! `sqlite3_serialize` / `sqlite3_deserialize` / the backup progress meter
+//! (plan §5 + §11), driven through the exported C API. Since §11 the image
+//! is a REAL sqlite file of the logical content (the writer's v1 scope —
+//! the shim's ordinary rowid-table shape); out-of-scope bases refuse by
+//! name, and deserialize adopts BOTH formats (sqlite via the native
+//! reader, mpedb bytes as before). CPython's SerializeTests/BackupTests
+//! are the governing spec; this pins what their harness cannot show, plus
+//! the restart semantics repo-side (CPython runs by hand).
 
 use mpedb_sqlite3::*;
 use std::ffi::{c_char, c_longlong, c_uint, c_void, CStr, CString};
@@ -39,8 +42,17 @@ const RESIZEABLE: c_uint = 2;
 fn serialize_roundtrips_and_the_missing_table_speaks_sqlite() {
     unsafe {
         let db = open_memory();
-        assert_eq!(exec_rc(db, "CREATE TABLE t (a INTEGER PRIMARY KEY, v TEXT)"), SQLITE_OK);
+        assert_eq!(exec_rc(db, "CREATE TABLE t (a INTEGER, v TEXT)"), SQLITE_OK);
         assert_eq!(exec_rc(db, "INSERT INTO t VALUES (1, 'x')"), SQLITE_OK);
+
+        // §11: serialize now emits a REAL sqlite image (the writer's v1
+        // scope: the shim's ordinary rowid-table shape). A DECLARED primary
+        // key is outside it — NULL, the named refusal, never a foreign
+        // format under sqlite's name.
+        assert_eq!(exec_rc(db, "CREATE TABLE pked (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+        let mut sz: c_longlong = 0;
+        assert!(sqlite3_serialize(db, ptr::null(), &mut sz, 0).is_null());
+        assert_eq!(exec_rc(db, "DROP TABLE pked"), SQLITE_OK);
 
         // NOCOPY: the documented "no contiguous in-memory image" answer is
         // NULL — CPython then retries without the flag.
@@ -99,13 +111,13 @@ fn deserialize_detaches_from_a_real_file_without_touching_it() {
         let cpath = cs(&path);
         let mut db: *mut Sqlite3 = ptr::null_mut();
         assert_eq!(sqlite3_open(cpath.as_ptr(), &mut db), SQLITE_OK);
-        assert_eq!(exec_rc(db, "CREATE TABLE keepme (k INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec_rc(db, "CREATE TABLE keepme (k INTEGER)"), SQLITE_OK);
         assert_eq!(exec_rc(db, "INSERT INTO keepme VALUES (42)"), SQLITE_OK);
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         // Serialize an EMPTY image from a second connection and adopt it.
         let other = open_memory();
-        assert_eq!(exec_rc(other, "CREATE TABLE fresh (f INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec_rc(other, "CREATE TABLE fresh (f INTEGER)"), SQLITE_OK);
         let mut size: c_longlong = 0;
         let img = sqlite3_serialize(other, ptr::null(), &mut size, 0);
         assert!(!img.is_null());
@@ -132,5 +144,46 @@ fn deserialize_detaches_from_a_real_file_without_touching_it() {
         let after = std::fs::metadata(&path).unwrap().modified().unwrap();
         let _ = before <= after; // informational only — content above decides
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+
+/// §11's restart rule, repo-side: a source COMMIT mid-backup invalidates
+/// the partial copy — the meter rewinds (sqlite's own semantics, measured:
+/// journal [1, 1, 0]) and the destination carries the mid-backup row.
+#[test]
+fn a_mid_backup_source_commit_restarts_the_copy() {
+    unsafe {
+        let src = open_memory();
+        assert_eq!(exec_rc(src, "CREATE TABLE foo (key INTEGER)"), SQLITE_OK);
+        assert_eq!(exec_rc(src, "INSERT INTO foo VALUES (3)"), SQLITE_OK);
+        assert_eq!(exec_rc(src, "INSERT INTO foo VALUES (4)"), SQLITE_OK);
+        let dst = open_memory();
+        let main = cs("main");
+        let h = sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr());
+        assert!(!h.is_null());
+        // (stock reports pagecount 0 before the first step; the shim knows
+        // the geometry from init — a benign difference nothing reads.)
+        // Step 1 of 2 (the sqlite-image geometry of foo+2 rows IS 2 pages).
+        assert_eq!(sqlite3_backup_step(h, 1), SQLITE_OK);
+        assert_eq!(sqlite3_backup_remaining(h), 1);
+        assert_eq!(sqlite3_backup_pagecount(h), 2);
+        // The source commits mid-backup…
+        assert_eq!(exec_rc(src, "INSERT INTO foo VALUES (1001)"), SQLITE_OK);
+        // …so the NEXT step restarts: remaining goes back to 1, not 0.
+        assert_eq!(sqlite3_backup_step(h, 1), SQLITE_OK);
+        assert_eq!(sqlite3_backup_remaining(h), 1);
+        // And the copy completes with the new row IN the destination.
+        assert_eq!(sqlite3_backup_step(h, 1), SQLITE_DONE);
+        assert_eq!(sqlite3_backup_remaining(h), 0);
+        assert_eq!(sqlite3_backup_finish(h), SQLITE_OK);
+        let s = cs("SELECT key FROM foo WHERE key >= 1000");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(dst, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int64(st, 0), 1001);
+        sqlite3_finalize(st);
+        sqlite3_close(dst);
+        sqlite3_close(src);
     }
 }
