@@ -1,11 +1,14 @@
 # PyPI publish: when the tests are green on main, the `mpedb` package updates.
 #
-# Self-contained gate: this workflow runs the full workspace + capi suites
-# itself and only builds/publishes wheels if they pass — "green on GitHub"
-# IS the publish condition, not a parallel hope. `--skip-existing` makes a
-# push that does not bump the version in crates/mpedb-py/pyproject.toml a
-# no-op at the upload step, so ordinary pushes stay cheap and releasing is
-# exactly "bump the version, push, watch it go green".
+# Self-contained gate, spent where it pays: the PYTHON suite (the coverage no
+# other workflow runs — its second pass against one directory is what caught
+# #163) runs on EVERY push; the full workspace + capi + clippy gate and the
+# whole wheel fan (including the QEMU-emulated ARM builds, the expensive part)
+# run only when crates/mpedb-py/pyproject.toml names a version PyPI does not
+# have yet. An ordinary push is a few cached minutes; releasing is exactly
+# "bump the version, push, watch it go green". The version probe fails OPEN —
+# a PyPI hiccup just means the fan runs and `--skip-existing` discards it at
+# upload, which was this workflow's behavior on every push before the gate.
 
 name: pypi
 
@@ -17,23 +20,39 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pypi-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      new: ${{ steps.check.outputs.new }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        name: is this version already on PyPI?
+        run: |
+          v=$(grep -m1 '^version = ' crates/mpedb-py/pyproject.toml | cut -d'"' -f2)
+          if curl -fs "https://pypi.org/pypi/mpedb/$v/json" > /dev/null; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "mpedb $v is already on PyPI — wheel fan skipped"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "mpedb $v is not on PyPI — full gate + wheel fan run"
+          fi
+
+  # The binding's OWN suite, every push. Run TWICE against one directory —
+  # its documented mode, and how it exercises persistence across process
+  # restarts (that second run is what caught #163: live DDL leaving a table
+  # behind).
+  pysuite:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: workspace tests
-        run: cargo test --workspace
-      - name: capi tests (own workspace)
-        run: cargo test --manifest-path crates/mpedb-capi/Cargo.toml
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      # The binding's OWN suite, not just the Rust crate that backs it. Run
-      # TWICE against one directory — its documented mode, and how it exercises
-      # persistence across process restarts (that second run is what caught
-      # #163: live DDL leaving a table behind).
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -50,8 +69,28 @@ jobs:
           python crates/mpedb-py/pytest/test_mpedb.py "$d"
           python crates/mpedb-py/pytest/test_sync.py "$(mktemp -d)"
 
+  # The full self-contained publish gate — release pushes only. Ordinary
+  # pushes get the same coverage from linux.yml on the same commit; a RELEASE
+  # does not lean on that, it re-proves it here before anything uploads.
+  test:
+    needs: version
+    if: needs.version.outputs.new == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: workspace tests
+        run: cargo test --workspace
+      - name: capi tests (own workspace)
+        run: cargo test --manifest-path crates/mpedb-capi/Cargo.toml
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   # Linux wheels: x86-64 plus the two ARM shapes the engine is actually
   # crash-tested on (aarch64 and 32-bit armv7 — the Raspberry Pi pair).
+  # Cross wheels build inside QEMU-emulated manylinux containers — the
+  # expensive jobs the version gate exists to skip.
   #
   # The note that used to stand here — "no Windows wheel: the engine is POSIX at
   # its core ... a Windows port is an engine project, not a CI matrix entry" —
@@ -61,14 +100,14 @@ jobs:
   # green on `windows-latest`. The wheel is `wheel-windows` below, and the
   # Python suite runs there in `windows.yml` before this ever builds it.
   wheel-linux:
-    needs: test
+    needs: [version, pysuite, test]
+    if: needs.version.outputs.new == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
         target: [x86_64, aarch64, armv7]
     steps:
       - uses: actions/checkout@v4
-      # Cross wheels build inside QEMU-emulated manylinux containers.
       - uses: docker/setup-qemu-action@v3
         if: matrix.target != 'x86_64'
       - uses: PyO3/maturin-action@v1
@@ -83,7 +122,8 @@ jobs:
           path: dist
 
   wheel-windows:
-    needs: test
+    needs: [version, pysuite, test]
+    if: needs.version.outputs.new == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +137,8 @@ jobs:
           path: dist
 
   wheel-macos:
-    needs: test
+    needs: [version, pysuite, test]
+    if: needs.version.outputs.new == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -111,7 +152,8 @@ jobs:
           path: dist
 
   sdist:
-    needs: test
+    needs: [version, pysuite, test]
+    if: needs.version.outputs.new == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

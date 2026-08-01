@@ -86,18 +86,38 @@ import mpedb as sqlite3   # existing sqlite3 code runs unchanged
 `connect("app.mpedb")` is the native engine. Details:
 [crates/mpedb-py](crates/mpedb-py/README.md).
 
-**Any libsqlite3 consumer** — build the ABI-level shim and preload it; the
-program's own sqlite3 calls land in mpedb:
+**Any libsqlite3 consumer** — no build needed: every
+[release](https://github.com/punnerud/mpedb/releases) since v0.2.0 ships the
+ABI-level shim prebuilt (Linux x86-64 `.so`, macOS arm64 `.dylib`, sha256sums
+alongside). Download, unpack, preload — the program's own sqlite3 calls land
+in mpedb:
 
 ```sh
-cargo build --release --manifest-path crates/mpedb-capi/Cargo.toml
-LD_PRELOAD=$PWD/crates/mpedb-capi/target/release/libmpedb_sqlite3.so \
-    python3 app.py    # CPython's own sqlite3 module, unchanged
+curl -LO https://github.com/punnerud/mpedb/releases/latest/download/libmpedb_sqlite3-0.2.1-linux-x86_64.tar.gz
+tar xzf libmpedb_sqlite3-0.2.1-linux-x86_64.tar.gz
+LD_PRELOAD=$PWD/libmpedb_sqlite3.so python3 app.py   # CPython's own sqlite3 module, unchanged
+```
+
+`pip install mpedb` is NOT this: the pip package is its own module you import
+*instead of* `sqlite3`. The preload route is for code you do not want to touch
+— frameworks included. A Django project switches its test run without changing
+a line or a setting (the `django.db.backends.sqlite3` backend runs unchanged,
+migrations included):
+
+```sh
+LD_PRELOAD=$PWD/libmpedb_sqlite3.so python3 manage.py test
 ```
 
 This is the binary CPython's `test_sqlite3` (466/466) and the Django and
-SQLAlchemy suites run through. Per-function status, macOS interposition, and
-the refusal list: [C-API-COMPAT.md](C-API-COMPAT.md).
+SQLAlchemy suites run through. Building it yourself is one command when you
+want HEAD instead of a release:
+
+```sh
+cargo build --release --manifest-path crates/mpedb-capi/Cargo.toml
+```
+
+Per-function status, macOS interposition (`DYLD_INSERT_LIBRARIES`, with the
+macOS-26 caveat), and the refusal list: [C-API-COMPAT.md](C-API-COMPAT.md).
 
 **CLI** — the `mpedb` binary (REPL, dump, stress/crash harnesses, benchmarks,
 sqlite mirror/checkpoint). On macOS and Linux, from the tap:
@@ -106,6 +126,10 @@ sqlite mirror/checkpoint). On macOS and Linux, from the tap:
 brew install punnerud/mpedb/mpedb
 mpedb data.db     # opens an existing sqlite .db directly
 ```
+
+Or grab it prebuilt from the [releases](https://github.com/punnerud/mpedb/releases)
+— Linux x86-64, macOS arm64 and Windows x86-64 (`mpedb.exe`), no toolchain
+required.
 
 Or from source anywhere a Rust toolchain runs:
 
