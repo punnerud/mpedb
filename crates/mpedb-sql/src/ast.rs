@@ -296,6 +296,12 @@ pub(crate) enum Expr {
     Lit(Value),
     /// 0-based parameter index.
     Param(u16),
+    /// `t.*` — per-table star expansion (a SELECT-ITEM form, not a value).
+    /// Parsed as a marker and expanded by the planner into the table's
+    /// visible columns as `Qualified(t, col)` items, where the schema is in
+    /// hand; the binder refuses one that survives anywhere else (`count(t.*)`
+    /// is an error in sqlite too).
+    TableStar(String),
     /// A bare column reference. The bool is `true` when the name was written
     /// DOUBLE-QUOTED — the one spelling sqlite's DQS misfeature applies to: in
     /// expression position, a double-quoted name that resolves to NO column

@@ -97,6 +97,15 @@ fn create_ddl(t: &mpedb::TableDef, idx: &IndexRecords) -> String {
             if c.collation != mpedb::Collation::Binary {
                 s.push_str(&format!(" COLLATE {}", c.collation.name()));
             }
+            // A CHECK is a real constraint the replay must re-create — and it
+            // is what Django's `get_constraints` reads back out of
+            // `sqlite_master.sql`. Omitting it made every rebuilt/renamed
+            // table LOOK unconstrained while the compiled program still
+            // enforced it (the rename test measured exactly that: 0 checks
+            // reported, `x > 10` still firing).
+            if let Some(chk) = &c.check {
+                s.push_str(&format!(" CHECK ({chk})"));
+            }
             // A GENERATED column MUST carry its clause: without it the replayed
             // statement makes an ordinary column, and the dump's INSERTs — which
             // take their column list from `table_info`, where a generated column

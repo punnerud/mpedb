@@ -1330,14 +1330,12 @@ impl<'a> Parser<'a> {
     /// a column — so accepting it here could only ever guess.
     fn dot_suffix(&mut self, qualifier: String) -> Result<Expr> {
         self.pos += 1; // the `.`
-        // `t.*` is per-table star expansion, a different feature from a
-        // qualified column — name it, rather than emit "expected a column name"
-        // at a `*` the writer put there on purpose.
+        // `t.*` — per-table star expansion. A MARKER the planner expands
+        // where the schema is in hand; anywhere an expression is genuinely
+        // required, the binder refuses it by name (as sqlite does).
         if self.peek() == Some(&Tok::Star) {
-            return Err(self.err_here(format!(
-                "`{qualifier}.*` (per-table star expansion) is not supported — \
-                 use a bare `*`, or list the columns"
-            )));
+            self.pos += 1;
+            return Ok(Expr::TableStar(qualifier));
         }
         let col = self.ident("column name after `.`")?;
         if self.peek() == Some(&Tok::Dot) {

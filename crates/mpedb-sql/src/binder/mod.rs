@@ -792,6 +792,12 @@ impl<'a> Binder<'a> {
                 })?;
                 Ok((BExpr::Param(*i), ty))
             }
+            // `t.*` reaching the binder means it stood somewhere other than a
+            // top-level select item (the planner expands those before binding)
+            // — `count(t.*)`, a WHERE, an ORDER BY. sqlite refuses these too.
+            ast::Expr::TableStar(q) => Err(bind_err(format!(
+                "`{q}.*` is only valid as a top-level select item"
+            ))),
             ast::Expr::Col(name, dq) => {
                 // sqlite's DQS misfeature, and ONLY where sqlite applies it
                 // (measured, 3.45.1): a DOUBLE-quoted name in expression

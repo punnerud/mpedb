@@ -1337,3 +1337,79 @@ fn a_typeless_argument_to_a_numeric_function_agrees_with_sqlite() {
     assert_same(setup, "SELECT typeof(round(1e17)), round(1e17) = 1e17");
     assert_same(setup, "SELECT round(NULL), round(1.5, NULL), typeof(round(NULL))");
 }
+
+/// The three fixes that closed the LAST Django shim-onlys (S35), each pinned
+/// with the oracle where the measurement was made.
+#[test]
+fn insert_select_stores_a_zero_one_into_a_bool_column() {
+    // Django's table rebuild writes `SELECT …, 0 AS awesome` into the rebuilt
+    // table's bool column (`test_add_field_temp_default_boolean`): the
+    // parameter rule — 0/1 IS sqlite's boolean — applied to the copy path.
+    assert_same(
+        &[
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT)",
+            "INSERT INTO src VALUES (1, 'a')",
+            "CREATE TABLE dst (id INTEGER PRIMARY KEY, v TEXT, flag bool NOT NULL)",
+            "INSERT INTO dst SELECT id, v, 0 FROM src",
+        ],
+        "SELECT id, v, flag FROM dst",
+    );
+    // Any OTHER integer keeps refusing (sqlite stores 2; mpedb's rigid bool
+    // cannot — the documented deviation, a refusal and never a wrong answer).
+    let t = open();
+    t.db.query("CREATE TABLE s2 (id INTEGER PRIMARY KEY)", &[]).unwrap();
+    t.db.query("INSERT INTO s2 VALUES (1)", &[]).unwrap();
+    t.db.query("CREATE TABLE d2 (id INTEGER PRIMARY KEY, f bool)", &[]).unwrap();
+    assert!(t.db.query("INSERT INTO d2 SELECT id, 2 FROM s2", &[]).is_err());
+}
+
+/// RENAME COLUMN rewrites the CHECK's SOURCE (rename_identifier + compile-
+/// compare, the generated-column contract) and the reconstructed DDL prints
+/// it — enforcement always survived (ordinals), but the TEXT still named the
+/// old column and the C-API's sqlite_master dropped the clause entirely, so
+/// Django's get_constraints read back zero checks
+/// (`test_rename_field_with_check_to_truncated_name`).
+#[test]
+fn rename_column_carries_its_check_text() {
+    let t = open();
+    t.db.query("CREATE TABLE rc (id INTEGER PRIMARY KEY, x INTEGER CHECK (x > 10))", &[])
+        .unwrap();
+    t.db.query("ALTER TABLE rc RENAME COLUMN x TO y", &[]).unwrap();
+    // The rewritten text enforces under the NEW name…
+    let e = t.db.query("INSERT INTO rc VALUES (1, 5)", &[]).unwrap_err().to_string();
+    assert!(e.contains('y') && !e.contains('x'), "{e}");
+    // …and still admits what it always did.
+    t.db.query("INSERT INTO rc VALUES (2, 11)", &[]).unwrap();
+}
+
+/// `a.*` — per-table star expansion (Django's `raw_query.test_annotations`
+/// writes `SELECT a.*, count(b.id) …`). Expanded by the planner into the
+/// table's visible columns; misuse positions keep sqlite's refusal.
+#[test]
+fn per_table_star_expands_like_sqlite() {
+    const SETUP: &[&str] = &[
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, nm TEXT)",
+        "INSERT INTO a VALUES (1, 'x')",
+        "INSERT INTO a VALUES (2, 'y')",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, aid INTEGER)",
+        "INSERT INTO b VALUES (10, 1)",
+        "INSERT INTO b VALUES (11, 1)",
+    ];
+    for q in [
+        "SELECT a.* FROM a ORDER BY a.id",
+        "SELECT a.*, b.id FROM a JOIN b ON b.aid = a.id ORDER BY b.id",
+        "SELECT t.* FROM a AS t ORDER BY t.id",
+        "SELECT a.id, a.* FROM a ORDER BY a.id",
+        "SELECT a.*, count(b.id) FROM a LEFT JOIN b ON b.aid = a.id \
+         GROUP BY a.id, a.nm ORDER BY a.id",
+    ] {
+        assert_same(SETUP, q);
+    }
+    // Misuse positions refuse, as sqlite does.
+    let t = open();
+    for s in SETUP {
+        t.db.query(s, &[]).unwrap();
+    }
+    assert!(t.db.query("SELECT count(a.*) FROM a", &[]).is_err());
+    assert!(t.db.query("SELECT z.* FROM a", &[]).is_err());
+}

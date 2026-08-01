@@ -77,7 +77,8 @@ pub(super) fn expr_has_subquery(e: &ast::Expr) -> bool {
         // stage 1 (the window planner binds those sub-expressions directly); one
         // that appears there is refused by the binder, not lifted here.
         E::Window { .. } => false,
-        E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
+        E::TableStar(_)
+        | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) | E::Raise(..) => false,
     }
 }
@@ -531,7 +532,7 @@ impl Lift<'_> {
             // Windows are not descended into for subquery lifting (stage 1); a
             // subquery inside one reaches the binder's refusal unchanged.
             other @ E::Window { .. } => other.clone(),
-            other @ (E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_)
+            other @ (E::TableStar(_) | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_)
             | E::Excluded(_) | E::Qualified(..) | E::Raise(..)) => other.clone(),
         })
     }
@@ -1153,7 +1154,7 @@ impl<'a> Correlate<'a, '_> {
             // a window inside a subquery that references an enclosing row reaches
             // the binder's "unknown column" / window refusal unchanged.
             other @ E::Window { .. } => other.clone(),
-            other @ (E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_)
+            other @ (E::TableStar(_) | E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_)
             | E::Raise(..)) => other.clone(),
         })
     }

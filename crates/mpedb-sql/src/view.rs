@@ -741,7 +741,8 @@ fn rewrite_cte_cols(
             }
             Ok(())
         }
-        Expr::Lit(_)
+        Expr::TableStar(_)
+        | Expr::Lit(_)
         | Expr::Param(_)
         | Expr::ContextRef(_)
         | Expr::Excluded(_)
@@ -1384,7 +1385,8 @@ fn expr_mentions(e: &Expr, hidden: &[String]) -> bool {
         // too — over-counting is the safe direction here.
         Expr::Subquery(b) | Expr::Exists(b, _) => body(b),
         Expr::InSubquery(a, b, _) => sub(a) || body(b),
-        Expr::Lit(_)
+        Expr::TableStar(_)
+        | Expr::Lit(_)
         | Expr::Param(_)
         | Expr::ContextRef(_)
         | Expr::Excluded(_)
@@ -1522,7 +1524,8 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
         // keeps aggregate/correlated bodies out, and a plain uncorrelated
         // subquery does not see the derived alias, so it is left as-is.
         Expr::Subquery(_) | Expr::Exists(_, _) | Expr::InSubquery(_, _, _) => {}
-        Expr::Lit(_)
+        Expr::TableStar(_)
+        | Expr::Lit(_)
         | Expr::Param(_)
         | Expr::Col(..)
         | Expr::ContextRef(_)
@@ -1926,6 +1929,7 @@ pub(crate) fn expr_aggregates(e: &Expr) -> bool {
         Expr::Subquery(_)
         | Expr::Exists(..)
         | Expr::InSubquery(..)
+        | Expr::TableStar(_)
         | Expr::Lit(_)
         | Expr::Param(_)
         | Expr::Col(..)

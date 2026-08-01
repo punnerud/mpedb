@@ -3958,6 +3958,13 @@ fn build_insert_row_impl<'a>(
 fn coerce_insert_value(v: Value, ty: mpedb_types::ColumnType) -> Value {
     match (&v, ty) {
         (Value::Int(i), mpedb_types::ColumnType::Float64) => Value::Float(*i as f64),
+        // The parameter rule (`coerce_params` below), applied to the
+        // INSERT … SELECT copy: 0/1 IS sqlite's representation of a boolean,
+        // so a source column feeding a `bool` target converts exactly —
+        // Django's table rebuild writes `SELECT …, 0 AS awesome` into the
+        // rebuilt table's bool column (`test_add_field_temp_default_boolean`).
+        // Any other integer keeps refusing via the engine's type check.
+        (Value::Int(i @ (0 | 1)), mpedb_types::ColumnType::Bool) => Value::Bool(*i == 1),
         _ => v,
     }
 }

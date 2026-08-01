@@ -261,6 +261,57 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
 /// explicit item list of the VISIBLE columns (#94). The hidden trailing `rowid`
 /// is dropped, so the resulting projection, ORDER-BY ordinals and DISTINCT all
 /// operate over exactly the columns sqlite's `SELECT *` would show.
+/// Expand every `t.*` select item into `t`'s VISIBLE columns as
+/// `Qualified(t, col)` items, resolving `t` against the FROM sources by the
+/// name each is ADDRESSED by (alias when given — an aliased table's own name
+/// is out of scope, PG's rule the binder enforces). `None` = nothing to do.
+/// An unknown qualifier gets sqlite's words; an alias on the star is refused
+/// (`a.* AS x` is not a thing in sqlite either).
+fn expand_table_stars(
+    s: &ast::SelectStmt,
+    schema: &Schema,
+    cte: Option<CteRef<'_>>,
+) -> Result<Option<ast::SelectStmt>> {
+    let Some(items) = &s.items else { return Ok(None) };
+    if !items.iter().any(|(e, _)| matches!(e, ast::Expr::TableStar(_))) {
+        return Ok(None);
+    }
+    let mut out: Vec<(ast::Expr, Option<String>)> = Vec::with_capacity(items.len());
+    for (e, alias) in items {
+        let ast::Expr::TableStar(q) = e else {
+            out.push((e.clone(), alias.clone()));
+            continue;
+        };
+        if alias.is_some() {
+            return Err(bind_err(format!("`{q}.*` cannot take an alias")));
+        }
+        let mut hit: Option<(String, String)> = None;
+        if let Some(base) = &s.table {
+            let name = s.alias.clone().unwrap_or_else(|| base.clone());
+            if mpedb_types::ident_eq(&name, q) {
+                hit = Some((name, base.clone()));
+            }
+        }
+        if hit.is_none() {
+            for jc in &s.joins {
+                let name = jc.alias.clone().unwrap_or_else(|| jc.table.clone());
+                if mpedb_types::ident_eq(&name, q) {
+                    hit = Some((name, jc.table.clone()));
+                    break;
+                }
+            }
+        }
+        let Some((name, tbl)) = hit else {
+            return Err(bind_err(format!("no such table: {q}")));
+        };
+        let (_, t) = super::resolve_table_cte(schema, cte, &tbl)?;
+        for c in t.visible_columns() {
+            out.push((ast::Expr::Qualified(name.clone(), c.name.clone()), None));
+        }
+    }
+    Ok(Some(ast::SelectStmt { items: Some(out), ..s.clone() }))
+}
+
 fn expand_implicit_rowid_star(s: &ast::SelectStmt, table: &TableDef) -> ast::SelectStmt {
     let items = table
         .visible_columns()
@@ -322,6 +373,18 @@ pub(super) fn plan_select<'s>(
             "a derived table in JOIN position is not supported in this context",
         ));
     }
+    // `t.*` select items expand HERE, where the schema is in hand — before
+    // the RIGHT rewrite and the lift, so every later stage sees only plain
+    // `Qualified` items (Django's raw `SELECT a.*, count(…) FROM … a …` is
+    // the consumer). The binder refuses one anywhere else.
+    let star_expanded;
+    let s = match expand_table_stars(s, schema, cte)? {
+        Some(x) => {
+            star_expanded = x;
+            &star_expanded
+        }
+        None => s,
+    };
     // RIGHT rewrites to a swapped LEFT before anything else looks at the
     // statement — the subquery lift's correlation scope and every stage
     // below must see the FINAL table order.
@@ -838,6 +901,7 @@ fn rewrite_where_aliases_rec(
         }
         ast::Expr::Col(..)
         | ast::Expr::Qualified(..)
+        | ast::Expr::TableStar(_)
         | ast::Expr::Lit(_)
         | ast::Expr::Param(_)
         | ast::Expr::ContextRef(_)

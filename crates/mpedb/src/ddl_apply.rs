@@ -917,6 +917,47 @@ pub(crate) fn rename_generated_srcs(
     Ok(out)
 }
 
+/// Rewritten CHECK sources for a column rename — `rename_generated_srcs`'s
+/// twin, same contract: the rename arrives as DATA (ordinal, new source),
+/// verified by compiling BOTH spellings against before/after tables and
+/// requiring the identical program. A CHECK that stops compiling refuses the
+/// rename by name — shipping a schema whose text and behaviour disagree is
+/// exactly the failure this exists to prevent.
+pub(crate) fn rename_check_srcs(
+    t: &mpedb_types::TableDef,
+    column: &str,
+    new_name: &str,
+) -> Result<Vec<(u16, String)>> {
+    if t.columns.iter().all(|c| c.check.is_none()) {
+        return Ok(Vec::new());
+    }
+    let mut after = t.clone();
+    match after.columns.iter_mut().find(|c| mpedb_types::ident_eq(&c.name, column)) {
+        Some(c) => c.name = new_name.to_string(),
+        None => return Ok(Vec::new()),
+    }
+    let mut out = Vec::new();
+    for (i, c) in t.columns.iter().enumerate() {
+        let Some(src0) = &c.check else { continue };
+        let src = mpedb_sql::rename_identifier(src0, column, new_name)?;
+        let refuse = |why: String| {
+            Error::Schema(format!(
+                "cannot rename column `{column}` of `{}`: the CHECK on `{}`                  would become `{src}`, which {why}",
+                t.name, c.name
+            ))
+        };
+        let before = mpedb_sql::compile_check(src0, t)
+            .map_err(|e| refuse(format!("cannot be checked — `{src0}` does not compile: {e}")))?;
+        let after_prog = mpedb_sql::compile_check(&src, &after)
+            .map_err(|e| refuse(format!("does not compile: {e}")))?;
+        if before != after_prog {
+            return Err(refuse("checks something different".into()));
+        }
+        out.push((i as u16, src));
+    }
+    Ok(out)
+}
+
 /// Resolve `CREATE INDEX` column names to ordinals against `t`. Shared by the
 /// autocommit facade and an in-transaction session (#95).
 pub(crate) fn resolve_index_columns(
@@ -1277,16 +1318,19 @@ impl Database {
                 return self.apply_alter_rename(&table, |w, id| w.alter_rename_table(id, &new_name));
             }
             DdlStmt::AlterRenameColumn { table, column, new_name } => {
-                let srcs = {
+                let (srcs, chk_srcs) = {
                     let bundle = self.schema();
                     let id = bundle.schema.table_id(&table).ok_or_else(|| {
                         Error::Bind(format!("ALTER TABLE: no such table `{table}`"))
                     })?;
                     let t = bundle.schema.table(id).expect("table_id resolved");
-                    rename_generated_srcs(t, &column, &new_name)?
+                    (
+                        rename_generated_srcs(t, &column, &new_name)?,
+                        rename_check_srcs(t, &column, &new_name)?,
+                    )
                 };
                 return self.apply_alter_rename(&table, |w, id| {
-                    w.alter_rename_column(id, &column, &new_name, &srcs)
+                    w.alter_rename_column(id, &column, &new_name, &srcs, &chk_srcs)
                 });
             }
             DdlStmt::AlterAddColumn { table, column } => {

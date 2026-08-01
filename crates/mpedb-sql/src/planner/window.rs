@@ -38,7 +38,8 @@ pub(super) fn contains_window(e: &ast::Expr) -> bool {
                 || els.as_deref().is_some_and(contains_window)
         }
         E::Agg(..) | E::Subquery(_) | E::Exists(..) => false,
-        E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
+        E::TableStar(_)
+        | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) | E::Raise(..) => false,
     }
 }
@@ -135,7 +136,7 @@ pub(super) fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Res
         // A window inside an aggregate/subquery is refused by the binder; leave
         // it for that refusal rather than lifting it here.
         other @ (E::Agg(..) | E::Subquery(_) | E::Exists(..)) => other.clone(),
-        other @ (E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
+        other @ (E::TableStar(_) | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) | E::Raise(..)) => other.clone(),
     })
 }

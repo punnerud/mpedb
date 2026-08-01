@@ -1304,6 +1304,12 @@ impl Schema {
         column: &str,
         new_name: &str,
         generated_srcs: &[(u16, String)],
+        // Rewritten CHECK sources, same contract as `generated_srcs`: a CHECK
+        // names its columns in SOURCE text, the compiled program reads
+        // ordinals — so enforcement survived a rename while the text (the DDL
+        // a dump replays, the message a violation quotes, the constraint
+        // Django's get_constraints reads back) still named the OLD column.
+        check_srcs: &[(u16, String)],
     ) -> Result<Schema> {
         let mut tables = self.tables.clone();
         let slot = tables
@@ -1363,6 +1369,21 @@ impl Schema {
                 )));
             };
             g.expr = src.clone();
+        }
+        for (o, src) in check_srcs {
+            let Some(c) = slot.columns.get_mut(*o as usize) else {
+                return Err(Error::Schema(format!(
+                    "rewritten CHECK for column ordinal {o}, which table `{}` does not have",
+                    slot.name
+                )));
+            };
+            if c.check.is_none() {
+                return Err(Error::Schema(format!(
+                    "rewritten CHECK for `{}.{}`, which has none",
+                    slot.name, c.name
+                )));
+            }
+            c.check = Some(src.clone());
         }
         let col = slot
             .columns
@@ -3400,12 +3421,12 @@ mod tests {
 
         // A rename with NO rewritten source is refused: the `AS (…)` text would
         // keep naming a column that no longer exists. Silence is not consent.
-        let err = s.with_renamed_column(0, "b", "z", &[]).unwrap_err();
+        let err = s.with_renamed_column(0, "b", "z", &[], &[]).unwrap_err();
         assert!(format!("{err}").contains("no rewritten expression"), "{err}");
 
         // Supplied, it is taken — and the ordinal must be the generated
         // column's own, not the renamed one's.
-        let after = s.with_renamed_column(0, "b", "z", &[(3, "z".into())]).unwrap();
+        let after = s.with_renamed_column(0, "b", "z", &[(3, "z".into())], &[]).unwrap();
         let t = after.table(0).unwrap();
         assert_eq!(t.columns[2].name, "z");
         assert_eq!(t.columns[3].generated.as_ref().unwrap().expr, "z");
@@ -3419,7 +3440,7 @@ mod tests {
         // silent no-op. (Ordinal 3 is supplied too, so this trips the entry
         // check and not the completeness one above it.)
         let err = s
-            .with_renamed_column(0, "b", "z", &[(3, "z".into()), (1, "z".into())])
+            .with_renamed_column(0, "b", "z", &[(3, "z".into()), (1, "z".into())], &[])
             .unwrap_err();
         assert!(format!("{err}").contains("not generated"), "{err}");
     }

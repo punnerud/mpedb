@@ -4198,7 +4198,8 @@ impl WriteSession<'_> {
                 let id = resolve(&table)?;
                 let t = schema.schema.table(id).expect("resolve() returned a live id");
                 let srcs = crate::ddl_apply::rename_generated_srcs(t, &column, &new_name)?;
-                self.txn.alter_rename_column(id, &column, &new_name, &srcs)?;
+                let chk = crate::ddl_apply::rename_check_srcs(t, &column, &new_name)?;
+                self.txn.alter_rename_column(id, &column, &new_name, &srcs, &chk)?;
             }
             DdlStmt::AlterAddColumn { table, column } => {
                 let id = resolve(&table)?;

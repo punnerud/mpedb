@@ -1996,12 +1996,16 @@ impl<'e> WriteTxn<'e> {
         column: &str,
         new_name: &str,
         generated_srcs: &[(u16, String)],
+        check_srcs: &[(u16, String)],
     ) -> Result<()> {
         let bundle = Arc::clone(&self.bundle);
-        let new_schema =
-            bundle
-                .schema
-                .with_renamed_column(table_id, column, new_name, generated_srcs)?;
+        let new_schema = bundle.schema.with_renamed_column(
+            table_id,
+            column,
+            new_name,
+            generated_srcs,
+            check_srcs,
+        )?;
         self.publish_schema(&new_schema)
     }
 

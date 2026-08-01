@@ -523,7 +523,7 @@ fn rewrite_row_in_expr(e: &mut Expr, scope: &RowScope, map: &mut RowMap) -> Resu
         Expr::Raise(..) => Err(trg_err(
             "RAISE is only supported as its own `SELECT RAISE(...) [WHERE <cond>]`              statement in a trigger body",
         )),
-        Expr::Lit(_) | Expr::Col(..) | Expr::Excluded(_) => Ok(()),
+        Expr::TableStar(_) | Expr::Lit(_) | Expr::Col(..) | Expr::Excluded(_) => Ok(()),
         Expr::Unary(_, a)
         | Expr::IsNull(a, _)
         | Expr::Cast(a, _)

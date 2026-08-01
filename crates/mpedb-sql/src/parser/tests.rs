@@ -865,15 +865,20 @@ fn three_part_names_refuse_by_name() {
     }
 }
 
-/// `t.*` is per-table star expansion — a different feature from a qualified
-/// column, and one mpedb does not have. It refuses by NAME rather than
-/// complaining about a missing column name at a `*` the writer meant.
+/// `t.*` is per-table star expansion — a SELECT-ITEM form, not a value
+/// (Django's raw `SELECT a.*, count(…)` is the consumer).
 #[test]
-fn per_table_star_refuses_by_name() {
+fn per_table_star_parses_as_a_marker_item() {
+    // `t.*` parses to the TableStar marker (every quoting spelling); the
+    // PLANNER expands it into the table's visible columns where the schema
+    // is in hand, and the binder refuses one anywhere else.
     for src in ["t.*", "\"t\".*", "[t].*"] {
-        let e = parse_statement(&format!("SELECT {src} FROM t"))
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("star expansion"), "{src}: {e}");
+        let stmt = parse_statement(&format!("SELECT {src} FROM t")).unwrap().0;
+        let Stmt::Select(sel) = stmt else { panic!("expected SELECT") };
+        assert_eq!(
+            sel.items.as_deref(),
+            Some(&[(Expr::TableStar("t".into()), None)][..]),
+            "{src}"
+        );
     }
 }
