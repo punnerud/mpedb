@@ -328,14 +328,19 @@ pub(super) fn plan_select<'s>(
     // parameter slot, and the rest of planning sees only `Param(slot)` — no
     // stage below knows subqueries exist (see planner/subquery.rs).
     let lifted;
-    let (s, subplans, slot_types): (&ast::SelectStmt, Vec<SubPlan>, Vec<Ty>) =
-        if subquery::has_subquery(s) {
-            lifted =
-                subquery::lift_subqueries(s, schema, n_params, catalog, mode, host_udfs, row_count, consts)?;
-            (&lifted.stmt, lifted.subplans, lifted.slot_types)
-        } else {
-            (s, Vec::new(), Vec::new())
-        };
+    #[allow(clippy::type_complexity)]
+    let (s, subplans, slot_types, slot_colls): (
+        &ast::SelectStmt,
+        Vec<SubPlan>,
+        Vec<Ty>,
+        Vec<Option<mpedb_types::Collation>>,
+    ) = if subquery::has_subquery(s) {
+        lifted =
+            subquery::lift_subqueries(s, schema, n_params, catalog, mode, host_udfs, row_count, consts)?;
+        (&lifted.stmt, lifted.subplans, lifted.slot_types, lifted.slot_colls)
+    } else {
+        (s, Vec::new(), Vec::new(), Vec::new())
+    };
     // The binder's parameter table covers `[user ‖ subplan results]`; the
     // planner KNOWS each result slot's type, so pin it instead of inferring.
     let eff_params = n_params + subplans.len() as u16;
@@ -390,6 +395,10 @@ pub(super) fn plan_select<'s>(
     for (i, ty) in slot_types.iter().enumerate() {
         binder.pin_param(n_params + i as u16, *ty);
     }
+    // Rung 4, indexed by RESULT SLOT (`n_params + i`) so the IN arm can look it
+    // up from the slot the lift handed it.
+    binder.slot_colls = vec![None; n_params as usize];
+    binder.slot_colls.extend(slot_colls.iter().copied());
     // FTS: a top-level `<col-or-table> MATCH 'literal'` conjunct against an FTS
     // table compiles to an FtsScan access path BEFORE binding (the whole-row form
     // `ft MATCH …` names the TABLE, which the binder cannot resolve as a column).

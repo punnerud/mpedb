@@ -1694,7 +1694,7 @@ fn plan_update(
     // Subqueries in the WHERE lift out FIRST (#97), exactly as they do for a
     // SELECT: each becomes a `SubPlan` + reserved slot and is replaced by
     // `Param(slot)`, so everything below sees only a parameter.
-    let (where_ast, subplans, slot_types) = lift_where(
+    let (where_ast, subplans, slot_types, _slot_colls) = lift_where(
         s.where_clause.as_ref(), table, &s.table, schema, n_params, catalog, mode, host_udfs,
         row_count, consts, "UPDATE",
     )?;
@@ -1785,6 +1785,9 @@ fn plan_update(
     ))
 }
 
+/// `lift_where`'s result: `None` expression when there was no WHERE at all.
+type OptLiftedWhere = (Option<ast::Expr>, Vec<SubPlan>, Vec<Ty>, Vec<Option<Collation>>);
+
 /// The shared WHERE-lift both write planners run (#97). `None` / subquery-free
 /// WHERE clauses take the zero-cost path and produce no subplans at all.
 #[allow(clippy::too_many_arguments)]
@@ -1800,15 +1803,15 @@ fn lift_where(
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
     op: &str,
-) -> Result<(Option<ast::Expr>, Vec<SubPlan>, Vec<Ty>)> {
+) -> Result<OptLiftedWhere> {
     match where_clause {
         Some(w) if subquery::expr_has_subquery(w) => {
-            let (e, subs, tys) = subquery::lift_dml_where(
+            let (e, subs, tys, colls) = subquery::lift_dml_where(
                 w, table, table_name, schema, n_params, catalog, mode, host_udfs, row_count, consts, op,
             )?;
-            Ok((Some(e), subs, tys))
+            Ok((Some(e), subs, tys, colls))
         }
-        other => Ok((other.cloned(), Vec::new(), Vec::new())),
+        other => Ok((other.cloned(), Vec::new(), Vec::new(), Vec::new())),
     }
 }
 
@@ -1825,7 +1828,7 @@ fn plan_delete(
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     // Subqueries in the WHERE lift out FIRST (#97) — see `plan_update`.
-    let (where_ast, subplans, slot_types) = lift_where(
+    let (where_ast, subplans, slot_types, _slot_colls) = lift_where(
         s.where_clause.as_ref(), table, &s.table, schema, n_params, catalog, mode, host_udfs,
         row_count, consts, "DELETE",
     )?;

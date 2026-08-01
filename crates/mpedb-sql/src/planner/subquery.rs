@@ -15,6 +15,10 @@
 use super::*;
 use crate::plan::LimitVal;
 
+/// A lifted WHERE clause: the rewritten expression, its subplans, and — per
+/// subplan result slot — the pinned output type and the rung-4 collation.
+pub(super) type LiftedWhere = (ast::Expr, Vec<SubPlan>, Vec<Ty>, Vec<Option<Collation>>);
+
 /// Everything `lift_subqueries` learned about one statement.
 pub(super) struct Lifted {
     /// The statement with every subquery replaced by `Param(slot)`.
@@ -23,6 +27,9 @@ pub(super) struct Lifted {
     /// Output type of each subplan's result slot, parallel to `subplans`
     /// (`None` when the inner output type could not be pinned).
     pub slot_types: Vec<Ty>,
+    /// Declared collation of each subplan's output column, parallel to
+    /// `subplans`. sqlite's rung 4 — see `Lift::body_collation`.
+    pub slot_colls: Vec<Option<Collation>>,
 }
 
 /// Does any expression of this statement contain a subquery at all? Cheap
@@ -125,6 +132,7 @@ pub(super) fn lift_subqueries<'a>(
         outer_scope,
         subplans: Vec::new(),
         slot_types: Vec::new(),
+        slot_colls: Vec::new(),
     };
     let stmt = ast::SelectStmt {
         table: s.table.clone(),
@@ -206,6 +214,7 @@ pub(super) fn lift_subqueries<'a>(
         stmt,
         subplans: lift.subplans,
         slot_types: lift.slot_types,
+        slot_colls: lift.slot_colls,
     })
 }
 
@@ -247,7 +256,7 @@ pub(super) fn lift_dml_where<'a>(
     row_count: RowCountFn<'a>,
     consts: &'a mut Vec<Value>,
     op: &str,
-) -> Result<(ast::Expr, Vec<SubPlan>, Vec<Ty>)> {
+) -> Result<LiftedWhere> {
     let mut lift = Lift {
         schema,
         n_params,
@@ -259,6 +268,7 @@ pub(super) fn lift_dml_where<'a>(
         outer_scope: Scope::single_named(target_name.to_string(), target),
         subplans: Vec::new(),
         slot_types: Vec::new(),
+        slot_colls: Vec::new(),
     };
     let _ = op;
     // A CORRELATED subplan is no longer refused here: the caller splits the
@@ -266,7 +276,7 @@ pub(super) fn lift_dml_where<'a>(
     // path uses — so the correlated conjuncts become a per-row residual and
     // never reach the access-path extractor.
     let rewritten = lift.rewrite(where_clause)?;
-    Ok((rewritten, lift.subplans, lift.slot_types))
+    Ok((rewritten, lift.subplans, lift.slot_types, lift.slot_colls))
 }
 
 struct Lift<'a> {
@@ -287,9 +297,96 @@ struct Lift<'a> {
     outer_scope: Scope<'a>,
     subplans: Vec<SubPlan>,
     slot_types: Vec<Ty>,
+    /// (see `Lifted::slot_colls`)
+    /// The DECLARED collation each subplan's output column carries, parallel to
+    /// `slot_types`. sqlite's collation rung 4: an `IN (SELECT …)` whose PROBE
+    /// supplies no collation takes the SUBQUERY's. Measured over 62 forms —
+    /// 21 of them were live wrong answers before this existed.
+    slot_colls: Vec<Option<Collation>>,
 }
 
 impl Lift<'_> {
+    /// Rung 4: the collation of a lifted subquery's single output column.
+    ///
+    /// `None` means Binary, and `None` is the answer for anything this cannot
+    /// resolve with certainty — an unresolvable form keeps today's behaviour,
+    /// so widening the table later can only ever REMOVE a wrong answer, never
+    /// introduce one.
+    ///
+    /// Every rule here is MEASURED against 3.45.1, and two of them are
+    /// counterintuitive enough that reasoning would have got them wrong:
+    ///
+    /// * `CAST(a AS TEXT)` KEEPS the collation and so does unary `+a` (sqlite
+    ///   descends TK_CAST/TK_UPLUS in `sqlite3ExprCollSeq`), while `a || ''`
+    ///   LOSES it. A whitelist built from "expressions lose it" is wrong in the
+    ///   answering-more direction. (Unary plus needs no arm — the parser folds
+    ///   it away, so it arrives as the bare column.)
+    /// * The compound rule INVERTS with nesting: a BARE compound takes its LAST
+    ///   arm's collation, a DERIVED-WRAPPED one takes its FIRST. Measured
+    ///   two-arm and three-arm, both directions, EXCEPT included.
+    fn body_collation(&self, body: &ast::SubqueryBody, nested: bool, depth: u32) -> Option<Collation> {
+        if depth > crate::view::MAX_VIEW_DEPTH as u32 {
+            return None;
+        }
+        match body {
+            ast::SubqueryBody::Select(s) => self.select_collation(s, depth),
+            ast::SubqueryBody::Compound(c) => {
+                let arm = if nested { c.arms.first() } else { c.arms.last() };
+                self.select_collation(arm?, depth + 1)
+            }
+        }
+    }
+
+    fn select_collation(&self, s: &ast::SelectStmt, depth: u32) -> Option<Collation> {
+        if depth > crate::view::MAX_VIEW_DEPTH as u32 {
+            return None;
+        }
+        // `SELECT *` and multi-column projections: not a single-column probe
+        // target this path can reason about.
+        let items = s.items.as_ref()?;
+        if items.len() != 1 {
+            return None;
+        }
+        let (qual, name) = peel_to_column(&items[0].0)?;
+        // A derived FROM has ONE output (checked above), so the outer's single
+        // reference must be to it; take the body's own collation.
+        if let Some(d) = &s.from_derived {
+            return self.body_collation(d, true, depth + 1);
+        }
+        // Resolve the name across the FROM table and every join operand. An
+        // AMBIGUOUS name yields None — the binder reports it far better, and a
+        // guess here is the one thing this must not do.
+        let mut found: Option<Collation> = None;
+        let mut candidates: Vec<(Option<&str>, &str)> = Vec::new();
+        if let Some(t) = &s.table {
+            candidates.push((s.alias.as_deref(), t.as_str()));
+        }
+        for j in &s.joins {
+            candidates.push((j.alias.as_deref(), j.table.as_str()));
+        }
+        for (alias, tname) in candidates {
+            if let Some(q) = qual {
+                let addressed = alias.unwrap_or(tname);
+                if !mpedb_types::ident_eq(addressed, q) {
+                    continue;
+                }
+            }
+            let Some(def) = self
+                .schema
+                .table_id(tname)
+                .and_then(|id| self.schema.table(id))
+            else {
+                continue;
+            };
+            let Some(i) = def.column_index(name) else { continue };
+            let c = def.columns[i as usize].collation;
+            if found.is_some() {
+                return None; // ambiguous
+            }
+            found = Some(c);
+        }
+        found
+    }
     /// Replace every subquery in `e` with `Param(slot)`, planning it into
     /// `self.subplans` on the way.
     fn rewrite(&mut self, e: &ast::Expr) -> Result<ast::Expr> {
@@ -548,6 +645,9 @@ impl Lift<'_> {
             slot_type: ty,
         });
         self.slot_types.push(ty);
+        // A BARE compound takes its LAST arm's collation (measured).
+        self.slot_colls
+            .push(cs.arms.last().and_then(|a| self.select_collation(a, 1)));
         Ok(slot)
     }
 
@@ -714,7 +814,28 @@ impl Lift<'_> {
             slot_type: ty,
         });
         self.slot_types.push(ty);
+        // Rung 4 read from the ORIGINAL body, not the correlation-rewritten
+        // one: the rewrite turns outer references into params, and a param has
+        // no declared collation — reading the rewritten form would silently
+        // drop the collation for exactly the correlated shapes.
+        self.slot_colls.push(self.select_collation(inner, 0));
         Ok(slot)
+    }
+}
+
+/// The column a rung-4 output expression names, as `(qualifier, name)` — or
+/// `None` when the expression is not a bare column reference.
+///
+/// `CAST` is transparent here because sqlite makes it transparent for
+/// collation (measured), which is the opposite of what "a cast produces a new
+/// value" suggests. Everything else — concatenation, arithmetic, aggregates,
+/// window functions — yields `None`, i.e. Binary, which is also measured.
+fn peel_to_column(e: &ast::Expr) -> Option<(Option<&str>, &str)> {
+    match e {
+        ast::Expr::Col(n) => Some((None, n.as_str())),
+        ast::Expr::Qualified(q, n) => Some((Some(q.as_str()), n.as_str())),
+        ast::Expr::Cast(inner, _) => peel_to_column(inner),
+        _ => None,
     }
 }
 

@@ -67,7 +67,18 @@ fi
 
 [ -x "$PY" ] || { echo "no venv python at $PY (set WB_PY)"; exit 1; }
 [ -d "$DJ/tests" ] || { echo "no Django checkout at $DJ (set WB_DJANGO)"; exit 1; }
-cargo build --release --manifest-path "$CAPI/Cargo.toml" || exit 1
+# Rebuilt on EVERY invocation, and `djall.sh` invokes this script twice per
+# label group — 36 times for the full sweep. A source edit landing mid-sweep
+# therefore fails a build somewhere in the middle, this script exits, and the
+# group silently produces NO LOG. That is exactly how a 215-label sweep once
+# reported "1 shim-only" over three groups that never ran. Say so loudly: the
+# summary guard below catches the missing log, but the operator needs to see
+# the CAUSE, not just the symptom.
+if ! cargo build --release --manifest-path "$CAPI/Cargo.toml"; then
+    echo "  !! BUILD FAILED — this group was NOT measured. If a sweep is running,"
+    echo "  !! the tree was edited underneath it and the WHOLE sweep is invalid."
+    exit 1
+fi
 [ -f "$SO" ] || { echo "no shim at $SO"; exit 1; }
 mkdir -p "$OUT"
 
@@ -187,10 +198,23 @@ ids_of() {  # $@ = logs -> sorted dotted test ids
 #
 # Compare the two arms' totals as well. Equal failure counts over unequal test
 # counts is the same lie in a subtler form.
+# The log must EXIST and contain a `Ran` line. Both halves are needed and both
+# were learned the hard way: a traceback with no `Ran` line read as a clean
+# group once, and a run that died before opening its log left NO FILE at all —
+# which `[ -e ] || continue` then skipped in silence. A group this script was
+# asked to run and cannot account for is a MISSING measurement, never a pass.
 missing=0
 for arm in stock shim; do
-    for f in "$OUT"/${arm}_g*.txt; do
-        [ -e "$f" ] || continue
+    i=${WB_GROUP_BASE:-1}
+    for _g in "${LABEL_GROUPS[@]}"; do
+        f="$OUT/${arm}_g${i}.txt"
+        i=$((i + 1))
+        if [ ! -e "$f" ]; then
+            echo "  !! NO LOG FILE: $f — the arm never even opened its log. \
+Its labels were NOT measured."
+            missing=1
+            continue
+        fi
         if ! grep -q '^Ran ' "$f"; then
             echo "  !! NO 'Ran' LINE: $f — the suite never reached its tests. \
 Anything this group would have measured is MISSING, not passing."

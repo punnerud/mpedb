@@ -741,6 +741,17 @@ pub(crate) struct Binder<'a> {
     /// Indexed by parameter slot; a slot that is an ordinary user parameter has
     /// no entry, because a bound value carries no declared collation.
     pub param_colls: Vec<Option<Collation>>,
+    /// RUNG 4, and deliberately NOT `param_colls`: the collation of a lifted
+    /// SUBQUERY's output column, indexed by its result slot.
+    ///
+    /// Kept apart because the two rungs are read in different places and
+    /// merging them would be a wrong answer: `param_colls` is rung 2 (the
+    /// outer COLUMN a correlation param stands for) and the general comparison
+    /// arm reads it, while rung 4 applies ONLY to `IN (SELECT …)`. Measured:
+    /// `'ab' = (SELECT a FROM nc)` does NOT take the subquery's collation in
+    /// sqlite, in either operand order — folding rung 4 into `param_colls`
+    /// would have made mpedb answer where it is correct today.
+    pub slot_colls: Vec<Option<Collation>>,
     /// Number of caller-facing parameters; reserved context slots start here.
     n_user_params: u16,
     /// Distinct session-context keys, in first-reference order; index `p` maps
@@ -808,6 +819,7 @@ impl<'a> Binder<'a> {
             scope,
             param_types: vec![None; n_params as usize],
             param_colls: vec![None; n_params as usize],
+            slot_colls: Vec::new(),
             n_user_params: n_params,
             ctx_keys: Vec::new(),
             ctx_list_keys: std::collections::BTreeSet::new(),
@@ -887,6 +899,7 @@ impl<'a> Binder<'a> {
             scope,
             param_types: self.param_types,
             param_colls: self.param_colls,
+            slot_colls: self.slot_colls,
             n_user_params: self.n_user_params,
             ctx_keys: self.ctx_keys,
             ctx_list_keys: self.ctx_list_keys,
@@ -1755,8 +1768,15 @@ impl<'a> Binder<'a> {
                 // rows where sqlite gives one.
                 let (lhs_ast, lhs_coll) = peel_collate(lhs)?;
                 let (l, _lt) = self.bind_expr(lhs_ast)?;
+                // Rung 1 (explicit COLLATE) then rung 2 (the probe COLUMN),
+                // and only if BOTH are absent, rung 4: the SUBQUERY's output
+                // collation. Measured — left always wins, and the one place
+                // sqlite departs from that (an explicit COLLATE in the
+                // subquery's projection) is a form this binder still refuses
+                // by name, so it cannot be reached here.
                 let coll = lhs_coll
                     .or_else(|| self.operand_collation(&l))
+                    .or_else(|| self.slot_colls.get(*slot as usize).copied().flatten())
                     .unwrap_or_default();
                 let node = if coll == Collation::Binary {
                     BExpr::InParam(Box::new(l), *slot)

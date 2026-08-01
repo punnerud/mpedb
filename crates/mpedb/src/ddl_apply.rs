@@ -689,18 +689,34 @@ pub(crate) fn virtual_table_def_from_spec(
             )));
         }
     }
-    let mut columns = vec![mkcol("rowid", mpedb_types::ColumnType::Int64, false)];
-    for c in &spec.columns {
-        columns.push(mkcol(c, mpedb_types::ColumnType::Text, true));
-    }
+    // The rowid is the TRAILING column and HIDDEN (#94's implicit-rowid shape),
+    // not a leading visible one. That is not cosmetic: sqlite hides an fts5
+    // vtab's rowid from `SELECT *`, from `PRAGMA table_info` and from the
+    // default INSERT column list, and exposing it did both damages at once —
+    // `SELECT *` answered (rowid, content) where stock answers (content), a
+    // wrong answer; and `INSERT INTO t VALUES('a')` was refused with
+    // "expected 2" where stock auto-assigns. The trailing position is what
+    // lets every piece of the #94 machinery (visible_columns, the default
+    // insert list, table_info, rowid-name resolution, auto-assign) apply
+    // unchanged. `rowid` stays addressable BY NAME, exactly as in sqlite.
+    //
+    // Existing fts tables keep their stored (leading, visible) shape — the
+    // schema is file-authoritative and both shapes validate.
+    let mut columns: Vec<_> = spec
+        .columns
+        .iter()
+        .map(|c| mkcol(c, mpedb_types::ColumnType::Text, true))
+        .collect();
+    columns.push(mkcol("rowid", mpedb_types::ColumnType::Int64, false));
+    let pk = (columns.len() - 1) as u16;
     Ok(mpedb_types::TableDef {
         id: 0,
         name: spec.name.clone(),
         columns,
-        primary_key: vec![0],
+        primary_key: vec![pk],
         indexes: Vec::new(),
         dead: false,
-        implicit_rowid: false, autoincrement: false,
+        implicit_rowid: true, autoincrement: false,
         kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer },
         // An FTS shadow table is engine-owned; user DDL never attaches a key
         // to it.

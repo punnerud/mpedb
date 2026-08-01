@@ -725,7 +725,12 @@ impl TableDef {
     /// the canonical schema bytes carry no rowid-alias flag, so this adds no
     /// schema-format surface.
     pub fn rowid_alias_col(&self) -> Option<u16> {
-        if !matches!(self.kind, TableKind::Standard) {
+        // Fts is eligible too: an fts5 table's rowid IS a rowid alias in
+        // sqlite — `INSERT … (NULL, …)` and an omitted rowid both auto-assign,
+        // and `last_insert_rowid()` reports it. Excluding the kind here is why
+        // an fts INSERT could never auto-assign. (Virtual stays out: those
+        // tables have no storage to assign into.)
+        if !matches!(self.kind, TableKind::Standard | TableKind::Fts { .. }) {
             return None;
         }
         match self.primary_key.as_slice() {
@@ -1737,12 +1742,16 @@ impl Schema {
             // `SELECT *` would hide an arbitrary column or whose auto-assign
             // would target a non-integer key.
             if t.implicit_rowid {
-                if t.kind.is_fts() {
-                    return Err(Error::Schema(format!(
-                        "table `{}` cannot be both FTS and implicit-rowid",
-                        t.name
-                    )));
-                }
+                // FTS + implicit-rowid IS legal, and is the shape every fts5
+                // table created via `CREATE VIRTUAL TABLE` now takes. It was
+                // refused here as an untested combination — and the refusal is
+                // what forced the vtab's rowid to be a VISIBLE leading column,
+                // which the C-API shim then measured as two divergences from
+                // sqlite at once (`SELECT *` shape, INSERT arity). The two
+                // blocks compose: this one pins the hidden-rowid shape, the
+                // FTS block above pins content-is-text, and the fts machinery
+                // itself is ordinal-agnostic (`primary_key[0]`,
+                // `fts_content_columns` skip the pk wherever it sits).
                 let last = (t.columns.len() - 1) as u16;
                 let c = &t.columns[last as usize];
                 if t.primary_key.as_slice() != [last]

@@ -430,9 +430,12 @@ fn streaming_insert_into_fts_is_refused() {
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("mpedb-fts-stream-{}-{}.txt", std::process::id(), UNIQ.fetch_add(1, Ordering::Relaxed)));
     std::fs::write(&tmp, b"streamedtoken uniquephrase").unwrap();
-    // FTS content table is (rowid, body); stream the last column (body, index 1).
+    // FTS content table is (body, hidden trailing rowid); stream the content
+    // column (body, index 0). The rowid moved BEHIND the content when fts5
+    // adopted the #94 hidden-rowid shape — `SELECT *` and INSERT arity now
+    // match sqlite — and this guard must fire regardless of where it sits.
     let mut s = d.begin().unwrap();
-    let r = s.insert_file("ft", &[Value::Int(1), Value::Text(String::new())], 1, &tmp);
+    let r = s.insert_file("ft", &[Value::Text(String::new()), Value::Int(1)], 0, &tmp);
     let _ = std::fs::remove_file(&tmp);
     let e = r.expect_err("streaming insert into an FTS table must be refused");
     assert!(format!("{e}").contains("FTS"), "expected an FTS refusal, got {e}");

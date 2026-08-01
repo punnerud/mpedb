@@ -653,3 +653,62 @@ fn an_in_subquery_compares_under_the_probes_collation() {
         agree(&stmts);
     }
 }
+
+/// RUNG 4: when the probe supplies no collation, `IN (SELECT …)` takes the
+/// SUBQUERY's — and only `IN`, and only for the forms sqlite actually
+/// propagates through.
+///
+/// Measured over 62 forms; 21 were live wrong answers. Two of the rules would
+/// have been got wrong by reasoning: `CAST(a AS TEXT)` KEEPS the collation
+/// (sqlite descends TK_CAST in `sqlite3ExprCollSeq`) while `a || ''` loses it,
+/// and a BARE compound takes its LAST arm's collation while a DERIVED-WRAPPED
+/// one takes its FIRST — the rule inverts with nesting.
+///
+/// The AGREE rows are as load-bearing as the wrong ones: they are the plans
+/// that must keep emitting plain `InParam` and byte-identical plan bytes.
+#[test]
+fn an_in_subquery_takes_the_right_sides_collation_only_where_sqlite_does() {
+    let setup = [
+        "CREATE TABLE nc (a TEXT COLLATE NOCASE)",
+        "CREATE TABLE bn (b TEXT)",
+        "INSERT INTO nc VALUES ('AB'),('cd')",
+        "INSERT INTO bn VALUES ('ab')",
+    ];
+    for q in [
+        // --- PROPAGATE (were wrong) -------------------------------------
+        "SELECT 'ab' IN (SELECT a FROM nc)",
+        "SELECT 'ab' NOT IN (SELECT a FROM nc)",
+        "SELECT 'ab' IN (SELECT a AS z FROM nc)",
+        "SELECT 'ab' IN (SELECT (a) FROM nc)",
+        "SELECT 'ab' IN (SELECT a FROM (SELECT a FROM nc))",
+        "SELECT 'ab' IN (SELECT z FROM (SELECT a AS z FROM nc))",
+        "SELECT 'ab' IN (SELECT DISTINCT a FROM nc)",
+        "SELECT 'ab' IN (SELECT a FROM nc ORDER BY a LIMIT 2)",
+        "SELECT 'ab' IN (SELECT a FROM nc GROUP BY a)",
+        "SELECT 'ab' IN (SELECT CAST(a AS TEXT) FROM nc)",
+        "SELECT 'ab' IN (SELECT a FROM nc WHERE 1)",
+        "SELECT count(*) FROM bn WHERE 'ab' IN (SELECT a FROM nc)",
+        // --- AGREE: must stay Binary, must keep plain InParam ------------
+        "SELECT 'ab' IN (SELECT a||'' FROM nc)",
+        "SELECT 'ab' IN (VALUES('AB'))",
+        "SELECT 'ab' IN (SELECT max(a) FROM nc)",
+        "SELECT 'ab' IN (SELECT min(a) FROM nc)",
+        "SELECT 'ab' IN ('AB')",
+        // rung 1 on the probe BEATS rung 4
+        "SELECT 'ab' COLLATE BINARY IN (SELECT a FROM nc)",
+        // left rung 2 BEATS right rung 4 — the S24 pin, which must not move
+        "SELECT b IN (SELECT a FROM nc) FROM bn",
+        // scalar `=` does NOT take rung 4, in either operand order
+        "SELECT 'ab' = (SELECT a FROM nc LIMIT 1)",
+        "SELECT (SELECT a FROM nc LIMIT 1) = 'ab'",
+        "SELECT b = (SELECT a FROM nc LIMIT 1) FROM bn",
+        // --- the compound asymmetry, both directions ---------------------
+        "SELECT 'ab' IN (SELECT a FROM nc UNION SELECT 'zz')",
+        "SELECT 'ab' IN (SELECT 'zz' UNION SELECT a FROM nc)",
+        "SELECT 'ab' IN (SELECT a FROM (SELECT a FROM nc UNION SELECT 'zz'))",
+    ] {
+        let mut stmts: Vec<&str> = setup.to_vec();
+        stmts.push(q);
+        agree(&stmts);
+    }
+}
