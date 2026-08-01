@@ -931,6 +931,41 @@ content it **errors and touches nothing**:
 
 No on-disk marker format was added.
 
+
+### 5.x Three rewrites that carried the suites to parity (2026-08-01, all differentially tested)
+
+**The byte plane under `||` (ConcatN).** mpedb's `Text` value is a Rust
+`String` — valid UTF-8 by construction, and that invariant is load-bearing
+everywhere. sqlite's `||` is byte-level: `? || ?` fed `C3` and `A9` yields
+`'é'`, the bytes RECOMBINING across operands. The reconciliation is one n-ary
+opcode: the binder flattens the WHOLE `||` chain into a single `ConcatN` when
+an operand may be a blob, so the bytes live in one opcode's stack frame and
+never in a `Value`; a valid result becomes `Text`, an invalid one becomes the
+decode error carrying CPython's own message shape (U+FFFD rendering measured
+against CPython's generator). Pure text chains keep the old two-operand
+opcode — and their byte-identical plans. Evidence: a 12-row truth table
+identical with stock, both directions; corpus 7.4 M / 0 wrong at format 70.
+
+**A row value against a subquery, by moving the comparison inside.**
+`(a,b) = (SELECT x,y …)` needs ONE evaluation (two per-column subqueries
+could see different rows) and must keep 0-rows→NULL / >1-rows→refuse. The
+rewrite plans the body once as an ordinary scalar subplan whose single output
+column IS the row-value comparison — `RowValue(probe) = RowValue(items)` in
+the projection, probe columns becoming correlation parameters under the same
+qualification fences the row-value `IN` uses. 3VL `AND` is exactly sqlite's
+pairwise rule (FALSE beats NULL beats TRUE — measured both ways round), so
+the binder's existing desugar is the whole semantics. No plan-format change.
+
+**A derived table as a JOIN operand, without a new plan shape.** `FROM t
+JOIN (SELECT …) AS d ON c` parses inline (parameters keep their slots), then
+Stage B consumes it: a simple body SPLICES onto its base through the same
+core the CTE-join uses — `JOIN (SELECT …) AS d` IS `WITH d AS (…) … JOIN d`,
+one machine, fences inherited — and a non-spliceable FIRST INNER join MOVES
+into the leading-FROM slot (`FROM t JOIN (X) d ON c` ≡ `FROM (X) d JOIN t ON
+c`, a row-set identity) where materialization already existed. The planner
+never sees a new construct. Evidence: SQLAlchemy's dialect suite at exact
+stock parity, 1277/1277.
+
 ---
 
 ## 6. Method as technique

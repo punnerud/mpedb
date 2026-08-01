@@ -169,11 +169,11 @@ aggregate, registered through the libsqlite3 C-API shim — CPython's own
 `sqlite3` module loads it via `LD_PRELOAD`), secondary/composite indexes
 (including partial `CREATE INDEX … WHERE`, stored P1), and live multi-process
 DDL — verified against sqlite's own 7.4M-record test corpus with **zero wrong
-answers**. CPython's `test_sqlite3` under the shim is **98.3% of stock-passing
-on M3** (459/467); Django frozen A and `queries` are **831/831** and **493/493**.
-Remaining CPython failures are documented deliberate refusals
-([`C-API-COMPAT.md`](C-API-COMPAT.md)). Django measured labels stay high-90s with
-zero wrong answers. What is still missing is short — attached-database *writes*
+answers**. As of 2026-08-01: **Django's ENTIRE suite — every label, 18,214
+tests per arm — has zero shim-only failures** (the 13 failing test IDs are
+identical under stock sqlite), **SQLAlchemy's dialect suite is 1277/1277**
+(exact stock parity), and CPython's `test_sqlite3` is **462/466** with the
+remaining four documented, named gaps ([`C-API-COMPAT.md`](C-API-COMPAT.md)). What is still missing is short — attached-database *writes*
 (`ATTACH` + cross-file SELECT work), loadable extensions (non-goal), and a few
 honesty refusals (AUTOINCREMENT, fts4 layout, serialize-as-sqlite-image) — each
 a clean error, never a wrong answer. And on one axis mpedb goes *past* sqlite:
@@ -239,11 +239,12 @@ and executable, and none of it was written by this project:
 
 | what pins the behaviour | scale | current | where it runs |
 |---|---|---|---|
-| sqlite's own **sqllogictest** corpus, run differentially | 5.94 M records attempted | **99.9765 % pass, 0 wrong answers, 0 error mismatches** ([COMPAT.md](COMPAT.md)) | by hand at a named commit; a curated subset rides `cargo test` |
-| the **differential oracle** — the bundled sqlite3 answering the same generated program in-process | every run | any divergence is a record with both engines' answers next to it | in `cargo test --workspace`: Linux on every push, macOS and Windows nightly |
+| sqlite's own **sqllogictest** corpus, run differentially | 7,420,638 records | **0 wrong answers, 0 error mismatches** — on x86-64 AND arm64 ([COMPAT.md](COMPAT.md)) | by hand at a named commit; a curated subset rides `cargo test` |
+| the **differential oracle** — the bundled sqlite3 answering the same generated program in-process | every run | any divergence is a record with both engines' answers next to it | in `cargo test --workspace`: Linux, macOS and Windows on every push |
 | the **three-way** arm, adding a throwaway PostgreSQL 16 cluster | every run where a cluster can start | catches what sqlite alone cannot: the strictness a deploy will apply | Linux; it SKIPS loudly, by name, where PostgreSQL is absent |
-| **CPython's `test_sqlite3`** — the authoritative test of the DB-API surface | 467 tests stock 3.53.1 passes | **459/467** through the C-API shim ([C-API-COMPAT.md](C-API-COMPAT.md)) | by hand on the M3 |
-| **Django 5.2**'s own suite, 9 labels, mpedb as the database | 831 tests + `queries` 493 | **831/831** and **493/493** on the M3 (830/831 on the Linux runner) | by hand |
+| **CPython's `test_sqlite3`** — the authoritative test of the DB-API surface | 466 tests | **462/466** through the C-API shim; the four gaps are named ([C-API-COMPAT.md](C-API-COMPAT.md)) | by hand |
+| **Django 5.2**'s own suite, EVERY label, mpedb as the database | 18,214 tests per arm | **0 shim-only failures** — the 13 failing IDs are identical under stock | by hand, both arms serialized |
+| **SQLAlchemy 2.0**'s dialect suite (`test/dialect/test_suite.py`) | 1,544 collected | **1277 passed / 0 failed** — exact stock parity, skips included | by hand |
 
 A defect on that surface does not arrive as a hunch. It arrives as a named
 failing record with the answer sqlite gives sitting beside it, reproducible by
@@ -531,10 +532,10 @@ statements, clauses, operators, functions, types — in the same format as
 Turso's COMPAT.md so the two read side by side.
 
 It is also measured against sqlite's own **sqllogictest corpus** (the
-`sqlite_corpus` runner in `crates/mpedb-testkit`), all 7.4 million records of it:
-**99.9% of attempted statements pass, with zero error mismatches and zero genuine
-wrong answers** — of everything mpedb accepts, essentially 100% matches sqlite.
-What does not pass is deliberate refusals with error messages
+`sqlite_corpus` runner in `crates/mpedb-testkit`), all 7,420,638 records of it:
+**zero wrong answers and zero error mismatches, on x86-64 and arm64** — of
+everything mpedb accepts, 100% matches sqlite, and what does not pass is
+deliberate refusals with error messages
 ([`design/CORPUS-STATUS.md`](design/CORPUS-STATUS.md) ranks them).
 
 | | mpedb | note |
