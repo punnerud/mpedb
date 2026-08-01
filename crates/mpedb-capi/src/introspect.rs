@@ -1348,6 +1348,7 @@ pub fn pragma(
 
 /// The five sqlite_master columns, in order.
 const MASTER_COLS: [&str; 5] = ["type", "name", "tbl_name", "rootpage", "sql"];
+const SEQ_COLS: [&str; 2] = ["name", "seq"];
 
 /// Does `sql` read `sqlite_master`/`sqlite_schema`? (identifier match, so a
 /// string literal containing the word does not trigger it).
@@ -1397,14 +1398,95 @@ pub fn references_sqlite_sequence(sql: &str) -> bool {
     false
 }
 
-/// The rows of the synthesised `sqlite_sequence`, as `(name, seq)`.
-pub fn sqlite_sequence_rows(seqs: &[(String, i64)]) -> (Vec<String>, Vec<Vec<Value>>) {
-    (
-        cols(&["name", "seq"]),
-        seqs.iter()
-            .map(|(n, v)| vec![Value::Text(n.clone()), Value::Int(*v)])
-            .collect(),
-    )
+/// Answer a `SELECT … FROM sqlite_sequence …` over the synthesised rows —
+/// the same mini-evaluator as [`sqlite_master`]: projection of any subset of
+/// `name`/`seq` (or `*`, or `count(*)`), an AND-joined WHERE with bound
+/// parameters (`WHERE name = ?` is how CPython consumers read one table's
+/// counter, and `name == ?` is accepted because sqlite treats the doubled
+/// spelling identically), and `ORDER BY name`.
+///
+/// `seq` projects as the INTEGER it is; in a WHERE it compares as its decimal
+/// text against a stringified bound parameter — like for like. `ORDER BY seq`
+/// is REFUSED rather than string-sorted (10 before 2 is a wrong answer, and no
+/// measured consumer orders by seq).
+pub fn sqlite_sequence_query(
+    seqs: &[(String, i64)],
+    sql: &str,
+    params: &[Value],
+) -> Result<(Vec<String>, Vec<Vec<Value>>), DbError> {
+    let lower = sql.to_ascii_lowercase();
+    let sel = lower.find("select").ok_or_else(unsupported)?;
+    let from = lower.find("from").ok_or_else(unsupported)?;
+    if from < sel {
+        return Err(unsupported());
+    }
+    let proj_src = sql[sel + 6..from].trim();
+
+    let rest_lower = &lower[from..];
+    let where_at = rest_lower.find("where").map(|p| from + p);
+    let order_at = rest_lower.find("order").map(|p| from + p);
+    let where_end = order_at.unwrap_or(sql.len());
+
+    let mut rows: Vec<(String, i64)> = seqs.to_vec();
+    if let Some(w) = where_at {
+        let preds = parse_where(sql[w + 5..where_end].trim(), params, &SEQ_COLS)?;
+        rows.retain(|r| {
+            let val = |c: &str| match c {
+                "name" => r.0.clone(),
+                "seq" => r.1.to_string(),
+                _ => String::new(),
+            };
+            preds.iter().all(|p| p.matches_with(&val))
+        });
+    }
+    if let Some(o) = order_at {
+        let ol = lower[o + 5..].trim();
+        let ol = ol.strip_prefix("by").map(str::trim_start).unwrap_or(ol);
+        let key = ol
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|ch| ch == '"' || ch == '`' || ch == '[' || ch == ']');
+        if key != "name" {
+            return Err(unsupported());
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        if ol.contains("desc") {
+            rows.reverse();
+        }
+    }
+
+    let proj_lower = proj_src.to_ascii_lowercase();
+    if proj_lower.replace(' ', "") == "count(*)" {
+        return Ok((vec!["count(*)".into()], vec![vec![Value::Int(rows.len() as i64)]]));
+    }
+    let out_cols: Vec<String> = if proj_src == "*" {
+        SEQ_COLS.iter().map(|s| s.to_string()).collect()
+    } else {
+        let mut v = Vec::new();
+        for item in proj_src.split(',') {
+            let name = item.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            let name = name.trim_matches('"');
+            if !SEQ_COLS.contains(&name) {
+                return Err(unsupported());
+            }
+            v.push(name.to_string());
+        }
+        v
+    };
+    let out_rows = rows
+        .iter()
+        .map(|(n, s)| {
+            out_cols
+                .iter()
+                .map(|c| match c.as_str() {
+                    "seq" => Value::Int(*s),
+                    _ => Value::Text(n.clone()),
+                })
+                .collect()
+        })
+        .collect();
+    Ok((out_cols, out_rows))
 }
 
 /// Which catalog a statement reads: `Some(false)` for the main one,
@@ -1666,7 +1748,7 @@ pub fn sqlite_master(
 
     // WHERE.
     if let Some(w) = &where_src {
-        let preds = parse_where(w, params)?;
+        let preds = parse_where(w, params, &MASTER_COLS)?;
         rows.retain(|r| preds.iter().all(|p| p.matches(r)));
     }
 
@@ -1754,14 +1836,22 @@ enum Pred {
 
 impl Pred {
     fn matches(&self, r: &MasterRow) -> bool {
-        let val = |c: &str| match c {
+        self.matches_with(&|c: &str| match c {
             "type" => r.ty.to_string(),
             "name" => r.name.clone(),
             "tbl_name" => r.tbl_name.clone(),
             "rootpage" => "0".to_string(),
             "sql" => r.sql.clone(),
             _ => String::new(),
-        };
+        })
+    }
+
+    /// The row abstracted to a cell-lookup, so the synthesised
+    /// `sqlite_sequence` shares this evaluator instead of growing a second
+    /// one that would drift (`seq` arrives as its decimal text — a bound
+    /// integer parameter is stringified the same way in [`operand`], so
+    /// equality still compares like for like).
+    fn matches_with(&self, val: &dyn Fn(&str) -> String) -> bool {
         match self {
             Pred::Eq(c, v) => val(c) == *v,
             Pred::Ne(c, v) => val(c) != *v,
@@ -1770,7 +1860,7 @@ impl Pred {
             // `sql` is the only column that is ever NULL here — a constraint
             // index has no statement text, in sqlite's catalog and in this one.
             Pred::Null(c, negated) => val(c).is_empty() != *negated,
-            Pred::Not(inner) => !inner.matches(r),
+            Pred::Not(inner) => !inner.matches_with(val),
             Pred::Never => false,
         }
     }
@@ -1822,7 +1912,7 @@ fn like_match(s: &str, pat: &str) -> bool {
     go(s.as_bytes(), pat.as_bytes())
 }
 
-fn parse_where(w: &str, params: &[Value]) -> Result<Vec<Pred>, DbError> {
+fn parse_where(w: &str, params: &[Value], cols: &[&str]) -> Result<Vec<Pred>, DbError> {
     let mut preds = Vec::new();
     // Split on AND (case-insensitive), at top level (no nested parens support).
     for clause in split_and(w) {
@@ -1838,7 +1928,7 @@ fn parse_where(w: &str, params: &[Value]) -> Result<Vec<Pred>, DbError> {
             negate = !negate;
             c = c[3..].trim_start();
         }
-        let p = parse_cmp(c, params)?;
+        let p = parse_cmp(c, params, cols)?;
         preds.push(if negate { Pred::Not(Box::new(p)) } else { p });
     }
     Ok(preds)
@@ -1848,7 +1938,7 @@ fn parse_where(w: &str, params: &[Value]) -> Result<Vec<Pred>, DbError> {
 /// recognize is REFUSED — including anything containing a top-level `OR`, whose
 /// operands this AND-only evaluator would otherwise silently drop and answer
 /// wrongly.
-fn parse_cmp(c: &str, params: &[Value]) -> Result<Pred, DbError> {
+fn parse_cmp(c: &str, params: &[Value], cols: &[&str]) -> Result<Pred, DbError> {
     let cl = c.to_ascii_lowercase();
     if cl.starts_with("or ") || cl.contains(" or ") {
         return Err(unsupported());
@@ -1858,7 +1948,7 @@ fn parse_cmp(c: &str, params: &[Value]) -> Result<Pred, DbError> {
             .trim()
             .trim_matches(|ch| ch == '"' || ch == '`' || ch == '[' || ch == ']')
             .to_ascii_lowercase();
-        if MASTER_COLS.contains(&t.as_str()) {
+        if cols.contains(&t.as_str()) {
             Some(t)
         } else {
             None
@@ -1910,7 +2000,13 @@ fn parse_cmp(c: &str, params: &[Value]) -> Result<Pred, DbError> {
         })
     } else if let Some(idx) = c.find('=') {
         let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
-        let v = operand(&c[idx + 1..], params).ok_or_else(unsupported)?;
+        // sqlite spells equality `=` or `==` and treats them identically —
+        // `name == ?` is a form CPython consumers write against
+        // `sqlite_sequence`. (`!=` was taken above, so a second `=` here can
+        // only be the doubled spelling.)
+        let rest = &c[idx + 1..];
+        let rest = rest.trim_start().strip_prefix('=').unwrap_or(rest);
+        let v = operand(rest, params).ok_or_else(unsupported)?;
         Ok(match v {
             Some(v) => Pred::Eq(col, v),
             None => Pred::Never,

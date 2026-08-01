@@ -659,8 +659,37 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // Answered before the master arms because it is a different table
             // with its own columns.
             if introspect::references_sqlite_sequence(sqltext) {
-                let seqs = c.db.rowid_sequences().unwrap_or_default();
-                let (columns, rows) = introspect::sqlite_sequence_rows(&seqs);
+                // The table exists the moment an AUTOINCREMENT table does —
+                // the SAME rule that lists it in `sqlite_master` below, so a
+                // consumer can never read a table the listing denies or vice
+                // versa. Before any such table: sqlite's exact refusal
+                // (measured — a fresh database says `no such table`, an empty
+                // one with the keyword answers zero rows). Stock keeps the
+                // table after the LAST autoincrement table is dropped; the
+                // schema records only live tables, so that one form stays a
+                // named divergence.
+                if c.txn.is_none() {
+                    let _ = c.db.refresh_schema_if_stale();
+                }
+                let has_autoinc = {
+                    let bundle = match c.txn.as_ref() {
+                        Some(s) => s.schema(),
+                        None => c.db.schema(),
+                    };
+                    bundle.schema.tables.iter().any(|t| !t.dead && t.autoincrement)
+                };
+                if !has_autoinc {
+                    return Err(DbError::Bind("no such table: sqlite_sequence".into()));
+                }
+                // Through the open txn when there is one: a fresh read
+                // snapshot cannot see ids the txn has just handed out (the
+                // FK pragma needed the same cure).
+                let seqs = match c.txn.as_mut() {
+                    Some(s) => s.rowid_sequences()?,
+                    None => c.db.rowid_sequences()?,
+                };
+                let (columns, rows) =
+                    introspect::sqlite_sequence_query(&seqs, sqltext, params)?;
                 return Ok(Outcome::Rows { columns, rows });
             }
             let master_q_name = introspect::master_schema(sqltext)

@@ -197,6 +197,28 @@ pub(crate) fn view_exists_on_txn(
     Ok(resolve_view_key(w, name)?.is_some())
 }
 
+impl crate::WriteSession<'_> {
+    /// The AUTOINCREMENT high-waters visible in THIS txn — committed rows plus
+    /// ids this still-open transaction has handed out. The C-API's
+    /// `sqlite_sequence` read must come through here when a txn is open: a
+    /// fresh read snapshot cannot see the open txn's inserts (the same cure as
+    /// the FK pragma's `foreign_key_check`).
+    pub fn rowid_sequences(&mut self) -> crate::Result<Vec<(String, i64)>> {
+        let bundle = self.txn.schema_bundle();
+        let mut out = Vec::new();
+        for t in bundle.schema.tables.iter().filter(|t| !t.dead && t.autoincrement) {
+            let key = mpedb_core::engine::rowid_seq_key(t.id);
+            if let Some(b) = self.txn.sys_get(&key)? {
+                if b.len() == 8 {
+                    let v = i64::from_le_bytes(b[..8].try_into().expect("len 8"));
+                    out.push((t.name.clone(), v));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Every view visible through this write txn (for mid-transaction iterdump).
 pub(crate) fn list_views_on_txn(
     w: &mut mpedb_core::WriteTxn,

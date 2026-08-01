@@ -381,6 +381,16 @@ pub(crate) trait TxnCtx {
         }
         Ok(max.map_or(1, |m| m.saturating_add(1)))
     }
+    /// An INSERT that SUPPLIES the rowid-alias value still moves an
+    /// AUTOINCREMENT table's high-water (sqlite records `max(seq-or-0, id)` in
+    /// `sqlite_sequence` on every assigned id, explicit included). Default:
+    /// no-op — the same contexts whose `next_rowid` default applies the plain
+    /// non-AUTOINCREMENT rule have no high-water to move; the engine contexts
+    /// override with [`WriteTxn::note_rowid`].
+    fn note_rowid(&mut self, table: u32, id: i64) -> Result<()> {
+        let _ = (table, id);
+        Ok(())
+    }
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool>;
     fn delete_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<bool>;
     /// Every posting entry whose key starts with `prefix`, as `(key, doclist)`
@@ -638,6 +648,9 @@ impl TxnCtx for WriteTxn<'_> {
         // maximum — no need to read `pk_col` out of a full row.
         WriteTxn::next_rowid(self, table)
     }
+    fn note_rowid(&mut self, table: u32, id: i64) -> Result<()> {
+        WriteTxn::note_rowid(self, table, id)
+    }
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool> {
         WriteTxn::update_by_pk(self, table, new_values)
     }
@@ -750,6 +763,9 @@ impl TxnCtx for WriteCtx<'_, '_> {
     }
     fn next_rowid(&mut self, table: u32, _pk_col: u16) -> Result<i64> {
         WriteTxn::next_rowid(self.txn, table)
+    }
+    fn note_rowid(&mut self, table: u32, id: i64) -> Result<()> {
+        WriteTxn::note_rowid(self.txn, table, id)
     }
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool> {
         WriteTxn::update_by_pk(self.txn, table, new_values)
@@ -2823,6 +2839,12 @@ fn exec_stmt_rest(
                                 return Err(e);
                             }
                         }
+                    } else if let Some(Value::Int(id)) = row.get(rc as usize) {
+                        // An EXPLICIT id through the alias: an AUTOINCREMENT
+                        // table must remember it so it is never handed out
+                        // again (a no-op for plain tables — the flag is the
+                        // first check inside).
+                        ctx.note_rowid(*table, *id)?;
                     }
                 }
                 // RLS WITH CHECK on the new row (before the engine's PK/unique

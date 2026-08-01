@@ -1343,6 +1343,36 @@ impl<'e> WriteTxn<'e> {
         Ok(next)
     }
 
+    /// An INSERT that SUPPLIES its rowid still moves an AUTOINCREMENT table's
+    /// high-water: sqlite records `max(seq-or-0, id)` in `sqlite_sequence` the
+    /// moment the first id is ASSIGNED — explicit or auto, and clamped at zero
+    /// for a negative or zero first id (measured: `INSERT VALUES (-3)` into a
+    /// fresh table puts `0` in the sequence, and the next auto id is 1) — so a
+    /// handed-out id can never come back. Without it, `insert 9; delete;
+    /// insert NULL` gave 1 where sqlite gives 10: a reused id under a keyword
+    /// whose whole promise is never-reuse.
+    ///
+    /// UPDATE deliberately has no such hook — sqlite does not bump the
+    /// sequence on `UPDATE … SET id = 50` either; the next auto id is still 51
+    /// because [`Self::next_rowid`] takes `max(stored, tree max) + 1`, which
+    /// covers that case with no write. Tables without the keyword return at
+    /// the first branch and pay nothing else.
+    pub fn note_rowid(&mut self, table_id: u32, id: i64) -> Result<()> {
+        if !self.bundle.schema.tables[table_id as usize].autoincrement {
+            return Ok(());
+        }
+        let key = rowid_seq_key(table_id);
+        let stored = match self.sys_get(&key)? {
+            Some(b) if b.len() == 8 => Some(i64::from_le_bytes(b[..8].try_into().expect("len 8"))),
+            _ => None,
+        };
+        let new = stored.unwrap_or(0).max(id);
+        if stored != Some(new) {
+            self.sys_put(&key, &new.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
     /// Delete by primary key; returns whether the row existed.
     pub fn delete_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<bool> {
         self.check_write_blocked(table_id)?;

@@ -39,10 +39,16 @@ path (subquery-lifted statements — `WHERE rowid IN (SELECT … LIMIT ?)` —
 failed with a wrong-parameter-count before); and `rowid`/`_rowid_`/`oid`
 resolve to a declared single int64 PK (sqlite's INTEGER PRIMARY KEY alias,
 oracle-checked; TEXT/composite PKs keep refusing like WITHOUT ROWID).
+Post-0.1.3 the engine also closed #132 (S28, below).
 
 Remaining 20, bucketed: **#133 overlay secondary-UNIQUE conflict misses the
 base after reopen (WRONG ANSWER — `INSERT OR REPLACE` duplicates; tops the
-0.2 list)**, ~5; #132 DQS double-quote leniency (`WHERE key = "misses"`), ~5;
+0.2 list)**, ~5; #132 DQS double-quote leniency (`WHERE key = "misses"`), ~5
+— **shipped at S28** (an unbound double-quoted bare name in expression
+position becomes a string literal, exactly sqlite's misfeature; ambiguous /
+qualified / backtick / bracket / INSERT-list / SET-target keep refusing;
+`tests/dqs.rs` pins the truth table differentially — the diskcache ~5 await
+a re-measure in the next mpedb-py release);
 `PRAGMA integrity_check`/`VACUUM` acceptance; volume()-vs-preallocated-file
 expectations; checkpoint-while-open (`database is locked`) in two tests.
 

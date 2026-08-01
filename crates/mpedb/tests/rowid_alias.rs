@@ -11,9 +11,10 @@
 //! Deliberate, documented deviations from sqlite (each a clean error, never a
 //! wrong answer): a composite PK and a non-integer PK are NOT rowid aliases and
 //! stay strict — mpedb rejects a NULL there, where sqlite's historical leniency
-//! stores the NULL; and `AUTOINCREMENT` is refused by name (mpedb keeps no
-//! persisted high-water counter, so it cannot promise the never-reuse guarantee
-//! and will not silently downgrade it to the reuse-allowed behavior).
+//! stores the NULL. `AUTOINCREMENT` is honoured since S3w (schema v17): the
+//! high-water lives in the catalog's sys keyspace, moved by BOTH the auto
+//! assign (`next_rowid`) and an explicit insert (`note_rowid`), which is what
+//! makes the never-reuse promise hold across `insert 9; delete; insert NULL`.
 
 use mpedb::{Config, Database, Error, ExecResult, Value};
 use std::ops::Deref;
@@ -318,6 +319,37 @@ fn autoincrement_survives_a_reopen() {
         ),
         other => panic!("expected rows, got {other:?}"),
     }
+}
+
+/// The live wrong answer plan §4 step 1 closed: an id handed out by an
+/// EXPLICIT insert is as spent as an auto-assigned one. Before `note_rowid`
+/// the high-water only moved on auto-assign, so `insert 9; delete; insert
+/// NULL` gave 1 where sqlite gives 10 — a reused id under a keyword whose
+/// whole promise is never-reuse. Rules measured on stock and pinned by the
+/// oracle here: the counter is `max(stored-or-0, id)` (so an explicit id
+/// below it never moves it down, and a NEGATIVE first id clamps at zero).
+#[test]
+fn an_explicit_id_moves_the_autoincrement_high_water() {
+    const A: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)";
+    assert_same(
+        &[A, "INSERT INTO t VALUES (9, 'a')", "DELETE FROM t", "INSERT INTO t VALUES (NULL, 'b')"],
+        SELECT,
+    );
+    assert_same(
+        &[
+            A,
+            "INSERT INTO t VALUES (9, 'a')",
+            "INSERT INTO t VALUES (5, 'b')",
+            "INSERT INTO t VALUES (-3, 'c')",
+            "DELETE FROM t",
+            "INSERT INTO t VALUES (NULL, 'd')",
+        ],
+        SELECT,
+    );
+    assert_same(
+        &[A, "INSERT INTO t VALUES (-7, 'a')", "INSERT INTO t VALUES (NULL, 'b')"],
+        SELECT,
+    );
 }
 
 #[test]
