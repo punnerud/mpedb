@@ -1096,12 +1096,7 @@ fn optimistic_prep_inner(
                         {
                             return Prep::Fallback
                         }
-                        Some(c) => match crate::exec::default_cell(
-                            c.default.as_ref(),
-                            now,
-                            crate::session::now_micros(),
-                            None,
-                        ) {
+                        Some(c) => match crate::exec::default_cell(c.default.as_ref(), now, None) {
                             Ok(v) => v,
                             Err(_) => return Prep::Fallback,
                         },

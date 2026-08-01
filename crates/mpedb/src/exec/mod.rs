@@ -35,21 +35,22 @@ std::thread_local! {
 ///
 /// One function for the three insert paths (plan executor, INSERT…SELECT, and
 /// the ring's fast prepare) so a default cannot mean one thing on one path and
-/// another on the next. `now_micros` is read ONCE per statement by the caller:
-/// every row of one INSERT must carry the same instant, which is what sqlite
-/// does and what a test comparing two rows of one statement depends on.
-/// Record the rowid of a row just inserted into a rowid-alias table (facade hook
-/// for `sqlite3_last_insert_rowid`). Called from the INSERT loop after each
-/// successful `insert_row`, so the final call reflects the last inserted row.
+/// another on the next. `now_micros` is the STATEMENT instant, read ONCE per
+/// statement by the caller and passed to every row: every row of one INSERT
+/// must carry the same instant, which is what sqlite does and what a test
+/// comparing two rows of one statement depends on. It used to be TWO clock
+/// parameters, and callers filled the second with a fresh read per row — two
+/// rows of one INSERT straddling a millisecond then carried different
+/// instants, a wrong answer a loaded box reproduces and an idle one hides.
+/// One parameter makes the per-row read unwritable.
 pub(crate) fn default_cell(
     default: Option<&DefaultExpr>,
-    now: i64,
     now_micros: i64,
     host: Option<&dyn HostFns>,
 ) -> Result<Value> {
     Ok(match default {
         Some(DefaultExpr::Const(v)) => v.clone(),
-        Some(DefaultExpr::Now) => Value::Timestamp(now),
+        Some(DefaultExpr::Now) => Value::Timestamp(now_micros),
         // An instant-dependent expression default is EVALUATED here, once per
         // statement's worth of rows like the keyword forms — the instant sits
         // in parameter slot 0, which is the only slot a default can have (it
@@ -76,6 +77,9 @@ pub(crate) fn default_cell(
     })
 }
 
+/// Record the rowid of a row just inserted into a rowid-alias table (facade hook
+/// for `sqlite3_last_insert_rowid`). Called from the INSERT loop after each
+/// successful `insert_row`, so the final call reflects the last inserted row.
 pub(crate) fn record_last_insert_rowid(rowid: i64) {
     LAST_INSERT_ROWID.with(|c| c.set(Some(rowid)));
 }

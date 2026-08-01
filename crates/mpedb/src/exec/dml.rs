@@ -52,7 +52,7 @@ pub(super) fn exec_stmt_rest(
                                 srow.get(si as usize).cloned().unwrap_or(Value::Null),
                                 col.ty,
                             ),
-                            None => default_cell(col.default.as_ref(), now, now_micros(), host)?,
+                            None => default_cell(col.default.as_ref(), now, host)?,
                         });
                     }
                     built.push(std::borrow::Cow::Owned(row));
@@ -1213,7 +1213,7 @@ fn build_insert_row_impl<'a>(
             InsertSource::Default => {
                 let col = t.columns.get(ci).ok_or_else(|| internal("insert col"))?;
                 // plan-validated: a column with no default is nullable
-                default_cell(col.default.as_ref(), now, now_micros(), host)?
+                default_cell(col.default.as_ref(), now, host)?
             }
             InsertSource::Expr(prog) => {
                 // Dual row: empty tuple. Program carries its own const pool.
