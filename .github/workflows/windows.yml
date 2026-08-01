@@ -19,8 +19,8 @@
 name: Windows
 
 on:
-  schedule:
-    - cron: '0 3 * * *'
+  push:
+    branches: [main]
   workflow_dispatch:
 
 env:
