@@ -4237,6 +4237,14 @@ impl WriteSession<'_> {
                     .table(id)
                     .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
                 let (col, fill) = crate::ddl_apply::add_column_from_spec(def, column)?;
+                // The ALTER-time CHECK discipline is the SAME decision pair as
+                // the autocommit applier's — compile against the engine's own
+                // widening, then test every existing row with the fill in the
+                // new slot (sqlite scans too; see the helpers' contract).
+                let chk = crate::ddl_apply::compile_added_column_check(&schema.schema, id, &col)?;
+                if let Some(c) = &chk {
+                    crate::ddl_apply::refuse_check_violating_rows(&mut self.txn, id, c, &fill)?;
+                }
                 self.txn.alter_add_column(id, col, fill)?;
             }
             DdlStmt::AlterDropColumn { table, column } => {

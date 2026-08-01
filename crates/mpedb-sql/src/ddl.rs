@@ -944,11 +944,25 @@ mod tests {
         }
         // Two DEFAULTs on one column is a clean error, not last-wins.
         assert!(parse_ddl("CREATE TABLE t (a INT DEFAULT 1 DEFAULT 2)").is_err());
-        // sqlite refuses a CHECK on ADD COLUMN; so do we, by name.
-        let e = parse_ddl("ALTER TABLE t ADD COLUMN a INT CHECK (a > 0)")
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("CHECK"), "{e}");
+        // sqlite ACCEPTS a CHECK on ADD COLUMN (differentially confirmed on
+        // 3.45.1 — Django emits this for every added PositiveIntegerField), so
+        // the clause parses like its CREATE TABLE twin: source captured,
+        // several CHECKs conjoined.
+        match parse_ddl("ALTER TABLE t ADD COLUMN a INT CHECK (a > 0)").unwrap().unwrap() {
+            DdlStmt::AlterAddColumn { column, .. } => {
+                assert_eq!(column.check.as_deref(), Some("a > 0"));
+            }
+            other => panic!("expected AlterAddColumn: {other:?}"),
+        }
+        match parse_ddl("ALTER TABLE t ADD COLUMN a INT CHECK (a > 0) CHECK (a < 9)")
+            .unwrap()
+            .unwrap()
+        {
+            DdlStmt::AlterAddColumn { column, .. } => {
+                assert_eq!(column.check.as_deref(), Some("(a > 0) AND (a < 9)"));
+            }
+            other => panic!("expected AlterAddColumn: {other:?}"),
+        }
         // …but REFERENCES on ADD COLUMN is fine, as in sqlite.
         assert!(parse_ddl("ALTER TABLE t ADD COLUMN a INT REFERENCES o (id)").is_ok());
     }

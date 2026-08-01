@@ -827,6 +827,23 @@ pub(crate) fn add_column_from_spec(
         collation: spec.collation,
         affinity: spec.affinity,
     };
+    // `ADD COLUMN … CHECK (<expr>)`: store the SOURCE — bundle (re)builds
+    // compile the program from it like any CREATE TABLE check, so future
+    // writes enforce it for free. Compilation AND the existing-row test live
+    // in [`compile_added_column_check`] / [`refuse_check_violating_rows`],
+    // which both appliers call with the schema in hand: the widening must be
+    // `with_added_column`'s (a hand-widened def that APPENDS puts the
+    // program's slots one off on a #94 implicit-rowid table, where the new
+    // column lands BEFORE the trailing rowid), and sqlite DOES test existing
+    // rows at ALTER time — measured on 3.45.1: `DEFAULT -5 CHECK (x >= 0)`
+    // on a populated table refuses the whole ALTER ("CHECK constraint
+    // failed"), and `DEFAULT 5 CHECK (x > id)` over rows {1, 9} refuses too,
+    // so the verdict is PER ROW, not per fill constant. A NULL fill passes
+    // (3VL), an empty table accepts anything — both fall out of the one rule
+    // "refuse iff any existing row evaluates to FALSE".
+    if let Some(src) = &spec.check {
+        col.check = Some(src.clone());
+    }
     // `ADD COLUMN … AS (<expr>)`: compile against the WIDENED table, since the
     // expression's own column is the last one. The engine backfills every
     // existing row by evaluating it (and refuses STORED once the table has rows,
@@ -845,6 +862,68 @@ pub(crate) fn add_column_from_spec(
         col.generated = Some(mpedb_types::GeneratedCol { expr: src, kind, program });
     }
     Ok((col, fill))
+}
+
+/// The compiled half of `ADD COLUMN … CHECK`, built where the caller has the
+/// SCHEMA in hand: the table is widened by [`Schema::with_added_column`] —
+/// the engine's own rule, which places the new column BEFORE a #94
+/// implicit-rowid's trailing `rowid` — so the program's slots match the rows
+/// the scan will feed it. `insert_at` is where the fill value goes in an
+/// existing row to reproduce exactly the row the engine is about to write.
+pub(crate) struct AddedColumnCheck {
+    program: mpedb_types::expr::ExprProgram,
+    insert_at: usize,
+}
+
+pub(crate) fn compile_added_column_check(
+    schema: &mpedb_types::Schema,
+    table_id: u32,
+    col: &mpedb_types::ColumnDef,
+) -> Result<Option<AddedColumnCheck>> {
+    let Some(src) = col.check.as_deref() else {
+        return Ok(None);
+    };
+    let widened = schema.with_added_column(table_id, col.clone())?;
+    let t = widened.table(table_id).expect("with_added_column keeps the id live");
+    let program = mpedb_sql::compile_check(src, t).map_err(|e| {
+        Error::Bind(format!(
+            "ALTER TABLE {} ADD COLUMN {}: CHECK failed to compile: {e}",
+            t.name, col.name
+        ))
+    })?;
+    let insert_at = t
+        .columns
+        .iter()
+        .position(|c| c.name == col.name)
+        .expect("the added column is in the widened table");
+    Ok(Some(AddedColumnCheck { program, insert_at }))
+}
+
+/// sqlite tests EXISTING rows against an `ADD COLUMN … CHECK` at ALTER time
+/// (measured on 3.45.1, per row and not per fill constant: `DEFAULT 5
+/// CHECK (x > id)` over rows {1, 9} refuses because the id=9 row fails). One
+/// rule reproduces every measured edge: refuse iff any existing row, with the
+/// fill value in the new column's slot, evaluates to FALSE — a NULL verdict
+/// passes (3VL, so the no-DEFAULT NULL fill sails through) and an empty table
+/// never enters the loop (stock accepts even a violating default there). The
+/// error is sqlite's ALTER-time message VERBATIM — bare, no expression
+/// suffix, unlike the INSERT-time form. Materializing the scan matches the
+/// engine's own `alter_add_column`, which buffers every rewritten row of the
+/// same table in the same transaction anyway.
+pub(crate) fn refuse_check_violating_rows(
+    w: &mut mpedb_core::engine::WriteTxn,
+    table_id: u32,
+    chk: &AddedColumnCheck,
+    fill: &Value,
+) -> Result<()> {
+    for mut row in w.scan_rows(table_id, None, None)? {
+        row.insert(chk.insert_at, fill.clone());
+        let verdict = chk.program.eval(&row, &[])?;
+        if mpedb_types::expr::truthy3(&verdict) == Some(false) {
+            return Err(Error::Bind("CHECK constraint failed".into()));
+        }
+    }
+    Ok(())
 }
 
 /// The rewritten `AS (…)` sources an `ALTER TABLE … RENAME COLUMN` needs, each
@@ -1269,8 +1348,14 @@ impl Database {
             .and_then(|id| bundle.schema.table(id).map(|t| (id, t)))
             .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
         let (col, fill) = add_column_from_spec(def, spec)?;
+        let chk = compile_added_column_check(&bundle.schema, id, &col)?;
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        match w.alter_add_column(id, col, fill) {
+        let applied = match &chk {
+            Some(c) => refuse_check_violating_rows(&mut w, id, c, &fill)
+                .and_then(|()| w.alter_add_column(id, col, fill)),
+            None => w.alter_add_column(id, col, fill),
+        };
+        match applied {
             Ok(()) => w.commit()?,
             Err(e) => {
                 w.abort();

@@ -182,6 +182,51 @@ fn add_column_refusals_and_persistence() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `ADD COLUMN … CHECK (…)` — sqlite ACCEPTS this (differentially confirmed on
+/// 3.45.1; Django emits it for every added PositiveIntegerField): the check
+/// binds future writes only, existing rows hold the fill value untested. The
+/// constraint must also survive reopen — it is recompiled from source at every
+/// bundle build, so a reopened database that forgot it would enforce nothing.
+#[test]
+fn add_column_with_check_binds_new_writes_only() {
+    let (cfg, path) = config("add-col-check");
+    {
+        let db = Database::open_with_config(cfg.clone()).unwrap();
+        db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT)", &[]).unwrap();
+        db.query("INSERT INTO t (id, a) VALUES (1, 100)", &[]).unwrap();
+
+        // The Django shape: nullable column, CHECK over its own name.
+        db.query("ALTER TABLE t ADD COLUMN pos INT NULL CHECK (pos >= 0)", &[]).unwrap();
+        // The pre-existing row was never tested; its NULL fill stands.
+        assert_eq!(
+            rows(db.query("SELECT pos FROM t WHERE id = 1", &[]).unwrap()),
+            vec![vec![Value::Null]]
+        );
+        // New writes are bound by it: a violation refuses, NULL passes (3VL —
+        // only FALSE fails a CHECK), a legal value lands.
+        assert!(db.query("INSERT INTO t (id, a, pos) VALUES (2, 1, -1)", &[]).is_err());
+        db.query("INSERT INTO t (id, a, pos) VALUES (2, 1, NULL)", &[]).unwrap();
+        db.query("INSERT INTO t (id, a, pos) VALUES (3, 2, 7)", &[]).unwrap();
+        assert!(db.query("UPDATE t SET pos = -5 WHERE id = 3", &[]).is_err());
+        assert_eq!(scalar_i64(&db, "SELECT pos FROM t WHERE id = 3"), 7);
+
+        // A CHECK naming a column the widened table does not have is refused at
+        // the DDL, and leaves no half-applied column behind.
+        assert!(db.query("ALTER TABLE t ADD COLUMN q INT CHECK (nosuch > 0)", &[]).is_err());
+        assert!(db.query("SELECT q FROM t", &[]).is_err());
+        db.verify().unwrap();
+    }
+    // The check is durable: a reopened database still enforces it.
+    {
+        let db = Database::open_with_config(cfg).unwrap();
+        assert!(db.query("INSERT INTO t (id, a, pos) VALUES (4, 3, -2)", &[]).is_err());
+        db.query("INSERT INTO t (id, a, pos) VALUES (4, 3, 4)", &[]).unwrap();
+        assert_eq!(scalar_i64(&db, "SELECT count(*) FROM t"), 4);
+        db.verify().unwrap();
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn drop_column_removes_it_and_keeps_the_rest() {
     let (cfg, path) = config("drop-col");
@@ -355,6 +400,63 @@ fn add_column_on_an_implicit_rowid_table_keeps_the_rowid_last() {
         ],
         "old row keeps its values, new column is NULL, rowid never leaks into c"
     );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `ADD COLUMN … CHECK` — the Django-migration form (every added
+/// `PositiveIntegerField` emits it), found live by a real project the suites
+/// never pinned. Every fact below is measured against stock 3.45.1:
+/// accepted on a populated table, enforced on the next write, the NULL fill
+/// passes (3VL), and the ALTER-time scan is PER ROW — a fill that violates
+/// the check against ANY existing row's values refuses the whole ALTER with
+/// sqlite's bare "CHECK constraint failed", while an empty table accepts
+/// even a violating default.
+#[test]
+fn add_column_with_check_matches_sqlite() {
+    let (cfg, path) = config("addcheck");
+    let cfg_reopen = cfg.clone();
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query("INSERT INTO users (id, name) VALUES (1, 'a'), (9, 'b')", &[]).unwrap();
+
+    // Accepted on a populated table; existing rows read NULL, which no check
+    // re-tests (3VL pass).
+    db.query("ALTER TABLE users ADD COLUMN pos integer CHECK (pos >= 0)", &[]).unwrap();
+    assert_eq!(rows(db.query("SELECT pos FROM users WHERE id = 1", &[]).unwrap())[0][0], Value::Null);
+
+    // Enforced for new writes — and only FALSE refuses: NULL sails through.
+    assert!(db.query("INSERT INTO users (id, name, pos) VALUES (2, 'c', -5)", &[]).is_err());
+    db.query("INSERT INTO users (id, name, pos) VALUES (3, 'd', 7)", &[]).unwrap();
+    db.query("INSERT INTO users (id, name, pos) VALUES (4, 'e', NULL)", &[]).unwrap();
+
+    // A fill that violates the check refuses the whole ALTER (populated
+    // table), exactly like stock — nothing is half-applied, the column is
+    // not there afterwards.
+    let err = db
+        .query("ALTER TABLE users ADD COLUMN neg integer NOT NULL DEFAULT -3 CHECK (neg > 0)", &[])
+        .unwrap_err();
+    assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+    assert!(db.query("SELECT neg FROM users", &[]).is_err());
+
+    // The scan is PER ROW: fill 5 passes the id=1 row and fails the id=9 row.
+    let err = db
+        .query("ALTER TABLE users ADD COLUMN hi integer DEFAULT 5 CHECK (hi > id)", &[])
+        .unwrap_err();
+    assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+
+    // Empty table: even a violating default is accepted (stock's rule — there
+    // is no row to test), and the check still governs future writes.
+    db.query("CREATE TABLE fresh (id INTEGER PRIMARY KEY)", &[]).unwrap();
+    db.query("ALTER TABLE fresh ADD COLUMN n integer DEFAULT -3 CHECK (n > 0)", &[]).unwrap();
+    assert!(db.query("INSERT INTO fresh (id, n) VALUES (1, -1)", &[]).is_err());
+    db.query("INSERT INTO fresh (id, n) VALUES (1, 2)", &[]).unwrap();
+
+    // The stored check survives a reopen — the bundle recompiles it from the
+    // column's source, so enforcement is not a property of this handle.
+    drop(db);
+    let db = Database::open_with_config(cfg_reopen).unwrap();
+    assert!(db.query("INSERT INTO users (id, name, pos) VALUES (5, 'f', -1)", &[]).is_err());
+    db.query("INSERT INTO users (id, name, pos) VALUES (5, 'f', 1)", &[]).unwrap();
     drop(db);
     let _ = std::fs::remove_file(&path);
 }

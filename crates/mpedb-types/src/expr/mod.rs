@@ -1062,7 +1062,11 @@ impl ExprProgram {
 /// `predicate evaluated to int64, expected bool`; sqlite truthy-tests it, so
 /// mpedb does too — never a truth value invented for a type sqlite has no rule
 /// for, because sqlite's rule covers every storage class.
-fn truthy3(v: &Value) -> Option<bool> {
+/// sqlite's three-valued truth test, exposed for consumers that must judge a
+/// compiled predicate's verdict OUTSIDE the executor — the ALTER-time
+/// `ADD COLUMN … CHECK` scan refuses a row exactly when this says
+/// `Some(false)`, the same rule the write path applies on INSERT.
+pub fn truthy3(v: &Value) -> Option<bool> {
     match v {
         Value::Null => None,
         Value::Bool(b) => Some(*b),

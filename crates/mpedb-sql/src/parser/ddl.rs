@@ -1404,6 +1404,17 @@ impl<'a> Parser<'a> {
                 references: None,
             };
             loop {
+                // A per-column constraint may carry a `CONSTRAINT <name>`
+                // prefix — same grammar as the CREATE TABLE column path, and
+                // the name is dropped the same way (stock accepts
+                // `ADD COLUMN q integer CONSTRAINT qpos CHECK (q >= 0)`;
+                // carrying the name into messages is the v19 named-check
+                // item, for both paths at once).
+                let named = if self.eat_word("CONSTRAINT") {
+                    Some(self.ident("constraint name after CONSTRAINT")?)
+                } else {
+                    None
+                };
                 if self.eat_kw(Kw::Not) {
                     self.expect_kw(Kw::Null, "NULL")?;
                     col.not_null = true;
@@ -1433,13 +1444,19 @@ impl<'a> Parser<'a> {
                     // default. The facade type-checks the value against `ty`.
                     col.default = Some(self.parse_add_column_default()?);
                 } else if self.eat_word("CHECK") {
-                    // sqlite REFUSES a CHECK on ADD COLUMN ("Cannot add a
-                    // CHECK constraint"), because existing rows were never
-                    // tested against it. Refusing is agreeing with sqlite.
-                    let _ = self.capture_paren_source();
-                    return Err(self.err_here(
-                        "ALTER TABLE ADD COLUMN cannot carry a CHECK — the rows already in                          the table were never tested against it (sqlite refuses this too);                          declare the CHECK in CREATE TABLE",
-                    ));
+                    // sqlite ACCEPTS a CHECK on ADD COLUMN — differentially
+                    // confirmed on 3.45.1: `ALTER TABLE t ADD COLUMN x integer
+                    // CHECK (x >= 0)` succeeds on a populated table, the next
+                    // violating write is refused, and the rows already present
+                    // are never re-tested (they read the fill value, tested by
+                    // nothing — sqlite's rule, kept). Django emits exactly this
+                    // for every added PositiveIntegerField. Same clause grammar
+                    // as the CREATE TABLE column path: several CHECKs conjoin.
+                    let src = self.capture_paren_source()?;
+                    col.check = Some(match col.check.take() {
+                        Some(prev) => format!("({prev}) AND ({src})"),
+                        None => src,
+                    });
                 } else if self.eat_word("REFERENCES") {
                     col.references = Some(self.references_clause(vec![col.name.clone()], None)?);
                 } else if self.eat_word("GENERATED") {
@@ -1448,6 +1465,11 @@ impl<'a> Parser<'a> {
                 } else if matches!(self.peek(), Some(Tok::Kw(Kw::As))) {
                     col.generated = Some(self.parse_generated_tail()?);
                 } else {
+                    if let Some(n) = named {
+                        return Err(self.err_here(format!(
+                            "CONSTRAINT {n} must be followed by a constraint"
+                        )));
+                    }
                     break;
                 }
             }
