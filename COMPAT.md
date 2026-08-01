@@ -539,8 +539,8 @@ see [GUIDE.md](GUIDE.md) for the full list with examples:
    parses a leading numeric prefix (see the CAST row above), and **storage**
    into a `CREATE TABLE`-declared column applies sqlite's store affinity (see
    *Two vocabularies* above). A config-declared column converts nothing.
-6. `||` refuses a blob or a float operand where sqlite renders both as text.
+5. `||` refuses a blob or a float operand where sqlite renders both as text.
    The blob half cannot be matched: sqlite's result is bytes that need not be
    valid UTF-8, and mpedb's `text` is.
-5. Compound set-ops use sqlite's flat precedence; PostgreSQL binds INTERSECT
+6. Compound set-ops use sqlite's flat precedence; PostgreSQL binds INTERSECT
    tighter. Documented, matching sqlite here.
