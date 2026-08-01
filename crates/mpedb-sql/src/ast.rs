@@ -265,6 +265,14 @@ pub(crate) struct JoinClause {
     /// explicit USING one. A natural join with NO common column keeps `using`
     /// empty and its `ON true`, i.e. a cross join (sqlite's rule).
     pub natural: bool,
+    /// `JOIN (SELECT …) AS <alias> ON …` — a derived table as the join
+    /// operand (plan §3). `table` carries the ALIAS (the only name the
+    /// operand has). Stage B consumes this: a simple body is SPLICED onto
+    /// its base (the CTE-join core, S23 fences shared), a first-position
+    /// INNER one is MOVED into `from_derived` for materialization, and the
+    /// rest refuse by name — the planner NEVER sees `Some` here (it checks,
+    /// defensively, and refuses).
+    pub derived: Option<Box<SubqueryBody>>,
 }
 
 /// The body of a subquery used as a value/list/existence — a scalar `(…)`,

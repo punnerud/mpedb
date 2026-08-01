@@ -348,6 +348,7 @@ impl<'a> Parser<'a> {
                         on: Expr::Lit(Value::Bool(true)),
                         using: Vec::new(),
                         natural: false,
+                        derived: None,
                     });
                 } else if self.eat_kw(Kw::Inner) {
                     self.expect_kw(Kw::Join, "JOIN after INNER")?;
@@ -383,6 +384,7 @@ impl<'a> Parser<'a> {
                         on: Expr::Lit(Value::Bool(true)),
                         using: Vec::new(),
                         natural: false,
+                        derived: None,
                     });
                 } else if matches!(self.peek_join_kind(), Some("NATURAL")) {
                     joins.push(self.natural_join()?);
@@ -560,8 +562,44 @@ impl<'a> Parser<'a> {
     }
 
     fn join_tail(&mut self, kind: JoinKind) -> Result<JoinClause> {
+        // `JOIN (SELECT …) AS d` — a derived table as a JOIN OPERAND (plan
+        // §3). Parsed INLINE (the same `subquery_body` grammar the leading
+        // `FROM (SELECT …)` uses), so its parameters keep their place in the
+        // statement's numbering. Stage B then SPLICES a simple body onto its
+        // base with the CTE-join core — every S23 fence shared — or MOVES a
+        // first-position INNER one into `from_derived` for materialization;
+        // what fits neither refuses by name before any plan exists.
+        if self.peek() == Some(&Tok::LParen)
+            && matches!(self.peek_at(1), Some(Tok::Kw(Kw::Select)))
+        {
+            self.expect(&Tok::LParen, "(")?;
+            let inner = self.subquery_body()?;
+            self.expect(&Tok::RParen, "`)` to close the derived table")?;
+            let Some(alias) = self.opt_table_alias()? else {
+                // sqlite accepts the anonymous spelling; everything here
+                // addresses the operand by name, so the alias is required.
+                // A documented narrowing, refused by name.
+                return Err(self.err_here(
+                    "a derived table in JOIN position needs an alias (`AS d`) — \
+                     the alias is the name it is addressed by",
+                ));
+            };
+            let mut j = self.join_condition(alias.clone(), Some(alias), kind)?;
+            j.derived = Some(Box::new(inner));
+            return Ok(j);
+        }
         let table = self.ident("table name after JOIN")?;
         let alias = self.opt_table_alias()?;
+        self.join_condition(table, alias, kind)
+    }
+
+    /// The `USING (…)` / `ON …` tail every join form shares.
+    fn join_condition(
+        &mut self,
+        table: String,
+        alias: Option<String>,
+        kind: JoinKind,
+    ) -> Result<JoinClause> {
         // The join condition — either `ON <cond>` or `USING (c1, …)`. `USING` is
         // a positional word (not a keyword), so a table/column named `using` is
         // unaffected; NATURAL (the implicit USING over all common columns) is
@@ -587,6 +625,7 @@ impl<'a> Parser<'a> {
                 on: Expr::Lit(Value::Bool(true)),
                 using,
                 natural: false,
+                derived: None,
             });
         }
         // ON is otherwise required. A comma-join / cross join is a cartesian
@@ -594,7 +633,7 @@ impl<'a> Parser<'a> {
         // times they forgot the condition.
         self.expect_kw(Kw::On, "ON after JOIN — the join condition is required (or USING (…))")?;
         let on = self.expr()?;
-        Ok(JoinClause { table, alias, kind, on, using: Vec::new(), natural: false })
+        Ok(JoinClause { table, alias, kind, on, using: Vec::new(), natural: false, derived: None })
     }
 
     /// `NATURAL [INNER | LEFT [OUTER]] JOIN <table> [alias]` — the join condition
@@ -633,6 +672,7 @@ impl<'a> Parser<'a> {
             on: Expr::Lit(Value::Bool(true)),
             using: Vec::new(),
             natural: true,
+            derived: None,
         })
     }
 

@@ -160,6 +160,7 @@ pub(super) fn lift_subqueries<'a>(
                     },
                     using: j.using.clone(),
                     natural: j.natural,
+                    derived: None,
                 })
             })
             .collect::<Result<_>>()?,
@@ -952,6 +953,7 @@ impl<'a> Correlate<'a, '_> {
                         on: self.rewrite(&j.on)?,
                         using: j.using.clone(),
                         natural: j.natural,
+                        derived: None,
                     })
                 })
                 .collect::<Result<_>>()?,

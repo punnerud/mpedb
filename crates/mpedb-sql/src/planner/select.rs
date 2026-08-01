@@ -313,6 +313,15 @@ pub(super) fn plan_select<'s>(
              subquery body, an INSERT … SELECT source, or a recursive CTE component",
         ));
     }
+    // Stage B consumes every derived JOIN operand — spliced onto its base,
+    // moved into `from_derived`, or refused by name. One surviving here came
+    // through a path that skipped the flatten pass; refuse it before a
+    // rebuild silently drops the body.
+    if s.joins.iter().any(|j| j.derived.is_some()) {
+        return Err(bind_err(
+            "a derived table in JOIN position is not supported in this context",
+        ));
+    }
     // RIGHT rewrites to a swapped LEFT before anything else looks at the
     // statement — the subquery lift's correlation scope and every stage
     // below must see the FINAL table order.

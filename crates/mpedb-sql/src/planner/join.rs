@@ -156,6 +156,10 @@ pub(super) fn rewrite_right_join<'s>(
         // `j0.using` is empty here; the swapped LEFT join carries a plain ON.
         using: Vec::new(),
         natural: false,
+        // Stage B consumed every derived JOIN operand (spliced, moved or
+        // refused) before any planner rebuild runs — `plan_select`'s
+        // defensive check upholds it.
+        derived: None,
     });
     joins.extend(s.joins[1..].iter().cloned());
     Ok(Some(ast::SelectStmt {

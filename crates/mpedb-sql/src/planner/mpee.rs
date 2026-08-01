@@ -1236,7 +1236,7 @@ fn rewrite(
             } else {
                 (ast::JoinKind::Inner, ast::Expr::Lit(Value::Bool(true)))
             };
-            ast::JoinClause { table: t, alias: a, kind, on, using: Vec::new(), natural: false }
+            ast::JoinClause { table: t, alias: a, kind, on, using: Vec::new(), natural: false, derived: None }
         })
         .collect();
     ast::SelectStmt {

@@ -575,3 +575,159 @@ fn a_recursive_cte_body_may_carry_dollar_parameters() {
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+/// A derived table as a JOIN OPERAND (plan §3 — the last SQLAlchemy test's
+/// blocker): `FROM u JOIN (SELECT …) AS d ON …`. The parser desugars it to
+/// the CTE it is — a synthetic `WITH d AS (…)` — so the Stage-B splice and
+/// every S23 fence in it are INHERITED, not copied. Expected rows measured
+/// on stock 3.45.1.
+#[test]
+fn a_derived_table_joins_like_the_cte_it_is() {
+    let (db, path) = open();
+    setup(&db);
+    db.query("CREATE TABLE u (uid INTEGER PRIMARY KEY, oid INT, x TEXT)", &[]).unwrap();
+    for uid in 1..=6 {
+        db.query(&format!("INSERT INTO u (uid, oid, x) VALUES ({uid}, {uid}, 'u{uid}')"), &[])
+            .unwrap();
+    }
+    // Same body and answer as `cte_in_join_operand`, spelled inline.
+    let got = rows(
+        db.query(
+            "SELECT u.x, d.c FROM u JOIN (SELECT id, c FROM t WHERE a > 4) AS d \
+             ON d.id = u.oid ORDER BY u.x",
+            &[],
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Text("u5".into()), Value::Int(50)],
+            vec![Value::Text("u6".into()), Value::Int(60)],
+        ]
+    );
+    // LEFT JOIN with an empty-matching body NULL-extends (stock: u1..u6, NULLs
+    // beyond the matches).
+    let got = rows(
+        db.query(
+            "SELECT u.x, d.c FROM u LEFT JOIN (SELECT id, c FROM t WHERE a > 5) AS d \
+             ON d.id = u.oid ORDER BY u.uid",
+            &[],
+        )
+        .unwrap(),
+    );
+    assert_eq!(got.len(), 6);
+    assert_eq!(got[5], vec![Value::Text("u6".into()), Value::Int(60)]);
+    assert_eq!(got[0], vec![Value::Text("u1".into()), Value::Null]);
+    // The alias is how everything addresses it; anonymous refuses by name.
+    let e = db
+        .query("SELECT u.x FROM u JOIN (SELECT id FROM t) ON 1=1", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("needs an alias"), "{e}");
+    // A non-spliceable body (here: an aggregate) in FIRST-join INNER position
+    // MOVES into the leading-FROM slot and MATERIALIZES — `FROM u JOIN (X) d
+    // ON c` is `FROM (X) d JOIN u ON c`, an INNER row-set identity. Stock
+    // answers one derived row against every u row.
+    let got = rows(
+        db.query(
+            "SELECT u.x, d.m FROM u JOIN (SELECT max(id) AS m FROM t) AS d ON 1=1 \
+             ORDER BY u.uid",
+            &[],
+        )
+        .unwrap(),
+    );
+    assert_eq!(got.len(), 6);
+    assert_eq!(got[0], vec![Value::Text("u1".into()), Value::Int(7)]);
+    // …and the move is SINGLE-SLOT: a second non-spliceable derived operand
+    // refuses by name (materialization has one leading position).
+    let e = db
+        .query(
+            "SELECT u.x FROM u JOIN (SELECT max(id) AS m FROM t) AS d ON 1=1 \
+             JOIN (SELECT min(id) AS m2 FROM t) AS e ON 1=1",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("materialization"), "{e}");
+    // A non-spliceable body NOT in first position (LEFT here) refuses by name.
+    let e = db
+        .query(
+            "SELECT u.x FROM u LEFT JOIN (SELECT max(id) AS m FROM t) AS d ON 1=1",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("materialization"), "{e}");
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+/// The capture fence (found while building §3, fixed in the SHARED splice so
+/// both the CTE and the derived-join path inherit it): a name the BODY cannot
+/// resolve must not survive the move into the join's ON and quietly bind
+/// against an OUTER table. Measured on 3.45.1 — both spellings refused with
+/// `no such column`, while the splice answered rows: a shipped wrong answer.
+#[test]
+fn a_body_reference_the_body_cannot_resolve_does_not_capture_the_outer_scope() {
+    let (db, path) = open();
+    db.query("CREATE TABLE big (a INTEGER PRIMARY KEY)", &[]).unwrap();
+    db.query("INSERT INTO big (a) VALUES (5)", &[]).unwrap();
+    db.query("CREATE TABLE small (x INTEGER PRIMARY KEY)", &[]).unwrap();
+    db.query("INSERT INTO small (x) VALUES (7)", &[]).unwrap();
+    // Qualified foreign reference: sqlite's exact words.
+    let e = db
+        .query(
+            "WITH c AS (SELECT x FROM small WHERE big.a = 5) \
+             SELECT big.a FROM big JOIN c ON 1=1",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("no such column: big.a"), "{e}");
+    // Bare reference that only an OUTER table holds: qualified with the
+    // body's own FROM name by the fence, so the binder scopes it to the
+    // spliced base and refuses (`unknown column c.a`) instead of answering.
+    let e = db
+        .query(
+            "WITH c AS (SELECT x FROM small WHERE a = 5) \
+             SELECT big.a FROM big JOIN c ON 1=1",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("column"), "{e}");
+    // Same two fences through the derived-JOIN spelling.
+    assert!(db
+        .query(
+            "SELECT big.a FROM big JOIN (SELECT x FROM small WHERE big.a = 5) AS d ON 1=1",
+            &[],
+        )
+        .is_err());
+    assert!(db
+        .query(
+            "SELECT big.a FROM big JOIN (SELECT x FROM small WHERE a = 5) AS d ON 1=1",
+            &[],
+        )
+        .is_err());
+    // And the fence must NOT break the body's OWN references, bare or
+    // qualified: `WHERE x = 7` and `WHERE small.x = 7` both stay answers.
+    let got = rows(
+        db.query(
+            "SELECT big.a, d.x FROM big JOIN (SELECT x FROM small WHERE x = 7) AS d ON 1=1",
+            &[],
+        )
+        .unwrap(),
+    );
+    assert_eq!(got, vec![vec![Value::Int(5), Value::Int(7)]]);
+    let got = rows(
+        db.query(
+            "SELECT big.a, d.x FROM big JOIN (SELECT x FROM small WHERE small.x = 7) AS d ON 1=1",
+            &[],
+        )
+        .unwrap(),
+    );
+    assert_eq!(got, vec![vec![Value::Int(5), Value::Int(7)]]);
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}

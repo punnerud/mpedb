@@ -203,8 +203,63 @@ fn flatten_select(
     // JOIN c ON c.a = u.id` answered three rows of fabricated `b` where sqlite
     // says `no such column: c.b`.
     let outer_refs = qualified_refs_of(s);
-    for j in &mut s.joins {
-        if catalog_has(ctes, &j.table) {
+    // A derived JOIN operand deferred for materialization: `(join index,
+    // body)`. Applied after the loop — `from_derived` is a single slot, so
+    // only the FIRST INNER join can move into it.
+    let mut move_body: Option<Box<SubqueryBody>> = None;
+    for i in 0..s.joins.len() {
+        let j = &mut s.joins[i];
+        // Checked BEFORE the catalog names: for a derived operand `j.table`
+        // holds the ALIAS, which must not accidentally resolve as a CTE or
+        // view of the same name.
+        if let Some(body) = j.derived.take() {
+            match *body {
+                SubqueryBody::Select(b) if check_simple(&b, &j.table).is_ok() => {
+                    // The simple shape splices onto its base — the better
+                    // plan (index access paths survive), and the exact CTE
+                    // machinery: `JOIN (SELECT …) AS d` IS `WITH d AS (…) …
+                    // JOIN d`.
+                    let name = j.table.clone();
+                    splice_join_body(
+                        j,
+                        &name,
+                        b,
+                        views,
+                        ctes,
+                        depth,
+                        outer_has_items,
+                        &outer_refs,
+                    )?;
+                }
+                other => {
+                    // Not spliceable (a join/aggregate/DISTINCT/compound
+                    // body — the SQLAlchemy shape). The FIRST join, INNER
+                    // with a plain ON, can swap with the base instead:
+                    // `FROM t JOIN (X) d ON c` ≡ `FROM (X) d JOIN t ON c`,
+                    // and the leading-FROM position is where derived-table
+                    // MATERIALIZATION already exists. Parameters are fine —
+                    // the body parsed inline, its slots are the statement's.
+                    let movable = i == 0
+                        && matches!(j.kind, JoinKind::Inner)
+                        && !j.natural
+                        && j.using.is_empty()
+                        && s.from_derived.is_none()
+                        && s.table.is_some();
+                    if !movable {
+                        return Err(bind_err(format!(
+                            "the derived table `{}` in JOIN position has a body \
+                             that cannot be spliced (join/aggregate/DISTINCT/\
+                             compound bodies need materialization), and \
+                             materialization is only available for the FIRST \
+                             join, INNER, with a plain ON — write it as the \
+                             leading FROM source or as a CTE",
+                            j.table
+                        )));
+                    }
+                    move_body = Some(Box::new(other));
+                }
+            }
+        } else if catalog_has(ctes, &j.table) {
             flatten_cte_join(j, views, ctes, depth, outer_has_items, &outer_refs)?;
         } else if catalog_has(views, &j.table) {
             return Err(bind_err(format!(
@@ -212,6 +267,30 @@ fn flatten_select(
                 j.table
             )));
         }
+    }
+    if let Some(body) = move_body {
+        // `FROM t [AS a] JOIN (X) AS d ON c ⟨rest⟩` becomes
+        // `FROM (X) AS d JOIN t [AS a] ON c ⟨rest⟩` — the INNER swap is a
+        // row-set identity, ⟨rest⟩ still sees both names at or left of
+        // itself, and the body lands in the one position the planner
+        // materializes. LEFT joins in ⟨rest⟩ are untouched by the swap.
+        let j = s.joins.remove(0);
+        let base_table = s.table.take().expect("movable required a base table");
+        let base_alias = s.alias.take();
+        s.from_derived = Some(body);
+        s.alias = j.alias.clone();
+        s.joins.insert(
+            0,
+            JoinClause {
+                table: base_table,
+                alias: base_alias,
+                kind: JoinKind::Inner,
+                on: j.on,
+                using: Vec::new(),
+                natural: false,
+                derived: None,
+            },
+        );
     }
     // Recurse into subqueries first (they may reference views/CTEs too).
     if let Some(items) = &mut s.items {
@@ -695,27 +774,50 @@ fn flatten_cte_join(
     outer_refs: &[(String, String)],
 ) -> Result<()> {
     let tname = j.table.clone();
-    if !matches!(j.kind, JoinKind::Inner | JoinKind::Left) {
-        return Err(bind_err(format!(
-            "CTE `{tname}` on the preserved side of a RIGHT/FULL JOIN is not \
-             supported yet"
-        )));
-    }
     let cte_src = catalog_get(ctes, &tname).expect("caller checked the CTE exists");
-    // The name the outer query addresses the CTE by: an explicit `AS x`, else
-    // the CTE name itself. Kept as the base's alias so qualified refs resolve.
-    let ref_alias = j.alias.clone().unwrap_or_else(|| tname.clone());
     let (cte_stmt, _explain, n_params) = parse_statement(cte_src)
         .map_err(|e| bind_err(format!("CTE `{tname}` body does not parse: {e}")))?;
+    // TEXT-route only: the body is re-parsed standalone, so a `?` in it would
+    // renumber from zero and silently read the wrong bound value. A derived
+    // JOIN operand parses INLINE and has no such restriction.
     if n_params != 0 {
         return Err(bind_err(format!("CTE `{tname}` body must not use parameters")));
     }
-    let Stmt::Select(mut body) = cte_stmt else {
+    let Stmt::Select(body) = cte_stmt else {
         return Err(bind_err(format!("CTE `{tname}` body is not a simple SELECT")));
     };
+    splice_join_body(j, &tname, body, views, ctes, depth, outer_has_items, outer_refs)
+}
+
+/// The JOIN-position splice CORE, shared by a joined CTE (text body, above)
+/// and a derived JOIN operand (inline body, `flatten_select`): the join reads
+/// the body's BASE table under the reference alias, the body's WHERE is
+/// AND-merged into the ON, and every fence — S23's projection rules, the
+/// capture fence, the USING/WHERE interaction — lives HERE, once. Two copies
+/// would drift, and the fences are the correctness.
+#[allow(clippy::too_many_arguments)]
+fn splice_join_body(
+    j: &mut JoinClause,
+    tname: &str,
+    mut body: SelectStmt,
+    views: &ViewCatalog,
+    ctes: &ViewCatalog,
+    depth: usize,
+    outer_has_items: bool,
+    outer_refs: &[(String, String)],
+) -> Result<()> {
+    if !matches!(j.kind, JoinKind::Inner | JoinKind::Left) {
+        return Err(bind_err(format!(
+            "`{tname}` on the preserved side of a RIGHT/FULL JOIN is not \
+             supported yet"
+        )));
+    }
+    // The name the outer query addresses the body by: an explicit `AS x`, else
+    // the CTE's own name. Kept as the base's alias so qualified refs resolve.
+    let ref_alias = j.alias.clone().unwrap_or_else(|| tname.to_string());
     // The body itself may reference a view or another (preceding) CTE.
     flatten_select(&mut body, views, ctes, depth + 1)?;
-    check_simple(&body, &tname)?;
+    check_simple(&body, tname)?;
     // `SELECT *` over the join cannot expand a projecting CTE body correctly —
     // the base carries columns the body hid. Refuse rather than answer wrongly.
     if !outer_has_items && body.items.is_some() {
@@ -762,6 +864,25 @@ fn flatten_cte_join(
         .expect("check_simple guarantees a FROM table");
     let mut body_where = body.where_clause.take();
     if let Some(w) = &mut body_where {
+        // THE BODY'S SCOPE IS THE BODY'S ALONE. Its WHERE moves into the
+        // join's ON, where a name resolves against EVERY table of the outer
+        // join — so a reference the body could not resolve must not survive
+        // the move and quietly bind out there. Measured (both spellings,
+        // 3.45.1): `WITH c AS (SELECT x FROM u WHERE a = 5) … t JOIN c` and
+        // the `t.a = 5` twin both answered rows through the splice where
+        // sqlite says `no such column` — a shipped wrong answer. Two fences:
+        // a qualifier that is not the body's own FROM name refuses with
+        // sqlite's words; every BARE column is qualified with the body's
+        // FROM name first, so after the rename below it can only resolve
+        // against the spliced base — exactly the body's original scope.
+        // (Subquery bodies inside the WHERE keep their own scope and are not
+        // descended into; a DOUBLE-QUOTED unknown that sqlite's DQS would
+        // have turned into a literal inside the body becomes a named
+        // refusal instead — a narrowing, never an answer.)
+        if let Some((q, c)) = foreign_qualifier(w, &from_name) {
+            return Err(bind_err(format!("no such column: {q}.{c}")));
+        }
+        qualify_bare_cols(w, &from_name);
         rename_qualifier(w, &from_name, &ref_alias);
     }
 
@@ -788,6 +909,85 @@ fn flatten_cte_join(
         j.on = Expr::Binary(crate::ast::BinOp::And, Box::new(existing), Box::new(cw));
     }
     Ok(())
+}
+
+/// The first `qualifier.column` in `e` whose qualifier is NOT `own` — a
+/// reference the body's own scope could never resolve. Skips subquery bodies
+/// (their scope is their own). See the capture fence in `flatten_cte_join`.
+fn foreign_qualifier(e: &Expr, own: &str) -> Option<(String, String)> {
+    match e {
+        Expr::Qualified(q, c) if !mpedb_types::ident_eq(q, own) => {
+            Some((q.clone(), c.clone()))
+        }
+        Expr::Qualified(..) => None,
+        Expr::Binary(_, a, b)
+        | Expr::Like(a, b, _)
+        | Expr::Match(a, b)
+        | Expr::IsDistinct(a, b, _)
+        | Expr::Glob(a, b, _)
+        | Expr::Regexp(a, b, _) => {
+            foreign_qualifier(a, own).or_else(|| foreign_qualifier(b, own))
+        }
+        Expr::Unary(_, a)
+        | Expr::Cast(a, _)
+        | Expr::Collate(a, _)
+        | Expr::IsNull(a, _)
+        | Expr::InContext(a, _, _)
+        | Expr::InParamSlot(a, _, _) => foreign_qualifier(a, own),
+        Expr::Func(_, args) | Expr::Coalesce(args) | Expr::RowValue(args) => {
+            args.iter().find_map(|a| foreign_qualifier(a, own))
+        }
+        Expr::InList(a, xs, _) => foreign_qualifier(a, own)
+            .or_else(|| xs.iter().find_map(|x| foreign_qualifier(x, own))),
+        Expr::Case(arms, els) => arms
+            .iter()
+            .find_map(|(w, t)| foreign_qualifier(w, own).or_else(|| foreign_qualifier(t, own)))
+            .or_else(|| els.as_deref().and_then(|e| foreign_qualifier(e, own))),
+        _ => None,
+    }
+}
+
+/// Qualify every BARE column in `e` with the body's own FROM name, so its
+/// resolution scope survives the move into the join's ON. Skips subquery
+/// bodies. See the capture fence in `flatten_cte_join`.
+fn qualify_bare_cols(e: &mut Expr, own: &str) {
+    match e {
+        Expr::Col(name, _) => {
+            *e = Expr::Qualified(own.to_string(), std::mem::take(name));
+        }
+        Expr::Binary(_, a, b)
+        | Expr::Like(a, b, _)
+        | Expr::Match(a, b)
+        | Expr::IsDistinct(a, b, _)
+        | Expr::Glob(a, b, _)
+        | Expr::Regexp(a, b, _) => {
+            qualify_bare_cols(a, own);
+            qualify_bare_cols(b, own);
+        }
+        Expr::Unary(_, a)
+        | Expr::Cast(a, _)
+        | Expr::Collate(a, _)
+        | Expr::IsNull(a, _)
+        | Expr::InContext(a, _, _)
+        | Expr::InParamSlot(a, _, _) => qualify_bare_cols(a, own),
+        Expr::Func(_, args) | Expr::Coalesce(args) | Expr::RowValue(args) => {
+            args.iter_mut().for_each(|a| qualify_bare_cols(a, own));
+        }
+        Expr::InList(a, xs, _) => {
+            qualify_bare_cols(a, own);
+            xs.iter_mut().for_each(|x| qualify_bare_cols(x, own));
+        }
+        Expr::Case(arms, els) => {
+            for (w, t) in arms.iter_mut() {
+                qualify_bare_cols(w, own);
+                qualify_bare_cols(t, own);
+            }
+            if let Some(e) = els {
+                qualify_bare_cols(e, own);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Every `qualifier.column` pair the statement addresses, anywhere an
