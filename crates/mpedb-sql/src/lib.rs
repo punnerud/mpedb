@@ -254,7 +254,7 @@ pub fn split_db_alias(sql: &str) -> Result<(Option<String>, String)> {
         None => return Ok((None, sql.to_string())),
     };
     let ident_of = |t: &Tok| match t {
-        Tok::Ident(s) | Tok::QuotedIdent(s) => Some(s.clone()),
+        Tok::Ident(s) | Tok::QuotedIdent(s, _) => Some(s.clone()),
         _ => None,
     };
     if let (Some(a), Some(dot), Some(tb)) = (toks.get(ti), toks.get(ti + 1), toks.get(ti + 2)) {
@@ -321,7 +321,7 @@ fn collect_discriminators(e: &ast::Expr, table: &TableDef, out: &mut Vec<u16>) {
         }
         Expr::Binary(BinOp::Eq, a, b) => {
             let pair = match (a.as_ref(), b.as_ref()) {
-                (Expr::Col(c), Expr::ContextRef(_)) | (Expr::ContextRef(_), Expr::Col(c)) => {
+                (Expr::Col(c, _), Expr::ContextRef(_)) | (Expr::ContextRef(_), Expr::Col(c, _)) => {
                     Some(c)
                 }
                 _ => None,

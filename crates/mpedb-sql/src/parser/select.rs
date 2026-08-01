@@ -46,7 +46,7 @@ fn align_order_by_alias_case(
 ) {
     let Some(items) = items else { return };
     for (key, _) in order_by.iter_mut() {
-        let Expr::Col(n) = key else { continue };
+        let Expr::Col(n, _) = key else { continue };
         // An EXACT alias already resolves; only a case-differing one needs help.
         if items.iter().any(|it| it.1.as_deref() == Some(n.as_str())) {
             continue;
@@ -507,7 +507,7 @@ impl<'a> Parser<'a> {
         // it is a compound operator: with FROM optional (#67), `SELECT 1
         // UNION SELECT 2` puts `UNION` right after an item, and reading it as
         // the item's alias would swallow the second arm.
-        if matches!(self.peek(), Some(Tok::QuotedIdent(_))) {
+        if matches!(self.peek(), Some(Tok::QuotedIdent(..))) {
             return Ok((e, Some(self.ident("select-item alias")?)));
         }
         if matches!(self.peek(), Some(Tok::Ident(_))) && self.peek_compound_op().is_none() {
@@ -541,7 +541,7 @@ impl<'a> Parser<'a> {
         // positionally), so without this `FROM emp LEFT JOIN dept` would read
         // `LEFT` as an alias for `emp` and lose the join. A quoted identifier is
         // always an alias — quoting is how you'd name a table `left`.
-        if matches!(self.peek(), Some(Tok::QuotedIdent(_))) {
+        if matches!(self.peek(), Some(Tok::QuotedIdent(..))) {
             return Ok(Some(self.ident("table alias")?));
         }
         // `USING` is likewise positional (`JOIN b USING (id)`): reading it as an

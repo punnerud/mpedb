@@ -89,7 +89,7 @@ fn plan_fts_match(
     // Left operand: the FTS table itself (whole-row) or one of its content
     // columns (column-scoped). Anything else is the misuse error.
     let default_columns: Vec<u16> = match lhs {
-        ast::Expr::Col(name) => resolve_match_target(table, table_ref, name)?,
+        ast::Expr::Col(name, _) => resolve_match_target(table, table_ref, name)?,
         ast::Expr::Qualified(tbl, col) => {
             if !tbl.eq_ignore_ascii_case(table_ref) && !tbl.eq_ignore_ascii_case(&table.name) {
                 return Err(match_ctx_err());

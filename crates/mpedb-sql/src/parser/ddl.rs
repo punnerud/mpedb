@@ -309,7 +309,7 @@ impl<'a> Parser<'a> {
                 }
                 // A QUOTED word can never be a constraint keyword, so it is
                 // always part of the type name (sqlite's `ids ::= ID|STRING`).
-                Some(Tok::QuotedIdent(_)) => {
+                Some(Tok::QuotedIdent(..)) => {
                     words.push(self.ident("a type name")?.to_ascii_lowercase())
                 }
                 _ => break,
@@ -482,7 +482,7 @@ impl<'a> Parser<'a> {
         // reading `("app_label", "model")` as two EXPRESSIONS gave both parts
         // the same sentinel ordinal — which then failed the duplicate-column
         // check and took down every migration that has a composite index.
-        let named = matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_)));
+        let named = matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(..)));
         if named && ends_part {
             return Ok((self.ident("column name")?, None, None));
         }
@@ -874,7 +874,7 @@ impl<'a> Parser<'a> {
                 let optname = self.ident("option name")?.to_ascii_lowercase();
                 self.expect(&Tok::Eq, "=")?;
                 let val = match self.advance() {
-                    Some(Tok::Str(s)) | Some(Tok::Ident(s)) | Some(Tok::QuotedIdent(s)) => s,
+                    Some(Tok::Str(s)) | Some(Tok::Ident(s)) | Some(Tok::QuotedIdent(s, _)) => s,
                     _ => {
                         return Err(
                             self.err_here("expected a tokenizer name, e.g. 'unicode61' or 'ascii'")
@@ -1344,7 +1344,7 @@ impl<'a> Parser<'a> {
     /// Consume an optional single identifier target (bare or quoted), returning
     /// `None` at end of statement / a trailing `;`. Shared by ANALYZE/REINDEX.
     fn opt_target_name(&mut self) -> Result<Option<String>> {
-        if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_))) {
+        if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(..))) {
             Ok(Some(self.ident("table or index name")?))
         } else {
             Ok(None)

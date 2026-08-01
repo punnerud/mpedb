@@ -128,7 +128,7 @@ pub fn parse_attach(sql: &str) -> Result<Option<AttachStmt>> {
     }
     let word = |t: Option<&SpTok>| -> Option<String> {
         match t.map(|t| &t.tok) {
-            Some(Tok::Ident(s)) | Some(Tok::QuotedIdent(s)) => Some(s.clone()),
+            Some(Tok::Ident(s)) | Some(Tok::QuotedIdent(s, _)) => Some(s.clone()),
             Some(Tok::Str(s)) => Some(s.clone()),
             _ => None,
         }
@@ -157,7 +157,7 @@ pub fn parse_attach(sql: &str) -> Result<Option<AttachStmt>> {
             // that is a wide surface where a typo'd column name silently
             // becomes a string, which is the footgun sqlite itself regrets.
             // This is one position where the identifier reading has no meaning.
-            Some(Tok::QuotedIdent(s)) => s.clone(),
+            Some(Tok::QuotedIdent(s, _)) => s.clone(),
             Some(Tok::Question) | Some(Tok::DollarParam(_)) => {
                 return Err(Error::Unsupported(
                     "ATTACH with a bound parameter is not supported; \
@@ -232,7 +232,7 @@ enum StmtClass {
 /// One `Ident`/`QuotedIdent` payload, or `None`.
 fn ident_of(tok: &Tok) -> Option<&str> {
     match tok {
-        Tok::Ident(s) | Tok::QuotedIdent(s) => Some(s.as_str()),
+        Tok::Ident(s) | Tok::QuotedIdent(s, _) => Some(s.as_str()),
         _ => None,
     }
 }
@@ -323,7 +323,7 @@ pub fn rename_identifier(sql: &str, old: &str, new: &str) -> Result<String> {
     let mut cut = 0usize;
     for t in &toks {
         let hit = match &t.tok {
-            Tok::Ident(s) | Tok::QuotedIdent(s) => mpedb_types::ident_eq(s, old),
+            Tok::Ident(s) | Tok::QuotedIdent(s, _) => mpedb_types::ident_eq(s, old),
             _ => false,
         };
         if !hit {
@@ -405,14 +405,14 @@ pub fn rename_table_in_ddl(sql: &str, old: &str, new: &str) -> Result<Option<Str
         return Ok(None);
     };
     let names_old = match &name_tok.tok {
-        Tok::Ident(s) | Tok::QuotedIdent(s) => mpedb_types::ident_eq(s, old),
+        Tok::Ident(s) | Tok::QuotedIdent(s, _) => mpedb_types::ident_eq(s, old),
         _ => false,
     };
     if !names_old {
         return Ok(None);
     }
     let recurs = toks[i + 1..].iter().any(|t| match &t.tok {
-        Tok::Ident(s) | Tok::QuotedIdent(s) => mpedb_types::ident_eq(s, old),
+        Tok::Ident(s) | Tok::QuotedIdent(s, _) => mpedb_types::ident_eq(s, old),
         _ => false,
     });
     if recurs {
@@ -1124,7 +1124,7 @@ fn collect_table_refs(toks: &[SpTok], head: usize) -> Result<Vec<TableRef>> {
                         // Explicit alias?
                         let has_alias = match toks.get(name_idx + 1).map(|t| &t.tok) {
                             Some(Tok::Kw(Kw::As)) => true,
-                            Some(Tok::QuotedIdent(_)) => true,
+                            Some(Tok::QuotedIdent(..)) => true,
                             Some(Tok::Ident(_)) => {
                                 let t = &toks[name_idx + 1].tok;
                                 !is_join_side_word(t)

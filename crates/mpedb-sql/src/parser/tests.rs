@@ -36,7 +36,7 @@ fn cast_parses_and_concat_sits_in_the_additive_tier() {
     // parenthesized size is dropped.
     assert_eq!(
         expr("CAST(a AS INTEGER)"),
-        Expr::Cast(Box::new(Expr::Col("a".into())), "INTEGER".into())
+        Expr::Cast(Box::new(Expr::Col("a".into(), false)), "INTEGER".into())
     );
     assert_eq!(
         expr("cast(NULL as real)"),
@@ -45,18 +45,18 @@ fn cast_parses_and_concat_sits_in_the_additive_tier() {
     // An unknown name no longer errors — it is a valid type name to the parser.
     assert_eq!(
         expr("CAST(a AS lolwut)"),
-        Expr::Cast(Box::new(Expr::Col("a".into())), "lolwut".into())
+        Expr::Cast(Box::new(Expr::Col("a".into(), false)), "lolwut".into())
     );
     assert_eq!(
         expr("CAST(a AS VARCHAR(10))"),
-        Expr::Cast(Box::new(Expr::Col("a".into())), "VARCHAR".into())
+        Expr::Cast(Box::new(Expr::Col("a".into(), false)), "VARCHAR".into())
     );
     assert_eq!(
         expr("CAST(a AS DOUBLE PRECISION)"),
-        Expr::Cast(Box::new(Expr::Col("a".into())), "DOUBLE PRECISION".into())
+        Expr::Cast(Box::new(Expr::Col("a".into(), false)), "DOUBLE PRECISION".into())
     );
     // bare `cast` is still a column name
-    assert_eq!(expr("cast"), Expr::Col("cast".into()));
+    assert_eq!(expr("cast"), Expr::Col("cast".into(), false));
 
     // `a || b || c` is left-associative and binds like +/-
     assert_eq!(
@@ -65,10 +65,10 @@ fn cast_parses_and_concat_sits_in_the_additive_tier() {
             BinOp::Concat,
             Box::new(Expr::Binary(
                 BinOp::Concat,
-                Box::new(Expr::Col("a".into())),
-                Box::new(Expr::Col("b".into()))
+                Box::new(Expr::Col("a".into(), false)),
+                Box::new(Expr::Col("b".into(), false))
             )),
-            Box::new(Expr::Col("c".into()))
+            Box::new(Expr::Col("c".into(), false))
         )
     );
     // A lone `|` is the bitwise OR since #74 item 2 — the one-byte lookahead
@@ -77,8 +77,8 @@ fn cast_parses_and_concat_sits_in_the_additive_tier() {
         expr("a | b"),
         Expr::Binary(
             BinOp::BitOr,
-            Box::new(Expr::Col("a".into())),
-            Box::new(Expr::Col("b".into()))
+            Box::new(Expr::Col("a".into(), false)),
+            Box::new(Expr::Col("b".into(), false))
         )
     );
     // The bitwise tier sits BETWEEN comparison and `+`/`-` (sqlite's parse.y),
@@ -89,21 +89,21 @@ fn cast_parses_and_concat_sits_in_the_additive_tier() {
             BinOp::BitOr,
             Box::new(Expr::Binary(
                 BinOp::Add,
-                Box::new(Expr::Col("a".into())),
-                Box::new(Expr::Col("b".into()))
+                Box::new(Expr::Col("a".into(), false)),
+                Box::new(Expr::Col("b".into(), false))
             )),
-            Box::new(Expr::Col("c".into()))
+            Box::new(Expr::Col("c".into(), false))
         )
     );
     assert_eq!(
         expr("a = b | c"),
         Expr::Binary(
             BinOp::Eq,
-            Box::new(Expr::Col("a".into())),
+            Box::new(Expr::Col("a".into(), false)),
             Box::new(Expr::Binary(
                 BinOp::BitOr,
-                Box::new(Expr::Col("b".into())),
-                Box::new(Expr::Col("c".into()))
+                Box::new(Expr::Col("b".into(), false)),
+                Box::new(Expr::Col("c".into(), false))
             ))
         )
     );
@@ -114,23 +114,23 @@ fn cast_parses_and_concat_sits_in_the_additive_tier() {
             BinOp::BitAnd,
             Box::new(Expr::Binary(
                 BinOp::BitOr,
-                Box::new(Expr::Col("a".into())),
-                Box::new(Expr::Col("b".into()))
+                Box::new(Expr::Col("a".into(), false)),
+                Box::new(Expr::Col("b".into(), false))
             )),
-            Box::new(Expr::Col("c".into()))
+            Box::new(Expr::Col("c".into(), false))
         )
     );
     // `~` is prefix-only, at unary-minus precedence.
     assert_eq!(
         expr("~a"),
-        Expr::Unary(UnOp::BitNot, Box::new(Expr::Col("a".into())))
+        Expr::Unary(UnOp::BitNot, Box::new(Expr::Col("a".into(), false)))
     );
     assert_eq!(
         expr("~a + b"),
         Expr::Binary(
             BinOp::Add,
-            Box::new(Expr::Unary(UnOp::BitNot, Box::new(Expr::Col("a".into())))),
-            Box::new(Expr::Col("b".into()))
+            Box::new(Expr::Unary(UnOp::BitNot, Box::new(Expr::Col("a".into(), false)))),
+            Box::new(Expr::Col("b".into(), false))
         )
     );
     // A trailing `~` still has nothing to apply to.
@@ -180,7 +180,7 @@ fn compound_selects_parse() {
 }
 
 fn col(name: &str) -> Box<Expr> {
-    Box::new(Expr::Col(name.into()))
+    Box::new(Expr::Col(name.into(), false))
 }
 
 fn int(v: i64) -> Box<Expr> {
@@ -412,8 +412,8 @@ fn full_select() {
             assert_eq!(
                 sel.order_by,
                 vec![
-                    (Expr::Col("a".into()), SortDir::dir(false)),
-                    (Expr::Col("b".into()), SortDir::dir(true))
+                    (Expr::Col("a".into(), false), SortDir::dir(false)),
+                    (Expr::Col("b".into(), false), SortDir::dir(true))
                 ]
             );
             assert_eq!(sel.limit, Some(LimitVal::Lit(10)));
@@ -434,7 +434,7 @@ fn order_by_takes_an_aggregate_not_just_a_name() {
             .unwrap();
     match s {
         Stmt::Select(sel) => {
-            assert_eq!(sel.group_by, vec![Expr::Col("dept".into())]);
+            assert_eq!(sel.group_by, vec![Expr::Col("dept".into(), false)]);
             assert_eq!(
                 sel.order_by,
                 vec![(
@@ -810,9 +810,11 @@ fn table_qualified_columns_parse_and_are_distinct_from_excluded() {
     // `excluded` is its own thing, not a table qualifier.
     let (e, _) = parse_expr_only("excluded.tenant").unwrap();
     assert_eq!(e, Expr::Excluded("tenant".into()));
-    // A quoted qualifier is still a qualifier; a quoted `excluded` is a column.
+    // A quoted qualifier is still a qualifier; a quoted `excluded` is a column
+    // — and a DOUBLE-quoted one carries the DQS flag (#132), so if nothing
+    // binds it, it falls back to the literal 'excluded' exactly as sqlite.
     let (e, _) = parse_expr_only("\"excluded\"").unwrap();
-    assert_eq!(e, Expr::Col("excluded".into()));
+    assert_eq!(e, Expr::Col("excluded".into(), true));
 }
 
 /// #1 — THE Django blocker. A quoted identifier must be usable everywhere a

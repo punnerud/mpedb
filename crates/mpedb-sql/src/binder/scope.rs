@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// See [`Scope::binds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameBinding {
+    Unique,
+    Ambiguous,
+    Unknown,
+}
+
+
 /// The tables a statement can name, and how a column reference resolves to a
 /// slot in the row the expression will see.
 ///
@@ -127,6 +136,26 @@ impl<'a> Scope<'a> {
             }
         }
         found
+    }
+
+    /// Does this scope bind `name` at all — uniquely, ambiguously, or not?
+    /// The three-way answer exists for sqlite's DQS misfeature: a DOUBLE-quoted
+    /// name that resolves to NOTHING becomes a string literal, but an
+    /// AMBIGUOUS one is still an error (measured, 3.45.1) — and `resolve`'s two
+    /// failures are both `Err`, which the caller must not tell apart by
+    /// matching message text.
+    pub fn binds(&self, name: &str) -> NameBinding {
+        let mut hits = 0;
+        for t in self.tables.iter() {
+            if t.column_index(name).or_else(|| t.rowid_name_col(name)).is_some() {
+                hits += 1;
+            }
+        }
+        match hits {
+            0 => NameBinding::Unknown,
+            1 => NameBinding::Unique,
+            _ => NameBinding::Ambiguous,
+        }
     }
 
     pub fn resolve(&self, name: &str) -> Result<(u16, ColumnType)> {

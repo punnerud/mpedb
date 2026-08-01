@@ -16,7 +16,7 @@ impl<'a> Binder<'a> {
     /// could matter, never silently dropped.
     pub(super) fn defining_collation(&self, e: &ast::Expr) -> Option<Collation> {
         match e {
-            ast::Expr::Col(_) | ast::Expr::Qualified(..) => {
+            ast::Expr::Col(..) | ast::Expr::Qualified(..) => {
                 Some(declared_collation(e, &self.scope))
             }
             ast::Expr::Cast(inner, _) => self.defining_collation(inner),

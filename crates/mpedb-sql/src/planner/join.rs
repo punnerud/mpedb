@@ -643,7 +643,7 @@ fn plan_join_select_inner<'s>(
             });
             // Same PG rule as the single-table path: an output ALIAS wins
             // over an input column of the same name.
-            if let ast::Expr::Col(n) = e {
+            if let ast::Expr::Col(n, _) = e {
                 if s.items.as_ref().is_some_and(|items| {
                     items.iter().any(|it| it.1.as_deref() == Some(n.as_str()))
                 }) {
@@ -891,7 +891,7 @@ fn join_order_by(
             }
             // A bare identifier naming an item's ALIAS is that output
             // position (PG/sqlite resolve the output name first).
-            if let ast::Expr::Col(n) = e {
+            if let ast::Expr::Col(n, _) = e {
                 if let Some(pos) =
                     items.iter().position(|it| it.1.as_deref() == Some(n.as_str()))
                 {

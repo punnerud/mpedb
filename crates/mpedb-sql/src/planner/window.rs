@@ -38,7 +38,7 @@ pub(super) fn contains_window(e: &ast::Expr) -> bool {
                 || els.as_deref().is_some_and(contains_window)
         }
         E::Agg(..) | E::Subquery(_) | E::Exists(..) => false,
-        E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
+        E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) | E::Raise(..) => false,
     }
 }
@@ -95,7 +95,7 @@ pub(super) fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Res
                     specs.len() - 1
                 }
             };
-            E::Col(format!("__w{slot}"))
+            E::Col(format!("__w{slot}"), false)
         }
         E::Unary(op, a) => E::Unary(*op, Box::new(rec(a, specs)?)),
         E::Cast(a, t) => E::Cast(Box::new(rec(a, specs)?), t.clone()),
@@ -135,7 +135,7 @@ pub(super) fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Res
         // A window inside an aggregate/subquery is refused by the binder; leave
         // it for that refusal rather than lifting it here.
         other @ (E::Agg(..) | E::Subquery(_) | E::Exists(..)) => other.clone(),
-        other @ (E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
+        other @ (E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) | E::Raise(..)) => other.clone(),
     })
 }
@@ -437,7 +437,7 @@ pub(super) fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableD
 /// values, not names, are what the differential tests pin).
 fn window_item_name(e: &ast::Expr) -> String {
     match e {
-        ast::Expr::Col(c) => c.clone(),
+        ast::Expr::Col(c, _) => c.clone(),
         ast::Expr::Qualified(_, c) => c.clone(),
         ast::Expr::Window { func, .. } => match func {
             ast::WindowFunc::RowNumber => "row_number()".to_string(),
@@ -580,7 +580,7 @@ pub(super) fn plan_window_select(
         }
         // A bare name matching a select-item ALIAS names that output position
         // (PG's rule: the output name wins over an input column).
-        if let ast::Expr::Col(n) = orig {
+        if let ast::Expr::Col(n, _) = orig {
             if let Some(items) = &s.items {
                 if let Some(pos) = items.iter().position(|it| it.1.as_deref() == Some(n.as_str())) {
                     order_by.push((pos as u16, *desc, coll));

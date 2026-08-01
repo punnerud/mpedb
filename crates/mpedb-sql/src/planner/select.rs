@@ -85,7 +85,7 @@ pub(super) fn distinct_order_by(
         // output position — PostgreSQL and sqlite both resolve the output
         // name before the input column, so `SELECT a AS b … ORDER BY b`
         // sorts by the output even when the table has its own `b`.
-        if let ast::Expr::Col(n) = key {
+        if let ast::Expr::Col(n, _) = key {
             if let Some(pos) = items.iter().position(|it| it.1.as_deref() == Some(n.as_str())) {
                 out.push((pos as u16, *desc, coll));
                 continue;
@@ -116,7 +116,7 @@ pub(super) fn distinct_order_by(
 /// follows, with a message about the actual problem rather than about the sort.
 fn col_slot(e: &ast::Expr, scope: &Scope<'_>) -> Option<u16> {
     match e {
-        ast::Expr::Col(n) => scope.resolve(n).ok().map(|(i, _)| i),
+        ast::Expr::Col(n, _) => scope.resolve(n).ok().map(|(i, _)| i),
         ast::Expr::Qualified(q, n) => scope.resolve_qualified(q, n).ok().map(|(i, _)| i),
         _ => None,
     }
@@ -167,7 +167,7 @@ pub(super) fn push_junk(
 /// 1-based position, the way sqlite says "1st ORDER BY term".
 pub(super) fn describe_key(e: &ast::Expr, pos: usize) -> String {
     match e {
-        ast::Expr::Col(n) => format!("ORDER BY `{n}`"),
+        ast::Expr::Col(n, _) => format!("ORDER BY `{n}`"),
         ast::Expr::Qualified(q, n) => format!("ORDER BY `{q}.{n}`"),
         _ => format!(
             "the {}{} ORDER BY key",
@@ -221,7 +221,7 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
     let strip = |e: &ast::Expr| -> ast::Expr {
         match e {
             ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => {
-                ast::Expr::Col(n.clone())
+                ast::Expr::Col(n.clone(), false)
             }
             other => other.clone(),
         }
@@ -239,7 +239,7 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
             continue;
         }
         // A key naming an item's alias IS in the SELECT list.
-        if let ast::Expr::Col(n) = key {
+        if let ast::Expr::Col(n, _) = key {
             if items.iter().any(|it| it.1.as_deref() == Some(n.as_str())) {
                 continue;
             }
@@ -265,7 +265,7 @@ fn expand_implicit_rowid_star(s: &ast::SelectStmt, table: &TableDef) -> ast::Sel
     let items = table
         .visible_columns()
         .iter()
-        .map(|c| (ast::Expr::Col(c.name.clone()), None))
+        .map(|c| (ast::Expr::Col(c.name.clone(), false), None))
         .collect();
     ast::SelectStmt { items: Some(items), ..s.clone() }
 }
@@ -603,7 +603,7 @@ pub(super) fn plan_select<'s>(
         // An unqualified name matching a select-item ALIAS orders the OUTPUT
         // (the PostgreSQL rule) — never the base row, even when a table
         // column shares the name. Route it to the projection-sort path.
-        if let ast::Expr::Col(n) = e {
+        if let ast::Expr::Col(n, _) = e {
             if s.items.as_ref().is_some_and(|items| {
                 items.iter().any(|it| it.1.as_deref() == Some(n.as_str()))
             }) {
@@ -614,7 +614,7 @@ pub(super) fn plan_select<'s>(
         // complaint: `ORDER BY nope` is a typo, and reporting it as "not in the
         // SELECT list" would send the reader looking in the wrong place.
         let name = match e {
-            ast::Expr::Col(n) => n,
+            ast::Expr::Col(n, _) => n,
             ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => n,
             // Not a name at all (an ordinal, an expression): the base row
             // cannot be the tuple being sorted.
@@ -827,7 +827,7 @@ fn rewrite_where_aliases_rec(
                 rewrite_where_aliases_rec(o, aliases, scope);
             }
         }
-        ast::Expr::Col(_)
+        ast::Expr::Col(..)
         | ast::Expr::Qualified(..)
         | ast::Expr::Lit(_)
         | ast::Expr::Param(_)
@@ -838,7 +838,7 @@ fn rewrite_where_aliases_rec(
         | ast::Expr::Raise(..) => {}
     }
     // After children: rewrite this node if it is a bare alias name.
-    if let ast::Expr::Col(name) = e {
+    if let ast::Expr::Col(name, _) = e {
         // A real column always wins — do not substitute.
         if scope.resolve(name).is_ok() {
             return;

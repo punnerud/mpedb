@@ -558,7 +558,7 @@ fn fromless_item_name(e: &Expr) -> String {
             mpedb_types::Value::Bool(b) => if *b { "1" } else { "0" }.into(),
             other => format!("{other:?}"),
         },
-        Expr::Col(n) => n.clone(),
+        Expr::Col(n, _) => n.clone(),
         // Fall back to a stable placeholder; callers that need the exact dual
         // name go through an explicit alias.
         _ => "?column?".into(),
@@ -574,7 +574,7 @@ fn rewrite_cte_cols(
     ref_alias: &str,
 ) -> Result<()> {
     match e {
-        Expr::Col(n) => {
+        Expr::Col(n, _) => {
             if let Some(repl) = by_name.get(&fold_ident(n)) {
                 *e = repl.clone();
             }
@@ -736,7 +736,7 @@ fn flatten_cte_join(
         let projects = |name: &str| {
             items.iter().any(|(e, alias)| match alias {
                 Some(a) => mpedb_types::ident_eq(a, name),
-                None => matches!(e, Expr::Col(c) if mpedb_types::ident_eq(c, name))
+                None => matches!(e, Expr::Col(c, _) if mpedb_types::ident_eq(c, name))
                     || matches!(e, Expr::Qualified(_, c) if mpedb_types::ident_eq(c, name)),
             })
         };
@@ -1092,7 +1092,7 @@ fn body_output_names(b: &SubqueryBody) -> Option<Vec<String>> {
         .iter()
         .map(|(e, alias)| match (alias, e) {
             (Some(a), _) => Some(a.clone()),
-            (None, Expr::Col(n)) | (None, Expr::Qualified(_, n)) => Some(n.clone()),
+            (None, Expr::Col(n, _)) | (None, Expr::Qualified(_, n)) => Some(n.clone()),
             _ => None,
         })
         .collect()
@@ -1123,7 +1123,7 @@ fn projection_passthrough(m: &SelectStmt) -> Option<Vec<String>> {
         .as_ref()?
         .iter()
         .map(|(e, alias)| match (alias, e) {
-            (None, Expr::Col(n)) => Some(n.clone()),
+            (None, Expr::Col(n, _)) => Some(n.clone()),
             (None, Expr::Qualified(q, n)) if m.alias.as_deref() == Some(q.as_str()) => {
                 Some(n.clone())
             }
@@ -1154,7 +1154,7 @@ fn expr_mentions(e: &Expr, hidden: &[String]) -> bool {
         SubqueryBody::Compound(c) => c.arms.iter().any(|a| mentions_any(a, hidden)),
     };
     match e {
-        Expr::Col(n) | Expr::Qualified(_, n) => {
+        Expr::Col(n, _) | Expr::Qualified(_, n) => {
             hidden.iter().any(|h| h.eq_ignore_ascii_case(n))
         }
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => sub(a),
@@ -1242,7 +1242,7 @@ fn collapse_projection_passthrough(s: &mut SelectStmt, body: &mut SubqueryBody) 
         return false;
     }
     if expand_star {
-        s.items = Some(sel.iter().map(|n| (Expr::Col(n.clone()), None)).collect());
+        s.items = Some(sel.iter().map(|n| (Expr::Col(n.clone(), false), None)).collect());
     }
     let SubqueryBody::Select(m) = body else { unreachable!("matched above") };
     let inner = m.from_derived.take().expect("projection_passthrough checked it");
@@ -1324,7 +1324,7 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
         Expr::Subquery(_) | Expr::Exists(_, _) | Expr::InSubquery(_, _, _) => {}
         Expr::Lit(_)
         | Expr::Param(_)
-        | Expr::Col(_)
+        | Expr::Col(..)
         | Expr::ContextRef(_)
         | Expr::Excluded(_)
         | Expr::Raise(..) => {}
@@ -1619,7 +1619,7 @@ fn body_exposed_names(body: &SelectStmt) -> HashMap<String, Expr> {
     };
     let renaming = items
         .iter()
-        .any(|(e, a)| a.is_some() || !matches!(e, Expr::Col(_)));
+        .any(|(e, a)| a.is_some() || !matches!(e, Expr::Col(..)));
     if !renaming {
         return HashMap::new();
     }
@@ -1627,7 +1627,7 @@ fn body_exposed_names(body: &SelectStmt) -> HashMap<String, Expr> {
     for (e, alias) in items {
         let name = match (alias, e) {
             (Some(a), _) => a.clone(),
-            (None, Expr::Col(c)) => c.clone(),
+            (None, Expr::Col(c, _)) => c.clone(),
             (None, Expr::Qualified(_, c)) => c.clone(),
             // An un-aliased computed item has no name an outer query could
             // write, so there is nothing to substitute for it.
@@ -1676,7 +1676,7 @@ fn check_simple(v: &SelectStmt, name: &str) -> Result<()> {
         }
         if items
             .iter()
-            .any(|(e, _)| !matches!(e, Expr::Col(_) | Expr::Qualified(..)))
+            .any(|(e, _)| !matches!(e, Expr::Col(..) | Expr::Qualified(..)))
         {
             bad.push("a computed (non-column) projection");
         }
@@ -1728,7 +1728,7 @@ pub(crate) fn expr_aggregates(e: &Expr) -> bool {
         | Expr::InSubquery(..)
         | Expr::Lit(_)
         | Expr::Param(_)
-        | Expr::Col(_)
+        | Expr::Col(..)
         | Expr::Qualified(..)
         | Expr::ContextRef(_)
         | Expr::Excluded(_)

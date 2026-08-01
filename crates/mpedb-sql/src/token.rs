@@ -21,7 +21,12 @@ pub(crate) enum Tok {
     /// `"a"` (`""` escapes), `` `a` `` (``` `` ``` escapes), `[a]` (no escape,
     /// closed by the first `]` — MS-Access/SQL-Server style, which sqlite
     /// accepts too).
-    QuotedIdent(String),
+    /// The bool is `true` for a DOUBLE-quoted identifier — the one spelling
+    /// sqlite's DQS misfeature applies to: in EXPRESSION position, a
+    /// double-quoted name that resolves to no column becomes a string
+    /// LITERAL. Backtick and `[…]` never do (measured, 3.45.1), so the flag
+    /// is what lets the parser tell the binder which names are eligible.
+    QuotedIdent(String, bool),
     Kw(Kw),
     Int(i64),
     Float(f64),
@@ -425,14 +430,14 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
             b'"' | b'`' => {
                 let (s, next) = lex_quoted_ident(sql, i, c)?;
                 i = next;
-                Tok::QuotedIdent(s)
+                Tok::QuotedIdent(s, c == b'"')
             }
             // `[name]` — no escape mechanism (sqlite has none either): the
             // first `]` closes it, so a `]` cannot appear in a bracketed name.
             b'[' => {
                 let (s, next) = lex_bracket_ident(sql, i)?;
                 i = next;
-                Tok::QuotedIdent(s)
+                Tok::QuotedIdent(s, false)
             }
             b'0'..=b'9' => {
                 let (tok, next) = lex_number(sql, i)?;
@@ -712,7 +717,7 @@ mod tests {
                 Tok::Ident("users".into()),
             ]
         );
-        assert_eq!(toks("\"select\""), vec![Tok::QuotedIdent("select".into())]);
+        assert_eq!(toks("\"select\""), vec![Tok::QuotedIdent("select".into(), true)]);
     }
 
     #[test]
@@ -833,23 +838,27 @@ mod tests {
     }
 
     /// #1: all THREE quoted-identifier spellings sqlite accepts lex to the SAME
-    /// token, so a quoted name is usable everywhere a bare one is and nothing
-    /// downstream can tell which spelling was written.
+    /// token, so a quoted name is usable everywhere a bare one is. The one
+    /// thing downstream MAY tell apart is whether the spelling was DOUBLE
+    /// quotes — the bool exists solely for the DQS misfeature (#132), where an
+    /// unbound double-quoted name in expression position becomes a string
+    /// literal and the other two spellings never do.
     #[test]
     fn every_quoting_spelling_is_one_token() {
-        let q = |s: &str| Tok::QuotedIdent(s.into());
-        assert_eq!(toks("\"t\""), vec![q("t")]);
+        let dq = |s: &str| Tok::QuotedIdent(s.into(), true);
+        let q = |s: &str| Tok::QuotedIdent(s.into(), false);
+        assert_eq!(toks("\"t\""), vec![dq("t")]);
         assert_eq!(toks("`t`"), vec![q("t")]);
         assert_eq!(toks("[t]"), vec![q("t")]);
         // A doubled delimiter escapes one, for the two that have an escape.
-        assert_eq!(toks("\"a\"\"b\""), vec![q("a\"b")]);
+        assert_eq!(toks("\"a\"\"b\""), vec![dq("a\"b")]);
         assert_eq!(toks("`a``b`"), vec![q("a`b")]);
         // `[...]` has NO escape in sqlite: the first `]` closes it.
         assert_eq!(toks("[a b]"), vec![q("a b")]);
         // Keywords, spaces and dots all survive quoting.
         assert_eq!(toks("[select]"), vec![q("select")]);
         assert_eq!(toks("`from`"), vec![q("from")]);
-        assert_eq!(toks("\"a.b\""), vec![q("a.b")]);
+        assert_eq!(toks("\"a.b\""), vec![dq("a.b")]);
         // Every spelling of the dotted path lexes to ident-dot-ident.
         for src in ["\"t\".\"c\"", "`t`.`c`", "[t].[c]", "\"t\".c", "t.\"c\""] {
             assert_eq!(

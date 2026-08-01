@@ -288,7 +288,17 @@ pub(crate) enum Expr {
     Lit(Value),
     /// 0-based parameter index.
     Param(u16),
-    Col(String),
+    /// A bare column reference. The bool is `true` when the name was written
+    /// DOUBLE-QUOTED — the one spelling sqlite's DQS misfeature applies to: in
+    /// expression position, a double-quoted name that resolves to NO column
+    /// becomes a string LITERAL (measured, 3.45.1; backtick/bracket never do,
+    /// qualified refs never do, ambiguity is still an error, and INSERT column
+    /// lists / UPDATE SET targets are not expression position). Carried on the
+    /// variant rather than as a separate node so that every match site was
+    /// forced through the compiler — an `if let Expr::Col` that silently did
+    /// not match a new variant is exactly how a correlated reference would
+    /// have fallen to a literal instead of correlating.
+    Col(String, bool),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// A ROW VALUE (tuple): a parenthesized list of ≥2 expressions, `(e1, e2, …)`.

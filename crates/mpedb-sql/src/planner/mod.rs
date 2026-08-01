@@ -962,7 +962,7 @@ fn plan_returning(
     let mut proj = Vec::with_capacity(items.len());
     for e in items {
         match e {
-            ast::Expr::Col(name) => {
+            ast::Expr::Col(name, _) => {
                 let i = table
                     .columns
                     .iter()
@@ -985,7 +985,7 @@ fn plan_returning(
 /// A display name for a RETURNING expression item.
 fn render_expr_name(e: &ast::Expr) -> String {
     match e {
-        ast::Expr::Col(c) => c.clone(),
+        ast::Expr::Col(c, _) => c.clone(),
         _ => "?column?".to_string(),
     }
 }
@@ -1217,7 +1217,7 @@ fn plan_compound(
             order_by.push((pos, *dir, coll));
             continue;
         }
-        let ast::Expr::Col(n) = e else {
+        let ast::Expr::Col(n, _) = e else {
             return Err(bind_err(
                 "ORDER BY over a compound must name an output column or ordinal",
             ));

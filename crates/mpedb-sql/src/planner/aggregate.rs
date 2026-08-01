@@ -30,7 +30,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
         // walk stops here exactly as it does at a subquery boundary. This is
         // what keeps `sum(x) OVER (…)` from being read as a plain aggregate.
         E::Window { .. } => false,
-        E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
+        E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) | E::Raise(..) => false,
     }
 }
@@ -58,7 +58,7 @@ fn subst_output_alias(
     items: &[(ast::Expr, Option<String>)],
     scope: &Scope<'_>,
 ) -> ast::Expr {
-    let ast::Expr::Col(n) = e else {
+    let ast::Expr::Col(n, _) = e else {
         return e.clone();
     };
     if scope.resolve(n).is_ok() {
@@ -110,7 +110,7 @@ fn lift_aggs(
     // before anything else, so the whole key wins over its parts; aggregate
     // ARGUMENTS never get here (the Agg arm below clones them unrewritten).
     if let Some(pos) = keys.asts.iter().position(|k| k == e) {
-        return Ok(E::Col(format!("__g{pos}")));
+        return Ok(E::Col(format!("__g{pos}"), false));
     }
     Ok(match e {
         E::Agg(f, arg, distinct, filter, extra) => {
@@ -137,7 +137,7 @@ fn lift_aggs(
                 };
             // The grouped tuple has no table, so name the slot positionally;
             // `synthetic_grouped_table` below gives those names meaning.
-            E::Col(format!("__g{slot}"))
+            E::Col(format!("__g{slot}"), false)
         }
         // A bare column in an aggregate query is one that is neither a GROUP BY
         // key nor inside an aggregate. `Postgres` refuses it (SQL's rule);
@@ -149,19 +149,19 @@ fn lift_aggs(
         // windows]`, which does not exist yet — so it must pass through
         // untouched rather than be resolved against the base row, where it
         // would be reported as an unknown column.
-        E::Col(n) if n.starts_with("__w") && n[3..].bytes().all(|b| b.is_ascii_digit()) => {
+        E::Col(n, _) if n.starts_with("__w") && n[3..].bytes().all(|b| b.is_ascii_digit()) => {
             e.clone()
         }
-        E::Col(_) | E::Qualified(..) => {
+        E::Col(..) | E::Qualified(..) => {
             let (idx, ty) = match e {
-                E::Col(n) => scope.resolve(n)?,
+                E::Col(n, _) => scope.resolve(n)?,
                 E::Qualified(q, n) => scope.resolve_qualified(q, n)?,
                 _ => unreachable!("matched above"),
             };
             // Slot-based match: `GROUP BY a` + `SELECT t.a` are the same key
             // under two spellings, which AST equality above cannot see.
             match keys.cols.iter().position(|g| *g == Some(idx)) {
-                Some(pos) => E::Col(format!("__g{pos}")),
+                Some(pos) => E::Col(format!("__g{pos}"), false),
                 None => match mode {
                     BareGroupBy::Postgres => {
                         return Err(bind_err(format!(
@@ -187,7 +187,7 @@ fn lift_aggs(
                                 bare.len() - 1
                             }
                         };
-                        E::Col(format!("__b{j}"))
+                        E::Col(format!("__b{j}"), false)
                     }
                 },
             }
@@ -487,9 +487,9 @@ pub(super) fn plan_aggregate_select(
             ));
         }
         match g {
-            ast::Expr::Col(_) | ast::Expr::Qualified(..) => {
+            ast::Expr::Col(..) | ast::Expr::Qualified(..) => {
                 let (i, ty) = match g {
-                    ast::Expr::Col(n) => base_scope.resolve(n)?,
+                    ast::Expr::Col(n, _) => base_scope.resolve(n)?,
                     ast::Expr::Qualified(q, n) => base_scope.resolve_qualified(q, n)?,
                     _ => unreachable!("matched above"),
                 };
@@ -1177,7 +1177,7 @@ fn agg_index_choice(
 /// The output column name for one item of an aggregate SELECT list.
 fn agg_item_name(e: &ast::Expr) -> String {
     match e {
-        ast::Expr::Col(c) => c.clone(),
+        ast::Expr::Col(c, _) => c.clone(),
         ast::Expr::Qualified(_, c) => c.clone(),
         ast::Expr::Agg(f, None, _, _, _) => format!("{}(*)", f.name()),
         ast::Expr::Agg(f, Some(a), distinct, _, _) => format!(

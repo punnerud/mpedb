@@ -77,7 +77,7 @@ pub(super) fn expr_has_subquery(e: &ast::Expr) -> bool {
         // stage 1 (the window planner binds those sub-expressions directly); one
         // that appears there is refused by the binder, not lifted here.
         E::Window { .. } => false,
-        E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
+        E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) | E::Raise(..) => false,
     }
 }
@@ -510,7 +510,7 @@ impl Lift<'_> {
             // Windows are not descended into for subquery lifting (stage 1); a
             // subquery inside one reaches the binder's refusal unchanged.
             other @ E::Window { .. } => other.clone(),
-            other @ (E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_)
+            other @ (E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_)
             | E::Excluded(_) | E::Qualified(..) | E::Raise(..)) => other.clone(),
         })
     }
@@ -832,7 +832,7 @@ impl Lift<'_> {
 /// window functions — yields `None`, i.e. Binary, which is also measured.
 fn peel_to_column(e: &ast::Expr) -> Option<(Option<&str>, &str)> {
     match e {
-        ast::Expr::Col(n) => Some((None, n.as_str())),
+        ast::Expr::Col(n, _) => Some((None, n.as_str())),
         ast::Expr::Qualified(q, n) => Some((Some(q.as_str()), n.as_str())),
         ast::Expr::Cast(inner, _) => peel_to_column(inner),
         _ => None,
@@ -1004,7 +1004,7 @@ impl<'a> Correlate<'a, '_> {
             // descending through is likewise NOT ours; only a name bound by no
             // inner-or-nested scope is tried against the outer row and becomes a
             // (possibly transit) correlation parameter.
-            E::Col(n) => {
+            E::Col(n, _) => {
                 if self.bound_here(n) {
                     e.clone()
                 } else if let Ok((slot, ty)) = self.outer_scope.resolve(n) {
@@ -1259,7 +1259,7 @@ fn qualify_probe(
     use ast::Expr as E;
     let sub = |a: &ast::Expr, q: &mut Vec<String>| qualify_probe(a, outer, q);
     Some(match e {
-        E::Col(name) => {
+        E::Col(name, _) => {
             let owner = outer.owner_name(name)?;
             quals.push(owner.to_string());
             E::Qualified(owner.to_string(), name.clone())

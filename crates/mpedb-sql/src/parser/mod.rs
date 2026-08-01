@@ -735,9 +735,9 @@ impl<'a> Parser<'a> {
     /// Identifier (bare or quoted).
     fn ident(&mut self, what: &str) -> Result<String> {
         match self.peek() {
-            Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_)) => {
+            Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(..)) => {
                 match self.advance() {
-                    Some(Tok::Ident(s)) | Some(Tok::QuotedIdent(s)) => Ok(s),
+                    Some(Tok::Ident(s)) | Some(Tok::QuotedIdent(s, _)) => Ok(s),
                     _ => unreachable!(),
                 }
             }
@@ -965,7 +965,7 @@ impl<'a> Parser<'a> {
     /// case-insensitive (see the write session), matching sqlite.
     fn savepoint_name(&mut self, what: &str) -> Result<String> {
         match self.peek() {
-            Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_)) => self.ident(what),
+            Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(..)) => self.ident(what),
             Some(Tok::Str(_)) => match self.advance() {
                 Some(Tok::Str(s)) => Ok(s),
                 _ => unreachable!(),

@@ -792,7 +792,29 @@ impl<'a> Binder<'a> {
                 })?;
                 Ok((BExpr::Param(*i), ty))
             }
-            ast::Expr::Col(name) => {
+            ast::Expr::Col(name, dq) => {
+                // sqlite's DQS misfeature, and ONLY where sqlite applies it
+                // (measured, 3.45.1): a DOUBLE-quoted name in expression
+                // position that binds to NOTHING is a string LITERAL. An
+                // ambiguous one is still an error; backtick/bracket and
+                // qualified spellings never fall back; PostgreSQL never does.
+                // The parser sets `dq` at exactly one site, so an ordinary
+                // identifier cannot reach the fallback.
+                //
+                // Why it exists at all: Django's table-rebuild emits SQL that
+                // names a column it just renamed away, and survives on stock
+                // only because DQS turns the dangler into a literal over an
+                // empty table. Refusing was more honest but answered where
+                // the oracle does not.
+                if *dq
+                    && self.sqlite_dialect()
+                    && self.scope.binds(name) == scope::NameBinding::Unknown
+                {
+                    return Ok((
+                        BExpr::Const(Value::Text(name.clone())),
+                        Some(ColumnType::Text),
+                    ));
+                }
                 let (idx, ty) = self.scope.resolve(name)?;
                 Ok((BExpr::Col(idx), Some(ty)))
             }

@@ -157,7 +157,7 @@ pub(crate) fn peel_collate(e: &ast::Expr) -> Result<(&ast::Expr, Option<Collatio
 /// which only differs from sqlite for a `+`-prefixed collated column in ORDER BY).
 pub(crate) fn declared_collation(key: &ast::Expr, scope: &Scope) -> Collation {
     let slot = match key {
-        ast::Expr::Col(n) => scope.resolve(n).ok().map(|(i, _)| i),
+        ast::Expr::Col(n, _) => scope.resolve(n).ok().map(|(i, _)| i),
         ast::Expr::Qualified(q, n) => scope.resolve_qualified(q, n).ok().map(|(i, _)| i),
         _ => None,
     };

@@ -92,7 +92,7 @@ impl<'a> Parser<'a> {
     /// quoted empty identifier (`CAST(x AS "")`) is allowed and yields "".
     fn type_name(&mut self) -> Result<String> {
         let mut words: Vec<String> = Vec::new();
-        while matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_))) {
+        while matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(..))) {
             words.push(self.ident("a type name in CAST")?);
         }
         if words.is_empty() {
@@ -587,7 +587,7 @@ impl<'a> Parser<'a> {
         // sqlite shorthand: `x IN <table>` == `x IN (SELECT * FROM <table>)`
         // (the table must have a single column; the InSubquery lift enforces it).
         if self.peek() != Some(&Tok::LParen) {
-            if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_))) {
+            if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(..))) {
                 let tname = self.ident("table name after IN")?;
                 let inner = SelectStmt {
                     table: Some(tname),
@@ -1311,7 +1311,7 @@ impl<'a> Parser<'a> {
                 if let Some(f) = now_fn {
                     return Ok(Expr::Func(f.into(), vec![Expr::Lit(Value::Text("now".into()))]));
                 }
-                Ok(Expr::Col(s))
+                Ok(Expr::Col(s, false))
     }
 
     /// `<qualifier> . <column>` — the caller has seen a bare or quoted
@@ -1447,11 +1447,14 @@ impl<'a> Parser<'a> {
             // though: `"t"."c"` must be exactly `t.c` (Django quotes every
             // identifier it emits, so this is the difference between working
             // and not).
-            Some(Tok::QuotedIdent(s)) => {
+            Some(Tok::QuotedIdent(s, dq)) => {
                 if self.peek() == Some(&Tok::Dot) {
+                    // Qualified (`"t"."c"`): never DQS-eligible — sqlite errors
+                    // on an unresolved qualified name even when double-quoted
+                    // (measured), so the flag stops here.
                     return self.dot_suffix(s);
                 }
-                Ok(Expr::Col(s))
+                Ok(Expr::Col(s, dq))
             }
             Some(Tok::LParen) => {
                 // `(SELECT …)` is a scalar subquery, not a parenthesized
