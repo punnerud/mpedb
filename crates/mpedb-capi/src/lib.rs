@@ -4544,7 +4544,7 @@ pub unsafe extern "C" fn sqlite3_deserialize(
             // we can open" — defer nothing, say it now.
             let rc = fail(c, SQLITE_NOTADB, "file is not a database");
             free_buf();
-            return rc;
+            rc
         }
     }
 }

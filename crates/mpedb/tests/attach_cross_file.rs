@@ -475,7 +475,11 @@ fn attach_memory_and_shapes() {
         // database", measured) — unlike a missing FILE, which it creates.
         (
             "ATTACH '/nonexistent/nowhere.mpedb' AS ghost".to_string(),
-            "No such file or directory",
+            // Unix says "No such file or directory", Windows "cannot find
+            // the path" (os error 3) — the refusal CLASS is the contract
+            // (mpedb's `i/o error:` wrapper), the OS's words are not. CI's
+            // first real Windows run caught the Unix-text pin.
+            "i/o error",
         ),
         ("ATTACH ? AS pdb".to_string(), "bound parameter"),
     ] {
