@@ -78,7 +78,7 @@ SQLITE_LIMIT_WORKER_THREADS = 11
 
 sqlite_version = "3.45.0-mpedb"
 sqlite_version_info = (3, 45, 0)
-version = "0.2.2"
+version = "0.2.3"
 version_info = (0, 1, 5)
 
 # ---------------------------------------------------------------------------
