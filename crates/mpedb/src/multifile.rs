@@ -384,6 +384,15 @@ impl Database {
                 return Err(Error::Bind(format!("view {name} already exists")));
             }
             guard.insert(name, (select_sql, verbatim));
+            drop(guard);
+            // A temp view moves name resolution WITHOUT moving `schema_gen` —
+            // it is connection-local text, not catalog. A text memoized while
+            // this name meant something else would keep hitting (the memo runs
+            // before every routing hook), so both local plan caches go. Debug
+            // builds hid this: `verify_plan_memo` recompiles every hit, and
+            // the recompile resolves the new name — only a release build ever
+            // served the stale plan.
+            self.drop_local_plans();
             return Ok(Some(ExecResult::Affected(0)));
         }
         // A bare `DROP VIEW v` hits the temp view first — same shadowing rule
@@ -401,7 +410,17 @@ impl Database {
         };
         let mut guard = self.temp_views.write().expect(POISON);
         match guard.remove(&name) {
-            Some(_) => Ok(Some(ExecResult::Affected(0))),
+            Some(_) => {
+                drop(guard);
+                // The unshadowing direction of the same rule as CREATE above:
+                // a plan derived THROUGH the view (its body was inlined before
+                // compile) sits in the local caches under the original text,
+                // and nothing else invalidates it — `SELECT … FROM v` kept
+                // ANSWERING after this drop in release builds, where the test
+                // demands "no such view".
+                self.drop_local_plans();
+                Ok(Some(ExecResult::Affected(0)))
+            }
             // `temp.v` names the temp schema and nothing else, so a miss there
             // must not fall through to main and drop a different view.
             None if qualified => Err(Error::Bind(format!("no such view: temp.{name}"))),
@@ -563,6 +582,13 @@ impl Database {
         };
         if let Some(rewritten) = mpedb_sql::rewrite_temp_ddl(sql)? {
             self.ensure_temp_schema()?;
+            // TEMP-keyword DDL (a temp TABLE, index, trigger) shadows main
+            // names exactly like a temp view does, and moves the temp MEMBER's
+            // catalog, not main's `schema_gen` — the memo's key never sees it.
+            // Flushing here over-approximates (this resolver also serves
+            // inspection paths), which costs a cold recompile and can never
+            // cost an answer.
+            self.drop_local_plans();
             let guard = self.attached.read().expect(POISON);
             let scope = self.build_scope(&guard)?;
             drop(guard);
