@@ -147,6 +147,322 @@ pub fn sqlite_sequence_query(
     Ok((out_cols, out_rows))
 }
 
+/// Is this statement a WRITE targeting `sqlite_sequence`? TARGET position
+/// only — `UPDATE sqlite_sequence`, `INSERT INTO sqlite_sequence`,
+/// `DELETE FROM sqlite_sequence` — for the same reason the read detector
+/// pins the FROM position: the name appears as a string LITERAL in Django's
+/// own catalog queries, and match-anywhere answered the wrong table once
+/// already. Statement-start anchored; sqlite's `OR <conflict>` spellings are
+/// carried through.
+pub fn sqlite_sequence_write_target(sql: &str) -> bool {
+    parse_seq_target(sql).is_some()
+}
+
+/// (verb, byte offset just past the table name) when the statement writes
+/// `sqlite_sequence`.
+fn parse_seq_target(sql: &str) -> Option<(SeqVerb, usize)> {
+    let lower = sql.to_ascii_lowercase();
+    let s = lower.trim_start();
+    let base = lower.len() - s.len();
+    let take = |rest: &str, word: &str| -> Option<usize> {
+        let r = rest.strip_prefix(word)?;
+        (r.starts_with(char::is_whitespace) || r.is_empty()).then_some(word.len())
+    };
+    let skip_ws = |s: &str| s.len() - s.trim_start().len();
+    let (verb, mut at) = if let Some(n) = take(s, "update") {
+        (SeqVerb::Update, n)
+    } else if let Some(n) = take(s, "insert") {
+        (SeqVerb::Insert, n)
+    } else if let Some(n) = take(s, "delete") {
+        (SeqVerb::Delete, n)
+    } else {
+        return None;
+    };
+    at += skip_ws(&s[at..]);
+    // `UPDATE OR ROLLBACK …` / `INSERT OR REPLACE INTO …` — conflict clauses
+    // change nothing for a counter write, so they parse and are ignored.
+    if matches!(verb, SeqVerb::Update | SeqVerb::Insert) {
+        if let Some(n) = take(&s[at..], "or") {
+            at += n + skip_ws(&s[at + n..]);
+            let word_end = s[at..].find(char::is_whitespace).unwrap_or(s.len() - at);
+            at += word_end + skip_ws(&s[at + word_end..]);
+        }
+    }
+    match verb {
+        SeqVerb::Insert => {
+            let n = take(&s[at..], "into")?;
+            at += n + skip_ws(&s[at + n..]);
+        }
+        SeqVerb::Delete => {
+            let n = take(&s[at..], "from")?;
+            at += n + skip_ws(&s[at + n..]);
+        }
+        SeqVerb::Update => {}
+    }
+    let rest = &s[at..];
+    let (rest, quoted) = match rest
+        .strip_prefix('"')
+        .or_else(|| rest.strip_prefix('`'))
+        .or_else(|| rest.strip_prefix('['))
+    {
+        Some(r) => (r, 1),
+        None => (rest, 0),
+    };
+    let tail = rest.strip_prefix("sqlite_sequence")?;
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    if quoted == 0 && tail.chars().next().is_some_and(ident) {
+        return None;
+    }
+    let name_end = at + quoted + "sqlite_sequence".len() + quoted;
+    Some((verb, base + name_end))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SeqVerb {
+    Update,
+    Insert,
+    Delete,
+}
+
+/// What a `sqlite_sequence` write resolves to over the SYNTHESISED rows: the
+/// per-name counter updates (`None` = delete the record), the changes()
+/// count, and — for INSERT — a possibly-virgin name the caller must resolve
+/// against the live schema (stock would store an orphan row for an unknown
+/// table; mpedb's catalog-backed counters have nowhere to keep one, so the
+/// caller refuses BY NAME rather than faking success).
+pub struct SeqWritePlan {
+    pub updates: Vec<(String, Option<i64>)>,
+    pub affected: i64,
+    pub insert_new: Option<(String, i64)>,
+}
+
+/// Parse + evaluate a `sqlite_sequence` write against the visible rows.
+/// Supported forms are the CONSUMER forms, measured on stock 3.45.1:
+///
+///  * `UPDATE sqlite_sequence SET seq = <int> [WHERE …]` — Django's flush
+///    reset (`WHERE name IN (…)`), the seek form (`WHERE name = ?`), and the
+///    bare no-WHERE sweep. The value is stored VERBATIM (stock keeps a low
+///    seq as written; allocation corrects, and so does mpedb's `next_rowid`).
+///    A WHERE that matches nothing is a SILENT no-op with 0 changes — stock's
+///    "it is just a table" answer, and rowcounts match stock row for row.
+///  * `DELETE FROM sqlite_sequence [WHERE …]` — the record goes away, which
+///    resets the sequence (recreated at the next allocation), stock's rule.
+///  * `INSERT INTO sqlite_sequence [(cols)] VALUES (…)` — pre-seeding a
+///    VIRGIN table's counter is honored (next id = seq + 1); a name that
+///    already has a row becomes stock's allocation-inert duplicate, which
+///    the synthesised table represents as a counted no-op (1 change, counter
+///    unchanged — the FIRST row wins allocation in stock, and ours IS the
+///    first row).
+///
+/// Everything else refuses by name rather than approximating: `SET name = …`
+/// (stock manufactures duplicate rows), a non-integer or NULL seq (stock
+/// stores junk verbatim and treats it as 0 at allocation — mpedb's counters
+/// are rigid i64), expressions over `seq`, and multi-row VALUES.
+pub fn sqlite_sequence_write(
+    seqs: &[(String, i64)],
+    sql: &str,
+    params: &[Value],
+) -> Result<SeqWritePlan, DbError> {
+    let (verb, after_name) = parse_seq_target(sql).ok_or_else(unsupported)?;
+    let rest = sql[after_name..].trim();
+    let lower_rest = rest.to_ascii_lowercase();
+    let int_of = |tok: &str| -> Result<i64, DbError> {
+        let t = tok.trim();
+        if let Some(idx) = t.strip_prefix('?') {
+            let i = if idx.is_empty() {
+                0
+            } else {
+                idx.parse::<usize>().map_err(|_| unsupported())?.saturating_sub(1)
+            };
+            return match params.get(i) {
+                Some(Value::Int(v)) => Ok(*v),
+                Some(other) => Err(DbError::Unsupported(format!(
+                    "sqlite_sequence.seq is a rigid INTEGER counter in mpedb; a bound {} \
+                     is refused (sqlite would store it verbatim and read it as 0)",
+                    other.type_name()
+                ))),
+                None => Err(unsupported()),
+            };
+        }
+        if t.eq_ignore_ascii_case("null") {
+            return Err(DbError::Unsupported(
+                "sqlite_sequence.seq = NULL is refused: mpedb keeps the counter as a rigid \
+                 INTEGER (sqlite stores the NULL and treats it as no history)"
+                    .into(),
+            ));
+        }
+        t.parse::<i64>().map_err(|_| {
+            DbError::Unsupported(format!(
+                "sqlite_sequence.seq must be an integer literal or bound parameter \
+                 (got `{t}`) — expressions and junk values are refused by name"
+            ))
+        })
+    };
+    match verb {
+        SeqVerb::Update => {
+            let set_tail = lower_rest.strip_prefix("set").ok_or_else(unsupported)?;
+            if !set_tail.starts_with(char::is_whitespace) {
+                return Err(unsupported());
+            }
+            let after_set = rest[3..].trim_start();
+            let lower_after = after_set.to_ascii_lowercase();
+            // The assignment is strictly `seq = <int|param>`, so the first
+            // word-bounded `where` splits it — nothing in a legal assignment
+            // can contain the word.
+            let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+            let mut where_pos = None;
+            let mut i = 0;
+            while let Some(p) = lower_after[i..].find("where") {
+                let at = i + p;
+                i = at + 5;
+                let before_ok = !lower_after[..at].chars().last().is_some_and(ident);
+                let after_ok = !lower_after[at + 5..].chars().next().is_some_and(ident);
+                if before_ok && after_ok {
+                    where_pos = Some(at);
+                    break;
+                }
+            }
+            let (assign_src, where_src) = match where_pos {
+                Some(w) => (&after_set[..w], Some(after_set[w + 5..].trim())),
+                None => (after_set, None),
+            };
+            let mut parts = assign_src.split('=');
+            let lhs = parts.next().unwrap_or("").trim().trim_matches('"');
+            let rhs = parts.next().ok_or_else(unsupported)?.trim();
+            if parts.next().is_some() {
+                return Err(unsupported());
+            }
+            if !lhs.eq_ignore_ascii_case("seq") {
+                return Err(DbError::Unsupported(format!(
+                    "UPDATE sqlite_sequence SET {lhs} is refused by name — only `seq` is \
+                     writable (renaming rows manufactures the duplicates stock then \
+                     ignores at allocation)"
+                )));
+            }
+            let value = int_of(rhs)?;
+            let preds = match where_src {
+                Some(w) if !w.is_empty() => parse_where(w, params, &SEQ_COLS)?,
+                _ => Vec::new(),
+            };
+            let matched: Vec<&(String, i64)> = seqs
+                .iter()
+                .filter(|r| {
+                    let val = |c: &str| match c {
+                        "name" => r.0.clone(),
+                        "seq" => r.1.to_string(),
+                        _ => String::new(),
+                    };
+                    preds.iter().all(|p| p.matches_with(&val))
+                })
+                .collect();
+            Ok(SeqWritePlan {
+                affected: matched.len() as i64,
+                updates: matched.iter().map(|r| (r.0.clone(), Some(value))).collect(),
+                insert_new: None,
+            })
+        }
+        SeqVerb::Delete => {
+            let preds = if let Some(w) = lower_rest.strip_prefix("where") {
+                if !w.starts_with(char::is_whitespace) && !w.is_empty() {
+                    return Err(unsupported());
+                }
+                parse_where(rest[5..].trim(), params, &SEQ_COLS)?
+            } else if rest.is_empty() {
+                Vec::new()
+            } else {
+                return Err(unsupported());
+            };
+            let matched: Vec<&(String, i64)> = seqs
+                .iter()
+                .filter(|r| {
+                    let val = |c: &str| match c {
+                        "name" => r.0.clone(),
+                        "seq" => r.1.to_string(),
+                        _ => String::new(),
+                    };
+                    preds.iter().all(|p| p.matches_with(&val))
+                })
+                .collect();
+            Ok(SeqWritePlan {
+                affected: matched.len() as i64,
+                updates: matched.iter().map(|r| (r.0.clone(), None)).collect(),
+                insert_new: None,
+            })
+        }
+        SeqVerb::Insert => {
+            // `[(name, seq)] VALUES (a, b)` — explicit column list honored in
+            // either order, defaulting to (name, seq). One row.
+            let (cols, vals_src) = if let Some(after_paren) = rest.strip_prefix('(') {
+                let close = after_paren.find(')').ok_or_else(unsupported)?;
+                let cols: Vec<String> = after_paren[..close]
+                    .split(',')
+                    .map(|c| c.trim().trim_matches('"').to_ascii_lowercase())
+                    .collect();
+                (cols, after_paren[close + 1..].trim())
+            } else {
+                (vec!["name".into(), "seq".into()], rest)
+            };
+            let lower_vals = vals_src.to_ascii_lowercase();
+            let body = lower_vals.strip_prefix("values").ok_or_else(unsupported)?;
+            if !body.trim_start().starts_with('(') {
+                return Err(unsupported());
+            }
+            let body_src = vals_src["values".len()..].trim_start();
+            let inner = body_src
+                .strip_prefix('(')
+                .and_then(|b| b.strip_suffix(')'))
+                .ok_or_else(|| {
+                    DbError::Unsupported(
+                        "INSERT INTO sqlite_sequence takes ONE (name, seq) row; multi-row \
+                         VALUES is refused by name"
+                            .into(),
+                    )
+                })?;
+            let items: Vec<&str> = inner.split(',').map(str::trim).collect();
+            if items.len() != cols.len() || cols.len() != 2 {
+                return Err(unsupported());
+            }
+            let mut name: Option<String> = None;
+            let mut seq: Option<i64> = None;
+            for (c, item) in cols.iter().zip(&items) {
+                match c.as_str() {
+                    "name" => {
+                        let v = if let Some(idx) = item.strip_prefix('?') {
+                            let i = if idx.is_empty() {
+                                0
+                            } else {
+                                idx.parse::<usize>().map_err(|_| unsupported())?.saturating_sub(1)
+                            };
+                            match params.get(i) {
+                                Some(Value::Text(s)) => s.clone(),
+                                _ => return Err(unsupported()),
+                            }
+                        } else {
+                            let t = item.trim();
+                            t.strip_prefix('\'')
+                                .and_then(|s| s.strip_suffix('\''))
+                                .ok_or_else(unsupported)?
+                                .replace("''", "'")
+                        };
+                        name = Some(v);
+                    }
+                    "seq" => seq = Some(int_of(item)?),
+                    _ => return Err(unsupported()),
+                }
+            }
+            let (name, seq) = (name.ok_or_else(unsupported)?, seq.ok_or_else(unsupported)?);
+            if seqs.iter().any(|(n, _)| *n == name) {
+                // Stock creates a duplicate row that allocation then ignores
+                // (the FIRST matching row wins). The synthesised table IS the
+                // first row, so the honest equivalent is: change nothing,
+                // count one changed row, exactly what stock reports.
+                return Ok(SeqWritePlan { updates: Vec::new(), affected: 1, insert_new: None });
+            }
+            Ok(SeqWritePlan { updates: Vec::new(), affected: 1, insert_new: Some((name, seq)) })
+        }
+    }
+}
+
 /// Which catalog a statement reads: `Some(false)` for the main one,
 /// `Some(true)` for the TEMP one, `None` for neither.
 ///

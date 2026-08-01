@@ -66,6 +66,26 @@ impl Database {
         Ok(out)
     }
 
+    /// The autocommit twin of [`WriteSession::set_rowid_sequences`]: all N
+    /// counter writes in ONE transaction — never one commit per name, which
+    /// would let a crash land a flush half-reset.
+    pub fn set_rowid_sequences(&self, updates: &[(u32, Option<i64>)]) -> Result<()> {
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
+        for (id, v) in updates {
+            let key = mpedb_core::engine::rowid_seq_key(*id);
+            let r = match v {
+                Some(v) => w.sys_put(&key, &v.to_le_bytes()),
+                None => w.sys_delete(&key).map(|_| ()),
+            };
+            if let Err(e) = r {
+                w.abort();
+                return Err(e);
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn list_views(&self) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
         let r = self.engine.begin_read()?;
@@ -216,6 +236,28 @@ impl crate::WriteSession<'_> {
             }
         }
         Ok(out)
+    }
+
+    /// Write the AUTOINCREMENT counters the C-API's `sqlite_sequence` write
+    /// arm resolved — N tables in THIS one open txn, atomic with whatever
+    /// else the txn holds (a Django flush runs its resets inside the same
+    /// transaction as its deletes). `Some(v)` stores v VERBATIM — sqlite
+    /// keeps a low seq as written and silently corrects at the next
+    /// allocation, and so does mpedb: `next_rowid` takes
+    /// max(counter, tree max) + 1 already, so a lowered counter can never
+    /// hand out a live id. `None` deletes the record, which IS sqlite's
+    /// `DELETE FROM sqlite_sequence` (record existence = row existence).
+    pub fn set_rowid_sequences(&mut self, updates: &[(u32, Option<i64>)]) -> crate::Result<()> {
+        for (id, v) in updates {
+            let key = mpedb_core::engine::rowid_seq_key(*id);
+            match v {
+                Some(v) => self.txn.sys_put(&key, &v.to_le_bytes())?,
+                None => {
+                    self.txn.sys_delete(&key)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

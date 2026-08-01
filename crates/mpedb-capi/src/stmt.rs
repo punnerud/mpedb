@@ -91,6 +91,11 @@ unsafe fn prepare_common(
             | sql::Kind::Pragma
             | sql::Kind::Maintenance
     ) || (matches!(kind, sql::Kind::Read) && introspect::references_sqlite_master(first))
+        // `sqlite_sequence` WRITES are answered by the exec arm's counter
+        // mapping, never compiled — prepare-time validation would refuse them
+        // with "no such table" before the arm could run. The detector is
+        // TARGET-position only, so this skips validation for nothing else.
+        || introspect::sqlite_sequence_write_target(first)
         // `EXPLAIN QUERY PLAN <stmt>` is rewritten to mpedb's `EXPLAIN <stmt>`
         // on the execution path (so `sqlite3_sql()` keeps the consumer's text);
         // `prepare_detached` would reject the un-rewritten form here.

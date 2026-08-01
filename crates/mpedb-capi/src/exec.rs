@@ -156,6 +156,76 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
         }
         None => (sqltext, false),
     };
+    // `sqlite_sequence` WRITES (plan §4 step 2): stock keeps the counters in
+    // an ordinary table, so UPDATE/DELETE/INSERT against it all work — Django's
+    // flush reset (`UPDATE sqlite_sequence SET seq = 0 WHERE name IN (…)`)
+    // RAISED "no such table" here before this arm. The consumer forms map onto
+    // the catalog's AUTOINCREMENT counters, every name in the ONE transaction
+    // (the open one when present — a flush resets inside the txn that holds
+    // its deletes); junk/duplicate/rename shapes refuse BY NAME (the matrix in
+    // introspect::sqlite_sequence_write's contract). Detection is
+    // TARGET-position only, for the read detector's measured Django reason:
+    // the table's name appears as a string LITERAL in catalog queries.
+    if !eqp && introspect::sqlite_sequence_write_target(sqltext) {
+        if c.txn.is_none() {
+            let _ = c.db.refresh_schema_if_stale();
+        }
+        let bundle = match c.txn.as_ref() {
+            Some(s) => s.schema(),
+            None => c.db.schema(),
+        };
+        // The table exists the moment an AUTOINCREMENT table does — the same
+        // rule as the read arm, so a write can never target a table the
+        // listing denies.
+        if !bundle.schema.tables.iter().any(|t| !t.dead && t.autoincrement) {
+            return Err(DbError::Bind("no such table: sqlite_sequence".into()));
+        }
+        let seqs = match c.txn.as_mut() {
+            Some(s) => s.rowid_sequences()?,
+            None => c.db.rowid_sequences()?,
+        };
+        let plan = introspect::sqlite_sequence_write(&seqs, sqltext, params)?;
+        // Names resolve BYTE-EXACT: stock compares `sqlite_sequence.name` as
+        // ordinary data, so 'T1' does not touch table t1 — and every name in
+        // `plan.updates` came from the synthesised rows, so it resolves.
+        let mut updates: Vec<(u32, Option<i64>)> = Vec::new();
+        for (name, v) in &plan.updates {
+            if let Some(t) = bundle
+                .schema
+                .tables
+                .iter()
+                .find(|t| !t.dead && t.autoincrement && t.name == *name)
+            {
+                updates.push((t.id, *v));
+            }
+        }
+        if let Some((name, seq)) = &plan.insert_new {
+            match bundle.schema.tables.iter().find(|t| !t.dead && t.name == *name) {
+                Some(t) if t.autoincrement => updates.push((t.id, Some(*seq))),
+                Some(t) => {
+                    return Err(DbError::Unsupported(format!(
+                        "INSERT INTO sqlite_sequence for `{}` is refused by name: the \
+                         table is not AUTOINCREMENT, and mpedb's catalog-backed counters \
+                         have nowhere to keep the inert row sqlite would store and never \
+                         read",
+                        t.name
+                    )))
+                }
+                None => {
+                    return Err(DbError::Unsupported(format!(
+                        "INSERT INTO sqlite_sequence for unknown table `{name}` is \
+                         refused by name: sqlite stores an orphan row; mpedb's \
+                         catalog-backed counters cannot"
+                    )))
+                }
+            }
+        }
+        match c.txn.as_mut() {
+            Some(s) => s.set_rowid_sequences(&updates)?,
+            None => c.db.set_rowid_sequences(&updates)?,
+        }
+        return Ok(Outcome::Affected(plan.affected as u64));
+    }
     match sql::classify(sqltext) {
         // PRAGMA and sqlite_master reads are answered by the shim's schema
         // introspection (mpedb has neither); they never reach the engine.

@@ -353,7 +353,8 @@ pub(crate) use ddl::{
 };
 pub use master::{
     master_reference, master_schema, qualified_temp_master, references_sqlite_master,
-    references_sqlite_sequence, sqlite_master, sqlite_sequence_query, MasterRef, MasterSource,
+    references_sqlite_sequence, sqlite_master, sqlite_sequence_query, sqlite_sequence_write,
+    sqlite_sequence_write_target, MasterRef, MasterSource,
 };
 pub(crate) use pragma::{names_a_table, parse_pragma, pragma_cols};
 pub use pragma::{pragma, pragma_schema, EchoPragmas};
