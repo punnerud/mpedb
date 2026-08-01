@@ -281,10 +281,11 @@ fn misuse_and_deferred_forms_are_refused() {
     // Arity mismatch between the two tuples.
     refuses("SELECT (1, 2) = (1, 2, 3)");
     refuses("SELECT (1, 2, 3) < (1, 2)");
-    // Row value COMPARED to a subquery (`=`, not `IN`) — still deferred: a
-    // 2-column subquery cannot be a scalar operand, so either the subquery lift
-    // or the binder refuses it. `IN` is a different question and is answered —
-    // see `a_row_value_in_a_subquery_matches_sqlite_including_nulls`.
+    // Row value COMPARED to a subquery (`=`) is ANSWERED since plan §2 — see
+    // `a_row_value_compared_with_a_subquery_matches_sqlite` — but THIS spelling
+    // still refuses: the subquery reads a table addressed by the SAME name as
+    // the outer one, and qualification cannot distinguish two identical names
+    // (the shadowing fence `qualify_row_probe` shares with row-value IN).
     refuses("SELECT a FROM t WHERE (a, b) = (SELECT id, a FROM t)");
     // An IN-subquery whose width disagrees with the probe.
     refuses("SELECT a FROM t WHERE (a, b) IN (SELECT id FROM t)");
@@ -496,4 +497,103 @@ fn a_row_value_probe_is_not_captured_by_the_subquerys_own_columns() {
         )
         .unwrap_err();
     assert!(format!("{e}").contains("unambiguously"), "{e}");
+}
+
+/// `(a, b) = (SELECT x, y …)` and `<>` (plan §2 — the last Django label's
+/// blocker). The comparison moves INTO the subquery's projection and the body
+/// is planned ONCE as an ordinary scalar subplan — never one subquery per
+/// column, which could see different rows. Every row below was measured on
+/// stock 3.45.1 before the rewrite existed; the oracle keeps it honest here.
+///
+/// The deliberate deviation stays deliberate: on a MULTI-ROW subquery sqlite
+/// silently compares the first row, mpedb refuses (its documented multi-row
+/// scalar-subquery position). That is asserted as a refusal, not compared.
+#[test]
+fn a_row_value_compared_with_a_subquery_matches_sqlite() {
+    const SETUP: &[&str] = &[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        "INSERT INTO t (id, a, b) VALUES (1, 1, 2)",
+        "INSERT INTO t (id, a, b) VALUES (2, NULL, 2)",
+        "CREATE TABLE s (k INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+    ];
+    // (s-contents, query) — the value column renders NULL as '' on both sides.
+    let cases: &[(&str, &str)] = &[
+        // 1 row, matching / mismatching / NULL pair / definite-mismatch-beats-NULL.
+        ("INSERT INTO s VALUES (1, 1, 2)", "SELECT id, (a,b) = (SELECT x,y FROM s) FROM t ORDER BY id"),
+        ("INSERT INTO s VALUES (1, 1, 3)", "SELECT id, (a,b) = (SELECT x,y FROM s) FROM t ORDER BY id"),
+        ("INSERT INTO s VALUES (1, 1, NULL)", "SELECT id, (a,b) = (SELECT x,y FROM s) FROM t ORDER BY id"),
+        ("INSERT INTO s VALUES (1, 9, NULL)", "SELECT id, (a,b) = (SELECT x,y FROM s) FROM t ORDER BY id"),
+        // 0 rows -> NULL.
+        ("DELETE FROM s WHERE 0", "SELECT id, (a,b) = (SELECT x,y FROM s) FROM t ORDER BY id"),
+        // `<>` — the same NULL rule negated.
+        ("INSERT INTO s VALUES (1, 1, 2)", "SELECT id, (a,b) <> (SELECT x,y FROM s) FROM t ORDER BY id"),
+        ("INSERT INTO s VALUES (1, 1, NULL)", "SELECT id, (a,b) <> (SELECT x,y FROM s) FROM t ORDER BY id"),
+        // Flipped spelling: the subquery on the LEFT (operand order preserved).
+        ("INSERT INTO s VALUES (1, 1, 2)", "SELECT id, (SELECT x,y FROM s) = (a,b) FROM t ORDER BY id"),
+        // ORDER BY a named column + LIMIT picks the row sqlite picks.
+        (
+            "INSERT INTO s VALUES (1, 3, 4); INSERT INTO s VALUES (2, 1, 2)",
+            "SELECT id, (a,b) = (SELECT x,y FROM s ORDER BY x LIMIT 1) FROM t ORDER BY id",
+        ),
+        ("INSERT INTO s VALUES (1, 1, 2)", "SELECT id, (a,b) = (SELECT x,y FROM s LIMIT 1) FROM t ORDER BY id"),
+        // Aggregates in the INNER projection stay inner (1 group, empty included).
+        ("INSERT INTO s VALUES (1, 1, 2)", "SELECT id, (a,b) = (SELECT max(x), max(y) FROM s) FROM t ORDER BY id"),
+        ("DELETE FROM s WHERE 0", "SELECT id, (a,b) = (SELECT max(x), max(y) FROM s) FROM t ORDER BY id"),
+        // WHERE position — the Django shape.
+        ("INSERT INTO s VALUES (1, 1, 2)", "SELECT id FROM t WHERE (a,b) = (SELECT x,y FROM s) ORDER BY id"),
+        // The subquery's own correlation to the outer row survives the move.
+        (
+            "INSERT INTO s VALUES (1, 1, 2); INSERT INTO s VALUES (2, 5, 6)",
+            "SELECT id FROM t WHERE (a,b) = (SELECT x,y FROM s WHERE s.k = t.id) ORDER BY id",
+        ),
+    ];
+    let d = db();
+    for stmt in SETUP {
+        d.query(stmt, &[]).unwrap();
+    }
+    let mut script_setup = String::new();
+    for stmt in SETUP {
+        script_setup.push_str(stmt);
+        script_setup.push_str(";\n");
+    }
+    for (fill, q) in cases {
+        d.query("DELETE FROM s", &[]).unwrap();
+        for f in fill.split(';') {
+            let f = f.trim();
+            if !f.is_empty() {
+                d.query(f, &[]).unwrap();
+            }
+        }
+        let got = mpedb_rows(&d, q);
+        let want = sqlite_rows(&format!("{script_setup}DELETE FROM s;\n{fill};\n{q};\n"));
+        assert_eq!(got, want, "`{fill}` then `{q}`");
+    }
+
+    // The named refusals around the answered core.
+    let refuses = |sql: &str, needle: &str| {
+        let e = d.query(sql, &[]).unwrap_err().to_string();
+        assert!(e.contains(needle), "`{sql}`: expected `{needle}` in `{e}`");
+    };
+    // Multi-row subquery: sqlite compares the FIRST row; mpedb's documented
+    // multi-row scalar refusal stands.
+    d.query("DELETE FROM s", &[]).unwrap();
+    d.query("INSERT INTO s VALUES (1, 1, 2)", &[]).unwrap();
+    d.query("INSERT INTO s VALUES (2, 3, 4)", &[]).unwrap();
+    assert!(d
+        .query("SELECT id, (a,b) = (SELECT x,y FROM s) FROM t", &[])
+        .is_err());
+    // Arity mismatch names both numbers (sqlite refuses this too).
+    refuses("SELECT (a,b) = (SELECT x FROM s) FROM t", "row value has 2 column(s) but the subquery selects 1");
+    // An aggregate probe would aggregate over the INNER rows — refused by name.
+    refuses(
+        "SELECT max(a) FROM t GROUP BY b HAVING (max(a), max(b)) = (SELECT x, y FROM s)",
+        "aggregate",
+    );
+    // Shapes the projection swap would change keep their refusal.
+    assert!(d.query("SELECT (a,b) = (SELECT DISTINCT x,y FROM s) FROM t", &[]).is_err());
+    assert!(d
+        .query("SELECT (a,b) = (SELECT x,y FROM s ORDER BY 1 LIMIT 1) FROM t", &[])
+        .is_err());
+    // Order comparisons stay refusals this round.
+    assert!(d.query("SELECT (a,b) < (SELECT x,y FROM s) FROM t", &[]).is_err());
 }

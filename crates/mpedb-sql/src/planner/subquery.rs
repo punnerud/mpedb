@@ -404,11 +404,31 @@ impl Lift<'_> {
             E::Unary(op, a) => E::Unary(*op, Box::new(self.rewrite(a)?)),
             E::IsNull(a, n) => E::IsNull(Box::new(self.rewrite(a)?), *n),
             E::Cast(a, t) => E::Cast(Box::new(self.rewrite(a)?), t.clone()),
-            E::Binary(op, a, b) => E::Binary(
-                *op,
-                Box::new(self.rewrite(a)?),
-                Box::new(self.rewrite(b)?),
-            ),
+            E::Binary(op, a, b) => {
+                // `(a, b) = (SELECT x, y …)` / `<>`, either way round —
+                // rewritten so the comparison moves INTO the subquery's
+                // projection (see `row_value_eq_subquery`); the result is an
+                // ordinary scalar subquery the arm above then lifts.
+                if matches!(op, ast::BinOp::Eq | ast::BinOp::Ne) {
+                    let hit = match (a.as_ref(), b.as_ref()) {
+                        (E::RowValue(_), E::Subquery(inner)) => Some((a.as_ref(), inner, true)),
+                        (E::Subquery(inner), E::RowValue(_)) => Some((b.as_ref(), inner, false)),
+                        _ => None,
+                    };
+                    if let Some((probe, inner, probe_on_left)) = hit {
+                        if let Some(rewritten) = row_value_eq_subquery(
+                            *op,
+                            probe_on_left,
+                            probe,
+                            inner,
+                            &self.outer_scope,
+                        )? {
+                            return self.rewrite(&rewritten);
+                        }
+                    }
+                }
+                E::Binary(*op, Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?))
+            }
             E::Like(a, b, esc) => {
                 E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?), *esc)
             }
@@ -1355,52 +1375,7 @@ fn row_value_in_subquery(
     //
     // because `a = a` is trivially true and `a = b AND b = a` trivially false
     // once BOTH sides bind inside q. Only the fully-qualified spelling escaped.
-    let mut probe_quals: Vec<String> = Vec::new();
-    let mut qualified: Vec<Expr> = Vec::with_capacity(probe.len());
-    for p in probe {
-        match qualify_probe(p, outer, &mut probe_quals) {
-            Some(q) => qualified.push(q),
-            // Cannot be qualified safely — see `qualify_probe`. Refusing by
-            // name is the only answer that is not a guess.
-            None => {
-                return Err(bind_err(
-                    "a row value compared with a subquery must name outer columns \
-                     the outer query binds unambiguously — an unqualified name that \
-                     the outer query does not resolve would be resolved INSIDE the \
-                     subquery instead, which silently changes what is compared"
-                        .to_string(),
-                ))
-            }
-        }
-    }
-    // Qualification cannot save a probe whose outer table is ADDRESSED by the
-    // same name inside the subquery (`FROM r` in both). Refuse the rewrite —
-    // the ordinary path then reports the row-value limit by name, which is the
-    // right answer where this one cannot be given safely.
-    let inner_names: Vec<&str> = sel
-        .alias
-        .as_deref()
-        .into_iter()
-        .chain(if sel.alias.is_none() { sel.table.as_deref() } else { None })
-        .chain(
-            sel.joins
-                .iter()
-                .map(|j| j.alias.as_deref().unwrap_or(j.table.as_str())),
-        )
-        .collect();
-    let shadowed = probe_quals
-        .iter()
-        .any(|q| inner_names.iter().any(|n| mpedb_types::ident_eq(n, q)));
-    if shadowed {
-        return Err(bind_err(
-            "a row value cannot be compared with a subquery that reads a table \
-             addressed by the SAME name as the outer one — qualifying the probe \
-             is what keeps the outer columns from being resolved inside the \
-             subquery, and it cannot distinguish two identical names. Alias one \
-             of them."
-                .to_string(),
-        ));
-    }
+    let qualified = qualify_row_probe(probe, sel, outer)?;
     // `a = x AND b = y`, over the inner row's scope — the items move into the
     // WHERE rather than the other way round.
     //
@@ -1447,4 +1422,147 @@ fn row_value_in_subquery(
     } else {
         case
     }))
+}
+
+/// Qualify every element of a row-value probe against the OUTER scope, so the
+/// probe can move INTO a subquery without an inner column of the same name
+/// silently capturing it (the S22 rules). ONE copy, shared by row-value `IN`
+/// and row-value `=`/`<>` — two copies of these fences would drift, and the
+/// fences are the correctness.
+fn qualify_row_probe(
+    probe: &[ast::Expr],
+    sel: &ast::SelectStmt,
+    outer: &Scope<'_>,
+) -> Result<Vec<ast::Expr>> {
+    use ast::Expr;
+    let mut probe_quals: Vec<String> = Vec::new();
+    let mut qualified: Vec<Expr> = Vec::with_capacity(probe.len());
+    for p in probe {
+        match qualify_probe(p, outer, &mut probe_quals) {
+            Some(q) => qualified.push(q),
+            // Cannot be qualified safely — see `qualify_probe`. Refusing by
+            // name is the only answer that is not a guess.
+            None => {
+                return Err(bind_err(
+                    "a row value compared with a subquery must name outer columns \
+                     the outer query binds unambiguously — an unqualified name that \
+                     the outer query does not resolve would be resolved INSIDE the \
+                     subquery instead, which silently changes what is compared"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+    // Qualification cannot save a probe whose outer table is ADDRESSED by the
+    // same name inside the subquery (`FROM r` in both). Refuse the rewrite —
+    // the ordinary path then reports the row-value limit by name, which is the
+    // right answer where this one cannot be given safely.
+    let inner_names: Vec<&str> = sel
+        .alias
+        .as_deref()
+        .into_iter()
+        .chain(if sel.alias.is_none() { sel.table.as_deref() } else { None })
+        .chain(
+            sel.joins
+                .iter()
+                .map(|j| j.alias.as_deref().unwrap_or(j.table.as_str())),
+        )
+        .collect();
+    let shadowed = probe_quals
+        .iter()
+        .any(|q| inner_names.iter().any(|n| mpedb_types::ident_eq(n, q)));
+    if shadowed {
+        return Err(bind_err(
+            "a row value cannot be compared with a subquery that reads a table \
+             addressed by the SAME name as the outer one — qualifying the probe \
+             is what keeps the outer columns from being resolved inside the \
+             subquery, and it cannot distinguish two identical names. Alias one \
+             of them."
+                .to_string(),
+        ));
+    }
+    Ok(qualified)
+}
+
+/// `(a, b) = (SELECT x, y FROM s …)` and `<>` — plan §2, the last Django
+/// label. The comparison MOVES INTO the subquery's projection: the body is
+/// planned ONCE as an ordinary scalar subplan whose single output column IS
+/// the row-value comparison (bound later by the binder's proven-3VL row-value
+/// desugar), and the probe columns become correlation parameters under
+/// [`qualify_row_probe`]'s fences. No plan-format change, ONE evaluation —
+/// never one scalar subquery per column, which could see different rows.
+///
+/// Why not the `IN` desugar above: `EXISTS` answers where `=` must refuse.
+/// The scalar-subplan shape keeps every measured semantic: 0 inner rows →
+/// slot NULL (sqlite: NULL); 1 row → the pairwise rule (FALSE if any pair
+/// definitely unequal, else NULL if any pair NULL, else TRUE — 3VL AND is
+/// exactly that, measured both ways round); >1 rows → mpedb's DOCUMENTED
+/// multi-row scalar refusal stands, where sqlite silently takes the first
+/// row. Operand order is PRESERVED (`(SELECT…) = (a,b)` keeps the subquery
+/// on the left) — sqlite takes a comparison's collation from the LEFT
+/// operand, the same lesson the `IN` desugar above carries.
+///
+/// `Ok(None)` — fall back to the ordinary named refusal — for shapes the
+/// projection swap would CHANGE: a compound body, `SELECT *`, a derived
+/// FROM, DISTINCT (it would dedup the comparison's value instead of the
+/// pair), GROUP BY/HAVING, and an ORDINAL `ORDER BY` (it would silently
+/// re-bind to the ONE swapped column — with LIMIT that picks a different
+/// row: a wrong answer, not a refusal). Order comparisons (`<` `<=` `>`
+/// `>=`) stay refusals this round.
+fn row_value_eq_subquery(
+    op: BinOp,
+    probe_on_left: bool,
+    probe: &ast::Expr,
+    inner: &ast::SubqueryBody,
+    outer: &Scope<'_>,
+) -> Result<Option<ast::Expr>> {
+    use ast::{Expr, SubqueryBody};
+    let Expr::RowValue(probe_items) = probe else {
+        return Ok(None);
+    };
+    let SubqueryBody::Select(sel) = inner else {
+        return Ok(None);
+    };
+    if sel.distinct
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || sel.from_derived.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(items) = &sel.items else {
+        return Ok(None); // `SELECT *`: arity unknown until the schema is in hand
+    };
+    if sel.order_by.iter().any(|(e, _)| matches!(e, Expr::Lit(Value::Int(_)))) {
+        return Ok(None);
+    }
+    if items.len() != probe_items.len() {
+        return Err(bind_err(format!(
+            "row value has {} column(s) but the subquery selects {}",
+            probe_items.len(),
+            items.len()
+        )));
+    }
+    // The probe is checked for aggregates/windows BEFORE it moves: inside the
+    // subquery `max(a)` becomes LEGAL — and aggregates over the INNER rows,
+    // a wrong answer the refutation round measured. Refused by name instead.
+    if probe_items.iter().any(crate::view::expr_aggregates) {
+        return Err(bind_err(
+            "a row value carrying an aggregate or window function cannot be \
+             compared with a subquery: the comparison is evaluated inside the \
+             subquery, where the aggregate would run over the subquery's rows \
+             instead of the outer group"
+                .to_string(),
+        ));
+    }
+    let qualified = qualify_row_probe(probe_items, sel, outer)?;
+    let inner_vals: Vec<Expr> = items.iter().map(|(e, _)| e.clone()).collect();
+    let (l, r) = if probe_on_left {
+        (Expr::RowValue(qualified), Expr::RowValue(inner_vals))
+    } else {
+        (Expr::RowValue(inner_vals), Expr::RowValue(qualified))
+    };
+    let mut s = sel.clone();
+    s.items = Some(vec![(Expr::Binary(op, Box::new(l), Box::new(r)), None)]);
+    Ok(Some(Expr::Subquery(Box::new(SubqueryBody::Select(s)))))
 }
