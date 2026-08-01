@@ -760,7 +760,7 @@ fn backup_of_the_temp_schema_copies_nothing_yet() {
 /// gets the actual gap instead — mpedb cannot adopt a page image into an open
 /// connection.
 #[test]
-fn deserialize_separates_not_a_database_from_not_supported() {
+fn deserialize_separates_not_a_database_from_a_broken_one() {
     unsafe {
         let db = open_memory();
         let mut junk = *b"\0\x01\x03";
@@ -772,12 +772,16 @@ fn deserialize_separates_not_a_database_from_not_supported() {
         // Empty and NULL buffers are not databases either.
         assert_eq!(sqlite3_deserialize(db, ptr::null(), ptr::null_mut(), 0, 0, 0), SQLITE_NOTADB);
 
+        // Since plan §5 a REAL image is ADOPTED (capi_serialize.rs owns the
+        // round trip); bytes that only START like one still refuse — the
+        // magic passes, the attach-time validation does not, and the honest
+        // answer is still sqlite's.
         let mut img = *b"MPEDB1\0\0rest of a database image";
         assert_eq!(
             sqlite3_deserialize(db, ptr::null(), img.as_mut_ptr(), img.len() as _, img.len() as _, 0),
-            SQLITE_ERROR
+            SQLITE_NOTADB
         );
-        assert_eq!(errmsg(db), "deserialize is not supported by mpedb");
+        assert_eq!(errmsg(db), "file is not a database");
         sqlite3_close(db);
     }
 }

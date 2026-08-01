@@ -202,6 +202,15 @@ pub fn sqlite_shaped_message(e: &DbError) -> Option<String> {
         {
             Some(m.clone())
         }
+        // "no such table: t" is sqlite's wording, and consumers assert on it
+        // by regex (CPython's `test_serialize_deserialize` among them).
+        // mpedb's binder says "unknown table `t`" — the same truth, so this
+        // is a renaming, never a reinterpretation. Only the EXACT shape maps
+        // (a guarded arm: any other Bind falls through to the checks below);
+        // a message with trailing detail keeps the native form.
+        DbError::Bind(m) if m.starts_with("unknown table `") && m.ends_with('`') => {
+            Some(format!("no such table: {}", &m["unknown table `".len()..m.len() - 1]))
+        }
         e if is_writer_lock_reentry(e) => Some("database is locked".to_string()),
         _ => None,
     }

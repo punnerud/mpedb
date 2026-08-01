@@ -51,10 +51,9 @@
 //! lose (`is_temp`). Everything else — an ATTACHed name — is refused by name.
 
 use crate::consts::*;
-use crate::{conn, register_shim_builtins, Sqlite3};
+use crate::{conn, Sqlite3};
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
-use std::time::Duration;
 
 /// A live backup: the captured image plus the destination it will be installed
 /// over. Handed to the caller as an opaque `sqlite3_backup *`.
@@ -265,20 +264,10 @@ pub unsafe extern "C" fn sqlite3_backup_step(b: *mut c_void, n: c_int) -> c_int 
     }
     match mpedb::Database::open_from_file(&d.path) {
         Ok(newdb) => {
-            d.db = newdb;
-            // A reopened `Database` starts with an empty function registry:
-            // re-install the shim's own builtins and everything this connection
-            // registered, so a backup is invisible to the caller's UDFs.
-            register_shim_builtins(&d.db);
-            for h in &d.host_fns {
-                h.reinstall(&d.db);
-            }
-            for h in &d.host_colls {
-                h.reinstall(&d.db);
-            }
-            if d.busy_timeout_ms > 0 {
-                d.db.set_busy_timeout(Some(Duration::from_millis(d.busy_timeout_ms as u64)));
-            }
+            // Re-installs the builtins + the caller's UDFs/collations and
+            // carries the per-connection knobs (busy timeout, FK pragma) —
+            // shared with `sqlite3_deserialize` (`adopt_reopened`).
+            crate::adopt_reopened(d, newdb);
             bk.installed = true;
             SQLITE_DONE
         }

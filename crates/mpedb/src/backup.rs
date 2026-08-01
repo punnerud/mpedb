@@ -102,6 +102,32 @@ impl Database {
     }
 }
 
+impl Database {
+    /// The whole database as ONE consistent byte image — `backup_capture`'s
+    /// snapshot discipline (the copy is taken under the writer lock, and the
+    /// boot id is voided so the first attach to the image re-initializes the
+    /// writer mutex and reader table) — returned as BYTES instead of staged
+    /// beside a destination. The C-API's `sqlite3_serialize` is the consumer;
+    /// `sqlite3_deserialize` reopens such an image from a scratch file.
+    ///
+    /// The image is mpedb's own format, full fallocated length included: a
+    /// truncated image would fail the attach-time geometry validation, so
+    /// fidelity beats compactness here.
+    pub fn serialize_image(&self) -> Result<Vec<u8>> {
+        let src = self.path().to_path_buf();
+        let tmp = src.with_extension("mpedb-serialize-tmp");
+        let _ = std::fs::remove_file(&tmp);
+        {
+            let _writer = self.begin()?;
+            std::fs::copy(&src, &tmp).map_err(Error::Io)?;
+        }
+        void_boot_id(&tmp)?;
+        let bytes = std::fs::read(&tmp).map_err(Error::Io)?;
+        let _ = std::fs::remove_file(&tmp);
+        Ok(bytes)
+    }
+}
+
 impl BackupImage {
     /// Total pages reported for progress pacing — content high-water, not the
     /// full fallocated file (see [`Database::backup_capture`]).

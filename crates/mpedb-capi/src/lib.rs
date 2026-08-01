@@ -2261,6 +2261,35 @@ unsafe fn close_common(db: *mut Sqlite3, v2: bool) -> c_int {
 }
 
 /// Free the connection for real. Only ever called with no blob handles left.
+/// Point this connection at a REOPENED engine handle, carrying over every
+/// piece of per-connection state that lives in the `Database` being replaced:
+/// the shim builtins and the caller's UDFs/collations (a reopened `Database`
+/// starts with an empty function registry), the busy timeout, and the
+/// FK-enforcement pragma — per-CONNECTION state in sqlite, so a backup or a
+/// deserialize must not silently reset it to the default.
+///
+/// Shared by `sqlite3_backup_step`'s install and `sqlite3_deserialize`; a
+/// third copy of this list is how one of them would drift.
+///
+/// # Safety
+/// The connection's registered UDF/collation `pApp` pointers must still be
+/// valid — true for a live connection (they are freed only on close/replace).
+pub(crate) unsafe fn adopt_reopened(c: &mut Sqlite3, newdb: Database) {
+    let fk = c.db.fk_enforced();
+    c.db = newdb;
+    c.db.set_fk_enforced(fk);
+    register_shim_builtins(&c.db);
+    for h in &c.host_fns {
+        h.reinstall(&c.db);
+    }
+    for h in &c.host_colls {
+        h.reinstall(&c.db);
+    }
+    if c.busy_timeout_ms > 0 {
+        c.db.set_busy_timeout(Some(Duration::from_millis(c.busy_timeout_ms as u64)));
+    }
+}
+
 pub(crate) unsafe fn free_connection(db: *mut Sqlite3) {
     let mut boxed = Box::from_raw(db);
     // Drop any open transaction before the engine (borrow discipline).
@@ -4191,48 +4220,172 @@ pub unsafe extern "C" fn sqlite3_value_blob(v: *mut c_void) -> *const c_void {
 // ---- incremental blob: REAL — see `blob.rs` (sqlite3_blob_open/read/write/
 // bytes/reopen/close + zeroblob/bind_zeroblob) ------------------------------
 
-// ---- serialize / deserialize (refused) ------------------------------------
+// ---- serialize / deserialize (plan §5) -------------------------------------
 
+const SQLITE_SERIALIZE_NOCOPY: c_uint = 0x001;
+const SQLITE_DESERIALIZE_FREEONCLOSE: c_uint = 1;
+const SQLITE_DESERIALIZE_RESIZEABLE: c_uint = 2;
+
+/// `sqlite3_serialize(db, "main", &size, flags)` — the database as one
+/// malloc'd byte image (mpedb's OWN format; `sqlite3_deserialize` below and
+/// nothing else adopts it). The buffer comes from this shim's
+/// `sqlite3_malloc64`, so the caller's `sqlite3_free` pairs with it —
+/// CPython copies then frees.
+///
+/// `SQLITE_SERIALIZE_NOCOPY` asks for a borrowed pointer to a contiguous
+/// in-memory image; mpedb's pages live in a file mapping, so the answer is
+/// NULL — the documented "no such image" outcome, after which CPython simply
+/// calls again without the flag. Named narrowings, each answered with NULL
+/// (CPython raises `unable to serialize` from it): a non-`main` schema, and
+/// a connection holding an open transaction (the capture takes the writer
+/// lock, which that transaction already owns).
+///
+/// # Safety
+/// `db` must be a connection this shim opened (or NULL); `p_size` NULL is
+/// tolerated (sqlite crashes on it — nothing depends on matching that).
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_serialize(
-    _db: *mut Sqlite3,
-    _schema: *const c_char,
+    db: *mut Sqlite3,
+    schema: *const c_char,
     p_size: *mut c_longlong,
-    _flags: c_uint,
+    flags: c_uint,
 ) -> *mut c_uchar {
     if !p_size.is_null() {
         *p_size = 0;
     }
-    ptr::null_mut()
+    let Some(c) = conn(db) else {
+        return ptr::null_mut();
+    };
+    c.clear_error();
+    if flags & SQLITE_SERIALIZE_NOCOPY != 0 {
+        return ptr::null_mut();
+    }
+    let is_main = schema.is_null()
+        || c_str_opt(schema).is_none_or(|s| s.is_empty() || s.eq_ignore_ascii_case("main"));
+    if !is_main || c.txn.is_some() {
+        return ptr::null_mut();
+    }
+    let bytes = match c.db.serialize_image() {
+        Ok(b) => b,
+        Err(_) => return ptr::null_mut(),
+    };
+    let p = sqlite3_malloc64(bytes.len() as u64) as *mut c_uchar;
+    if p.is_null() {
+        return ptr::null_mut();
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+    if !p_size.is_null() {
+        *p_size = bytes.len() as c_longlong;
+    }
+    p
 }
+
+/// `sqlite3_deserialize(db, "main", data, sz, szBuf, flags)` — adopt a
+/// serialized image: the connection DETACHES from whatever it was open on
+/// and reopens on the image, written to a fresh scratch file (tmpfs when
+/// available) that closes out like an `:memory:` database. The caller's
+/// original FILE is never touched — sqlite likewise leaves it behind rather
+/// than writing the image over it.
+///
+/// Ownership: with `SQLITE_DESERIALIZE_FREEONCLOSE` the buffer is OURS from
+/// this call on, success or failure (sqlite's documented contract, and
+/// CPython passes the flag and never frees) — every exit path below frees
+/// it. `RESIZEABLE` is moot (the bytes are copied out); a flag beyond the
+/// two known ones refuses by name.
+///
+/// Per-connection state (FK pragma, busy timeout, UDFs, collations) carries
+/// over — `adopt_reopened`, shared with the backup install. Statements
+/// prepared before the call keep the backup path's semantics.
+///
+/// # Safety
+/// `db` must be a connection this shim opened (or NULL); `data` must point
+/// at `sz` readable bytes (and, under FREEONCLOSE, come from this shim's
+/// `sqlite3_malloc`).
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_deserialize(
     db: *mut Sqlite3,
-    _schema: *const c_char,
+    schema: *const c_char,
     data: *mut c_uchar,
     sz: c_longlong,
     _sz_buf: c_longlong,
-    _flags: c_uint,
+    flags: c_uint,
 ) -> c_int {
-    // Two different refusals, because there are two different truths.
-    //
-    // If the buffer is not a database image at all, mpedb can say so with
-    // sqlite's own words and code — `SQLITE_NOTADB` / "file is not a database"
-    // — and that is not a claim to have implemented anything: those bytes are
-    // not a database, which is exactly what sqlite reports for them (CPython's
-    // `test_deserialize_corrupt_database` asserts that message). If it IS a
-    // plausible image, the honest answer is the gap itself: mpedb has no way
-    // to adopt a foreign page image into an open connection.
-    if !is_database_image(data, sz) {
-        if let Some(c) = conn(db) {
-            c.set_error(SQLITE_NOTADB, SQLITE_NOTADB, "file is not a database");
+    let free_buf = || {
+        if flags & SQLITE_DESERIALIZE_FREEONCLOSE != 0 {
+            sqlite3_free(data as *mut c_void);
         }
-        return SQLITE_NOTADB;
+    };
+    let Some(c) = conn(db) else {
+        free_buf();
+        return SQLITE_MISUSE;
+    };
+    c.clear_error();
+    let fail = |c: &mut Sqlite3, code: c_int, msg: &str| -> c_int {
+        c.set_error(code, code, msg);
+        code
+    };
+    if flags & !(SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE) != 0 {
+        let rc = fail(c, SQLITE_ERROR, "unsupported sqlite3_deserialize flags");
+        free_buf();
+        return rc;
     }
-    if let Some(c) = conn(db) {
-        c.set_error(SQLITE_ERROR, SQLITE_ERROR, "deserialize is not supported by mpedb");
+    let is_main = schema.is_null()
+        || c_str_opt(schema).is_none_or(|s| s.is_empty() || s.eq_ignore_ascii_case("main"));
+    if !is_main {
+        let rc = fail(c, SQLITE_ERROR, "deserialize into an attached schema is not supported");
+        free_buf();
+        return rc;
     }
-    SQLITE_ERROR
+    if c.txn.is_some() || !c.blobs.is_empty() || !c.backups.is_empty() {
+        let rc = fail(c, SQLITE_BUSY, "database is locked");
+        free_buf();
+        return rc;
+    }
+    // Bytes that are not an mpedb image at all: sqlite's own words and code
+    // (CPython's `test_deserialize_corrupt_database` asserts the message; the
+    // error may legally surface here rather than on the first query).
+    if !is_database_image(data, sz) {
+        let rc = fail(c, SQLITE_NOTADB, "file is not a database");
+        free_buf();
+        return rc;
+    }
+    let bytes = std::slice::from_raw_parts(data, sz as usize);
+    let tmp = ephemeral_path();
+    if std::fs::write(&tmp, bytes).is_err() {
+        let rc = fail(c, SQLITE_IOERR, "could not stage the deserialized image");
+        free_buf();
+        return rc;
+    }
+    match Database::open_from_file(&tmp) {
+        Ok(newdb) => {
+            adopt_reopened(c, newdb);
+            // Detach from the old backing exactly as a close would have:
+            // an ephemeral file is removed, a named-memory refcount drops.
+            // A real FILE is left exactly as it was.
+            let old_path = std::mem::replace(&mut c.path, tmp);
+            match std::mem::replace(&mut c.backing, Backing::Ephemeral) {
+                Backing::Ephemeral => {
+                    let _ = std::fs::remove_file(&old_path);
+                }
+                Backing::NamedMemory => {
+                    if named_memory_release(&old_path) {
+                        let _ = std::fs::remove_file(&old_path);
+                    }
+                }
+                Backing::File => {}
+            }
+            free_buf();
+            SQLITE_OK
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            // An mpedb magic that fails validation is still "not a database
+            // we can open" — defer nothing, say it now.
+            let rc = fail(c, SQLITE_NOTADB, "file is not a database");
+            free_buf();
+            return rc;
+        }
+    }
 }
 
 /// Could `data[..sz]` be a database image? Only a header test — enough to tell
