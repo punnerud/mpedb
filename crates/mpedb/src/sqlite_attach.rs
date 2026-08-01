@@ -201,6 +201,21 @@ impl SqliteAttach {
         let mut tables = Vec::new();
         let mut defs = Vec::new();
         let mut skipped = Vec::new();
+        // Virtual tables are catalog-only in the native reader: their data
+        // lives behind a module we do not run, so each is a NAMED skip. The
+        // shadow tables they leave behind are ordinary tables and import
+        // below. (Their rows never pass through the loop's `_mpedb_` guard,
+        // so it is DELIBERATELY duplicated here — seeding `skipped` from a
+        // second source without it would surface our own bookkeeping.)
+        for (name, _sql) in file.virtual_tables().map_err(ferr)? {
+            if name.starts_with("_mpedb_") {
+                continue;
+            }
+            skipped.push((
+                name,
+                "virtual table (module-backed — its data is not readable natively)".into(),
+            ));
+        }
         for t in src_tables {
             // `_mpedb_`-prefixed tables are OURS (the overlay's checkpoint
             // marker, mirror's tracking tables) — internal like `sqlite_`,

@@ -134,6 +134,9 @@ pub struct SqliteFile {
     page_size: usize,
     usable: usize,
     n_pages: usize,
+    /// The highest page a table root may name (see `from_bytes` — sqlite's
+    /// header rule, not the file length).
+    root_bound: usize,
 }
 
 const HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -185,7 +188,19 @@ impl SqliteFile {
             return Err(corrupt("file size is not a page multiple"));
         }
         let n_pages = data.len() / page_size;
-        Ok(SqliteFile { data, page_size, usable, n_pages })
+        // sqlite's own rootpage ceiling is the IN-HEADER database size
+        // (offset 28), not the file length — a legacy writer may leave it
+        // stale, so it is valid only when nonzero AND the change counter
+        // (offset 24) matches the version-valid-for number (offset 92);
+        // otherwise the file's page count is the bound. Validating roots
+        // against the file length instead refused whole databases sqlite
+        // opens (and accepted roots sqlite refuses).
+        let cc = u32::from_be_bytes([data[24], data[25], data[26], data[27]]);
+        let size28 = u32::from_be_bytes([data[28], data[29], data[30], data[31]]);
+        let vvf = u32::from_be_bytes([data[92], data[93], data[94], data[95]]);
+        let root_bound =
+            if size28 != 0 && cc == vvf { (size28 as usize).min(n_pages) } else { n_pages };
+        Ok(SqliteFile { data, page_size, usable, n_pages, root_bound })
     }
 
     fn page(&self, no: u32) -> Result<&[u8]> {
@@ -202,18 +217,38 @@ impl SqliteFile {
     pub fn tables(&self) -> Result<Vec<Table>> {
         let mut out = Vec::new();
         self.scan_rowid_tree(1, &mut |_rowid, vals| {
-            let [Value::Text(ty), Value::Text(name), _, root, Value::Text(sql)] = &vals[..]
-            else {
-                // Views have NULL sql? No: views carry sql; internal
-                // auto-indexes carry NULL sql — either way, not a table row
-                // shape we consume.
+            let [Value::Text(ty), Value::Text(name), _, root, sqlv] = &vals[..] else {
                 return Ok(());
             };
+            // A VIEW with a NON-ZERO rootpage poisons the WHOLE database in
+            // sqlite — even reads of healthy tables say "malformed database
+            // schema (name)" — while a trigger with one is silently
+            // tolerated. Both measured; both followed.
+            if ty == "view" && !matches!(root, Value::Int(0)) {
+                return Err(corrupt(format!("malformed database schema ({name})")));
+            }
             if ty != "table" || name.starts_with("sqlite_") {
                 return Ok(());
             }
+            let Value::Text(sql) = sqlv else {
+                return Ok(()); // auto-index rows carry NULL sql; not a table shape
+            };
+            // The SQL TEXT is the discriminator, checked BEFORE the rootpage:
+            // sqlite never reads a vtab's root (a crafted POSITIVE one still
+            // answers module data — measured), so reading that page as a
+            // rowid tree was a wrong answer, and rootpage 0 aborting the
+            // whole scan as "corrupt" was a refusal of files sqlite opens.
+            // Their catalog rows come from [`Self::virtual_tables`]; their
+            // shadow tables are ordinary tables and stay in this list.
+            if is_create_virtual(sql) {
+                return Ok(());
+            }
             let root_page = match root {
-                Value::Int(r) if *r > 0 && *r <= u32::MAX as i64 => *r as u32,
+                // 0 is legal IN THE CATALOG: sqlite lists the table and
+                // refuses READS of it alone ("database disk image is
+                // malformed"), with every other table still readable —
+                // measured. `scan_table` carries that per-table refusal.
+                Value::Int(r) if *r >= 0 && *r <= u32::MAX as i64 => *r as u32,
                 _ => return Err(corrupt(format!("table `{name}` has a bad rootpage"))),
             };
             let parsed = parse_create_table(sql)
@@ -258,6 +293,26 @@ impl SqliteFile {
         Ok(out)
     }
 
+    /// Every `CREATE VIRTUAL TABLE` row, as `(name, create_sql)` — catalog
+    /// only. The DATA lives behind the table's module, which a native reader
+    /// does not run; the shadow tables (`<t>_content`, `<t>_segdir`, …) are
+    /// ordinary tables and appear in [`Self::tables`]. Classification is the
+    /// SQL text, never the rootpage — sqlite ignores a vtab row's root
+    /// entirely (measured: a crafted positive one still answers module data).
+    pub fn virtual_tables(&self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        self.scan_rowid_tree(1, &mut |_rowid, vals| {
+            let [Value::Text(ty), Value::Text(name), _, _, Value::Text(sql)] = &vals[..] else {
+                return Ok(());
+            };
+            if ty == "table" && is_create_virtual(sql) {
+                out.push((name.clone(), sql.clone()));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Scan a table in b-tree order, invoking `f(rowid, values)` per row.
     /// For a rowid table the order is rowid order; the `INTEGER PRIMARY KEY`
     /// alias column (if any) is materialized from the rowid. For a WITHOUT
@@ -269,6 +324,16 @@ impl SqliteFile {
         t: &Table,
         f: &mut dyn FnMut(i64, Vec<Value>) -> Result<()>,
     ) -> Result<()> {
+        // The catalog may legally carry an UNREADABLE table: rootpage 0, or
+        // one past the header's database size. sqlite scopes the refusal to
+        // exactly that table — "database disk image is malformed" — and
+        // reads everything else; same words, same scope, here.
+        if t.root_page == 0 || t.root_page as usize > self.root_bound {
+            return Err(corrupt(format!(
+                "table `{}`: database disk image is malformed (rootpage {})",
+                t.name, t.root_page
+            )));
+        }
         if t.without_rowid {
             let order = without_rowid_order(t)?;
             self.scan_index_tree(t.root_page, &mut |payload| {
@@ -598,10 +663,27 @@ fn without_rowid_order(t: &Table) -> Result<Vec<usize>> {
     Ok(order)
 }
 
+/// `CREATE VIRTUAL TABLE …`, with sqlite's own tolerance for case and
+/// whitespace runs. (Comments between the keywords are theoretically legal
+/// and not handled — sqlite normalises the stored text, so a stored row
+/// starts with the plain keywords.)
+fn is_create_virtual(sql: &str) -> bool {
+    let mut words = sql.split_whitespace();
+    matches!(
+        (words.next(), words.next(), words.next()),
+        (Some(a), Some(b), Some(c))
+            if a.eq_ignore_ascii_case("create")
+                && b.eq_ignore_ascii_case("virtual")
+                && c.eq_ignore_ascii_case("table")
+    )
+}
+
 /// Minimal CREATE TABLE parser: column names + declared types + PK shape.
-/// Handles quoting (`"x"`, `` `x` ``, `[x]`), nested parens in types/CHECKs,
-/// and table-level constraints. It does NOT evaluate defaults or understand
-/// generated columns — the differential test is the fence.
+/// Handles quoting (`"x"`, `` `x` ``, `[x]`, and `'x'` — sqlite accepts a
+/// single-quoted IDENTIFIER in DDL, and its own fts shadow tables are written
+/// that way), nested parens in types/CHECKs, and table-level constraints. It
+/// does NOT evaluate defaults or understand generated columns — the
+/// differential test is the fence.
 fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
     let open = sql.find('(')?;
     let body_and_tail = &sql[open + 1..];
@@ -1108,6 +1190,11 @@ fn take_identifier(s: &str) -> Option<(String, &str)> {
         '"' => ('"', '"'),
         '`' => ('`', '`'),
         '[' => ('[', ']'),
+        // sqlite accepts a single-quoted IDENTIFIER in DDL, and writes its
+        // own fts shadow tables that way (`CREATE TABLE 't_content'(docid
+        // INTEGER PRIMARY KEY, 'c0example')`) — unreachable until virtual
+        // tables stopped aborting the scan, reachable the moment they did.
+        '\'' => ('\'', '\''),
         _ => {
             let end = s
                 .find(|c: char| c.is_whitespace() || c == '(')
@@ -1123,7 +1210,9 @@ fn take_identifier(s: &str) -> Option<(String, &str)> {
 
 fn unquote(s: &str) -> String {
     let s = s.trim();
-    for (o, c) in [('"', '"'), ('`', '`'), ('[', ']')] {
+    // `'x'` included: a single-quoted identifier is legal DDL in sqlite, and
+    // its fts shadow tables are stored that way (see `take_identifier`).
+    for (o, c) in [('"', '"'), ('`', '`'), ('[', ']'), ('\'', '\'')] {
         if s.starts_with(o) && s.ends_with(c) && s.len() >= 2 {
             return s[1..s.len() - 1].to_string();
         }

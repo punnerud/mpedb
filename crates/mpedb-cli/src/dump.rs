@@ -74,6 +74,14 @@ fn dump_sqlite(path: &Path, with_data: bool) -> CliResult {
     use mpedb_sqlitefmt::{SqliteFile, Value as SV};
     let f = SqliteFile::open(path).map_err(|e| crate::util::Failure::Runtime(e.to_string()))?;
     let tables = f.tables().map_err(|e| crate::util::Failure::Runtime(e.to_string()))?;
+    // Catalog-only: a virtual table's data lives behind its module, which the
+    // native reader does not run. Named here so the dump never silently
+    // shrinks; the shadow tables it left behind are ordinary and dump below.
+    for (name, _sql) in
+        f.virtual_tables().map_err(|e| crate::util::Failure::Runtime(e.to_string()))?
+    {
+        println!("# virtual table {name}: module-backed, data not readable natively");
+    }
     for t in &tables {
         let mut n = 0u64;
         f.scan_table(t, &mut |_, _| {

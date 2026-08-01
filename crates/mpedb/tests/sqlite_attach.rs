@@ -147,3 +147,99 @@ fn check_constraints_compile_or_skip_per_table() {
 
     let _ = std::fs::remove_file(&p);
 }
+
+/// Plan §6: a `CREATE VIRTUAL TABLE` row is CATALOG, never data. Before this,
+/// rootpage 0 (every vtab) aborted the whole scan as "corrupt" — refusing
+/// files sqlite opens — and a crafted POSITIVE rootpage was read as a rowid
+/// tree, a wrong answer (sqlite ignores a vtab's root entirely, measured).
+/// The vtab is a NAMED skip; its shadow tables are ordinary tables and
+/// attach readable.
+#[test]
+fn a_virtual_table_is_catalog_only_and_never_aborts_the_scan() {
+    let p = std::env::temp_dir()
+        .join("mpedb-attach-tests")
+        .join(format!("at-vtab-{}.db", std::process::id()));
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&p);
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT);
+         INSERT INTO a VALUES (1, 'x'), (2, 'y');
+         CREATE VIRTUAL TABLE ft USING fts4(example);
+         INSERT INTO ft VALUES ('hello world');",
+    )
+    .unwrap();
+    drop(c);
+
+    let at = SqliteAttach::open(&p).unwrap();
+    assert!(
+        at.skipped().iter().any(|(n, why)| n == "ft" && why.contains("virtual table")),
+        "{:?}",
+        at.skipped()
+    );
+    let got = rows(at.query("SELECT v FROM a WHERE id = 2", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("y".into())]]);
+    // The vtab's CONTENT is reachable the way fts4 itself stores it: the
+    // `<t>_content` shadow table (single-quoted, typeless DDL — the parser
+    // must take both).
+    let got = rows(at.query("SELECT c0example FROM ft_content", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("hello world".into())]]);
+
+    let _ = std::fs::remove_file(&p);
+}
+
+/// Plan §6 twin rules, measured on stock and scoped identically here:
+/// an ordinary table with rootpage 0 refuses ALONE ("database disk image is
+/// malformed") while its siblings stay readable; a VIEW with a non-zero
+/// rootpage poisons the WHOLE database ("malformed database schema (name)").
+#[test]
+fn rootpage_damage_is_scoped_exactly_like_sqlite() {
+    let base = std::env::temp_dir().join("mpedb-attach-tests");
+    std::fs::create_dir_all(&base).unwrap();
+
+    // Table with rootpage 0: only that table refuses.
+    let p = base.join(format!("at-root0-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT);
+         INSERT INTO a VALUES (1, 'x');
+         CREATE TABLE b (id INTEGER PRIMARY KEY, w TEXT);
+         INSERT INTO b VALUES (7, 'z');
+         PRAGMA writable_schema = ON;
+         UPDATE sqlite_master SET rootpage = 0 WHERE name = 'b';",
+    )
+    .unwrap();
+    drop(c);
+    let at = SqliteAttach::open(&p).unwrap();
+    let got = rows(at.query("SELECT v FROM a WHERE id = 1", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("x".into())]]);
+    let err = at.query("SELECT w FROM b", &[]).unwrap_err();
+    assert!(format!("{err}").contains("malformed"), "{err}");
+    let _ = std::fs::remove_file(&p);
+
+    // View with rootpage != 0: the whole file refuses, sqlite's words.
+    let p = base.join(format!("at-viewroot-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT);
+         CREATE VIEW vw AS SELECT v FROM a;
+         PRAGMA writable_schema = ON;
+         UPDATE sqlite_master SET rootpage = 2 WHERE name = 'vw';",
+    )
+    .unwrap();
+    drop(c);
+    let err = match SqliteAttach::open(&p) {
+        Err(e) => e,
+        Ok(_) => panic!("a view with a non-zero rootpage must poison the open"),
+    };
+    assert!(
+        format!("{err}").contains("malformed database schema (vw)"),
+        "{err}"
+    );
+    let _ = std::fs::remove_file(&p);
+}
