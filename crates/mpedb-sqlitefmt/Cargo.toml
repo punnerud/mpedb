@@ -1,6 +1,6 @@
 [package]
 name = "mpedb-sqlitefmt"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 # Dependency-light BY DESIGN: this is the native sqlite-file READER
