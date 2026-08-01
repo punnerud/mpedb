@@ -10,9 +10,17 @@
 //! minimal CREATE TABLE column extractor. Refusals by name: WAL-mode files,
 //! non-UTF8 text encodings, page 1 corruption. The house rule applies:
 //! corrupt input yields [`Error::Corrupt`], never a panic.
+//!
+//! [`write`] is the mirror: a minimal WRITER emitting real, stock-verified
+//! sqlite images of logical content (plan §11) for the C-API shim's
+//! backup/serialize surface — everything its v1 scope cannot represent
+//! faithfully is [`Error::Unsupported`] by name, never an amputated image.
 
 pub mod lock;
 pub mod stamp;
+mod write;
+
+pub use write::{write_image, ImageTable};
 
 use std::fs::File;
 use std::io::Read as _;
