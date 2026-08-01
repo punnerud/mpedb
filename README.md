@@ -974,7 +974,17 @@ and [mpee](https://github.com/punnerud/mpee) (streaming matrices / route optimiz
 
 ## License
 
-Released under the [MIT License](LICENSE).
+Released under the [mpedb License 1.0](LICENSE) — source-available, and
+**free of charge for every person and every organization**, with one
+exception: a corporate group whose consolidated revenue **or** valuation
+exceeds **USD 5 billion** (2026 dollars, whichever is higher; ownership
+chains count in both directions, non-profits included) owes a **one-time
+NOK 0.07 per physical device** (2026 kroner) running the software — for
+server deployments, per physical device connected, whichever count is
+higher. Crossing the threshold once keeps the obligation for the five
+following years. Ambiguities resolve in favor of the project. The license
+applies to all versions, current and prior. Details and payment contact:
+[LICENSE](LICENSE).
 
 ---
 

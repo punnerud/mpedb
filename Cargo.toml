@@ -43,7 +43,7 @@ exclude = ["crates/mpedb-capi", "crates/mpedb-olapbench"]
 [workspace.package]
 version = "0.2.2"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "LicenseRef-mpedb-1.0"
 
 [workspace.dependencies]
 mpedb-types = { path = "crates/mpedb-types" }

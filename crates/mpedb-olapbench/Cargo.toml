@@ -2,7 +2,7 @@
 name = "mpedb-olapbench"
 version = "0.2.2"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "LicenseRef-mpedb-1.0"
 publish = false
 
 # Its OWN workspace, like mpedb-capi and for the same class of reason: this
