@@ -98,7 +98,9 @@ fn decode_params(buf: &[u8]) -> Result<Vec<Value>> {
 /// joined with 0x1f; truncation degrades messages, never safety.
 pub(crate) fn encode_error(e: &Error) -> (u32, Vec<u8>) {
     match e {
-        Error::PrimaryKeyViolation { table } => (1, table.as_bytes().to_vec()),
+        Error::PrimaryKeyViolation { table, pk } => {
+            (1, format!("{table}{SEP}{pk}").into_bytes())
+        }
         Error::UniqueViolation { table, constraint } => {
             (2, format!("{table}{SEP}{constraint}").into_bytes())
         }
@@ -128,7 +130,7 @@ pub(crate) fn decode_ring_result(r: mpedb_core::RingResult) -> Result<ExecResult
     let mut parts = msg.split(SEP);
     let mut next = || parts.next().unwrap_or("").to_owned();
     Err(match r.err_code {
-        1 => Error::PrimaryKeyViolation { table: next() },
+        1 => Error::PrimaryKeyViolation { table: next(), pk: next() },
         2 => Error::UniqueViolation {
             table: next(),
             constraint: next(),
@@ -1126,7 +1128,7 @@ fn optimistic_prep_inner(
                     table,
                     key_hash: kh,
                     snap,
-                    outcome: Err(Error::PrimaryKeyViolation { table: tname(db, table) }),
+                    outcome: Err(Error::PrimaryKeyViolation { table: tname(db, table), pk: pk_name(db, table) }),
                 },
                 Ok(None) => match row::encode_row(&values, types) {
                     Ok(payload) => Prep::Apply {
@@ -1264,6 +1266,24 @@ fn tname(db: &Database, table: u32) -> String {
         .unwrap_or_default()
 }
 
+/// The PK columns sqlite-spelled (`t.a` / `t.a, t.b`) — the shape
+/// `PrimaryKeyViolation` carries so the C-API can report sqlite's exact
+/// UNIQUE-failure wording without re-deriving columns from a name.
+fn pk_name(db: &Database, table: u32) -> String {
+    db.schema()
+        .table(table)
+        .map(|t| {
+            t.primary_key
+                .iter()
+                .filter_map(|&c| {
+                    t.columns.get(c as usize).map(|c| format!("{}.{}", t.name, c.name))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
 /// Plain serial execute of one statement under a fresh writer lock — the
 /// optimistic fallback (ineligible statements and exhausted-retry conflicts).
 fn serial_execute(db: &Database, plan: &CompiledPlan, params: &[Value]) -> Result<ExecResult> {
@@ -1329,7 +1349,7 @@ fn optimistic_execute(
                         // PK appeared despite validation passing (hash-level
                         // false-negative is impossible here since validate
                         // covers this exact key) → real violation
-                        Ok(false) => Err(Error::PrimaryKeyViolation { table: tname(db, table) }),
+                        Ok(false) => Err(Error::PrimaryKeyViolation { table: tname(db, table), pk: pk_name(db, table) }),
                         Err(e) => Err(e),
                     },
                     ApplyOp::Upsert(payload) => txn.optimistic_upsert(table, &key, payload),

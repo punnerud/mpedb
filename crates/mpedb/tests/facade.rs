@@ -256,13 +256,15 @@ fn constraint_violations_surface_precisely() {
     // duplicate PK
     assert!(matches!(
         db.execute(&ins, &params![1, "other@x.no", 1]),
-        Err(Error::PrimaryKeyViolation { table }) if table == "users"
+        Err(Error::PrimaryKeyViolation { table, .. }) if table == "users"
     ));
-    // duplicate UNIQUE email
+    // duplicate UNIQUE email — `constraint` carries sqlite's own spelling
+    // (`table.column`, comma-joined for composites), built at the raise site
+    // where the column list is still structured (§10).
     assert!(matches!(
         db.execute(&ins, &params![2, "a@x.no", 1]),
         Err(Error::UniqueViolation { table, constraint })
-            if table == "users" && constraint == "email"
+            if table == "users" && constraint == "users.email"
     ));
     // CHECK violation
     assert!(matches!(

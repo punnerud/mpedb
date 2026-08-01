@@ -1423,10 +1423,11 @@ primary_key = ["id"]
     w.insert_row(0, &row(4, None, Some("x"), None)).unwrap();
     w.commit().unwrap();
 
-    // Composite UNIQUE (b, c): another ("x", 1) must refuse, naming both.
+    // Composite UNIQUE (b, c): another ("x", 1) must refuse, naming both in
+    // sqlite's own spelling (§10 — built at the raise site, never re-split).
     let mut w = eng.begin_write().unwrap();
     let err = w.insert_row(0, &row(5, Some(9), Some("x"), Some(1))).unwrap_err();
-    assert!(format!("{err}").contains("b, c"), "{err}");
+    assert!(format!("{err}").contains("t.b, t.c"), "{err}");
     w.abort();
 
     // Update moving a member value re-keys both trees exactly; delete then

@@ -181,13 +181,30 @@ pub fn is_writer_lock_reentry(e: &DbError) -> bool {
 /// (CPython's own tests regex-search these), with mpedb's detail kept after
 /// the canonical phrase. `None` = use mpedb's message as-is.
 pub fn sqlite_shaped_message(e: &DbError) -> Option<String> {
-    let raw = e.to_string();
     match e {
-        DbError::CheckViolation { .. } => Some(format!("CHECK constraint failed: {raw}")),
-        DbError::PrimaryKeyViolation { .. } | DbError::UniqueViolation { .. } => {
-            Some(format!("UNIQUE constraint failed: {raw}"))
+        // The four constraint classes are built from the STRUCTURED fields —
+        // formatting sqlite's prefix around `e.to_string()` doubled every one
+        // of them ("NOT NULL constraint failed: NOT NULL violation: t.b").
+        // `constraint`/`pk` arrive sqlite-spelled (`t.a, t.b`) from the raise
+        // sites, where the column list is still a list — a column name may
+        // legally contain `, `, so nothing here may re-split or re-join.
+        //
+        // CHECK: sqlite names a NAMED constraint and prints the expression
+        // for an anonymous one. mpedb folds per-column CHECKs at parse and
+        // does not store the name, so the expression is always the answer —
+        // exact for anonymous checks, a documented divergence for named ones.
+        DbError::CheckViolation { expr, .. } => {
+            Some(format!("CHECK constraint failed: {expr}"))
         }
-        DbError::NotNullViolation { .. } => Some(format!("NOT NULL constraint failed: {raw}")),
+        DbError::PrimaryKeyViolation { pk, .. } => {
+            Some(format!("UNIQUE constraint failed: {pk}"))
+        }
+        DbError::UniqueViolation { constraint, .. } => {
+            Some(format!("UNIQUE constraint failed: {constraint}"))
+        }
+        DbError::NotNullViolation { table, column } => {
+            Some(format!("NOT NULL constraint failed: {table}.{column}"))
+        }
         // sqlite says exactly this and NOTHING else — no table, no column, no
         // constraint name (measured, 3.45.1), and its own test suite asserts on
         // the string. The detail mpedb carries stays on the native surface.

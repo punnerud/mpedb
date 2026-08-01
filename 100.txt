@@ -553,7 +553,55 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
   de to.
 
 
-1e. STATUS 31/7 KVELD — S18..S24, OG HVA SOM STÅR IGJEN
+1f. STATUS 1/8 — S25..S34: SQLALCHEMY I MÅL, CPYTHON 462/466
+------------------------------------------------------------
+
+  MÅLT, hver rad med kontrollarm:
+
+    korpus                 7 420 638 records, 0 gale, 0 errmis (x86-64 + arm64,
+                           re-målt ved S28, S31 og S32 — obligatorisk for
+                           binder/planner-endringer)
+    SQLAlchemy compliance  1277/1277 — I MÅL ved S32 (eksakt stock-paritet)
+    CPython test_sqlite3   462/466 (var 460); rest = NØYAKTIG planens fire:
+                           progress-paret (§11), fts4-dump (§7), decode (§8)
+    Django composite_pk    176/176 begge armer (S31 lukket labelen); full
+                           215-sveip står som SLUTTMÅLING etter §-postene
+
+  DAGENS COMMITS (hastighetsklausul målt ved S32: bench-A/B mot pre-S25,
+  select/insert/update innenfor støy, p50/p99 identiske — all kost er
+  bind-tid):
+
+    S28  DQS-misfeature (#132): ubundet "navn" i uttrykksposisjon er literal
+         — lukket schema.test_autofield_to_o2o; hele tabellen målt og pinnet
+    S29  sqlite_sequence: note_rowid (id-gjenbruk var GALT SVAR), lesearmen
+         deler master-mini-evaluatoren, `==`, txn-snapshot, eksistensregel
+    S30  vtab er KATALOG i sqlitefmt: SQL-teksten er diskriminatoren,
+         rootpage-skader skopes som stock (tabell alene / VIEW forgifter alt /
+         trigger tolereres), fts-skyggenes '…'-DDL parses
+    S31  (a,b) = (SELECT x,y): sammenligningen flyttes INN i projeksjonen,
+         én evaluering, delte S22-gjerder (qualify_row_probe)
+    S32  derived JOIN-operand: inline-parse (parametre beholder plassene),
+         splice via CTE-kjernen ELLER move til from_derived; PLUSS
+         fangst-gjerdet — kroppens skop overlever splicen (to shippede gale
+         svar i CTE-join-stien lukket)
+    S33  serialize/deserialize: egen bildeformat rundtur, FREEONCLOSE-
+         eierskap på alle stier, adopt_reopened delt med backup (som fikk
+         FK-pragma-bæringen), `no such table`-mappingen
+    S34  §10: de fire constraint-klassene bygges fra STRUKTURERTE felt ved
+         kilden (dotted i write.rs/ring/overlay; PK bærer pk-kolonnene på
+         ringen) — seks/seks meldingsrader identiske med stock, kompositt
+         inkludert. Navngitt CHECK divergerer fortsatt (navnet foldes bort
+         ved parse; å bære det er skjema-v18)
+
+  GJENSTÅR TIL 100 %: §8 decode (ConcatN, format 70), §7 fts4 (lesbar
+  vtab-projeksjon; fts5-arven fra S25), §11 sqlite-bildeskriveren
+  (progress-paret — eneste vei til 466/466), §4 steg 2 (sekvens-skriving som
+  mengde + executescript-rc med INTERRUPT-tvilling), tre Django-shim-onlys
+  (add_field_temp_default_boolean, rename_field_with_check_to_truncated_name,
+  raw_query a.*), full 215-sveip, og modulariseringsmålet (filer >2000
+  linjer: capi/lib.rs 4400+, shm.rs, exec/mod.rs, schema.rs, …).
+
+1e. STATUS 31/7 KVELD — S18..S24, OG HVA SOM STÅR IGJEN (HISTORISK)
 --------------------------------------------------------
 
   MÅLT, hver rad med kontrollarm:

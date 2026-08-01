@@ -871,7 +871,7 @@ impl<'e> WriteTxn<'e> {
             // any payload byte or bookkeeping exists, so a duplicate leaves
             // the txn clean enough to continue.
             if btree::get(self, root, &key)?.is_some() {
-                return Err(Error::PrimaryKeyViolation { table: tname });
+                return Err(Error::PrimaryKeyViolation { table: tname, pk: pk_constraint_name(self.eng, table_id) });
             }
             let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
                 .map_err(|_| Error::Unsupported("value too large for one extent".into()))?;
@@ -948,7 +948,7 @@ impl<'e> WriteTxn<'e> {
         };
         let out = btree::insert(self, root, &key, &mut payload, InsertMode::InsertOnly)?;
         if out.existed {
-            return Err(Error::PrimaryKeyViolation { table: tname });
+            return Err(Error::PrimaryKeyViolation { table: tname, pk: pk_constraint_name(self.eng, table_id) });
         }
         self.set_tree_root(table_id, 0, out.new_root, count + 1);
         self.note_columnar_mutation(table_id, &key)?;
@@ -1122,7 +1122,7 @@ impl<'e> WriteTxn<'e> {
                     .table(table_id)
                     .map(|t| t.name.clone())
                     .unwrap_or_default();
-                return Err(Error::PrimaryKeyViolation { table: tname });
+                return Err(Error::PrimaryKeyViolation { table: tname, pk: pk_constraint_name(self.eng, table_id) });
             }
             let total_len = encoded_len as u64;
             let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
@@ -1164,7 +1164,7 @@ impl<'e> WriteTxn<'e> {
                 .table(table_id)
                 .map(|t| t.name.clone())
                 .unwrap_or_default();
-            return Err(Error::PrimaryKeyViolation { table: tname });
+            return Err(Error::PrimaryKeyViolation { table: tname, pk: pk_constraint_name(self.eng, table_id) });
         }
         self.set_tree_root(table_id, 0, out.new_root, count + 1);
 
@@ -3072,11 +3072,33 @@ fn table_column_name(eng: &Engine, table_id: u32, col: u16) -> String {
 
 /// Constraint name for a UNIQUE-violation error: the indexed column, or the
 /// comma-joined list for a composite index.
+/// The violated columns in sqlite's OWN spelling — `t.a` / `t.a, t.b`.
+/// Built HERE, where the columns are still a structured list: a column name
+/// may legally contain `, `, so no later stage may re-split the join.
 fn index_constraint_name(eng: &Engine, table_id: u32, cols: &[u16]) -> String {
+    let t = table_name(eng, table_id);
     cols.iter()
-        .map(|&c| table_column_name(eng, table_id, c))
+        .map(|&c| format!("{t}.{}", table_column_name(eng, table_id, c)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The PRIMARY KEY columns, sqlite-spelled — a PK conflict is reported by
+/// sqlite as a UNIQUE failure over exactly these.
+fn pk_constraint_name(eng: &Engine, table_id: u32) -> String {
+    let bundle = eng.bundle();
+    let Some(t) = bundle.schema.table(table_id) else {
+        return String::new();
+    };
+    t.primary_key
+        .iter()
+        .filter_map(|&c| t.columns.get(c as usize).map(|c| format!("{}.{}", t.name, c.name)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn table_name(eng: &Engine, table_id: u32) -> String {
+    eng.bundle().schema.table(table_id).map(|t| t.name.clone()).unwrap_or_default()
 }
 
 /// The sys-keyspace key holding one table's AUTOINCREMENT high-water mark.

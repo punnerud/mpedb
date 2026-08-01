@@ -995,13 +995,23 @@ impl TxnCtx for MergeCtx<'_> {
         // free again.
         let pk = values[self.pk_idx[table as usize]].clone();
         if self.get_by_pk(table, std::slice::from_ref(&pk))?.is_some() {
-            let name = self
+            let (name, pkname) = self
                 .at
                 .schema()
                 .table(table)
-                .map(|t| t.name.clone())
+                .map(|t| {
+                    let pk = t
+                        .primary_key
+                        .iter()
+                        .filter_map(|&c| {
+                            t.columns.get(c as usize).map(|c| format!("{}.{}", t.name, c.name))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (t.name.clone(), pk)
+                })
                 .unwrap_or_default();
-            return Err(Error::PrimaryKeyViolation { table: name });
+            return Err(Error::PrimaryKeyViolation { table: name, pk: pkname });
         }
         self.check_unique(table, values, None)?;
         let pre = self.pre_for(table, &pk)?;

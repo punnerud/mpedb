@@ -57,6 +57,10 @@ pub enum Error {
     },
     UniqueViolation {
         table: String,
+        /// The violated columns in sqlite's OWN spelling — `t.a` or
+        /// `t.a, t.b` — built at the RAISE site from the structured column
+        /// list. Downstream (the C-API's message shaping above all) must
+        /// never re-split it: a column NAME may legally contain `, `.
         constraint: String,
     },
     CheckViolation {
@@ -71,6 +75,9 @@ pub enum Error {
     Raise(String),
     PrimaryKeyViolation {
         table: String,
+        /// The PK columns, sqlite-spelled (`t.a` / `t.a, t.b`) — sqlite
+        /// reports a PK conflict as a UNIQUE failure over exactly these.
+        pk: String,
     },
     /// A FOREIGN KEY was not satisfied: a child row named a parent that does
     /// not exist, or a parent row was deleted/re-keyed while a RESTRICT/NO
@@ -201,14 +208,16 @@ impl fmt::Display for Error {
                 write!(f, "NOT NULL violation: {table}.{column}")
             }
             Error::UniqueViolation { table, constraint } => {
-                write!(f, "UNIQUE violation: {table} ({constraint})")
+                let _ = table;
+                write!(f, "UNIQUE violation: {constraint}")
             }
             Error::CheckViolation { table, column, expr } => {
                 write!(f, "CHECK violation: {table}.{column} failed `{expr}`")
             }
             Error::Raise(m) => write!(f, "{m}"),
-            Error::PrimaryKeyViolation { table } => {
-                write!(f, "PRIMARY KEY violation in {table}")
+            Error::PrimaryKeyViolation { table, pk } => {
+                let _ = table;
+                write!(f, "PRIMARY KEY violation in {pk}")
             }
             Error::ForeignKeyViolation { table, constraint } => match constraint {
                 Some(c) => write!(f, "FOREIGN KEY violation: {table} ({c})"),
