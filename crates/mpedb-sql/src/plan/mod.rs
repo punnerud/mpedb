@@ -502,7 +502,7 @@ const MAX_JOINS: usize = 63;
 //     `a NOT IN (…)` returned both rows where sqlite returns one. Emitted only
 //     for a non-Binary collation, so every plan that was already right keeps
 //     byte-identical bytes and the same hash.
-const PLAN_FORMAT: u8 = 69;
+const PLAN_FORMAT: u8 = 70;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

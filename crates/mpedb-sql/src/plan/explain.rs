@@ -1262,6 +1262,13 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
             }
             // Unreachable: a program containing jumps returned early above.
             Instr::Jump(_) | Instr::JumpIfNotTrue(_) | Instr::JumpIfNotNull(_) => continue,
+            // §8: the n-ary chain renders as the `||` chain it is, so an
+            // unaliased decode-error column reads like sqlite's.
+            Instr::ConcatN(n) => {
+                let mut ops: Vec<String> = (0..n).map(|_| pop(&mut st).s).collect();
+                ops.reverse();
+                Item { s: ops.join(" || "), atom: false }
+            }
             Instr::Pop => {
                 let _ = pop(&mut st);
                 continue;

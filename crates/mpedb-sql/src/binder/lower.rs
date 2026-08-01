@@ -301,6 +301,12 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
             emit(a, instrs, consts)?;
             instrs.push(Instr::Cast(*t));
         }
+        BExpr::ConcatN(ops) => {
+            for a in ops {
+                emit(a, instrs, consts)?;
+            }
+            instrs.push(Instr::ConcatN(ops.len() as u16));
+        }
         BExpr::Binary(op, a, b) => {
             emit(a, instrs, consts)?;
             emit(b, instrs, consts)?;

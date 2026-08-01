@@ -127,6 +127,16 @@ pub enum Instr {
     /// returned NO rows where sqlite returns the row, and `NOT IN` returned
     /// BOTH rows where sqlite returns one.
     InParamColl(u16, Collation),
+    /// n-ary `||` over RAW BYTES (plan §8, format 70): pops `n` operands,
+    /// concatenates their byte forms (text/blob as-is; int/bool rendered;
+    /// NULL propagates), and pushes TEXT when the result is valid UTF-8 —
+    /// which is how `? || ?` fed `C3` + `A9` yields `'é'` exactly as sqlite
+    /// (the bytes RECOMBINE across operands; measured). An invalid result is
+    /// [`Error::NonUtf8Concat`] — the bytes never enter a `Value`, so
+    /// `Value::Text`'s valid-UTF-8 invariant stands. Emitted ONLY when an
+    /// operand may be a blob; pure text chains keep [`Instr::Concat`] and
+    /// their byte-identical plans.
+    ConcatN(u16),
     /// `<scalar> IN (<e1>, …, <en>)` — set membership against `n` values taken
     /// from the STACK (general SQL `IN`, task #21). Pops `n` list elements plus
     /// the probe beneath them, pushes the 3VL verdict.
@@ -666,6 +676,11 @@ impl ExprProgram {
                     let b = stack.pop().expect("validated");
                     let a = stack.pop().expect("validated");
                     stack.push(concat_value(a, b)?);
+                }
+                Instr::ConcatN(n) => {
+                    let at = stack.len() - n as usize;
+                    let ops = stack.split_off(at);
+                    stack.push(concat_bytes_n(ops)?);
                 }
                 Instr::Like(pi) => {
                     let a = stack.pop().expect("validated");
@@ -1497,6 +1512,40 @@ fn real_as_int(r: f64) -> Option<i64> {
     };
     // NaN fails this comparison, so a NaN stays a real.
     (r == ix as f64 && ix > i64::MIN && ix < i64::MAX).then_some(ix)
+}
+
+/// The [`Instr::ConcatN`] body: byte-level `||` over the whole chain.
+/// NULL propagates; text and BLOB contribute their raw bytes; ints and bools
+/// render (sqlite's rule); floats are refused (formatting unpinned) — same
+/// set the binder admits. Valid UTF-8 -> Text; anything else is the decode
+/// error, with the LOSSY rendering sqlite consumers display (each invalid
+/// sequence as U+FFFD — measured against CPython's own message generator).
+fn concat_bytes_n(ops: Vec<Value>) -> Result<Value> {
+    if ops.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    for v in ops {
+        match v {
+            Value::Text(s) => bytes.extend_from_slice(s.as_bytes()),
+            Value::Blob(b) => bytes.extend_from_slice(&b),
+            Value::Int(i) => bytes.extend_from_slice(i.to_string().as_bytes()),
+            Value::Bool(b) => bytes.push(if b { b'1' } else { b'0' }),
+            v => {
+                return Err(Error::TypeMismatch(format!(
+                    "|| cannot render {} as text",
+                    v.type_name()
+                )))
+            }
+        }
+    }
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(Value::Text(s)),
+        Err(e) => Err(Error::NonUtf8Concat {
+            column: None,
+            text: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }),
+    }
 }
 
 /// `||` semantics: NULL propagates; ints and bools render as text (sqlite's

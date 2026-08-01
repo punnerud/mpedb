@@ -77,6 +77,8 @@ const OP_CALL_COLL: u8 = 61;
 const OP_SPELL_CALL: u8 = 62;
 /// The collated twin of [`OP_IN_PARAM`] — see [`Instr::InParamColl`].
 const OP_IN_PARAM_COLL: u8 = 63;
+/// n-ary byte-level `||` — see [`Instr::ConcatN`] (plan §8, format 70).
+const OP_CONCAT_N: u8 = 64;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -214,6 +216,10 @@ impl ExprProgram {
                     buf.push(OP_IN_PARAM_COLL);
                     buf.extend_from_slice(&x.to_le_bytes());
                     buf.push(coll as u8);
+                }
+                Instr::ConcatN(n) => {
+                    buf.push(OP_CONCAT_N);
+                    buf.extend_from_slice(&n.to_le_bytes());
                 }
                 Instr::Affinity(aff) => {
                     buf.push(OP_AFFINITY);
@@ -372,6 +378,16 @@ impl ExprProgram {
                     let coll = Collation::from_tag(c)
                         .ok_or_else(|| Error::Corrupt("bad collation tag".into()))?;
                     Instr::InParamColl(x, coll)
+                }
+                OP_CONCAT_N => {
+                    let n = read_u16_arg()?;
+                    // One operand would make it an identity that still pays
+                    // the byte round-trip; zero would push from nothing. The
+                    // binder never emits either — corrupt, not a shrug.
+                    if n < 2 {
+                        return Err(Error::Corrupt("ConcatN arity below 2".into()));
+                    }
+                    Instr::ConcatN(n)
                 }
                 OP_AFFINITY => {
                     let t = *buf.get(*pos).ok_or_else(err)?;
@@ -537,6 +553,7 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     Instr::InParam(_) | Instr::InParamColl(..) => (1, 1),
                     Instr::Cast(_) | Instr::Affinity(_) => (1, 1),
                     Instr::Concat => (2, 1),
+                    Instr::ConcatN(n) => (n as usize, 1),
                     // n list elements plus the probe beneath them. n == 0 is the
                     // empty set `x IN ()`: eval pops the probe and pushes FALSE
                     // (`in_items_3vl` on an empty slice), so it is a valid (1, 1)

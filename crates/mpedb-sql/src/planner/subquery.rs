@@ -1228,6 +1228,7 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
             refs_correlated(a, sub_base, correlated)
                 || xs.iter().any(|x| refs_correlated(x, sub_base, correlated))
         }
+        BExpr::ConcatN(xs) => xs.iter().any(|x| refs_correlated(x, sub_base, correlated)),
         BExpr::Case(arms, els) => {
             arms.iter().any(|(c, r)| {
                 refs_correlated(c, sub_base, correlated)

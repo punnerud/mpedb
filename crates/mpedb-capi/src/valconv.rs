@@ -140,6 +140,10 @@ pub fn error_codes(e: &DbError) -> (c_int, c_int) {
             (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT)
         }
         DbError::TypeMismatch(_) => (SQLITE_MISMATCH, SQLITE_MISMATCH),
+        // §8: the `||` decode error is CPython's OperationalError, not a
+        // constraint — plain SQLITE_ERROR, with Display already carrying
+        // CPython's own message shape once the projection filled the column.
+        DbError::NonUtf8Concat { .. } => (SQLITE_ERROR, SQLITE_ERROR),
         DbError::Corrupt(_) => (SQLITE_CORRUPT, SQLITE_CORRUPT),
         DbError::Io(_) => (SQLITE_IOERR, SQLITE_IOERR),
         DbError::DbFull => (SQLITE_FULL, SQLITE_FULL),
@@ -225,6 +229,10 @@ pub fn sqlite_shaped_message(e: &DbError) -> Option<String> {
         // is a renaming, never a reinterpretation. Only the EXACT shape maps
         // (a guarded arm: any other Bind falls through to the checks below);
         // a message with trailing detail keeps the native form.
+        // §8: Display IS the shape (CPython's own message generator, measured
+        // byte-for-byte, U+FFFD rendering included) — pass it through so no
+        // `bind error:`-style prefix is added around it.
+        DbError::NonUtf8Concat { .. } => Some(e.to_string()),
         DbError::Bind(m) if m.starts_with("unknown table `") && m.ends_with('`') => {
             Some(format!("no such table: {}", &m["unknown table `".len()..m.len() - 1]))
         }

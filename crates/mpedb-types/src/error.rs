@@ -51,6 +51,16 @@ pub enum Error {
     Corrupt(String),
     /// A value did not match the rigid column type, or an expression mixed types.
     TypeMismatch(String),
+    /// `||` produced bytes that are not valid UTF-8 (plan §8). `text` is the
+    /// LOSSY rendering (each invalid sequence as U+FFFD) — the raw bytes never
+    /// enter a `Value`, which is the boundary this variant exists to protect.
+    /// `column` is filled at the PROJECTION, where the output name is known;
+    /// the C-API shapes CPython's own message from the two
+    /// (`Could not decode to UTF-8 column '…' with text '…'`).
+    NonUtf8Concat {
+        column: Option<String>,
+        text: String,
+    },
     NotNullViolation {
         table: String,
         column: String,
@@ -204,6 +214,10 @@ impl fmt::Display for Error {
             Error::Schema(m) => write!(f, "schema error: {m}"),
             Error::Corrupt(m) => write!(f, "database corrupt: {m}"),
             Error::TypeMismatch(m) => write!(f, "type mismatch: {m}"),
+            Error::NonUtf8Concat { column, text } => match column {
+                Some(c) => write!(f, "Could not decode to UTF-8 column '{c}' with text '{text}'"),
+                None => write!(f, "|| produced bytes that are not valid UTF-8: '{text}'"),
+            },
             Error::NotNullViolation { table, column } => {
                 write!(f, "NOT NULL violation: {table}.{column}")
             }

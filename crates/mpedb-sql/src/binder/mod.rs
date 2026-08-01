@@ -44,6 +44,13 @@ pub(crate) enum BExpr {
     Col(u16),
     Unary(BUnOp, Box<BExpr>),
     Binary(BinOp, Box<BExpr>, Box<BExpr>),
+    /// The WHOLE `||` chain as one n-ary node (plan §8) — built only when an
+    /// operand may be a BLOB (sqlite dialect). One node for the chain is what
+    /// lets the bytes recombine across every operand exactly as sqlite
+    /// (`'x' || ?C3 || ?A9` is valid UTF-8 as a WHOLE — measured); nesting
+    /// two-operand nodes would refuse at the first invalid intermediate.
+    /// Pure text chains keep `Binary(Concat)` and their byte-identical plans.
+    ConcatN(Vec<BExpr>),
     /// `l IS r` / `l IS NOT r` — NULL-safe (not-)distinct-from, a 2-valued Bool.
     /// The bool is `negated` (`IS NOT`). Its own node rather than a `BinOp`
     /// because it is NOT 3VL: it compiles to a dedicated instruction that never

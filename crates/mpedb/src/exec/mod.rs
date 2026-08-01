@@ -1238,6 +1238,20 @@ fn hide_constraint_variant(e: Error, table: &str, rls: bool) -> Error {
     }
 }
 
+/// Fill the OUTPUT-COLUMN name into a `||` decode error rising out of a
+/// projection slot (§8): the C-API shapes CPython's exact message from it
+/// (`Could not decode to UTF-8 column '<name>' with text '…'`), and the
+/// projection is the one place that knows what the column is called.
+fn name_decode_error(e: Error, name: &str) -> Error {
+    match e {
+        Error::NonUtf8Concat { column: None, text } => Error::NonUtf8Concat {
+            column: Some(name.to_string()),
+            text,
+        },
+        other => other,
+    }
+}
+
 fn precheck_failure(e: &Error) -> bool {
     matches!(
         e,
@@ -1898,8 +1912,10 @@ fn exec_select(
                             .get(*i as usize)
                             .cloned()
                             .ok_or_else(|| internal("projection column"))?,
-                        Projection::Expr { program, .. } => {
-                            program.eval_host(&row, params, ctx.host_fns())?
+                        Projection::Expr { program, name, .. } => {
+                            program
+                                .eval_host(&row, params, ctx.host_fns())
+                                .map_err(|e| name_decode_error(e, name))?
                         }
                     });
                 }
@@ -2154,8 +2170,10 @@ fn try_exec_knn(
                     .get(*i as usize)
                     .cloned()
                     .ok_or_else(|| internal("projection column"))?,
-                Projection::Expr { program, .. } => {
-                    program.eval_host(row, params, ctx.host_fns())?
+                Projection::Expr { program, name, .. } => {
+                    program
+                        .eval_host(row, params, ctx.host_fns())
+                        .map_err(|e| name_decode_error(e, name))?
                 }
             });
         }

@@ -184,6 +184,43 @@ impl<'a> Binder<'a> {
                 Ok((e, Some(ColumnType::Bool)))
             }
             BinOp::Concat => {
+                // §8: may a BLOB reach this chain? An unpinned parameter
+                // (type still None), an `Any` operand (typeless column, UDF
+                // result) or a declared blob can each deliver one at run
+                // time. sqlite dialect only — PostgreSQL's `||` refuses as
+                // before.
+                let blob_possible = self.sqlite_dialect()
+                    && ([&lt, &rt].into_iter().any(|t| {
+                        matches!(t, None | Some(ColumnType::Any) | Some(ColumnType::Blob))
+                    })
+                        // An operand that is ALREADY the n-ary node forces the
+                        // n-ary path: `'xxx' || ? || 'yyy'` binds left-deep,
+                        // the inner pair took ConcatN for its parameter, and
+                        // the outer (Text ++ Text on paper) must SPLICE INTO
+                        // it or 'yyy' never joins the byte recombination —
+                        // measured: stock's message carries 'xxx�yyy', a
+                        // two-level tree stopped at 'xxx�'.
+                        || matches!(l, BExpr::ConcatN(_))
+                        || matches!(r, BExpr::ConcatN(_)));
+                if blob_possible {
+                    // Floats keep their refusal in BOTH forms.
+                    for t in [lt, rt].into_iter().flatten() {
+                        if matches!(t, ColumnType::Float64) {
+                            return Err(bind_err(format!(
+                                "`||` requires text, int64, or bool operands, got {t}"
+                            )));
+                        }
+                    }
+                    // ONE node for the WHOLE chain: splice nested concat
+                    // operands (either form) so the bytes recombine across
+                    // every operand, exactly as sqlite evaluates the chain.
+                    // Parameters stay UNPINNED — the slot remains `Any`, which
+                    // is what lets CPython bind a blob into `'xxx' || ?`.
+                    let mut ops = Vec::new();
+                    splice_concat(l, &mut ops);
+                    splice_concat(r, &mut ops);
+                    return Ok((BExpr::ConcatN(ops), Some(ColumnType::Text)));
+                }
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
                 let (r, rt) = self.unify_param(r, rt, ColumnType::Text);
                 // Same render set as the runtime: text/int/bool (Any decided
@@ -783,5 +820,24 @@ impl<'a> Binder<'a> {
             return fold(else_);
         }
         Ok(BExpr::Case(fold_arms(live)?, Some(Box::new(fold(else_)?))))
+    }
+}
+
+
+/// Flatten a concat operand into the n-ary chain (§8): an inner `ConcatN`
+/// or `Binary(Concat)` contributes its OPERANDS, so the whole `||` chain is
+/// one node whatever mix of paths bound the parts.
+fn splice_concat(e: BExpr, out: &mut Vec<BExpr>) {
+    match e {
+        BExpr::ConcatN(ops) => {
+            for o in ops {
+                splice_concat(o, out);
+            }
+        }
+        BExpr::Binary(BinOp::Concat, a, b) => {
+            splice_concat(*a, out);
+            splice_concat(*b, out);
+        }
+        other => out.push(other),
     }
 }
