@@ -850,8 +850,28 @@ impl Pred {
 /// `get_constraints` reaches `sqlite_master` ONLY through bound parameters
 /// (`WHERE type='table' and name=%s`), so before this the whole method raised
 /// on the shim.
-fn operand(s: &str, params: &[Value]) -> Option<Option<String>> {
+fn operand(s: &str, params: &[Value], cols: &[&str]) -> Option<Option<String>> {
     let t = s.trim();
+    // sqlite's double-quote misfeature, exactly as measured: `"x"` in operand
+    // position is an IDENTIFIER when x names a column of the queried catalog
+    // table, and falls back to the STRING literal 'x' when it does not.
+    // Django 4.2's `get_constraints` writes `name="tblname"` (5.x
+    // parameterizes, which is why the Django suite never surfaced it) — the
+    // fallback half answers that. The identifier half — `name="name"` is
+    // sqlite's ALWAYS-TRUE column self-compare, measured — has no measured
+    // consumer, so it REFUSES rather than guessing at column-vs-column
+    // semantics: treating it as a literal would be a silent wrong answer.
+    // Only `"` carries the fallback; a backtick/bracket-quoted unknown is an
+    // error in sqlite too.
+    if let Some(inner) = t.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        if inner.is_empty() || inner.contains('"') {
+            return None;
+        }
+        if cols.contains(&inner.to_ascii_lowercase().as_str()) {
+            return None;
+        }
+        return Some(Some(inner.to_string()));
+    }
     if let Some(digits) = t.strip_prefix('$') {
         if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
             let n: usize = digits.parse().ok()?;
@@ -943,14 +963,14 @@ fn parse_cmp(c: &str, params: &[Value], cols: &[&str]) -> Result<Pred, DbError> 
     }
     if let Some(idx) = cl.find(" not like ") {
         let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
-        let pat = operand(&c[idx + 10..], params).ok_or_else(unsupported)?;
+        let pat = operand(&c[idx + 10..], params, cols).ok_or_else(unsupported)?;
         Ok(match pat {
             Some(p) => Pred::Like(col, p, true),
             None => Pred::Never,
         })
     } else if let Some(idx) = cl.find(" like ") {
         let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
-        let pat = operand(&c[idx + 6..], params).ok_or_else(unsupported)?;
+        let pat = operand(&c[idx + 6..], params, cols).ok_or_else(unsupported)?;
         Ok(match pat {
             Some(p) => Pred::Like(col, p, false),
             None => Pred::Never,
@@ -960,12 +980,12 @@ fn parse_cmp(c: &str, params: &[Value], cols: &[&str]) -> Result<Pred, DbError> 
         let list = &c[idx + 4..];
         let inner = list.trim().trim_start_matches('(').trim_end_matches(')');
         let vals: Option<Vec<Option<String>>> =
-            inner.split(',').map(|e| operand(e, params)).collect();
+            inner.split(',').map(|e| operand(e, params, cols)).collect();
         // A NULL element of an IN list never matches; the rest still can.
         Ok(Pred::In(col, vals.ok_or_else(unsupported)?.into_iter().flatten().collect()))
     } else if let Some(idx) = cl.find("!=").or_else(|| cl.find("<>")) {
         let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
-        let v = operand(&c[idx + 2..], params).ok_or_else(unsupported)?;
+        let v = operand(&c[idx + 2..], params, cols).ok_or_else(unsupported)?;
         Ok(match v {
             Some(v) => Pred::Ne(col, v),
             None => Pred::Never,
@@ -978,7 +998,7 @@ fn parse_cmp(c: &str, params: &[Value], cols: &[&str]) -> Result<Pred, DbError> 
         // only be the doubled spelling.)
         let rest = &c[idx + 1..];
         let rest = rest.trim_start().strip_prefix('=').unwrap_or(rest);
-        let v = operand(rest, params).ok_or_else(unsupported)?;
+        let v = operand(rest, params, cols).ok_or_else(unsupported)?;
         Ok(match v {
             Some(v) => Pred::Eq(col, v),
             None => Pred::Never,

@@ -266,3 +266,55 @@ fn a_trigger_can_be_created_and_fires() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// sqlite's double-quote misfeature in the mini-evaluator's WHERE, exactly as
+/// measured on stock 3.45.1: `"x"` in operand position is an IDENTIFIER when
+/// x names a catalog column, and falls back to the STRING literal otherwise.
+/// Django 4.2's `get_constraints` writes `name="tblname"` (5.x parameterizes,
+/// which is why the Django suite never surfaced the gap) — the fallback half
+/// answers it, for tables and indexes and inside IN-lists. The identifier
+/// half (`name="name"`, sqlite's always-true column self-compare) has no
+/// measured consumer and REFUSES rather than guessing: read as a literal it
+/// would be a silent wrong answer.
+#[test]
+fn double_quoted_names_fall_back_to_literals_like_sqlite() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE mytab (id INTEGER PRIMARY KEY, name TEXT)"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE INDEX myidx ON mytab (name)"), SQLITE_OK);
+
+        // Django 4.2's exact get_constraints shape.
+        let got = collect_text_col(
+            db,
+            "SELECT sql FROM sqlite_master WHERE type='table' and name=\"mytab\"",
+        );
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("CREATE TABLE"), "{}", got[0]);
+
+        // The index twin.
+        let got = collect_text_col(
+            db,
+            "SELECT sql FROM sqlite_master WHERE type='index' and name=\"myidx\"",
+        );
+        assert_eq!(got, ["CREATE INDEX myidx ON mytab (name)"]);
+
+        // DQS inside an IN list resolves element by element.
+        let got = collect_text_col(
+            db,
+            "SELECT name FROM sqlite_master WHERE name IN (\"mytab\", \"myidx\") ORDER BY name",
+        );
+        assert_eq!(got, ["myidx", "mytab"]);
+
+        // `name="name"` IS a column in sqlite (always-true self-compare,
+        // measured: it returns every row) — refused by the evaluator, never
+        // answered as the literal.
+        let mut st: *mut Stmt = ptr::null_mut();
+        let s = cs("SELECT name FROM sqlite_master WHERE name = \"name\"");
+        let rc = sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut());
+        let rc = if rc == SQLITE_OK { sqlite3_step(st) } else { rc };
+        assert!(rc != SQLITE_ROW && rc != SQLITE_DONE, "must refuse, got rc={rc}");
+        sqlite3_finalize(st);
+
+        sqlite3_close(db);
+    }
+}
