@@ -564,8 +564,10 @@ ALLE TRE SUITENE MÅLT PÅ NYTT 29/7 KVELD, ETTER §4 OG §5:
     SQLAlchemy compliance  1277/1277 — I MÅL ved S32 (eksakt stock-paritet)
     CPython test_sqlite3   462/466 (var 460); rest = NØYAKTIG planens fire:
                            progress-paret (§11), fts4-dump (§7), decode (§8)
-    Django composite_pk    176/176 begge armer (S31 lukket labelen); full
-                           215-sveip står som SLUTTMÅLING etter §-postene
+    Django, ALLE labels   18 214 tester per arm (fikset label-liste,
+                           __init__.py-filteret) — 0 SHIM-ONLY, 13 feil-IDer
+                           IDENTISKE i begge armer (stock-Djangos egne).
+                           DJANGO ER I MÅL (sluttmålt 1/8 etter S35)
 
   DAGENS COMMITS (hastighetsklausul målt ved S32: bench-A/B mot pre-S25,
   select/insert/update innenfor støy, p50/p99 identiske — all kost er
