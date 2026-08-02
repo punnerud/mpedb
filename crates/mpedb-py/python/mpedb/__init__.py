@@ -88,6 +88,24 @@ version_info = (0, 1, 5)
 # time) — application is part of the 0.2 detect_types work; registration must
 # not crash the import.
 import datetime as _dt
+import os
+
+_shared_memory_names = set()
+
+
+def _cleanup_shared_memory(name):
+    """Best-effort removal of a pid-scoped shared-memory database's backing
+    files at interpreter exit — sqlite's cache=shared dies with the process,
+    so ours must not leak 64 MiB per name in /dev/shm."""
+    import tempfile
+
+    bases = ["/dev/shm", tempfile.gettempdir()]
+    for b in bases:
+        for suffix in (".mpedb", ".mpedb-wal"):
+            try:
+                os.remove(f"{b}/mpedb-shared-{name}{suffix}")
+            except OSError:
+                pass
 
 Date = _dt.date
 Time = _dt.time
@@ -260,9 +278,28 @@ def connect(
             )
         if mode == "memory":
             base = name.strip("/").replace("/", "_") or "anon"
-            path = (
-                f":memory:shared:{base}" if cache == "shared" else ":memory:"
-            )
+            if cache == "shared":
+                # sqlite's cache=shared shares within THIS process and the
+                # database DIES WITH the process. mpedb's named shared memory
+                # is cross-process and outlives us — the swap route's W5: a
+                # second test run inherited the first run's half-migrated
+                # state. Scope the name by pid (same-process sharing intact,
+                # other/next processes get a fresh store) and remove the
+                # backing files at interpreter exit.
+                import atexit
+
+                suffix = f"_pid{os.getpid()}"
+                # the engine's name rule: [A-Za-z0-9_-], max 64 chars
+                base = "".join(
+                    ch if (ch.isalnum() or ch in "_-") else "_" for ch in base
+                )[: 64 - len(suffix)]
+                scoped = f"{base}{suffix}"
+                path = f":memory:shared:{scoped}"
+                if scoped not in _shared_memory_names:
+                    _shared_memory_names.add(scoped)
+                    atexit.register(_cleanup_shared_memory, scoped)
+            else:
+                path = ":memory:"
         elif mode in (None, "rw", "rwc"):
             path = name
         else:

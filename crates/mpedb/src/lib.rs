@@ -120,7 +120,7 @@ pub use mpedb_types::model::WorkloadModel;
 pub use mpedb_types::toml_escape;
 pub use mpedb_types::{
     BudgetKind, Collation, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, FkAction,
-    Footprint, ForeignKeyDef, FtsModule,
+    Footprint, ForeignKeyDef, FtsModule, IndexDef,
     HostAggState, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema,
     TableDef, TableKind, TableSet, Value, INDEX_EXPR_COL, MAX_DB_SIZE_MB,
 };

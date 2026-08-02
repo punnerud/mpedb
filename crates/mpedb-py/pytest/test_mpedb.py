@@ -959,6 +959,66 @@ def test_dbapi_introspection_and_teardown(workdir):
     ok("dbapi: open transaction at interpreter exit is a clean exit")
 
 
+def test_dbapi_w1_w5(workdir):
+    """The swap route's THIRD err log (W1-W5, 2026-08-02): cursor chaining,
+    multiline/multi-param sqlite_master WHERE, index_list/index_info,
+    faithful sql text, and pid-scoped shared memory with exit cleanup."""
+    import subprocess, sys as _sys
+
+    c = mpedb.connect(":memory:", isolation_level=None)
+    cur = c.cursor()
+    assert cur.execute("SELECT 1") is cur and cur.fetchone() == (1,)
+    c.execute("CREATE TABLE em (a INTEGER PRIMARY KEY)")
+    assert cur.executemany("INSERT INTO em VALUES (?)", [(1,), (2,)]) is cur
+    ok("dbapi: cursor.execute()/executemany() return the cursor (W1)")
+
+    c.execute(
+        'CREATE TABLE wx (id INTEGER PRIMARY KEY AUTOINCREMENT, a TEXT, '
+        'b INTEGER, UNIQUE (a, b))'
+    )
+    row = c.execute(
+        """SELECT sql
+FROM sqlite_master
+WHERE
+    type = 'table' AND
+    name = ? AND
+    sql LIKE ?""",
+        ("wx", "%id%"),
+    ).fetchone()
+    assert row and "CREATE TABLE" in row[0]
+    ok("dbapi: multiline WHERE + positional params on sqlite_master (W2)")
+
+    c.execute('CREATE UNIQUE INDEX "wx_named" ON "wx" ("b")')
+    il = c.execute('PRAGMA index_list("wx")').fetchall()
+    names = [t[1] for t in il]
+    assert "wx_named" in names
+    auto = [t for t in il if t[1].startswith("sqlite_autoindex_wx_")][0]
+    assert auto[2] == 1 and auto[3] == "u"
+    ii = c.execute(f'PRAGMA index_info("{auto[1]}")').fetchall()
+    assert [t[2] for t in ii] == ["a", "b"]
+    ok("dbapi: index_list/index_info answer for real (W3)")
+
+    sql = c.execute("SELECT sql FROM sqlite_master WHERE name='wx'").fetchone()[0]
+    assert 'UNIQUE ("a", "b")' in sql and "AUTOINCREMENT" in sql
+    isql = c.execute("SELECT sql FROM sqlite_master WHERE name='wx_named'").fetchone()[0]
+    assert isql.startswith('CREATE UNIQUE INDEX "wx_named"')
+    ok("dbapi: table sql keeps UNIQUE/AUTOINCREMENT; named index carries text (W4)")
+
+    inner = (
+        "import mpedb, os\n"
+        "c = mpedb.connect('file:w5pin?mode=memory&cache=shared', uri=True)\n"
+        "c.execute('CREATE TABLE w5 (i INTEGER PRIMARY KEY)')\n"
+        "c.execute('INSERT INTO w5 VALUES (1)'); c.commit()\n"
+        "b = mpedb.connect('file:w5pin?mode=memory&cache=shared', uri=True)\n"
+        "assert b.execute('SELECT i FROM w5').fetchall() == [(1,)]\n"
+    )
+    r = subprocess.run([_sys.executable, "-c", inner], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    leaked = [f for f in os.listdir("/dev/shm") if "mpedb-shared-w5pin" in f] if os.path.isdir("/dev/shm") else []
+    assert leaked == [], leaked
+    ok("dbapi: shared-memory DB is pid-scoped and cleaned at exit (W5)")
+
+
 def main():
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-py-")
     os.makedirs(workdir, exist_ok=True)
@@ -1004,6 +1064,7 @@ def main():
     test_dbapi(cfg_path, base)
     test_dbapi_sqlite3_semantics(workdir)
     test_dbapi_introspection_and_teardown(workdir)
+    test_dbapi_w1_w5(workdir)
 
     db.verify()
     ok("verify()")

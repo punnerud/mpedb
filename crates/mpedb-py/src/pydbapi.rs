@@ -282,7 +282,7 @@ impl PyConnection {
         params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyCursor> {
         let mut cur = PyCursor::fresh(slf);
-        cur.execute(py, sql, params)?;
+        cur.execute_impl(py, sql, params)?;
         Ok(cur)
     }
 
@@ -294,7 +294,7 @@ impl PyConnection {
         seq: &Bound<'_, PyAny>,
     ) -> PyResult<PyCursor> {
         let mut cur = PyCursor::fresh(slf);
-        cur.executemany(py, sql, seq)?;
+        cur.executemany_impl(py, sql, seq)?;
         Ok(cur)
     }
 
@@ -578,6 +578,234 @@ impl PyCursor {
         }
         self.conn.borrow(py).row_factory.as_ref().map(|f| f.clone_ref(py))
     }
+
+
+    /// `?` needs no translation: mpedb's parser takes both `?` and `$n`
+    /// natively (and refuses to mix them in one statement). Which is why there
+    /// is no rewriter here — I wrote one, and it turned out to be a
+    /// reimplementation of something the tokenizer already did.
+    fn execute_impl(
+        &mut self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let sql = sql.to_string();
+        let vals = convert_params_sqlite3(params)?;
+        let mut conn = self.conn.borrow_mut(py);
+        if conn.closed {
+            return Err(closed_err());
+        }
+        // The connection-bootstrap ritual every real sqlite3 consumer runs
+        // before its first query (PY-COMPAT.md tier 1): PRAGMA in both forms,
+        // and transaction control through execute(). Handled here, above the
+        // backend split, so both engines answer identically.
+        let bare = sql.trim().trim_end_matches(';').trim();
+        if bare.len() >= 6 && bare[..6].eq_ignore_ascii_case("pragma") {
+            drop(conn);
+            return self.exec_pragma(py, bare[6..].trim());
+        }
+        // sqlite_master / sqlite_schema reads (native backend): answered from
+        // the schema by the compact evaluator below — Django's introspection
+        // runs these before anything else works (err log FEIL 2).
+        if let Backend::Native(db) = &conn.backend {
+            if let Some(res) = master_read(db, bare, &vals)? {
+                drop(conn);
+                return self.load_result(py, res);
+            }
+        }
+        let head = bare
+            .split_whitespace()
+            .next()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match head.as_str() {
+            // BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION]: opens the
+            // REAL transaction (sqlite's semantics — Django drives its test
+            // isolation with an explicit BEGIN and expects a later ROLLBACK
+            // to undo everything since). Already in one → sqlite's exact
+            // refusal. On the overlay backend the delta IS the transaction,
+            // so BEGIN stays a no-op there (diskcache's _transact runs on
+            // that backend).
+            "begin" => {
+                if let Backend::Native(db) = &conn.backend {
+                    if conn.txn.is_some() {
+                        return Err(crate::OperationalError::new_err(
+                            "cannot start a transaction within a transaction",
+                        ));
+                    }
+                    let db = db.clone();
+                    conn.txn = Some(open_session(py, &db)?);
+                }
+                drop(conn);
+                self.rowcount = -1;
+                self.rows.clear();
+                self.pos = 0;
+                self.description = None;
+                return Ok(());
+            }
+            "commit" | "end" => {
+                PyConnection::commit(&mut conn, py)?;
+                drop(conn);
+                self.rowcount = -1;
+                self.rows.clear();
+                self.pos = 0;
+                self.description = None;
+                return Ok(());
+            }
+            "rollback" => {
+                PyConnection::rollback(&mut conn, py)?;
+                drop(conn);
+                self.rowcount = -1;
+                self.rows.clear();
+                self.pos = 0;
+                self.description = None;
+                return Ok(());
+            }
+            _ => {}
+        }
+        // The overlay backend runs EVERYTHING per statement: reads consult
+        // base+delta merged, writes land in the delta immediately (autocommit),
+        // and `commit()` checkpoints into the base. Read-your-writes therefore
+        // HOLDS on this backend — the delta is already durable.
+        if let Backend::Overlay(ov, base) = &conn.backend {
+            let ov = ov.clone();
+            let base = base.clone();
+            let sql2 = sql.clone();
+            // DDL through the overlay: the overlay reads the BASE's schema and
+            // has no DDL of its own, so the statement is applied TO THE BASE —
+            // checkpoint first (push our deltas; an unpushed delta across a
+            // schema change is exactly what the overlay refuses by name), run
+            // the DDL via sqlite itself, reopen to re-derive the schema. The
+            // forced sync point is a documented divergence from sqlite3's
+            // transactional DDL.
+            let t = sql2.trim_start();
+            let is_ddl = ["create", "drop", "alter"]
+                .iter()
+                .any(|k| t.len() >= k.len() && t[..k.len()].eq_ignore_ascii_case(k));
+            if is_ddl {
+                py.detach(move || -> Result<(), DbError> {
+                    let mut g = ov.lock().expect("overlay poisoned");
+                    if let Some(o) = g.as_mut() {
+                        o.checkpoint()?;
+                    }
+                    *g = None; // release the base (the overlay holds SHARED)
+                    let c = rusqlite::Connection::open(&base)
+                        .map_err(|e| DbError::Unsupported(format!("open base: {e}")))?;
+                    c.execute_batch(&sql2)
+                        .map_err(|e| DbError::Unsupported(format!("ddl: {e}")))?;
+                    drop(c);
+                    // The old overlay sidecar was seeded from the PRE-DDL
+                    // schema; the checkpoint above emptied it, so dropping it
+                    // is lossless and lets the reopen seed from the new
+                    // schema (the overlay refuses a seed-hash mismatch).
+                    let mut side = base.as_os_str().to_owned();
+                    side.push(".overlay.mpedb");
+                    let _ = std::fs::remove_file(std::path::Path::new(&side));
+                    *g = Some(mpedb::SqliteOverlay::open(&base)?);
+                    Ok(())
+                })
+                .map_err(map_err)?;
+                drop(conn);
+                self.rowcount = 0;
+                self.rows.clear();
+                self.pos = 0;
+                self.description = None;
+                return Ok(());
+            }
+            let res = py
+                .detach(move || {
+                    run_coercing(vals, |p| {
+                        ov.lock()
+                            .expect("overlay poisoned")
+                            .as_mut()
+                            .ok_or_else(|| DbError::Internal("overlay gone".into()))?
+                            .query(&sql2, p)
+                    })
+                })
+                .map_err(map_err)?;
+            drop(conn);
+            return self.load_result(py, res);
+        }
+        let Backend::Native(db) = &conn.backend else { unreachable!() };
+        let db = db.clone();
+
+        let is_write = PyCursor::is_write(&sql);
+        // sqlite3's implicit-transaction rule: in a legacy isolation level
+        // (the default `""`), the module opens the transaction before the
+        // first DML; at `isolation_level = None` (autocommit — Django's mode)
+        // nothing opens implicitly and a lone DML commits on its own below.
+        if is_write && conn.txn.is_none() && conn.isolation_level.is_some() {
+            conn.txn = Some(open_session(py, &db)?);
+        }
+
+        if let Some(session) = conn.txn.as_mut() {
+            // Everything inside the open transaction — reads INCLUDED — runs
+            // through the session, which is what makes a SELECT see this
+            // connection's own uncommitted writes (sqlite's semantics; the
+            // first real Django consumer's TestCase isolation depends on it).
+            session.check_owner()?;
+            let wm = &session.w;
+            let sql2 = sql.clone();
+            let res = py
+                .detach(move || {
+                    let mut w = wm.lock().expect("session poisoned");
+                    run_coercing(vals, |p| w.query(&sql2, p))
+                })
+                .map_err(map_err)?;
+            if is_write {
+                if let Some(id) = mpedb::take_last_insert_rowid() {
+                    self.lastrowid = Some(id);
+                }
+            }
+            drop(conn);
+            return self.load_result(py, res);
+        }
+
+        if !is_write {
+            // No open transaction: a read runs against the committed snapshot.
+            let sql2 = sql.clone();
+            let res = py
+                .detach(move || run_coercing(vals, |p| db.query(&sql2, p)))
+                .map_err(map_err)?;
+            drop(conn);
+            return self.load_result(py, res);
+        }
+
+        // Autocommit DML (isolation_level = None, no explicit BEGIN): one
+        // statement, one transaction, committed here — sqlite's autocommit.
+        let sql2 = sql.clone();
+        let res = py
+            .detach(move || -> Result<ExecResult, DbError> {
+                let mut w = db.begin()?;
+                let r = run_coercing(vals, |p| w.query(&sql2, p))?;
+                w.commit()?;
+                Ok(r)
+            })
+            .map_err(map_err)?;
+        if let Some(id) = mpedb::take_last_insert_rowid() {
+            self.lastrowid = Some(id);
+        }
+        drop(conn);
+        self.load_result(py, res)
+    }
+
+    fn executemany_impl(
+        &mut self,
+        py: Python<'_>,
+        sql: &str,
+        seq: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let mut total = 0i64;
+        for params in seq.try_iter()? {
+            self.execute_impl(py, sql, Some(&params?))?;
+            if self.rowcount > 0 {
+                total += self.rowcount;
+            }
+        }
+        self.rowcount = total;
+        Ok(())
+    }
 }
 
 /// Only `None` and the `mpedb.Row` class are accepted as row factories for
@@ -614,6 +842,89 @@ impl PyCursor {
         // Real introspection pragmas (native backend): answered from the
         // schema. `table_info` returning [] silently was a wrong answer for
         // every introspection consumer (err log FEIL 2).
+        if name_part == "index_list" || name_part == "index_info" {
+            let conn = self.conn.borrow(py);
+            if let Backend::Native(db) = &conn.backend {
+                let _ = db.refresh_schema_if_stale();
+                let bundle = db.schema();
+                let arg = rest
+                    .split_once('(')
+                    .map(|(_, r)| r.trim_end_matches(')').trim())
+                    .unwrap_or("")
+                    .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`')
+                    .to_string();
+                self.rows.clear();
+                self.pos = 0;
+                self.rowcount = -1;
+                if name_part == "index_list" {
+                    // (seq, name, unique, origin, partial) — Django's
+                    // get_constraints walks this, then index_info per name
+                    // (the swap route's W3: empty answers made every
+                    // constraint invisible).
+                    let cols = ["seq", "name", "unique", "origin", "partial"];
+                    self.description = Some(describe(
+                        py,
+                        &cols.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                    )?);
+                    self.col_names = cols.iter().map(|c| c.to_string()).collect();
+                    let mut out = Vec::new();
+                    if let Some(t) = bundle
+                        .schema
+                        .tables
+                        .iter()
+                        .find(|t| !t.dead && t.name.eq_ignore_ascii_case(&arg))
+                    {
+                        for (seq, (name, i, synthesized)) in
+                            table_indexes(t).into_iter().enumerate()
+                        {
+                            let idx = &t.indexes[i];
+                            let origin = if synthesized && idx.unique { "u" } else { "c" };
+                            let row = (
+                                seq as i64,
+                                name,
+                                i64::from(idx.unique),
+                                origin,
+                                i64::from(idx.predicate.is_some()),
+                            )
+                                .into_pyobject(py)?
+                                .into_any()
+                                .unbind();
+                            out.push(row);
+                        }
+                    }
+                    self.rows = out;
+                    return Ok(());
+                }
+                // index_info(<index name>): (seqno, cid, name) per key column.
+                let cols = ["seqno", "cid", "name"];
+                self.description = Some(describe(
+                    py,
+                    &cols.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                )?);
+                self.col_names = cols.iter().map(|c| c.to_string()).collect();
+                let mut out = Vec::new();
+                'outer: for t in bundle.schema.tables.iter().filter(|t| !t.dead) {
+                    for (name, i, _) in table_indexes(t) {
+                        if name.eq_ignore_ascii_case(&arg) {
+                            for (seqno, &c) in t.indexes[i].columns.iter().enumerate() {
+                                let row = (
+                                    seqno as i64,
+                                    c as i64,
+                                    t.columns[c as usize].name.as_str(),
+                                )
+                                    .into_pyobject(py)?
+                                    .into_any()
+                                    .unbind();
+                                out.push(row);
+                            }
+                            break 'outer;
+                        }
+                    }
+                }
+                self.rows = out;
+                return Ok(());
+            }
+        }
         if name_part == "table_info" || name_part == "table_list" {
             let conn = self.conn.borrow(py);
             if let Backend::Native(db) = &conn.backend {
@@ -846,235 +1157,30 @@ impl PyCursor {
         self.conn.clone_ref(py)
     }
 
-    /// PEP 249 `Cursor.execute()`.
-    ///
-    /// `?` needs no translation: mpedb's parser takes both `?` and `$n`
-    /// natively (and refuses to mix them in one statement). Which is why there
-    /// is no rewriter here — I wrote one, and it turned out to be a
-    /// reimplementation of something the tokenizer already did.
+    /// PEP 249 `Cursor.execute()` — returns the CURSOR, the stdlib contract
+    /// every chaining consumer leans on (`cursor.execute(...).fetchone()`;
+    /// Django's `_quote_params_for_last_executed_query` does it on a RAW
+    /// cursor, unshimmable from above — the swap route's W1).
     #[pyo3(signature = (sql, params=None))]
-    fn execute(
-        &mut self,
-        py: Python<'_>,
+    fn execute<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
         sql: &str,
         params: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<()> {
-        let sql = sql.to_string();
-        let vals = convert_params_sqlite3(params)?;
-        let mut conn = self.conn.borrow_mut(py);
-        if conn.closed {
-            return Err(closed_err());
-        }
-        // The connection-bootstrap ritual every real sqlite3 consumer runs
-        // before its first query (PY-COMPAT.md tier 1): PRAGMA in both forms,
-        // and transaction control through execute(). Handled here, above the
-        // backend split, so both engines answer identically.
-        let bare = sql.trim().trim_end_matches(';').trim();
-        if bare.len() >= 6 && bare[..6].eq_ignore_ascii_case("pragma") {
-            drop(conn);
-            return self.exec_pragma(py, bare[6..].trim());
-        }
-        // sqlite_master / sqlite_schema reads (native backend): answered from
-        // the schema by the compact evaluator below — Django's introspection
-        // runs these before anything else works (err log FEIL 2).
-        if let Backend::Native(db) = &conn.backend {
-            if let Some(res) = master_read(db, bare, &vals)? {
-                drop(conn);
-                return self.load_result(py, res);
-            }
-        }
-        let head = bare
-            .split_whitespace()
-            .next()
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default();
-        match head.as_str() {
-            // BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION]: opens the
-            // REAL transaction (sqlite's semantics — Django drives its test
-            // isolation with an explicit BEGIN and expects a later ROLLBACK
-            // to undo everything since). Already in one → sqlite's exact
-            // refusal. On the overlay backend the delta IS the transaction,
-            // so BEGIN stays a no-op there (diskcache's _transact runs on
-            // that backend).
-            "begin" => {
-                if let Backend::Native(db) = &conn.backend {
-                    if conn.txn.is_some() {
-                        return Err(crate::OperationalError::new_err(
-                            "cannot start a transaction within a transaction",
-                        ));
-                    }
-                    let db = db.clone();
-                    conn.txn = Some(open_session(py, &db)?);
-                }
-                drop(conn);
-                self.rowcount = -1;
-                self.rows.clear();
-                self.pos = 0;
-                self.description = None;
-                return Ok(());
-            }
-            "commit" | "end" => {
-                PyConnection::commit(&mut conn, py)?;
-                drop(conn);
-                self.rowcount = -1;
-                self.rows.clear();
-                self.pos = 0;
-                self.description = None;
-                return Ok(());
-            }
-            "rollback" => {
-                PyConnection::rollback(&mut conn, py)?;
-                drop(conn);
-                self.rowcount = -1;
-                self.rows.clear();
-                self.pos = 0;
-                self.description = None;
-                return Ok(());
-            }
-            _ => {}
-        }
-        // The overlay backend runs EVERYTHING per statement: reads consult
-        // base+delta merged, writes land in the delta immediately (autocommit),
-        // and `commit()` checkpoints into the base. Read-your-writes therefore
-        // HOLDS on this backend — the delta is already durable.
-        if let Backend::Overlay(ov, base) = &conn.backend {
-            let ov = ov.clone();
-            let base = base.clone();
-            let sql2 = sql.clone();
-            // DDL through the overlay: the overlay reads the BASE's schema and
-            // has no DDL of its own, so the statement is applied TO THE BASE —
-            // checkpoint first (push our deltas; an unpushed delta across a
-            // schema change is exactly what the overlay refuses by name), run
-            // the DDL via sqlite itself, reopen to re-derive the schema. The
-            // forced sync point is a documented divergence from sqlite3's
-            // transactional DDL.
-            let t = sql2.trim_start();
-            let is_ddl = ["create", "drop", "alter"]
-                .iter()
-                .any(|k| t.len() >= k.len() && t[..k.len()].eq_ignore_ascii_case(k));
-            if is_ddl {
-                py.detach(move || -> Result<(), DbError> {
-                    let mut g = ov.lock().expect("overlay poisoned");
-                    if let Some(o) = g.as_mut() {
-                        o.checkpoint()?;
-                    }
-                    *g = None; // release the base (the overlay holds SHARED)
-                    let c = rusqlite::Connection::open(&base)
-                        .map_err(|e| DbError::Unsupported(format!("open base: {e}")))?;
-                    c.execute_batch(&sql2)
-                        .map_err(|e| DbError::Unsupported(format!("ddl: {e}")))?;
-                    drop(c);
-                    // The old overlay sidecar was seeded from the PRE-DDL
-                    // schema; the checkpoint above emptied it, so dropping it
-                    // is lossless and lets the reopen seed from the new
-                    // schema (the overlay refuses a seed-hash mismatch).
-                    let mut side = base.as_os_str().to_owned();
-                    side.push(".overlay.mpedb");
-                    let _ = std::fs::remove_file(std::path::Path::new(&side));
-                    *g = Some(mpedb::SqliteOverlay::open(&base)?);
-                    Ok(())
-                })
-                .map_err(map_err)?;
-                drop(conn);
-                self.rowcount = 0;
-                self.rows.clear();
-                self.pos = 0;
-                self.description = None;
-                return Ok(());
-            }
-            let res = py
-                .detach(move || {
-                    run_coercing(vals, |p| {
-                        ov.lock()
-                            .expect("overlay poisoned")
-                            .as_mut()
-                            .ok_or_else(|| DbError::Internal("overlay gone".into()))?
-                            .query(&sql2, p)
-                    })
-                })
-                .map_err(map_err)?;
-            drop(conn);
-            return self.load_result(py, res);
-        }
-        let Backend::Native(db) = &conn.backend else { unreachable!() };
-        let db = db.clone();
-
-        let is_write = PyCursor::is_write(&sql);
-        // sqlite3's implicit-transaction rule: in a legacy isolation level
-        // (the default `""`), the module opens the transaction before the
-        // first DML; at `isolation_level = None` (autocommit — Django's mode)
-        // nothing opens implicitly and a lone DML commits on its own below.
-        if is_write && conn.txn.is_none() && conn.isolation_level.is_some() {
-            conn.txn = Some(open_session(py, &db)?);
-        }
-
-        if let Some(session) = conn.txn.as_mut() {
-            // Everything inside the open transaction — reads INCLUDED — runs
-            // through the session, which is what makes a SELECT see this
-            // connection's own uncommitted writes (sqlite's semantics; the
-            // first real Django consumer's TestCase isolation depends on it).
-            session.check_owner()?;
-            let wm = &session.w;
-            let sql2 = sql.clone();
-            let res = py
-                .detach(move || {
-                    let mut w = wm.lock().expect("session poisoned");
-                    run_coercing(vals, |p| w.query(&sql2, p))
-                })
-                .map_err(map_err)?;
-            if is_write {
-                if let Some(id) = mpedb::take_last_insert_rowid() {
-                    self.lastrowid = Some(id);
-                }
-            }
-            drop(conn);
-            return self.load_result(py, res);
-        }
-
-        if !is_write {
-            // No open transaction: a read runs against the committed snapshot.
-            let sql2 = sql.clone();
-            let res = py
-                .detach(move || run_coercing(vals, |p| db.query(&sql2, p)))
-                .map_err(map_err)?;
-            drop(conn);
-            return self.load_result(py, res);
-        }
-
-        // Autocommit DML (isolation_level = None, no explicit BEGIN): one
-        // statement, one transaction, committed here — sqlite's autocommit.
-        let sql2 = sql.clone();
-        let res = py
-            .detach(move || -> Result<ExecResult, DbError> {
-                let mut w = db.begin()?;
-                let r = run_coercing(vals, |p| w.query(&sql2, p))?;
-                w.commit()?;
-                Ok(r)
-            })
-            .map_err(map_err)?;
-        if let Some(id) = mpedb::take_last_insert_rowid() {
-            self.lastrowid = Some(id);
-        }
-        drop(conn);
-        self.load_result(py, res)
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.execute_impl(py, sql, params)?;
+        Ok(slf)
     }
 
-    /// PEP 249 `Cursor.executemany()`.
-    fn executemany(
-        &mut self,
-        py: Python<'_>,
+    /// PEP 249 `Cursor.executemany()` — returns the cursor, as the stdlib.
+    fn executemany<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
         sql: &str,
         seq: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let mut total = 0i64;
-        for params in seq.try_iter()? {
-            self.execute(py, sql, Some(&params?))?;
-            if self.rowcount > 0 {
-                total += self.rowcount;
-            }
-        }
-        self.rowcount = total;
-        Ok(())
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.executemany_impl(py, sql, seq)?;
+        Ok(slf)
     }
 
     /// sqlite3's `Cursor.executescript(script)`: commits any pending
@@ -1095,7 +1201,7 @@ impl PyCursor {
         while !mpedb::sqlscript::is_blank(rest) {
             let (stmt, tail) = mpedb::sqlscript::split_first(rest);
             if !mpedb::sqlscript::is_blank(stmt) {
-                self.execute(py, stmt, None)?;
+                self.execute_impl(py, stmt, None)?;
             }
             rest = tail;
         }
@@ -1330,7 +1436,7 @@ fn master_table_ref(sql_lower: &str) -> bool {
 /// double-quote fallback (a `"x"` that names no master column is the literal
 /// x — Django 4.2's `name="tbl"`; one that DOES name a column refuses, the
 /// S48 rule).
-fn m_operand(s: &str, params: &[Value]) -> PyResult<String> {
+fn m_operand(s: &str, params: &[Value], qpos: &mut usize) -> PyResult<String> {
     let t = s.trim();
     if let Some(inner) = t.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
         return Ok(inner.replace("''", "'"));
@@ -1344,10 +1450,15 @@ fn m_operand(s: &str, params: &[Value]) -> PyResult<String> {
         }
         return Ok(inner.to_string());
     }
+    // A bare `?` consumes the NEXT parameter position — sqlite's rule. The
+    // old always-index-0 reading silently answered 0 rows for any WHERE with
+    // two or more bound parameters (the swap route's W2b).
     let idx = if let Some(d) = t.strip_prefix('$') {
         d.parse::<usize>().ok().and_then(|n| n.checked_sub(1))
     } else if t == "?" {
-        Some(0)
+        let i = *qpos;
+        *qpos += 1;
+        Some(i)
     } else {
         None
     };
@@ -1364,19 +1475,25 @@ fn m_operand(s: &str, params: &[Value]) -> PyResult<String> {
     )))
 }
 
+/// Split on top-level `AND` as a WORD — any whitespace on either side, so a
+/// clause broken across lines (Django writes its json-introspection WHERE
+/// one condition per line — the swap route's W2a) splits like a
+/// single-spaced one.
 fn split_and_words(w: &str) -> Vec<String> {
     let lower = w.to_ascii_lowercase();
+    let b = lower.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;
-    let b = lower.as_bytes();
     let mut i = 0usize;
-    while i + 5 <= b.len() {
-        if &lower[i..i + 5] == " and "
-            || (i + 5 < b.len() && &lower[i..i + 4] == "and " && i == 0)
+    while i + 3 <= b.len() {
+        if &lower[i..i + 3] == "and"
+            && i > 0
+            && b[i - 1].is_ascii_whitespace()
+            && b.get(i + 3).is_some_and(|c| c.is_ascii_whitespace())
         {
             out.push(w[start..i].to_string());
-            start = i + 5;
-            i += 5;
+            i += 3;
+            start = i;
         } else {
             i += 1;
         }
@@ -1440,7 +1557,7 @@ fn m_col(name: &str) -> PyResult<usize> {
         })
 }
 
-fn parse_m_pred(clause: &str, params: &[Value]) -> PyResult<(bool, MPred)> {
+fn parse_m_pred(clause: &str, params: &[Value], qpos: &mut usize) -> PyResult<(bool, MPred)> {
     let mut c = clause.trim();
     let mut neg = false;
     while c.len() >= 4 && c[..3].eq_ignore_ascii_case("not") && c.as_bytes()[3].is_ascii_whitespace()
@@ -1452,26 +1569,61 @@ fn parse_m_pred(clause: &str, params: &[Value]) -> PyResult<(bool, MPred)> {
     if let Some(i) = cl.find(" in ").or(if cl.contains(" in(") { cl.find(" in(") } else { None }) {
         let col = m_col(&c[..i])?;
         let inner = c[i + 3..].trim().trim_start_matches('(').trim_end_matches(')');
-        let vals: PyResult<Vec<String>> = inner.split(',').map(|e| m_operand(e, params)).collect();
+        let vals: PyResult<Vec<String>> = inner.split(',').map(|e| m_operand(e, params, qpos)).collect();
         return Ok((neg, MPred::In(col, vals?)));
     }
     if let Some(i) = cl.find(" like ") {
         let col = m_col(&c[..i])?;
-        return Ok((neg, MPred::Like(col, m_operand(&c[i + 6..], params)?)));
+        return Ok((neg, MPred::Like(col, m_operand(&c[i + 6..], params, qpos)?)));
     }
     if let Some(i) = cl.find("!=").or_else(|| cl.find("<>")) {
         let col = m_col(&c[..i])?;
-        return Ok((neg, MPred::Ne(col, m_operand(&c[i + 2..], params)?)));
+        return Ok((neg, MPred::Ne(col, m_operand(&c[i + 2..], params, qpos)?)));
     }
     if let Some(i) = c.find('=') {
         let col = m_col(&c[..i])?;
         let rest = c[i + 1..].trim_start();
         let rest = rest.strip_prefix('=').unwrap_or(rest);
-        return Ok((neg, MPred::Eq(col, m_operand(rest, params)?)));
+        return Ok((neg, MPred::Eq(col, m_operand(rest, params, qpos)?)));
     }
     Err(crate::ProgrammingError::new_err(format!(
         "unsupported sqlite_master predicate `{c}` — refused by name"
     )))
+}
+
+
+/// Every index of `t` with its DISPLAY name: the created name, or sqlite's
+/// autoindex convention (`sqlite_autoindex_<table>_<n>`) for the unnamed
+/// flag/constraint-derived ones — which is what makes them visible to
+/// Django's `index_list` -> `index_info` walk (the swap route's W3).
+fn table_indexes(t: &mpedb::TableDef) -> Vec<(String, usize, bool)> {
+    let mut auto = 0usize;
+    t.indexes
+        .iter()
+        .enumerate()
+        .map(|(i, idx)| match &idx.name {
+            Some(n) => (n.clone(), i, false),
+            None => {
+                auto += 1;
+                (format!("sqlite_autoindex_{}_{}", t.name, auto), i, true)
+            }
+        })
+        .collect()
+}
+
+fn render_create_index(t: &mpedb::TableDef, name: &str, idx: &mpedb::IndexDef) -> String {
+    let cols: Vec<String> = idx
+        .columns
+        .iter()
+        .map(|&c| format!("\"{}\"", t.columns[c as usize].name))
+        .collect();
+    format!(
+        "CREATE {}INDEX \"{}\" ON \"{}\" ({})",
+        if idx.unique { "UNIQUE " } else { "" },
+        name,
+        t.name,
+        cols.join(", ")
+    )
 }
 
 /// Render the canonical CREATE TABLE text for the `sql` column — enough for
@@ -1527,7 +1679,26 @@ fn render_create(t: &mpedb::TableDef) -> String {
             .iter()
             .map(|&i| format!("\"{}\"", t.columns[i as usize].name))
             .collect();
-        parts.push(format!("PRIMARY KEY ({})", pk.join(", ")));
+        // AUTOINCREMENT is part of the text sqlite keeps, and consumers
+        // parse for it (the swap route's W4).
+        if t.autoincrement && pk.len() == 1 {
+            parts.push(format!("PRIMARY KEY ({}) /* AUTOINCREMENT */", pk[0]));
+        } else {
+            parts.push(format!("PRIMARY KEY ({})", pk.join(", ")));
+        }
+    }
+    // Table-level UNIQUE constraints (unnamed composite unique indexes —
+    // named ones are CREATE INDEX statements with their own master rows).
+    for (_, i, synthesized) in table_indexes(t) {
+        let idx = &t.indexes[i];
+        if synthesized && idx.unique && idx.columns.len() > 1 {
+            let cols: Vec<String> = idx
+                .columns
+                .iter()
+                .map(|&c| format!("\"{}\"", t.columns[c as usize].name))
+                .collect();
+            parts.push(format!("UNIQUE ({})", cols.join(", ")));
+        }
     }
     format!("CREATE TABLE \"{}\" ({})", t.name, parts.join(", "))
 }
@@ -1577,27 +1748,29 @@ fn master_read(
         }
     }
     for t in bundle.schema.tables.iter().filter(|t| !t.dead) {
-        for idx in &t.indexes {
-            if let Some(name) = &idx.name {
-                rows.push(MRow {
-                    ty: "index",
-                    name: name.clone(),
-                    tbl: t.name.clone(),
-                    // No verbatim CREATE INDEX text on this surface; NULL is
-                    // sqlite's own answer for constraint-made indexes, and
-                    // Django's `if not sql: continue` handles it.
-                    sql: None,
-                });
-            }
+        if t.name.starts_with("_mpedb_") {
+            continue;
+        }
+        for (name, i, synthesized) in table_indexes(t) {
+            let idx = &t.indexes[i];
+            rows.push(MRow {
+                ty: "index",
+                name: name.clone(),
+                tbl: t.name.clone(),
+                // A user-created index carries its CREATE INDEX text (sqlite
+                // keeps the original; this is the faithful reconstruction);
+                // a constraint-made autoindex is NULL, sqlite's own shape.
+                sql: if synthesized { None } else { Some(render_create_index(t, &name, idx)) },
+            });
         }
     }
 
     if let Some(w) = where_at {
-        let preds: PyResult<Vec<(bool, MPred)>> = split_and_words(sql[w + 5..where_end].trim())
-            .iter()
-            .map(|cl| parse_m_pred(cl, params))
-            .collect();
-        let preds = preds?;
+        let mut qpos = 0usize;
+        let mut preds: Vec<(bool, MPred)> = Vec::new();
+        for cl in split_and_words(sql[w + 5..where_end].trim()) {
+            preds.push(parse_m_pred(&cl, params, &mut qpos)?);
+        }
         rows.retain(|r| preds.iter().all(|(neg, p)| p.hit(r) != *neg));
     }
     if let Some(o) = order_at {
