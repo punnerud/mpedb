@@ -535,6 +535,9 @@ pub type IndexPredicates = Vec<Vec<Option<ExprProgram>>>;
 /// Everything the SQL layer has to compile out of a schema's stored SOURCE
 /// strings, produced in ONE call so the two can never describe different
 /// schemas: per-column CHECKs and per-index partial predicates.
+/// `Clone` so the facade's seed-schema memo can hand the install-time
+/// rebuild the programs the seed compile already produced (#N2 fase 5).
+#[derive(Clone)]
 pub struct SchemaPrograms {
     pub checks: CheckPrograms,
     pub index_predicates: IndexPredicates,

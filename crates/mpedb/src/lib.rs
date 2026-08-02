@@ -1017,7 +1017,9 @@ impl Database {
         }
         // The seed bundle takes CHECKs only; `set_check_compiler` below rebuilds
         // it with the index predicates too, from the LIVE catalog schema.
-        let mut engine = Engine::open(&config, checks.checks)?;
+        let seed_hash = config.schema.hash();
+        let seed_programs = std::sync::Arc::new(checks);
+        let mut engine = Engine::open(&config, seed_programs.checks.clone())?;
         // DESIGN-BLOBEXTENT §8: per-process knob, like durability. The format
         // self-describes, so this only decides what NEW writes do.
         engine.set_extent_threshold(config.options.extent_threshold);
@@ -1027,7 +1029,19 @@ impl Database {
         // CHECK (…)` — in this process or another — is picked up through this,
         // instead of landing in the catalog as a constraint that is stored and
         // never enforced.
-        engine.set_check_compiler(std::sync::Arc::new(compile_schema_checks))?;
+        //
+        // #N2 fase 5: the install-time rebuild recompiled the SAME programs
+        // the seed compile just produced, on every open whose live catalog
+        // still equals the seed — which is every open not racing a peer's
+        // DDL. Key on the schema hash, the identity the attach gate already
+        // trusts; any other schema (catalog grown past the seed, a later
+        // rebuild after DDL) compiles as before.
+        engine.set_check_compiler(std::sync::Arc::new(move |schema: &mpedb_types::Schema| {
+            if schema.hash() == seed_hash {
+                return Ok((*seed_programs).clone());
+            }
+            compile_schema_checks(schema)
+        }))?;
         let mut db = Database {
             engine,
             cache: RwLock::new(HashMap::new()),

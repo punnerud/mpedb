@@ -360,6 +360,62 @@ fn compile_pattern(pattern: &str, esc: Option<char>) -> Option<Vec<Pat>> {
     Some(out)
 }
 
+/// A compiled LIKE pattern, SHAPE-ANALYZED once per `(pattern, esc)` (#N2
+/// fase 5): the four wildcard-free-core shapes collapse to allocation-free
+/// byte comparisons, everything else runs the generic two-pointer walk —
+/// itself now over byte offsets, so no per-row `Vec<char>` either. Byte
+/// search is EXACT on UTF-8 (self-synchronizing: a valid needle's bytes can
+/// only match at a char boundary), and the ASCII-only case fold is
+/// length-preserving, so the CI variants stay window-aligned — both facts
+/// are what make the fast shapes semantics-identical to the walk, which the
+/// xorshift differential test below holds them to.
+enum LikeCompiled {
+    /// No wildcard at all — `lit`.
+    Exact(String),
+    /// `lit%`
+    Prefix(String),
+    /// `%lit`
+    Suffix(String),
+    /// `%lit%` (and the bare `%`, whose needle is empty).
+    Contains(String),
+    Generic(Vec<Pat>),
+}
+
+/// Collapse a compiled pattern to its fast shape where one applies. Operates
+/// AFTER escape resolution, so `\%a\%`-style patterns collapse too.
+fn analyze_pattern(pats: Vec<Pat>) -> LikeCompiled {
+    fn lit_run(ps: &[Pat]) -> Option<String> {
+        ps.iter()
+            .map(|p| match p {
+                Pat::Lit(c) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    }
+    let n = pats.len();
+    let lead = matches!(pats.first(), Some(Pat::Any));
+    let trail = matches!(pats.last(), Some(Pat::Any));
+    let fast = match (lead, trail) {
+        (false, false) => lit_run(&pats).map(LikeCompiled::Exact),
+        (false, true) => lit_run(&pats[..n - 1]).map(LikeCompiled::Prefix),
+        (true, false) => lit_run(&pats[1..]).map(LikeCompiled::Suffix),
+        // `%` alone is (true, true) with n == 1: an empty needle, which
+        // `Contains` answers TRUE for every subject — same as the walk.
+        (true, true) if n == 1 => Some(LikeCompiled::Contains(String::new())),
+        (true, true) => lit_run(&pats[1..n - 1]).map(LikeCompiled::Contains),
+    };
+    fast.unwrap_or(LikeCompiled::Generic(pats))
+}
+
+/// Allocation-free ASCII-case-folded substring probe (the CI `%lit%` shape).
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || (hay.len() >= needle.len()
+            && hay
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle)))
+}
+
 // The LAST `(pattern, escape)` this thread compiled and the compiled form —
 // `None` for a pattern with a DANGLING escape, which matches nothing. That
 // failure is CACHED and stays a plain no-match, deliberately unlike REGEXP's
@@ -376,7 +432,7 @@ fn compile_pattern(pattern: &str, esc: Option<char>) -> Option<Vec<Pat>> {
 // The key does NOT include case-sensitivity: the compiled form is
 // dialect-independent (`ci` only changes the literal comparison at match
 // time).
-type LikeMemoEntry = (String, Option<char>, Option<Vec<Pat>>);
+type LikeMemoEntry = (String, Option<char>, Option<LikeCompiled>);
 std::thread_local! {
     static LIKE_MEMO: std::cell::RefCell<Option<LikeMemoEntry>> =
         const { std::cell::RefCell::new(None) };
@@ -389,23 +445,61 @@ fn like_impl(pattern: &str, s: &str, ci: bool, esc: Option<char>) -> bool {
     LIKE_MEMO.with(|memo| {
         let mut memo = memo.borrow_mut();
         if !matches!(&*memo, Some((p, e, _)) if p == pattern && *e == esc) {
-            *memo = Some((pattern.to_string(), esc, compile_pattern(pattern, esc)));
+            *memo = Some((
+                pattern.to_string(),
+                esc,
+                compile_pattern(pattern, esc).map(analyze_pattern),
+            ));
         }
         match &memo.as_ref().expect("just filled").2 {
             // A dangling ESCAPE never matches anything — not even the empty
             // subject (worth caching too: it is reached on every row).
             None => false,
-            Some(p) => like_match_compiled(p, s, ci),
+            Some(LikeCompiled::Exact(l)) => {
+                if ci {
+                    s.as_bytes().eq_ignore_ascii_case(l.as_bytes())
+                } else {
+                    s == l
+                }
+            }
+            Some(LikeCompiled::Prefix(l)) => {
+                let (sb, lb) = (s.as_bytes(), l.as_bytes());
+                sb.len() >= lb.len()
+                    && if ci {
+                        sb[..lb.len()].eq_ignore_ascii_case(lb)
+                    } else {
+                        &sb[..lb.len()] == lb
+                    }
+            }
+            Some(LikeCompiled::Suffix(l)) => {
+                let (sb, lb) = (s.as_bytes(), l.as_bytes());
+                sb.len() >= lb.len()
+                    && if ci {
+                        sb[sb.len() - lb.len()..].eq_ignore_ascii_case(lb)
+                    } else {
+                        &sb[sb.len() - lb.len()..] == lb
+                    }
+            }
+            Some(LikeCompiled::Contains(l)) => {
+                if ci {
+                    contains_ci(s.as_bytes(), l.as_bytes())
+                } else {
+                    s.contains(l.as_str())
+                }
+            }
+            Some(LikeCompiled::Generic(p)) => like_match_compiled(p, s, ci),
         }
     })
 }
 
-/// The two-pointer match over an already-compiled pattern.
+/// The two-pointer match over an already-compiled pattern — byte offsets
+/// (always on char boundaries), so the subject is never collected into a
+/// per-row `Vec<char>`; `_` consumes one CHAR and the `%` backtrack advances
+/// one CHAR, exactly as before.
 fn like_match_compiled(p: &[Pat], s: &str, ci: bool) -> bool {
-    let t: Vec<char> = s.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
-    while ti < t.len() {
+    while ti < s.len() {
         // The wildcard branch MUST precede the literal branch: a literal '%'
         // in the SUBJECT would otherwise consume the pattern's '%' as a
         // one-character match ('a%c' LIKE 'a%' must be TRUE).
@@ -413,23 +507,27 @@ fn like_match_compiled(p: &[Pat], s: &str, ci: bool) -> bool {
             star_pi = pi;
             star_ti = ti;
             pi += 1;
-        } else if pi < p.len()
+            continue;
+        }
+        let ch = s[ti..].chars().next().expect("ti is a char boundary");
+        let matched = pi < p.len()
             && match p[pi] {
                 Pat::Any => false,
                 Pat::One => true,
                 Pat::Lit(c) => {
                     if ci {
-                        c.eq_ignore_ascii_case(&t[ti])
+                        c.eq_ignore_ascii_case(&ch)
                     } else {
-                        c == t[ti]
+                        c == ch
                     }
                 }
-            }
-        {
+            };
+        if matched {
             pi += 1;
-            ti += 1;
+            ti += ch.len_utf8();
         } else if star_pi != usize::MAX {
-            star_ti += 1;
+            let skip = s[star_ti..].chars().next().expect("boundary");
+            star_ti += skip.len_utf8();
             pi = star_pi + 1;
             ti = star_ti;
         } else {
@@ -440,6 +538,94 @@ fn like_match_compiled(p: &[Pat], s: &str, ci: bool) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+#[cfg(test)]
+mod like_shape_tests {
+    use super::*;
+
+    /// The PRE-fase-5 matcher, kept VERBATIM as the oracle — `Vec<char>`
+    /// walk and all. Both the byte-offset walk and every fast shape are
+    /// judged against it, so a transcription slip in the port cannot hide
+    /// behind agreeing with itself.
+    fn reference_match(p: &[Pat], s: &str, ci: bool) -> bool {
+        let t: Vec<char> = s.chars().collect();
+        let (mut pi, mut ti) = (0usize, 0usize);
+        let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
+        while ti < t.len() {
+            if pi < p.len() && p[pi] == Pat::Any {
+                star_pi = pi;
+                star_ti = ti;
+                pi += 1;
+            } else if pi < p.len()
+                && match p[pi] {
+                    Pat::Any => false,
+                    Pat::One => true,
+                    Pat::Lit(c) => {
+                        if ci {
+                            c.eq_ignore_ascii_case(&t[ti])
+                        } else {
+                            c == t[ti]
+                        }
+                    }
+                }
+            {
+                pi += 1;
+                ti += 1;
+            } else if star_pi != usize::MAX {
+                star_ti += 1;
+                pi = star_pi + 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+        }
+        while pi < p.len() && p[pi] == Pat::Any {
+            pi += 1;
+        }
+        pi == p.len()
+    }
+
+    /// Every road — the fast shapes AND the new byte-offset walk — against
+    /// the pre-fase-5 matcher (deterministic xorshift, no rand dep — the
+    /// testing convention). Alphabets include multibyte chars so the
+    /// byte-window soundness argument is exercised, and `%`/`_` so all five
+    /// shapes come up.
+    #[test]
+    fn fast_shapes_agree_with_the_generic_walk() {
+        fn oracle(pattern: &str, s: &str, ci: bool) -> bool {
+            match compile_pattern(pattern, None) {
+                None => false,
+                Some(p) => reference_match(&p, s, ci),
+            }
+        }
+        let alpha_p = ['a', 'b', 'A', '7', '%', '_', 'æ'];
+        let alpha_s = ['a', 'b', 'A', 'B', '7', 'æ', 'Ø'];
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..20_000 {
+            let pl = (next() % 9) as usize;
+            let pattern: String = (0..pl)
+                .map(|_| alpha_p[(next() % alpha_p.len() as u64) as usize])
+                .collect();
+            let sl = (next() % 13) as usize;
+            let subject: String = (0..sl)
+                .map(|_| alpha_s[(next() % alpha_s.len() as u64) as usize])
+                .collect();
+            for ci in [true, false] {
+                assert_eq!(
+                    like_impl(&pattern, &subject, ci, None),
+                    oracle(&pattern, &subject, ci),
+                    "pattern {pattern:?} subject {subject:?} ci {ci}"
+                );
+            }
+        }
+    }
 }
 
 /// Result of matching one non-`*` GLOB pattern token against a single string
