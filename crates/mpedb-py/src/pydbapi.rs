@@ -766,7 +766,7 @@ impl PyCursor {
         let Backend::Native(db) = &conn.backend else { unreachable!() };
         let db = db.clone();
 
-        let is_write = PyCursor::is_write(&sql);
+        let is_write = PyCursor::is_write(sql);
         // sqlite3's implicit-transaction rule: in a legacy isolation level
         // (the default `""`), the module opens the transaction before the
         // first DML; at `isolation_level = None` (autocommit — Django's mode)
