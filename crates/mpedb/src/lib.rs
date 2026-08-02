@@ -3165,6 +3165,17 @@ pub struct WriteSession<'db> {
     /// then rolling back would leave the memo answering for a column that never
     /// existed. Serving one is the mirror image — the plan would be built for a
     /// schema this statement is not running against.
+    ///
+    /// Mechanically the READ side of the latch is a fast-path duplicate: an
+    /// in-session DDL reloads the txn bundle with `gen = committed schema_gen
+    /// + 1` (`reload_bundle_from_catalog`), so every memo entry — stamped with
+    /// a committed gen — already fails `memoized`'s gen compare. The WRITE
+    /// side (the `remember` gate) is the load-bearing half and must stay:
+    /// after the first DDL every subsequent reload stamps the SAME
+    /// `committed+1`, so the gen stops discriminating between two different
+    /// in-session schemas — and an entry stamped `committed+1` that survives
+    /// this txn's ROLLBACK becomes a wrong-answer hit the moment a later,
+    /// unrelated DDL commit reaches that generation with a different catalog.
     ddl_applied: bool,
 }
 
@@ -3356,6 +3367,27 @@ impl WriteSession<'_> {
         if self.poisoned {
             return Err(poisoned_err());
         }
+        // #168: the Django path. The C-API shim routes every statement to this
+        // method whenever a transaction is open (capi/src/lib.rs:599), so
+        // without this an ORM that wraps its work in BEGIN/COMMIT — which is to
+        // say, an ORM — pays a full compile per statement and #166 buys it
+        // nothing. Checked FIRST, the same ordering rule as `query_ctx` and for
+        // the same reason: a hit also skips the ATTACH probe, the db-ref
+        // resolver (two full tokenizations for dotted SQL) and the `parse_ddl`
+        // probe below, all of which re-inspect the text on every call. The
+        // hop is sound because a hit can only be a text that reached
+        // compilation as a plain Passthrough statement: ATTACH/DETACH and DDL
+        // return before `remember` and are never memoized (their refusals and
+        // routing are reached by the same miss as before), a later ATTACH
+        // cannot pull a bare name away from main (shadowing — `query_ctx`'s
+        // argument, verbatim), and every temp-namespace mutation and DETACH
+        // clears the memo via `drop_local_plans` (the multifile.rs S42
+        // invariant: "the memo runs before every routing hook" — this call
+        // site was the one non-conforming router). `memoized` itself still
+        // enforces the `ddl_applied` latch.
+        if let Some(res) = self.memoized(origin, sql, params)? {
+            return Ok(res);
+        }
         // #51: the attach list is connection state, not transaction state —
         // mutating it mid-transaction (or reading a second file from inside
         // this write txn's snapshot) is refused by name in v1.
@@ -3440,16 +3472,6 @@ impl WriteSession<'_> {
         if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
             return self.apply_ddl(ddl);
         }
-        // #168: the Django path. The C-API shim routes every statement to this
-        // method whenever a transaction is open (capi/src/lib.rs:599), so
-        // without this an ORM that wraps its work in BEGIN/COMMIT — which is to
-        // say, an ORM — pays a full compile per statement and #166 buys it
-        // nothing.
-        if memoizable {
-            if let Some(res) = self.memoized(origin, sql, params)? {
-                return Ok(res);
-            }
-        }
         // Compile against THIS session's schema view — which includes any DDL
         // this session already applied (its txn's captured bundle), not just the
         // committed schema. Policies/views are read from the committed catalog
@@ -3504,6 +3526,9 @@ impl WriteSession<'_> {
         params: &[Value],
     ) -> Result<Option<ExecResult>> {
         if self.ddl_applied {
+            // Cheap early-out only — the gen compare below would miss anyway.
+            // The load-bearing half of this latch is the `remember` gate; the
+            // field's doc carries the argument.
             return Ok(None);
         }
         let schema = self.txn.schema_bundle();
