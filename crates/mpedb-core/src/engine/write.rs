@@ -286,6 +286,13 @@ pub struct WriteTxn<'e> {
     /// Pre-mutation images for [`Self::in_place`] pages — restored on abort so
     /// a failed autocommit cannot leave half-written committed pages.
     pub(super) inplace_undo: HashMap<u64, Box<[u8; PAGE_SIZE]>>,
+    /// How many COMMITTED pages this txn has ADOPTED in place, ever (the
+    /// private `:memory:` mode's third page state). Monotone like [`allocs`]:
+    /// only its DIFFERENCE against a savepoint's capture is ever asked, in
+    /// [`Self::undo_is_exact`] — adoption mutates a page under its ORIGINAL
+    /// id, which the root-pointer restore cannot undo, so a savepoint with
+    /// adoptions after it is never exactly undoable by the cheap pair.
+    pub(super) adopts: u64,
 }
 
 impl<'e> WriteTxn<'e> {
@@ -2675,6 +2682,7 @@ impl<'e> WriteTxn<'e> {
     pub fn savepoint(&self) -> TxnSavepoint {
         TxnSavepoint {
             allocs: self.allocs,
+            adopts: self.adopts,
             pristine: self.is_pristine(),
             catalog_root: self.catalog_root,
             freelist_root: self.freelist_root,
@@ -2779,7 +2787,12 @@ impl<'e> WriteTxn<'e> {
     /// [`savepoint_full`](Self::savepoint_full), or the ring's own predicate
     /// which pairs this with the executor's `partial` flag (#119).
     pub fn undo_is_exact(&self, sp: &TxnSavepoint) -> bool {
-        self.allocs == sp.allocs || (sp.pristine && self.extents_untouched())
+        // An in-place ADOPTION after the savepoint mutates a committed page
+        // under its original id — the root restore cannot undo it, so it
+        // voids BOTH exactness arguments below (the :memory: savepoint bug's
+        // tripwire hole: the repro passed through each arm).
+        self.adopts == sp.adopts
+            && (self.allocs == sp.allocs || (sp.pristine && self.extents_untouched()))
     }
 
     pub fn extents_untouched(&self) -> bool {
@@ -2827,6 +2840,11 @@ impl<'e> WriteTxn<'e> {
     pub fn restart(&mut self) {
         debug_assert!(!self.finished);
         debug_assert!(!self.in_freelist_op);
+        // In-place adoptions mutated committed pages under unchanged ids —
+        // resetting the pointers alone would carry the discarded round's
+        // mutations into the replay (and a replay re-adoption would then
+        // overwrite the committed pre-images). Restore and drain them first.
+        self.restore_inplace_undo();
         self.catalog_root = self.meta.catalog_root;
         self.freelist_root = self.meta.freelist_root;
         self.extent_map_root = self.meta.extent_map_root;
@@ -2897,9 +2915,23 @@ impl<'e> WriteTxn<'e> {
         for &id in &self.dirty {
             page_images.push((id, self.eng.shm.page(id)?.to_vec()));
         }
+        if std::env::var_os("SP_TRACE").is_some() {
+            eprintln!(
+                "[sp] savepoint_full: pristine={} dirty={:?} page_images.len={} catalog_root={}",
+                self.is_pristine(),
+                {
+                    let mut d: Vec<_> = self.dirty.iter().copied().collect();
+                    d.sort_unstable();
+                    d
+                },
+                page_images.len(),
+                self.catalog_root,
+            );
+        }
         Ok(TxnSavepointFull {
             base,
             page_images,
+            inplace_keys: self.inplace_undo.keys().copied().collect(),
             schema_gen_bump: self.schema_gen_bump,
             written_tables: self.written_tables,
             commit_point: self.commit_point,
@@ -2931,6 +2963,22 @@ impl<'e> WriteTxn<'e> {
     /// for an ordinary text column, not just for "genuinely large blobs".
     pub fn rollback_to_full(&mut self, sp: TxnSavepointFull) -> Result<()> {
         self.rollback_to_inner(sp.base);
+        // The in-place third page state (see `TxnSavepointFull::inplace_keys`):
+        // restore committed pre-images of pages adopted AFTER the savepoint,
+        // and DROP their undo entries — a later re-adoption must snapshot the
+        // committed bytes again, or a full abort would restore the leaked
+        // state (the review's second-order finding).
+        let adopted_after: Vec<u64> = self
+            .inplace_undo
+            .keys()
+            .copied()
+            .filter(|id| !sp.inplace_keys.contains(id))
+            .collect();
+        for id in adopted_after {
+            if let Some(bytes) = self.inplace_undo.remove(&id) {
+                self.eng.shm.page_mut_unchecked(id)?.copy_from_slice(&bytes[..]);
+            }
+        }
         // Restore the extent allocator BEFORE the page images: the map's own
         // pages live in the page store, so the image restore must be the last
         // word on their contents.
@@ -2987,6 +3035,7 @@ fn index_value_equal(a: &Value, b: &Value, spec: keycode::KeySpec) -> bool {
 #[derive(Clone)]
 pub struct TxnSavepoint {
     pub(super) allocs: u64,
+    pub(super) adopts: u64,
     /// Was the transaction pristine when this savepoint was taken? Captured
     /// here rather than asked of the caller: it is the load-bearing half of
     /// [`WriteTxn::undo_is_exact`], and a caller that computes it a line too
@@ -3023,6 +3072,15 @@ pub struct TxnSavepointFull {
     base: TxnSavepoint,
     /// `(page id, 4 KiB contents)` for every page dirty at savepoint time.
     page_images: Vec<(u64, Vec<u8>)>,
+    /// The pages ADOPTED IN PLACE (private `:memory:`) as of capture — the
+    /// keys of `inplace_undo`. Rollback restores the committed pre-image of
+    /// every page adopted AFTER the savepoint from `inplace_undo` and drops
+    /// the entry; pages adopted BEFORE are already dirty and travel in
+    /// `page_images`. Without this, an adoption after a PRISTINE savepoint
+    /// was invisible to both undo channels: the page kept its original id
+    /// (root restore a no-op) and no image existed — `ROLLBACK TO SAVEPOINT`
+    /// silently kept the writes (found by the first real Django consumer).
+    inplace_keys: std::collections::HashSet<u64>,
     schema_gen_bump: bool,
     written_tables: u64,
     commit_point: Option<(u32, u64)>,

@@ -1869,6 +1869,7 @@ impl Engine {
             work: WorkMeter::new(self.work_budget),
             in_place,
             inplace_undo: HashMap::new(),
+            adopts: 0,
         })
     }
 

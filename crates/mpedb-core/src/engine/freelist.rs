@@ -63,6 +63,9 @@ impl PageStore for WriteTxn<'_> {
             buf.copy_from_slice(page);
             self.inplace_undo.insert(id, buf);
             self.dirty.insert(id);
+            // The adoption counter undo_is_exact compares against a
+            // savepoint's capture — counted once per page, like the snapshot.
+            self.adopts = self.adopts.wrapping_add(1);
         }
         Ok(true)
     }

@@ -620,7 +620,7 @@ impl<'e> WriteTxn<'e> {
 
 impl WriteTxn<'_> {
     /// Put exclusive in-place pages back to their pre-txn bytes (abort path).
-    fn restore_inplace_undo(&mut self) {
+    pub(super) fn restore_inplace_undo(&mut self) {
         for (id, bytes) in self.inplace_undo.drain() {
             if let Ok(p) = self.eng.shm.page_mut_unchecked(id) {
                 p.copy_from_slice(&bytes[..]);

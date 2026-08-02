@@ -1049,17 +1049,10 @@ def test_dbapi_savepoints(workdir):
     assert [r[0] for r in c.execute("SELECT v FROM t WHERE v >= 20").fetchall()] == [20]
     ok("dbapi: the savepoint survives ROLLBACK TO; paired RELEASE works (N1b)")
 
-    # N1c is a PRISTINE-transaction savepoint (SAVEPOINT is the first
-    # statement) — the shape the tracked :memory:-engine issue hits, so this
-    # pin runs file-backed until that lands; the semantics under test are
-    # the py layer's (autocommit SAVEPOINT must open a transaction).
-    for f_ in ("sp_auto.mpedb", "sp_pin.mpedb"):
-        for suf in ("", "-wal"):
-            try:
-                os.remove(os.path.join(workdir, f_ + suf))
-            except OSError:
-                pass
-    fdb = mpedb.connect(str(os.path.join(workdir, "sp_auto.mpedb")), isolation_level=None)
+    # N1c: SAVEPOINT in autocommit is a PRISTINE-transaction savepoint —
+    # the exact shape of the (now fixed) :memory: in-place-adoption engine
+    # bug, so this pin deliberately runs on :memory: and guards both layers.
+    fdb = mpedb.connect(":memory:", isolation_level=None)
     fdb.execute("CREATE TABLE t (v INTEGER PRIMARY KEY)")
     fdb.execute("INSERT INTO t VALUES (1)")
     assert not fdb.in_transaction
@@ -1086,10 +1079,10 @@ def test_dbapi_savepoints(workdir):
     c.execute("ROLLBACK")
     ok("dbapi: Django's fixture + per-test savepoint cycle holds (N1)")
 
-    # The pristine-savepoint shape, FILE-backed (the plain :memory: twin is
-    # the tracked engine issue): prior committed txn, then BEGIN + SAVEPOINT
-    # as the first statement.
-    f = mpedb.connect(str(os.path.join(workdir, "sp_pin.mpedb")), isolation_level=None)
+    # The pristine-savepoint shape on :memory: — the in-place-adoption
+    # engine bug's exact trigger (prior committed txn, then BEGIN +
+    # SAVEPOINT as the first statement), green since the S54 fix.
+    f = mpedb.connect(":memory:", isolation_level=None)
     f.execute("CREATE TABLE t (v INTEGER PRIMARY KEY)")
     f.execute("BEGIN"); f.execute("INSERT INTO t VALUES (1)"); f.execute("COMMIT")
     f.execute("BEGIN"); f.execute("SAVEPOINT rep")
