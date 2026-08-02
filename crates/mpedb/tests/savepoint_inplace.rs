@@ -95,3 +95,37 @@ fn a_non_pristine_savepoint_still_holds() {
         _ => panic!(),
     }
 }
+
+/// The consumer's N4 shape (found by microbenchmark on 0.2.6, pre-fix):
+/// committed base + autocommit churn, then savepoint CYCLING in one
+/// transaction — the pre-fix leak compounded per cycle until btree cell
+/// offsets tore, and the connection gave silent wrong answers after. The
+/// page-accounting verifier is the structural judge here, on top of the
+/// count.
+#[test]
+fn savepoint_cycling_over_history_stays_sound() {
+    let db = memdb();
+    let mut s = db.begin().unwrap();
+    for i in 0..500 {
+        s.query("INSERT INTO t VALUES ($1)", &[Value::Int(i)]).unwrap();
+    }
+    s.commit().unwrap();
+    for i in 500..700 {
+        let mut s = db.begin().unwrap();
+        s.query("INSERT INTO t VALUES ($1)", &[Value::Int(i)]).unwrap();
+        s.commit().unwrap();
+    }
+    let mut s = db.begin().unwrap();
+    for k in 0..1000 {
+        s.query("SAVEPOINT sp", &[]).unwrap();
+        s.query("INSERT INTO t VALUES ($1)", &[Value::Int(100_000 + k)]).unwrap();
+        s.query("ROLLBACK TO SAVEPOINT sp", &[]).unwrap();
+        s.query("RELEASE SAVEPOINT sp", &[]).unwrap();
+    }
+    s.commit().unwrap();
+    match db.query("SELECT count(*) FROM t", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(700)),
+        _ => panic!(),
+    }
+    db.verify().unwrap();
+}
