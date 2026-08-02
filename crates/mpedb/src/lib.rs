@@ -2249,6 +2249,12 @@ impl Database {
             .collect();
         ids.sort_unstable();
         ids.dedup();
+        // Table-free statements (transaction control compiled on the
+        // autocommit road, bare VALUES, …) have no facts to probe — skip the
+        // read snapshot; an empty vector is what the loop would produce.
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let r = self.engine.begin_read()?;
         let out = ids
             .into_iter()
@@ -3265,6 +3271,17 @@ fn poisoned_err() -> Error {
     )
 }
 
+/// `BEGIN`/`COMMIT`/`ROLLBACK` inside a [`WriteSession`] — one message for
+/// both roads that can reach the refusal (`run_from`'s compiled-plan arm and
+/// the `parse_txn_control` fast dispatch).
+fn session_txn_verb_err() -> Error {
+    Error::Unsupported(
+        "the session already is a transaction; \
+         use WriteSession::commit()/rollback()"
+            .into(),
+    )
+}
+
 impl WriteSession<'_> {
     /// Schema as seen by this open write txn (includes uncommitted DDL).
     pub fn schema(&self) -> std::sync::Arc<mpedb_core::engine::SchemaBundle> {
@@ -3377,6 +3394,28 @@ impl WriteSession<'_> {
     ) -> Result<ExecResult> {
         if self.poisoned {
             return Err(poisoned_err());
+        }
+        // #N2: transaction/savepoint control never takes the compile road in a
+        // session. Django mints a UNIQUE savepoint name per use, so each op
+        // paid a full compile — plus a memo insert whose CLOCK eviction aimed
+        // at the hot texts, and an unbounded hash-cache entry. The recognizer
+        // is the real grammar (tokenizer + the same statement arms) behind a
+        // first-word byte gate, and it is fail-open: anything but a clean
+        // exact parse returns None and takes the road below, so every refusal
+        // keeps its canonical message. The arms are the same methods
+        // `run_from` dispatches to — one body, two roads.
+        if let Some(ctl) = mpedb_sql::parse_txn_control(sql) {
+            use mpedb_sql::TxnControl as Tc;
+            return match ctl {
+                Tc::Savepoint(name) => self.open_savepoint(&name),
+                Tc::Release(name) => {
+                    self.release_savepoint(&name).map(|()| ExecResult::Affected(0))
+                }
+                Tc::RollbackTo(name) => self
+                    .rollback_to_savepoint(&name)
+                    .map(|()| ExecResult::Affected(0)),
+                Tc::Begin | Tc::Commit | Tc::Rollback => Err(session_txn_verb_err()),
+            };
         }
         // #168: the Django path. The C-API shim routes every statement to this
         // method whenever a transaction is open (capi/src/lib.rs:599), so
@@ -3963,14 +4002,7 @@ impl WriteSession<'_> {
         // from `query`/`execute`, which already refuse a poisoned session, so a
         // savepoint op never runs on a torn transaction.
         match &plan.stmt {
-            PlanStmt::Savepoint(name) => {
-                let snap = self.txn.savepoint_full()?;
-                self.savepoints.push(NamedSavepoint {
-                    name: name.clone(),
-                    snap,
-                });
-                return Ok(ExecResult::Affected(0));
-            }
+            PlanStmt::Savepoint(name) => return self.open_savepoint(name),
             PlanStmt::Release(name) => {
                 return self.release_savepoint(name).map(|()| ExecResult::Affected(0));
             }
@@ -3980,11 +4012,7 @@ impl WriteSession<'_> {
                     .map(|()| ExecResult::Affected(0));
             }
             PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => {
-                return Err(Error::Unsupported(
-                    "the session already is a transaction; \
-                     use WriteSession::commit()/rollback()"
-                        .into(),
-                ));
+                return Err(session_txn_verb_err());
             }
             _ => {}
         }
@@ -4046,6 +4074,19 @@ impl WriteSession<'_> {
             self.poisoned = true;
         }
         res
+    }
+
+    /// `SAVEPOINT <name>`: capture the engine snapshot and push the marker.
+    /// One body for both roads — `run_from`'s compiled-plan arm (EXECUTE by
+    /// hash) and the `parse_txn_control` fast dispatch in `query_with_origin`
+    /// — so they cannot drift.
+    fn open_savepoint(&mut self, name: &str) -> Result<ExecResult> {
+        let snap = self.txn.savepoint_full()?;
+        self.savepoints.push(NamedSavepoint {
+            name: name.to_string(),
+            snap,
+        });
+        Ok(ExecResult::Affected(0))
     }
 
     /// Innermost (topmost) savepoint matching `name`, case-insensitively —

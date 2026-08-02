@@ -81,6 +81,20 @@ pub fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
     parser::parse_ddl(sql)
 }
 
+pub use parser::TxnControl;
+
+/// Recognize a transaction/savepoint-control statement (`BEGIN`, `COMMIT`,
+/// `ROLLBACK [TO SAVEPOINT n]`, `SAVEPOINT n`, `RELEASE n`) with the real
+/// grammar, or `None` for anything else — including any parse trouble, so the
+/// caller falls through to the compile road and refusals keep their canonical
+/// messages. The facade's write session dispatches these directly (#N2): a
+/// savepoint op needs no plan, and compiling one per Django's unique-per-use
+/// savepoint names churned the text memo's CLOCK ring and grew the hash cache
+/// without bound.
+pub fn parse_txn_control(sql: &str) -> Option<TxnControl> {
+    parser::parse_txn_control(sql)
+}
+
 // Re-export the shared types a plan consumer needs.
 pub use mpedb_types::{
     BareGroupBy, Collation, ColumnDef, ColumnType, DefaultExpr, Error, ExprProgram, Footprint,

@@ -974,3 +974,54 @@ impl<'a> Parser<'a> {
         }
     }
 }
+
+/// A transaction/savepoint-control statement recognized by
+/// [`parse_txn_control`]. Mirrors the corresponding `PlanStmt` arms
+/// one-to-one; the facade's session dispatches these without the compile
+/// pipeline (#N2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxnControl {
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(String),
+    Release(String),
+    RollbackTo(String),
+}
+
+/// Recognize a transaction/savepoint-control statement with the REAL grammar
+/// (tokenizer + the same `statement()` arms the compile road uses), or `None`
+/// for anything else — including any tokenize/parse trouble or trailing
+/// input, so the caller falls through to the full compile road and every
+/// refusal keeps its canonical message (fail-open by construction, never a
+/// second grammar that could drift).
+///
+/// The first-word byte gate keeps ordinary DML from paying a tokenization
+/// here; a comment-prefixed control statement conservatively misses the gate
+/// and takes the compile road — correct, merely not fast.
+pub(crate) fn parse_txn_control(sql: &str) -> Option<TxnControl> {
+    let t = sql.trim_start();
+    let end = t
+        .bytes()
+        .position(|b| !b.is_ascii_alphabetic())
+        .unwrap_or(t.len());
+    let word = &t[..end];
+    const VERBS: [&str; 5] = ["begin", "commit", "rollback", "savepoint", "release"];
+    if !VERBS.iter().any(|w| word.eq_ignore_ascii_case(w)) {
+        return None;
+    }
+    let toks = tokenize(sql).ok()?;
+    let mut p = Parser::new(sql, toks);
+    let stmt = p.statement().ok()?;
+    p.eat(&Tok::Semicolon);
+    p.expect_eof().ok()?;
+    match stmt {
+        Stmt::Begin => Some(TxnControl::Begin),
+        Stmt::Commit => Some(TxnControl::Commit),
+        Stmt::Rollback => Some(TxnControl::Rollback),
+        Stmt::Savepoint(n) => Some(TxnControl::Savepoint(n)),
+        Stmt::Release(n) => Some(TxnControl::Release(n)),
+        Stmt::RollbackTo(n) => Some(TxnControl::RollbackTo(n)),
+        _ => None,
+    }
+}

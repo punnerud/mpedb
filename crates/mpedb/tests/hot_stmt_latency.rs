@@ -170,6 +170,31 @@ fn hot_stmt_latency() {
             report("sp_savepoint_cycle_stmt", round, ns_per_op(t.elapsed().as_nanos(), cycles * 4));
             s.rollback();
         }
+
+        // (spu) savepoint cycle with UNIQUE names — Django's actual shape
+        // (`s<pid>_x<n>` per use). Pre-N2 every op compiled (full prelude),
+        // remembered (memo CLOCK churn against the hot texts) and grew the
+        // hash cache without bound.
+        {
+            let cycles = N / 4;
+            let mut s = db.begin().unwrap();
+            s.query("SAVEPOINT w0", &[]).unwrap();
+            s.query("RELEASE SAVEPOINT w0", &[]).unwrap();
+            let t = Instant::now();
+            for k in 0..cycles {
+                let n = round * cycles + k;
+                s.query(&format!("SAVEPOINT s{n}"), &[]).unwrap();
+                s.query(
+                    "INSERT INTO users VALUES ($1, $2, $3)",
+                    &[Value::Int(5_000_000 + n as i64), Value::Text("u@x.no".into()), Value::Int(2)],
+                )
+                .unwrap();
+                s.query(&format!("ROLLBACK TO SAVEPOINT s{n}"), &[]).unwrap();
+                s.query(&format!("RELEASE SAVEPOINT s{n}"), &[]).unwrap();
+            }
+            report("spu_savepoint_unique_stmt", round, ns_per_op(t.elapsed().as_nanos(), cycles * 4));
+            s.rollback();
+        }
     }
     db.verify().unwrap();
 }
