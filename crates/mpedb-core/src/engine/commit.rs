@@ -70,6 +70,14 @@ impl<'e> WriteTxn<'e> {
     }
 
     fn commit_inner<F: FnOnce()>(mut self, after_flip: F) -> Result<()> {
+        // Extent runs parked under open savepoints (N5) rejoin the pool: past
+        // this point no savepoint can roll back to before their frees, and
+        // the fixpoint below must see them or their space leaks for good
+        // (the #37 class). Harmless if the guard refuses — an aborted txn
+        // publishes none of it.
+        for (start, npages) in std::mem::take(&mut self.parked_runs) {
+            self.pool_insert(start, npages, None);
+        }
         // 0. The optimistic guard (#142 G1), FIRST — before a single page is
         //    written back.
         //

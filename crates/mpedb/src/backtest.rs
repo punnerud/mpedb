@@ -232,9 +232,12 @@ impl Database {
                         if out.veto_examples.len() < 3 {
                             out.veto_examples.push(e.to_string());
                         }
-                        w.rollback_to_full(sp)?;
+                        w.rollback_to_full(&sp)?;
                     }
                 }
+                // Dispose of the per-row savepoint either way — its journal
+                // layer must not pile up across the replay loop (#N2 fase 4).
+                w.release_savepoint_full(&sp)?;
             }
             for (i, (id, name)) in live_tables.iter().enumerate() {
                 let delta = w.row_count(*id)? as i64 - before[i];

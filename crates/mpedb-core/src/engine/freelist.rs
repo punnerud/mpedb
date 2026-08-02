@@ -28,7 +28,20 @@ impl PageStore for WriteTxn<'_> {
             // Allocated by THIS txn and freed again: back to the pool as our
             // own creation — never into a drawn entry's write-back, never
             // into the committed-free set (nothing published references it).
-            self.pool_insert(start_page, npages, None);
+            //
+            // N5 (pre-existing, found by the fase-4 adversarial review):
+            // while a FULL savepoint is open the run is PARKED instead — a
+            // recycled run's payload would be pwritten over (extent bytes
+            // are in no page journal, and >256 KiB never sit in the
+            // restorable coalescing buffer), and a ROLLBACK TO would restore
+            // the allocator map pointing at the clobbered offsets: a silent
+            // committed wrong answer. Parked runs drain back to the pool
+            // when the last savepoint layer closes, or at commit.
+            if self.sp_layers.is_empty() {
+                self.pool_insert(start_page, npages, None);
+            } else {
+                self.parked_runs.push((start_page, npages));
+            }
         } else {
             // A committed extent: freed under this commit's txn id.
             self.freed_runs.push((start_page, npages));
@@ -48,6 +61,25 @@ impl PageStore for WriteTxn<'_> {
             return Err(Error::Internal(format!(
                 "page_mut on non-dirty page {id} (COW violation)"
             )));
+        }
+        // #N2 fase 4: the first mutation of a dirty page after the innermost
+        // FULL savepoint journals its pre-image there — this is the ONLY
+        // mutation road for dirty pages, so bytes-at-first-mutation ==
+        // bytes-at-savepoint, exactly. (Restore paths deliberately write via
+        // `page_mut_unchecked` and are invisible here.) With no savepoint
+        // open the cost is the emptiness check.
+        if self
+            .sp_layers
+            .last()
+            .is_some_and(|l| !l.images.contains_key(&id))
+        {
+            let mut buf = Box::new([0u8; PAGE_SIZE]);
+            buf.copy_from_slice(self.eng.shm.page(id)?);
+            self.sp_layers
+                .last_mut()
+                .expect("checked non-empty above")
+                .images
+                .insert(id, buf);
         }
         self.eng.shm.page_mut_unchecked(id)
     }
@@ -88,6 +120,30 @@ impl PageStore for WriteTxn<'_> {
     }
 
     fn free(&mut self, id: u64) -> Result<()> {
+        // #N2 fase 4 — the adversarial review's find (all five lenses
+        // converged on it): a this-txn dirty page freed here can be RECYCLED
+        // by a later `alloc()` in the same savepoint scope, whose `fill(0)`
+        // bypasses `page_mut` — and `rollback_to_inner` will put the page
+        // back into the restored tree with its bytes destroyed. The eager
+        // copy covered this by construction; the journal must capture the
+        // pre-image at the moment the page leaves the dirty set, or never.
+        // (`in_freelist_op` frees go to `freed`, which is not recyclable
+        // within the txn — and no savepoint spans the commit fixpoint.)
+        if !self.in_freelist_op
+            && self.dirty.contains(&id)
+            && self
+                .sp_layers
+                .last()
+                .is_some_and(|l| !l.images.contains_key(&id))
+        {
+            let mut buf = Box::new([0u8; PAGE_SIZE]);
+            buf.copy_from_slice(self.eng.shm.page(id)?);
+            self.sp_layers
+                .last_mut()
+                .expect("checked non-empty above")
+                .images
+                .insert(id, buf);
+        }
         if self.dirty.remove(&id) && !self.in_freelist_op {
             // allocated this txn: immediately reusable, invisible to readers.
             // Sorted insert — `reusable` is kept ordered so `freelist_plan` can

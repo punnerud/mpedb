@@ -293,6 +293,35 @@ pub struct WriteTxn<'e> {
     /// id, which the root-pointer restore cannot undo, so a savepoint with
     /// adoptions after it is never exactly undoable by the cheap pair.
     pub(super) adopts: u64,
+    /// Lazily-filled pre-image journals for the outstanding FULL savepoints
+    /// (#N2 fase 4): layer k belongs to the k-th open [`savepoint_full`],
+    /// and [`PageStore::page_mut`] records a dirty page's bytes into the
+    /// INNERMOST layer at its first mutation after that savepoint. Folding
+    /// on release keeps outer savepoints exact — the parent inherits the
+    /// child's image for every page it has not seen itself. Empty whenever
+    /// no full savepoint is open, which is the hot path's whole cost: one
+    /// emptiness check per `page_mut`.
+    pub(super) sp_layers: Vec<SpLayer>,
+    /// Epochs name layers so a stale [`TxnSavepointFull`] token can never
+    /// address a recycled slot — depth alone would, silently.
+    pub(super) sp_epoch_next: u64,
+    /// Own-created extent runs freed while a FULL savepoint is open (N5,
+    /// found pre-existing by the fase-4 adversarial review): a freed run
+    /// re-entering `run_pool` can be recycled and its payload pwritten over
+    /// — bytes no page journal sees, because extent payloads never enter
+    /// `dirty` — and a ROLLBACK TO then restores the allocator map pointing
+    /// at the clobbered offsets: a silent committed wrong answer (the
+    /// coalescing buffer masks it only ≤ 256 KiB). Parked runs are not
+    /// allocatable; they drain back into the pool when the last layer
+    /// closes ([`release_savepoint_full`]) or at commit, and they ride the
+    /// [`ExtentSnapshot`] so a rollback restores them exactly.
+    pub(super) parked_runs: Vec<(u64, u32)>,
+}
+
+/// One lazily-filled pre-image journal layer (see [`WriteTxn::sp_layers`]).
+pub(super) struct SpLayer {
+    pub(super) epoch: u64,
+    pub(super) images: HashMap<u64, Box<[u8; PAGE_SIZE]>>,
 }
 
 impl<'e> WriteTxn<'e> {
@@ -380,14 +409,29 @@ impl<'e> WriteTxn<'e> {
 
     pub(super) fn tree_root(&mut self, table_id: u32, index_no: u32) -> Result<(u64, u64)> {
         if let Some(&e) = self.table_roots.get(&(table_id, index_no)) {
+            if std::env::var_os("SP_TRACE").is_some() {
+                eprintln!(
+                    "[sp] tree_root(t{table_id},i{index_no}) CACHE -> (root={}, count={})",
+                    e.0, e.1
+                );
+            }
             return Ok(e);
         }
         let (root, count, _gen) = catalog_entry(self, self.catalog_root, table_id, index_no)?;
+        if std::env::var_os("SP_TRACE").is_some() {
+            eprintln!(
+                "[sp] tree_root(t{table_id},i{index_no}) FALLBACK catalog_root={} -> (root={root}, count={count})",
+                self.catalog_root
+            );
+        }
         self.table_roots.insert((table_id, index_no), (root, count));
         Ok((root, count))
     }
 
     pub(super) fn set_tree_root(&mut self, table_id: u32, index_no: u32, root: u64, count: u64) {
+        if std::env::var_os("SP_TRACE").is_some() {
+            eprintln!("[sp] set_tree_root(t{table_id},i{index_no}) root={root} count={count}");
+        }
         // `& 63`: deliberate mod-64 fold, unchanged by the sparse-footprint work
         // (DESIGN-TABLE-CAP §5). A given table always folds to the same bit, so
         // a real conflict is never missed; aliasing only ever costs an extra
@@ -2733,6 +2777,21 @@ impl<'e> WriteTxn<'e> {
     /// them, so re-offering them is correct.
     fn rollback_to_inner(&mut self, sp: TxnSavepoint) {
         debug_assert!(!self.in_freelist_op);
+        if std::env::var_os("SP_TRACE").is_some() {
+            let mut roots: Vec<_> = sp.table_roots.iter().collect();
+            roots.sort();
+            eprintln!(
+                "[sp] rollback_to_inner: restore catalog_root={} table_roots={roots:?} \
+                 dirty={} (was catalog_root={} table_roots.len={} dirty.len={}) \
+                 inplace_undo.len={} (NOT restored)",
+                sp.catalog_root,
+                sp.dirty.len(),
+                self.catalog_root,
+                self.table_roots.len(),
+                self.dirty.len(),
+                self.inplace_undo.len(),
+            );
+        }
         self.catalog_root = sp.catalog_root;
         self.freelist_root = sp.freelist_root;
         self.table_roots = sp.table_roots;
@@ -2845,6 +2904,10 @@ impl<'e> WriteTxn<'e> {
         // mutations into the replay (and a replay re-adoption would then
         // overwrite the committed pre-images). Restore and drain them first.
         self.restore_inplace_undo();
+        // A discarded round's journal layers describe pages the reset below
+        // orphans; any savepoint token still naming them will fail its epoch
+        // check rather than restore stale bytes.
+        self.sp_layers.clear();
         self.catalog_root = self.meta.catalog_root;
         self.freelist_root = self.meta.freelist_root;
         self.extent_map_root = self.meta.extent_map_root;
@@ -2870,6 +2933,7 @@ impl<'e> WriteTxn<'e> {
         self.taken_runs.clear();
         self.freed_runs.clear();
         self.allocated_runs.clear();
+        self.parked_runs.clear();
         self.pending_map_edits.clear();
         self.extent_dirty.clear();
         self.extent_buf.clear();
@@ -2909,28 +2973,40 @@ impl<'e> WriteTxn<'e> {
     /// copy survives the root restore. `insert_row` does undo itself logically
     /// (`undo_partial_insert`), which is what makes the caller's `rollback_to`
     /// redundant there — and, being redundant, purely harmful. See #162.
-    pub fn savepoint_full(&self) -> Result<TxnSavepointFull> {
+    /// Since #N2 fase 4 the page contents are captured LAZILY: taking the
+    /// savepoint pushes an empty pre-image journal layer, and `page_mut`
+    /// records a dirty page's bytes into the innermost layer at its FIRST
+    /// mutation after the savepoint (bytes-at-first-mutation ==
+    /// bytes-at-savepoint, because `page_mut` is the only mutation road for
+    /// dirty pages). The eager copy made Django's fixture shape — a big
+    /// dirty set in the outer transaction, then a savepoint per test — pay
+    /// O(dirty) per SAVEPOINT and per ROLLBACK TO (the facade's stack clone);
+    /// the journal pays O(pages actually touched in the scope).
+    pub fn savepoint_full(&mut self) -> Result<TxnSavepointFull> {
         let base = self.savepoint();
-        let mut page_images = Vec::with_capacity(self.dirty.len());
-        for &id in &self.dirty {
-            page_images.push((id, self.eng.shm.page(id)?.to_vec()));
-        }
+        let layer_epoch = self.sp_epoch_next;
+        self.sp_epoch_next = self.sp_epoch_next.wrapping_add(1);
+        self.sp_layers.push(SpLayer {
+            epoch: layer_epoch,
+            images: HashMap::new(),
+        });
         if std::env::var_os("SP_TRACE").is_some() {
             eprintln!(
-                "[sp] savepoint_full: pristine={} dirty={:?} page_images.len={} catalog_root={}",
+                "[sp] savepoint_full: pristine={} dirty={:?} layer_depth={} catalog_root={}",
                 self.is_pristine(),
                 {
                     let mut d: Vec<_> = self.dirty.iter().copied().collect();
                     d.sort_unstable();
                     d
                 },
-                page_images.len(),
+                self.sp_layers.len() - 1,
                 self.catalog_root,
             );
         }
         Ok(TxnSavepointFull {
             base,
-            page_images,
+            layer_depth: self.sp_layers.len() - 1,
+            layer_epoch,
             inplace_keys: self.inplace_undo.keys().copied().collect(),
             schema_gen_bump: self.schema_gen_bump,
             written_tables: self.written_tables,
@@ -2943,10 +3019,55 @@ impl<'e> WriteTxn<'e> {
                 allocated_runs: self.allocated_runs.clone(),
                 pending_map_edits: self.pending_map_edits.clone(),
                 dirty: self.extent_dirty.clone(),
+                parked: self.parked_runs.clone(),
                 buf: self.extent_buf.clone(),
                 buf_off: self.extent_buf_off,
             },
         })
+    }
+
+    /// Check a savepoint token against the live layer stack. A mismatch is a
+    /// caller-stack/engine-layer desync, and acting on the wrong layer is
+    /// silent corruption — the one thing this machinery exists to prevent.
+    fn sp_layer_check(&self, sp: &TxnSavepointFull) -> Result<()> {
+        if self.sp_layers.get(sp.layer_depth).map(|l| l.epoch) != Some(sp.layer_epoch) {
+            return Err(Error::Internal(format!(
+                "savepoint layer desync: token depth {} epoch {} vs {} live layers",
+                sp.layer_depth,
+                sp.layer_epoch,
+                self.sp_layers.len(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// RELEASE (or plain disposal) of a [`savepoint_full`] marker: fold the
+    /// released layers' pre-images into the enclosing layer and drop them.
+    /// Everything from the token's depth OUTWARD is released together — the
+    /// SQL rule, and the facade truncates its name stack the same way. The
+    /// parent keeps its own image where both have one (the parent's is
+    /// as-of the parent's savepoint, i.e. older); folding ascending makes
+    /// the OLDEST released image win for pages only the children saw. With
+    /// no parent the images die: the only remaining undo target is the
+    /// whole-transaction abort, which restores COMMITTED state through the
+    /// COW/in-place machinery and never needs mid-transaction bytes.
+    pub fn release_savepoint_full(&mut self, sp: &TxnSavepointFull) -> Result<()> {
+        self.sp_layer_check(sp)?;
+        let released = self.sp_layers.split_off(sp.layer_depth);
+        if let Some(parent) = self.sp_layers.last_mut() {
+            for layer in released {
+                for (id, img) in layer.images {
+                    parent.images.entry(id).or_insert(img);
+                }
+            }
+        } else {
+            // No savepoint can roll back before their frees anymore — the
+            // parked extent runs (N5) rejoin the allocatable pool.
+            for (start, npages) in std::mem::take(&mut self.parked_runs) {
+                self.pool_insert(start, npages, None);
+            }
+        }
+        Ok(())
     }
 
     /// Roll back to a [`savepoint_full`](Self::savepoint_full): restore the
@@ -2961,13 +3082,21 @@ impl<'e> WriteTxn<'e> {
     /// rolled-back page allocation. This used to be a clean refusal, which was
     /// correct-but-narrow: on Linux `extent_threshold` is 4 KiB, so it fired
     /// for an ordinary text column, not just for "genuinely large blobs".
-    pub fn rollback_to_full(&mut self, sp: TxnSavepointFull) -> Result<()> {
-        self.rollback_to_inner(sp.base);
+    /// Takes the savepoint by reference — the caller keeps it on its stack
+    /// for a repeat `ROLLBACK TO` the same name (only the small accounting
+    /// snapshot and the extent working set are cloned here; page contents
+    /// live in the txn's own journal layers).
+    pub fn rollback_to_full(&mut self, sp: &TxnSavepointFull) -> Result<()> {
+        self.sp_layer_check(sp)?;
+        self.rollback_to_inner(sp.base.clone());
         // The in-place third page state (see `TxnSavepointFull::inplace_keys`):
         // restore committed pre-images of pages adopted AFTER the savepoint,
         // and DROP their undo entries — a later re-adoption must snapshot the
         // committed bytes again, or a full abort would restore the leaked
-        // state (the review's second-order finding).
+        // state (the review's second-order finding). The journal may hold the
+        // same pages (first post-adoption mutation snapshots the
+        // still-committed bytes), so the replay below writes the same images
+        // again — harmless by construction.
         let adopted_after: Vec<u64> = self
             .inplace_undo
             .keys()
@@ -2982,7 +3111,7 @@ impl<'e> WriteTxn<'e> {
         // Restore the extent allocator BEFORE the page images: the map's own
         // pages live in the page store, so the image restore must be the last
         // word on their contents.
-        let ext = sp.ext;
+        let ext = sp.ext.clone();
         self.extent_map_root = ext.map_root;
         self.run_pool = ext.run_pool;
         self.taken_runs = ext.taken_runs;
@@ -2990,19 +3119,27 @@ impl<'e> WriteTxn<'e> {
         self.allocated_runs = ext.allocated_runs;
         self.pending_map_edits = ext.pending_map_edits;
         self.extent_dirty = ext.dirty;
+        self.parked_runs = ext.parked;
         self.extent_buf = ext.buf;
         self.extent_buf_off = ext.buf_off;
         self.schema_gen_bump = sp.schema_gen_bump;
         self.written_tables = sp.written_tables;
         self.commit_point = sp.commit_point;
-        // Restore the bytes of pages that were dirty at the savepoint: these are
-        // exactly the pages `rollback_to` leaves in the dirty set, and an
-        // in-place mutation after the savepoint changed their contents.
-        for (id, bytes) in &sp.page_images {
-            self.eng
-                .shm
-                .page_mut_unchecked(*id)?
-                .copy_from_slice(bytes);
+        // Replay the pre-image journals: layers ABOVE the target first (their
+        // savepoints die with this rollback — the SQL rule, mirrored by the
+        // caller's stack truncate), the target's own layer LAST, so for a
+        // page journaled in several layers the OLDEST image is the final
+        // word. The target's layer survives EMPTIED: a repeat ROLLBACK TO
+        // replays only what gets touched after this one.
+        while self.sp_layers.len() > sp.layer_depth + 1 {
+            let layer = self.sp_layers.pop().expect("length checked");
+            for (id, bytes) in layer.images {
+                self.eng.shm.page_mut_unchecked(id)?.copy_from_slice(&bytes[..]);
+            }
+        }
+        let images = std::mem::take(&mut self.sp_layers[sp.layer_depth].images);
+        for (id, bytes) in images {
+            self.eng.shm.page_mut_unchecked(id)?.copy_from_slice(&bytes[..]);
         }
         Ok(())
     }
@@ -3070,8 +3207,12 @@ impl TxnSavepoint {
 #[derive(Clone)]
 pub struct TxnSavepointFull {
     base: TxnSavepoint,
-    /// `(page id, 4 KiB contents)` for every page dirty at savepoint time.
-    page_images: Vec<(u64, Vec<u8>)>,
+    /// Which [`WriteTxn::sp_layers`] entry holds this savepoint's lazily
+    /// captured pre-images, plus the epoch that proves the slot was not
+    /// recycled. The token is what makes this struct cheap to clone and keep
+    /// on a stack — the 4 KiB images live in the transaction, not here.
+    layer_depth: usize,
+    layer_epoch: u64,
     /// The pages ADOPTED IN PLACE (private `:memory:`) as of capture — the
     /// keys of `inplace_undo`. Rollback restores the committed pre-image of
     /// every page adopted AFTER the savepoint from `inplace_undo` and drops
@@ -3095,9 +3236,10 @@ pub struct TxnSavepointFull {
     ///
     /// Copying the state is exact BY CONSTRUCTION — no reasoning about which
     /// collections happen to be append-only, which is the kind of premise that
-    /// is true until someone adds a compaction pass. It rides alongside
-    /// `page_images`, which already clones 4 KiB per dirty page, so the cost is
-    /// noise next to what the savepoint already pays.
+    /// is true until someone adds a compaction pass. Deliberately still EAGER
+    /// after the page images went lazy (#N2 fase 4): the working set is small
+    /// (roots, run lists, a coalescing buffer), and lazy-capturing it would
+    /// mean hooking every allocator mutation for pennies.
     ext: ExtentSnapshot,
 }
 
@@ -3115,6 +3257,8 @@ struct ExtentSnapshot {
     allocated_runs: std::collections::HashMap<u64, u32>,
     pending_map_edits: Vec<super::extent::MapEdit>,
     dirty: Vec<(u64, u32)>,
+    /// Runs parked by an in-scope free (see [`WriteTxn::parked_runs`]).
+    parked: Vec<(u64, u32)>,
     /// The coalescing buffer and its file offset. Bytes buffered BEFORE the
     /// savepoint belong to runs allocated before it, which are still owned, so
     /// re-flushing them writes the same bytes to the same offsets — idempotent.

@@ -1870,6 +1870,9 @@ impl Engine {
             in_place,
             inplace_undo: HashMap::new(),
             adopts: 0,
+            sp_layers: Vec::new(),
+            sp_epoch_next: 0,
+            parked_runs: Vec::new(),
         })
     }
 

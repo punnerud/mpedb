@@ -4108,6 +4108,16 @@ impl WriteSession<'_> {
         let idx = self
             .find_savepoint(name)
             .ok_or_else(|| no_such_savepoint(name))?;
+        // Engine first: fold the released layers' pre-images into the
+        // enclosing savepoint's journal (a ROLLBACK TO an outer name must
+        // still undo everything the released scope touched), THEN drop the
+        // name markers — the two stacks move together or not at all. The
+        // only error is the desync class: poison rather than run on with an
+        // undo channel that no longer lines up.
+        if let Err(e) = self.txn.release_savepoint_full(&self.savepoints[idx].snap) {
+            self.poisoned = true;
+            return Err(e);
+        }
         self.savepoints.truncate(idx);
         Ok(())
     }
@@ -4119,14 +4129,19 @@ impl WriteSession<'_> {
         let idx = self
             .find_savepoint(name)
             .ok_or_else(|| no_such_savepoint(name))?;
+        // Engine first (it pops its own journal layers above the target), the
+        // name stack after. By reference: the snapshot stays on the stack for
+        // a repeat `ROLLBACK TO` the same name (the engine keeps the target's
+        // journal layer alive, emptied). An error here is the Corrupt/desync
+        // class and the replay may have applied partially — the review's
+        // point: the drained layer cannot be replayed twice, so a retry
+        // would silently restore less than it claims. Poison instead.
+        if let Err(e) = self.txn.rollback_to_full(&self.savepoints[idx].snap) {
+            self.poisoned = true;
+            return Err(e);
+        }
         // Keep the target; drop everything opened after it.
         self.savepoints.truncate(idx + 1);
-        // `WriteTxn::rollback_to_full` consumes the snapshot; hand it a clone so
-        // the original stays on the stack for a repeat `ROLLBACK TO` the same
-        // name. A refusal (a large-blob extent write in the scope) leaves the
-        // stack intact and surfaces cleanly.
-        let snap = self.savepoints[idx].snap.clone();
-        self.txn.rollback_to_full(snap)?;
         // The rollback restored the catalog PAGES; the txn's captured schema
         // BUNDLE is derived from them and has to be rebuilt, or a DDL undone
         // here would leave the session describing a table the catalog no longer
@@ -4208,6 +4223,15 @@ impl WriteSession<'_> {
                 // cleared anyway so a future latch refinement cannot inherit
                 // pre-DDL validations by accident.
                 self.validated.clear();
+                // The anonymous savepoint's journal layer folds into the
+                // enclosing named savepoint (if any) — a ROLLBACK TO an outer
+                // name must still undo this DDL's page mutations. A failure
+                // here is a layer-stack desync: poison rather than run on
+                // with an undo channel that no longer lines up.
+                if let Err(e) = self.txn.release_savepoint_full(&snap) {
+                    self.poisoned = true;
+                    return Err(e);
+                }
                 // `cache` only — and this is the ONE clear site that must not
                 // also drop the text memo (#168). The memo is keyed to the
                 // COMMITTED generation, and this DDL is not committed: its
@@ -4227,8 +4251,16 @@ impl WriteSession<'_> {
                 // catalog/pages; the bundle was never advanced, so the session
                 // view stays consistent and usable. If the scope crossed a
                 // large-blob extent write it refuses — the txn is then torn, so
-                // poison.
-                if self.txn.rollback_to_full(snap).is_err() {
+                // poison. Either way the anonymous savepoint's journal layer
+                // is disposed of (folded into an enclosing named savepoint if
+                // one is open), or the layer stack would drift from the
+                // facade's name stack.
+                if self
+                    .txn
+                    .rollback_to_full(&snap)
+                    .and_then(|()| self.txn.release_savepoint_full(&snap))
+                    .is_err()
+                {
                     self.poisoned = true;
                 }
                 Err(e)

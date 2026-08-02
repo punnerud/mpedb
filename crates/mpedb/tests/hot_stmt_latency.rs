@@ -195,6 +195,38 @@ fn hot_stmt_latency() {
             report("spu_savepoint_unique_stmt", round, ns_per_op(t.elapsed().as_nanos(), cycles * 4));
             s.rollback();
         }
+
+        // (spl) savepoint cycle over a LARGE dirty set — Django's fixture
+        // shape (setUpTestData in the outer transaction, then a savepoint
+        // per test). Pre-N2-fase-4 every SAVEPOINT eagerly copied the whole
+        // dirty set (and every ROLLBACK TO cloned it again), so this cell
+        // scaled with fixture size instead of with what the test touched.
+        {
+            let cycles = 500;
+            let mut s = db.begin().unwrap();
+            for i in 0..2000 {
+                s.query(
+                    "INSERT INTO users VALUES ($1, $2, $3)",
+                    &[Value::Int(6_000_000 + i), Value::Text("f@x.no".into()), Value::Int(1)],
+                )
+                .unwrap();
+            }
+            s.query("SAVEPOINT w1", &[]).unwrap();
+            s.query("RELEASE SAVEPOINT w1", &[]).unwrap();
+            let t = Instant::now();
+            for k in 0..cycles {
+                s.query("SAVEPOINT sp", &[]).unwrap();
+                s.query(
+                    "INSERT INTO users VALUES ($1, $2, $3)",
+                    &[Value::Int(7_000_000 + k as i64), Value::Text("s@x.no".into()), Value::Int(3)],
+                )
+                .unwrap();
+                s.query("ROLLBACK TO SAVEPOINT sp", &[]).unwrap();
+                s.query("RELEASE SAVEPOINT sp", &[]).unwrap();
+            }
+            report("spl_savepoint_bigdirty_stmt", round, ns_per_op(t.elapsed().as_nanos(), cycles * 4));
+            s.rollback();
+        }
     }
     db.verify().unwrap();
 }
