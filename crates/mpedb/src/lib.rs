@@ -3174,10 +3174,11 @@ pub struct WriteSession<'db> {
     /// existed. Serving one is the mirror image — the plan would be built for a
     /// schema this statement is not running against.
     ///
-    /// Mechanically the READ side of the latch is a fast-path duplicate: an
-    /// in-session DDL reloads the txn bundle with `gen = committed schema_gen
-    /// + 1` (`reload_bundle_from_catalog`), so every memo entry — stamped with
-    /// a committed gen — already fails `memoized`'s gen compare. The WRITE
+    /// Mechanically the READ side of the latch is a fast-path duplicate:
+    /// an in-session DDL reloads the txn bundle stamped one past the
+    /// committed `schema_gen` (`reload_bundle_from_catalog`), so every memo
+    /// entry — stamped with a committed gen — already fails `memoized`'s
+    /// gen compare. The WRITE
     /// side (the `remember` gate) is the load-bearing half and must stay:
     /// after the first DDL every subsequent reload stamps the SAME
     /// `committed+1`, so the gen stops discriminating between two different
