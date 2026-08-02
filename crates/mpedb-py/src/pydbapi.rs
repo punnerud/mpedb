@@ -835,14 +835,89 @@ impl PyCursor {
         sql: &str,
         seq: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
+        // Fast road (#N2): Native backend + open transaction + a DML head —
+        // Django's bulk_create shape. Parameters are converted under the GIL
+        // in chunks, then ONE detach and ONE session lock per chunk run the
+        // rows on the Rust side; the general road below pays the full
+        // execute() dispatch, a GIL round-trip and a mutex lock PER ROW.
+        // Everything else (overlay backend, autocommit, PRAGMA/txn-control
+        // heads, SELECTs) keeps that road — its interception semantics are
+        // load-bearing, and executemany over them is rare by construction.
+        let head_is_dml = {
+            let bare = sql.trim().trim_end_matches(';').trim();
+            let head = bare.split_whitespace().next().unwrap_or("");
+            ["insert", "update", "delete"]
+                .iter()
+                .any(|k| head.eq_ignore_ascii_case(k))
+        };
+        let fast = head_is_dml && {
+            let conn = self.conn.borrow(py);
+            !conn.closed && conn.txn.is_some() && matches!(conn.backend, Backend::Native(_))
+        };
+        if !fast {
+            let mut total = 0i64;
+            for params in seq.try_iter()? {
+                self.execute_impl(py, sql, Some(&params?))?;
+                if self.rowcount > 0 {
+                    total += self.rowcount;
+                }
+            }
+            self.rowcount = total;
+            return Ok(());
+        }
+
+        // O(chunk) heap: rows are converted (adapt chain included — that
+        // needs the GIL) at most CHUNK at a time, never the whole sequence.
+        const CHUNK: usize = 1024;
+        // A mid-sequence error leaves a deterministic -1, not whatever the
+        // previous statement's rowcount happened to be.
+        self.rowcount = -1;
+        let conn = self.conn.borrow_mut(py);
+        let session = conn.txn.as_ref().expect("gated on txn.is_some() above");
+        session.check_owner()?;
+        let wm = &session.w;
+        let sql2 = sql.to_string();
+        let sql_ref: &str = &sql2;
+        let mut it = seq.try_iter()?;
         let mut total = 0i64;
-        for params in seq.try_iter()? {
-            self.execute_impl(py, sql, Some(&params?))?;
-            if self.rowcount > 0 {
-                total += self.rowcount;
+        loop {
+            let mut chunk: Vec<Vec<Value>> = Vec::with_capacity(CHUNK);
+            for params in it.by_ref().take(CHUNK) {
+                chunk.push(convert_params_sqlite3(Some(&params?))?);
+            }
+            if chunk.is_empty() {
+                break;
+            }
+            let short = chunk.len() < CHUNK;
+            let n = py
+                .detach(move || -> Result<i64, DbError> {
+                    let mut w = wm.lock().expect("session poisoned");
+                    let mut cnt = 0i64;
+                    for vals in chunk {
+                        if let ExecResult::Affected(k) =
+                            run_coercing(vals, |p| w.query(sql_ref, p))?
+                        {
+                            cnt += k as i64;
+                        }
+                    }
+                    Ok(cnt)
+                })
+                .map_err(map_err)?;
+            total += n;
+            if short {
+                break;
             }
         }
+        if let Some(id) = mpedb::take_last_insert_rowid() {
+            self.lastrowid = Some(id);
+        }
+        drop(conn);
+        // The cursor state a finished DML loop leaves behind — same shape the
+        // general road's last execute_impl produced.
         self.rowcount = total;
+        self.rows.clear();
+        self.pos = 0;
+        self.description = None;
         Ok(())
     }
 }

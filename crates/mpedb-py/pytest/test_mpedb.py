@@ -1134,6 +1134,32 @@ def test_dbapi_dispatch_forms(workdir):
     c.execute("ROLLBACK TRANSACTION")
     assert c.execute("SELECT count(*) FROM d WHERE v = 2").fetchone() == (0,)
     ok("dbapi: 'BEGIN;' / 'ROLLBACK TRANSACTION' interception holds")
+
+    # N2 fase 3: executemany's in-transaction fast road — rowcount is the
+    # sum, lastrowid the last row's, parameter conversion runs per row (the
+    # same convert_params as execute — a datetime into this TEXT column is
+    # refused identically on both roads, rigid typing's call), and ROLLBACK
+    # undoes the lot.
+    c.execute("BEGIN")
+    cur = c.executemany(
+        "INSERT INTO d VALUES (?, ?)",
+        [(100 + i, f"n{i}") for i in range(300)],
+    )
+    assert cur.rowcount == 300, cur.rowcount
+    assert cur.lastrowid == 399, cur.lastrowid
+    assert c.execute("SELECT count(*) FROM d WHERE v >= 100").fetchone() == (300,)
+    c.execute("ROLLBACK")
+    assert c.execute("SELECT count(*) FROM d WHERE v >= 100").fetchone() == (0,)
+    # And a constraint error mid-sequence surfaces (earlier rows stand,
+    # uncommitted) — the fast road must not swallow it.
+    c.execute("BEGIN")
+    try:
+        c.executemany("INSERT INTO d VALUES (?, ?)", [(200, "a"), (200, "b")])
+        raise AssertionError("duplicate pk must raise")
+    except mpedb.IntegrityError:
+        pass
+    c.execute("ROLLBACK")
+    ok("dbapi: executemany fast road (rowcount/lastrowid/adapt/rollback/error)")
     c.close()
 
 
