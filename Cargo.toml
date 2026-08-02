@@ -41,7 +41,7 @@ members = [
 exclude = ["crates/mpedb-capi", "crates/mpedb-olapbench"]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "LicenseRef-mpedb-1.0"
 
@@ -65,6 +65,20 @@ codegen-units = 1
 
 [profile.bench]
 inherits = "release"
+
+# The CI release-tests profile: release SEMANTICS without release LINK COST.
+# The S42 class's actual requirement is debug_assertions = false (debug's
+# verify_plan_memo recompile-and-compare structurally MASKS stale-cache wrong
+# answers); it never needed thin-LTO at one codegen unit, which [profile.
+# release] rightly keeps for shipped binaries but which made `cargo test
+# --release` link every one of the dozens of test binaries at full price —
+# the 40-minute CI job (and its multi-GB artifacts lost the GitHub cache
+# lottery on top).
+[profile.citest]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+opt-level = 1
 
 [profile.dev]
 # Panic/crash backtraces keep full file:line; only debugger *variable* inspection

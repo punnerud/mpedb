@@ -176,8 +176,8 @@ jobs:
       # release cost a 60+ minute cold fill on a 4-core runner, and the
       # excluded crates' release behavior is covered by the M3 corpus runs
       # and the harnesses job's release-agnostic protocols.
-      - name: engine + facade + cli tests, release profile
-        run: cargo test -p mpedb-core -p mpedb -p mpedb-cli --release --no-fail-fast
+      - name: engine + facade + cli tests, citest profile (release semantics)
+        run: cargo test -p mpedb-core -p mpedb -p mpedb-cli --profile citest --no-fail-fast
 
   # The crash harnesses, on the REFERENCE platform. They were the one thing here
   # that CI never ran: they are CLI subcommands rather than tests, so
