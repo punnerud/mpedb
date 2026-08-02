@@ -1777,6 +1777,7 @@ impl Database {
             poisoned: false,
             savepoints: Vec::new(),
             ddl_applied: false,
+            validated: Default::default(),
         })
     }
 
@@ -2624,6 +2625,7 @@ impl Database {
             poisoned: false,
             savepoints: Vec::new(),
             ddl_applied: false,
+            validated: Default::default(),
         })
     }
 
@@ -3177,6 +3179,15 @@ pub struct WriteSession<'db> {
     /// this txn's ROLLBACK becomes a wrong-answer hit the moment a later,
     /// unrelated DDL commit reaches that generation with a different catalog.
     ddl_applied: bool,
+    /// Plan hashes whose memo table-facts this session has already
+    /// revalidated (`Database::plan_tables` — a `begin_read` plus a per-table
+    /// probe). Within one session those facts are FROZEN: they read the last
+    /// COMMITTED state, and no commit can happen while this session holds the
+    /// single writer lock — policy edits are locked out the same way
+    /// (policy_store's check runs under it). So the probe is paid once per
+    /// (session, plan) and the hash alone is proof after that. Never carried
+    /// across sessions; cleared with the `ddl_applied` latch.
+    validated: std::collections::HashSet<PlanHash>,
 }
 
 /// One entry on the [`WriteSession`] savepoint stack.
@@ -3536,7 +3547,14 @@ impl WriteSession<'_> {
         let (hash, tables) = {
             let memo = self.db.text_memo.read().expect(POISON);
             match memo.get(sql) {
-                Some(e) if e.gen == gen => (e.hash, e.tables.clone()),
+                // `tables` = None: this session already revalidated the
+                // entry's table facts for this hash, and within a session
+                // those facts are frozen (see `validated`'s doc) — skip both
+                // the clone and the probe below.
+                Some(e) if e.gen == gen => (
+                    e.hash,
+                    (!self.validated.contains(&e.hash)).then(|| e.tables.clone()),
+                ),
                 _ => return Ok(None),
             }
         };
@@ -3548,8 +3566,11 @@ impl WriteSession<'_> {
         let Ok(plan) = self.plan_by_hash(&hash) else {
             return Ok(None);
         };
-        if self.db.plan_tables(&plan)? != tables {
-            return Ok(None);
+        if let Some(tables) = tables {
+            if self.db.plan_tables(&plan)? != tables {
+                return Ok(None);
+            }
+            self.validated.insert(hash);
         }
         if verify_plan_memo() {
             let (fresh, _) = self
@@ -4141,6 +4162,10 @@ impl WriteSession<'_> {
                 }
                 // This session's view has left the committed catalog behind.
                 self.ddl_applied = true;
+                // Unreachable while the latch holds (`memoized` early-outs),
+                // cleared anyway so a future latch refinement cannot inherit
+                // pre-DDL validations by accident.
+                self.validated.clear();
                 // `cache` only — and this is the ONE clear site that must not
                 // also drop the text memo (#168). The memo is keyed to the
                 // COMMITTED generation, and this DDL is not committed: its
