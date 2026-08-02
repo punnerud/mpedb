@@ -93,6 +93,31 @@ import os
 _shared_memory_names = set()
 
 
+def _sweep_dead_shared_memory():
+    import re
+    import tempfile
+
+    for b in ("/dev/shm", tempfile.gettempdir()):
+        try:
+            names = os.listdir(b)
+        except OSError:
+            continue
+        for f in names:
+            m = re.match(r"mpedb-shared-.*_pid(\d+)\.mpedb(?:-wal)?$", f)
+            if not m:
+                continue
+            pid = int(m.group(1))
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                try:
+                    os.remove(os.path.join(b, f))
+                except OSError:
+                    pass
+            except OSError:
+                pass  # alive or not ours to ask about
+
+
 def _cleanup_shared_memory(name):
     """Best-effort removal of a pid-scoped shared-memory database's backing
     files at interpreter exit — sqlite's cache=shared dies with the process,
@@ -288,6 +313,10 @@ def connect(
                 # backing files at interpreter exit.
                 import atexit
 
+                # Sweep stale pid-scoped stores from CRASHED processes
+                # (SIGKILL skips atexit): a dead owner's files are inert by
+                # the pid-scoping, but 67 MB apiece adds up (err log N3).
+                _sweep_dead_shared_memory()
                 suffix = f"_pid{os.getpid()}"
                 # the engine's name rule: [A-Za-z0-9_-], max 64 chars
                 base = "".join(

@@ -653,7 +653,20 @@ impl PyCursor {
                 self.description = None;
                 return Ok(());
             }
-            "rollback" => {
+            // BARE `ROLLBACK [TRANSACTION]` only: `ROLLBACK TO SAVEPOINT s`
+            // is a SAVEPOINT operation and flows through the session, which
+            // keeps sqlite's semantics (undo since the savepoint, KEEP the
+            // savepoint). Matching on the prefix alone rolled back the WHOLE
+            // transaction — writes before the savepoint silently vanished,
+            // the root cause behind ~all of the Django consumer's failures
+            // (err log N1a; N1b was the same interception closing the
+            // session so the paired RELEASE found no transaction).
+            "rollback"
+                if bare
+                    .split_whitespace()
+                    .nth(1)
+                    .is_none_or(|w| w.eq_ignore_ascii_case("transaction")) =>
+            {
                 PyConnection::rollback(&mut conn, py)?;
                 drop(conn);
                 self.rowcount = -1;
@@ -661,6 +674,17 @@ impl PyCursor {
                 self.pos = 0;
                 self.description = None;
                 return Ok(());
+            }
+            // `SAVEPOINT s` outside a transaction STARTS one in sqlite (the
+            // implicit-transaction rule applies to savepoints too — err log
+            // N1c refused it). Open the real session, then let the statement
+            // flow through it like any savepoint op.
+            "savepoint" => {
+                if let (None, Backend::Native(db)) = (&conn.txn, &conn.backend) {
+                    let db = db.clone();
+                    conn.txn = Some(open_session(py, &db)?);
+                }
+                // fall through to normal execution below
             }
             _ => {}
         }
@@ -747,6 +771,9 @@ impl PyCursor {
             session.check_owner()?;
             let wm = &session.w;
             let sql2 = sql.clone();
+            if std::env::var_os("MPEDB_DBAPI_TRACE").is_some() {
+                eprintln!("[dbapi->session] {sql2:?}");
+            }
             let res = py
                 .detach(move || {
                     let mut w = wm.lock().expect("session poisoned");

@@ -1019,6 +1019,87 @@ WHERE
     ok("dbapi: shared-memory DB is pid-scoped and cleaned at exit (W5)")
 
 
+def test_dbapi_savepoints(workdir):
+    """The swap route's FOURTH err log (N1): ROLLBACK TO SAVEPOINT must undo
+    only to the savepoint (never the whole transaction), keep the savepoint
+    for a paired RELEASE, and SAVEPOINT in autocommit starts a transaction —
+    all measured against stdlib sqlite3. (A separate ENGINE issue with a
+    pristine-transaction savepoint on the plain :memory: backing is tracked
+    apart; the file-backed pin below covers that shape.)"""
+    c = mpedb.connect(":memory:", isolation_level=None)
+    c.execute("CREATE TABLE t (v INTEGER PRIMARY KEY)")
+    c.execute("BEGIN")
+    c.execute("INSERT INTO t VALUES (10)")
+    c.execute("SAVEPOINT s2")
+    c.execute("INSERT INTO t VALUES (11)")
+    c.execute("ROLLBACK TO SAVEPOINT s2")
+    c.execute("INSERT INTO t VALUES (12)")
+    c.execute("COMMIT")
+    rows = [r[0] for r in c.execute("SELECT v FROM t ORDER BY v").fetchall()]
+    assert rows == [10, 12], rows
+    ok("dbapi: ROLLBACK TO undoes to the savepoint only (N1a)")
+
+    c.execute("BEGIN")
+    c.execute("INSERT INTO t VALUES (20)")
+    c.execute("SAVEPOINT sp")
+    c.execute("INSERT INTO t VALUES (21)")
+    c.execute("ROLLBACK TO SAVEPOINT sp")
+    c.execute("RELEASE SAVEPOINT sp")
+    c.execute("COMMIT")
+    assert [r[0] for r in c.execute("SELECT v FROM t WHERE v >= 20").fetchall()] == [20]
+    ok("dbapi: the savepoint survives ROLLBACK TO; paired RELEASE works (N1b)")
+
+    # N1c is a PRISTINE-transaction savepoint (SAVEPOINT is the first
+    # statement) — the shape the tracked :memory:-engine issue hits, so this
+    # pin runs file-backed until that lands; the semantics under test are
+    # the py layer's (autocommit SAVEPOINT must open a transaction).
+    for f_ in ("sp_auto.mpedb", "sp_pin.mpedb"):
+        for suf in ("", "-wal"):
+            try:
+                os.remove(os.path.join(workdir, f_ + suf))
+            except OSError:
+                pass
+    fdb = mpedb.connect(str(os.path.join(workdir, "sp_auto.mpedb")), isolation_level=None)
+    fdb.execute("CREATE TABLE t (v INTEGER PRIMARY KEY)")
+    fdb.execute("INSERT INTO t VALUES (1)")
+    assert not fdb.in_transaction
+    fdb.execute("SAVEPOINT auto")
+    assert fdb.in_transaction
+    fdb.execute("INSERT INTO t VALUES (40)")
+    fdb.execute("ROLLBACK TO SAVEPOINT auto")
+    fdb.execute("RELEASE SAVEPOINT auto")
+    fdb.execute("COMMIT")
+    assert fdb.execute("SELECT count(*) FROM t WHERE v = 40").fetchone() == (0,)
+    ok("dbapi: SAVEPOINT in autocommit starts a transaction (N1c)")
+
+    # Django's TestCase shape: class fixture in the outer transaction, each
+    # test in an inner savepoint, rolled back after — the fixture must
+    # survive every cycle.
+    c.execute("BEGIN")
+    c.execute("INSERT INTO t VALUES (100)")
+    for i in (101, 102, 103):
+        c.execute("SAVEPOINT test_sp")
+        c.execute(f"INSERT INTO t VALUES ({i})")
+        c.execute("ROLLBACK TO SAVEPOINT test_sp")
+        c.execute("RELEASE SAVEPOINT test_sp")
+    assert c.execute("SELECT count(*) FROM t WHERE v = 100").fetchone() == (1,)
+    c.execute("ROLLBACK")
+    ok("dbapi: Django's fixture + per-test savepoint cycle holds (N1)")
+
+    # The pristine-savepoint shape, FILE-backed (the plain :memory: twin is
+    # the tracked engine issue): prior committed txn, then BEGIN + SAVEPOINT
+    # as the first statement.
+    f = mpedb.connect(str(os.path.join(workdir, "sp_pin.mpedb")), isolation_level=None)
+    f.execute("CREATE TABLE t (v INTEGER PRIMARY KEY)")
+    f.execute("BEGIN"); f.execute("INSERT INTO t VALUES (1)"); f.execute("COMMIT")
+    f.execute("BEGIN"); f.execute("SAVEPOINT rep")
+    f.execute("INSERT INTO t VALUES (30)")
+    f.execute("ROLLBACK TO SAVEPOINT rep")
+    f.execute("COMMIT")
+    assert f.execute("SELECT count(*) FROM t WHERE v = 30").fetchone() == (0,)
+    ok("dbapi: pristine savepoint after committed history, file-backed (N1)")
+
+
 def main():
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-py-")
     os.makedirs(workdir, exist_ok=True)
@@ -1065,6 +1146,7 @@ def main():
     test_dbapi_sqlite3_semantics(workdir)
     test_dbapi_introspection_and_teardown(workdir)
     test_dbapi_w1_w5(workdir)
+    test_dbapi_savepoints(workdir)
 
     db.verify()
     ok("verify()")
