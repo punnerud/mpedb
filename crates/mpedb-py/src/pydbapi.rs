@@ -55,23 +55,20 @@ impl Backend {
 
 #[pyclass(name = "Connection", module = "mpedb", subclass)]
 pub(crate) struct PyConnection {
+    /// The open transaction. DECLARED FIRST because Rust drops fields in
+    /// declaration order and the session borrows the `Database` inside
+    /// `backend`'s Arc — the reverse order was a real segfault: a connection
+    /// garbage-collected at interpreter exit with a transaction open dropped
+    /// the Arc first and the session's rollback then used freed memory
+    /// (the first Django consumer's err log, FEIL 4).
+    txn: Option<Session>,
     backend: Backend,
     /// sqlite3's `text_factory` — accepted and stored (str is the one
     /// behavior mpedb produces; sqlitedict SETS it at bootstrap and never
     /// needs another value).
     text_factory: Option<Py<PyAny>>,
-    /// The open transaction. This used to BUFFER statements and replay them
-    /// at commit — which meant a `SELECT` could not see this connection's own
-    /// uncommitted writes, and the first real Django consumer died on exactly
-    /// that (`TestCase` wraps every test in a transaction it rolls back, so
-    /// virtually every ORM read depends on read-your-own-writes). It is now a
-    /// REAL open `WriteSession`, sqlite's own model: the single writer lock is
-    /// held from the first write until commit/rollback, reads route through
-    /// the session and see everything it wrote, and errors surface at
-    /// `execute()` where the caller is looking. The lock-holding cost is
-    /// sqlite's too — a connection that sits in a transaction blocks other
-    /// writers there exactly as here.
-    txn: Option<Session>,
+    /// (The transaction model — a REAL WriteSession, sqlite's own locking
+    /// semantics — is documented on [`Session`].)
     /// sqlite3's `isolation_level`: `Some(level)` (default `""`) = the module
     /// opens the transaction implicitly before the first DML; `None` =
     /// autocommit — every statement commits on its own unless the caller
@@ -614,6 +611,103 @@ impl PyCursor {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
+        // Real introspection pragmas (native backend): answered from the
+        // schema. `table_info` returning [] silently was a wrong answer for
+        // every introspection consumer (err log FEIL 2).
+        if name_part == "table_info" || name_part == "table_list" {
+            let conn = self.conn.borrow(py);
+            if let Backend::Native(db) = &conn.backend {
+                let _ = db.refresh_schema_if_stale();
+                let bundle = db.schema();
+                self.rows.clear();
+                self.pos = 0;
+                self.rowcount = -1;
+                if name_part == "table_list" {
+                    let cols = ["schema", "name", "type", "ncol", "wr", "strict"];
+                    self.description = Some(describe(
+                        py,
+                        &cols.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                    )?);
+                    self.col_names = cols.iter().map(|c| c.to_string()).collect();
+                    let mut out = Vec::new();
+                    for t in bundle.schema.tables.iter().filter(|t| !t.dead) {
+                        if t.name.starts_with("_mpedb_") {
+                            continue;
+                        }
+                        let ncol = t.columns.len() - usize::from(t.implicit_rowid);
+                        let row = ("main", t.name.as_str(), "table", ncol as i64, 0i64, 0i64)
+                            .into_pyobject(py)?
+                            .into_any()
+                            .unbind();
+                        out.push(row);
+                    }
+                    self.rows = out;
+                    return Ok(());
+                }
+                // table_info(<name>): the argument, unquoted.
+                let arg = rest
+                    .split_once('(')
+                    .map(|(_, r)| r.trim_end_matches(')').trim())
+                    .unwrap_or("")
+                    .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`');
+                let cols = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
+                self.description = Some(describe(
+                    py,
+                    &cols.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                )?);
+                self.col_names = cols.iter().map(|c| c.to_string()).collect();
+                let mut out = Vec::new();
+                if let Some(t) = bundle
+                    .schema
+                    .tables
+                    .iter()
+                    .find(|t| !t.dead && t.name.eq_ignore_ascii_case(arg))
+                {
+                    let n = t.columns.len() - usize::from(t.implicit_rowid);
+                    for (i, c) in t.columns[..n].iter().enumerate() {
+                        let decl = c.decl.clone().unwrap_or_else(|| {
+                            use mpedb::ColumnType as CT;
+                            match c.ty {
+                                CT::Int64 => "INTEGER",
+                                CT::Float64 => "REAL",
+                                CT::Bool => "BOOL",
+                                CT::Text => "TEXT",
+                                CT::Blob => "BLOB",
+                                CT::Timestamp => "TIMESTAMP",
+                                CT::Any => "",
+                            }
+                            .to_string()
+                        });
+                        let pk_pos = t
+                            .primary_key
+                            .iter()
+                            .position(|&pi| pi as usize == i)
+                            .map(|p| (p + 1) as i64)
+                            .unwrap_or(0);
+                        let dflt = match &c.default_text {
+                            Some(d) => d.clone().into_pyobject(py)?.into_any().unbind(),
+                            None => py.None(),
+                        };
+                        let row = (
+                            i as i64,
+                            c.name.as_str(),
+                            decl,
+                            i64::from(!c.nullable),
+                            dflt,
+                            pk_pos,
+                        )
+                            .into_pyobject(py)?
+                            .into_any()
+                            .unbind();
+                        out.push(row);
+                    }
+                }
+                self.rows = out;
+                return Ok(());
+            }
+            // Overlay: keeps the old knob behavior for now (gap queued with
+            // the capi-unification; the overlay's base COULD answer these).
+        }
         let is_set = rest.contains('=');
         let answer: Option<i64> = if is_set {
             None
@@ -779,6 +873,15 @@ impl PyCursor {
         if bare.len() >= 6 && bare[..6].eq_ignore_ascii_case("pragma") {
             drop(conn);
             return self.exec_pragma(py, bare[6..].trim());
+        }
+        // sqlite_master / sqlite_schema reads (native backend): answered from
+        // the schema by the compact evaluator below — Django's introspection
+        // runs these before anything else works (err log FEIL 2).
+        if let Backend::Native(db) = &conn.backend {
+            if let Some(res) = master_read(db, bare, &vals)? {
+                drop(conn);
+                return self.load_result(py, res);
+            }
         }
         let head = bare
             .split_whitespace()
@@ -1156,6 +1259,19 @@ pub(crate) fn connect(
         })
         .map_err(map_err)?
     };
+    // SQL functions that describe the sqlite BUILD rather than the data —
+    // Django's register_functions() will not hand out a connection before
+    // `select sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS')` answers.
+    // Mirrors capi's register_shim_builtins: the LITERAL truth about mpedb
+    // (an empty compile-option set), never a guess — the 0 makes Django
+    // register its own math fallbacks, which then simply work.
+    db.register_host_function("sqlite_compileoption_used", 1, |args: &[Value]| {
+        Ok(match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(_) => Value::Int(0),
+        })
+    });
+    db.register_host_function("sqlite_compileoption_get", 1, |_args: &[Value]| Ok(Value::Null));
     Ok(PyConnection {
         backend: Backend::Native(Arc::new(db)),
         txn: None,
@@ -1166,3 +1282,370 @@ pub(crate) fn connect(
     })
 }
 
+
+// ------------------------------------------------ sqlite_master introspection
+//
+// Django's backend reads the catalog through `sqlite_master` and PRAGMA
+// `table_info`/`table_list` — the swap route's second universal blocker
+// (err log FEIL 2). This is a COMPACT evaluator over the facade's schema:
+// exactly the measured Django forms, named refusals beyond them.
+//
+// KNOWN DUPLICATION: mpedb-capi carries the full-fidelity twin
+// (`introspect/master.rs`, S48's DQS rule included). The two cannot share a
+// crate today (capi is its own workspace); unifying them in the facade is the
+// queued cleanup, same as `sqlscript` was for script splitting.
+
+struct MRow {
+    ty: &'static str,
+    name: String,
+    tbl: String,
+    sql: Option<String>,
+}
+
+const MASTER_COLS: [&str; 5] = ["type", "name", "tbl_name", "rootpage", "sql"];
+
+fn master_table_ref(sql_lower: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(pos) = sql_lower[from..].find("from") {
+        let at = from + pos;
+        from = at + 4;
+        if sql_lower[..at].chars().last().is_some_and(ident) {
+            continue;
+        }
+        let rest = sql_lower[from..].trim_start();
+        let rest = rest.strip_prefix('"').unwrap_or(rest);
+        for cat in ["sqlite_master", "sqlite_schema"] {
+            if let Some(tail) = rest.strip_prefix(cat) {
+                if !tail.chars().next().is_some_and(ident) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// One `=`/`IN`/`LIKE` operand: quoted literal, bound parameter, or sqlite's
+/// double-quote fallback (a `"x"` that names no master column is the literal
+/// x — Django 4.2's `name="tbl"`; one that DOES name a column refuses, the
+/// S48 rule).
+fn m_operand(s: &str, params: &[Value]) -> PyResult<String> {
+    let t = s.trim();
+    if let Some(inner) = t.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        return Ok(inner.replace("''", "'"));
+    }
+    if let Some(inner) = t.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        if MASTER_COLS.contains(&inner.to_ascii_lowercase().as_str()) {
+            return Err(crate::ProgrammingError::new_err(format!(
+                "double-quoted \"{inner}\" names a sqlite_master column (sqlite would \
+                 compare columns) — refused rather than guessed"
+            )));
+        }
+        return Ok(inner.to_string());
+    }
+    let idx = if let Some(d) = t.strip_prefix('$') {
+        d.parse::<usize>().ok().and_then(|n| n.checked_sub(1))
+    } else if t == "?" {
+        Some(0)
+    } else {
+        None
+    };
+    if let Some(i) = idx {
+        return match params.get(i) {
+            Some(Value::Text(v)) => Ok(v.clone()),
+            _ => Err(crate::ProgrammingError::new_err(
+                "sqlite_master comparison needs a TEXT parameter",
+            )),
+        };
+    }
+    Err(crate::ProgrammingError::new_err(format!(
+        "unsupported sqlite_master operand `{t}` — refused by name"
+    )))
+}
+
+fn split_and_words(w: &str) -> Vec<String> {
+    let lower = w.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let b = lower.as_bytes();
+    let mut i = 0usize;
+    while i + 5 <= b.len() {
+        if &lower[i..i + 5] == " and "
+            || (i + 5 < b.len() && &lower[i..i + 4] == "and " && i == 0)
+        {
+            out.push(w[start..i].to_string());
+            start = i + 5;
+            i += 5;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(w[start..].to_string());
+    out
+}
+
+enum MPred {
+    Eq(usize, String),
+    Ne(usize, String),
+    In(usize, Vec<String>),
+    Like(usize, String),
+}
+
+impl MPred {
+    fn hit(&self, r: &MRow) -> bool {
+        let cell = |i: usize| -> String {
+            match i {
+                0 => r.ty.to_string(),
+                1 => r.name.clone(),
+                2 => r.tbl.clone(),
+                3 => "0".into(),
+                _ => r.sql.clone().unwrap_or_default(),
+            }
+        };
+        match self {
+            MPred::Eq(c, v) => cell(*c) == *v,
+            MPred::Ne(c, v) => cell(*c) != *v,
+            MPred::In(c, vs) => vs.iter().any(|v| cell(*c) == *v),
+            MPred::Like(c, p) => {
+                let s = cell(*c).to_ascii_lowercase();
+                let p = p.to_ascii_lowercase();
+                like_simple(&s, &p)
+            }
+        }
+    }
+}
+
+fn like_simple(s: &str, p: &str) -> bool {
+    fn go(s: &[u8], p: &[u8]) -> bool {
+        match p.first() {
+            None => s.is_empty(),
+            Some(b'%') => go(s, &p[1..]) || (!s.is_empty() && go(&s[1..], p)),
+            Some(b'_') => !s.is_empty() && go(&s[1..], &p[1..]),
+            Some(c) => !s.is_empty() && s[0] == *c && go(&s[1..], &p[1..]),
+        }
+    }
+    go(s.as_bytes(), p.as_bytes())
+}
+
+fn m_col(name: &str) -> PyResult<usize> {
+    let t = name.trim().trim_matches('"').to_ascii_lowercase();
+    MASTER_COLS
+        .iter()
+        .position(|c| *c == t)
+        .ok_or_else(|| {
+            crate::ProgrammingError::new_err(format!(
+                "unknown sqlite_master column `{t}` — refused by name"
+            ))
+        })
+}
+
+fn parse_m_pred(clause: &str, params: &[Value]) -> PyResult<(bool, MPred)> {
+    let mut c = clause.trim();
+    let mut neg = false;
+    while c.len() >= 4 && c[..3].eq_ignore_ascii_case("not") && c.as_bytes()[3].is_ascii_whitespace()
+    {
+        neg = !neg;
+        c = c[3..].trim_start();
+    }
+    let cl = c.to_ascii_lowercase();
+    if let Some(i) = cl.find(" in ").or(if cl.contains(" in(") { cl.find(" in(") } else { None }) {
+        let col = m_col(&c[..i])?;
+        let inner = c[i + 3..].trim().trim_start_matches('(').trim_end_matches(')');
+        let vals: PyResult<Vec<String>> = inner.split(',').map(|e| m_operand(e, params)).collect();
+        return Ok((neg, MPred::In(col, vals?)));
+    }
+    if let Some(i) = cl.find(" like ") {
+        let col = m_col(&c[..i])?;
+        return Ok((neg, MPred::Like(col, m_operand(&c[i + 6..], params)?)));
+    }
+    if let Some(i) = cl.find("!=").or_else(|| cl.find("<>")) {
+        let col = m_col(&c[..i])?;
+        return Ok((neg, MPred::Ne(col, m_operand(&c[i + 2..], params)?)));
+    }
+    if let Some(i) = c.find('=') {
+        let col = m_col(&c[..i])?;
+        let rest = c[i + 1..].trim_start();
+        let rest = rest.strip_prefix('=').unwrap_or(rest);
+        return Ok((neg, MPred::Eq(col, m_operand(rest, params)?)));
+    }
+    Err(crate::ProgrammingError::new_err(format!(
+        "unsupported sqlite_master predicate `{c}` — refused by name"
+    )))
+}
+
+/// Render the canonical CREATE TABLE text for the `sql` column — enough for
+/// Django's constraint regexes (CHECK/UNIQUE/PRIMARY KEY render; a verbatim
+/// original does not exist on this surface). The #94 implicit rowid stays
+/// invisible, as everywhere.
+fn render_create(t: &mpedb::TableDef) -> String {
+    let decl_of = |c: &mpedb::ColumnDef| -> String {
+        if let Some(d) = &c.decl {
+            return d.clone();
+        }
+        use mpedb::ColumnType as CT;
+        match c.ty {
+            CT::Int64 => "INTEGER",
+            CT::Float64 => "REAL",
+            CT::Bool => "BOOL",
+            CT::Text => "TEXT",
+            CT::Blob => "BLOB",
+            CT::Timestamp => "TIMESTAMP",
+            CT::Any => "",
+        }
+        .to_string()
+    };
+    let n = t.columns.len() - usize::from(t.implicit_rowid);
+    let mut parts = Vec::new();
+    for c in &t.columns[..n] {
+        let mut p = format!("\"{}\"", c.name);
+        let d = decl_of(c);
+        if !d.is_empty() {
+            p.push(' ');
+            p.push_str(&d);
+        }
+        if !c.nullable {
+            p.push_str(" NOT NULL");
+        }
+        if let Some(dt) = &c.default_text {
+            p.push_str(" DEFAULT ");
+            p.push_str(dt);
+        }
+        if c.unique {
+            p.push_str(" UNIQUE");
+        }
+        if let Some(chk) = &c.check {
+            p.push_str(" CHECK (");
+            p.push_str(chk);
+            p.push(')');
+        }
+        parts.push(p);
+    }
+    if !t.implicit_rowid && !t.primary_key.is_empty() {
+        let pk: Vec<String> = t
+            .primary_key
+            .iter()
+            .map(|&i| format!("\"{}\"", t.columns[i as usize].name))
+            .collect();
+        parts.push(format!("PRIMARY KEY ({})", pk.join(", ")));
+    }
+    format!("CREATE TABLE \"{}\" ({})", t.name, parts.join(", "))
+}
+
+/// Answer a `SELECT … FROM sqlite_master` (native backend). `Ok(None)` =
+/// not a master read; the caller carries on.
+fn master_read(
+    db: &Arc<Db>,
+    sql: &str,
+    params: &[Value],
+) -> PyResult<Option<ExecResult>> {
+    let lower = sql.to_ascii_lowercase();
+    if !master_table_ref(&lower) {
+        return Ok(None);
+    }
+    let sel = match lower.find("select") {
+        Some(0) => 0,
+        _ => return Ok(None),
+    };
+    let _ = db.refresh_schema_if_stale();
+    let from = lower.find("from").ok_or_else(|| {
+        crate::ProgrammingError::new_err("sqlite_master read without FROM")
+    })?;
+    let proj_src = sql[sel + 6..from].trim();
+    let rest_lower = &lower[from..];
+    let where_at = rest_lower.find("where").map(|p| from + p);
+    let order_at = rest_lower.find("order").map(|p| from + p);
+    let where_end = order_at.unwrap_or(sql.len());
+
+    // The synthesised rows: user tables, then views, then named indexes.
+    let bundle = db.schema();
+    let mut rows: Vec<MRow> = Vec::new();
+    for t in bundle.schema.tables.iter().filter(|t| !t.dead) {
+        if t.name.starts_with("_mpedb_") {
+            continue; // the drop-in's own bootstrap seed, like capi's
+        }
+        rows.push(MRow {
+            ty: "table",
+            name: t.name.clone(),
+            tbl: t.name.clone(),
+            sql: Some(render_create(t)),
+        });
+    }
+    if let Ok(views) = db.list_views() {
+        for (name, text) in views {
+            rows.push(MRow { ty: "view", name: name.clone(), tbl: name, sql: Some(text) });
+        }
+    }
+    for t in bundle.schema.tables.iter().filter(|t| !t.dead) {
+        for idx in &t.indexes {
+            if let Some(name) = &idx.name {
+                rows.push(MRow {
+                    ty: "index",
+                    name: name.clone(),
+                    tbl: t.name.clone(),
+                    // No verbatim CREATE INDEX text on this surface; NULL is
+                    // sqlite's own answer for constraint-made indexes, and
+                    // Django's `if not sql: continue` handles it.
+                    sql: None,
+                });
+            }
+        }
+    }
+
+    if let Some(w) = where_at {
+        let preds: PyResult<Vec<(bool, MPred)>> = split_and_words(sql[w + 5..where_end].trim())
+            .iter()
+            .map(|cl| parse_m_pred(cl, params))
+            .collect();
+        let preds = preds?;
+        rows.retain(|r| preds.iter().all(|(neg, p)| p.hit(r) != *neg));
+    }
+    if let Some(o) = order_at {
+        let ol = lower[o + 5..].trim();
+        let ol = ol.strip_prefix("by").map(str::trim_start).unwrap_or(ol);
+        let key = ol.split_whitespace().next().unwrap_or("").trim_matches('"');
+        if key != "name" {
+            return Err(crate::ProgrammingError::new_err(
+                "sqlite_master ORDER BY supports `name` only — refused by name",
+            ));
+        }
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        if ol.contains("desc") {
+            rows.reverse();
+        }
+    }
+
+    let proj_lower = proj_src.to_ascii_lowercase().replace(' ', "");
+    if proj_lower == "count(*)" {
+        return Ok(Some(ExecResult::Rows {
+            columns: vec!["count(*)".into()],
+            rows: vec![vec![Value::Int(rows.len() as i64)]],
+        }));
+    }
+    let cols: Vec<usize> = if proj_src == "*" {
+        (0..5).collect()
+    } else {
+        proj_src
+            .split(',')
+            .map(m_col)
+            .collect::<PyResult<_>>()?
+    };
+    let out_rows: Vec<Vec<Value>> = rows
+        .iter()
+        .map(|r| {
+            cols.iter()
+                .map(|&c| match c {
+                    0 => Value::Text(r.ty.to_string()),
+                    1 => Value::Text(r.name.clone()),
+                    2 => Value::Text(r.tbl.clone()),
+                    3 => Value::Int(0),
+                    _ => r.sql.clone().map(Value::Text).unwrap_or(Value::Null),
+                })
+                .collect()
+        })
+        .collect();
+    Ok(Some(ExecResult::Rows {
+        columns: cols.iter().map(|&c| MASTER_COLS[c].to_string()).collect(),
+        rows: out_rows,
+    }))
+}

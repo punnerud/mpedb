@@ -921,6 +921,44 @@ def test_dbapi_sqlite3_semantics(workdir):
     ok("dbapi: create_function/aggregate, executescript, Row")
 
 
+def test_dbapi_introspection_and_teardown(workdir):
+    """The swap route's second err log (2026-08-02): build-description
+    builtins, sqlite_master/table_info introspection, and the open-txn-at-
+    exit segfault. FEIL 3 from that log is pinned as STOCK-IDENTICAL
+    behavior (measured side by side), not fixed."""
+    import subprocess, sys as _sys
+
+    c = mpedb.connect(":memory:", isolation_level=None)
+    assert c.execute(
+        "select sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS')"
+    ).fetchone() == (0,)
+    assert c.execute("select sqlite_compileoption_get(0)").fetchone() == (None,)
+    ok("dbapi: sqlite_compileoption_used/get answer the literal truth")
+
+    c.execute("CREATE TABLE mm (id INTEGER PRIMARY KEY, u TEXT UNIQUE, n INTEGER CHECK (n >= 0))")
+    c.execute("CREATE INDEX mm_u ON mm (u)")
+    rows = [tuple(r) for r in c.execute(
+        "SELECT name, type FROM sqlite_master WHERE type in ('table', 'view') "
+        "AND NOT name='sqlite_sequence' ORDER BY name").fetchall()]
+    assert ("mm", "table") in rows
+    sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' and name=\"mm\"").fetchone()[0]
+    assert "UNIQUE" in sql and "CHECK" in sql and sql.startswith("CREATE TABLE")
+    ti = c.execute("PRAGMA table_info(mm)").fetchall()
+    assert [t[1] for t in ti] == ["id", "u", "n"] and ti[0][5] == 1
+    assert any(r[0] == "mm_u" for r in c.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'").fetchall())
+    assert c.execute("SELECT count(*) FROM sqlite_schema").fetchone()[0] >= 2
+    ok("dbapi: sqlite_master / table_info / table_list introspection")
+
+    r = subprocess.run(
+        [_sys.executable, "-c",
+         "import mpedb; c = mpedb.connect(':memory:'); c.execute('BEGIN')"],
+        capture_output=True,
+    )
+    assert r.returncode == 0, f"exit med åpen txn: {r.returncode}"
+    ok("dbapi: open transaction at interpreter exit is a clean exit")
+
+
 def main():
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-py-")
     os.makedirs(workdir, exist_ok=True)
@@ -965,6 +1003,7 @@ def main():
     test_insert_file(db, base + 700, workdir)
     test_dbapi(cfg_path, base)
     test_dbapi_sqlite3_semantics(workdir)
+    test_dbapi_introspection_and_teardown(workdir)
 
     db.verify()
     ok("verify()")
