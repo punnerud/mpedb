@@ -590,36 +590,48 @@ impl PyCursor {
         sql: &str,
         params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let sql = sql.to_string();
         let vals = convert_params_sqlite3(params)?;
         let mut conn = self.conn.borrow_mut(py);
         if conn.closed {
             return Err(closed_err());
         }
+        // ONE pass over the text for dispatch (#N2): `bare` and `head` are
+        // slices, the head words are compared case-insensitively in place,
+        // and the only String the hot path allocates is the owned copy each
+        // detach closure needs. The old shape paid ~4 allocations and 2–3
+        // full scans per statement (an owned copy up front, a full-text
+        // lowercase inside `master_read`'s gate on EVERY statement, a
+        // lowercased head word, and a clone per closure).
+        //
         // The connection-bootstrap ritual every real sqlite3 consumer runs
         // before its first query (PY-COMPAT.md tier 1): PRAGMA in both forms,
         // and transaction control through execute(). Handled here, above the
         // backend split, so both engines answer identically.
         let bare = sql.trim().trim_end_matches(';').trim();
-        if bare.len() >= 6 && bare[..6].eq_ignore_ascii_case("pragma") {
+        let head = bare.split_whitespace().next().unwrap_or("");
+        if head.eq_ignore_ascii_case("pragma") {
             drop(conn);
             return self.exec_pragma(py, bare[6..].trim());
         }
         // sqlite_master / sqlite_schema reads (native backend): answered from
         // the schema by the compact evaluator below — Django's introspection
-        // runs these before anything else works (err log FEIL 2).
-        if let Backend::Native(db) = &conn.backend {
-            if let Some(res) = master_read(db, bare, &vals)? {
-                drop(conn);
-                return self.load_result(py, res);
+        // runs these before anything else works (err log FEIL 2). Gated on a
+        // SELECT head plus an allocation-free case-folded substring probe, so
+        // an INSERT/UPDATE never pays `master_read`'s full-text lowercase;
+        // the ident-boundary rule stays where it lives, in `master_table_ref`
+        // (a non-SELECT containing the literal `sqlite_master` is pinned to
+        // NOT route here).
+        if head.eq_ignore_ascii_case("select")
+            && (contains_ci(bare, "sqlite_master") || contains_ci(bare, "sqlite_schema"))
+        {
+            if let Backend::Native(db) = &conn.backend {
+                if let Some(res) = master_read(db, bare, &vals)? {
+                    drop(conn);
+                    return self.load_result(py, res);
+                }
             }
         }
-        let head = bare
-            .split_whitespace()
-            .next()
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default();
-        match head.as_str() {
+        match head {
             // BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION]: opens the
             // REAL transaction (sqlite's semantics — Django drives its test
             // isolation with an explicit BEGIN and expects a later ROLLBACK
@@ -627,7 +639,7 @@ impl PyCursor {
             // refusal. On the overlay backend the delta IS the transaction,
             // so BEGIN stays a no-op there (diskcache's _transact runs on
             // that backend).
-            "begin" => {
+            h if h.eq_ignore_ascii_case("begin") => {
                 if let Backend::Native(db) = &conn.backend {
                     if conn.txn.is_some() {
                         return Err(crate::OperationalError::new_err(
@@ -644,7 +656,7 @@ impl PyCursor {
                 self.description = None;
                 return Ok(());
             }
-            "commit" | "end" => {
+            h if h.eq_ignore_ascii_case("commit") || h.eq_ignore_ascii_case("end") => {
                 PyConnection::commit(&mut conn, py)?;
                 drop(conn);
                 self.rowcount = -1;
@@ -661,8 +673,8 @@ impl PyCursor {
             // the root cause behind ~all of the Django consumer's failures
             // (err log N1a; N1b was the same interception closing the
             // session so the paired RELEASE found no transaction).
-            "rollback"
-                if bare
+            h if h.eq_ignore_ascii_case("rollback")
+                && bare
                     .split_whitespace()
                     .nth(1)
                     .is_none_or(|w| w.eq_ignore_ascii_case("transaction")) =>
@@ -679,7 +691,7 @@ impl PyCursor {
             // implicit-transaction rule applies to savepoints too — err log
             // N1c refused it). Open the real session, then let the statement
             // flow through it like any savepoint op.
-            "savepoint" => {
+            h if h.eq_ignore_ascii_case("savepoint") => {
                 if let (None, Backend::Native(db)) = (&conn.txn, &conn.backend) {
                     let db = db.clone();
                     conn.txn = Some(open_session(py, &db)?);
@@ -695,7 +707,7 @@ impl PyCursor {
         if let Backend::Overlay(ov, base) = &conn.backend {
             let ov = ov.clone();
             let base = base.clone();
-            let sql2 = sql.clone();
+            let sql2 = sql.to_string();
             // DDL through the overlay: the overlay reads the BASE's schema and
             // has no DDL of its own, so the statement is applied TO THE BASE —
             // checkpoint first (push our deltas; an unpushed delta across a
@@ -770,8 +782,8 @@ impl PyCursor {
             // first real Django consumer's TestCase isolation depends on it).
             session.check_owner()?;
             let wm = &session.w;
-            let sql2 = sql.clone();
-            if std::env::var_os("MPEDB_DBAPI_TRACE").is_some() {
+            let sql2 = sql.to_string();
+            if dbapi_trace() {
                 eprintln!("[dbapi->session] {sql2:?}");
             }
             let res = py
@@ -791,7 +803,7 @@ impl PyCursor {
 
         if !is_write {
             // No open transaction: a read runs against the committed snapshot.
-            let sql2 = sql.clone();
+            let sql2 = sql.to_string();
             let res = py
                 .detach(move || run_coercing(vals, |p| db.query(&sql2, p)))
                 .map_err(map_err)?;
@@ -801,7 +813,7 @@ impl PyCursor {
 
         // Autocommit DML (isolation_level = None, no explicit BEGIN): one
         // statement, one transaction, committed here — sqlite's autocommit.
-        let sql2 = sql.clone();
+        let sql2 = sql.to_string();
         let res = py
             .detach(move || -> Result<ExecResult, DbError> {
                 let mut w = db.begin()?;
@@ -1145,6 +1157,24 @@ impl PyCursor {
             .iter()
             .any(|k| t.len() >= k.len() && t[..k.len()].eq_ignore_ascii_case(k))
     }
+}
+
+/// Allocation-free ASCII-case-insensitive substring probe — the cheap gate in
+/// front of `master_read`, which is where the authoritative (ident-boundary)
+/// rule lives. Only SELECT heads reach this.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    hay.len() >= needle.len()
+        && hay
+            .as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// `MPEDB_DBAPI_TRACE` read once — an env lookup per statement is real cost
+/// on this path.
+fn dbapi_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MPEDB_DBAPI_TRACE").is_some())
 }
 
 #[pymethods]

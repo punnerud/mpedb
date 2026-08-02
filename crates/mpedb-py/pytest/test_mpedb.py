@@ -1093,6 +1093,50 @@ def test_dbapi_savepoints(workdir):
     ok("dbapi: pristine savepoint after committed history, file-backed (N1)")
 
 
+def test_dbapi_dispatch_forms(workdir):
+    """N2 fase 2: execute()'s dispatch became a single pass (slice head word,
+    case-insensitive compares, master_read gated on a SELECT head plus an
+    allocation-free substring probe). These pins hold the dispatch semantics
+    that rewrite must never move."""
+    c = mpedb.connect(":memory:", isolation_level=None)
+    c.execute("CREATE TABLE d (v INTEGER PRIMARY KEY, note TEXT)")
+
+    # PRAGMA in every casing/whitespace shape keeps routing to the evaluator.
+    assert c.execute("  PRAGMA table_info(d)").fetchall()[0][1] == "v"
+    assert c.execute("PrAgMa table_info(d);").fetchall()[0][1] == "v"
+    ok("dbapi: PRAGMA dispatch survives case and whitespace")
+
+    # A glued 'pragmafoo' is NOT a pragma: it used to be swallowed by the
+    # pragma evaluator (prefix match); stdlib raises a syntax error, and so
+    # do we now — the canonical engine refusal, not a silent no-op.
+    expect_raises(
+        (mpedb.OperationalError, mpedb.ProgrammingError),
+        lambda: c.execute("pragmafoo table_info(d)"),
+    )
+    ok("dbapi: glued pragma-lookalike errors like stdlib")
+
+    # sqlite_master reads answer in any casing; the gate is the SELECT head
+    # plus a case-folded probe, the boundary rule stays in master_table_ref.
+    c.execute("CREATE INDEX d_note ON d (note)")
+    names = [r[0] for r in c.execute(
+        "SELECT name FROM SQLITE_master WHERE type = 'index'").fetchall()]
+    assert "d_note" in names, names
+    ok("dbapi: SQLITE_master mixed-case still routes to the evaluator")
+
+    # A non-SELECT merely CONTAINING the literal must not route: it inserts.
+    c.execute("INSERT INTO d VALUES (1, 'sqlite_master')")
+    assert c.execute("SELECT note FROM d WHERE v = 1").fetchone() == ("sqlite_master",)
+    ok("dbapi: a write containing 'sqlite_master' is a write")
+
+    # Transaction verbs in odd shapes keep their interception semantics.
+    c.execute("BEGIN;")
+    c.execute("INSERT INTO d VALUES (2, 'x')")
+    c.execute("ROLLBACK TRANSACTION")
+    assert c.execute("SELECT count(*) FROM d WHERE v = 2").fetchone() == (0,)
+    ok("dbapi: 'BEGIN;' / 'ROLLBACK TRANSACTION' interception holds")
+    c.close()
+
+
 def main():
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-py-")
     os.makedirs(workdir, exist_ok=True)
@@ -1140,6 +1184,7 @@ def main():
     test_dbapi_introspection_and_teardown(workdir)
     test_dbapi_w1_w5(workdir)
     test_dbapi_savepoints(workdir)
+    test_dbapi_dispatch_forms(workdir)
 
     db.verify()
     ok("verify()")
