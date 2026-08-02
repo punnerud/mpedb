@@ -877,13 +877,17 @@ def test_dbapi_sqlite3_semantics(workdir):
     prev = os.getcwd()
     os.chdir(workdir)
     try:
-        s1 = mpedb.connect("file:memdb_pin?mode=memory&cache=shared", uri=True)
-        s2 = mpedb.connect("file:memdb_pin?mode=memory&cache=shared", uri=True)
+        # pid-unique name: the shared segment OUTLIVES the process (that is
+        # the point of cache=shared), so a fixed name collides with run #2 —
+        # CI's double-run caught exactly that.
+        shared_uri = f"file:memdb_pin_{os.getpid()}?mode=memory&cache=shared"
+        s1 = mpedb.connect(shared_uri, uri=True)
+        s2 = mpedb.connect(shared_uri, uri=True)
         s1.execute("CREATE TABLE s (i INTEGER PRIMARY KEY)")
         s1.execute("INSERT INTO s VALUES (7)")
         s1.commit()
         assert s2.execute("SELECT i FROM s").fetchall() == [(7,)]
-        assert not os.path.exists("memdb_pin")
+        assert not os.path.exists(f"memdb_pin_{os.getpid()}")
     finally:
         os.chdir(prev)
     ok("dbapi: file:?mode=memory&cache=shared is shared memory, not a file")
