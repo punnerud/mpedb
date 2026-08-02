@@ -51,6 +51,7 @@ pub mod collab;
 pub mod sync;
 mod exec;
 mod multifile;
+pub mod sqlscript;
 mod policy_store;
 mod registry;
 pub mod risk;

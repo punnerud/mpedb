@@ -220,13 +220,70 @@ fn convert_params(params: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Value>> {
 /// `raw = ?` is exactly that. The native `mpedb.Database` API keeps
 /// `Value::Bool` for declared bool columns; only the drop-in surface flattens.
 fn convert_params_sqlite3(params: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Value>> {
-    Ok(convert_params(params)?
-        .into_iter()
-        .map(|v| match v {
+    let Some(obj) = params else {
+        return Ok(Vec::new());
+    };
+    if obj.is_none() {
+        return Ok(Vec::new());
+    }
+    if obj.cast::<PyString>().is_ok() || obj.cast::<PyBytes>().is_ok() {
+        return Err(PyTypeError::new_err(
+            "params must be a sequence of values (list/tuple), not str or bytes",
+        ));
+    }
+    let mut out = Vec::new();
+    for item in obj.try_iter()? {
+        let item = item?;
+        let v = convert_one_sqlite3(&item)?;
+        out.push(match v {
             Value::Bool(b) => Value::Int(i64::from(b)),
             other => other,
-        })
-        .collect())
+        });
+    }
+    Ok(out)
+}
+
+/// One bound value on the sqlite3 surface, with the stdlib's adapter chain:
+/// the BASE types bind directly; anything else consults the registered
+/// adapters (`mpedb.adapters`, exact type, `PrepareProtocol`) FIRST — Django
+/// registers its own date/datetime/Decimal adapters and depends on them
+/// winning — then the object's own `__conform__(PrepareProtocol)`, and only
+/// then the native conversion (which covers datetime when nothing is
+/// registered, like the stdlib's default adapters).
+fn convert_one_sqlite3(item: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let py = item.py();
+    let is_base = item.is_none()
+        || item.cast::<pyo3::types::PyBool>().is_ok()
+        || item.cast::<pyo3::types::PyInt>().is_ok()
+        || item.cast::<pyo3::types::PyFloat>().is_ok()
+        || item.cast::<PyString>().is_ok()
+        || item.cast::<PyBytes>().is_ok()
+        || item.cast::<pyo3::types::PyByteArray>().is_ok()
+        || item.cast::<pyo3::types::PyMemoryView>().is_ok();
+    if is_base {
+        return py_to_value(item);
+    }
+    if let Ok(module) = py.import("mpedb") {
+        if let (Ok(proto), Ok(adapters)) =
+            (module.getattr("PrepareProtocol"), module.getattr("adapters"))
+        {
+            let key = pyo3::types::PyTuple::new(
+                py,
+                [item.get_type().into_any(), proto.clone()],
+            )?;
+            if let Ok(adapter) = adapters.get_item(&key) {
+                let adapted = adapter.call1((item,))?;
+                return py_to_value(&adapted);
+            }
+            if let Ok(conform) = item.getattr("__conform__") {
+                let adapted = conform.call1((proto,))?;
+                if !adapted.is_none() {
+                    return py_to_value(&adapted);
+                }
+            }
+        }
+    }
+    py_to_value(item)
 }
 
 fn parse_hash(plan_hash: &str) -> PyResult<PlanHash> {
@@ -1358,6 +1415,7 @@ fn mpedb_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // DB-API 2.0 (PEP 249).
     m.add_class::<crate::pydbapi::PyConnection>()?;
     m.add_class::<crate::pydbapi::PyCursor>()?;
+    m.add_class::<crate::pydbapi::PyRow>()?;
     m.add_function(wrap_pyfunction!(crate::pydbapi::connect, m)?)?;
     m.add("apilevel", "2.0")?;
     // 1 = "threads may share the module, but not connections". A Connection

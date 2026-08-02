@@ -31,6 +31,7 @@ from mpedb._native import (
     Connection,
     Cursor,
     Database,
+    Row,
     Error,
     IntegrityError,
     OperationalError,
@@ -112,8 +113,33 @@ converters = {}
 
 
 def register_adapter(type_, adapter):
-    """Store the adapter (applied in 0.2's detect_types work)."""
+    """Register `adapter` for `type_` — consulted at BIND time (an object of
+    a non-base type is adapted before it is bound, the stdlib's microprotocol)
+    and by :func:`adapt`."""
     adapters[(type_, PrepareProtocol)] = adapter
+
+
+_ADAPT_SENTINEL = object()
+
+
+def adapt(obj, proto=None, alt=_ADAPT_SENTINEL):
+    """sqlite3.adapt: run the adapter chain for `obj` — the registered adapter
+    for its exact type first, then the object's own ``__conform__``; `alt` (if
+    given) instead of raising when nothing adapts. Django's schema editor
+    calls this directly under ``migrate``."""
+    if proto is None:
+        proto = PrepareProtocol
+    adapter = adapters.get((type(obj), proto))
+    if adapter is not None:
+        return adapter(obj)
+    conform = getattr(obj, "__conform__", None)
+    if conform is not None:
+        adapted = conform(proto)
+        if adapted is not None:
+            return adapted
+    if alt is not _ADAPT_SENTINEL:
+        return alt
+    raise ProgrammingError(f"can't adapt type {type(obj).__name__!r}")
 
 
 def register_converter(name, converter):
@@ -140,6 +166,8 @@ def complete_statement(statement):
 __all__ = [
     "Connection",
     "Cursor",
+    "Row",
+    "adapt",
     "Database",
     "DataError",
     "DatabaseError",
@@ -204,12 +232,45 @@ def connect(
     ignored. ``engine="mpedb"`` forces the native engine — the programmatic
     form of ``import mpedb.mpedb``.
     """
-    del timeout, detect_types, isolation_level, check_same_thread
+    del timeout, detect_types, check_same_thread
     del factory, cached_statements
     path = str(database)
     if uri and path.startswith("file:"):
-        path = path[5:].split("?", 1)[0]
-    return _connect(path, engine=engine)
+        # sqlite URI semantics, honestly: `mode=memory` IS an in-memory
+        # database (never a file quietly named after the URI's path —
+        # Django's shared test DB `file:memorydb_default?mode=memory&
+        # cache=shared` used to fallocate 64 MiB on disk in the project
+        # root). `cache=shared` shares the store between connections in
+        # this process via mpedb's named shared memory; anything this
+        # cannot represent refuses by name.
+        rest = path[5:]
+        name, _, query = rest.partition("?")
+        params = {}
+        for kv in query.split("&"):
+            if kv:
+                k, _, v = kv.partition("=")
+                params[k] = v
+        mode = params.pop("mode", None)
+        cache = params.pop("cache", None)
+        params.pop("nolock", None)  # accepted-and-ignored, like a plain open
+        if params:
+            raise NotSupportedError(
+                f"unsupported sqlite URI parameter(s) {sorted(params)!r} in "
+                f"{path!r} — refused by name rather than silently ignored"
+            )
+        if mode == "memory":
+            base = name.strip("/").replace("/", "_") or "anon"
+            path = (
+                f":memory:shared:{base}" if cache == "shared" else ":memory:"
+            )
+        elif mode in (None, "rw", "rwc"):
+            path = name
+        else:
+            raise NotSupportedError(
+                f"sqlite URI mode={mode!r} is not supported by mpedb yet "
+                f"(refused by name)"
+            )
+    return _connect(path, engine=engine, isolation_level=isolation_level)
 
 
 # `from sqlite3 import dbapi2` must resolve as an attribute after a

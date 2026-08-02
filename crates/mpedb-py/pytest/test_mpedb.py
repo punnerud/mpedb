@@ -815,6 +815,108 @@ def test_locking_rules_are_enforced(db):
     ok("locking rules: Database-under-txn and thread affinity both refuse (#161)")
 
 
+def test_dbapi_sqlite3_semantics(workdir):
+    """The five classes the first real Django consumer hit (err log 2026-08-01):
+    subclassable Connection/Cursor + cursor(factory=), read-your-own-
+    uncommitted-writes on the native engine, adapt()/adapter-at-bind, the
+    shared-memory URI, and the create_function/aggregate/executescript/Row/
+    isolation_level surface. Every assertion is stdlib-sqlite3-measured."""
+    import datetime
+
+    class MyCursor(mpedb.Cursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params or ())
+            return self
+
+    class MyConn(mpedb.Connection):
+        pass
+
+    ok("dbapi: Connection/Cursor are subclassable")
+
+    # RYOW + rollback on the native engine (Django TestCase's whole model).
+    c = mpedb.connect(":memory:")
+    c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)")
+    c.execute("INSERT INTO t (id, x) VALUES (?, ?)", (1, "a"))
+    assert c.execute("SELECT * FROM t").fetchall() == [(1, "a")]
+    assert c.in_transaction
+    c.rollback()
+    assert c.execute("SELECT count(*) FROM t").fetchall() == [(0,)]
+    ok("dbapi: uncommitted reads see own writes; rollback undoes them")
+
+    # Autocommit mode + explicit BEGIN/ROLLBACK (Django drives txns itself).
+    a = mpedb.connect(":memory:", isolation_level=None)
+    assert a.isolation_level is None
+    a.execute("CREATE TABLE u (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+    cur = a.cursor(factory=MyCursor)
+    assert isinstance(cur, MyCursor)
+    cur.execute("INSERT INTO u (v) VALUES ('x')")
+    assert cur.lastrowid == 1
+    assert not a.in_transaction  # autocommit committed it
+    a.execute("BEGIN")
+    a.execute("INSERT INTO u (v) VALUES ('y')")
+    assert a.execute("SELECT count(*) FROM u").fetchall() == [(2,)]
+    a.execute("ROLLBACK")
+    assert a.execute("SELECT count(*) FROM u").fetchall() == [(1,)]
+    ok("dbapi: isolation_level=None + explicit BEGIN, factory cursor, lastrowid")
+
+    # adapt() and the adapter chain at bind time.
+    mpedb.register_adapter(datetime.date, lambda d: d.isoformat())
+    assert mpedb.adapt(datetime.date(2026, 8, 2)) == "2026-08-02"
+    try:
+        mpedb.adapt(object())
+        assert False, "adapt(object()) must refuse"
+    except mpedb.ProgrammingError:
+        pass
+    a.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, day TEXT)")
+    a.execute("INSERT INTO d VALUES (1, ?)", (datetime.date(2026, 8, 2),))
+    assert a.execute("SELECT day FROM d").fetchall() == [("2026-08-02",)]
+    ok("dbapi: adapt() + registered adapter wins at bind")
+
+    # Django's shared-memory test-DB URI: shared between connections in this
+    # process, and never a file on disk.
+    prev = os.getcwd()
+    os.chdir(workdir)
+    try:
+        s1 = mpedb.connect("file:memdb_pin?mode=memory&cache=shared", uri=True)
+        s2 = mpedb.connect("file:memdb_pin?mode=memory&cache=shared", uri=True)
+        s1.execute("CREATE TABLE s (i INTEGER PRIMARY KEY)")
+        s1.execute("INSERT INTO s VALUES (7)")
+        s1.commit()
+        assert s2.execute("SELECT i FROM s").fetchall() == [(7,)]
+        assert not os.path.exists("memdb_pin")
+    finally:
+        os.chdir(prev)
+    ok("dbapi: file:?mode=memory&cache=shared is shared memory, not a file")
+
+    # create_function / create_aggregate / executescript / Row.
+    f = mpedb.connect(":memory:", isolation_level=None)
+    f.create_function("triple", 1, lambda x: x * 3, deterministic=True)
+    f.execute("CREATE TABLE f (n INTEGER PRIMARY KEY)")
+    f.execute("INSERT INTO f VALUES (5)")
+    assert f.execute("SELECT triple(n) FROM f").fetchall() == [(15,)]
+
+    class Sum:
+        def __init__(self):
+            self.v = 0
+        def step(self, x):
+            self.v += x
+        def finalize(self):
+            return self.v
+
+    f.create_aggregate("mysum", 1, Sum)
+    f.execute("INSERT INTO f VALUES (7)")
+    assert f.execute("SELECT mysum(n) FROM f").fetchall() == [(12,)]
+    f.executescript(
+        "CREATE TABLE es (a INTEGER PRIMARY KEY);"
+        "INSERT INTO es VALUES (1); INSERT INTO es VALUES (2);"
+    )
+    assert f.execute("SELECT count(*) FROM es").fetchall() == [(2,)]
+    f.row_factory = mpedb.Row
+    row = f.execute("SELECT a FROM es ORDER BY a").fetchone()
+    assert row["a"] == 1 and row[0] == 1 and list(row.keys()) == ["a"]
+    ok("dbapi: create_function/aggregate, executescript, Row")
+
+
 def main():
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-py-")
     os.makedirs(workdir, exist_ok=True)
@@ -858,6 +960,7 @@ def main():
     test_any_roundtrip(db, base + 600)
     test_insert_file(db, base + 700, workdir)
     test_dbapi(cfg_path, base)
+    test_dbapi_sqlite3_semantics(workdir)
 
     db.verify()
     ok("verify()")
