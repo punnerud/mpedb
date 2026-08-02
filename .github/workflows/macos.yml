@@ -16,8 +16,22 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Same policy as linux.yml: superseded PR runs cancel; pushes to main do
+  # not, so a red is attributable to its commit.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Same CI-speed knobs as windows.yml (motivation there): no incremental on
+  # throwaway runners, line-tables-only debuginfo (release profile included —
+  # the release-tests job is the expensive one), sccache on the GHA cache.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+  CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   macos:
@@ -25,6 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: toolchain
         run: rustc --version && cargo --version && cargo clippy --version && sqlite3 --version
       # mpedb-py is excluded here only: its PyO3 cdylib needs

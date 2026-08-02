@@ -23,6 +23,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Same CI-speed knobs as windows.yml (motivation there): no incremental on
+  # throwaway runners, line-tables-only debuginfo (release profile included —
+  # the release-tests job is the expensive one), sccache on the GHA cache.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+  CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   linux:
@@ -30,6 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.9
       # Print the toolchain LOUDLY: CI tracks stable, dev boxes lag, and a clippy
       # lint that exists in one and not the other reads as "CI is flaky" when it
       # is really "your box is a release behind" (byte_char_slices, new in 1.97,
@@ -161,6 +170,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: workspace tests, release profile
         run: cargo test --workspace --release --no-fail-fast
 
@@ -182,6 +192,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: build the CLI
         run: cargo build -p mpedb-cli
       - name: SIGKILL and power-loss harnesses
