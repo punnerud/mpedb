@@ -171,8 +171,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - name: workspace tests, release profile
-        run: cargo test --workspace --release --no-fail-fast
+      # Narrowed to the crates where release-only classes actually live
+      # (S42 lived in engine + the collide harness): the full workspace in
+      # release cost a 60+ minute cold fill on a 4-core runner, and the
+      # excluded crates' release behavior is covered by the M3 corpus runs
+      # and the harnesses job's release-agnostic protocols.
+      - name: engine + facade + cli tests, release profile
+        run: cargo test -p mpedb-core -p mpedb -p mpedb-cli --release --no-fail-fast
 
   # The crash harnesses, on the REFERENCE platform. They were the one thing here
   # that CI never ran: they are CLI subcommands rather than tests, so
