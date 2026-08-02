@@ -86,6 +86,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: toolchain
         run: rustc --version; cargo --version
+      # The regexp differentials cross-check against the sqlite3 CLI. The
+      # runner image used to carry one and a 2026-08 image rotation dropped
+      # it — pin OUR OWN 3.45.1 (the version the tests name) instead of
+      # trusting the image ever again.
+      - name: sqlite3 CLI 3.45.1 for the differential cross-checks
+        run: |
+          curl -sLO https://www.sqlite.org/2024/sqlite-tools-win-x64-3450100.zip
+          Expand-Archive sqlite-tools-win-x64-3450100.zip -DestinationPath C:\sqlite-cli
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\sqlite-cli"
+          C:\sqlite-cli\sqlite3.exe --version
       - name: build the engine for Windows
         run: cargo build -p mpedb-core
       - name: stage 1 — engine unit tests (single-process)
