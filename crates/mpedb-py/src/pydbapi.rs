@@ -892,6 +892,17 @@ impl PyCursor {
             let n = py
                 .detach(move || -> Result<i64, DbError> {
                     let mut w = wm.lock().expect("session poisoned");
+                    // Bulk road (#N2 — the engine half): plan and
+                    // per-statement facts resolved once, rows run in a tight
+                    // loop inside an engine savepoint. On ANY error the
+                    // batch rolled back whole, so the per-row road below can
+                    // rerun the same rows exactly — coercion retries and
+                    // stdlib's stop-at-failing-row semantics included —
+                    // with no double-apply possible. Ok(None) = the text
+                    // wants per-row routing.
+                    if let Ok(Some(n)) = w.query_many(sql_ref, &chunk) {
+                        return Ok(n as i64);
+                    }
                     let mut cnt = 0i64;
                     for vals in chunk {
                         if let ExecResult::Affected(k) =

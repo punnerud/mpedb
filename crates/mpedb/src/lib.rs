@@ -3584,12 +3584,12 @@ impl WriteSession<'_> {
     /// so the committed generation cannot move for the session's lifetime.
     /// The generation compared against is the txn bundle's own, not this
     /// handle's `cache_gen`, which nothing refreshes while a session is open.
-    fn memoized(
-        &mut self,
-        origin: Option<u64>,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<Option<ExecResult>> {
+    /// The lookup half of [`Self::memoized`], shared with
+    /// [`Self::query_many`]: resolve `sql` to its memoized plan WITHOUT
+    /// executing — gen compare, once-per-session table-fact revalidation,
+    /// and the debug/corpus recompile oracle all live here, so every road
+    /// through the memo is verified by the same assert.
+    fn memo_plan(&mut self, sql: &str) -> Result<Option<Arc<CompiledPlan>>> {
         if self.ddl_applied {
             // Cheap early-out only — the gen compare below would miss anyway.
             // The load-bearing half of this latch is the `remember` gate; the
@@ -3643,8 +3643,124 @@ impl WriteSession<'_> {
                  input moved without moving `schema_gen` or this plan's table facts"
             );
         }
+        Ok(Some(plan))
+    }
+
+    /// The [`TextMemo`] fast path for a statement inside an open
+    /// transaction: a hit executes through the same [`Self::run_from`] the
+    /// compile road uses. `Ok(None)` = take the compile road.
+    fn memoized(
+        &mut self,
+        origin: Option<u64>,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<ExecResult>> {
+        match self.memo_plan(sql)? {
+            None => Ok(None),
+            Some(plan) => {
+                self.db.warn_if_risky(&plan);
+                self.run_from(origin, &plan, params).map(Some)
+            }
+        }
+    }
+
+    /// Execute one parameterized DML text against MANY parameter rows (#N2
+    /// — executemany's engine half): the plan and the per-statement fixed
+    /// facts (trigger rules, schema bundle, host-fn tables, the policy
+    /// staleness check) are resolved ONCE and the loop pays only bind +
+    /// execute per row. `Ok(None)` means "this text wants the per-row
+    /// road" — transaction control, ATTACH, db-qualified routing, DDL and
+    /// EXPLAIN all fall back, so their refusals and routing keep canonical
+    /// behavior (the parse_txn_control fail-open rule, one level up).
+    /// Hoisting the facts is sound for the same reason the per-hit
+    /// revalidation cache is: the session holds the writer lock, so no
+    /// commit, policy edit or trigger change can land between two rows of
+    /// one batch, and the batch itself applies no DDL (DDL texts fell back).
+    /// The per-row guard/notify machinery stays per row, inside
+    /// [`Self::exec_prepared`].
+    pub fn query_many(&mut self, sql: &str, rows: &[Vec<Value>]) -> Result<Option<u64>> {
+        if self.poisoned {
+            return Err(poisoned_err());
+        }
+        if mpedb_sql::parse_txn_control(sql).is_some()
+            || mpedb_sql::parse_attach(sql)?.is_some()
+            || !matches!(
+                self.db.resolve_db_refs_hook(sql)?,
+                multifile::DbRoute::Passthrough
+            )
+            || mpedb_sql::parse_ddl(sql)?.is_some()
+        {
+            return Ok(None);
+        }
+        let plan = match self.memo_plan(sql)? {
+            Some(plan) => plan,
+            None => {
+                // The compile road, exactly as `query_with_origin` walks it.
+                let schema = self.txn.schema_bundle();
+                let (plan, is_explain) =
+                    self.db.compile_maybe_explain_with_schema(sql, &schema)?;
+                if is_explain {
+                    return Ok(None);
+                }
+                let hash = plan.hash();
+                let plan = {
+                    let mut cache = self.db.cache.write().expect(POISON);
+                    cache.entry(hash).or_insert_with(|| Arc::new(plan)).clone()
+                };
+                if !self.ddl_applied {
+                    self.db.remember(schema.schema_gen, sql, &plan, hash)?;
+                }
+                plan
+            }
+        };
         self.db.warn_if_risky(&plan);
-        self.run_from(origin, &plan, params).map(Some)
+        let schema = self.txn.schema_bundle();
+        self.db.validate_policy_write(None, &plan, &mut self.txn)?;
+        let triggers = self.db.write_rules()?;
+        let tables = self.db.host_tables(&plan);
+        // The whole batch runs inside an anonymous engine savepoint: on ANY
+        // row error the batch is rolled back WHOLE and the error returned —
+        // so a caller with richer per-row semantics (the dbapi's coercing,
+        // stop-at-failing-row road) can rerun the same rows one by one with
+        // no double-apply possible. Cheap since the pre-images went lazy.
+        let snap = self.txn.savepoint_full()?;
+        let mut total = 0u64;
+        let mut failed: Option<Error> = None;
+        for params in rows {
+            // Rows-returning shapes contribute no affected count — the same
+            // rule the dbapi's per-row fast road applies.
+            match self.exec_prepared(None, &plan, params, &schema, &triggers, &tables) {
+                Ok(ExecResult::Affected(k)) => total += k,
+                Ok(_) => {}
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        match failed {
+            None => {
+                self.txn.release_savepoint_full(&snap).inspect_err(|_| {
+                    self.poisoned = true;
+                })?;
+                Ok(Some(total))
+            }
+            Some(e) => {
+                match self
+                    .txn
+                    .rollback_to_full(&snap)
+                    .and_then(|()| self.txn.release_savepoint_full(&snap))
+                {
+                    // The rollback restored whole-statement state, so a
+                    // poison set by the failing row's partial apply is
+                    // cleared with it — the caller may rerun the rows on
+                    // the per-row road (that is the whole contract).
+                    Ok(()) => self.poisoned = false,
+                    Err(_) => self.poisoned = true,
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Commit everything written through this session.
@@ -4035,6 +4151,37 @@ impl WriteSession<'_> {
         // lock, so no policy edit can race it). Local-cache plans only, so no
         // shared-registry eviction is needed here.
         self.db.validate_policy_write(None, plan, &mut self.txn)?;
+        let triggers = self.db.write_rules()?;
+        // Execute against the session's OWN schema view (== the txn's captured
+        // bundle), so a statement touching a table this session created/altered
+        // earlier resolves against the shape it will commit with (#95). For a
+        // session that has applied no DDL this equals the committed schema.
+        let schema = self.txn.schema_bundle();
+        // Host UDF closures for THIS statement (design/DESIGN-UDF.md). This is
+        // the path CPython's implicit transaction takes: after the first DML,
+        // every statement — reads included — arrives here, so a UDF that
+        // resolves in autocommit must resolve here too or Django breaks the
+        // moment it stops committing between statements. `None` for a plan with
+        // no host call, which then runs on the bare `&mut WriteTxn` exactly as
+        // before.
+        let tables = self.db.host_tables(plan);
+        self.exec_prepared(origin, plan, params, &schema, &triggers, &tables)
+    }
+
+    /// The per-row execution body shared by [`Self::run_from`] and
+    /// [`Self::query_many`] — param resolve, the #139 notify hint, the
+    /// #142/#151 guard machinery, the host-closure wiring and the
+    /// poison-on-partial contract in ONE place, so the bulk road cannot
+    /// drift from the single-statement one.
+    fn exec_prepared(
+        &mut self,
+        origin: Option<u64>,
+        plan: &CompiledPlan,
+        params: &[Value],
+        schema: &std::sync::Arc<mpedb_core::engine::SchemaBundle>,
+        triggers: &trigger::WriteRules,
+        tables: &Option<(HostFnTable, HostAggTable, HostCollTable)>,
+    ) -> Result<ExecResult> {
         let full = session::resolve_params(plan, params, &self.session)?;
         // Change-notification key hint (#139 S2). An interactive session runs
         // several statements into ONE commit, so this is the path where the
@@ -4051,21 +4198,7 @@ impl WriteSession<'_> {
         let mut full = full;
         ring_exec::rebase_splice_params(&mut self.txn, plan, full.to_mut(), origin)?;
         ring_exec::widen_guard(&mut self.txn, plan, &full);
-        let triggers = self.db.write_rules()?;
-        // Execute against the session's OWN schema view (== the txn's captured
-        // bundle), so a statement touching a table this session created/altered
-        // earlier resolves against the shape it will commit with (#95). For a
-        // session that has applied no DDL this equals the committed schema.
-        let schema = self.txn.schema_bundle();
         let mut partial = false;
-        // Host UDF closures for THIS statement (design/DESIGN-UDF.md). This is
-        // the path CPython's implicit transaction takes: after the first DML,
-        // every statement — reads included — arrives here, so a UDF that
-        // resolves in autocommit must resolve here too or Django breaks the
-        // moment it stops committing between statements. `None` for a plan with
-        // no host call, which then runs on the bare `&mut WriteTxn` exactly as
-        // before.
-        let tables = self.db.host_tables(plan);
         let host: Option<&dyn mpedb_types::HostFns> =
             tables.as_ref().map(|(f, _, _)| f as &dyn mpedb_types::HostFns);
         let aggs: Option<&dyn mpedb_types::HostAggs> =
@@ -4075,11 +4208,11 @@ impl WriteSession<'_> {
         let mut ctx = exec::WriteCtx::new(&mut self.txn, host, aggs, colls);
         let res = exec::exec_stmt_triggered(
             &mut ctx,
-            &schema,
+            schema,
             plan,
             &full,
             &mut partial,
-            &triggers,
+            triggers,
             0,
         );
         if res.is_err() && partial {

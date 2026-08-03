@@ -72,6 +72,18 @@ def cell_insert_txn(c):
     return dt / N_INSERT
 
 
+def cell_update_txn(c):
+    cur = c.cursor()
+    c.execute("BEGIN")
+    cur.execute("UPDATE bench SET age = age + 1 WHERE id = ?", (0,))
+    t = time.perf_counter_ns()
+    for i in range(5000):
+        cur.execute("UPDATE bench SET age = age + 1 WHERE id = ?", (i % 1000,))
+    dt = time.perf_counter_ns() - t
+    c.execute("ROLLBACK")
+    return dt / 5000
+
+
 def cell_point_select(c):
     cur = c.cursor()
     cur.execute("SELECT email FROM bench WHERE id = ?", (1,)).fetchone()
@@ -141,10 +153,11 @@ def run(storage):
             per = {}
             conn_target = target_for(engine, storage, tmp) if storage == "disk" else ":memory:"
             samples = {k: [] for k in
-                       ("insert_txn", "point_select", "executemany", "like_scan", "connect", "savepoint")}
+                       ("insert_txn", "update_txn", "point_select", "executemany", "like_scan", "connect", "savepoint")}
             c = seeded(engine, target)
             for _ in range(ROUNDS):
                 samples["insert_txn"].append(cell_insert_txn(c))
+                samples["update_txn"].append(cell_update_txn(c))
                 samples["point_select"].append(cell_point_select(c))
                 samples["executemany"].append(cell_executemany(c))
                 samples["like_scan"].append(cell_like_scan(c))

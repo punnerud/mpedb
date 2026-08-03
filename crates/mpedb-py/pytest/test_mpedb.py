@@ -1162,6 +1162,25 @@ def test_dbapi_dispatch_forms(workdir):
     ok("dbapi: executemany fast road (rowcount/lastrowid/adapt/rollback/error)")
     c.close()
 
+    # Legacy (default) isolation level, the native route: the module opens
+    # the implicit transaction before the first DML, and a following BEGIN
+    # refuses — measured byte-identical to stdlib (the swap route's standing
+    # report item expected stdlib to ALLOW it; stdlib does not). The overlay
+    # backend's no-op BEGIN is separate, documented behavior.
+    lc = mpedb.connect(":memory:")
+    lc.execute("CREATE TABLE lt (v INTEGER PRIMARY KEY)")
+    lc.commit()
+    lc.execute("INSERT INTO lt VALUES (1)")
+    assert lc.in_transaction, "legacy mode must open the implicit txn on DML"
+    expect_raises(
+        mpedb.OperationalError,
+        lambda: lc.execute("BEGIN"),
+        substring="within a transaction",
+    )
+    lc.rollback()
+    lc.close()
+    ok("dbapi: legacy default opens implicit txn; BEGIN refuses like stdlib")
+
 
 def main():
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-py-")
