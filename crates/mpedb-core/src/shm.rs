@@ -3912,10 +3912,20 @@ impl Shm {
     ) -> Result<()> {
         self.init_state().store(INIT_FORMATTING, Ordering::Release);
 
-        // zero the control region (metas, lock area, reader table)
-        let ctl_pages = data_start_page(max_readers) as usize;
-        unsafe {
-            std::ptr::write_bytes(self.at(0), 0, ctl_pages * PAGE_SIZE);
+        // zero the control region (metas, lock area, reader table). A PRIVATE
+        // backing skips it: `is_private` means a memfd this open just created
+        // (open_memory is its only maker), and fresh memfd pages are
+        // kernel-zeroed by construction — the memset only faulted all 92 ctl
+        // pages in up front, which was 235 of a :memory: connect's ~330 µs
+        // (#N2 0.2.9). Every ctl invariant reads identically: untouched bytes
+        // stay zero either way, and the stamps below write what they write.
+        // Reused SHARED files keep the full wipe — their ctl bytes carry a
+        // previous incarnation.
+        if !self.is_private {
+            let ctl_pages = data_start_page(max_readers) as usize;
+            unsafe {
+                std::ptr::write_bytes(self.at(0), 0, ctl_pages * PAGE_SIZE);
+            }
         }
         // re-set state: the zeroing above cleared it
         self.init_state().store(INIT_FORMATTING, Ordering::Release);
