@@ -195,12 +195,27 @@ powerset — not by abandoning the search, which is what the number looked
 like before this cell was run. That the fix was one branch does not make the
 old number less real; it makes the measurement the reason it is gone.
 
-**Execution: PostgreSQL wins, and the gap is not the planner's.** The same
-12-table chain costs 5.7 ms per call against their 2.06. Join *order* is what
-this solver chooses; join *algorithm* is what closes that gap, and an
-index-nested-loop chain paying ~11 000 B-tree descents against a hash join's
-~11 000 probes is exactly the shape of a 2.8× difference. That is an
-executor project, not an MPEE one, and it is not attempted here.
+**Execution: PostgreSQL wins, and it is not the join algorithm.** The same
+12-table chain costs 5.7 ms per call against their 2.06. The obvious story —
+index-nested-loop against hash join — is wrong, and `workbench/joinstep-profile.py`
+is what says so. Decomposing the 520 ns each of the ~11 000 join steps costs:
+
+| | ns |
+|---|---:|
+| `count(*)` over one table — traversal, no row materialised | **4 /row** |
+| full scan projecting one column — traversal + materialise | **187 /row** |
+| the probe itself (slope − scan) | **332** |
+
+Materialising a row costs **45× walking past it**. A hash join would
+materialise those same rows, so it cannot be the answer; PostgreSQL's entire
+per-step budget is 187 ns, and we spend that much before the probe even
+starts. The lever is decode-time column pruning on the join path — and the
+machinery already exists: `RowCursor::next_masked` (#125's observable-column
+analysis) decodes only the slots a statement reads, `scan_rows_pruned` uses
+it, and the join gather calls `scan_rows_capped`, which does not. Threading
+the analysis through join gather is the next concrete piece of work; it is
+scoped, guarded by the corpus, and deliberately not started at the tail of
+the session that measured it.
 
 **Overhead: mpedb wins by a distance**, on the axis an embedded engine owns —
 12 µs against 74 for a point-anchored join through those same twelve tables,
