@@ -15,42 +15,63 @@ writer-lock acquisition and one durable commit per op. The harness verifies
 `sum(v) == total committed ops` after every run (a lost or doubled
 increment fails the row), plus the engine's page-accounting verifier.
 
-Control arm (rule #122, like-for-like durability): stdlib sqlite3, same
-N-process autocommit-increment shape, `journal_mode=WAL`,
-`synchronous=FULL`, `fullfsync=ON` (a no-op on Linux; on macOS plain
-`fsync()` does not reach the platter, and mpedb's commit durability pays
-`F_FULLFSYNC` — the control must too), `busy_timeout=60s`. mpedb ran
-`--durability commit`. Both engines on the same host, back to back, mpedb
-from the released v0.2.7 binary.
+Control arms (rule #122, like-for-like durability), same host, back to
+back, mpedb from the released v0.2.7 binary:
+
+- **sqlite3** (stdlib): same N-process autocommit-increment shape,
+  `journal_mode=WAL`, `synchronous=FULL`, `fullfsync=ON` (a no-op on
+  Linux; on macOS plain `fsync()` does not reach the platter, and mpedb's
+  commit durability pays `F_FULLFSYNC` — the control must too),
+  `busy_timeout=60s`.
+- **PostgreSQL 16.14**: same shape against a dedicated local cluster
+  (`synchronous_commit=on`, `fsync=on` — both asserted by the harness —
+  `shared_buffers=512MB`, `max_connections=1100`, unix socket). One
+  transport asymmetry is inherent and worth naming: mpedb and sqlite are
+  IN-PROCESS while every PostgreSQL op crosses a socket round trip — that
+  is not an unfairness to correct, it is the architectural difference the
+  question is about, but it does pad PostgreSQL's per-op floor at low
+  concurrency.
 
 ## Linux x86-64 (2 cores, 7.6 GB RAM, ext4 — deliberately small hardware)
 
-| concurrent writer processes | mpedb ops/s | sqlite ops/s |
-|---:|---:|---:|
-| 1 | 1 218 | 2 505 |
-| 2 | 1 888 | 2 376 |
-| 4 | 3 704 | 2 296 |
-| 8 | 6 993 | 2 398 |
-| 16 | 11 932 | 2 269 |
-| 32 | 24 426 | 2 248 |
-| 64 | 37 792 | 2 190 |
-| 128 | **47 091** | 2 097 |
-| 256 | 31 487 | 2 364 |
-| 512 | 29 689 | — |
-| 1 024 | 23 475 | — |
+| concurrent writer processes | mpedb ops/s | sqlite ops/s | postgres ops/s |
+|---:|---:|---:|---:|
+| 1 | 1 218 | 2 505 | 1 822 |
+| 2 | 1 888 | 2 376 | 3 532 |
+| 4 | 3 704 | 2 296 | 5 535 |
+| 8 | 6 993 | 2 398 | 8 345 |
+| 16 | 11 932 | 2 269 | **9 587** |
+| 32 | 24 426 | 2 248 | 9 195 |
+| 64 | 37 792 | 2 190 | 7 728 |
+| 128 | **47 091** | 2 097 | 5 689 |
+| 256 | 31 487 | 2 364 | 4 166 |
+| 512 | 29 689 | — | — |
+| 1 024 | 23 475 | — | — |
 
-Verify: green at every point, both engines.
+Verify: green at every point, all three engines (conservation invariant;
+PostgreSQL's asserted via `sum(v)` like the others).
 
-Reading it: at 1 writer, sqlite is 2× faster — a single mpedb commit pays
-its full durability cost alone, and sqlite's WAL append is cheap. The
-crossover is at ~3 processes. From there mpedb's intent-ring group commit
-turns waiters into batch: every process posts its intent, one leader
-executes the batch and pays ONE durability cycle for all of it, so more
-contention means bigger batches means higher total throughput — 38× the
-single-writer rate at the 128-process peak, on 2 cores. That is 64×
-oversubscribed; the post-peak slope is scheduler cost, not lock collapse.
-sqlite's single-writer WAL lock serializes the same work at a flat ~2.3 k
-ops/s with each commit paying its own fsync.
+Reading it: three different answers to the same lock.
+
+- **sqlite** serializes on the WAL write lock and pays a private fsync per
+  commit: flat ~2.3 k ops/s at every concurrency, drooping past 128. It
+  neither melts nor benefits — the queue just gets longer.
+- **PostgreSQL** group-commits in the WAL writer, so it scales first —
+  fastest of the three from 2 to ~24 processes — peaks at 9.6 k ops/s at
+  16, then pays the server model's price per additional connection
+  (a backend process each, lock-manager traffic, scheduler pressure on 2
+  cores): down to 4.2 k at 256.
+- **mpedb**'s intent-ring group commit turns waiters into batch with no
+  per-connection server state: it passes PostgreSQL between 16 and 32
+  processes, peaks at 47 k ops/s at 128 — 5× PostgreSQL's peak, 38× its
+  own single-writer rate, on a box 64× oversubscribed — and at 1 024
+  concurrent lock-takers still commits 23 k/s, five times PostgreSQL's
+  best point. The post-peak slope is scheduler cost, not lock collapse.
+
+At 1 writer, everyone's group-commit machinery is pure overhead: sqlite
+(which has none to arm) wins, and mpedb's window — a lone committer
+briefly waiting for followers that never come — is the visible price of
+the curve that follows.
 
 ## macOS arm64 (Apple Silicon, 11 cores, APFS)
 

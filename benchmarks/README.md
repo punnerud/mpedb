@@ -20,7 +20,7 @@ feature-by-feature status is [../COMPAT.md](../COMPAT.md).
 | [notify.md](notify.md) | PostgreSQL LISTEN/NOTIFY | Change notification: throughput, latency, contention, fan-out — and arm E, **acting** on a notification, where PostgreSQL currently wins |
 | [documents.md](documents.md) | PostgreSQL `SELECT … FOR UPDATE` | Arm F: many editors on ONE document, and another document with its own editors — with the control that attributes the scaling, plus the C1 calibration behind the 1 s feedback contract |
 | [sync.md](sync.md) | — (mpedb against itself) | Arm G: many mpedb clients, each with its OWN `.mpedb`, reconciling with one authority — general sync, one contended cell, a replica offline for 10 000 edits, and the control that says the role itself is free |
-| [concurrency.md](concurrency.md) | sqlite3 (WAL, fullfsync) | "How many concurrent locks before it melts?" — the writer-contention curve, 1 to 1 024 processes, verified at every point; it climbs to a 128-process peak and sags, never melts |
+| [concurrency.md](concurrency.md) | sqlite3 (WAL, fullfsync), PostgreSQL 16 | "How many concurrent locks before it melts?" — the writer-contention curve, 1 to 1 024 processes, verified at every point: sqlite stays flat, PostgreSQL peaks at 16 connections, mpedb climbs to a 128-process peak at 5× PostgreSQL's best and sags, never melts |
 | [minisqlite.md](minisqlite.md) | minisqlite, sqlite3, PostgreSQL | Two SQL engines built the same way, and the number nobody publishes |
 | [turso.md](turso.md) | Turso | Side document for the fourth engine in the head-to-head |
 
