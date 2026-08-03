@@ -581,6 +581,46 @@ fn access_has_outer(a: &AccessPath) -> bool {
     }
 }
 
+/// Which inner ordinals a per-outer-row probe must decode: the mask's
+/// observable slots, WIDENED by every column the join's RLS policy reads —
+/// that program runs over the fetched row, so a slot it names must be real
+/// and not the NULL a dropped slot decodes as. `None` when nothing would be
+/// skipped, so the caller keeps the plain full-row read.
+fn probe_cols(mask: &Mask, policy: Option<&ExprProgram>, width: usize) -> Option<Vec<u16>> {
+    let mut keep: Vec<bool> = (0..width).map(|i| mask.observes(i)).collect();
+    if let Some(p) = policy {
+        // `PushCol` is the IR's only column read — `scan_keep`'s rule.
+        for instr in &p.instrs {
+            if let mpedb_types::Instr::PushCol(i) = instr {
+                if let Some(s) = keep.get_mut(*i as usize) {
+                    *s = true;
+                }
+            }
+        }
+    }
+    if keep.iter().all(|k| *k) {
+        return None;
+    }
+    Some(keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i as u16).collect())
+}
+
+/// Put a projection-ordered decode back on its ORDINALS: slot `cols[k]` takes
+/// `vals[k]`, everything below the last kept slot is NULL, and the dead tail
+/// is simply absent — the same shape `narrow_row` produces, which is what
+/// lets a pruned probe row travel the path held rows already travel. An empty
+/// `cols` yields an EMPTY row, which is the honest answer for `count(*)` over
+/// a join: the row's existence is the whole of what survives.
+fn expand_cols(cols: &[u16], vals: Vec<Value>) -> Vec<Value> {
+    let trim = cols.last().map_or(0, |c| *c as usize + 1);
+    let mut out = vec![Value::Null; trim];
+    for (k, &c) in cols.iter().enumerate() {
+        if let (Some(slot), Some(v)) = (out.get_mut(c as usize), vals.get(k)) {
+            *slot = v.clone();
+        }
+    }
+    out
+}
+
 /// Fetch one join step's candidate rows for ONE outer row — the index nested
 /// loop. The join's POLICY runs here, over each fetched inner row alone,
 /// BEFORE the residual ON can raise on it: the same RLS ordering contract as
@@ -591,6 +631,11 @@ fn fetch_inner(
     plan: &CompiledPlan,
     params: &[Value],
     outer: &[Value],
+    // #125 on the PROBE (the held path's twin): the ordinals to decode,
+    // computed ONCE per join stage by [`probe_cols`] — this runs per outer
+    // ROW, and deriving the list here cost more than the decode it saved.
+    // `None` keeps the full-width read every path did before.
+    cols: Option<&[u16]>,
 ) -> Result<Vec<Vec<Value>>> {
     let mut rows = match &join.access {
         AccessPath::PkPoint(parts) => {
@@ -609,7 +654,21 @@ fn fetch_inner(
             if any_null {
                 Vec::new()
             } else {
-                ctx.get_by_pk(join.table, &pk)?.into_iter().collect()
+                // Decode only the slots something can still read. The mask is
+                // the SAME one the held inner side is narrowed by, so the ON
+                // sees what it saw before (its reads are in the mask by
+                // construction) and `append_candidate` NULL-pads the rest to
+                // the logical width — the contract narrowed held rows already
+                // travel under. Widened by the policy's own reads, because
+                // the policy runs below, over this very row.
+                match cols {
+                    Some(cols) => ctx
+                        .get_by_pk_cols(join.table, &pk, cols)?
+                        .map(|vals| expand_cols(cols, vals))
+                        .into_iter()
+                        .collect(),
+                    None => ctx.get_by_pk(join.table, &pk)?.into_iter().collect(),
+                }
             }
         }
         AccessPath::IndexPoint { index_no, parts } => {
@@ -917,13 +976,18 @@ pub(super) fn gather_joined_arena(
         // clone+drop it always cost.
         let mut next = RowArena::new(next_trim);
         let mut probe_key: Vec<u8> = Vec::with_capacity(16);
+        // Once per STAGE, never per outer row (#125 on the probe): the list
+        // is a function of the mask, the policy and the width, all fixed
+        // here.
+        let probe_keep: Option<Vec<u16>> =
+            prune.and_then(|p| probe_cols(p.inner(ji), join.policy.as_ref(), inner_width));
         for ai in 0..acc.len() {
             let a = acc.row(ai);
             let fetched;
             let candidates: &[Vec<Value>] = match &held {
                 Some(rows) => rows,
                 None => {
-                    fetched = fetch_inner(ctx, join, plan, params, a)?;
+                    fetched = fetch_inner(ctx, join, plan, params, a, probe_keep.as_deref())?;
                     &fetched
                 }
             };

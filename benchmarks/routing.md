@@ -234,9 +234,34 @@ nothing to skip, −23 % where there is. The chain benchmark above is
 unmoved, because its tables are two columns wide — which is the honest
 shape of this change, not a disappointment.
 
-Still open, and named: the per-outer-row nested-loop probe (`get_by_pk` and
-`scan_rows_capped`) reads full width too, and `get_by_pk_cols` already
-exists for it. That one is the next piece of work.
+The per-outer-row **probe** now prunes too. `fetch_inner`'s PK arm reads
+through `get_by_pk_cols` — decoding only the mask's slots, widened by the
+join policy's own reads, since that program runs over the fetched row — and
+`expand_cols` puts the projection-ordered result back on its ordinals so a
+pruned probe row travels the path held rows already travel. Measured on a
+200-row outer (under the hash switch's threshold, so every row does its own
+probe) against a 1000-row inner:
+
+| inner width | before | after (`count(*)`) | after (`sum(c1)`) |
+|---:|---:|---:|---:|
+| 2 columns | 103 µs | **93 µs** | 109 µs (was 110) |
+| 8 columns | 125 µs | **102 µs** | 111 µs (was 126) |
+| 20 columns | 150 µs | **118 µs** | 129 µs (was 167) |
+
+−10 % even at two columns, because `count(*)` now probes for pure
+EXISTENCE and decodes nothing at all; −21 % at twenty. Every cell asserts
+its answer, `count(*)` and a value-bearing `sum` both, so a mask that
+dropped a needed column would surface as a wrong answer rather than a fast
+one.
+
+One measurement earned its keep here: the first version derived the column
+list inside `fetch_inner`, i.e. once per OUTER ROW, and measured 45 %
+*slower* than no pruning at all — two allocations per probe swamping the
+decode they saved. Hoisting it to once per join stage is the whole
+difference between the regression and the −21 %.
+
+Still full-width: the `IndexPoint` probe (`scan_by_index` has no
+column-projecting twin yet) and the range scans. Named, not fixed.
 
 **Overhead: mpedb wins by a distance**, on the axis an embedded engine owns —
 12 µs against 74 for a point-anchored join through those same twelve tables,
