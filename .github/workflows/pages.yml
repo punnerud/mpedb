@@ -58,6 +58,13 @@ jobs:
       - name: build the engine for wasm32
         run: cargo build -p mpedb-wasm --target wasm32-unknown-unknown --release
 
+      # "Deployed" is not "runs": instantiate the module the way the page
+      # does and require open() to answer. This is the gate that would have
+      # caught the std::time-on-wasm32 trap the demo shipped with for nine
+      # days while every native suite stayed green.
+      - name: the module must OPEN, not just compile
+        run: node web/ci-open-check.mjs target/wasm32-unknown-unknown/release/mpedb_wasm.wasm
+
       # A size ACCELERATOR, opted into the same way linux.yml opts into mold:
       # if binaryen is unavailable the site still ships, just larger. A
       # committed hard dependency on a tool the runner may not have is how the

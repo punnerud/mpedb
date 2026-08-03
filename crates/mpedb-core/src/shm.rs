@@ -78,10 +78,9 @@ fn memory_backing_file() -> Result<File> {
         let path = dir.join(format!(
             "mpedb-mem-{}-{}-{}",
             crate::os::process_id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
+            // via os: std::time panics on wasm32 (the :memory: namer IS the
+            // browser boot path)
+            crate::os::wall_clock_micros(),
             MEM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let file = OpenOptions::new()
@@ -2932,12 +2931,10 @@ impl Shm {
     fn fresh_epoch() -> u64 {
         use std::sync::atomic::AtomicU64;
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        // via os: std::time AND std::process::id both panic on wasm32.
+        let nanos = (crate::os::wall_clock_micros() as u64).wrapping_mul(1000);
         let mix = nanos
-            ^ ((std::process::id() as u64) << 32)
+            ^ ((crate::os::process_id() as u64) << 32)
             ^ SEQ.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         mix | 1
     }
