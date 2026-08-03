@@ -93,32 +93,51 @@ everything timed is planning/compile or warm read-only execution.
 Shape: 17 tables `t1..t17`, each `(id int64 PK, a int64)`, 1000 rows,
 `a = id`, joined as a 1:1 chain `t(k).a = t(k+1).id`.
 
-**The headline claim is false in the range people actually hit, and true
-past it — for a reason nobody would call graceful.**
+**The headline claim was false when it was written — and measuring it is
+what made it true.** The first run put mpedb at 3.08 ms on a 12-table chain
+against PostgreSQL's 0.50, with a bizarre *cliff* down to 0.11 ms at
+thirteen tables. That cliff was the finding: `DP_FULL_MAX = 12` in
+`planner/mpee.rs` made the solver enumerate `univ & !mask` — every subset of
+the unplaced tables, 2^n of them — up to twelve tables, and only past twelve
+hand over to expansion along the join graph's **frontier**, which for a chain
+admits O(n²) states instead of 2^n. The expensive branch was the one meant to
+be careful. Restricting expansion to the frontier at *every* width (the
+disconnected case still falls back, so cross products remain reachable where
+they are forced) removes it:
 
-| tables | mpedb compile | pg plan (default) | pg plan (exhaustive) |
-|---:|---:|---:|---:|
-| 4 | 0.04 ms | 0.12 ms | 0.12 ms |
-| 8 | 0.14 ms | 0.35 ms | 0.36 ms |
-| 10 | 0.77 ms | — | — |
-| 11 | 1.37 ms | — | — |
-| **12** | **3.08 ms** | **0.50 ms** | **0.83 ms** |
-| 13 | 0.11 ms | — | — |
-| 16 | 0.11 ms | 0.71 ms | 1.73 ms |
-| 17 | 0.11 ms | 0.86 ms | 2.00 ms |
+| tables | mpedb before | **mpedb now** | pg plan (default) | pg plan (exhaustive) |
+|---:|---:|---:|---:|---:|
+| 4 | 0.04 ms | **0.03 ms** | 0.12 ms | 0.12 ms |
+| 8 | 0.14 ms | **0.05 ms** | 0.35 ms | 0.36 ms |
+| 10 | 0.77 ms | **0.06 ms** | — | — |
+| 11 | 1.37 ms | **0.07 ms** | — | — |
+| **12** | **3.08 ms** | **0.07 ms** | **0.50 ms** | **0.83 ms** |
+| 13 | 0.11 ms | **0.08 ms** | — | — |
+| 16 | 0.11 ms | **0.11 ms** | 0.71 ms | 1.73 ms |
+| 17 | 0.11 ms | **0.11 ms** | 0.86 ms | 2.00 ms |
+| 64 (self-aliases) | 0.77 ms | **0.77 ms** | 6.83 ms | — |
 
 (`default` = PostgreSQL's shipped `join_collapse_limit = 8`; `exhaustive` =
-`join_collapse_limit`/`from_collapse_limit` raised to 32 with
-`geqo = off`, which is the arm the "exponential explosion" story is about.)
+`join_collapse_limit`/`from_collapse_limit` raised to 32 with `geqo = off`,
+which is the arm the "exponential explosion" story is about.)
 
-**PostgreSQL plans a 12-table chain 6× faster than mpedb does** — 0.50 ms
-against 3.08 ms. The cliff at 13 is not scaling; it is
-`DP_FULL_MAX = 12` in `planner/mpee.rs`: up to twelve tables the solver runs
-its full `(subset, last)` DP, and past that it drops to the frontier pass
-with the identical scoring function. So mpedb's curve is *bounded*, which is
-a real property — compile never exceeds ~0.8 ms even at 64 join operands —
-but it is bounded by **giving up on the search**, not by a cheaper way to
-finish it. PostgreSQL's growth is the honest cost of continuing to look.
+**41× at twelve tables, and the curve is now smooth** — no cliff, because
+there is no longer a width at which the algorithm changes character. Against
+PostgreSQL it is 6.8× faster at twelve tables and 6.6× at seventeen, and the
+gap widens with width: PostgreSQL's growth is the honest cost of continuing
+to search, ours is bounded because the search space itself is bounded by the
+join graph rather than by the powerset.
+
+Two things kept this from being a free lunch, and both were checked rather
+than assumed. Seeding — whether the DP starts from every table or from an
+extremal sample — is a *separate* decision from expansion, and the old
+constant conflated them; it is now `DP_ALL_SEEDS_MAX`, still 12, so small
+scopes keep full seeding **on top of** frontier expansion (it costs ~1 µs at
+n=12 once expansion is cheap). And plan quality: all 202 planner/plan tests
+assert unchanged choices, and `select4.test` — the join-heavy corpus file
+this solver was built for — runs 3857/3857 correct in 35.3 s against the old
+arm's 35.7 s, i.e. identical within noise. A worse join order there would
+show as a blow-up, not a rounding difference.
 
 **Repeated queries: it depends entirely on what the query does.**
 
@@ -170,21 +189,28 @@ each identically from the Python module and the release CLI:
 
 ### Reading it
 
-The defensible claim is **bounded planning cost with a named ceiling**, not
-superior handling of complex queries. Past twelve tables mpedb's compile
-time stops growing because the search stops; PostgreSQL keeps searching and
-keeps paying, and on a 12-table join it both plans faster *and* executes
-2.8× faster. What mpedb wins, it wins on the axis an embedded engine owns:
-statements small enough that per-call overhead is the cost — 6× on a
-point-anchored 12-table join, 15× on the floor — plus compile times an order
-of magnitude under PostgreSQL's planning on nested subqueries, which matters
-for query shapes minted fresh rather than prepared.
+**Planning: mpedb wins, and now for a defensible reason.** 6.8× at twelve
+tables, 6.6× at seventeen, bounded by the join graph rather than the
+powerset — not by abandoning the search, which is what the number looked
+like before this cell was run. That the fix was one branch does not make the
+old number less real; it makes the measurement the reason it is gone.
 
-Anyone reaching for "mpedb doesn't break where PostgreSQL does" should say
-instead: mpedb *declines* where PostgreSQL bends — four named refusals here,
-against zero — and its cost curve flattens because of that same posture.
-That is a design choice worth defending on its own terms, and it is not the
-same thing as being better at complex queries.
+**Execution: PostgreSQL wins, and the gap is not the planner's.** The same
+12-table chain costs 5.7 ms per call against their 2.06. Join *order* is what
+this solver chooses; join *algorithm* is what closes that gap, and an
+index-nested-loop chain paying ~11 000 B-tree descents against a hash join's
+~11 000 probes is exactly the shape of a 2.8× difference. That is an
+executor project, not an MPEE one, and it is not attempted here.
+
+**Overhead: mpedb wins by a distance**, on the axis an embedded engine owns —
+12 µs against 74 for a point-anchored join through those same twelve tables,
+2 µs against 31 on the floor. Compile times an order of magnitude under
+PostgreSQL's planning on nested subqueries belong here too: they matter for
+SQL minted fresh rather than prepared.
+
+**Limits: mpedb declines where PostgreSQL bends** — four named refusals here
+against zero. Worth defending on its own terms, and not the same claim as
+being better at complex queries.
 
 Reproduce: `workbench/complexq-{gen,mpedb,pg}.py` (the PostgreSQL arm builds
 and tears down its own throwaway cluster).

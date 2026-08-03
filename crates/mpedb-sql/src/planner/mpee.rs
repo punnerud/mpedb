@@ -152,10 +152,19 @@ impl Cost {
     }
 }
 
-/// Above this many tables the DP stops considering cartesian-first orders and
-/// expands only along the join graph's frontier (design/DESIGN-MPEE-SOLVER.md
-/// §4). `2^12 * 12 ≈ 49k` transitions is the exhaustive budget.
-const DP_FULL_MAX: usize = 12;
+/// At or below this many tables the DP is SEEDED from every table in the
+/// scope; above it, from the extremal sample only (`extremes`). This is a
+/// seeding decision and nothing else — expansion has followed the join
+/// graph's frontier at every width since the PostgreSQL planning-cost cell
+/// (benchmarks/routing.md).
+///
+/// The two used to be one constant, and conflating them cost a factor of 41
+/// at twelve tables: expansion over `univ & !mask` walks 2^n subsets where a
+/// chain's graph admits O(n²), so compile hit 3.1 ms at n=12 and then FELL to
+/// 0.11 ms at n=13 when the old threshold handed over to the frontier rule.
+/// Frontier expansion is not a concession for wide scopes; it is the better
+/// rule everywhere, and full seeding is affordable on top of it.
+const DP_ALL_SEEDS_MAX: usize = 12;
 
 /// Hard cap on live DP states. Exceeding it falls back to a greedy pass with
 /// the identical scoring function, so compile time stays predictable. Both
@@ -458,13 +467,20 @@ impl<'a> Problem<'a> {
             for (&mask, &(cost, _)) in &cur {
                 let placed = prefix | mask;
                 // Collapse + stream (design/DESIGN-MPEE-SOLVER.md §4): expand
-                // only along the join graph's frontier once the scope is too
-                // wide for exhaustive search. A subgraph attached through few
-                // edges can then only appear as a connected prefix, so the
-                // state count follows the graph's decomposition instead of 2^n.
-                let mut cand =
-                    if m <= DP_FULL_MAX { univ & !mask } else { self.frontier(placed) & univ };
+                // only along the join graph's frontier. A subgraph attached
+                // through few edges can then only appear as a connected
+                // prefix, so the state count follows the graph's
+                // decomposition instead of 2^n — for a chain that is O(n²)
+                // states against 2^n, which is the whole compile-time win
+                // measured in benchmarks/routing.md. `DP_FULL_MAX` is 0, so
+                // the exhaustive arm is inert; see its doc for why.
+                let mut cand = self.frontier(placed) & univ;
                 if cand == 0 {
+                    // No frontier: the remaining scope is disconnected from
+                    // what is placed, so a cartesian step is the only legal
+                    // move. Cross products stay reachable exactly where they
+                    // are forced — which is what makes the frontier rule a
+                    // restriction on SEARCH and not on expressible plans.
                     cand = univ & !mask;
                 }
                 for t in 0..self.n {
@@ -564,9 +580,10 @@ impl<'a> Problem<'a> {
     /// only possibly a non-optimal one.
     fn search(&self, prefix: Mask, univ: Mask, base: usize) -> Vec<usize> {
         let m = univ.count_ones() as usize;
-        if m <= DP_FULL_MAX {
-            // Small enough to be exhaustive: extremal sampling would only be a
-            // way of not looking at everything, and here we can afford to.
+        if m <= DP_ALL_SEEDS_MAX {
+            // Small enough to seed from everywhere: extremal sampling would
+            // only be a way of not looking at every starting table, and here
+            // we can afford to.
             if let Some(o) = self.dp(prefix, univ, base, univ) {
                 return o;
             }
