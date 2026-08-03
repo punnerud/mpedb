@@ -938,6 +938,16 @@ impl Engine {
                 "checks vector does not match schema table count".into(),
             ));
         }
+        // MPEDB_OPEN_TRACE=1: per-stage µs (the facade's connect attribution
+        // reaches into the engine here, #N2 0.2.9).
+        let trace = std::env::var_os("MPEDB_OPEN_TRACE").is_some();
+        let mut t0 = std::time::Instant::now();
+        let mut stage = |name: &str| {
+            if trace {
+                eprintln!("[engine_open] {name}: {}µs", t0.elapsed().as_micros());
+                t0 = std::time::Instant::now();
+            }
+        };
         let shm = Shm::open(
             &config.options.path,
             config.options.size_bytes,
@@ -946,6 +956,7 @@ impl Engine {
             &schema.hash(),
             &config.options.perms,
         )?;
+        stage("shm_open");
         let shm = Arc::new(shm);
         // durability = async: a background thread coalesces fdatasync on a
         // bounded interval so commits ack without waiting for the flush
@@ -964,13 +975,16 @@ impl Engine {
             query_threads: config.options.max_query_threads,
             check_compiler: std::sync::RwLock::new(None),
         };
+        stage("bundle");
         engine.bootstrap_catalog()?;
+        stage("bootstrap");
         // #47 stage 1: the FILE is authoritative for the schema. The config
         // seeded it (first open) or must hash-match the SEED (the frozen
         // M_SCHEMA_HASH, which never changes); the LIVE schema — which DDL
         // may have evolved past the seed — is read from the catalog. For a
         // never-evolved file the two are byte-identical and this is a no-op.
         engine.reload_schema_from_catalog()?;
+        stage("reload");
         Ok(engine)
     }
 

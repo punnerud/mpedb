@@ -1226,8 +1226,33 @@ pub fn pid_is_alive(pid: u32, recorded_start: u64) -> bool {
 
 /// This process's `/proc` start time, the second half of the identity that
 /// makes pid reuse harmless.
+///
+/// Cached KEYED BY PID, not in a plain `OnceLock`: our own start time is a
+/// per-process constant (one `/proc` read per open was part of the connect
+/// cell's cost, #N2 0.2.9), but Python consumers FORK — a fork's child must
+/// not inherit the parent's identity, so a pid change invalidates the slot.
+/// Other pids' start times (recovery, reader scans) are never cached.
 pub fn own_process_start_time() -> Option<u64> {
-    proc_start_time(crate::os::process_id())
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    // pid == 0 marks the slot empty; start == 0 encodes "read failed" so a
+    // failure is re-tried rather than cached.
+    static PID: AtomicU32 = AtomicU32::new(0);
+    static START: AtomicU64 = AtomicU64::new(0);
+    let me = crate::os::process_id();
+    if PID.load(Ordering::Acquire) == me {
+        let cached = START.load(Ordering::Acquire);
+        if cached != 0 {
+            return Some(cached);
+        }
+    }
+    let fresh = proc_start_time(me);
+    if let Some(v) = fresh {
+        // Store the value BEFORE publishing the pid, so a racing reader that
+        // matches on pid can only see the matching start time.
+        START.store(v, Ordering::Release);
+        PID.store(me, Ordering::Release);
+    }
+    fresh
 }
 
 fn pid_alive_identity(pid: u32, recorded_start: u64) -> bool {
@@ -3571,6 +3596,16 @@ impl Shm {
                 "size_mb too small for in-memory db: need at least {min_pages} pages"
             )));
         }
+        // MPEDB_OPEN_TRACE=1: per-stage µs (#N2 0.2.9 — the connect cell's
+        // attribution reaches its floor here).
+        let trace = std::env::var_os("MPEDB_OPEN_TRACE").is_some();
+        let mut t0 = std::time::Instant::now();
+        let mut stage = |name: &str| {
+            if trace {
+                eprintln!("[open_memory] {name}: {}µs", t0.elapsed().as_micros());
+                t0 = std::time::Instant::now();
+            }
+        };
         let file = memory_backing_file()?;
         // `crate::os::ftruncate_len` routes through the LFS variant on 32-bit
         // glibc (armv7's plain `ftruncate` takes a 32-bit off_t) and through
@@ -3578,13 +3613,17 @@ impl Shm {
         if crate::os::ftruncate_len(file.as_raw_fd(), size) != 0 {
             return Err(io_err("ftruncate (in-memory size)"));
         }
+        stage("memfd+truncate");
         // Synthetic path for macOS .wlock sidecar only; never used as a real
         // multi-process attach name. Linux ignores it in `map`.
         let pseudo = Path::new(":memory:");
         let mut shm = Self::map(&file, size, max_readers, durability, pseudo, true)?;
         shm.is_private = true;
+        stage("map");
         shm.format(page_count, max_readers, durability, schema_hash)?;
+        stage("format");
         shm.post_attach(schema_hash)?;
+        stage("post_attach");
         Ok(shm)
     }
 

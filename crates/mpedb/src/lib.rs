@@ -992,10 +992,21 @@ impl Database {
     }
 
     pub fn open_with_config(mut config: Config) -> Result<Database> {
+        // MPEDB_OPEN_TRACE=1: per-stage µs on stderr (the SP_TRACE pattern) —
+        // the connect cell's attribution instrument (#N2 0.2.9).
+        let trace = std::env::var_os("MPEDB_OPEN_TRACE").is_some();
+        let mut t0 = std::time::Instant::now();
+        let mut stage = |name: &str| {
+            if trace {
+                eprintln!("[open] {name}: {}µs", t0.elapsed().as_micros());
+                t0 = std::time::Instant::now();
+            }
+        };
         // Resolve `:memory:` / `:memory:shared:name` before the engine opens.
         let (resolved, storage) = mpedb_types::resolve_storage_path(&config.options.path)?;
         config.options.path = resolved;
         let checks = compile_schema_checks(&config.schema)?;
+        stage("checks");
         let path = config.options.path.clone();
         let bare_group_by = config.options.bare_group_by;
         let role = crate::sync::Role::parse(&config.options.sync_role)?;
@@ -1020,6 +1031,7 @@ impl Database {
         let seed_hash = config.schema.hash();
         let seed_programs = std::sync::Arc::new(checks);
         let mut engine = Engine::open(&config, seed_programs.checks.clone())?;
+        stage("engine_open");
         // DESIGN-BLOBEXTENT §8: per-process knob, like durability. The format
         // self-describes, so this only decides what NEW writes do.
         engine.set_extent_threshold(config.options.extent_threshold);
@@ -1042,6 +1054,7 @@ impl Database {
             }
             compile_schema_checks(schema)
         }))?;
+        stage("check_compiler");
         let mut db = Database {
             engine,
             cache: RwLock::new(HashMap::new()),
@@ -1067,6 +1080,7 @@ impl Database {
             cross_cache_live: std::sync::atomic::AtomicBool::new(false),
         };
         db.reconcile_stored_compat(&config.options)?;
+        stage("reconcile");
         Ok(db)
     }
 

@@ -1176,7 +1176,26 @@ pub fn boot_id_matches(stored: &[u8; 16]) -> Option<bool> {
 /// Boot identity: changes across reboots, so a post-reboot attach triggers
 /// robust-mutex/reader-table recovery. Linux: `/proc/sys/kernel/random/boot_id`.
 /// macOS: `sysctl(KERN_BOOTTIME)` (the boot instant).
+///
+/// Cached for the process lifetime everywhere EXCEPT Windows: the id is a
+/// per-boot, fork-invariant constant (a reboot kills the process), and the
+/// Linux `/proc` read was ~a third of a whole `:memory:` connect — three
+/// reads per open (#N2 0.2.9, the connect cell's attribution). Windows is
+/// deliberately uncached: its pair carries a LIVE uptime clock that
+/// [`boot_id_matches`] must read fresh.
 pub fn boot_id() -> Option<[u8; 16]> {
+    #[cfg(windows)]
+    {
+        boot_id_uncached()
+    }
+    #[cfg(not(windows))]
+    {
+        static CACHED: std::sync::OnceLock<Option<[u8; 16]>> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(boot_id_uncached)
+    }
+}
+
+fn boot_id_uncached() -> Option<[u8; 16]> {
     // wasm32: "boot" is the module instantiation, and the database is created
     // fresh inside it — memory cannot outlive the boot that made it, so the
     // stale-across-reboot hazard this guards is unreachable. A fixed non-zero
