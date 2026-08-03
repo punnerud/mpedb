@@ -4299,12 +4299,25 @@ impl WriteSession<'_> {
         // A failure here means reading back the catalog we just restored did
         // not work: the txn view is stale, so the session is poisoned rather
         // than left to commit something nobody can describe.
-        if let Err(e) = self.txn.reload_bundle_from_catalog() {
-            self.poisoned = true;
-            return Err(e);
+        //
+        // BOTH the rebuild and the plan-cache clear exist for undone DDL —
+        // and `ddl_applied` is a one-way latch, so a session it is false for
+        // cannot have moved the schema: the bundle still equals the committed
+        // catalog's and every cached plan still describes it. Skipping both
+        // is what keeps the savepoint-per-test pattern (Django's TestCase)
+        // from paying a catalog decode AND a whole plan-cache eviction per
+        // test. (Mid-transaction sys-keyspace writes — registry last-used
+        // patches — share the catalog TREE, but neither the bundle nor a
+        // compiled plan reads them; their rollback is bookkeeping.)
+        if self.ddl_applied {
+            if let Err(e) = self.txn.reload_bundle_from_catalog() {
+                self.poisoned = true;
+                return Err(e);
+            }
+            // A cached plan may reference the catalog as it was BEFORE the
+            // rollback.
+            self.db.cache.write().expect(POISON).clear();
         }
-        // A cached plan may reference the catalog as it was BEFORE the rollback.
-        self.db.cache.write().expect(POISON).clear();
         Ok(())
     }
 
