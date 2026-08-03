@@ -195,16 +195,31 @@ pub fn run_parent(argv: &[String]) -> CliResult {
     let mut totals = Totals::default();
     let mut failures = 0u64;
     let mut out_of_space = 0u64;
+    // Per-op latency, aggregated across children (incr emits it): the p50s
+    // and p99s are per-CHILD percentiles; the honest summary is the median
+    // p50 (the typical writer's typical op) and the WORST p99 (no child's
+    // tail is averaged away).
+    let (mut p50s, mut p99s, mut lat_max) = (Vec::new(), Vec::new(), 0u64);
     for (k, child) in children.into_iter().enumerate() {
         let out = child.wait_with_output()?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         for line in stdout.lines() {
             if let Some(stats) = line.strip_prefix("STATS ") {
-                let (kind, ops, ok, conflicts) = parse_stats(stats);
+                let (kind, ops, ok, conflicts, lat) = parse_stats(stats);
                 totals.ops += ops;
                 totals.ok += ok;
                 totals.conflicts += conflicts;
-                println!("child {k} ({kind}): ops={ops} ok={ok} expected-conflicts={conflicts}");
+                if let Some((p50, p99, max)) = lat {
+                    p50s.push(p50);
+                    p99s.push(p99);
+                    lat_max = lat_max.max(max);
+                    println!(
+                        "child {k} ({kind}): ops={ops} ok={ok} expected-conflicts={conflicts} \
+                         p50={p50}µs p99={p99}µs max={max}µs"
+                    );
+                } else {
+                    println!("child {k} ({kind}): ops={ops} ok={ok} expected-conflicts={conflicts}");
+                }
             }
         }
         match out.status.code() {
@@ -229,6 +244,16 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         totals.conflicts,
         totals.ops as f64 / elapsed
     );
+    if !p50s.is_empty() {
+        p50s.sort_unstable();
+        p99s.sort_unstable();
+        println!(
+            "latency: p50={}µs (median child) p99={}µs (worst child) max={}µs",
+            p50s[p50s.len() / 2],
+            p99s[p99s.len() - 1],
+            lat_max
+        );
+    }
     match &check {
         Ok(()) => println!("verify: ok"),
         Err(Failure::Runtime(m)) | Err(Failure::Usage(m)) => eprintln!("VERIFY FAILED: {m}"),
@@ -398,9 +423,12 @@ fn final_check(db: &Database, mode: &str, totals: &Totals) -> CliResult {
     Ok(())
 }
 
-fn parse_stats(s: &str) -> (String, u64, u64, u64) {
+type LatTriple = Option<(u64, u64, u64)>;
+
+fn parse_stats(s: &str) -> (String, u64, u64, u64, LatTriple) {
     let mut kind = String::from("?");
     let (mut ops, mut ok, mut conflicts) = (0, 0, 0);
+    let (mut p50, mut p99, mut lmax) = (None, None, None);
     for tok in s.split_whitespace() {
         if let Some((k, v)) = tok.split_once('=') {
             match k {
@@ -408,11 +436,18 @@ fn parse_stats(s: &str) -> (String, u64, u64, u64) {
                 "ops" => ops = v.parse().unwrap_or(0),
                 "ok" => ok = v.parse().unwrap_or(0),
                 "conflicts" => conflicts = v.parse().unwrap_or(0),
+                "p50" => p50 = v.parse().ok(),
+                "p99" => p99 = v.parse().ok(),
+                "latmax" => lmax = v.parse().ok(),
                 _ => {}
             }
         }
     }
-    (kind, ops, ok, conflicts)
+    let lat = match (p50, p99, lmax) {
+        (Some(a), Some(b), Some(c)) => Some((a, b, c)),
+        _ => None,
+    };
+    (kind, ops, ok, conflicts, lat)
 }
 
 fn int(v: &Value) -> Result<i64, Failure> {
@@ -478,17 +513,33 @@ fn incr_child(db: &Database, deadline: Instant, rng: &mut Rng) -> CliResult {
     let upd = db.prepare("UPDATE ctr SET v = v + 1 WHERE id = $1")?;
     let mut ops = 0u64;
     let mut ok = 0u64;
+    // Per-op latency in µs — the contention question's other half: batching
+    // buys throughput by making each waiter wait for its batch turn, and
+    // that cost must be SHOWN, not hidden behind the ops/s headline.
+    let mut lats: Vec<u64> = Vec::with_capacity(1 << 14);
     while Instant::now() < deadline {
         let key = rng.below(INCR_KEYSPACE as u64) as i64;
         ops += 1;
+        let t0 = Instant::now();
         match db.execute(&upd, &params![key]) {
             Ok(ExecResult::Affected(1)) => ok += 1,
             Ok(other) => return runtime(format!("incr child: unexpected {other:?}")),
             Err(e) if matches!(e, mpedb::Error::DbFull) => exit_db_full("incr", &e),
                 Err(e) => return runtime(format!("incr child: unexpected error: {e}")),
         }
+        lats.push(t0.elapsed().as_micros() as u64);
     }
-    println!("STATS kind=incr ops={ops} ok={ok} conflicts=0");
+    lats.sort_unstable();
+    let (p50, p99, latmax) = if lats.is_empty() {
+        (0, 0, 0)
+    } else {
+        (
+            lats[lats.len() / 2],
+            lats[(lats.len() * 99 / 100).min(lats.len() - 1)],
+            lats[lats.len() - 1],
+        )
+    };
+    println!("STATS kind=incr ops={ops} ok={ok} conflicts=0 p50={p50} p99={p99} latmax={latmax}");
     Ok(())
 }
 

@@ -104,6 +104,49 @@ arm halves. Crossover on this host is ~48 processes; at 128, mpedb commits
 dependent; if a workload is single-writer-dominated, `--durability commit`
 is the wrong knob to hold the writer lock under in the first place.
 
+## Latency under contention — the question throughput hides
+
+A fair objection: batching buys throughput by making each waiter wait for
+its batch turn, so the ops/s headline could hide terrible individual
+latency. Measured (same Linux host and shape, per-op wall time inside each
+worker; p50 = the median worker's median op, p99 = the WORST worker's p99,
+so no tail is averaged away):
+
+| N | mpedb p50 | mpedb p99 | sqlite p50 | sqlite p99 |
+|---:|---:|---:|---:|---:|
+| 1 | 0.81 ms | 1.3 ms | 0.38 ms | 1.0 ms |
+| 8 | 1.0 ms | 1.5 ms | 0.39 ms | 2.7 ms |
+| 32 | 1.4 ms | 2.1 ms | 0.40 ms | **15.0 s** |
+| 128 | 2.7 ms | 5.3 ms | 0.45 ms | 16.9 s |
+| 512 | 8.4 ms | 15.5 s | 0.28 ms | 19.4 s |
+
+Two shapes of queue:
+
+- **mpedb's median grows exactly as the batch model predicts** (Little's
+  law: 128 workers / 46 k ops/s ≈ 2.8 ms — the measured 2.7 ms p50), and
+  through 128 processes the p99 stays about 2× the p50: the intent ring
+  serves waiters in ORDER, so nobody is starved. Batching costs every
+  writer a batch turn; it does not cost an unlucky writer everything.
+- **sqlite's p50 looks better and its p99 is the disaster**: the lock is a
+  retry lottery, so the median grab is fast while the unlucky writer
+  starves for 15–19 SECONDS — from 8 processes up. The commenter's worry
+  is real, and it lands on the arm without an ordered queue.
+- At 512 processes (256× oversubscribed on this 2-core box) mpedb's worst
+  worker also starves once (15.5 s) — the OS scheduler's unfairness, past
+  the ring's. That is the honest edge of the curve, and it is why the
+  throughput table above stops claiming smooth degradation past ~256.
+
+If individual write latency under contention is the workload's binding
+constraint and the writes touch DISJOINT data, the serialized-batch road
+is the wrong tool entirely — that is what the optimistic-guard work is
+for, measured in [documents.md](documents.md): many editors on one
+document vs editors on their own documents, p50 pinned to think time on
+independent surfaces, with the C1 calibration for how many editors fit
+inside a 1 s answer. (On a fully CONTENDED surface like this cell's 64
+shared keys, optimistic retry is the worst tool — we measured it
+collapsing to ~36 ops/s here — which is exactly the split documents.md's
+control arms attribute.)
+
 ## The honest boundaries
 
 - This is the WRITE-contention cell. Readers never take the lock at all
@@ -117,4 +160,9 @@ is the wrong knob to hold the writer lock under in the first place.
   smooth the 256–1 024 tail but not move the shape.
 
 Harness: `mpedb stress --mode incr --durability commit` (in-tree,
-multi-process, self-verifying) + `sqlite_incr.py` (same shape, stdlib).
+multi-process, self-verifying; per-op p50/p99/max since the latency
+section) + `workbench/lockbench-sqlite_incr.py` and
+`workbench/lockbench-pg_incr.py` (same shape). One instrument lesson paid
+for twice while measuring: the storage medium is part of the instrument —
+a curve from the box's slow volume read 34× under the SSD's and both
+control arms collapsed with it; curves from different disks do not mix.

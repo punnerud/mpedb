@@ -34,14 +34,21 @@ def child(path, secs, wid):
     c.execute("PRAGMA busy_timeout=60000")
     deadline = time.monotonic() + secs
     ops = ok = 0
+    lats = []
     while time.monotonic() < deadline:
         key = random.randrange(KEYSPACE)
         ops += 1
+        t0 = time.perf_counter_ns()
         cur = c.execute("UPDATE ctr SET v = v + 1 WHERE id = ?", (key,))
+        lats.append((time.perf_counter_ns() - t0) // 1000)
         if cur.rowcount == 1:
             ok += 1
     c.close()
-    print(f"{ops} {ok}")
+    lats.sort()
+    p50 = lats[len(lats) // 2] if lats else 0
+    p99 = lats[min(len(lats) * 99 // 100, len(lats) - 1)] if lats else 0
+    lmax = lats[-1] if lats else 0
+    print(f"{ops} {ok} {p50} {p99} {lmax}")
 
 
 def main():
@@ -71,23 +78,34 @@ def main():
         for wid in range(workers)
     ]
     tot_ops = tot_ok = failed = 0
+    p50s, p99s, lmaxes = [], [], []
     for p in procs:
         out, _ = p.communicate()
         if p.returncode != 0 or not out.strip():
             failed += 1
             continue
-        ops, ok = map(int, out.split())
+        ops, ok, p50, p99, lmax = map(int, out.split())
         tot_ops += ops
         tot_ok += ok
+        p50s.append(p50)
+        p99s.append(p99)
+        lmaxes.append(lmax)
     elapsed = time.monotonic() - t0
 
     c = sqlite3.connect(path)
     total = c.execute("SELECT sum(v) FROM ctr").fetchone()[0]
     c.close()
     verdict = "ok" if (total == tot_ok and failed == 0) else f"FAILED sum={total} ok={tot_ok} dead_children={failed}"
+    p50s.sort()
+    p99s.sort()
+    lat = (
+        f" p50={p50s[len(p50s) // 2]}µs p99={p99s[-1]}µs max={max(lmaxes)}µs"
+        if p50s
+        else ""
+    )
     print(
         f"sqlite incr: workers={workers} secs={secs} ops={tot_ops} ok={tot_ok} "
-        f"throughput={tot_ops / elapsed:.0f} ops/s"
+        f"throughput={tot_ops / elapsed:.0f} ops/s{lat}"
     )
     print(f"verify: {verdict}")
 
