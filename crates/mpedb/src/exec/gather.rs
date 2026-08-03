@@ -829,22 +829,44 @@ pub(super) fn gather_joined_arena(
         let held = match &held {
             Some(_) => held,
             None if hash_switch_wins(ctx, schema, join, &join.on, acc_width, acc.len(), &cells)? => {
-                let mut rows = gather_rows(
-                    ctx,
-                    join.table,
-                    &AccessPath::FullScan,
-                    join.policy.as_ref(),
-                    plan,
-                    params,
-                    None,
-                )?;
-                // Built at FULL width and narrowed AFTER: the join key comes
-                // from the ACCESS path, so the #125 mask — which keeps what
-                // later stages read — is free to drop the very column the hash
-                // is built on. The keys are copied into the map first, so the
-                // held rows can then be narrowed exactly as the ordinary held
-                // side is, and the resident cost is the same as that path's.
+                // The join key comes from the ACCESS path, so the #125 mask —
+                // which keeps what later STAGES read — is free to drop the
+                // very column the hash is built on. So the read is widened by
+                // that one slot and narrowed again once the keys are copied
+                // out: `Mask::with_slot`, exact because pruning preserves
+                // positions. This used to gather at FULL width instead, which
+                // on a wide inner meant decoding every column to build a hash
+                // on one — the 45×-materialisation cost the join-step profile
+                // measured (benchmarks/routing.md).
                 let key_col = join_hash_key(schema, join, &join.on, acc_width).map(|(_, i)| i);
+                let mut rows = match prune {
+                    Some(p) => {
+                        let m = p.inner(ji);
+                        let read = match key_col {
+                            Some(icol) => m.with_slot(icol as usize),
+                            None => m.clone(),
+                        };
+                        gather_narrowed(
+                            ctx,
+                            join.table,
+                            &AccessPath::FullScan,
+                            join.policy.as_ref(),
+                            plan,
+                            params,
+                            &inner_def,
+                            &read,
+                        )?
+                    }
+                    None => gather_rows(
+                        ctx,
+                        join.table,
+                        &AccessPath::FullScan,
+                        join.policy.as_ref(),
+                        plan,
+                        params,
+                        None,
+                    )?,
+                };
                 let map = key_col.map(|icol| build_hash_index(&rows, icol));
                 if let Some(p) = prune {
                     narrow_rows(&mut rows, p.inner(ji))?;

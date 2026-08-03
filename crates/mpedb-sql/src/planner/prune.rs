@@ -118,6 +118,25 @@ impl Mask {
     pub fn prunes(&self) -> bool {
         self.keep.iter().any(|k| !k)
     }
+
+    /// This mask, plus slot `i`. Used where the executor needs a column the
+    /// OUTPUT does not — the hash join's build key comes from the ACCESS
+    /// path, so the mask is free to drop the very column the hash is built
+    /// on. Widening for the read and narrowing again afterwards is exact
+    /// because pruning preserves POSITIONS (a dropped slot decodes as NULL
+    /// in place; only the dead tail is trimmed), so an ordinal means the same
+    /// thing in the widened row as in the full one.
+    ///
+    /// Never shrinks: a slot past the mask already reads as observable
+    /// (`observes`'s open-world rule), and this keeps it that way.
+    pub fn with_slot(&self, i: usize) -> Mask {
+        let mut keep = self.keep.clone();
+        if i >= keep.len() {
+            return self.clone();
+        }
+        keep[i] = true;
+        Mask { keep }
+    }
 }
 
 /// Which slots of each stage of one `SELECT`'s row pipeline a later stage can

@@ -209,13 +209,34 @@ is what says so. Decomposing the 520 ns each of the ~11 000 join steps costs:
 Materialising a row costs **45× walking past it**. A hash join would
 materialise those same rows, so it cannot be the answer; PostgreSQL's entire
 per-step budget is 187 ns, and we spend that much before the probe even
-starts. The lever is decode-time column pruning on the join path — and the
-machinery already exists: `RowCursor::next_masked` (#125's observable-column
-analysis) decodes only the slots a statement reads, `scan_rows_pruned` uses
-it, and the join gather calls `scan_rows_capped`, which does not. Threading
-the analysis through join gather is the next concrete piece of work; it is
-scoped, guarded by the corpus, and deliberately not started at the tail of
-the session that measured it.
+starts. (mpedb already *has* a hash join, and it fires on this chain: with
+`MPEDB_NO_HASH_SWITCH=1` the step costs 595 ns instead of 518. The
+algorithm was never the missing piece.)
+
+The lever is decode-time column pruning, and one of the two join reads has
+now been fixed. The hash branch gathered its inner relation at **full
+width** — the build key comes from the access path, so #125's mask is free
+to drop the very column the hash is built on, and the old code sidestepped
+that by not pruning at all. Widening the mask by exactly that slot
+(`Mask::with_slot`, exact because pruning preserves positions) lets the scan
+decode narrowly and the existing re-narrow pass drop the key afterwards.
+Measured on a 1000-row inner joined as `count(*)`, so nothing of it is
+observable past the join:
+
+| inner width | before | after |
+|---:|---:|---:|
+| 2 columns | 442 µs | 442 µs |
+| 8 columns | 534 µs | 471 µs |
+| 20 columns | 713 µs | **549 µs** |
+
+Per-column read cost 15.0 → 5.9 µs (−61 %): exactly nothing where there is
+nothing to skip, −23 % where there is. The chain benchmark above is
+unmoved, because its tables are two columns wide — which is the honest
+shape of this change, not a disappointment.
+
+Still open, and named: the per-outer-row nested-loop probe (`get_by_pk` and
+`scan_rows_capped`) reads full width too, and `get_by_pk_cols` already
+exists for it. That one is the next piece of work.
 
 **Overhead: mpedb wins by a distance**, on the axis an embedded engine owns —
 12 µs against 74 for a point-anchored join through those same twelve tables,
