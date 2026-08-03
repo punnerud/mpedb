@@ -994,12 +994,16 @@ impl Database {
     pub fn open_with_config(mut config: Config) -> Result<Database> {
         // MPEDB_OPEN_TRACE=1: per-stage µs on stderr (the SP_TRACE pattern) —
         // the connect cell's attribution instrument (#N2 0.2.9).
-        let trace = std::env::var_os("MPEDB_OPEN_TRACE").is_some();
-        let mut t0 = std::time::Instant::now();
+        // `Instant::now()` PANICS on wasm32-unknown-unknown, and the browser
+        // playground's open runs through here — so the clock is only ever
+        // touched when tracing is actually on (env is always empty there).
+        let mut t0 = std::env::var_os("MPEDB_OPEN_TRACE")
+            .is_some()
+            .then(std::time::Instant::now);
         let mut stage = |name: &str| {
-            if trace {
-                eprintln!("[open] {name}: {}µs", t0.elapsed().as_micros());
-                t0 = std::time::Instant::now();
+            if let Some(prev) = t0 {
+                eprintln!("[open] {name}: {}µs", prev.elapsed().as_micros());
+                t0 = Some(std::time::Instant::now());
             }
         };
         // Resolve `:memory:` / `:memory:shared:name` before the engine opens.

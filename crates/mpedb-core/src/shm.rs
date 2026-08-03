@@ -3598,12 +3598,15 @@ impl Shm {
         }
         // MPEDB_OPEN_TRACE=1: per-stage µs (#N2 0.2.9 — the connect cell's
         // attribution reaches its floor here).
-        let trace = std::env::var_os("MPEDB_OPEN_TRACE").is_some();
-        let mut t0 = std::time::Instant::now();
+        // Clock only when tracing: `Instant::now()` panics on wasm32, and
+        // wasm's database IS a private in-memory one — this exact function.
+        let mut t0 = std::env::var_os("MPEDB_OPEN_TRACE")
+            .is_some()
+            .then(std::time::Instant::now);
         let mut stage = |name: &str| {
-            if trace {
-                eprintln!("[open_memory] {name}: {}µs", t0.elapsed().as_micros());
-                t0 = std::time::Instant::now();
+            if let Some(prev) = t0 {
+                eprintln!("[open_memory] {name}: {}µs", prev.elapsed().as_micros());
+                t0 = Some(std::time::Instant::now());
             }
         };
         let file = memory_backing_file()?;

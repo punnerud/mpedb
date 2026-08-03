@@ -940,12 +940,15 @@ impl Engine {
         }
         // MPEDB_OPEN_TRACE=1: per-stage µs (the facade's connect attribution
         // reaches into the engine here, #N2 0.2.9).
-        let trace = std::env::var_os("MPEDB_OPEN_TRACE").is_some();
-        let mut t0 = std::time::Instant::now();
+        // Clock only when tracing: `Instant::now()` panics on wasm32 (see the
+        // facade's twin — the playground opens through this path).
+        let mut t0 = std::env::var_os("MPEDB_OPEN_TRACE")
+            .is_some()
+            .then(std::time::Instant::now);
         let mut stage = |name: &str| {
-            if trace {
-                eprintln!("[engine_open] {name}: {}µs", t0.elapsed().as_micros());
-                t0 = std::time::Instant::now();
+            if let Some(prev) = t0 {
+                eprintln!("[engine_open] {name}: {}µs", prev.elapsed().as_micros());
+                t0 = Some(std::time::Instant::now());
             }
         };
         let shm = Shm::open(
