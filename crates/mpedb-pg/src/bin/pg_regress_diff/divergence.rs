@@ -49,10 +49,21 @@ fn short(s: &str, n: usize) -> String {
 /// divergence is mpedb being wrong about a question it took, and this one is
 /// mpedb taking a question PostgreSQL declined. A `CHECK` mpedb does not
 /// enforce and an out-of-range value mpedb accepts both land here.
-pub fn pg_refused_mpedb_answered(mp: &str) -> Shape {
+/// `why` is PostgreSQL's own error message, SHAPED (quoted text and digit runs
+/// removed). It is the grouping key, and it has to be: mpedb produced an
+/// ANSWER, so nothing on mpedb's side says what was wrong with the question.
+/// Without it this is one line of a thousand whose example — `0` — describes
+/// nothing, which is the failure this module exists to stop.
+pub fn pg_refused_mpedb_answered(why: Option<&str>, mp: &str) -> Shape {
+    let Some(why) = why else {
+        return Shape {
+            key: "mpedb ANSWERED what PostgreSQL refused (no PostgreSQL message)".into(),
+            example: short(mp.lines().next().unwrap_or(""), 90),
+        };
+    };
     Shape {
-        key: "mpedb ANSWERED what PostgreSQL refused".into(),
-        example: short(mp.lines().next().unwrap_or(""), 90),
+        key: format!("mpedb ANSWERED, PostgreSQL: {}", short(why, 78)),
+        example: format!("mpedb said `{}`", short(mp.lines().next().unwrap_or(""), 60)),
     }
 }
 
@@ -270,6 +281,29 @@ mod tests {
         // row-count branch catches first and correctly. The empty-string case
         // needs a row that has one.
         assert!(classify(&["NULL|x"], &["|x"], true).key.contains("empty string"));
+    }
+
+    #[test]
+    fn the_answered_bucket_groups_on_postgresqls_reason_because_mpedb_has_none() {
+        // Two statements mpedb answered, refused by PostgreSQL for the SAME
+        // reason, must land on ONE line — and one refused for a different
+        // reason must not join them. Without PostgreSQL's message there is
+        // nothing to group on at all: mpedb produced rows, and rows do not say
+        // what was wrong with the question.
+        let a = pg_refused_mpedb_answered(Some("value out of range for type integer"), "0");
+        let b = pg_refused_mpedb_answered(Some("value out of range for type integer"), "7");
+        let c = pg_refused_mpedb_answered(Some("division by zero"), "0");
+        assert_eq!(a.key, b.key);
+        assert_ne!(a.key, c.key);
+        // The example still shows what mpedb said, which is the other half of
+        // the finding.
+        assert!(a.example.contains('0'), "{}", a.example);
+        assert!(b.example.contains('7'), "{}", b.example);
+        // Missing message is its own line rather than silently merged into a
+        // real reason.
+        assert!(pg_refused_mpedb_answered(None, "0")
+            .key
+            .contains("no PostgreSQL message"));
     }
 
     #[test]

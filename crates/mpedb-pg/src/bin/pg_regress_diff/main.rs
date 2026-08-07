@@ -277,6 +277,10 @@ fn run(args: &[String]) -> Result<i32, String> {
         if tail > 0 {
             println!("  {tail:>6}  … in {} further shapes", ranked.len() - shown);
         }
+        // The same rollup the refusal list gets, for the same reason: this
+        // family is split by PostgreSQL's REASON, so its members scatter below
+        // the cutoff and the family's size disappears with them.
+        print_families(&ranked, &["mpedb ANSWERED, PostgreSQL: "]);
     }
 
     if !causes.is_empty() {
@@ -305,7 +309,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         if tail > 0 {
             println!("  {tail:>6}  … in {} further causes", ranked.len() - shown);
         }
-        print_families(&ranked);
+        print_families(&ranked, &["unknown function `", "table function in FROM `"]);
     }
 
     // The `unknown table` split, printed whenever there is one to print.
@@ -574,9 +578,8 @@ struct Cause {
 /// its own use and that nothing will ever implement as a builtin. The family
 /// total is real; the share of it a table-function planner would collect is
 /// not, and only both numbers together say so.
-fn print_families(ranked: &[(&String, &Cause)]) {
-    const FAMILIES: &[&str] = &["unknown function `", "table function in FROM `"];
-    for fam in FAMILIES {
+fn print_families(ranked: &[(&String, &Cause)], families: &[&str]) {
+    for fam in families {
         let members: Vec<&(&String, &Cause)> =
             ranked.iter().filter(|(k, _)| k.starts_with(fam)).collect();
         if members.is_empty() {
@@ -584,19 +587,19 @@ fn print_families(ranked: &[(&String, &Cause)]) {
         }
         let total: u32 = members.iter().map(|(_, c)| c.count).sum();
         let biggest = members.iter().map(|(_, c)| c.count).max().unwrap_or(0);
-        let name = fam.trim_end_matches(" `").trim_end_matches('`');
+        let name = fam.trim_end_matches(": ").trim_end_matches(" `").trim_end_matches('`');
         println!(
             "\n  FAMILY `{name}`: {total} refusals over {} distinct names; \
              biggest single name {biggest} ({:.0}% of the family).",
             members.len(),
             100.0 * f64::from(biggest) / f64::from(total.max(1))
         );
-        for (k, c) in members.iter().take(6) {
+        for (k, c) in members.iter().take(12) {
             println!("      {:>6}  {}", c.count, k);
         }
-        if members.len() > 6 {
-            let rest: u32 = members.iter().skip(6).map(|(_, c)| c.count).sum();
-            println!("      {rest:>6}  … {} further names", members.len() - 6);
+        if members.len() > 12 {
+            let rest: u32 = members.iter().skip(12).map(|(_, c)| c.count).sum();
+            println!("      {rest:>6}  … {} further names", members.len() - 12);
         }
     }
 }
@@ -742,9 +745,15 @@ fn diff_file(
             // PostgreSQL refusing what mpedb ACCEPTS is also a divergence: mpedb
             // answered a question PostgreSQL declined, which is a wrong answer in
             // the direction nobody looks for.
-            (Some(Outcome::Error(_)), Some(Outcome::Rows(y))) => {
+            (Some(Outcome::Error(pe)), Some(Outcome::Rows(y))) => {
                 c.diverged += 1;
-                note(diffs, divergence::pg_refused_mpedb_answered(y));
+                note(
+                    diffs,
+                    divergence::pg_refused_mpedb_answered(
+                        pe.as_ref().map(|e| cause_shape(&e.message)).as_deref(),
+                        y,
+                    ),
+                );
             }
             (Some(Outcome::Rows(x)), Some(Outcome::Rows(y))) => match compare(x, y, stmt) {
                 Verdict::Same => c.matched += 1,
@@ -929,13 +938,36 @@ fn pg_transcript(stmts: &[String]) -> Result<Vec<Outcome>, String> {
     let chunks = split_marked(&text, MARK);
     Ok((0..stmts.len())
         .map(|i| match chunks.get(i) {
-            // PostgreSQL's own wording is never grouped with mpedb's, so its
-            // side carries no message.
+            // PostgreSQL's own wording is never grouped with MPEDB's — the two
+            // engines phrase the same refusal differently and a shared bucket
+            // would be noise. It IS kept, because there is one bucket where it
+            // is the only information there is: `PostgreSQL refused, mpedb
+            // ANSWERED`, the largest divergence shape. Nothing on mpedb's side
+            // says why that statement should have been refused; PostgreSQL's
+            // message is the entire content of the finding.
             None => Outcome::Error(None),
-            Some(c) if c.contains("ERROR:") || c.contains("FATAL:") => Outcome::Error(None),
+            Some(c) if c.contains("ERROR:") || c.contains("FATAL:") => {
+                Outcome::Error(pg_error_text(c))
+            }
             Some(c) => Outcome::Rows(strip_notices(c)),
         })
         .collect())
+}
+
+/// PostgreSQL's own error line out of a psql chunk.
+///
+/// No SQLSTATE: `psql -q -A -t` prints `ERROR:  <message>` and nothing else,
+/// so the code is a placeholder. The message is what matters here — see the
+/// call site on why this side is kept at all.
+fn pg_error_text(chunk: &str) -> Option<ErrText> {
+    let line = chunk
+        .lines()
+        .find(|l| l.contains("ERROR:") || l.contains("FATAL:"))?;
+    let at = line.find("ERROR:").or_else(|| line.find("FATAL:"))?;
+    Some(ErrText {
+        code: "-".into(),
+        message: line[at + 6..].trim().to_string(),
+    })
 }
 
 /// Empty the PostgreSQL side before a file runs.

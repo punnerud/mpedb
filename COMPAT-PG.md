@@ -336,7 +336,7 @@ the same way:
 
 | statements | shape |
 |---:|---|
-| **1 061** | **mpedb ANSWERED what PostgreSQL refused** |
+| **1 058** | **mpedb ANSWERED what PostgreSQL refused** — a FAMILY over 218 reasons, see below |
 | 628 | text values differ (the residual catch-all) |
 | 518 | row count: mpedb returned **NO** rows |
 | 131 | row count: mpedb returned MORE rows |
@@ -351,12 +351,39 @@ the same way:
 | 19 | trailing spaces — PostgreSQL PADS (`character(n)`), mpedb does not |
 | 32 | field-count and float-precision shapes |
 
-**A third of the wrong answers are mpedb accepting what PostgreSQL rejects.**
-1 061 of 3 101. That is the direction nobody looks for — every other line is
-mpedb getting a question wrong, and this one is mpedb taking a question that
-should have been refused. It is also the direction in which "improving
-compatibility" makes things worse, which this document already warned about in
-the abstract (`EXPLAIN`, `COPY`) without knowing it was the largest item.
+**A third of the wrong answers are mpedb accepting what PostgreSQL rejects** —
+1 058 of 3 101 — and the moment that line was split by PostgreSQL's own reason,
+it said something different from what it looked like. That is the SEVENTH time
+in this document, and the first time the mistake was made *by this section*:
+the paragraph that used to stand here read the 1 058 as mpedb being too
+permissive across the board. It is 218 distinct reasons, and the largest ones
+are not that at all:
+
+| statements | PostgreSQL's reason | what it is |
+|---:|---|---|
+| 144 | `relation _ does not exist` | PostgreSQL's OWN cascade — its earlier `CREATE` failed, mpedb's did not |
+| 83 | `type _ does not exist` | the same, for types |
+| 58 | `invalid input syntax for type json` | **mpedb accepting bad JSON** |
+| 42 | `violates foreign key constraint _` | **mpedb not enforcing an FK PostgreSQL does** |
+| 27 | `invalid input syntax for type numeric` | **mpedb's sqlite CAST rule** |
+| 27 | `no schema has been selected to create in` | environment, not a question about mpedb |
+| 22 | `current transaction is aborted` | PostgreSQL's cascade again |
+| 22 | `division by zero` | **mpedb answering where PostgreSQL raises** |
+| 560 | 206 further reasons | a tail |
+
+So roughly 276 of the top are PostgreSQL declining because of something that
+already went wrong ON PostgreSQL'S SIDE, or because of the harness's schema
+handling — the exact mirror of the `unknown table` shadow measured on the
+refusal column, and it inflates this line the same way. The genuinely
+actionable core is narrower and much more specific: JSON input validation,
+foreign-key enforcement, numeric CAST, and division by zero. `'nan'::numeric`
+folding to `0` — already named in this document as a separate item — is
+visible right there in the numeric line.
+
+The reading still holds in kind: this is the direction nobody looks for, and
+the direction in which "improving compatibility" makes the engine worse. Its
+SIZE was overstated by a third, by exactly the reading this document has
+warned against six times before doing it once more.
 
 **Second, 518 statements where mpedb answers with NO ROWS.** A feature that
 silently returns nothing is worse than one that refuses: a refusal is visible
@@ -448,8 +475,8 @@ prints both, and that is the general rule: **a bucket split by name needs a
 family rollup, or the next reader reconstructs the wrong total by adding up the
 top few lines.**
 
-**Five times now, one number has stood for a population nobody had looked
-inside, and five times the reading was wrong while the number was right.**
+**Seven times now, one number has stood for a population nobody had looked
+inside, and seven times the reading was wrong while the number was right.**
 
 | the line | what it looked like | what it was |
 |---|---|---|
@@ -458,10 +485,19 @@ inside, and five times the reading was wrong while the number was right.**
 | tail `TIME` 150 | a type-name gap | `AT TIME ZONE`, swallowed as an alias |
 | `unknown table` 1 875 | the #1 item | 86 % shadow of the items below it |
 | `table function in FROM` 969 | one feature: table functions | 107 names; 39 % is ONE corpus-local plpgsql helper |
+| `mpedb ANSWERED what PG refused` 1 058 | mpedb too permissive, across the board | 218 reasons; ~26 % is PostgreSQL's OWN cascade |
 
 None of those counts was wrong. The INTERPRETATION was, every time, and always
 for the same reason: an aggregate with one example under it reads as a
 description of the whole, and an example is one arbitrary member.
+
+The seventh happened in the same session as the sixth, in a section written to
+warn about it, by the author of that section — which is the strongest available
+evidence that knowing the rule does not apply it. What applies it is the tool:
+a grouping key that keeps the distinguishing field. The rule that follows is
+mechanical rather than wise. **Whenever a bucket reaches the top of a ranked
+list, the next move is to find a field that splits it and re-rank — and to
+print the family total alongside, so the split does not delete the size.**
 
 **A collapsed line's EXAMPLE is not its description, and this document said so
 three times before believing it.** `unknown function` carried
