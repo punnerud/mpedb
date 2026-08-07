@@ -51,7 +51,27 @@ pub(super) fn extract_access(
     // rewrite a filter. `as_col_cmp` matches `BExpr::Binary` only and so
     // already skips `ClassCmp`; this guard is the one that does not depend on
     // which node the binder happened to choose.
-    let typeless = |col: u16| table.columns[col as usize].ty == ColumnType::Any;
+    // `INDEX_EXPR_COL` (`u16::MAX`) is not an ordinal at all — it marks a key
+    // part of an EXPRESSION index (`CREATE INDEX ON t (lower(a))`), where the
+    // key is computed rather than read from a column. Indexing `table.columns`
+    // with it PANICS, and a panic is the one outcome this crate's contract does
+    // not allow: an input it cannot plan must be a named refusal.
+    //
+    // Reporting it as `typeless` is not a shrug — it is the correct
+    // conservative answer at all three call sites below. Each one uses this to
+    // decide "can a key bound be built from this part", and for a computed key
+    // part the answer is no: `find` matches a COLUMN comparison, and there is no
+    // column here to match. So the part blocks the probe and the predicate stays
+    // a residual filter over a scan, which is exactly what an unusable key part
+    // should do.
+    //
+    // Found by the PostgreSQL regress differential on `create_index.sql`, which
+    // is full of expression indexes; the sqlite corpus has none, so nothing had
+    // ever reached this line with the sentinel.
+    let typeless = |col: u16| {
+        col == mpedb_types::schema::INDEX_EXPR_COL
+            || table.columns[col as usize].ty == ColumnType::Any
+    };
 
     // Index MEMBERSHIP is "no indexed column of this row is NULL" (one rule,
     // `engine::index_row_key`). For a SINGLE-column index that is free: a
@@ -72,9 +92,16 @@ pub(super) fn extract_access(
     // index path ("…and the trailing columns NOT NULL"); the access paths were
     // simply never given it.
     let suffix_not_null = |ix: &mpedb_types::IndexDef, k: usize| -> bool {
-        ix.columns[k.min(ix.columns.len())..]
-            .iter()
-            .all(|&c| !table.columns[c as usize].nullable)
+        ix.columns[k.min(ix.columns.len())..].iter().all(|&c| {
+            // An EXPRESSION key part has no column to be nullable, and its value
+            // can certainly be NULL (`lower(a)` of a NULL `a`). Reporting it as
+            // nullable is the conservative answer: it denies the coverage this
+            // predicate grants, so the path is not taken. Reporting it NOT NULL
+            // would grant coverage the index does not have — and indexing
+            // `table.columns` with `u16::MAX` would panic outright.
+            c != mpedb_types::schema::INDEX_EXPR_COL
+                && !table.columns[c as usize].nullable
+        })
     };
 
     // 1. Every PK column pinned by equality -> PkPoint.
@@ -133,6 +160,13 @@ pub(super) fn extract_access(
         type Candidate = (usize, Vec<(usize, Atom)>, bool, bool);
         let mut best: Option<Candidate> = None;
         for (pos, ix) in table.indexes.iter().enumerate() {
+            // An expression index is never an access path (see
+            // `IndexDef::has_expression_part`): its key is a computed value, and
+            // its ordinals carry a sentinel that would panic below.
+            if ix.has_expression_part() {
+                continue;
+            }
+
             if pos >= 63 {
                 break;
             }
@@ -187,7 +221,13 @@ pub(super) fn extract_access(
     // above (the engine folds those); only <, >, BETWEEN, and the multi-col-PK
     // equality-as-point-range fall through here — and for a collated column they
     // must stay a residual filter (`sql_cmp` honors the collation) over a scan.
-    let collated = |col: u16| table.columns[col as usize].collation != Collation::Binary;
+    // Same sentinel guard as `typeless`. This one is only ever reached through
+    // `unbounded`, which ORs the two — but guarding both is what keeps the fix
+    // from depending on the order of that `||`.
+    let collated = |col: u16| {
+        col != mpedb_types::schema::INDEX_EXPR_COL
+            && table.columns[col as usize].collation != Collation::Binary
+    };
 
     // 3. Range over the first PK column. `typeless` blocks it for the same
     // reason `collated` does — the bound would be encoded raw, and for an
@@ -275,6 +315,13 @@ pub(super) fn extract_access(
     // declaration order with a range conjunct wins; both bounds on the SAME
     // column are consumed together, everything else stays residual.
     for (pos, ix) in table.indexes.iter().enumerate() {
+        // An expression index is never an access path (see
+        // `IndexDef::has_expression_part`): its key is a computed value, and
+        // its ordinals carry a sentinel that would panic below.
+        if ix.has_expression_part() {
+            continue;
+        }
+
         if pos >= 63 {
             break; // beyond the footprint bitmap — never chosen
         }

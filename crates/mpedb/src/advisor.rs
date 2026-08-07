@@ -262,6 +262,11 @@ fn fold_shape(
             }
         }
         AccessPath::FullScan => {}
+        // No table, so no index to advise on.
+        AccessPath::Series { .. } => {
+            rep.skipped_shape += 1;
+            return;
+        }
         AccessPath::FtsScan { .. } => {
             rep.skipped_shape += 1;
             return;

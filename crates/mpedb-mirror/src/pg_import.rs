@@ -104,7 +104,7 @@ pub fn import_pg(
         schema.clone(),
         opts.size_bytes,
         opts.durability,
-        mpedb_types::BareGroupBy::Postgres,
+        mpedb_types::Dialect::Postgres,
     )?;
 
     // install the changelog + triggers BEFORE the snapshot (§4.3 step 0) so a
@@ -242,7 +242,7 @@ mod tests {
     use mpedb::ExecResult;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir()
+        let p = mpedb_testkit::scratch_base()
             .join("mpedb-mirror-tests")
             .join(format!("{name}-{}.mpedb", std::process::id()));
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

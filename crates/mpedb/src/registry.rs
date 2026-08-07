@@ -38,9 +38,29 @@ pub(crate) const MAX_REGISTRY_PLANS: usize = 4096;
 /// the registry is full.
 pub(crate) const EVICT_BATCH: usize = 256;
 
-pub(crate) fn plan_subkey(hash: &PlanHash) -> Vec<u8> {
-    let mut k = Vec::with_capacity(PLAN_PREFIX.len() + 32);
+/// The dialect tag that separates PostgreSQL plans from sqlite ones IN THE KEY.
+///
+/// Why a key separation and not just the record's dialect byte: with one key per
+/// hash, a plan published by a sqlite session and one published by a PG session
+/// for the same SQL land on the same key, and whichever wrote last evicts the
+/// other. The record's byte then turns every read by the loser into an error.
+/// That is fine while a database HAS a dialect, and wrong the moment two
+/// sessions with different dialects share a file — which is the whole point of
+/// making the dialect per-session.
+///
+/// `0xFF` cannot collide with a sqlite key: a sqlite key is `plan/` + 32 bytes
+/// and a PG key is `plan/` + 33, and two byte strings of different lengths are
+/// different keys whatever their contents. Sqlite keys are therefore
+/// BYTE-IDENTICAL to what they have always been, so no existing plan cache is
+/// invalidated by this change.
+const PG_KEY_TAG: u8 = 0xFF;
+
+pub(crate) fn plan_subkey(hash: &PlanHash, dialect: mpedb_types::Dialect) -> Vec<u8> {
+    let mut k = Vec::with_capacity(PLAN_PREFIX.len() + 33);
     k.extend_from_slice(PLAN_PREFIX);
+    if dialect == mpedb_types::Dialect::Postgres {
+        k.push(PG_KEY_TAG);
+    }
     k.extend_from_slice(&hash.0);
     k
 }
@@ -64,21 +84,21 @@ pub(crate) struct Record<'a> {
     /// a process configured `postgres` could run a plan a `sqlite` process
     /// published — bare grouped columns, case-folded LIKE and all — and get the
     /// lenient answer its own config had refused to compile.
-    pub dialect: mpedb_types::BareGroupBy,
+    pub dialect: mpedb_types::Dialect,
     pub last_used_txn: u64,
 }
 
-fn dialect_byte(d: mpedb_types::BareGroupBy) -> u8 {
+fn dialect_byte(d: mpedb_types::Dialect) -> u8 {
     match d {
-        mpedb_types::BareGroupBy::Sqlite => 0,
-        mpedb_types::BareGroupBy::Postgres => 1,
+        mpedb_types::Dialect::Sqlite => 0,
+        mpedb_types::Dialect::Postgres => 1,
     }
 }
 
 pub(crate) fn encode_record(
     sql: &str,
     blob: &[u8],
-    dialect: mpedb_types::BareGroupBy,
+    dialect: mpedb_types::Dialect,
     last_used_txn: u64,
 ) -> Vec<u8> {
     // `last_used_txn` stays LAST: `patched_last_used` rewrites the trailing
@@ -109,8 +129,8 @@ pub(crate) fn parse_record(bytes: &[u8]) -> Option<Record<'_>> {
     let blob_len = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().ok()?) as usize;
     let blob = take(bytes, &mut pos, blob_len)?;
     let dialect = match take(bytes, &mut pos, 1)?[0] {
-        0 => mpedb_types::BareGroupBy::Sqlite,
-        1 => mpedb_types::BareGroupBy::Postgres,
+        0 => mpedb_types::Dialect::Sqlite,
+        1 => mpedb_types::Dialect::Postgres,
         // Untrusted shared memory: an unknown dialect is not a plan.
         _ => return None,
     };
@@ -152,21 +172,22 @@ pub(crate) fn decode_registry_plan(
     record_bytes: &[u8],
     hash: &PlanHash,
     schema: &Schema,
-    dialect: mpedb_types::BareGroupBy,
+    dialect: mpedb_types::Dialect,
 ) -> Result<CompiledPlan> {
     let Some(rec) = parse_record(record_bytes) else {
         return Err(Error::UnknownPlan(*hash));
     };
     if rec.dialect != dialect {
-        // Named, not `UnknownPlan`: the plan exists and is perfectly valid —
-        // it just does not belong to a process compiling under this dialect,
-        // and running it anyway is the wrong answer this gate exists to stop.
+        // Since the dialect is part of the KEY, reaching this is not a
+        // cross-dialect READ any more — those cannot collide. It means the
+        // record's own byte disagrees with the key it was stored under, i.e.
+        // the shared memory has been corrupted or written by something that is
+        // not this code. Refuse by name rather than run it.
         return Err(Error::Unsupported(format!(
-            "plan {hash} was compiled under the `{}` dialect and this database is \
-             `{}` — the two accept different SQL, so running it here would answer \
-             a question this process refused to compile. Re-prepare the statement.",
-            crate::costlayer::dialect_name(rec.dialect),
+            "plan {hash} is stored under the `{}` dialect key but records `{}` — \
+             the registry entry is inconsistent. Re-prepare the statement.",
             crate::costlayer::dialect_name(dialect),
+            crate::costlayer::dialect_name(rec.dialect),
         )));
     }
     let plan = match CompiledPlan::decode(rec.blob, schema) {
@@ -188,9 +209,9 @@ pub(crate) fn insert_plan(
     hash: &PlanHash,
     sql: &str,
     blob: &[u8],
-    dialect: mpedb_types::BareGroupBy,
+    dialect: mpedb_types::Dialect,
 ) -> Result<bool> {
-    let subkey = plan_subkey(hash);
+    let subkey = plan_subkey(hash, dialect);
     let existing = txn.sys_get(&subkey)?;
     if let Some(cur) = &existing {
         // Identical content INCLUDES the dialect: a record published by a
@@ -315,13 +336,13 @@ mod tests {
 
     #[test]
     fn record_roundtrip() {
-        let rec = encode_record("SELECT 1", b"blobby", mpedb_types::BareGroupBy::Sqlite, 42);
+        let rec = encode_record("SELECT 1", b"blobby", mpedb_types::Dialect::Sqlite, 42);
         let parsed = parse_record(&rec).unwrap();
         assert_eq!(parsed.sql, "SELECT 1");
         assert_eq!(parsed.blob, b"blobby");
         assert_eq!(parsed.last_used_txn, 42);
 
-        assert_eq!(parsed.dialect, mpedb_types::BareGroupBy::Sqlite);
+        assert_eq!(parsed.dialect, mpedb_types::Dialect::Sqlite);
 
         // `patched_last_used` rewrites the TRAILING eight bytes in place, so
         // the dialect byte sitting in front of them must survive untouched.
@@ -332,13 +353,13 @@ mod tests {
         assert_eq!(parse_record(&patched).unwrap().blob, b"blobby");
         assert_eq!(
             parse_record(&patched).unwrap().dialect,
-            mpedb_types::BareGroupBy::Sqlite
+            mpedb_types::Dialect::Sqlite
         );
 
-        let pg = encode_record("SELECT 1", b"blobby", mpedb_types::BareGroupBy::Postgres, 42);
+        let pg = encode_record("SELECT 1", b"blobby", mpedb_types::Dialect::Postgres, 42);
         assert_eq!(
             parse_record(&pg).unwrap().dialect,
-            mpedb_types::BareGroupBy::Postgres
+            mpedb_types::Dialect::Postgres
         );
         // An unknown dialect byte is not a plan — shared memory is hostile.
         let mut evil = pg.clone();
@@ -353,25 +374,31 @@ mod tests {
     /// goes through prepare: it decodes straight out of the shared registry.
     /// So a `postgres` process could run a plan a `sqlite` process published —
     /// bare grouped columns and case-folded LIKE included — and get the lenient
-    /// answer its own configuration had refused to compile. The two dialects
-    /// accept different SQL; a plan is only interchangeable within one.
+    /// answer its own configuration had refused to compile.
+    ///
+    /// The dialect is now part of the KEY, so that collision cannot happen by
+    /// ordinary means: the two dialects address different records. What is left
+    /// for this gate to catch is a record whose own byte disagrees with the key
+    /// it sits under — shared memory is hostile, and the byte is the last thing
+    /// standing between a hand-written record and the executor. It must still
+    /// fire BEFORE decode, and it must still name both sides.
     #[test]
     fn a_plan_from_the_other_dialect_is_refused_by_name() {
-        use mpedb_types::BareGroupBy;
+        use mpedb_types::Dialect;
         // The blob is nonsense on purpose: the dialect gate must come BEFORE
         // decode, so this never reaches the validator.
-        let rec = encode_record("SELECT 1", b"not a plan", BareGroupBy::Sqlite, 1);
+        let rec = encode_record("SELECT 1", b"not a plan", Dialect::Sqlite, 1);
         let schema = Schema::new(Vec::new()).unwrap();
         let h = PlanHash([0u8; 32]);
-        let e = decode_registry_plan(&rec, &h, &schema, BareGroupBy::Postgres).unwrap_err();
+        let e = decode_registry_plan(&rec, &h, &schema, Dialect::Postgres).unwrap_err();
         let e = e.to_string();
         assert!(
-            e.contains("`sqlite` dialect") && e.contains("`postgres`"),
+            e.contains("`sqlite`") && e.contains("`postgres`"),
             "the refusal must name BOTH sides: {e}"
         );
         // Matching dialect gets past the gate and fails on the blob instead,
         // which is what proves the gate is not simply refusing everything.
-        let e = decode_registry_plan(&rec, &h, &schema, BareGroupBy::Sqlite).unwrap_err();
+        let e = decode_registry_plan(&rec, &h, &schema, Dialect::Sqlite).unwrap_err();
         assert!(matches!(e, Error::UnknownPlan(_)), "{e}");
     }
 
@@ -382,13 +409,39 @@ mod tests {
     /// registry.
     #[test]
     fn plan_family_bound_excludes_the_counter_and_covers_every_hash() {
-        for b in [0u8, 1, 0x2f, 0x30, 0x7f, 0xfe, 0xff] {
-            let k = plan_subkey(&PlanHash([b; 32]));
-            assert!(k.as_slice() >= PLAN_PREFIX, "{b:#x} below the family");
-            assert!(k.as_slice() < PLAN_PREFIX_END, "{b:#x} above the family");
+        // BOTH dialects, because a PG key outside the family would never be
+        // walked by eviction — the PG half of the registry would then grow
+        // without a cap, which is the same un-capping this test was written to
+        // catch, just reached from the other side.
+        for d in [mpedb_types::Dialect::Sqlite, mpedb_types::Dialect::Postgres] {
+            for b in [0u8, 1, 0x2f, 0x30, 0x7f, 0xfe, 0xff] {
+                let k = plan_subkey(&PlanHash([b; 32]), d);
+                assert!(k.as_slice() >= PLAN_PREFIX, "{b:#x} {d:?} below the family");
+                assert!(k.as_slice() < PLAN_PREFIX_END, "{b:#x} {d:?} above the family");
+            }
         }
         assert!(PLAN_COUNT_KEY >= PLAN_PREFIX_END);
         assert!(!PLAN_COUNT_KEY.starts_with(PLAN_PREFIX));
+    }
+
+    /// The two dialects must never land on the same key — that collision is
+    /// precisely what made the dialect a per-FILE property before.
+    #[test]
+    fn the_two_dialects_never_share_a_key_and_sqlite_keys_are_unchanged() {
+        for b in [0u8, 1, 0x7f, 0xfe, 0xff] {
+            let h = PlanHash([b; 32]);
+            let lite = plan_subkey(&h, mpedb_types::Dialect::Sqlite);
+            let pg = plan_subkey(&h, mpedb_types::Dialect::Postgres);
+            assert_ne!(lite, pg, "{b:#x}");
+            // A sqlite key is byte-for-byte what it has always been, so every
+            // plan already published in every existing file is still found.
+            let mut want = PLAN_PREFIX.to_vec();
+            want.extend_from_slice(&h.0);
+            assert_eq!(lite, want, "{b:#x}");
+            // …and the lengths differ, which is why no hash content can ever
+            // make the two coincide.
+            assert_eq!(pg.len(), lite.len() + 1);
+        }
     }
 
     #[test]
@@ -401,11 +454,11 @@ mod tests {
         evil.extend_from_slice(b"x");
         assert!(parse_record(&evil).is_none());
         // trailing garbage
-        let mut rec = encode_record("s", b"b", mpedb_types::BareGroupBy::Sqlite, 1);
+        let mut rec = encode_record("s", b"b", mpedb_types::Dialect::Sqlite, 1);
         rec.push(0);
         assert!(parse_record(&rec).is_none());
         // every truncation fails cleanly
-        let rec = encode_record("SELECT 1", b"blob", mpedb_types::BareGroupBy::Sqlite, 7);
+        let rec = encode_record("SELECT 1", b"blob", mpedb_types::Dialect::Sqlite, 7);
         for cut in 0..rec.len() {
             assert!(parse_record(&rec[..cut]).is_none(), "cut at {cut}");
         }

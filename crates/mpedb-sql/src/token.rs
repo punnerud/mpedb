@@ -9,9 +9,10 @@
 //! bare word that might be a keyword from a quoted one that never is — NOT
 //! because quoting affects case (measured: it does not).
 
-use mpedb_types::{Error, Result};
+use mpedb_types::{Dialect, Error, Result};
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "pg-dialect"), allow(dead_code))]
 pub(crate) enum Tok {
     /// Bare identifier (not a keyword). Spelled as written; comparisons
     /// against it fold ASCII case (`mpedb_types::ident_eq`).
@@ -79,6 +80,28 @@ pub(crate) enum Tok {
     /// `.` — only ever used to qualify a table with a database alias
     /// (`alias.table`) for `Workspace` routing; not otherwise part of the grammar.
     Dot,
+    /// `::` — PostgreSQL's cast operator, PG DIALECT ONLY.
+    ///
+    /// Constructed only by `pg::lex`, which is compiled only with the
+    /// `pg-dialect` feature — so without it these four variants are declared
+    /// and never built. They stay declared in BOTH builds on purpose: the
+    /// parser matches on them unconditionally, and a `#[cfg]` on an enum
+    /// variant would push that `#[cfg]` into every match arm.
+    ///
+    /// It cannot exist under the sqlite dialect because `:` opens a `:sym:`
+    /// custom operator there (SQL-EXTENSIONS.md) and `a::text` would lex as an
+    /// unterminated one. That is not a gap to be closed later: the two spellings
+    /// want the same byte, so the dialect has to pick, and PG dialect trades
+    /// `:sym:` away for `::`.
+    DoubleColon,
+    /// `~*` — PostgreSQL case-insensitive regex match. (Plain `~` is already
+    /// [`Tok::Tilde`]; PG makes it INFIX, which the parser decides, not the
+    /// lexer.)
+    TildeStar,
+    /// `!~` — PostgreSQL negated regex match.
+    NotTilde,
+    /// `!~*` — PostgreSQL negated case-insensitive regex match.
+    NotTildeStar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +224,21 @@ pub(crate) struct SpTok {
     pub end: usize,
 }
 
+/// The PostgreSQL containment / jsonb-path operator at the head of `rest`, if
+/// there is one.
+///
+/// LONGEST FIRST: `@>` before `@`, `#>>` before `#>`. A shorter match would
+/// name the wrong operator in the refusal, which is the whole thing this
+/// function exists to avoid.
+fn pg_json_operator(rest: &str) -> Option<&'static str> {
+    // `<@` is NOT here: its `<` is consumed as a comparison operator before
+    // this is ever reached, so it is recognised by looking backward at the
+    // call site instead.
+    ["#>>", "@>", "#>", "@@", "@?", "?&", "?|"]
+        .into_iter()
+        .find(|op| rest.starts_with(op))
+}
+
 fn perr(pos: usize, msg: impl Into<String>) -> Error {
     Error::Parse {
         pos,
@@ -208,13 +246,39 @@ fn perr(pos: usize, msg: impl Into<String>) -> Error {
     }
 }
 
+/// Lex under the **sqlite** dialect — the spelling every existing caller, test
+/// and corpus record means. Byte-for-byte what this function has always done.
 pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
+    tokenize_dialect(sql, Dialect::Sqlite)
+}
+
+/// Lex under an explicit dialect.
+///
+/// The two dialects want the SAME BYTES for different things — `::` is a cast
+/// in PG and an unterminated `:sym:` here, `$$` is a quoted string there and a
+/// malformed `$n` here — so this is a lexer-level decision, not a binder one.
+/// The PG-owned bytes are dispatched ONCE, before the sqlite match below, and
+/// `pg::lex::special` hands back `None` for anything it does not own. That
+/// shape is deliberate: the sqlite arms are untouched, so the dialect cannot
+/// move a corpus answer by accident — it can only fail to add a PG one.
+pub(crate) fn tokenize_dialect(sql: &str, dialect: Dialect) -> Result<Vec<SpTok>> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < b.len() {
         let start = i;
         let c = b[i];
+        if dialect == Dialect::Postgres {
+            if let Some((tok, next)) = crate::pg::lex::special(b, i)? {
+                out.push(SpTok {
+                    tok,
+                    pos: start,
+                    end: next,
+                });
+                i = next;
+                continue;
+            }
+        }
         let tok = match c {
             b' ' | b'\t' | b'\r' | b'\n' => {
                 i += 1;
@@ -480,6 +544,26 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
             }
             _ => {
                 let ch = sql[i..].chars().next().unwrap_or('?');
+                // PostgreSQL's containment and jsonb-path operators get their
+                // own sentence. `unexpected character \`@\`` is true and says
+                // nothing: it names a punctuation mark where the reader wrote
+                // `@>`, and it is the largest single member of that bucket —
+                // 679 of 908 in the corpus's forty heaviest files, with `#`
+                // (`#>`, `#>>`) another 119. Two characters, one feature.
+                // `<@` needs a look BACKWARD: the tokenizer already consumed
+                // `<` as a comparison operator, so by the time we fail we are
+                // standing on the `@` alone. Found by the test, which is the
+                // only way it would have been — the forward table looks right.
+                let backward = (start > 0 && sql.as_bytes()[start - 1] == b'<' && ch == '@')
+                    .then_some("<@");
+                if let Some(op) = backward.or_else(|| pg_json_operator(&sql[i..])) {
+                    return Err(perr(
+                        start,
+                        format!(
+                            "`{op}` is one of PostgreSQL's containment / jsonb-path                              operators. mpedb stores JSON as TEXT and reads it with the                              sqlite functions (`json_extract`, `->`, `->>`), which have no                              containment test and no path type — `{op}` would need a jsonb                              VALUE to be a value, not a string that happens to hold JSON"
+                        ),
+                    ));
+                }
                 return Err(perr(start, format!("unexpected character `{ch}`")));
             }
         };
@@ -944,5 +1028,56 @@ mod tests {
             other => panic!("expected parse error, got {other:?}"),
         }
         assert!(tokenize("x'0'").is_err()); // odd digit count
+    }
+}
+
+#[cfg(test)]
+mod pg_json_op_tests {
+    use super::*;
+
+    /// The containment / jsonb-path operators name themselves. `unexpected
+    /// character `@`` is true and useless: it points at a punctuation mark
+    /// where the reader wrote `@>`, and those two characters were 798 of the
+    /// 908 refusals in that bucket across the corpus's forty heaviest files.
+    #[test]
+    fn a_containment_operator_names_itself_rather_than_its_first_character() {
+        for (sql, op) in [
+            ("SELECT a @> b", "@>"),
+            ("SELECT a <@ b", "<@"),
+            ("SELECT a #> '{x}'", "#>"),
+            ("SELECT a #>> '{x}'", "#>>"),
+            ("SELECT a @@ b", "@@"),
+        ] {
+            let e = tokenize(sql).unwrap_err().to_string();
+            assert!(e.contains(op), "{sql}\n  got: {e}");
+            assert!(e.contains("jsonb-path"), "{sql}\n  got: {e}");
+        }
+    }
+
+    /// Longest first: `#>>` must not be reported as `#>`, or the refusal names
+    /// an operator the reader did not write.
+    #[test]
+    fn the_longest_operator_wins() {
+        assert_eq!(pg_json_operator("#>>'{a}'"), Some("#>>"));
+        assert_eq!(pg_json_operator("#>'{a}'"), Some("#>"));
+        assert_eq!(pg_json_operator("@>x"), Some("@>"));
+        // `<@` is deliberately absent — see the comment on the table.
+        assert_eq!(pg_json_operator("<@x"), None);
+        assert_eq!(pg_json_operator("nothing"), None);
+    }
+
+    /// The operators mpedb DOES have are untouched — a refusal added next to a
+    /// working path is how that path quietly stops working.
+    #[test]
+    fn the_json_arrows_that_work_still_tokenize() {
+        for sql in [
+            "SELECT a -> 'k'",
+            "SELECT a ->> 'k'",
+            "SELECT json_extract(a, '$.k')",
+            "SELECT a > b",
+            "SELECT a >> 2",
+        ] {
+            assert!(tokenize(sql).is_ok(), "{sql}");
+        }
     }
 }

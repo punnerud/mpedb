@@ -15,3 +15,6 @@ crates/mpedb-fs/target/
 # Scratch-notater som erklærer seg selv som ikke-commit (rest.txt:2).
 # Lagt inn fordi et `git add -A` tok den med én gang.
 rest.txt
+
+# Arbeidslogg for PG-kompatibilitetsarbeidet (#PG). Ikke commit.
+summary.txt

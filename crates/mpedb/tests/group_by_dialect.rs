@@ -1,4 +1,4 @@
-//! GROUP BY column-strictness dialect (`[compat] bare_group_by`, COMPAT.md).
+//! GROUP BY column-strictness dialect (`[compat] dialect`, COMPAT.md).
 //!
 //! mpedb supports BOTH sqlite's lenient bare-column rule and PostgreSQL's strict
 //! one, chosen by config. The hard constraint is mpedb's core guarantee: in

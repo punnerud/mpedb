@@ -49,20 +49,18 @@ pub struct PgTable {
 /// `None` ⇒ not representable (caller rejects the table or marks it pull_only).
 /// numeric → Text (lossless round-trip); uuid → Blob(16); json/jsonb → Text.
 pub fn map_pg_type(typname: &str) -> Option<ColumnType> {
-    Some(match typname {
-        "int2" | "int4" | "int8" => ColumnType::Int64,
-        "float4" | "float8" => ColumnType::Float64,
-        "bool" => ColumnType::Bool,
-        "text" | "varchar" | "bpchar" | "name" | "citext" => ColumnType::Text,
-        "bytea" => ColumnType::Blob,
-        // timestamptz/timestamp store int64 micros; date/time handled at import
-        "timestamptz" | "timestamp" | "date" => ColumnType::Timestamp,
-        "time" => ColumnType::Int64,
-        "numeric" => ColumnType::Text, // lossless as canonical text
-        "uuid" => ColumnType::Blob,    // 16 bytes
-        "json" | "jsonb" => ColumnType::Text,
-        _ => return None,
-    })
+    // The table moved to `mpedb_types::pgtype` so the PG DIALECT and the WIRE
+    // PROTOCOL resolve `int4` exactly the way an import does. Two copies would
+    // have meant an imported table and a locally created one answering
+    // differently for the same declared type — the quietest kind of wrong.
+    //
+    // `citext` is the one name that stays here: it is an EXTENSION type with no
+    // fixed OID, so it has no place in a table whose OIDs are wire ABI. A
+    // mirror can still meet one, and Text is the right carrier.
+    if typname == "citext" {
+        return Some(ColumnType::Text);
+    }
+    mpedb_types::pgtype::by_name(typname).and_then(|t| t.mpedb)
 }
 
 /// How faithfully `map_pg_type` carried this PG type into mpedb — recorded per

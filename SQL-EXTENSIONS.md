@@ -33,6 +33,52 @@ mpedb exec app.toml 'SELECT double(amount) FROM orders'
 - Execution is budgeted: a runaway body is a deterministic error at the same
   instruction count everywhere.
 
+### PL/pgSQL — the same mechanism, PostgreSQL's language
+
+`pg_dump` writes functions as `CREATE FUNCTION … AS $$ … $$ LANGUAGE plpgsql;`,
+and mpedb compiles that statement whole — through the CLI, or straight over the
+wire protocol, which is what makes a dump replayable:
+
+```sh
+mpedb fn define app.toml add_tax.sql          # a .sql file is plpgsql
+psql -h /run/mpedb -f dump-fragment.sql       # or feed the dump directly
+mpedb exec app.toml 'SELECT add_tax(amount, 25) FROM orders'
+```
+
+It is a third FRONTEND, not a third runtime: PL/pgSQL is parsed on the host at
+define time and emits the same IR the Python and Rust subsets do, so the
+security boundary ("the parser stays on the host; the runtime only ever sees
+IR") is unchanged, and so are the budget and the content hash.
+
+The unit is the whole statement rather than the bare body, because the HEADER
+is where the parameter names live — a frontend fed only the body would need a
+second channel to learn them, and the two could disagree.
+
+**Accepted:** `DECLARE`, assignment (`:=` and PostgreSQL's `=`),
+`IF`/`ELSIF`/`ELSE`, `WHILE`, bare `LOOP`, `FOR v IN [REVERSE] lo..hi [BY n]`,
+`EXIT`/`CONTINUE` (with `WHEN`), `RETURN`, arithmetic and comparisons,
+`AND`/`OR`/`NOT`, `IS [NOT] NULL`, and `::int` casts as identities.
+
+**Refused by name**, in three groups: a different FEATURE (`RETURNS SETOF` /
+`RETURNS TABLE` are row sources, `RETURNS trigger` is a trigger body,
+`CREATE PROCEDURE` is invoked with `CALL`); the stored-function CONTRACT
+(`SELECT … INTO`, `PERFORM`, `INSERT`/`UPDATE`/`DELETE`, `FOR … IN SELECT` all
+touch the database, and a function is evaluated per row inside a statement that
+is already scanning — those belong in `mpedb proc`); and what the IR cannot say
+without inventing an answer (`RAISE`, `||`, a converting `::text`, dynamic
+`EXECUTE`, an `EXCEPTION` block).
+
+Two semantics decisions worth knowing, both measured against PostgreSQL 16
+rather than assumed:
+
+- **`x = NULL` is a compile error**, pointing at `IS NULL`. In PostgreSQL that
+  comparison is NULL — never true, whatever `x` is — while the interpreter's
+  equality says `None == None` is true. Refusing it is the only way not to
+  quietly disagree, and in PostgreSQL the comparison was already a bug.
+  (`IF <null> THEN` needs no such care: it does not take the branch in either.)
+- **`/` and `%` follow PostgreSQL, not Python** — truncate toward zero, and the
+  remainder takes the dividend's sign. `(-7)/2` is `-3` and `(-7)%2` is `-1`.
+
 ## `splice()` — sub-edits inside one cell
 
 ```sql

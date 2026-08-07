@@ -51,16 +51,55 @@ use std::sync::Arc;
 
 static ATTACH_EPHEMERAL_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Where a connection-local ephemeral file (an `ATTACH ':memory:'` member or the
+/// `temp` schema) is put.
+///
+/// `/dev/shm` by default: a temp table IS temporary, and a tmpfs is the right
+/// home for one. But a tmpfs is small — 3.8 GB on the development box — and
+/// when it fills, `fallocate` returns `StorageFull` from inside whatever
+/// statement happened to run next, while the real disk sits empty. That reads
+/// as an engine bug and points at the wrong place entirely.
+///
+/// It bit this project twice. `mpedb_testkit::scratch_base` was written for it
+/// and documents it in those words; these two call sites were simply never
+/// wired to the same knob, so a `cargo test --workspace` filled /dev/shm with
+/// several hundred orphaned temp members and the next run's `CREATE TEMP TABLE`
+/// began failing non-deterministically — which turned a PostgreSQL-corpus
+/// measurement into noise that moved between runs with no code change.
+///
+/// `MPEDB_TEST_DIR` is the same variable the testkit uses, so ONE setting moves
+/// a whole run onto a real volume:
+///
+/// ```text
+/// MPEDB_TEST_DIR=/mnt/ext4/mpedb-scratch cargo test --workspace
+/// ```
+///
+/// A named directory that cannot be created falls back rather than panicking —
+/// unlike the testkit's, because this one runs in PRODUCTION, where a bad
+/// environment variable must not take the database down.
+pub fn ephemeral_dir() -> std::path::PathBuf {
+    if let Some(d) = std::env::var_os("MPEDB_TEST_DIR") {
+        if !d.is_empty() {
+            let d = std::path::PathBuf::from(d);
+            if std::fs::create_dir_all(&d).is_ok() {
+                return d;
+            }
+        }
+    }
+    if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        // macOS has no /dev/shm at all (#66) — this fallback is load-bearing.
+        std::env::temp_dir()
+    }
+}
+
 /// `ATTACH ':memory:'` — a fresh empty mpedb file on `/dev/shm` (or temp),
 /// unlinked on DETACH. Seed is a one-column dummy table the live DDL path can
 /// grow past; CPython's backup of the attached schema only needs tables the
 /// test creates.
 fn open_ephemeral_attach() -> Result<Database> {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = ephemeral_dir();
     let seq = ATTACH_EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(format!(
         "mpedb-attach-mem-{}-{}.mpedb",
@@ -251,11 +290,7 @@ fn empty_bundle() -> Arc<mpedb_core::engine::SchemaBundle> {
 /// The `temp` schema's backing file: like [`open_ephemeral_attach`] but with no
 /// seed table, because everything in `temp` is user-visible.
 fn open_ephemeral_temp() -> Result<Database> {
-    let dir = if std::path::Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
+    let dir = ephemeral_dir();
     let seq = ATTACH_EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(format!(
         "mpedb-temp-{}-{}.mpedb",
@@ -286,6 +321,38 @@ pub(crate) struct AttachedMember {
 pub(crate) struct AttachState {
     pub members: Vec<AttachedMember>,
     pub epoch: u64,
+}
+
+/// Unlink every ephemeral member's file when the connection goes away.
+///
+/// `DETACH` already does this, and for a while that was thought to be enough.
+/// It is not: a connection that simply CLOSES never detaches, so the 16 MB file
+/// behind `CREATE TEMPORARY TABLE` was left on disk once per connection,
+/// forever.
+///
+/// Measured rather than reasoned about — it is what CORRUPTED a full corpus
+/// run. Seven passes of PostgreSQL's regress suite left 2 513 files in the
+/// scratch directory; the volume filled enough that two files which had run
+/// clean the pass before both HUNG, and the run reported 656 new divergences
+/// that were an artifact of the measurement's own litter. The same shape as the
+/// `/dev/shm` flapping recorded in COMPAT-PG.md, and from the same root: an
+/// ephemeral file nobody was responsible for removing.
+///
+/// The order — drop the `Database`, THEN unlink — is the order `DETACH` uses
+/// and is load-bearing on Windows, where a mapped, locked file cannot be
+/// removed. Taking the member out of the vector is what makes that expressible.
+impl Drop for AttachState {
+    fn drop(&mut self) {
+        for m in std::mem::take(&mut self.members) {
+            if !m.ephemeral {
+                continue;
+            }
+            let path = m.db.path().to_path_buf();
+            drop(m);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        }
+    }
 }
 
 impl AttachState {
@@ -361,7 +428,7 @@ impl Database {
     /// view body that reads `main` into a cross-file statement (see
     /// [`Database::temp_views`]).
     pub(crate) fn temp_view_stmt_hook(&self, sql: &str) -> Result<Option<ExecResult>> {
-        if let Some(rewritten) = mpedb_sql::rewrite_temp_ddl(sql)? {
+        if let Some(rewritten) = mpedb_sql::rewrite_temp_ddl_dialect(sql, self.dialect)? {
             // `rewrite_temp_ddl` both drops the TEMP keyword and qualifies the
             // name for a member. The view is not going to a member, so the
             // qualifier comes straight back off — and what is left is exactly
@@ -450,7 +517,7 @@ impl Database {
         let bodies: HashMap<String, String> =
             guard.iter().map(|(n, (s, _))| (n.clone(), s.clone())).collect();
         drop(guard);
-        mpedb_sql::inline_temp_views(sql, &bodies)
+        mpedb_sql::inline_temp_views_dialect(sql, &bodies, self.dialect)
     }
 
     /// Merge the temp views over a main view catalog (temp shadows main).
@@ -462,7 +529,7 @@ impl Database {
 
     /// Intercept `ATTACH`/`DETACH`; `None` means "not an attach statement".
     pub(crate) fn attach_stmt_hook(&self, sql: &str) -> Result<Option<ExecResult>> {
-        match mpedb_sql::parse_attach(sql)? {
+        match mpedb_sql::parse_attach_dialect(sql, self.dialect)? {
             None => Ok(None),
             Some(st) => self.exec_attach(st).map(Some),
         }
@@ -580,7 +647,7 @@ impl Database {
             }
             None => sql,
         };
-        if let Some(rewritten) = mpedb_sql::rewrite_temp_ddl(sql)? {
+        if let Some(rewritten) = mpedb_sql::rewrite_temp_ddl_dialect(sql, self.dialect)? {
             self.ensure_temp_schema()?;
             // TEMP-keyword DDL (a temp TABLE, index, trigger) shadows main
             // names exactly like a temp view does, and moves the temp MEMBER's
@@ -592,7 +659,7 @@ impl Database {
             let guard = self.attached.read().expect(POISON);
             let scope = self.build_scope(&guard)?;
             drop(guard);
-            return match mpedb_sql::resolve_db_refs(&rewritten, &scope)? {
+            return match mpedb_sql::resolve_db_refs_dialect(&rewritten, &scope, self.dialect)? {
                 DbResolution::MainOnly(s) => Ok(DbRoute::Main(s)),
                 DbResolution::Cross { sql, tables, main_free } => {
                     Ok(DbRoute::Cross { sql, tables, main_free })
@@ -611,7 +678,7 @@ impl Database {
         } else {
             self.build_scope(&guard)?
         };
-        match mpedb_sql::resolve_db_refs(sql, &scope)? {
+        match mpedb_sql::resolve_db_refs_dialect(sql, &scope, self.dialect)? {
             DbResolution::MainOnly(s) => {
                 if s == sql {
                     Ok(DbRoute::Passthrough)
@@ -814,7 +881,7 @@ impl Database {
             &merged,
             &PolicyCatalog::empty(),
             &views,
-            self.bare_group_by,
+            self.dialect,
             &self.host_udf_set(),
             // A cross-file plan spans a MERGED schema whose table ids are
             // synthetic and whose members are separate files; there is no one

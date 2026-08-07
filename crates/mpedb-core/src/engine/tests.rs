@@ -34,7 +34,7 @@ impl Drop for TestCfg {
 }
 
 fn test_config(name: &str, size_mb: u64) -> TestCfg {
-    let path = std::env::temp_dir()
+    let path = crate::test_scratch()
         .join("mpedb-engine-tests")
         .join(format!("{}-{}.mpedb", name, std::process::id()));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -354,7 +354,7 @@ fn wal_class_config(name: &str, durability: &str) -> Config {
     let dir = if base.is_dir() {
         base.join("mpedb-engine-wal-tests")
     } else {
-        std::env::temp_dir().join("mpedb-engine-wal-tests")
+        crate::test_scratch().join("mpedb-engine-wal-tests")
     };
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{}-{}.mpedb", name, std::process::id()));
@@ -508,7 +508,7 @@ fn wal_recovery_replays_overflow_chains_byte_identical() {
     let dir = if base.is_dir() {
         base.join("mpedb-engine-wal-tests")
     } else {
-        std::env::temp_dir().join("mpedb-engine-wal-tests")
+        crate::test_scratch().join("mpedb-engine-wal-tests")
     };
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("blob-recover-{}.mpedb", std::process::id()));
@@ -854,7 +854,7 @@ fn reserved_pages_extend_the_alloc_ceiling_past_normal_dbfull() {
 
 #[test]
 fn cdc_write_block_refuses_optimistic_blind_apply() {
-    let path = std::env::temp_dir()
+    let path = crate::test_scratch()
         .join("mpedb-engine-tests")
         .join(format!("cdcblockopt-{}.mpedb", std::process::id()));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1002,7 +1002,7 @@ fn savepoint_rollback_after_refill_keeps_accounting_exact() {
 #[test]
 fn cdc_capture_hooks_optimistic_blind_apply() {
     // a table with no secondary index, so the optimistic trio is legal
-    let path = std::env::temp_dir()
+    let path = crate::test_scratch()
         .join("mpedb-engine-tests")
         .join(format!("cdcopt-{}.mpedb", std::process::id()));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1086,7 +1086,7 @@ fn sys_scan_range_is_prefix_bounded_and_txn_id_tracks_commits() {
 /// map root actually round-trips through the published meta.
 #[test]
 fn extent_rows_roundtrip_reclaim_and_verify() {
-    let path = std::env::temp_dir()
+    let path = crate::test_scratch()
         .join("mpedb-engine-tests")
         .join(format!("extents-{}.mpedb", std::process::id()));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1204,7 +1204,7 @@ primary_key = ["id"]
 /// review of the failure-order, pinned here).
 #[test]
 fn failed_extent_insert_leaves_no_trace() {
-    let path = std::env::temp_dir()
+    let path = crate::test_scratch()
         .join("mpedb-engine-tests")
         .join(format!("extents-fail-{}.mpedb", std::process::id()));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1255,7 +1255,7 @@ primary_key = ["id"]
 /// boundaries, NULL, and the absent row. Byte-exact against the source.
 #[test]
 fn blob_read_chunks_every_value_shape() {
-    let path = std::env::temp_dir()
+    let path = crate::test_scratch()
         .join("mpedb-engine-tests")
         .join(format!("blobread-{}.mpedb", std::process::id()));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1362,7 +1362,7 @@ fn composite_indexes_are_maintained_and_unique_enforces() {
     let dir = if base.is_dir() {
         base.to_path_buf()
     } else {
-        std::env::temp_dir()
+        crate::test_scratch()
     };
     let path = dir.join(format!("mpedb-core-composite-{}.mpedb", std::process::id()));
     let _ = std::fs::remove_file(&path);

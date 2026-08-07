@@ -247,6 +247,24 @@ fn encode_access(a: &AccessPath, buf: &mut Vec<u8>) {
             buf.push(ACCESS_FTS_SCAN);
             encode_fts_query(query, buf);
         }
+        AccessPath::Series { start, stop, step } => {
+            buf.push(ACCESS_SERIES);
+            encode_part(start, buf);
+            encode_part(stop, buf);
+            // The optional third bound is a presence byte then the part, the
+            // same shape a range bound uses — so an absent step costs one byte
+            // and `generate_series(1, 9)` and `generate_series(1, 9, 1)` stay
+            // DIFFERENT plans with different hashes. They compute the same
+            // rows; making them collide would mean folding a default into the
+            // canonical bytes, and the bytes are the identity.
+            match step {
+                None => buf.push(0),
+                Some(p) => {
+                    buf.push(1);
+                    encode_part(p, buf);
+                }
+            }
+        }
     }
 }
 

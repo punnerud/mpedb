@@ -427,7 +427,7 @@ fn streaming_insert_into_fts_is_refused() {
     // index, which FTS tables lack, so a streamed insert committed a content row
     // the inverted index never saw — silently unsearchable. Must refuse.
     let d = db_with(&["CREATE VIRTUAL TABLE ft USING fts5(body)"]);
-    let mut tmp = std::env::temp_dir();
+    let mut tmp = mpedb_testkit::scratch_base();
     tmp.push(format!("mpedb-fts-stream-{}-{}.txt", std::process::id(), UNIQ.fetch_add(1, Ordering::Relaxed)));
     std::fs::write(&tmp, b"streamedtoken uniquephrase").unwrap();
     // FTS content table is (body, hidden trailing rowid); stream the content

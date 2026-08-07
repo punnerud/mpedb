@@ -222,6 +222,37 @@ pub struct CreateTriggerSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlStmt {
     CreateTable(CreateTableSpec),
+    /// `CREATE [OR REPLACE] FUNCTION … AS $$ … $$ LANGUAGE plpgsql` — carried
+    /// as its WHOLE SOURCE TEXT rather than as a parsed shape, and that is the
+    /// design rather than laziness.
+    ///
+    /// The plpgsql frontend (`mpedb_spell::plpgsql`) already parses the entire
+    /// statement — header, parameters and body — because `pg_dump` writes it as
+    /// one unit and the header is where the parameter NAMES live. Parsing it a
+    /// second time here would put two grammars for the same statement in the
+    /// tree, and the day they disagree is the day a dump imports with the wrong
+    /// parameter names.
+    ///
+    /// So this variant's only job is DETECTION: recognise the statement, keep
+    /// the text, and let the one frontend that understands it do the work. The
+    /// facade compiles and stores it exactly as `mpedb fn define` does.
+    /// `DROP FUNCTION [IF EXISTS] <name> [(args)] [CASCADE|RESTRICT]`.
+    ///
+    /// The signature is PARSED AND DROPPED, and that is a real difference from
+    /// PostgreSQL rather than a shortcut: PostgreSQL overloads on argument
+    /// types, so `DROP FUNCTION f(int)` and `f(text)` name two functions.
+    /// mpedb's stored functions are keyed by (name, arity) with one entry per
+    /// NAME, so there is only one `f` to drop and a signature could only ever
+    /// confirm or contradict that. The facade drops by name.
+    DropFunction { name: String, if_exists: bool },
+    CreateFunction {
+        /// The complete statement, verbatim.
+        source: String,
+        /// `OR REPLACE` — kept for the message when a redefinition is refused;
+        /// mpedb's stored functions replace by name regardless (redefining
+        /// bumps the schema generation), so it changes no behaviour.
+        or_replace: bool,
+    },
     /// `CREATE VIRTUAL TABLE … USING fts5(…)` (design/DESIGN-FTS.md §1).
     CreateVirtualTable(CreateVirtualTableSpec),
     /// `DROP TABLE [IF EXISTS] <name>` (#47 stage 4) — applied by the facade as

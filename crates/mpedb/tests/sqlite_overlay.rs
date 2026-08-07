@@ -41,7 +41,7 @@ impl Drop for OvlPaths {
 }
 
 fn setup(tag: &str) -> OvlPaths {
-    let p = std::env::temp_dir()
+    let p = mpedb_testkit::scratch_base()
         .join("mpedb-overlay-tests")
         .join(format!("ovl-{tag}-{}.db", std::process::id()));
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -195,7 +195,7 @@ fn deltas_survive_reopen_and_divergence_is_refused() {
 #[test]
 fn text_pk_without_rowid_merges_like_any_other_shape() {
     let p = OvlPaths(
-        std::env::temp_dir()
+        mpedb_testkit::scratch_base()
             .join("mpedb-overlay-tests")
             .join(format!("ovl-textpk-{}.db", std::process::id())),
     );
@@ -872,7 +872,7 @@ fn secondary_unique_sees_the_base_after_a_reopen() {
     // if mpedb's overlay and the real library ever disagree about which row
     // survives an `INSERT OR REPLACE` across a secondary UNIQUE, that is the
     // wrong answer #133 was, wearing different clothes.
-    let oracle = std::env::temp_dir()
+    let oracle = mpedb_testkit::scratch_base()
         .join("mpedb-overlay-tests")
         .join(format!("oracle-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&oracle);

@@ -185,7 +185,7 @@ const MAX_JOINS: usize = 63;
 //     whole-plan version gates it: a format-28 blob fails CLOSED at byte 0 with
 //     `PlanInvalidated` and is re-prepared under the new semantics.
 // 30: sqlite "bare columns" in a grouped SELECT (COMPAT.md, `[compat]
-//     bare_group_by = "sqlite"`). `Aggregation` grows a trailing `bare_cols`
+//     dialect = "sqlite"`). `Aggregation` grows a trailing `bare_cols`
 //     LIST (base-row column indices) after `having`: the columns whose value is
 //     carried from each group's single min()/max() witness row into the grouped
 //     tuple `[keys ‖ aggs ‖ bare_cols]`. Empty for every strict/postgres plan
@@ -238,7 +238,7 @@ const MAX_JOINS: usize = 63;
 //     earlier window bumps (24, 34).
 // 37: config-selectable PostgreSQL-strict LIKE. A new additive expr opcode —
 //     `Instr::LikeCs` (38, case-SENSITIVE LIKE) — is emitted for a
-//     `bare_group_by = "postgres"` database (the same dialect signal #87 uses for
+//     `dialect = "postgres"` database (the same dialect signal #87 uses for
 //     GROUP BY strictness); the sqlite default still emits `Instr::Like` (22).
 //     Case-sensitivity changes what the plan MEANS, so it is baked into the
 //     opcode rather than resolved at eval time — two dialects hash to distinct
@@ -512,7 +512,16 @@ const MAX_JOINS: usize = 63;
 //     `a NOT IN (…)` returned both rows where sqlite returns one. Emitted only
 //     for a non-Binary collation, so every plan that was already right keeps
 //     byte-identical bytes and the same hash.
-const PLAN_FORMAT: u8 = 70;
+//  71: `AccessPath::Series` (tag `ACCESS_SERIES = 6`) over the [`SERIES_TABLE`]
+//     sentinel — `FROM generate_series(start, stop[, step])` as a real row
+//     source rather than a named refusal. The three bounds are ordinary
+//     [`KeyPart`]s, so a `Const`/`Param` series is resolved once and an
+//     `OuterCol` one is re-resolved per outer row, which is what makes
+//     `t JOIN generate_series(1, t.n)` fall out of the machinery the index
+//     nested loop already has instead of needing LATERAL as a separate
+//     concept. Additive: a format-70 reader hits an unknown access tag and
+//     says `bad access path tag 6` rather than misreading it.
+const PLAN_FORMAT: u8 = 71;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -529,6 +538,71 @@ pub const DUAL_TABLE: u32 = u32::MAX;
 /// FullScan) is [`RecursiveCtePlan::cte_def`]. `u32::MAX - 1`, one below the
 /// dual sentinel and far above any real table id.
 pub const CTE_TABLE: u32 = u32::MAX - 1;
+
+/// The table id `FROM generate_series(…)` carries. Like [`DUAL_TABLE`] and
+/// [`CTE_TABLE`] it names no catalog table: the executor GENERATES its rows
+/// from the access path's three bounds. One column, named `generate_series`
+/// exactly as PostgreSQL names it, so `SELECT generate_series FROM
+/// generate_series(1, 3)` resolves — the corpus writes that.
+///
+/// `u32::MAX - 2`, one below the CTE sentinel and far above any real table id.
+pub const SERIES_TABLE: u32 = u32::MAX - 2;
+
+/// The one-column [`TableDef`] standing in for [`SERIES_TABLE`] wherever the
+/// planner, validator or EXPLAIN needs "the table's" width or column names.
+///
+/// It has NO primary key and no indexes, which is load-bearing rather than
+/// incidental: it makes every access path except [`AccessPath::Series`]
+/// unplannable over it by the ordinary rules, so the validator's "this table
+/// takes only this access" rule and the planner's own choices cannot drift
+/// apart. Never registered in a schema, and never reaching the row or key
+/// layer.
+pub fn series_def() -> &'static mpedb_types::TableDef {
+    use std::sync::OnceLock;
+    static SERIES: OnceLock<mpedb_types::TableDef> = OnceLock::new();
+    SERIES.get_or_init(|| series_def_named("generate_series", "generate_series"))
+}
+
+/// [`series_def`] with the table and column named — PostgreSQL renames BOTH
+/// from the alias, and the column name is observable as the result header:
+///
+/// ```text
+/// SELECT * FROM generate_series(1,3);            -- column "generate_series"
+/// SELECT * FROM generate_series(1,3) AS g;       -- column "g"
+/// SELECT * FROM generate_series(1,3) AS g(n);    -- column "n"
+/// ```
+///
+/// Measured against PostgreSQL 16.14 rather than assumed, because getting it
+/// wrong is a WRONG ANSWER and not a missing feature: the rows would be right
+/// and the header would not, which no refusal reports and every transcript
+/// diff catches.
+pub fn series_def_named(table: &str, column: &str) -> mpedb_types::TableDef {
+    mpedb_types::TableDef {
+        id: 0,
+        name: table.into(),
+        columns: vec![mpedb_types::ColumnDef {
+            name: column.into(),
+            ty: ColumnType::Int64,
+            nullable: false,
+            unique: false,
+            indexed: false,
+            default: None,
+            default_text: None,
+            check: None,
+            collation: mpedb_types::Collation::Binary,
+            affinity: mpedb_types::Affinity::Integer,
+            decl: Some("integer".into()),
+            generated: None,
+        }],
+        primary_key: Vec::new(),
+        indexes: Vec::new(),
+        dead: false,
+        implicit_rowid: false,
+        autoincrement: false,
+        kind: mpedb_types::TableKind::Standard,
+        foreign_keys: Vec::new(),
+    }
+}
 
 /// The zero-column [`TableDef`] that stands in for `DUAL_TABLE` wherever the
 /// planner/validator needs "the table's" width or column names. It never
@@ -1329,7 +1403,7 @@ pub struct Aggregation {
     /// bare_cols]` — a different tuple from the one `filter` sees, which is
     /// exactly why SQL has two clauses rather than one.
     pub having: Option<ExprProgram>,
-    /// sqlite "bare columns" (COMPAT.md, `[compat] bare_group_by = "sqlite"`):
+    /// sqlite "bare columns" (COMPAT.md, `[compat] dialect = "sqlite"`):
     /// base-row column indices whose value each group carries from its **single
     /// `min()`/`max()` witness row** — the one input row that achieved the
     /// extremum. They occupy the grouped tuple AFTER the aggregates, so the
@@ -1525,6 +1599,26 @@ pub enum AccessPath {
     /// posting-list set algebra and yields matching rows in rowid order. Only an
     /// FTS table (`TableKind::Fts`) carries this access — `validate` enforces it.
     FtsScan { query: FtsQuery },
+    /// `FROM generate_series(start, stop[, step])` — rows generated, not read.
+    /// Only over [`SERIES_TABLE`], and that sentinel takes no other access;
+    /// `validate` enforces both directions.
+    ///
+    /// The bounds are [`KeyPart`]s and NOT an [`ExprProgram`], which is a
+    /// deliberate limit rather than an oversight: a `Const`/`Param` series
+    /// resolves once, an `OuterCol` series re-resolves per outer row, and both
+    /// behaviours already exist for the index nested loop. Reusing them is
+    /// what makes a correlated series (`t JOIN generate_series(1, t.n)`) work
+    /// without LATERAL being a separate concept — and it means the planner
+    /// must fold `generate_series(1, 2+3)` to a constant or refuse by name,
+    /// rather than smuggling an evaluator in here.
+    Series {
+        start: KeyPart,
+        stop: KeyPart,
+        /// `None` = 1, PostgreSQL's default. A step of 0 is an ERROR at
+        /// runtime (PostgreSQL: "step size cannot equal zero"), not an
+        /// infinite loop and not an empty result.
+        step: Option<KeyPart>,
+    },
 }
 
 /// A compiled FTS5 `MATCH` query tree (design/DESIGN-FTS.md §3), carried by
@@ -1604,6 +1698,7 @@ const ACCESS_PK_RANGE: u8 = 2;
 const ACCESS_INDEX_POINT: u8 = 3;
 const ACCESS_INDEX_RANGE: u8 = 4;
 const ACCESS_FTS_SCAN: u8 = 5;
+const ACCESS_SERIES: u8 = 6;
 
 // FTS query-node wire tags (design/DESIGN-FTS.md §3).
 const FTS_TERM: u8 = 0;

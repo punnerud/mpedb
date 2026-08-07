@@ -63,7 +63,8 @@
 //! the deadline stays meetable. Reading it as mutual exclusion would be reading
 //! in the one thing this whole architecture does not have.
 
-use std::time::{Duration, Instant};
+use mpedb_core::Instant;
+use std::time::Duration;
 
 use crate::{Database, Error, Result, Value, WriteSession};
 

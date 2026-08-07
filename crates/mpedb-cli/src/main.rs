@@ -8,6 +8,8 @@
 //! additionally use 3 (invariant violation — an MVCC/engine bug) and 4
 //! (unexpected error inside a child).
 
+mod backup;
+mod compact;
 mod args;
 mod bench;
 mod blob;
@@ -76,7 +78,8 @@ usage: mpedb <command> [args]
   model maintain <target>                  adaptive columnar upkeep: build/rebuild
          [--tail-fraction F] [--max N]     only what went stale (absent, or tail
          [--plan]                          grown past F); --plan = dry-run
-  fn define <target> <file.py|file.rs>     store a PySpell SQL function
+  fn define <target> <file.py|.rs|.sql>    store a SQL function (.sql = a whole
+                                            CREATE FUNCTION … LANGUAGE plpgsql)
   fn drop <target> <name>                  drop a stored function
   fn list <target>                         list stored functions
   lens define <target> <name> <fwd> <inv>  register a reversible pair over stored
@@ -181,6 +184,15 @@ usage: mpedb <command> [args]
   <target> is a config.toml, or a .mpedb file directly (e.g. a mirror, which
   is config-free: its schema lives in the file).
   dump    <file.mpedb> [--data]             config-free schema/row dump
+  compact-ids <target>                      report the table-id budget: how many
+                                            of MAX_TABLES slots are tombstones
+                                            from dropped tables (ids are never
+                                            reused, so the cap is a LIFETIME one)
+  backup  <target> <out.mpebak>             the whole database, verbatim: the
+  restore <in.mpebak> <target>              B+trees copied rather than the rows
+                                            re-inserted. No SQL, no parse back,
+                                            indexes carried. Sized by the DATA,
+                                            not by the arena. Blocks no writer.
   bench   <config.toml>|--auto [--secs N] [--durability M] [--disk DIR]
   stress  --dir <dir> --workers N --secs S --mode bank|unique|mixed|incr
           [--size_mb M]  (default 64; exit 4 = out of space, NOT a correctness failure)
@@ -279,6 +291,8 @@ fn dispatch(argv: &[String]) -> CliResult {
         "repl" => repl::run(rest),
         "blob" => blob::run(rest),
         "dump" => dump::run(rest),
+        v @ ("backup" | "restore") => backup::run(v, rest),
+        "compact-ids" => compact::run(rest),
         "bench" => bench::run(rest),
         "stress" => stress::run_parent(rest),
         "crash" => crash::run_parent(rest),
@@ -486,7 +500,15 @@ fn cmd_fn(args: &[String]) -> CliResult {
     use mpedb::spellfn::SpellLang;
     match args {
         [sub, config, file] if sub == "define" => {
-            let lang = if file.ends_with(".rs") { SpellLang::Rust } else { SpellLang::Python };
+            // The extension picks the frontend. `.sql` means plpgsql because
+            // that is what a `pg_dump` fragment is called and what a migration
+            // will have on disk — the file holds a whole `CREATE FUNCTION …
+            // LANGUAGE plpgsql` statement, not a bare body.
+            let lang = match () {
+                _ if file.ends_with(".rs") => SpellLang::Rust,
+                _ if file.ends_with(".sql") => SpellLang::PlPgSql,
+                _ => SpellLang::Python,
+            };
             let src = std::fs::read_to_string(file)
                 .map_err(|e| Failure::Runtime(format!("reading {file}: {e}")))?;
             let db = crate::util::open_target(config)?;
@@ -514,7 +536,9 @@ fn cmd_fn(args: &[String]) -> CliResult {
             }
             Ok(())
         }
-        _ => usage("fn needs: define <target> <file.py|rs> | drop <target> <name> | list <target>"),
+        _ => usage(
+            "fn needs: define <target> <file.py|rs|sql> | drop <target> <name> | list <target>",
+        ),
     }
 }
 

@@ -106,7 +106,7 @@ impl TableSet {
     /// tests; every other construction path goes through `insert`.
     pub fn from_sorted(ids: Vec<u32>) -> Result<TableSet> {
         for (i, &id) in ids.iter().enumerate() {
-            if id as usize >= crate::MAX_TABLES {
+            if id as usize >= crate::MAX_TABLES_CEILING {
                 return Err(Error::Corrupt(format!("table id {id} out of range")));
             }
             if i > 0 && id <= ids[i - 1] {
@@ -131,8 +131,8 @@ impl TableSet {
     /// silently WRONG table (cdc.rs, DESIGN-TABLE-CAP §4).
     pub fn insert(&mut self, id: u32) {
         debug_assert!(
-            (id as usize) < crate::MAX_TABLES,
-            "table id {id} >= MAX_TABLES"
+            (id as usize) < crate::MAX_TABLES_CEILING,
+            "table id {id} >= MAX_TABLES_CEILING"
         );
         if let Err(pos) = self.0.binary_search(&id) {
             self.0.insert(pos, id);
@@ -193,7 +193,7 @@ impl TableSet {
         // `len() ≤ MAX_TABLES` by the ascending + in-range invariant (see
         // `insert`), and MAX_TABLES is far below u16::MAX, so the count can
         // never truncate.
-        debug_assert!(self.0.len() <= crate::MAX_TABLES);
+        debug_assert!(self.0.len() <= crate::MAX_TABLES_CEILING);
         buf.extend_from_slice(&(self.0.len() as u16).to_le_bytes());
         for &id in &self.0 {
             buf.extend_from_slice(&id.to_le_bytes());
@@ -205,8 +205,18 @@ impl TableSet {
         let raw = buf.get(*pos..*pos + 2).ok_or_else(err)?;
         *pos += 2;
         let n = u16::from_le_bytes(raw.try_into().unwrap()) as usize;
-        if n > crate::MAX_TABLES {
-            return Err(Error::Corrupt("too many tables in table set".into()));
+        // The count is a `u16`, so it cannot claim more than 65 535 — comparing
+        // it against a table-id ceiling would be a check that can never fire.
+        // The claim worth checking is against the BUFFER: refuse a length the
+        // input cannot possibly satisfy before doing any work for it. The
+        // `.min(64)` below is the second half of the same rule — reserve what a
+        // real set needs, not what a corrupt one asks for.
+        let need = n.checked_mul(4).ok_or_else(err)?;
+        if buf.len().saturating_sub(*pos) < need {
+            return Err(Error::Corrupt(format!(
+                "table set claims {n} ids ({need} bytes), {} available",
+                buf.len().saturating_sub(*pos)
+            )));
         }
         let mut ids = Vec::with_capacity(n.min(64));
         for _ in 0..n {
@@ -455,12 +465,21 @@ mod tests {
         buf.extend_from_slice(&9u32.to_le_bytes());
         buf.extend_from_slice(&2u32.to_le_bytes());
         assert!(TableSet::decode(&buf, &mut 0).is_err());
-        // An id at or past MAX_TABLES.
+        // An id at or past the CEILING. Not `MAX_TABLES`: that is a per-
+        // database RESOURCE budget now (`[database] max_tables`) and a decoder
+        // that enforced it would refuse a file written by a process configured
+        // differently — a legal id it happens not to mint itself.
+        let mut buf = 1u16.to_le_bytes().to_vec();
+        buf.extend_from_slice(&(crate::MAX_TABLES_CEILING as u32).to_le_bytes());
+        assert!(TableSet::decode(&buf, &mut 0).is_err());
+        // …and an id inside the ceiling but past the default budget DECODES.
+        // That is the property that makes a raised `max_tables` readable at all.
         let mut buf = 1u16.to_le_bytes().to_vec();
         buf.extend_from_slice(&(crate::MAX_TABLES as u32).to_le_bytes());
-        assert!(TableSet::decode(&buf, &mut 0).is_err());
-        // A count past MAX_TABLES must be rejected before any id is read, so a
-        // corrupt length can never drive a large speculative allocation.
+        assert!(TableSet::decode(&buf, &mut 0).is_ok());
+        // A count the buffer cannot satisfy must be rejected before any id is
+        // read, so a corrupt length can never drive a large speculative
+        // allocation.
         let buf = u16::MAX.to_le_bytes().to_vec();
         assert!(matches!(
             TableSet::decode(&buf, &mut 0),
@@ -470,7 +489,7 @@ mod tests {
         // aliased: it survives encode as itself and decode refuses the record.
         // (Debug builds trip `insert`'s assert first, so construct directly.)
         let mut buf = 1u16.to_le_bytes().to_vec();
-        buf.extend_from_slice(&99_999u32.to_le_bytes());
+        buf.extend_from_slice(&(crate::MAX_TABLES_CEILING as u32 + 1).to_le_bytes());
         match TableSet::decode(&buf, &mut 0) {
             Err(Error::Corrupt(m)) => assert!(m.contains("out of range"), "{m}"),
             other => panic!("expected out-of-range rejection, got {other:?}"),

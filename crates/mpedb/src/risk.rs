@@ -133,6 +133,12 @@ fn card_access(access: &AccessPath, table: u32, schema: &Schema, rc: &dyn Fn(u32
         return 1; // the FROM-less synthetic single row
     }
     match access {
+        // A series' worst case is not bounded by any table — it is the bounds,
+        // which are `KeyPart`s and may be parameters unknown until dispatch.
+        // The honest schema-only answer is "unbounded", and the layer-2 work
+        // meter is what actually stops a runaway (it charges per generated row,
+        // exactly as it charges per scanned one).
+        AccessPath::Series { .. } => u64::MAX,
         // A PK equality pins at most one row.
         AccessPath::PkPoint(_) => 1,
         // A full-width probe of a UNIQUE secondary index pins at most one row;

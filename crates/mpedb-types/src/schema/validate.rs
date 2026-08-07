@@ -8,13 +8,19 @@ impl Schema {
         // system-table headroom guard. The total (live + dead) is bounded by
         // MAX_TABLES — dead slots hold an id.
         let live = self.tables.iter().filter(|t| !t.dead).count();
-        if live > MAX_TABLES - 8 {
+        // The CEILING here, not the configured cap. `validate` runs on every
+        // schema LOAD, including of a file written by a process configured
+        // differently — refusing it against THIS process's `max_tables` would
+        // make a legitimate file unreadable because of a setting that is not
+        // the file's. The mint is where a config bound belongs, and that is
+        // where it is (`with_added_table_capped`).
+        if live > crate::MAX_TABLES_CEILING - 8 {
             return Err(Error::Schema(format!(
                 "too many tables ({live} > {})",
                 MAX_TABLES - 8 // headroom for system tables
             )));
         }
-        if self.tables.len() > MAX_TABLES {
+        if self.tables.len() > crate::MAX_TABLES_CEILING {
             return Err(Error::Schema("table-id space exhausted".into()));
         }
         // Duplicate LIVE names (dead slots have empty names, excluded). Set-

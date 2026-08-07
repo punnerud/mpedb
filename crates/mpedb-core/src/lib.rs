@@ -6,13 +6,40 @@
 //! - [`row`] — row payload codec
 //! - shm mapping, meta pages, reader table, transactions: in progress
 
+/// Where this crate's own tests put their files.
+///
+/// The same `MPEDB_TEST_DIR` knob `mpedb_testkit::scratch_base` reads, spelled
+/// again here rather than shared — and the duplication is forced, not lazy.
+/// `mpedb-testkit` depends on the facade, which depends on THIS crate, so using
+/// it here is a dependency cycle.
+///
+/// It exists because the alternative was measured: `std::env::temp_dir()` put
+/// every core test database on the root filesystem, and one run of the suite
+/// left 1 189 directories and 652 MB behind. That volume is 38 GB on the
+/// machine this is developed on; when it filled, `ld` died with a bus error
+/// mid-link and the failure looked like a compiler bug rather than a full disk.
+#[cfg(test)]
+pub(crate) fn test_scratch() -> std::path::PathBuf {
+    match std::env::var_os("MPEDB_TEST_DIR") {
+        Some(d) if !d.is_empty() => {
+            let d = std::path::PathBuf::from(d);
+            let _ = std::fs::create_dir_all(&d);
+            d
+        }
+        _ => std::env::temp_dir(),
+    }
+}
+
+pub mod backup;
 pub mod btree;
+pub mod compact;
 pub mod cdc;
 pub mod engine;
 // Kept PRIVATE: several of these take raw pointers, and clippy's
 // `not_unsafe_ptr_arg_deref` (rightly) only tolerates that behind a private
 // module. The facade needs exactly one of them, re-exported below.
 mod os;
+pub use os::Instant;
 
 /// Wall-clock microseconds since the Unix epoch — see [`os::wall_clock_micros`].
 ///

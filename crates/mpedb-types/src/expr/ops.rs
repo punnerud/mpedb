@@ -276,7 +276,7 @@ pub(super) fn in_items_3vl(
 /// is true; Unicode is NOT casefolded, exactly like NOCASE and sqlite itself).
 /// GLOB stays case-sensitive. (Note: PostgreSQL's LIKE is case-sensitive — this
 /// is the canonical sqlite/PG divergence; sqlite is mpedb's default and the
-/// semantics the C-API drop-in must present. A `bare_group_by = "postgres"`
+/// semantics the C-API drop-in must present. A `dialect = "postgres"`
 /// database instead compiles case-SENSITIVE LIKE via [`like_match_cs`] behind the
 /// [`Instr::LikeCs`](super::Instr::LikeCs) opcode.)
 ///

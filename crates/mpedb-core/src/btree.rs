@@ -400,7 +400,7 @@ fn descent_index(p: &[u8], key: &[u8]) -> Result<usize> {
 #[cfg(feature = "leakstat")]
 macro_rules! ovf_timed {
     ($ctr:expr, $body:expr) => {{
-        let __t = std::time::Instant::now();
+        let __t = crate::os::Instant::now();
         let __r = $body;
         crate::engine::leakstat::add(&$ctr, __t.elapsed().as_nanos() as u64);
         __r

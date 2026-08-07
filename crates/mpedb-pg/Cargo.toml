@@ -1,0 +1,47 @@
+[workspace]
+# Its OWN workspace, like mpedb-capi and mpedb-fs, and for the same class of
+# reason — but here the reason is the whole point of the crate rather than a
+# link-time accident.
+#
+# mpedb's contract is that there is NO SERVER: processes mmap a file and attach.
+# A network listener in the parent workspace would be compiled by every
+# `cargo build` and `cargo test --workspace` whether or not anyone asked for it,
+# and cargo's feature unification means one member enabling `mpedb-sql/pg-dialect`
+# would silently change what the sqlite corpus is measuring. (The root
+# Cargo.toml's own comments record that exact failure mode biting once already,
+# which is why mpedb-capi had to be excluded.)
+#
+# Being outside the parent's `members` IS the build toggle: the default build
+# contains not one byte of this crate.
+members = []
+
+[package]
+name = "mpedb-pg"
+version = "0.2.9"
+edition = "2021"
+license = "LicenseRef-mpedb-1.0"
+description = "PostgreSQL v3 wire protocol for mpedb — serverless, one process per connection"
+
+[dependencies]
+mpedb = { path = "../mpedb" }
+mpedb-sql = { path = "../mpedb-sql", features = ["pg-dialect"] }
+mpedb-types = { path = "../mpedb-types" }
+# No tokio, no pgwire, no TLS stack. The protocol is a length-prefixed byte
+# format and the connection model is one blocking socket per process; an async
+# runtime would buy nothing and cost a dependency tree. TLS terminates in nginx
+# or stunnel (see deploy/), which is also where it belongs for a process that is
+# spawned per connection.
+
+[dev-dependencies]
+mpedb-testkit = { path = "../mpedb-testkit" }
+
+[[bin]]
+name = "mpedb-pg"
+path = "src/bin/mpedb_pg.rs"
+
+# The PostgreSQL oracle. Its own binary rather than a test, for the same reason
+# `sqlite_corpus` is: the corpus is out of tree and large, the run is long, and
+# it is driven by hand at named commits — not on every `cargo test`.
+[[bin]]
+name = "pg_regress_diff"
+path = "src/bin/pg_regress_diff.rs"

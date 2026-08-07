@@ -26,6 +26,16 @@
 //! narrowed to `all(unix, …)` purely so wasm can take that third arm — the
 //! Linux and macOS code paths are unchanged.
 
+
+/// The engine's monotonic clock type. Native: `std::time::Instant`.
+/// wasm32 with `js-clock`: wasmtimer's API-mirror backed by
+/// `performance.now()` — std's Instant panics on wasm32-unknown-unknown,
+/// and the engine uses deadlines/timing on paths a browser embedder hits.
+#[cfg(not(all(target_arch = "wasm32", feature = "js-clock")))]
+pub use std::time::Instant;
+#[cfg(all(target_arch = "wasm32", feature = "js-clock"))]
+pub use wasmtimer::std::Instant;
+
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 use std::os::unix::io::RawFd;
 // Windows: the handle type and a `libc`-shaped module over real Win32 calls,

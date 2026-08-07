@@ -1,0 +1,564 @@
+# mpedb PostgreSQL Compatibility
+
+What mpedb answers when a PostgreSQL client connects, feature by feature — the
+companion to [COMPAT.md](COMPAT.md), which does the same for sqlite.
+
+**Two rules, the same as everywhere else in this project.** Every ✅ is measured
+by a test that fails if it stops being true. Every ❌ is a **named refusal** with
+a SQLSTATE a client can branch on — never a silent wrong answer.
+
+**Nothing here is a claim to BE PostgreSQL.** `version()` reports `PostgreSQL
+16.14 (mpedb <ver>)` because SQLAlchemy, Django and psycopg parse that string at
+CONNECT and fail before they can ask anything else if they cannot; it names mpedb
+in the same breath. 16.14 is the version the differential work measures against,
+so raising it means re-measuring.
+
+## How to run it
+
+The wire protocol lives in `crates/mpedb-pg`, which is **its own cargo
+workspace** and therefore not built by `cargo build` or `cargo test --workspace`
+in the parent. That separation IS the build toggle: the default build of mpedb
+contains no network code at all.
+
+```sh
+cargo build --release --manifest-path crates/mpedb-pg/Cargo.toml
+mpedb-pg serve --unix /run/mpedb app.mpedb    # or --inherited-fd under systemd
+psql -h /run/mpedb -d app
+```
+
+Deployment (socket activation, nginx, cron) is in [`deploy/`](deploy/README.md).
+
+## The three named limits
+
+These are not bugs and they are not "not yet". They are what mpedb's design
+means when it meets PostgreSQL's, stated before anyone finds them.
+
+### 1. One writer at a time
+
+mpedb serializes writers (one writer lock, group commit). PostgreSQL has
+row-level MVCC for writers. A client that opens `BEGIN`, thinks, and then
+`COMMIT`s would hold mpedb's writer lock for the whole think-time and block every
+other process on the machine.
+
+So mpedb-pg does not hold it. A transaction block is **buffered** and replayed as
+ONE mpedb transaction at `COMMIT`.
+
+| | PostgreSQL | mpedb-pg |
+|---|---|---|
+| writes inside the block are visible to the block | ✅ | ✅ |
+| the block is atomic | ✅ | ✅ |
+| `ROLLBACK` discards it | ✅ | ✅ |
+| a failed statement poisons the block | ✅ | ✅ |
+| **a constraint violation is reported at the offending statement** | ✅ | ❌ — at `COMMIT` |
+| **`ROLLBACK` undoes DDL** (transactional DDL) | ✅ | ❌ — DDL commits immediately |
+| the writer lock is held from BEGIN to COMMIT | n/a | **no** |
+
+The last three rows are the same trade seen from three sides.
+
+DDL is the one thing the block does NOT buffer, and that is not a shortcut: it
+is forced. mpedb's DDL takes its OWN write transaction, so replaying it inside
+the block's open `WriteSession` waits on a lock this process already holds —
+measured, as a permanent hang on `BEGIN; CREATE TEMPORARY TABLE t(a int);
+COMMIT`. Buffering it would not have made it atomic either (mpedb commits the
+schema change on its own); it would only have hidden the deadlock.
+
+### 2. Text format only
+
+`RowDescription` advertises format 0 (text) for every column, and a **binary bind
+parameter is refused by name**. Binary is where a wrong answer hides best: a
+misencoded `int8` is eight bytes that decode to a plausible number with no error
+anywhere. `numeric` loses nothing by this — PostgreSQL's text form for it IS the
+canonical decimal string, which is exactly how mpedb carries the type.
+
+### 3. The catalog is a separate database
+
+`pg_catalog` and `information_schema` are materialised as real tables in a
+session-private in-memory database, built lazily on first reference. A statement
+naming **both** a catalog relation and a user table cannot run.
+
+Why not CTEs, which would have kept everything in one database — measured:
+
+```text
+WITH c(a) AS (SELECT 1 UNION ALL SELECT 3),
+     d(b) AS (SELECT 2 UNION ALL SELECT 4)
+SELECT c.a, d.b FROM c JOIN d ON c.a = d.b
+  → bind error: CTE `d` body is not a simple SELECT
+```
+
+A CTE in join position is *spliced* onto its body's base table, and a `UNION ALL`
+body has none. Since `psql \d` joins four catalog relations and every ORM's
+reflection does the same, the rows have to arrive as ordinary tables.
+
+## Connection
+
+| Feature | Status | Comment |
+|---|---|---|
+| Protocol v3 startup | ✅ | v2 (code 131072) is refused **by number**, not hung on |
+| `SSLRequest` / `GSSENCRequest` | ✅ | answered `N`; TLS terminates in nginx (`deploy/`) |
+| Trust auth on a unix socket | ✅ | the default — the peer is authenticated by filesystem permissions, which is the same fence mpedb uses for the file |
+| Cleartext password | ✅ | `--require-password`; any password is accepted, so this is a *speed bump*, not authentication |
+| SCRAM-SHA-256 | ❌ | not implemented. Over TCP, put nginx or a firewall in front |
+| `CancelRequest` | 🚧 | the connection is accepted and closed silently (as PostgreSQL does); the query is not actually cancelled |
+| `BackendKeyData` | ✅ | pid + a pid-derived secret |
+| `ParameterStatus` at connect | ✅ | `server_version`, `server_encoding`, `client_encoding`, `DateStyle`, `TimeZone`, `standard_conforming_strings`, … |
+
+## Query protocol
+
+| Feature | Status | Comment |
+|---|---|---|
+| Simple query (`Q`) | ✅ | multi-statement, split on top-level `;` only — quotes, `--` comments and `$$` bodies are respected |
+| Extended query | ✅ | `Parse`/`Bind`/`Describe`/`Execute`/`Sync`/`Close`, named and unnamed. This is the path psycopg uses by default |
+| Portals with `max_rows` | ✅ | `PortalSuspended` and resume. mpedb materialises a result set, so this bounds what is SENT, not peak memory |
+| `Describe` on a statement | 🚧 | `ParameterDescription` reports the OIDs the client declared (`unknown` where it declared none); the row description is sent at `Execute` rather than here |
+| `EmptyQueryResponse` | ✅ | |
+| `COPY … FROM STDIN` / `TO STDOUT` | ❌ | refused by name. `pg_dump` and `\copy` need it |
+| `LISTEN` / `NOTIFY` as SQL | ❌ | mpedb's notification exists but carries **no payload** (DESIGN-NOTIFY §1); a bare `NOTIFY chan` could be mapped, `NOTIFY chan, 'text'` could not |
+
+## SQL surface
+
+Everything in [COMPAT.md](COMPAT.md) applies — this table is the PostgreSQL-only
+surface on top of it.
+
+| Feature | Status | Comment |
+|---|---|---|
+| `expr::type` cast | ✅ | binds tighter than unary minus, chains left-to-right. The typmod is parsed and DISCARDED — mpedb has `Text`, not `varchar(8)`, and keeping the number would imply an enforcement that does not exist |
+| `$$…$$` / `$tag$…$tag$` | ✅ | the tag rule (may not start with a digit) is exactly what keeps `$1` a parameter |
+| `$n` parameters | ✅ | in both dialects |
+| `~` / `!~` regex match | ✅ | lowered onto the same node as `x REGEXP y`, so there is one implementation |
+| `~*` / `!~*` | ❌ | case-insensitive matching needs the pattern rewritten to `(?i)…`, which only works for a LITERAL — doing it only for literals would make `a ~* b` and `a ~* 'x'` behave differently |
+| `ILIKE` | ❌ | not implemented (sqlite-dialect `LIKE` is already case-insensitive; the PG dialect's is not) |
+| `OPERATOR(pg_catalog.=)` | ✅ | unwrapped to the operator inside. psql writes every comparison in `\d <table>` this way |
+| `COLLATE pg_catalog.default` / `COLLATE "C"` | ✅ | the IDENTITY, not an approximation: mpedb compares text bytewise and the catalog reports `C` everywhere it is asked |
+| `E'…'` escape strings | ❌ | |
+| `SERIAL` / `BIGSERIAL` | 🚧 | resolves to the integer type. Auto-assignment comes from mpedb's rowid-alias rule (#94), so `id serial PRIMARY KEY` fills itself in and a non-PK `serial` does not |
+| Table functions in `FROM` (`generate_series`, `unnest`, …) | ❌ | mpedb has no table-function planner. Refused BY NAME with the workaround where one exists — 1 235 corpus statements, previously an opaque ``unexpected trailing input `LParen` ``. `generate_series` is 578 of the corpus's 1 823 FROM-position calls and the only one broadly implementable: the rest need a stored procedural language, an array type, or JSON |
+| Arrays (`int4[]`, `ARRAY[…]`, `unnest`) | ❌ | there is no storable array type. `int4[]` does NOT resolve to its element type — that would make a whole column read back as one number |
+| `pg_typeof()` | ❌ | mpedb's `typeof()` speaks sqlite's five storage classes, a different vocabulary |
+| `nextval` / `currval` / `setval` | ❌ | no sequences; the refusal points at the rowid-alias rule and `RETURNING id` |
+| `octet_length()` | ❌ | counts BYTES; mpedb's `length()` counts characters. Aliasing them would return a plausible wrong number for any non-ASCII text |
+| `char_length` / `character_length` | ✅ | → `length()` |
+| `strpos` / `position(x in y)` | ✅ | the same function written both ways round; `position` swaps its arguments |
+| `version()`, `current_schema()`, `current_database()`, `current_catalog` | ✅ | folded to constants |
+| `pg_get_userbyid()`, `pg_table_is_visible()` | ✅ | one role, one namespace — `\d` calls both |
+| `pg_get_expr()`, `pg_get_indexdef()` | 🚧 | the identity: mpedb stores DDL TEXT rather than a parse tree, so the argument already IS what the call would have returned |
+| `ATTACH` and TEMP objects under the PG dialect | ✅ | the cross-database resolver (`dbref.rs`) lexes under the session's dialect, so `::` and `!~` survive it. This was a named limitation until the resolver was threaded — and the bypass that stood in for it silently disabled `CREATE TEMP TABLE`, which opens 76 of the 222 corpus files |
+
+## Types
+
+The core set maps onto mpedb's seven column types. `numeric` is carried as
+canonical TEXT — lossless, and identical to PostgreSQL's own wire form.
+
+| PostgreSQL | mpedb | Fidelity |
+|---|---|---|
+| `bool` | Bool | exact |
+| `int8` | Int64 | exact |
+| `int2`, `int4`, `oid` | Int64 | widened — a local write can exceed what the PG column takes |
+| `float8` | Float64 | exact |
+| `float4` | Float64 | widened |
+| `text` | Text | exact |
+| `varchar(n)`, `bpchar(n)`, `name`, `char` | Text | widened — **the length is not enforced** |
+| `bytea` | Blob | exact |
+| `timestamp`, `timestamptz` | Timestamp (µs, UTC) | exact |
+| `date` | Timestamp | widened (midnight UTC) |
+| `time` | Int64 (µs since midnight) | widened |
+| `numeric`, `json`, `jsonb` | Text | via canonical text |
+| `uuid` | Blob (16 bytes) | via bytes |
+| `interval`, `timetz` | — | ❌ named refusal |
+| anything else | — | ❌ unknown type |
+
+The OIDs are PostgreSQL's own, from `pg_type.dat`. They are ABI: every client
+has them compiled in, and a wrong one makes psycopg silently produce the wrong
+Python type with no error to notice.
+
+## Catalog
+
+| Relation | Status |
+|---|---|
+| `pg_class`, `pg_namespace`, `pg_attribute`, `pg_type` | ✅ tables AND their indexes |
+| `pg_index`, `pg_constraint`, `pg_attrdef` | ✅ PK, UNIQUE, FOREIGN KEY, CHECK |
+| `pg_database`, `pg_roles`, `pg_am` | ✅ one database, one role, heap+btree |
+| `pg_tables`, `pg_indexes` | ✅ |
+| `pg_views`, `pg_matviews`, `pg_description` | ✅ (empty) |
+| `information_schema.tables`, `.columns`, `.schemata` | ✅ |
+| `information_schema.table_constraints`, `.key_column_usage`, `.referential_constraints` | ✅ |
+
+`pg_catalog` resolves unqualified (it is on PostgreSQL's implicit `search_path`);
+`information_schema` does **not**, which is what keeps a user table called
+`tables` from being shadowed.
+
+Fidelity notes worth knowing:
+
+- `reltuples` is `-1` ("never analysed"), not a fabricated row count — a made-up
+  number here would feed the CLIENT's planner.
+- OIDs come from the table's STABLE id, so one survives a `DROP` of an unrelated
+  table. A client that cached `attrelid` between two queries would otherwise read
+  another table's columns.
+- `attnum` is 1-based; `indkey` is space-separated (int2vector), not
+  comma-separated, because every client parses exactly that.
+- `is_nullable` is the strings `YES`/`NO`, not a boolean.
+
+## psql
+
+| Command | Status |
+|---|---|
+| `\d` (list relations) | ✅ |
+| `\dt` | ✅ |
+| `\d <table>` | ❌ — needs `format_type()`, `array_to_string()` and a `CASE` shape mpedb does not parse |
+| arbitrary SQL | ✅ |
+
+## What is measured
+
+### The differential against PostgreSQL 16.14
+
+`crates/mpedb-pg/src/bin/pg_regress_diff.rs` sends each of PostgreSQL's own
+`src/test/regress/sql/*.sql` through BOTH a throwaway PG 16.14 cluster and
+mpedb, and diffs the two transcripts **against each other**. The `.out` files
+are not used at all — they carry PostgreSQL's error wording, OID numbering and
+`EXPLAIN` output, none of which mpedb can or should reproduce.
+
+**Full run, all 222 files, 40 474 statements** (PostgreSQL 16.14, measured on a
+real volume — see the notes below on why both of those qualifiers matter):
+
+| outcome | statements | share |
+|---|---:|---:|
+| **match** — both answered, identically | 9 132 | 22.6 % |
+| **order-only** — same rows, different order, no `ORDER BY` asked | 20 | 0.0 % |
+| **both refused** — both errored | 7 653 | 18.9 % |
+| **refused** — PostgreSQL answered, mpedb refused by name | 20 595 | 50.9 % |
+| **DIVERGED** — both answered, differently | 3 074 | 7.6 % |
+
+Agreement (match + order-only + both-refused) is **41.5 %**. Divergence — the
+only number that means something is WRONG — is **7.6 %**.
+
+Run to run the totals move by a handful of statements (a `match` here, a
+`both-refused` there). That is the corpus's own nondeterminism — OIDs, `now()`,
+a `\timing` line — not measurement noise to be averaged away, and it is why a
+baseline compares PER FILE rather than on the total.
+
+**The run before this one was thrown away, and why is worth more than the
+number.** It reported two files as HUNG that had run clean the pass before
+(`cluster`, `collate.icu.utf8`) and 656 new divergences. Run in isolation, both
+files reproduced the baseline exactly. The cause was 2 513 files left in the
+scratch directory by seven earlier passes: `CREATE TEMPORARY TABLE` opens a
+16 MB ephemeral member, `DETACH` unlinked it, and a connection that simply
+CLOSED never detached — so every connection that used a temp table left 16 MB
+behind, forever. The volume filled enough for two files to time out. Fixed in
+the engine (`impl Drop for AttachState`, with a regression test) rather than in
+the harness, because the leak was mpedb's. Same shape as the `/dev/shm`
+flapping recorded below, from the same root — an ephemeral file nobody was
+responsible for removing. A measurement tool that litters eventually measures
+its own litter.
+
+Both percentages rose against the previous run over the same code, because the
+denominator lost 1 634 statements that were never a compatibility question:
+**`EXPLAIN` is excluded from both arms.** It was found by hunting the corpus's
+single largest refusal bucket — 1 047 statements reported as `unsupported
+statement (`, which turned out to be `EXPLAIN (COSTS OFF) SELECT …`,
+PostgreSQL's parenthesised option list hitting a parser whose `EXPLAIN` takes no
+options. Teaching the parser to swallow the option list was the obvious move and
+the wrong one: it would have converted 1 047 refusals into 1 047 divergences,
+because mpedb prints its own access paths and MPEE join order and PostgreSQL
+prints `Seq Scan on document / Filter: …`. Neither can produce the other's plan
+text, and neither should. In absolute terms divergence did not move (3 040 →
+3 036); of the 1 634 excluded statements, 1 121 were `refused` and 521
+`both-refused`, i.e. essentially all of them were already scored as failures or
+as hollow agreement.
+
+**That agreement figure went DOWN from a previously reported 46.9 %, and the
+drop is the measurement getting more honest.** The statement splitter used to
+read `COPY … FROM stdin` payloads as SQL: eleven files, 1 553 data lines, each
+`;` inside a data row splitting into another statement that was never SQL. Both
+engines rejected all of it, so ~6 000 pieces of garbage counted as
+`both-refused`, i.e. as AGREEMENT. Removing them cost six points of a number
+that was never real.
+
+What moved in the right direction is what matters: real matches rose by 2 070,
+and divergence nearly halved, from 13.7 % to 7.5 %.
+
+`both-refused` counts as agreement on purpose: mpedb's contract IS a named
+refusal, and refusing what PostgreSQL refuses is the right answer — several
+corpus files (`int4`, `limit`, `bit`) are largely error-case tests, where that
+is most of the file.
+
+**order-only** is a separate column rather than folded into `match` because it
+is the one number that would let this harness flatter itself. SQL does not
+define the order of a result set without `ORDER BY`, so two engines returning
+the same multiset are both right; counting that as a divergence measures the
+scan order of two storage engines, which is not a compatibility question.
+sqlite's sqllogictest solves the same problem with an explicit `rowsort` marker
+per query — the PostgreSQL corpus has no such declaration, so the statement text
+is asked instead (`ORDER BY` at paren depth zero). A PARTIAL `ORDER BY` whose
+keys tie is still counted as a divergence even though both engines are right:
+the alternative would hide a real ordering bug behind an "it might have been a
+tie" excuse.
+
+### What the measurement is worth, and what it is not
+
+Two things about this number are worth stating plainly.
+
+**It was not stable until the scratch directory moved.** The same command
+returned three different results for `window.sql` (0, then 7, then 2 matches)
+with no code change in between. `/dev/shm` was 100 % full, and the temp member
+backing `CREATE TEMP TABLE` is a 16 MB file there — whether it fit depended on
+free space at that instant. `mpedb_testkit::scratch_base` was written for
+exactly this and says so in its own docs; the two ephemeral paths in
+`multifile.rs` were simply never wired to the same knob. They are now, so:
+
+```sh
+MPEDB_TEST_DIR=/mnt/ext4/mpedb-scratch cargo test --workspace
+```
+
+**One file does not finish.** `temp.sql` hangs mpedb and is recorded as
+`HUNG`, its 163 statements counted as diverged. The harness gives each file a
+120-second watchdog rather than letting one file stall a 222-file run — a
+measurement tool that can be stopped by the thing it measures cannot finish, and
+an unfinished run measures nothing. The hang is open; a hang is the same class
+of contract violation as a panic.
+
+### The ranked work list
+
+The harness records mpedb's SQLSTATE and message for every statement PostgreSQL
+answered and mpedb refused, groups them by SHAPE (anything quoted → `_`, digit
+runs → `N`) and ranks them. **393 distinct causes over 20 684 refusals** — the
+cause list got FINER as the refusals themselves got more specific, which is the
+point of naming a refusal. The top, with a real example under each:
+
+| refusals | SQLSTATE | cause | example |
+|---:|---|---|---|
+| 1 875 | 42P01 | unknown table | **86 % CASCADE** from an earlier failed `CREATE` — counted, see below. ~260 is the real content |
+| **1 369** | 42601 | **declarative partitioning** | `PARTITION BY` / `PARTITION OF` / `ATTACH PARTITION` — one message, gathered from three |
+| 1 075 | 42601 | unexpected character `\` | psql meta-commands the harness passes through |
+| 946 | 42601 | **table function in `FROM`** | `unnest(…)`, `rngfunct(1) WITH ORDINALITY` — `generate_series` in the first `FROM` position now EXECUTES |
+| 921 | 42601 | parse: `expected …` | ``expected `TABLE` `` — `CREATE <thing the DDL grammar does not know>` |
+| 790 | 25P02 | transaction aborted | cascade from an earlier failure inside a block |
+| 604 | 42601 | parse: `expected )` closing the argument list | |
+| 483 | 42601 | parse: expected an expression | |
+| 418 | 42601 | `ALTER TABLE … ROW LEVEL SECURITY` | other `ALTER TABLE` forms |
+| 316 | 42601 | parse: `expected (` | |
+| ~2 150 | 42883 | unknown function — **404 DISTINCT names**, biggest 127 | a long tail, scattered below the cutoff; see below |
+
+**Partitioning is the second-largest item in the corpus, and nothing said so
+until the messages were fixed.** `PARTITION BY`, `PARTITION OF` and `ATTACH
+PARTITION` each landed on whichever check the parser happened to reach last —
+`expected (`, the generic trailing-input complaint, and (for `ATTACH`) "expected
+ENABLE, FORCE, or DISABLE ROW LEVEL SECURITY", which is a message about a
+different feature entirely. Three of the four spellings pointed the reader
+somewhere useless, and the work list read the whole thing as a scatter of
+punctuation problems. One named refusal gathers 1 369 statements: `expected (`
+fell 1 098 → 316, the RLS message 656 → 418, and the `PARTITION` tail to zero.
+
+The totals did not move, and that is correct — these are refusals either way.
+What changed is that the second-biggest job in the corpus is now visible as one.
+
+**Four times now, one number has stood for a population nobody had looked
+inside, and four times the reading was wrong while the number was right.**
+
+| the line | what it looked like | what it was |
+|---|---|---|
+| `unknown function` 2 158 | the biggest opportunity | 404 names, biggest 127 — a tail |
+| `unexpected trailing input` 1 933 | statement-tail keywords (`CASCADE`) | PARTITION; the corpus has 48 CASCADEs |
+| tail `TIME` 150 | a type-name gap | `AT TIME ZONE`, swallowed as an alias |
+| `unknown table` 1 875 | the #1 item | 86 % shadow of the items below it |
+
+None of those counts was wrong. The INTERPRETATION was, every time, and always
+for the same reason: an aggregate with one example under it reads as a
+description of the whole, and an example is one arbitrary member.
+
+**A collapsed line's EXAMPLE is not its description, and this document said so
+three times before believing it.** `unknown function` carried
+`pg_advisory_xact_lock()` and turned out to be 404 names. `unexpected trailing
+input` carried ``Ident("cascade")`` and turned out to be PARTITION — the corpus
+has 48 CASCADEs, so it could never have been 1 933. The tail `TIME` turned out
+to be `AT TIME ZONE`, swallowed as an alias (`ts AS AT`) so the complaint named
+the word after the one that mattered. Each was one arbitrary member standing in
+for a population, and each pointed the wrong way.
+
+**The list rewrote the roadmap twice in one afternoon, in opposite directions.**
+
+First it demoted `generate_series`. The plan had it as the second-biggest
+blocker on the strength of 803 occurrences across 96 files — a real count — and
+it is nowhere in the top 25, because `FROM generate_series(…)` fails at PARSE
+time and lands in a different bucket entirely.
+
+Then reading the EXAMPLES promoted it again, under a better name: those
+refusals were **table functions in `FROM`** — `rngfunct(1) WITH ORDINALITY`,
+`unnest(…)`, `generate_series(…)`. So the feature is worth several times what
+the plan estimated, but the thing to build is a table-function row source, not
+one function. It now has its own named refusal and its own line (1 235).
+
+Neither correction was available from counting occurrences in the corpus, and
+neither was available from the outcome counts alone. Both needed the message.
+
+**The biggest bucket is a long tail, and that took a measurement to learn.**
+`unknown function` sat at the top of this list for three rounds as one line of
+~2 150 refusals with one arbitrary example under it. That line reads as the
+largest opportunity in the corpus. It is not: keeping the NAME in the grouping
+key splits it into **404 distinct functions**, and exactly one of them —
+`pg_input_is_valid()` at 127 — reaches the top 25 at all. The rest are each
+worth fewer than about 120 statements. Per unit of work it is the least
+attractive item in the top five, not the most, and the collapsed line said the
+opposite. (The top name is not even a function to implement: `pg_input_is_valid`
+asks whether PostgreSQL's OWN type-input function accepts a string. The answer
+is PostgreSQL's by definition.)
+
+The change that produced that was five lines, and it shipped BROKEN for a full
+run: `msg.strip_prefix("unknown function \`")` against a message that reads
+`bind error: unknown function \`f()\`; available: …`, where the marker is in
+the middle. The prefix matched nothing, the code fell through to the old
+grouping, and the output was identical to not having made the change — which
+looked like the idea had failed. Its unit test passed throughout, because the
+test fed it a stripped message rather than the real one. A test that builds its
+own input can confirm a function that never meets production.
+
+`generate_series` is the one that was BUILT rather than reclassified, and what
+it measured is worth as much as what it fixed. It is a real row source now —
+`AccessPath::Series` over a `SERIES_TABLE` sentinel, rows generated and charged
+to the same #74 work meter the engine's scans charge, `KeyPart` bounds so a
+correlated series reuses the index nested loop's machinery rather than making
+LATERAL a separate concept (PLAN\_FORMAT 71). The table-function bucket fell
+1 235 → 946.
+
+**But only about 20 of those 289 became agreement.** The rest moved to OTHER
+refusal buckets — `unknown table` +113, `unexpected trailing input` +16 —
+because those statements needed more than `generate_series`: LATERAL, arrays,
+`::numeric`, or the series in JOIN position. The bucket was the FIRST blocker
+in each of them, not the only one. 803 corpus occurrences bought 20 statements,
+and the ranked list cannot tell you that in advance — only building it can.
+
+It also cost four wrong answers before it shipped, which the oracle caught and
+which are worth naming because both are the same shape. `generate_series('nan'
+::numeric, 100, 10)` is an ERROR in PostgreSQL — it has a numeric series and
+NaN is not a legal bound for it. mpedb has no NaN-carrying numeric, so
+`'nan'::numeric` takes sqlite's CAST rule and folds to the INTEGER 0, at which
+point the series is indistinguishable from a written `generate_series(0, 100,
+10)` and ANSWERS where PostgreSQL refuses. Neither the folded value nor its
+type can see it afterwards — both say `Int(0)` — so the cast is refused while
+it is still WRITTEN DOWN, on the AST, before binding. That also refuses
+`generate_series(1::numeric, 3::numeric)`, which PostgreSQL accepts: mpedb has
+no numeric or timestamp series, and a refusal is the contract where an invented
+answer is not. (The root cause is not the series. `CAST('nan' AS numeric)` = 0
+is sqlite's rule and mpedb agrees with sqlite there; it is still wrong under
+the PostgreSQL dialect, and it is still wrong inside `sum()`, where the cast
+refusal cannot reach it. That is a separate item.)
+
+**PL/pgSQL compiles.** PostgreSQL's procedural language is a third FRONTEND to
+the PySpell layer (`mpedb_spell::plpgsql`), emitting the same IR the Python and
+Rust subsets do — so the security boundary is unchanged (the parser stays on
+the host; the runtime only ever sees IR), and so are the budget and the content
+hash. The unit is the whole `CREATE FUNCTION … LANGUAGE plpgsql` statement,
+because that is what `pg_dump` writes and because the HEADER is where the
+parameter names live. `CREATE FUNCTION` is now a DDL statement, so a dump
+replays over the wire protocol unchanged and the function is callable from SQL
+immediately.
+
+Against PostgreSQL's own corpus it compiles **45 of 417** plpgsql functions
+(`cargo test -p mpedb-spell -- --ignored plpgsql_corpus`). That test asserts
+nothing about the rate on purpose: a coverage number a test enforces is a
+number someone eventually moves by widening what is accepted, and this
+frontend's refusals are load-bearing. What it does assert is that no input
+panics. The ranked reasons are the work list — 98 `RETURNS trigger`, 45
+`RAISE`, 35 row-returning (`SETOF`/`TABLE`), 14 cursors, 11 `OUT` parameters.
+
+`plpgsql.sql` moved 240 → 254 match and 542 → 517 refused. Its divergences rose
+32 → 51, and those are NOT the frontend being wrong: they are `character(20)`
+columns, which PostgreSQL pads with trailing spaces and mpedb stores unpadded.
+The statements simply reach further into the file now. Same pattern as the
+`'NaN'::numeric` case — a feature that works exposes an older gap, and saying
+so is the point of counting divergence separately.
+
+**The biggest line in that table is mostly a SHADOW of the lines below it, and
+that is now counted rather than claimed.**
+
+`unknown table` sat at #1 in every measurement this session. The harness now
+remembers, per file, which `CREATE TABLE`s mpedb refused, and classifies each
+later `unknown table X` as a CONSEQUENCE (the create was refused earlier in the
+same file) or an INDEPENDENT gap. Over the 40 heaviest files — 23 072 of 40 474
+statements, holding 1 487 of the refusals:
+
+> **1 275 of 1 487 are consequences (86 %); 212 are not.**
+
+So the corpus's largest single item is largely the second-order cost of the
+refusals ranked above it. Fixing those removes it; it is not its own job.
+Scaled, the real content is around 260 — which puts it BELOW partitioning
+(1 369), psql meta-commands (1 075) and table functions in `FROM` (946).
+
+The name extractor is a text scan rather than a parse, deliberately: the
+statement already failed to parse in at least one engine, so a parser is the
+wrong tool, and reading a name wrong here can only misfile ONE refusal between
+two buckets — it cannot change whether a statement passed. That tolerance is
+honest for this job and would not be for the judging. It is tested against every
+spelling the corpus uses AND against `CREATE INDEX`/`VIEW`/`FUNCTION`, because a
+false positive there would quietly inflate the consequence bucket and flatter
+the split.
+
+Caveat, stated rather than buried: 40 files of 222. The subset is the heaviest
+by refusal count — where the bucket actually lives — which is deliberate, not
+random, and not the same as the whole corpus.
+
+The same list is what produced the `EXPLAIN` exclusion above — and that one is
+worth stating as a general rule, because it is the failure mode a coverage
+number invites: **the cheapest way to move a compatibility metric is to accept
+syntax you cannot answer correctly.** Every refusal turned into a divergence
+reads as progress in the parse-error column while making the engine wronger.
+The list is only useful if the response to a big bucket may be "this is not a
+compatibility question", and that has now happened twice — for `COPY` payloads
+and for `EXPLAIN`.
+
+What the list says overall: **most of the refusals are GRAMMAR**, not missing
+features — statement-level coverage (`CREATE <thing>`, `GRANT`, `ANALYZE`, …)
+and the system-function surface dominate.
+
+### What the oracle has found so far
+
+Running it is not bookkeeping — it is how these were found, and none of them
+was reachable from the sqlite corpus:
+
+- **Four panics**, all one root cause: `INDEX_EXPR_COL` (`u16::MAX`) marks an
+  index key part that is an EXPRESSION, and six places in the planner used it to
+  index the column list. `IndexDef::has_expression_part()` now guards every
+  place an index is chosen as an access path. The sqlite corpus has no
+  expression indexes, so nothing had ever reached those lines.
+- **One self-deadlock**: `BEGIN; CREATE TEMPORARY TABLE t(a int); COMMIT` hung
+  forever. mpedb's DDL takes its own write transaction, and replaying it inside
+  an already-open `WriteSession` waits on a lock the process is holding. The
+  wire session now executes DDL immediately and buffers only DML.
+- **One measurement instability** (`/dev/shm`, above), which had been quietly
+  understating the score.
+
+`crates/mpedb-pg/pg-regress-baseline.tsv` records the per-file counts. Any
+movement against it — an improvement included — exits non-zero, the same
+discipline `corpus-baseline.tsv` applies to the sqlite corpus.
+
+```sh
+# One-time: fetch the corpus (deliberately not vendored) and start a cluster.
+curl -LO https://ftp.postgresql.org/pub/source/v16.14/postgresql-16.14.tar.bz2
+tar xjf postgresql-16.14.tar.bz2 postgresql-16.14/src/test/regress/sql
+export MPEDB_PG_REGRESS=$PWD/postgresql-16.14/src/test/regress
+
+cargo run --release --manifest-path crates/mpedb-pg/Cargo.toml \
+  --bin pg_regress_diff -- --all \
+  --baseline crates/mpedb-pg/pg-regress-baseline.tsv
+
+# Investigating one file: --show prints BOTH transcripts per statement.
+cargo run --manifest-path crates/mpedb-pg/Cargo.toml --bin pg_regress_diff -- \
+  --show $MPEDB_PG_REGRESS/sql/int4.sql
+```
+
+`--show` is not a debugging leftover. The first three runs of this harness
+reported 1 550 divergences across five files; every one was a bug in the
+HARNESS, not in mpedb, and the counts alone could not tell the difference. After
+the fixes the same five files show 39.
+
+### The protocol
+
+`crates/mpedb-pg/tests/wire.rs` drives a `Session` over a pipe — no socket, no
+PostgreSQL needed, milliseconds. Plus the unit tests under `crates/mpedb-pg/src/`
+and `crates/mpedb-sql/src/pg/`.
+
+### Not yet measured
+
+The ecosystem suites — psycopg3's own tests, SQLAlchemy's PG dialect suite,
+Django's `postgresql` backend — two-armed and diffed by test NAME, the way
+`crates/mpedb-capi/workbench/djsuite` does it for sqlite. None of them is
+installed on the development box, so that harness has to build its own venv
+first.

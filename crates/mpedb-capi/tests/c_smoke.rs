@@ -53,7 +53,7 @@ fn c_consumer_drives_mpedb() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let src = manifest.join("tests/smoke.c");
     let include = manifest.join("include");
-    let out = std::env::temp_dir().join(format!("mpedb_capi_smoke_{}", std::process::id()));
+    let out = scratch().join(format!("mpedb_capi_smoke_{}", std::process::id()));
 
     let status = Command::new(&cc)
         .arg(&src)
@@ -87,4 +87,25 @@ fn c_consumer_drives_mpedb() {
     assert!(stdout.contains("row: id=3 name=linus"), "expected row output");
     assert!(stdout.trim_end().ends_with("OK"), "expected final OK");
     let _ = Path::new(".");
+}
+
+/// The same `MPEDB_TEST_DIR` knob `mpedb_testkit::scratch_base` reads, spelled
+/// again because this crate CANNOT reach it: mpedb-capi is a separate
+/// workspace precisely so it does not co-link the bundled sqlite the parent's
+/// feature unification pulls in, and a dev-dependency on the testkit would drag
+/// the whole parent graph back in.
+///
+/// Six lines against a compiled C binary left in `/tmp` on every run. Small on
+/// its own; the class is not — a full suite has filled the root filesystem
+/// three times, and a full disk announces itself as a flapping measurement, a
+/// hanging test, or a linker asking for an LLVM bug report.
+fn scratch() -> PathBuf {
+    match std::env::var_os("MPEDB_TEST_DIR") {
+        Some(d) if !d.is_empty() => {
+            let d = PathBuf::from(d);
+            let _ = std::fs::create_dir_all(&d);
+            d
+        }
+        _ => std::env::temp_dir(),
+    }
 }

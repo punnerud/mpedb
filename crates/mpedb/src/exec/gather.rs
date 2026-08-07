@@ -578,6 +578,10 @@ fn access_has_outer(a: &AccessPath) -> bool {
         // references the outer row (and MATCH is single-table only — it never
         // reaches a join inner side).
         AccessPath::FullScan | AccessPath::FtsScan { .. } => false,
+        AccessPath::Series { start, stop, step } => [Some(start), Some(stop), step.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(outer),
     }
 }
 
@@ -1133,6 +1137,92 @@ fn resolve_part_outer(
     }
 }
 
+/// `generate_series(start, stop[, step])` — the rows, generated.
+///
+/// Three things this does that a `for i in start..=stop` would not:
+///
+/// * **It charges the work meter per row.** A series is the one access path
+///   whose cost is bounded by neither a table nor an index, so
+///   `generate_series(1, 10000000000)` is a runaway by construction. One
+///   [`crate::exec::TxnCtx::charge_work`] per row is the SAME budget the
+///   engine's scans charge, so the abort names `generate_series` and the
+///   #74 ceiling needs no special case.
+/// * **It refuses a zero step by name**, as PostgreSQL does — never an
+///   infinite loop, and never the empty result a `while i <= stop` would
+///   silently give for `step = 0`.
+/// * **It counts in `i128`.** The step is added to a value that is compared
+///   against `stop`, and both are `i64`: `generate_series(1, i64::MAX, 2)`
+///   overflows the counter on its way past the end, which in release mode
+///   would WRAP and restart the series from a negative number. The wider
+///   accumulator makes the comparison happen before the value can wrap, and
+///   the emitted `Value::Int` is the narrowed one, which is in range because
+///   the loop already proved it is within the bounds.
+///
+/// A NULL bound is the empty series — PostgreSQL returns zero rows for
+/// `generate_series(NULL, 10)`, which is also what `i <= NULL` being UNKNOWN
+/// would give.
+#[allow(clippy::too_many_arguments)]
+fn series_rows(
+    ctx: &mut dyn TxnCtx,
+    start: &KeyPart,
+    stop: &KeyPart,
+    step: Option<&KeyPart>,
+    filter: Option<&ExprProgram>,
+    plan: &CompiledPlan,
+    params: &[Value],
+    cap: Option<usize>,
+) -> Result<Vec<Vec<Value>>> {
+    let int = |p: &KeyPart| -> Result<Option<i64>> {
+        Ok(match resolve_part(p, plan, params)? {
+            Value::Null => None,
+            Value::Int(i) => Some(i),
+            // The validator types every bound int64, so anything else here is a
+            // context that fills a parameter without going through it.
+            other => {
+                return Err(mpedb_types::Error::Unsupported(format!(
+                    "generate_series bound must be an integer, got {}",
+                    other.type_name()
+                )))
+            }
+        })
+    };
+    let (Some(start), Some(stop)) = (int(start)?, int(stop)?) else {
+        return Ok(Vec::new());
+    };
+    let step = match step {
+        None => 1,
+        Some(p) => match int(p)? {
+            None => return Ok(Vec::new()),
+            Some(0) => {
+                return Err(mpedb_types::Error::Unsupported(
+                    "generate_series: step size cannot equal zero".into(),
+                ))
+            }
+            Some(s) => s,
+        },
+    };
+    let mut out: Vec<Vec<Value>> = Vec::new();
+    let mut stack = filter.map(|f| Vec::with_capacity(f.max_stack()));
+    let mut i = start as i128;
+    let (stop, step) = (stop as i128, step as i128);
+    while if step > 0 { i <= stop } else { i >= stop } {
+        if cap == Some(out.len()) {
+            break;
+        }
+        ctx.charge_work(1, &|| "generate_series".to_string())?;
+        let row = vec![Value::Int(i as i64)];
+        let keep = match (filter, stack.as_mut()) {
+            (Some(f), Some(st)) => f.eval_filter_host(st, &row, params, ctx.host_fns())?,
+            _ => true,
+        };
+        if keep {
+            out.push(row);
+        }
+        i += step;
+    }
+    Ok(out)
+}
+
 /// Fetch the candidate rows for an access path and apply the residual filter.
 pub(super) fn gather_rows(
     ctx: &mut dyn TxnCtx,
@@ -1251,6 +1341,9 @@ pub(super) fn gather_rows(
         }
         AccessPath::FullScan => {
             return ctx.scan_rows_capped(table, None, None, filter.map(|f| (f, params)), cap);
+        }
+        AccessPath::Series { start, stop, step } => {
+            return series_rows(ctx, start, stop, step.as_ref(), filter, plan, params, cap);
         }
         AccessPath::FtsScan { query } => {
             // Posting-list set algebra → matching rowids in ascending order
@@ -1411,6 +1504,7 @@ impl BatchScan {
             AccessPath::PkPoint(_)
             | AccessPath::IndexPoint { .. }
             | AccessPath::IndexRange { .. }
+            | AccessPath::Series { .. }
             | AccessPath::FtsScan { .. } => return Ok(None),
         };
         Ok(Some(BatchScan {
@@ -1609,6 +1703,7 @@ pub(super) fn gather_topk(
         AccessPath::PkPoint(_)
         | AccessPath::IndexPoint { .. }
         | AccessPath::IndexRange { .. }
+        | AccessPath::Series { .. }
         | AccessPath::FtsScan { .. } => {
             let mut r = gather_rows(ctx, table, access, filter, plan, params, None)?;
             sort_rows(&mut r, order_by, ctx.host_colls());

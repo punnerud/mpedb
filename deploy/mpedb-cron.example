@@ -1,0 +1,21 @@
+# Scheduled work: the database is the schedule, the OS is the executor.
+#
+# Every line here is a process that attaches, does what is due, and exits. The
+# "is anything due?" check is a lock-free MVCC read, so overlapping ticks cost
+# nothing and claim disjoint work by construction (DESIGN-SERVICE §2).
+
+# Drain the task queue every minute. Safe to overlap: the claim is one atomic
+# UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING, so two runners never take
+# the same row.
+* * * * * mpedb queue run /var/lib/mpedb/app.mpedb --lease 300
+
+# Keep a table-set map in step, bounded so one invocation cannot run long.
+*/5 * * * * mpedb rretl map run /var/lib/mpedb/app.mpedb mymap --max-secs 60
+
+# Pull from an upstream source on the schedule `mpedb advise` recommended.
+# `--emit-cron` prints these lines for you rather than having you guess.
+17 * * * * mpedb ingest next /var/lib/mpedb/app.mpedb
+
+# Nothing here needs a daemon, and nothing here needs mpedb-pg: the wire
+# protocol is for CLIENTS. Scheduled work attaches the file directly, which is
+# the cheaper path anyway.

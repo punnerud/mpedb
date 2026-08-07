@@ -11,6 +11,65 @@ impl<'a> Binder<'a> {
     /// `CASE WHEN a = b THEN NULL ELSE a END`, and re-implementing it would be a
     /// second place for the NULL and equality rules to drift.
     pub(super) fn bind_func(&mut self, name: &str, args: &[ast::Expr]) -> Result<(BExpr, Ty)> {
+        // PostgreSQL's own function names, resolved by REWRITING to mpedb's
+        // rather than by new opcodes — so the PG surface costs the plan format
+        // nothing. `resolve` returns `None` for every name that is not
+        // PG-specific, which is what keeps `lower`, `abs` and the rest on
+        // exactly ONE code path in both dialects (`pg/funcs.rs`).
+        if self.dialect == Dialect::Postgres {
+            if let Some(hit) = crate::pg::funcs::resolve(name, args.len()) {
+                use crate::pg::funcs::PgFunc;
+                match hit? {
+                    PgFunc::Const(v) => {
+                        // `Ty` is `Option<ColumnType>` — None is the untyped
+                        // NULL, which none of these constants is.
+                        let ty = v.column_type();
+                        return Ok((BExpr::Const(v), ty));
+                    }
+                    PgFunc::ConstOfAny(v) => {
+                        let ty = v.column_type();
+                        return Ok((BExpr::Const(v), ty));
+                    }
+                    PgFunc::TypeOf => {
+                        // Exact, not a guess: bind the argument and read the
+                        // type the binder gave it. An untyped NULL or an
+                        // unpinned parameter has no static type, and PostgreSQL
+                        // calls that `unknown` — the same word, so the answer
+                        // stays honest rather than inventing `text`.
+                        let Some(arg) = args.first() else {
+                            return Err(bind_err("pg_typeof() takes exactly 1 argument"));
+                        };
+                        let (_, ty) = self.bind_expr(arg)?;
+                        let name = match ty {
+                            Some(t) => mpedb_types::pgtype::by_oid(
+                                mpedb_types::pgtype::default_oid(t),
+                            )
+                            .map(|p| p.name)
+                            .unwrap_or("unknown"),
+                            None => "unknown",
+                        };
+                        return Ok((
+                            BExpr::Const(Value::Text(name.into())),
+                            Some(ColumnType::Text),
+                        ));
+                    }
+                    PgFunc::AlwaysTrue => {
+                        return Ok((BExpr::Const(Value::Bool(true)), Some(ColumnType::Bool)))
+                    }
+                    PgFunc::FirstArg => {
+                        let Some(first) = args.first() else {
+                            return Err(bind_err(format!("{name}() takes at least 1 argument")));
+                        };
+                        return self.bind_expr(first);
+                    }
+                    PgFunc::Alias(real) => return self.bind_func(real, args),
+                    PgFunc::AliasSwap2(real) => {
+                        let swapped = [args[1].clone(), args[0].clone()];
+                        return self.bind_func(real, &swapped);
+                    }
+                }
+            }
+        }
         if name == "nullif" {
             if args.len() != 2 {
                 return Err(bind_err("nullif() takes exactly 2 arguments"));
@@ -1141,7 +1200,7 @@ impl<'a> Binder<'a> {
     ///
     /// A bool or a still-unconstrained operand passes through untouched — this
     /// only ever ACCEPTS more, it never changes an answer mpedb already gives.
-    /// Under the PostgreSQL dialect (`bare_group_by = "postgres"`) the rigid
+    /// Under the PostgreSQL dialect (`dialect = "postgres"`) the rigid
     /// refusal is kept, exactly as [`like_glob_operand`] keeps it there.
     pub(crate) fn coerce_bool_ctx(&mut self, e: BExpr, t: Ty) -> Result<(BExpr, Ty)> {
         let src = match t {
@@ -1149,7 +1208,7 @@ impl<'a> Binder<'a> {
             None | Some(ColumnType::Bool) => return Ok((e, t)),
             Some(src) => src,
         };
-        if self.bare_group_by != BareGroupBy::Sqlite {
+        if self.dialect != Dialect::Sqlite {
             return Ok((e, t)); // PostgreSQL: `WHERE 1` stays an error
         }
         let (probe, zero) = match src {

@@ -1065,7 +1065,7 @@ impl<'e> WriteTxn<'e> {
         let values = self.with_generated(table_id, &affined)?;
         let values = &values[..];
         #[cfg(feature = "leakstat")]
-        let __t = std::time::Instant::now();
+        let __t = crate::os::Instant::now();
         self.eng.validate_row_in(&self.bundle, table_id, values)?;
         #[cfg(feature = "leakstat")]
         leakstat::add(&leakstat::INS_NS_VALIDATE, __t.elapsed().as_nanos() as u64);
@@ -1090,7 +1090,7 @@ impl<'e> WriteTxn<'e> {
         // construction rather than by measurement, which matters here because
         // this box cannot resolve a few percent without ~50 paired runs.
         #[cfg(feature = "leakstat")]
-        let __t = std::time::Instant::now();
+        let __t = crate::os::Instant::now();
         let types = &self.bundle.col_types[tid];
         let encoded_len = row::encoded_len(values, types);
         let spills = encoded_len > btree::MAX_INLINE_VAL;
@@ -1204,7 +1204,7 @@ impl<'e> WriteTxn<'e> {
 
         let (root, count) = self.tree_root(table_id, 0)?;
         #[cfg(feature = "leakstat")]
-        let __t = std::time::Instant::now();
+        let __t = crate::os::Instant::now();
         let out = btree::insert(self, root, &key, &mut payload, InsertMode::InsertOnly)?;
         #[cfg(feature = "leakstat")]
         leakstat::add(&leakstat::INS_NS_BTREE, __t.elapsed().as_nanos() as u64);
@@ -1861,7 +1861,10 @@ impl<'e> WriteTxn<'e> {
     /// does nothing else; the caller swaps the engine bundle after commit
     /// (`Engine::reload_schema_from_catalog`).
     pub fn create_table(&mut self, def: mpedb_types::TableDef) -> Result<u32> {
-        let new_schema = self.bundle.schema.with_added_table(def)?;
+        let new_schema = self
+            .bundle
+            .schema
+            .with_added_table_capped(def, self.eng.max_tables)?;
         let new = new_schema.tables.last().expect("just appended");
         let tid = new.id;
         let n_indexes = new.indexes.len();

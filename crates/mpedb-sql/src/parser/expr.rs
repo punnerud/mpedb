@@ -17,7 +17,20 @@ use crate::ast::{
     WindowSpecAst,
 };
 use crate::token::{Kw, Tok};
-use mpedb_types::{Error, Result, Value};
+
+/// Array and row CONSTRUCTORS — one message for a type mpedb does not have.
+///
+/// Not a syntax gap: an array is a VALUE that holds many values, with its own
+/// containment operators, subscripting, `unnest`, and a per-element type. mpedb
+/// stores one scalar per cell by construction, which is what its rigid schema
+/// and its key encoding are built on. Accepting the syntax without the type
+/// would produce a value nothing else in the engine could hold.
+const ARRAY_OR_ROW: &str = "array and row constructors (`ARRAY[…]`, `ARRAY(SELECT …)`, \
+     `ROW(…)`) build a VALUE that holds many values. mpedb stores one scalar per cell — \
+     its rigid schema and its memcmp key encoding both rest on that — so there is nothing \
+     for the constructor to build. A row per element, or a TEXT/JSON column, is the shape \
+     that works here";
+use mpedb_types::{Dialect, Error, Result, Value};
 
 /// The aggregate names, matched case-insensitively. Kept out of the scalar
 /// function table on purpose: a scalar runs per row, an aggregate consumes a
@@ -267,6 +280,46 @@ impl<'a> Parser<'a> {
                 seen_cmp = true;
                 continue;
             }
+            // PostgreSQL's regex operators. `a ~ b` is exactly `a REGEXP b` and
+            // `a !~ b` is `a NOT REGEXP b`, so they lower onto the SAME node —
+            // one implementation, not two that could disagree about NULL or
+            // about the pattern flavour.
+            //
+            // The tokens only exist under the PG dialect (`pg/lex.rs`), so no
+            // sqlite statement can reach this arm.
+            if !seen_cmp
+                && matches!(
+                    self.peek(),
+                    Some(Tok::Tilde) | Some(Tok::NotTilde) | Some(Tok::TildeStar)
+                        | Some(Tok::NotTildeStar)
+                )
+                // A leading `~` is bitwise NOT (a PREFIX operator) and has
+                // already been consumed by the unary tier when it was one; only
+                // an INFIX `~` reaches here, after a left operand.
+                && self.dialect == Dialect::Postgres
+            {
+                let tok = self.peek().cloned();
+                self.pos += 1;
+                let negated = matches!(tok, Some(Tok::NotTilde) | Some(Tok::NotTildeStar));
+                if matches!(tok, Some(Tok::TildeStar) | Some(Tok::NotTildeStar)) {
+                    // Case-insensitive matching would mean rewriting the pattern
+                    // to `(?i)…`, which is only possible when the pattern is a
+                    // LITERAL — and silently doing it only for literals would
+                    // make `a ~* b` and `a ~* 'x'` behave differently. A named
+                    // refusal instead.
+                    return Err(Error::Parse {
+                        pos: self.here(),
+                        msg: "`~*` / `!~*` (case-insensitive regex match) is not supported \
+                              — mpedb's REGEXP is case-sensitive; write the pattern with \
+                              an inline `(?i)` flag and use `~`"
+                            .into(),
+                    });
+                }
+                let pat = self.bit_expr()?;
+                e = Expr::Regexp(Box::new(e), Box::new(pat), negated);
+                seen_cmp = true;
+                continue;
+            }
             if !seen_cmp && (self.peek_kw(Kw::Between) || self.peek_not_between()) {
                 e = self.between_suffix(e)?;
                 seen_cmp = true;
@@ -276,6 +329,23 @@ impl<'a> Parser<'a> {
                 e = self.in_suffix(e)?;
                 seen_cmp = true;
                 continue;
+            }
+            // `OPERATOR(pg_catalog.=)` is PostgreSQL's schema-qualified
+            // operator syntax, and psql writes EVERY comparison in `\d <table>`
+            // that way so no search_path change can shadow it. mpedb has one
+            // namespace, so the wrapper carries no information: it is unwrapped
+            // to the operator inside and the rest of this tier is unchanged.
+            if self.dialect == Dialect::Postgres && self.peek_operator_keyword() {
+                let inner = self.qualified_operator()?;
+                if let Some(e2) = self.apply_operator_token(&inner, e.clone())? {
+                    e = e2;
+                    seen_cmp = true;
+                    continue;
+                }
+                return Err(Error::Parse {
+                    pos: self.here(),
+                    msg: "unsupported operator inside OPERATOR(...)".into(),
+                });
             }
             let op = match self.peek() {
                 Some(Tok::Eq) => BinOp::Eq,
@@ -378,7 +448,144 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
+    /// Positioned at the bare word `OPERATOR` followed by `(`?
+    fn peek_operator_keyword(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("operator"))
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::LParen))
+    }
+
+    /// Consume `OPERATOR ( [schema .] <op> )` and return the operator token.
+    fn qualified_operator(&mut self) -> Result<Tok> {
+        let pos = self.here();
+        self.pos += 2; // OPERATOR (
+        // An optional schema qualifier, which mpedb has nowhere to put.
+        if matches!(self.peek(), Some(Tok::Ident(_)))
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Dot))
+        {
+            self.pos += 2;
+        }
+        let tok = self
+            .peek()
+            .cloned()
+            .ok_or_else(|| Error::Parse {
+                pos,
+                msg: "expected an operator inside OPERATOR(...)".into(),
+            })?;
+        self.pos += 1;
+        self.expect(&Tok::RParen, "`)` closing OPERATOR(...)")?;
+        Ok(tok)
+    }
+
+    /// Build the node an unwrapped `OPERATOR(...)` stands for, or `None` when
+    /// the operator inside is one mpedb does not have.
+    fn apply_operator_token(&mut self, tok: &Tok, lhs: Expr) -> Result<Option<Expr>> {
+        let op = match tok {
+            Tok::Eq => BinOp::Eq,
+            Tok::Ne => BinOp::Ne,
+            Tok::Lt => BinOp::Lt,
+            Tok::Le => BinOp::Le,
+            Tok::Gt => BinOp::Gt,
+            Tok::Ge => BinOp::Ge,
+            Tok::Tilde | Tok::NotTilde => {
+                let pat = self.bit_expr()?;
+                return Ok(Some(Expr::Regexp(
+                    Box::new(lhs),
+                    Box::new(pat),
+                    matches!(tok, Tok::NotTilde),
+                )));
+            }
+            _ => return Ok(None),
+        };
+        let r = self.bit_expr()?;
+        Ok(Some(Expr::Binary(op, Box::new(lhs), Box::new(r))))
+    }
+
     fn unary_expr(&mut self) -> Result<Expr> {
+        let e = self.unary_expr_inner()?;
+        self.cast_suffix(e)
+    }
+
+    /// PostgreSQL's `expr::type` cast.
+    ///
+    /// It binds tighter than every operator including unary minus — `-x::int`
+    /// is `-(x::int)`, not `(-x)::int` — so it is applied as a SUFFIX at the top
+    /// of the unary tier rather than as an infix operator. Getting the
+    /// precedence wrong here is silent: both readings type-check, and they
+    /// differ only on values where the cast is lossy.
+    ///
+    /// It chains: `x::int::text` is legal and left-associative.
+    ///
+    /// The token only exists under the PG dialect (`pg/lex.rs`), so this loop
+    /// never runs for a sqlite statement.
+    fn cast_suffix(&mut self, mut e: Expr) -> Result<Expr> {
+        while self.peek() == Some(&Tok::DoubleColon) {
+            self.pos += 1;
+            let ty = self.type_name_for_cast()?;
+            e = Expr::Cast(Box::new(e), ty);
+        }
+        Ok(e)
+    }
+
+    /// A type name in cast position: one identifier, optionally with a typmod
+    /// (`numeric(10,2)`) and optionally two words (`double precision`).
+    ///
+    /// The typmod is parsed and DISCARDED. mpedb has no `varchar(8)` — it has
+    /// `Text` — so keeping the number would imply an enforcement that does not
+    /// exist, and a client that saw it honoured in the catalog but not in the
+    /// data would have found a wrong answer rather than a missing feature.
+    fn type_name_for_cast(&mut self) -> Result<String> {
+        let pos = self.here();
+        let mut name = match self.peek().cloned() {
+            Some(Tok::Ident(s)) => {
+                self.pos += 1;
+                s
+            }
+            Some(Tok::QuotedIdent(s, _)) => {
+                self.pos += 1;
+                s
+            }
+            _ => {
+                return Err(Error::Parse {
+                    pos,
+                    msg: "expected a type name after `::`".into(),
+                })
+            }
+        };
+        // `double precision`, `character varying`, `timestamp with time zone` —
+        // multi-word type names the SQL standard spells with spaces.
+        while let Some(Tok::Ident(w)) = self.peek().cloned() {
+            let lower = w.to_ascii_lowercase();
+            if !matches!(
+                lower.as_str(),
+                "precision" | "varying" | "with" | "without" | "time" | "zone"
+            ) {
+                break;
+            }
+            self.pos += 1;
+            name.push(' ');
+            name.push_str(&w);
+        }
+        if self.eat(&Tok::LParen) {
+            let mut depth = 1usize;
+            while depth > 0 {
+                match self.peek() {
+                    Some(Tok::LParen) => depth += 1,
+                    Some(Tok::RParen) => depth -= 1,
+                    None => {
+                        return Err(Error::Parse {
+                            pos,
+                            msg: "unterminated type modifier after `::`".into(),
+                        })
+                    }
+                    _ => {}
+                }
+                self.pos += 1;
+            }
+        }
+        Ok(name)
+    }
+
+    fn unary_expr_inner(&mut self) -> Result<Expr> {
         if self.eat(&Tok::Minus) {
             self.enter_expr()?;
             let e = self.unary_expr();
@@ -490,7 +697,32 @@ impl<'a> Parser<'a> {
     fn collate_expr(&mut self) -> Result<Expr> {
         let mut e = self.primary()?;
         while self.eat_word("COLLATE") {
+            // `COLLATE pg_catalog.default` — psql writes every collation
+            // schema-qualified, for the same reason it qualifies operators. One
+            // namespace here, so the qualifier is dropped.
+            if self.dialect == Dialect::Postgres
+                && matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("pg_catalog"))
+                && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Dot))
+            {
+                self.pos += 2;
+            }
             let name = self.ident("collation name after COLLATE")?;
+            // `COLLATE default` / `COLLATE "C"` under the PG dialect is the
+            // IDENTITY here, not an approximation of one: mpedb compares text
+            // bytewise and the catalog reports `C` for the database's collation
+            // everywhere it is asked. So the clause produces no node at all,
+            // which also sidesteps mpedb's restriction that COLLATE may only sit
+            // directly on a comparison operand — psql attaches it to the right
+            // operand of a regex match in `\d <table>`, where that restriction
+            // would refuse a statement whose collation was a no-op anyway.
+            //
+            // Every other collation name still builds the node and still obeys
+            // the restriction, because for those the position genuinely matters.
+            if self.dialect == Dialect::Postgres
+                && (name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("C"))
+            {
+                continue;
+            }
             e = Expr::Collate(Box::new(e), name);
         }
         Ok(e)
@@ -592,6 +824,7 @@ impl<'a> Parser<'a> {
                 let inner = SelectStmt {
                     table: Some(tname),
                     from_derived: None,
+                    from_series: None,
                     alias: None,
                     joins: Vec::new(),
                     distinct: false,
@@ -1291,6 +1524,23 @@ impl<'a> Parser<'a> {
                 // binder resolves a plain column name either way. When joins
                 // arrive the qualifier stops being decoration and this is where
                 // it gets used.
+                // `pg_catalog.f(…)` is how psql and every ORM write a catalog
+                // FUNCTION call — schema-qualified so no search_path change can
+                // shadow it. mpedb has one namespace, so the qualifier carries
+                // no information and is dropped; without this the `.` reaches
+                // `dot_suffix`, which reads it as `table.column` and reports a
+                // missing column for a function that is right there.
+                //
+                // Only `pg_catalog`, and only when a `(` follows: a user table
+                // legitimately called `pg_catalog` would still qualify columns.
+                if self.dialect == Dialect::Postgres
+                    && s.eq_ignore_ascii_case("pg_catalog")
+                    && self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 2).map(|t| &t.tok), Some(Tok::LParen))
+                {
+                    self.pos += 1; // the dot
+                    return self.primary();
+                }
                 if self.peek() == Some(&Tok::Dot) {
                     return self.dot_suffix(s);
                 }
@@ -1380,6 +1630,34 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self) -> Result<Expr> {
         let pos = self.here();
+        // Array and row CONSTRUCTORS name themselves. Without this they
+        // scattered across five unrelated messages — `ARRAY[1,2]` reported
+        // ``unknown column `ARRAY` ``, `ARRAY(SELECT …)` "expected an
+        // expression", `ROW(1,2)` ``unknown function `row()` ``, `= ANY(ARRAY
+        // [1])` "expected `)` closing the argument list" — so a work list built
+        // from those messages read one missing TYPE as four unrelated gaps.
+        //
+        // Only in CONSTRUCTOR position: `ARRAY` and `ROW` are ordinary
+        // identifiers otherwise, and a column called either must keep working.
+        // The bracket (or paren) is what makes it a constructor.
+        if let Some(Tok::Ident(w)) = self.peek() {
+            let w = w.clone();
+            // The `[` is read from the SOURCE, not from a token: sqlite's
+            // `[name]` quoting means the tokenizer has already turned
+            // `ARRAY[1,2,3]` into `ARRAY` followed by a bracket-quoted
+            // identifier `1,2,3`, so there is no `[` token left to match on.
+            let next_is_bracket = self
+                .toks
+                .get(self.pos)
+                .and_then(|t| self.src[t.end..].trim_start().chars().next())
+                == Some('[');
+            let is_array = w.eq_ignore_ascii_case("ARRAY")
+                && (next_is_bracket || matches!(self.peek_at(1), Some(Tok::LParen)));
+            let is_row = w.eq_ignore_ascii_case("ROW") && matches!(self.peek_at(1), Some(Tok::LParen));
+            if is_array || is_row {
+                return Err(Error::Parse { pos, msg: ARRAY_OR_ROW.into() });
+            }
+        }
         if self.eat_kw(Kw::Case) {
             return self.case_expr();
         }

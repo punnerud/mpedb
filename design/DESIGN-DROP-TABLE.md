@@ -65,8 +65,36 @@ Why, precisely:
    corruption. The escape hatch is an offline "compact table ids" maintenance
    op (rewrite to dense ids + rewrite every persisted `table_id` record + bump
    schema-gen, run exclusive so there is no aliasing window) — a single batch,
-   strictly easier to get right than online per-DROP purge. **Deferred past
-   stage 4.**
+   strictly easier to get right than online per-DROP purge. ~~Deferred past
+   stage 4.~~ **SHIPPED as `mpedb compact-ids <target> [--dry-run | --apply]`.**
+
+   Two things the sketch above did not have, both found by building it:
+
+   - **The published-plan registry must be DELETED, not renumbered.** A plan
+     carries `SelectPlan.table` and its footprint's `TableSet` *inside its
+     bytes*; after a renumber it names a different table and `validate` has no
+     objection, because the new id is perfectly legal. That is the one way this
+     operation could have been silently wrong. Dropping the registry forces a
+     re-prepare — correct, and cheap. `plancount` goes with it: the counter
+     lives outside `[plan/, plan0)` so eviction cannot reach it, which means
+     compaction has to, or it outlives what it counts.
+   - **The list of id-bearing key prefixes is a REGISTRY with a test behind
+     it** (`mpedb_core::compact::{ID_KEYS, ID_FREE_KEYS}`, checked by
+     `compact_classified.rs` against a database driven through every store).
+     The "permanent maintenance tax" argument in (1) applies to compaction too
+     — a future subsystem that persists a `table_id` without saying so is
+     exactly the same bug. The test is what collects the tax instead of a
+     reviewer.
+
+4. **The bound is a knob, not a constant.** `[database] max_tables` sets the
+   lifetime budget (default 4096); `MAX_TABLES_CEILING` (2²⁰) is what a
+   *decoder* enforces. The split matters: the config binds what THIS process
+   mints, the ceiling binds what a hostile file can make it allocate. Were the
+   config also checked on load, raising it would be a flag day — every tool
+   built without the setting would stop reading the database. Raising it is not
+   free and is not the first answer: the cost is ~17 B per tombstone in one
+   catalog record re-encoded on every DDL (~1 MB per DDL at 65536), which is
+   the reason compaction exists.
 
 **Tombstone-in-place** (Knob B) is what keeps the ~35 downstream
 `bundle.X[table_id as usize]` sites correct-by-inheritance: the decoder places

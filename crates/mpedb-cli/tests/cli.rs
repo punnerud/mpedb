@@ -1139,3 +1139,170 @@ fn rretl_putback_sigkilled_at_any_instant_is_all_or_nothing() {
         }
     }
 }
+
+/// `mpedb backup` / `mpedb restore` end to end, across PROCESSES — which is the
+/// only way to see that the restored file is a real database rather than
+/// something that merely looks right to the process that wrote it.
+#[test]
+fn backup_and_restore_carry_the_whole_database() {
+    let dir = TestDir::new("backup");
+    let src = dir.path().join("src.mpedb");
+    let src_s = src.to_str().unwrap();
+
+    let out = run(&[src_s, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for i in 1..=50 {
+        let sql = format!("INSERT INTO t (id, name) VALUES ({i}, 'row {i}')");
+        assert!(run(&[src_s, &sql]).status.success());
+    }
+    assert!(run(&[src_s, "CREATE INDEX t_name ON t (name)"]).status.success());
+
+    let bak = dir.path().join("out.mpebak");
+    let bak_s = bak.to_str().unwrap();
+    let out = run(&["backup", src_s, bak_s]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // The claim that makes this worth having: the file is the DATA. The source
+    // arena is 64 MiB by default and holds fifty short rows.
+    let bak_len = std::fs::metadata(&bak).unwrap().len();
+    let src_len = std::fs::metadata(&src).unwrap().len();
+    assert!(
+        bak_len * 10 < src_len,
+        "backup {bak_len} is not much smaller than the arena {src_len}"
+    );
+
+    // Restore into a path that does not exist: the geometry comes from the
+    // backup, so the operator does not have to know the source's max_readers.
+    let dst = dir.path().join("dst.mpedb");
+    let dst_s = dst.to_str().unwrap();
+    let out = run(&["restore", bak_s, dst_s]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let rows = run(&[dst_s, "SELECT count(*) FROM t"]);
+    assert!(String::from_utf8_lossy(&rows.stdout).contains("50"));
+    // The INDEX came across as a tree, not as re-inserted rows.
+    let hit = run(&[dst_s, "SELECT id FROM t WHERE name = 'row 42'"]);
+    assert!(
+        String::from_utf8_lossy(&hit.stdout).contains("42"),
+        "{}",
+        String::from_utf8_lossy(&hit.stdout)
+    );
+    // And it is writable — a live database, not an image.
+    assert!(run(&[dst_s, "INSERT INTO t (id, name) VALUES (999, 'after')"])
+        .status
+        .success());
+}
+
+/// A backup pointed at a target whose geometry was CHOSEN (a config.toml) must
+/// refuse rather than quietly substitute its own — an explicit geometry is a
+/// decision someone wrote down.
+#[test]
+fn restore_into_a_config_with_a_different_reader_width_is_refused() {
+    let dir = TestDir::new("backup-geo");
+    let src = dir.path().join("src.mpedb");
+    let src_s = src.to_str().unwrap();
+    assert!(run(&[src_s, "CREATE TABLE t (id INTEGER PRIMARY KEY)"]).status.success());
+
+    let bak = dir.path().join("g.mpebak");
+    let bak_s = bak.to_str().unwrap();
+    assert!(run(&["backup", src_s, bak_s]).status.success());
+
+    let cfg = dir.path().join("dst.toml");
+    let dst = dir.path().join("dst.mpedb");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[database]\npath = \"{}\"\nsize_mb = 64\nmax_readers = 8\n",
+            dst.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let out = run(&["restore", bak_s, cfg.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("reader slots"), "{e}");
+}
+
+#[test]
+fn restoring_something_that_is_not_a_backup_says_what_it_is() {
+    let dir = TestDir::new("backup-wrong");
+    let src = dir.path().join("src.mpedb");
+    let src_s = src.to_str().unwrap();
+    assert!(run(&[src_s, "CREATE TABLE t (id INTEGER PRIMARY KEY)"]).status.success());
+
+    // The arena itself is not a backup, and the message must say which it got.
+    let dst = dir.path().join("dst.mpedb");
+    let out = run(&["restore", src_s, dst.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("MPEDB1"), "{e}");
+    // Nothing was created on the way to failing.
+    assert!(!dst.exists(), "a failed restore left a file behind");
+}
+
+/// Opening a BACKUP as a database must name what the file is.
+///
+/// Detected by MAGIC, never by extension, so a backup someone called
+/// `project.mpedb` is caught too — which is the case that matters, because the
+/// name is exactly what misled them.
+#[test]
+fn opening_a_backup_as_a_database_says_what_it_is_and_what_to_do() {
+    let dir = TestDir::new("backup-open");
+    let src = dir.path().join("src.mpedb");
+    let src_s = src.to_str().unwrap();
+    assert!(run(&[src_s, "CREATE TABLE t (id INTEGER PRIMARY KEY)"]).status.success());
+
+    let bak = dir.path().join("b.mpebak");
+    assert!(run(&["backup", src_s, bak.to_str().unwrap()]).status.success());
+
+    for name in ["b.mpebak", "misleading.mpedb"] {
+        let p = dir.path().join(name);
+        if name != "b.mpebak" {
+            std::fs::copy(&bak, &p).unwrap();
+        }
+        let out = run(&[p.to_str().unwrap(), "SELECT 1"]);
+        assert!(!out.status.success(), "{name} was opened as a database");
+        let e = String::from_utf8_lossy(&out.stderr);
+        assert!(e.contains("is an mpedb BACKUP"), "{name}: {e}");
+        assert!(e.contains("mpedb restore"), "{name}: {e}");
+    }
+
+    // And a real database still opens.
+    let ok = run(&[src_s, "SELECT count(*) FROM t"]);
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+}
+
+/// The whole stored-function lifecycle over SQL, across processes: define,
+/// call, drop, gone. Round 6 shipped the create and left the drop refused —
+/// a `pg_dump` you can replay but not undo is a migration you can run once.
+#[test]
+fn a_plpgsql_function_can_be_created_called_and_dropped_over_sql() {
+    let dir = TestDir::new("dropfn");
+    let db = dir.path().join("d.mpedb");
+    let db_s = db.to_str().unwrap();
+    assert!(run(&[db_s, "CREATE TABLE t (id INTEGER PRIMARY KEY)"]).status.success());
+
+    let f = dir.path().join("f.sql");
+    std::fs::write(
+        &f,
+        "CREATE FUNCTION dbl(n integer) RETURNS integer AS $$ BEGIN RETURN n * 2; END $$ \
+         LANGUAGE plpgsql;",
+    )
+    .unwrap();
+    let out = run(&["fn", "define", db_s, f.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let call = run(&[db_s, "SELECT dbl(21)"]);
+    assert!(String::from_utf8_lossy(&call.stdout).contains("42"));
+
+    // The signature and CASCADE are what a dump writes; both must be accepted.
+    let drop = run(&[db_s, "DROP FUNCTION public.dbl(integer) CASCADE"]);
+    assert!(drop.status.success(), "{}", String::from_utf8_lossy(&drop.stderr));
+
+    let gone = run(&[db_s, "SELECT dbl(21)"]);
+    assert!(!gone.status.success(), "the function survived the drop");
+
+    // Dropping it again is an error; IF EXISTS is not.
+    assert!(!run(&[db_s, "DROP FUNCTION dbl"]).status.success());
+    assert!(run(&[db_s, "DROP FUNCTION IF EXISTS dbl"]).status.success());
+}

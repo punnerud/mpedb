@@ -160,12 +160,12 @@ pub enum Concurrency {
 /// a grouped (or otherwise aggregated) SELECT.
 ///
 /// The mode travels with the data's ORIGIN: a database imported from PostgreSQL
-/// (`mirror import` from PG) is born [`Postgres`](BareGroupBy::Postgres); every
-/// other database defaults to [`Sqlite`](BareGroupBy::Sqlite). It is a
+/// (`mirror import` from PG) is born [`Postgres`](Dialect::Postgres); every
+/// other database defaults to [`Sqlite`](Dialect::Sqlite). It is a
 /// per-process compilation option, like [`Durability`] — it decides what
 /// `prepare` accepts, never what a stored plan means (a plan is self-describing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BareGroupBy {
+pub enum Dialect {
     /// sqlite's rule: a bare column is accepted **only when mpedb reproduces
     /// sqlite's value exactly** (mpedb's core guarantee — never a wrong answer).
     /// Three cases qualify: the column is provably never evaluated (a dead
@@ -186,12 +186,12 @@ pub enum BareGroupBy {
     Postgres,
 }
 
-impl BareGroupBy {
+impl Dialect {
     /// The configured strictness as its config-string (`"sqlite"` / `"postgres"`).
     pub fn as_str(self) -> &'static str {
         match self {
-            BareGroupBy::Sqlite => "sqlite",
-            BareGroupBy::Postgres => "postgres",
+            Dialect::Sqlite => "sqlite",
+            Dialect::Postgres => "postgres",
         }
     }
 }
@@ -218,6 +218,19 @@ pub struct DbOptions {
     pub path: PathBuf,
     pub size_bytes: u64,
     pub max_readers: u32,
+    /// Lifetime table-id budget: how many `CREATE TABLE`s this database will
+    /// ever accept. LIFETIME, not live — ids are never reused, so a dropped
+    /// table keeps its slot (DESIGN-DROP-TABLE §0) and `mpedb compact-ids` is
+    /// what reclaims one. Absent ⇒ [`crate::MAX_TABLES`].
+    ///
+    /// It is not a representation limit — every persisted key already spends a
+    /// fixed `u32` on the id, so raising this widens nothing. What it costs is
+    /// the schema record: ~17 bytes per tombstone in one catalog entry that is
+    /// re-encoded on every DDL. That is the reason for a bound at all, and the
+    /// reason compaction beats raising it.
+    ///
+    /// Checked only on the DDL path, never per row or per query.
+    pub max_tables: usize,
     pub durability: Durability,
     pub concurrency: Concurrency,
     pub perms: FilePerms,
@@ -264,9 +277,9 @@ pub struct DbOptions {
     /// catches the mistake it is aimed at: the developer's own forgotten DDL, in
     /// their own build, at prepare time.
     pub require_policy: BTreeSet<String>,
-    /// GROUP BY column-strictness dialect ([`BareGroupBy`], COMPAT.md). Set from
-    /// `[compat] bare_group_by` (default [`BareGroupBy::Sqlite`]); a PostgreSQL
-    /// `mirror import` overrides it to [`BareGroupBy::Postgres`] so the strictness
+    /// GROUP BY column-strictness dialect ([`Dialect`], COMPAT.md). Set from
+    /// `[compat] dialect` (default [`Dialect::Sqlite`]); a PostgreSQL
+    /// `mirror import` overrides it to [`Dialect::Postgres`] so the strictness
     /// travels with the data's origin.
     ///
     /// **The FILE is authoritative** — this is what a config may SEED it with.
@@ -274,18 +287,18 @@ pub struct DbOptions {
     /// loosening bug: `Database::open_from_file` (the mirror daemon, `dump`,
     /// the C-API shim, `mpedb <file>`) has no `[compat]` to read, so a
     /// PostgreSQL-born file reopened lenient. The database records it now.
-    pub bare_group_by: BareGroupBy,
+    pub dialect: Dialect,
     /// Initial `PRAGMA foreign_keys` for connections to this database
     /// (`[compat] foreign_keys`, default false — sqlite's default). A
     /// connection may still flip it at runtime, as sqlite's pragma is
     /// per-connection; the FILE decides where it starts. Same authority and
-    /// the same reason as `bare_group_by`.
+    /// the same reason as `dialect`.
     pub foreign_keys: bool,
     /// Whether the CONFIG named each of the two above, as opposed to taking
     /// the default. See [`CompatOptions`]: a config that names a value the
     /// stored record contradicts is a named refusal, one that names nothing
     /// defers to the file.
-    pub bare_group_by_named: bool,
+    pub dialect_named: bool,
     pub foreign_keys_named: bool,
     /// This process's role in a sync topology (`[sync] role`, #157):
     /// `standalone` (default), `replica` or `authority`.
@@ -420,9 +433,16 @@ impl RawRuntime {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCompat {
-    /// `"sqlite"` (lenient bare columns, the default) or `"postgres"` (strict).
-    #[serde(default)]
-    bare_group_by: Option<String>,
+    /// `"sqlite"` (the default) or `"postgres"` — which engine mpedb agrees with
+    /// wherever the two genuinely disagree (COMPAT.md's dialect table).
+    ///
+    /// The key was `bare_group_by` while the bare-grouped-column rule was the
+    /// only thing it decided. It now reaches the TOKENIZER (`::` casts, `$$`
+    /// quoting) as well, so the old name described a fraction of its job. The
+    /// alias costs one attribute and saves every config file already written —
+    /// the only kind of migration this project keeps.
+    #[serde(default, alias = "bare_group_by")]
+    dialect: Option<String>,
     /// Initial `PRAGMA foreign_keys` for connections opened from this config
     /// (#194). Default FALSE — sqlite's own default, and the only value that
     /// leaves an existing database's write behaviour unchanged. A connection
@@ -434,7 +454,7 @@ struct RawCompat {
 /// The resolved `[compat]` section.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompatOptions {
-    pub bare_group_by: BareGroupBy,
+    pub dialect: Dialect,
     pub foreign_keys: bool,
     /// Whether the section NAMED each value, as opposed to taking the default.
     ///
@@ -444,25 +464,25 @@ pub struct CompatOptions {
     /// names nothing simply defers. Without this bit the two cases are
     /// indistinguishable, and every config-free-shaped attach would look like
     /// a caller demanding `sqlite`.
-    pub bare_group_by_named: bool,
+    pub dialect_named: bool,
     pub foreign_keys_named: bool,
 }
 
 impl RawCompat {
     fn resolve(this: Option<&RawCompat>) -> Result<CompatOptions> {
-        let bare_group_by = match this.and_then(|c| c.bare_group_by.as_deref()) {
-            None | Some("sqlite") => BareGroupBy::Sqlite,
-            Some("postgres") => BareGroupBy::Postgres,
+        let dialect = match this.and_then(|c| c.dialect.as_deref()) {
+            None | Some("sqlite") => Dialect::Sqlite,
+            Some("postgres") => Dialect::Postgres,
             Some(other) => {
                 return Err(Error::Config(format!(
-                    "compat.bare_group_by must be sqlite|postgres, got `{other}`"
+                    "compat.dialect must be sqlite|postgres, got `{other}`"
                 )))
             }
         };
         Ok(CompatOptions {
-            bare_group_by,
+            dialect,
             foreign_keys: this.and_then(|c| c.foreign_keys).unwrap_or(false),
-            bare_group_by_named: this.is_some_and(|c| c.bare_group_by.is_some()),
+            dialect_named: this.is_some_and(|c| c.dialect.is_some()),
             foreign_keys_named: this.is_some_and(|c| c.foreign_keys.is_some()),
         })
     }
@@ -476,6 +496,9 @@ struct RawDatabase {
     size_mb: u64,
     #[serde(default = "default_max_readers")]
     max_readers: u32,
+    /// Lifetime `CREATE TABLE` budget; absent ⇒ [`crate::MAX_TABLES`].
+    #[serde(default)]
+    max_tables: Option<usize>,
     #[serde(default)]
     durability: Option<String>,
     #[serde(default)]
@@ -682,6 +705,17 @@ fn raw_to_config(
         if db.max_readers < 1 || db.max_readers > 65_536 {
             return Err(Error::Config("database.max_readers must be in 1..=65536".into()));
         }
+        if let Some(t) = db.max_tables {
+            // The upper bound is the DECODE ceiling, and it is a hard one: a
+            // config may not authorise minting a schema that a reader — this
+            // process included — would refuse to load.
+            if !(1..=crate::MAX_TABLES_CEILING).contains(&t) {
+                return Err(Error::Config(format!(
+                    "database.max_tables must be in 1..={}",
+                    crate::MAX_TABLES_CEILING
+                )));
+            }
+        }
         if let Some(m) = db.mode {
             if m > 0o777 {
                 return Err(Error::Config(format!(
@@ -838,6 +872,7 @@ fn raw_to_config(
                 path: PathBuf::from(db.path),
                 size_bytes: db.size_mb * 1024 * 1024,
                 max_readers: db.max_readers,
+                max_tables: db.max_tables.unwrap_or(crate::MAX_TABLES),
                 durability,
                 concurrency,
                 perms: FilePerms {
@@ -854,9 +889,9 @@ fn raw_to_config(
                 max_join_cells: runtime.max_join_cells,
                 max_query_threads: runtime.max_query_threads,
                 require_policy,
-                bare_group_by: compat.bare_group_by,
+                dialect: compat.dialect,
                 foreign_keys: compat.foreign_keys,
-                bare_group_by_named: compat.bare_group_by_named,
+                dialect_named: compat.dialect_named,
                 foreign_keys_named: compat.foreign_keys_named,
                 sync_role: sync_role.unwrap_or_else(|| "standalone".to_string()),
                 sync_upstream,
@@ -917,6 +952,7 @@ impl RawMember {
                 path: self.path,
                 size_mb: self.size_mb,
                 max_readers: self.max_readers,
+                max_tables: None,
                 durability: self.durability,
                 concurrency: self.concurrency,
                 mode: self.mode,
@@ -1072,6 +1108,28 @@ fn parse_default(v: &toml::Value, ty: ColumnType) -> std::result::Result<Default
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[database] max_tables`: absent is the compiled default, present is
+    /// taken verbatim, and out-of-range is refused against the DECODE ceiling
+    /// rather than against the default.
+    #[test]
+    fn max_tables_knob() {
+        let base = "[database]\npath = \"/dev/shm/t.mpedb\"\n";
+        let cfg = Config::from_toml_str(base).unwrap();
+        assert_eq!(cfg.options.max_tables, crate::MAX_TABLES);
+
+        let cfg = Config::from_toml_str(&format!("{base}max_tables = 65536\n")).unwrap();
+        assert_eq!(cfg.options.max_tables, 65_536);
+
+        // (65 536 is above the compiled-in default — raising the budget is
+        // what the knob is FOR.)
+
+        let err = Config::from_toml_str(&format!("{base}max_tables = 0\n")).unwrap_err();
+        assert!(format!("{err}").contains("max_tables"), "{err}");
+        let over = crate::MAX_TABLES_CEILING + 1;
+        let err = Config::from_toml_str(&format!("{base}max_tables = {over}\n")).unwrap_err();
+        assert!(format!("{err}").contains("max_tables"), "{err}");
+    }
 
     const SAMPLE: &str = r#"
 [database]
@@ -1271,20 +1329,20 @@ path = "/dev/shm/shared.mpedb"
     fn parses_compat_bare_group_by() {
         // absent [compat] ⇒ the sqlite (lenient) default
         assert_eq!(
-            Config::from_toml_str(SAMPLE).unwrap().options.bare_group_by,
-            BareGroupBy::Sqlite
+            Config::from_toml_str(SAMPLE).unwrap().options.dialect,
+            Dialect::Sqlite
         );
         // explicit sqlite / postgres
         let cfg = Config::from_toml_str(&format!(
             "{SAMPLE}\n[compat]\nbare_group_by = \"postgres\""
         ))
         .unwrap();
-        assert_eq!(cfg.options.bare_group_by, BareGroupBy::Postgres);
+        assert_eq!(cfg.options.dialect, Dialect::Postgres);
         let cfg = Config::from_toml_str(&format!(
             "{SAMPLE}\n[compat]\nbare_group_by = \"sqlite\""
         ))
         .unwrap();
-        assert_eq!(cfg.options.bare_group_by, BareGroupBy::Sqlite);
+        assert_eq!(cfg.options.dialect, Dialect::Sqlite);
         // unknown value rejected
         assert!(Config::from_toml_str(&format!(
             "{SAMPLE}\n[compat]\nbare_group_by = \"mysql\""

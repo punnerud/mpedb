@@ -1621,6 +1621,7 @@ fn collapse_self_projection_passthrough(s: &mut SelectStmt) -> bool {
     *s = SelectStmt {
         table: x.table.take(),
         from_derived: x.from_derived.take(),
+        from_series: x.from_series.take(),
         alias: x.alias.take(),
         joins: std::mem::take(&mut x.joins),
         distinct: x.distinct,

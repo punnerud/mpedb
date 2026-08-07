@@ -77,6 +77,11 @@ pub(crate) struct SelectStmt {
     /// and refuses it by name in nested positions
     /// (design/DESIGN-DERIVED-TABLES.md §5).
     pub from_derived: Option<Box<SubqueryBody>>,
+    /// `FROM generate_series(start, stop[, step])` — a table FUNCTION as the
+    /// row source. Mutually exclusive with `table` and `from_derived`: the
+    /// parser produces at most one of the three, and the planner reads them in
+    /// that order.
+    pub from_series: Option<Box<SeriesArgs>>,
     /// `FROM t [AS] a` — the name `t`'s columns are addressed by. When present,
     /// the table's own name is NOT in scope (`FROM orders o` makes `orders.c`
     /// invalid and `o.c` valid — PG's rule), and it is what lets a table join
@@ -241,6 +246,24 @@ pub(crate) enum JoinKind {
 }
 
 /// `[NATURAL] [INNER | LEFT [OUTER]] JOIN <table> (ON <cond> | USING (c1, …))`.
+/// `generate_series(start, stop[, step])` as written. The three are
+/// EXPRESSIONS at parse time and must fold to a constant or a bare parameter
+/// by plan time — [`crate::plan::AccessPath::Series`] carries `KeyPart`s, not
+/// programs, and the reason is written there.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SeriesArgs {
+    pub start: Expr,
+    pub stop: Expr,
+    /// `None` = PostgreSQL's default of 1. Kept distinct from `Some(1)` so the
+    /// two spell different plans — the canonical bytes are the identity.
+    pub step: Option<Expr>,
+    /// `AS g(n)` — the column ALIAS LIST. At most one entry (a series has one
+    /// column); a longer list is a named refusal at parse time. Lives here
+    /// rather than on `SelectStmt` because only a FROM-item that is a function
+    /// call can take one.
+    pub columns: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinClause {
     pub table: String,

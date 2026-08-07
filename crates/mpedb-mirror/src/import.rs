@@ -117,7 +117,7 @@ pub fn import_sqlite(
         schema.clone(),
         opts.size_bytes,
         opts.durability,
-        mpedb_types::BareGroupBy::Sqlite,
+        mpedb_types::Dialect::Sqlite,
     )?;
 
     // 3. install tracked-mode changelog + triggers BEFORE the snapshot read
@@ -189,20 +189,21 @@ pub fn import_sqlite(
 
 /// Create a fresh `.mpedb` mirror file with the given schema (secure-by-default
 /// 0600 perms, serial concurrency). Shared by the sqlite and PostgreSQL import
-/// paths — which differ in `bare_group_by`, so the GROUP BY strictness travels
+/// paths — which differ in `dialect`, so the GROUP BY strictness travels
 /// with the data's origin (COMPAT.md): a PostgreSQL import is born strict.
 pub(crate) fn create_mirror_db(
     dest_path: &Path,
     schema: mpedb_types::Schema,
     size_bytes: u64,
     durability: Durability,
-    bare_group_by: mpedb_types::BareGroupBy,
+    dialect: mpedb_types::Dialect,
 ) -> Result<Database> {
     let config = Config {
         options: DbOptions {
             path: dest_path.to_path_buf(),
             size_bytes,
             max_readers: 64,
+            max_tables: mpedb_types::MAX_TABLES,
             durability,
             concurrency: Concurrency::Serial,
             // A mirror file carries no RLS assertions: the mirror applier runs
@@ -220,8 +221,8 @@ pub(crate) fn create_mirror_db(
             // strictness has to survive the next config-free attach, and it did
             // not — `dump`, the mirror daemon and the CLI all reopened a
             // PostgreSQL mirror lenient.
-            bare_group_by,
-            bare_group_by_named: true,
+            dialect,
+            dialect_named: true,
             // A mirror applier writes rows in the order the SOURCE's log gives
             // them, which is not a dependency order: a child can legitimately
             // land before its parent and be reconciled by the next batch.
@@ -589,7 +590,7 @@ mod tests {
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir()
+        let p = mpedb_testkit::scratch_base()
             .join("mpedb-mirror-tests")
             .join(format!("{name}-{}.mpedb", std::process::id()));
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -716,7 +717,7 @@ primary_key = ["id"]
             schema.clone(),
             16 * 1024 * 1024,
             Durability::None,
-            mpedb_types::BareGroupBy::Sqlite,
+            mpedb_types::Dialect::Sqlite,
         )
         .unwrap();
         db.query(
@@ -739,7 +740,7 @@ primary_key = ["id"]
             schema,
             16 * 1024 * 1024,
             Durability::None,
-            mpedb_types::BareGroupBy::Postgres,
+            mpedb_types::Dialect::Postgres,
         )
         .unwrap();
         db.query("INSERT INTO t (id, g, x, name) VALUES (1, 10, 5, 'a')", &[])

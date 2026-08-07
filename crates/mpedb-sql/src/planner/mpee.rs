@@ -333,6 +333,10 @@ impl<'a> Problem<'a> {
             // this changes no plan; it keeps the two in step when it stops.
             ix.unique
                 && ix.predicate.is_none()
+                // Same rule as the planner's: an expression index is never an
+                // access path, so the cost model must not treat it as one — the
+                // model has to describe the access the planner actually emits.
+                && !ix.has_expression_part()
                 && !ix.columns.is_empty()
                 && ix.columns.iter().all(|&c| pinned(c))
         })
@@ -858,7 +862,7 @@ pub(super) fn reorder<'s>(
     schema: &'s Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
-    mode: BareGroupBy,
+    mode: Dialect,
     host_udfs: &HostUdfSet,
     slot_types: &[Ty],
     cte: Option<CteRef<'s>>,

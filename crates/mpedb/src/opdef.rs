@@ -152,6 +152,15 @@ impl crate::Database {
         let skeleton = match lang {
             SpellLang::Python => mpedb_spell::py::compile(source)?,
             SpellLang::Rust => mpedb_spell::rs::compile(source)?,
+            // See `costlayer::set_cost_policy`: an operator macro RETURNS SQL
+            // text, and plpgsql compiles a whole CREATE FUNCTION statement.
+            SpellLang::PlPgSql => {
+                return Err(Error::Unsupported(
+                    "an operator macro is written in the Python or Rust subset; plpgsql \
+                     compiles a whole CREATE FUNCTION statement, which a macro is not"
+                        .into(),
+                ))
+            }
         };
         if !skeleton.calls.is_empty() {
             return Err(Error::Unsupported(

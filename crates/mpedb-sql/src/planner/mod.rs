@@ -84,7 +84,7 @@ use crate::plan::{
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};
 use crate::policy::{PolicyCatalog, TablePolicies};
-use mpedb_types::{exact_float_as_int, BareGroupBy, Collation, ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
+use mpedb_types::{exact_float_as_int, Dialect, Collation, ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
     TableDef, TableSet, Value,};
 
 mod access;
@@ -152,7 +152,7 @@ pub(crate) fn plan_statement(
     // planning site — including subqueries and CTEs — because a bare column can
     // appear at any nesting depth, and a postgres-mode database must refuse it
     // everywhere. Copy, so it rides alongside `catalog` without ceremony.
-    mode: BareGroupBy,
+    mode: Dialect,
     // Host-registered scalar UDFs in scope (design/DESIGN-UDF.md). Threaded to
     // every binder-construction site alongside `mode`, for the same reason: a
     // UDF call can appear at any nesting depth.

@@ -5,7 +5,7 @@ use mpedb::{SqliteAttach, Value};
 use rusqlite::Connection;
 
 fn setup() -> std::path::PathBuf {
-    let p = std::env::temp_dir()
+    let p = mpedb_testkit::scratch_base()
         .join("mpedb-attach-tests")
         .join(format!("at-{}.db", std::process::id()));
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -119,7 +119,7 @@ fn answers_match_the_library() {
 /// its table — PER TABLE, naming the function — while the rest stay attached.
 #[test]
 fn check_constraints_compile_or_skip_per_table() {
-    let p = std::env::temp_dir()
+    let p = mpedb_testkit::scratch_base()
         .join("mpedb-attach-tests")
         .join(format!("at-chk-{}.db", std::process::id()));
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -156,7 +156,7 @@ fn check_constraints_compile_or_skip_per_table() {
 /// attach readable.
 #[test]
 fn a_virtual_table_is_catalog_only_and_never_aborts_the_scan() {
-    let p = std::env::temp_dir()
+    let p = mpedb_testkit::scratch_base()
         .join("mpedb-attach-tests")
         .join(format!("at-vtab-{}.db", std::process::id()));
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -195,7 +195,7 @@ fn a_virtual_table_is_catalog_only_and_never_aborts_the_scan() {
 /// rootpage poisons the WHOLE database ("malformed database schema (name)").
 #[test]
 fn rootpage_damage_is_scoped_exactly_like_sqlite() {
-    let base = std::env::temp_dir().join("mpedb-attach-tests");
+    let base = mpedb_testkit::scratch_base().join("mpedb-attach-tests");
     std::fs::create_dir_all(&base).unwrap();
 
     // Table with rootpage 0: only that table refuses.

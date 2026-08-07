@@ -648,7 +648,7 @@ impl Database {
         match self.cached_or_load_tls(hash) {
             Ok(p) => Ok(p),
             Err(Error::PlanInvalidated) => {
-                let subkey = crate::registry::plan_subkey(hash);
+                let subkey = crate::registry::plan_subkey(hash, self.dialect);
                 let r = self.engine.begin_read()?;
                 let record = r.sys_get(&subkey);
                 r.finish()?;

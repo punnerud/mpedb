@@ -73,12 +73,12 @@ pub fn regenerate(db_path: &Path, size_bytes: u64) -> Result<RegenReport> {
     // Carry the GROUP BY strictness across the rebuild, keyed off the mirror's
     // persisted origin (COMPAT.md): a PostgreSQL mirror stays strict, a sqlite
     // one lenient — a regenerate must not silently relax a PG-origin mirror.
-    let bare_group_by = match old.sys_record_get(state::MIR_NS, state::KEY_CFG)? {
+    let dialect = match old.sys_record_get(state::MIR_NS, state::KEY_CFG)? {
         Some(bytes) => match state::MirrorConfig::decode(&bytes)?.source_kind {
-            state::SourceKind::Postgres => mpedb_types::BareGroupBy::Postgres,
-            state::SourceKind::Sqlite => mpedb_types::BareGroupBy::Sqlite,
+            state::SourceKind::Postgres => mpedb_types::Dialect::Postgres,
+            state::SourceKind::Sqlite => mpedb_types::Dialect::Sqlite,
         },
-        None => mpedb_types::BareGroupBy::Sqlite,
+        None => mpedb_types::Dialect::Sqlite,
     };
 
     // 1. Freeze. Every mirrored table refuses writes from here until the new
@@ -100,7 +100,7 @@ pub fn regenerate(db_path: &Path, size_bytes: u64) -> Result<RegenReport> {
             schema.clone(),
             size_bytes,
             Durability::None,
-            bare_group_by,
+            dialect,
         )?;
         let mut report = RegenReport {
             new_size_bytes: size_bytes,
@@ -237,7 +237,7 @@ mod tests {
     use rusqlite::Connection;
 
     fn fixture(tag: &str, size: u64) -> (PathBuf, PathBuf, Database) {
-        let dir = std::env::temp_dir().join("mpedb-regen-tests");
+        let dir = mpedb_testkit::scratch_base().join("mpedb-regen-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join(format!("{tag}-s-{}.db", std::process::id()));
         let dest = dir.join(format!("{tag}-d-{}.mpedb", std::process::id()));

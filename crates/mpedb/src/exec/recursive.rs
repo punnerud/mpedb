@@ -174,6 +174,13 @@ fn frontier_dedup(rc: &RecursiveCtePlan) -> Option<u16> {
             b.as_ref().is_some_and(|kb| part_reads(&kb.parts))
         }),
         AccessPath::FullScan | AccessPath::FtsScan { .. } => false,
+        AccessPath::Series { start, stop, step } => part_reads(
+            &[Some(start), Some(stop), step.as_ref()]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
     };
 
     // 2. Counter dead in the recursive term outside guard + own transit.

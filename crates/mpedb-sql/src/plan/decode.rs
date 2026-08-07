@@ -320,6 +320,16 @@ fn decode_access(buf: &[u8], pos: &mut usize) -> Result<AccessPath> {
             let mut budget = MAX_FTS_DEPTH;
             Ok(AccessPath::FtsScan { query: decode_fts_query(buf, pos, &mut budget)? })
         }
+        ACCESS_SERIES => {
+            let start = decode_part(buf, pos)?;
+            let stop = decode_part(buf, pos)?;
+            let step = match r_u8(buf, pos)? {
+                0 => None,
+                1 => Some(decode_part(buf, pos)?),
+                t => return Err(corrupt(format!("bad series step tag {t}"))),
+            };
+            Ok(AccessPath::Series { start, stop, step })
+        }
         t => Err(corrupt(format!("bad access path tag {t}"))),
     }
 }

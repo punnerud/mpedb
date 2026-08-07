@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 
 fn scratch_dir(name: &str) -> PathBuf {
-    let p = std::env::temp_dir()
+    let p = mpedb_testkit::scratch_base()
         .join("mpedb-stamp-tests")
         .join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);

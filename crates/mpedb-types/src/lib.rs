@@ -12,6 +12,9 @@ pub mod ident;
 pub mod keycode;
 pub mod model;
 pub mod ordkey;
+// PostgreSQL's base types, shared by the mirror, the PG dialect and the wire
+// protocol so the three cannot drift. Pure data — no engine dependency.
+pub mod pgtype;
 pub mod policy;
 pub mod schema;
 pub mod subedit;
@@ -19,7 +22,7 @@ pub mod value;
 
 pub use config::toml_escape;
 pub use config::{
-    resolve_storage_path, BareGroupBy, Concurrency, Config, DbOptions, Durability, FilePerms,
+    resolve_storage_path, Dialect, Concurrency, Config, DbOptions, Durability, FilePerms,
     StorageKind, WorkspaceConfig, WorkspaceMember, DEFAULT_MAX_JOIN_CELLS, DEFAULT_MAX_WORK_ROWS,
     MAX_DB_SIZE_MB,
 };
@@ -185,8 +188,31 @@ pub use value::{
 ///    workload this number was raised for.
 ///
 /// Raising it further is now a one-constant change: no format bump, no bit
-/// audit.
+/// audit. Since the id-compaction escape hatch shipped (`mpedb compact-ids`),
+/// a database that hits this is usually spending it on TOMBSTONES rather than
+/// on live tables — compact first, raise second.
+///
+/// This is the DEFAULT, not the ceiling: `[database] max_tables` overrides what
+/// a given database will mint, bounded by [`MAX_TABLES_CEILING`].
 pub const MAX_TABLES: usize = 4096;
+
+/// The hard structural ceiling on a table id, independent of any config.
+///
+/// The two bounds answer two different questions, and collapsing them would
+/// answer the wrong one in each place:
+///
+/// - [`MAX_TABLES`] (and its `[database] max_tables` override) bounds what THIS
+///   database will MINT. It is a resource decision — tombstone bloat in one
+///   catalog record re-encoded per DDL — and the owner gets to make it.
+/// - This bounds what any FILE can make a decoder believe. `ntables` and a
+///   `TableSet` count both come from untrusted bytes, and a reader must reject
+///   an absurd one before acting on it. That is not the owner's decision, and a
+///   config value would let a hostile file raise its own limit.
+///
+/// A million is far above any real schema and far below anything that could
+/// hurt: the canonical decoder reserves `min(ntables, 256)` rather than the
+/// count, so a large value costs a rejected read, not an allocation.
+pub const MAX_TABLES_CEILING: usize = 1 << 20;
 
 /// Maximum number of columns per table (bounded by `u16` column indices in
 /// the expression IR and row format, kept small for sane page layouts).

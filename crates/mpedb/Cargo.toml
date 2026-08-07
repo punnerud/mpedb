@@ -8,6 +8,14 @@ description = "Embedded multi-process shared-memory database with SQL and conten
 [features]
 # forward mpedb-core's #37 leak counters; `examples/leak_probe` dumps them
 leakstat = ["mpedb-core/leakstat"]
+# forward mpedb-core's wasm-bindgen-friendly clock (see mpedb-core/Cargo.toml)
+js-clock = ["mpedb-core/js-clock"]
+# Forwards `mpedb-sql/pg-dialect`. Exists so the CI matrix can run the SQLITE
+# gates with the PostgreSQL surface compiled IN — the proof that the surface is
+# inert, which is the whole claim the build toggle makes. Nothing enables it by
+# default, and no member of the parent workspace enables it at all, so the
+# feature-unification trap the root Cargo.toml warns about cannot spring.
+pg-dialect = ["mpedb-sql/pg-dialect"]
 # the sqlite-backed overlay's checkpoint push (DESIGN-SQLITE-BACKED §5): the
 # sqlite LIBRARY is the base writer, so this pulls in rusqlite. The CLI
 # enables it; library users opt in.

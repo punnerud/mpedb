@@ -19,3 +19,8 @@ libc = "0.2"
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
+# A DEV-dependency cycle (testkit -> mpedb -> this crate), which Cargo permits
+# precisely because it cannot affect the build graph of the library itself.
+# Worth it for the one thing it buys: every test in the workspace putting its
+# scratch files where MPEDB_TEST_DIR says, instead of on the root filesystem.
+mpedb-testkit = { path = "../mpedb-testkit" }

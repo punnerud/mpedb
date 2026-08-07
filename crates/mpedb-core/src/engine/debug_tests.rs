@@ -51,7 +51,7 @@ fn decompose_write_phases() {
     use std::time::Instant;
     // table with ONLY a PK (the optimistic-eligible class: no secondary
     // index maintenance, exact key-level footprint).
-    let path = std::env::temp_dir()
+    let path = crate::test_scratch()
         .join("mpedb-engine-tests")
         .join(format!("decomp-{}.mpedb", std::process::id()));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -179,7 +179,7 @@ fn decompose_write_phases() {
 }
 
 fn debug_cfg() -> Config {
-    let path = std::env::temp_dir()
+    let path = crate::test_scratch()
         .join("mpedb-engine-tests")
         .join(format!("churn-debug-{}.mpedb", std::process::id()));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

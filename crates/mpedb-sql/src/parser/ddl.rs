@@ -12,7 +12,7 @@ use crate::ddl::{
     CreatePolicySpec, CreateTriggerSpec, DdlStmt, RlsAction, TriggerBodySpec, TriggerEvent,
     TriggerTiming,
 };
-use crate::token::{tokenize, Kw, Tok};
+use crate::token::{Kw, Tok};
 use mpedb_types::{Collation, DefaultExpr, PolicyCmd, Result, Value};
 
 /// Recognize and parse a row-level-security DDL statement (`CREATE POLICY`,
@@ -20,9 +20,68 @@ use mpedb_types::{Collation, DefaultExpr, PolicyCmd, Result, Value};
 /// `sql` is not DDL — the caller then compiles it as an ordinary statement.
 /// The DDL words are plain identifiers (not reserved keywords), so no existing
 /// column name is affected.
-pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
-    let toks = tokenize(sql)?;
+/// DDL recognition under an explicit dialect.
+///
+/// The dialect has to reach HERE and not only the compile road, because this
+/// runs FIRST and it LEXES. A PostgreSQL statement containing `!~` or `::` —
+/// which is most of what psql sends — died at this line with a byte offset into
+/// SQL the user never wrote, long before anything could report it properly.
+/// The named refusal for a `CREATE <object>` mpedb does not implement.
+///
+/// Names WHAT was found and WHAT is supported — the two things the old
+/// ``expected `POLICY` `` said neither of.
+fn unsupported_create_msg(found: &str) -> String {
+    format!(
+        "CREATE {found} is not supported — mpedb implements CREATE TABLE, \
+         VIRTUAL TABLE, [UNIQUE] INDEX, VIEW, TRIGGER and POLICY"
+    )
+}
+
+/// Is this `CREATE OR REPLACE FUNCTION`, as opposed to `CREATE OR REPLACE
+/// VIEW` (which the corpus uses constantly and which has its own path)?
+///
+/// Read off the SOURCE TEXT rather than off the token stream, and NOT because
+/// text is easier: `OR` and `REPLACE` are tokenizer KEYWORDS, so `eat_word`
+/// does not see them (the same fact the `word_at_cursor` comment below records,
+/// found the same way — by writing the token version first and watching it
+/// return false on a statement that plainly matched).
+///
+/// Three words and their separators, so it cannot drift onto a longer statement.
+fn create_or_replace_function(sql: &str) -> bool {
+    let mut w = sql.split_whitespace();
+    matches!(
+        (w.next(), w.next(), w.next(), w.next()),
+        (Some(a), Some(b), Some(c), Some(d))
+            if a.eq_ignore_ascii_case("create")
+                && b.eq_ignore_ascii_case("or")
+                && c.eq_ignore_ascii_case("replace")
+                && d.eq_ignore_ascii_case("function")
+    )
+}
+
+/// The one message for every spelling of declarative partitioning.
+///
+/// It is a FEATURE, not a syntax gap — routing a row to the right child on
+/// INSERT, pruning children a predicate cannot match, and moving a whole child
+/// in or out with `ATTACH`/`DETACH`. Saying so is worth more than the parser's
+/// generic complaint, which named a comma or the word after the table.
+///
+/// ~1 900 statements in PostgreSQL's regress corpus involve it (926 `PARTITION
+/// OF`, 591 `PARTITION BY`, 395 `ATTACH`/`DETACH PARTITION`), which is why it
+/// gets its own sentence rather than sharing the unsupported-DDL one.
+const PARTITIONING: &str = "declarative partitioning is not implemented — \
+     `PARTITION BY` / `PARTITION OF` / `ATTACH PARTITION` need row routing on \
+     INSERT, child pruning at plan time, and a catalog that knows the parent's \
+     children; mpedb has none of those, and a table that accepted the syntax \
+     without them would store rows nothing could find";
+
+pub(crate) fn parse_ddl_dialect(
+    sql: &str,
+    dialect: mpedb_types::Dialect,
+) -> Result<Option<DdlStmt>> {
+    let toks = crate::token::tokenize_dialect(sql, dialect)?;
     let mut p = Parser::new(sql, toks);
+    p.dialect = dialect;
     let ddl = match p.peek_ident_ci().as_deref() {
         Some("create") => {
             p.advance();
@@ -40,8 +99,47 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
                 p.parse_create_view()?
             } else if p.eat_word("TRIGGER") {
                 p.parse_create_trigger()?
-            } else {
+            } else if p
+                .peek_ident_ci()
+                .is_some_and(|w| w.eq_ignore_ascii_case("policy"))
+            {
                 p.parse_create_policy()?
+            } else if p.eat_word("FUNCTION") {
+                // Detection only — the whole statement text goes to the
+                // plpgsql frontend, which owns the grammar. See
+                // `DdlStmt::CreateFunction`.
+                p.consume_rest();
+                DdlStmt::CreateFunction { source: sql.to_string(), or_replace: false }
+            } else if create_or_replace_function(sql) {
+                p.consume_rest();
+                DdlStmt::CreateFunction { source: sql.to_string(), or_replace: true }
+            } else {
+                // Everything else: `CREATE TYPE`, `CREATE
+                // SEQUENCE`, `CREATE OR REPLACE …` and the rest of PostgreSQL's
+                // object zoo.
+                //
+                // This used to fall THROUGH to `parse_create_policy`, whose
+                // first act is to demand the word POLICY — so every unsupported
+                // CREATE reported ``expected `POLICY` `` at byte 7. That names
+                // the last thing the parser happened to try, not the problem,
+                // and it is the single largest refusal cause in PostgreSQL's
+                // regress corpus at 3 626 statements.
+                // The word as WRITTEN, taken from the source span rather than
+                // from `peek_ident_ci` — that returns `None` for anything the
+                // tokenizer made a keyword, and `CREATE OR REPLACE VIEW` (which
+                // the corpus uses constantly) then reported "CREATE …", naming
+                // nothing at all.
+                let mut found = p.word_at_cursor();
+                // `CREATE OR REPLACE VIEW` is the commonest of these, and
+                // "CREATE OR" would send the reader looking at the wrong word:
+                // the VIEW is supported, the REPLACE is not.
+                if found == "OR" {
+                    found = "OR REPLACE".into();
+                }
+                return Err(mpedb_types::Error::Parse {
+                    pos: p.here(),
+                    msg: unsupported_create_msg(&found),
+                });
             }
         }
         Some("drop") => {
@@ -54,8 +152,25 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
                 p.parse_drop_trigger()?
             } else if p.eat_word("INDEX") {
                 p.parse_drop_index()?
-            } else {
+            } else if p.eat_word("FUNCTION") {
+                p.parse_drop_function()?
+            } else if p
+                .peek_ident_ci()
+                .is_some_and(|w| w.eq_ignore_ascii_case("policy"))
+            {
                 p.parse_drop_policy()?
+            } else {
+                // Same fall-through the CREATE arm had, and the same bad
+                // message: every unsupported DROP reported ``expected `POLICY` ``
+                // at byte 5, naming the last thing tried rather than the object.
+                return Err(mpedb_types::Error::Parse {
+                    pos: p.here(),
+                    msg: format!(
+                        "DROP {} is not supported — mpedb implements DROP TABLE, VIEW, \
+                         TRIGGER, INDEX and POLICY",
+                        p.word_at_cursor()
+                    ),
+                });
             }
         }
         Some("alter") => {
@@ -350,7 +465,31 @@ impl<'a> Parser<'a> {
             .map(|t| t.pos)
             .unwrap_or(self.src.len());
         let text = self.src.get(start..end).unwrap_or("").trim();
-        let (ty, aff) = mpedb_types::ColumnType::declared(&words.join(" "));
+        let joined = words.join(" ");
+        // `SERIAL` is PostgreSQL's sugar for "integer, with a sequence default".
+        // sqlite's affinity rule has never heard of it, so it fell through to
+        // NUMERIC affinity and `Any` — and `id serial PRIMARY KEY` then took a
+        // NOT NULL violation on the very first insert that omitted the id,
+        // because nothing had made it an INTEGER PRIMARY KEY.
+        //
+        // Reported as INTEGER instead. That is not an approximation of the
+        // sequence half: a single-column INTEGER PRIMARY KEY is mpedb's rowid
+        // alias (#94) and auto-assigns `max(rowid)+1`, which is what `serial`
+        // is FOR. The difference from a real sequence — a deleted top id can be
+        // reused, where a PostgreSQL sequence never goes backwards — is the same
+        // difference sqlite's plain rowid has from AUTOINCREMENT, and it is
+        // written down in COMPAT-PG.md rather than papered over.
+        //
+        // `decl` keeps the verbatim `serial`, so introspection still reports
+        // what was written.
+        let joined = if self.dialect == mpedb_types::Dialect::Postgres
+            && crate::pg::types::is_serial(&joined)
+        {
+            "integer".to_string()
+        } else {
+            joined
+        };
+        let (ty, aff) = mpedb_types::ColumnType::declared(&joined);
         let decl = (!text.is_empty()).then(|| text.to_string());
         Ok((ty, aff, decl))
     }
@@ -762,6 +901,12 @@ impl<'a> Parser<'a> {
             false
         };
         let name = self.ident("table name")?;
+        // `CREATE TABLE child PARTITION OF parent …` — a PARTITION has no column
+        // list of its own, so it never reaches the `(` below and would otherwise
+        // fail with `expected (`, naming the punctuation instead of the feature.
+        if self.word_at_cursor() == "PARTITION" {
+            return Err(self.err_here(PARTITIONING));
+        }
         self.expect(&Tok::LParen, "(")?;
         let mut columns: Vec<crate::ddl::CreateColumnSpec> = Vec::new();
         let mut table_pk: Vec<String> = Vec::new();
@@ -812,6 +957,13 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen, ")")?;
+        // `CREATE TABLE t (…) PARTITION BY RANGE (c)` — the tail after the
+        // column list. Caught here so it names the feature rather than reaching
+        // the generic end-of-input check, which reported the word `PARTITION`
+        // with no hint that it is a whole capability and not a typo.
+        if self.word_at_cursor() == "PARTITION" {
+            return Err(self.err_here(PARTITIONING));
+        }
         Ok(DdlStmt::CreateTable(crate::ddl::CreateTableSpec {
             name,
             if_not_exists,
@@ -1360,7 +1512,53 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `DROP FUNCTION [IF EXISTS] name [(args)] [CASCADE|RESTRICT]`.
+    ///
+    /// The counterpart to `CREATE FUNCTION`, and it exists because the pair has
+    /// to: a `pg_dump` that can be replayed but not undone is a migration you
+    /// can only run once. Round 6 added the create and left this refused.
+    fn parse_drop_function(&mut self) -> Result<DdlStmt> {
+        let if_exists = self.eat_word("IF") && self.eat_word("EXISTS");
+        let mut name = self.ident("function name")?;
+        // Schema-qualified: mpedb has one namespace, so the qualifier is
+        // dropped exactly as `CREATE FUNCTION`'s is.
+        if self.eat(&Tok::Dot) {
+            name = self.ident("function name after the schema qualifier")?;
+        }
+        // The signature, if written — consumed and discarded (see the variant).
+        if self.eat(&Tok::LParen) {
+            let mut depth = 1usize;
+            while depth > 0 {
+                match self.advance() {
+                    Some(Tok::LParen) => depth += 1,
+                    Some(Tok::RParen) => depth -= 1,
+                    Some(_) => {}
+                    None => return Err(self.err_here("unterminated argument list")),
+                }
+            }
+        }
+        // `CASCADE` / `RESTRICT` — PostgreSQL's dependency policy. mpedb tracks
+        // no dependencies on a stored function, so neither word changes what
+        // happens; consumed rather than refused, because refusing would reject
+        // the spelling every dump uses for the one behaviour mpedb has.
+        let _ = self.eat_word("CASCADE") || self.eat_word("RESTRICT");
+        Ok(DdlStmt::DropFunction { name, if_exists })
+    }
+
     fn parse_alter(&mut self) -> Result<DdlStmt> {
+        // `ALTER <anything but TABLE>` names the OBJECT KIND, as the CREATE and
+        // DROP paths already do. `expect_word("TABLE")` alone reported
+        // ``expected `TABLE` `` — 422 statements in PostgreSQL's regress corpus
+        // being told what the parser wanted, for a statement whose problem is
+        // that mpedb has no `ALTER TYPE`, `ALTER SEQUENCE`, `ALTER ROLE`…
+        // Naming the word they wrote is what makes the refusal a fact about
+        // mpedb rather than a fact about the parser's cursor.
+        if self.word_at_cursor() != "TABLE" {
+            let found = self.word_at_cursor();
+            return Err(self.err_here(format!(
+                "ALTER {found} is not supported — mpedb implements ALTER TABLE                  (RENAME, ADD/DROP COLUMN, and the ROW LEVEL SECURITY forms)"
+            )));
+        }
         self.expect_word("TABLE")?;
         let table = self.ident("table name")?;
         // RENAME forms (pure schema metadata) branch off before the RLS words.
@@ -1380,6 +1578,29 @@ impl<'a> Parser<'a> {
             return Ok(DdlStmt::AlterRenameColumn { table, column, new_name });
         }
         if self.eat_word("ADD") {
+            // A TABLE CONSTRAINT is not a column, and reading it as one was a
+            // WRONG ANSWER — the worst kind, because it succeeded.
+            //
+            // `ALTER TABLE t ADD CONSTRAINT c CHECK (id > 0)` reported
+            // `affected: 0` and left the table with a phantom column literally
+            // named `CONSTRAINT`: `SELECT *` showed it, and a violation read
+            // ``CHECK violation: t.CONSTRAINT failed``. `COLUMN` is optional in
+            // this grammar, so the constraint keyword landed in the slot the
+            // column name was read from. The same hole swallows `ADD PRIMARY
+            // KEY`, `ADD UNIQUE`, `ADD FOREIGN KEY` and a bare `ADD CHECK`.
+            //
+            // Found while giving the OTHER `ALTER TABLE` actions their names —
+            // `ADD` was the one action that did not reach the message being
+            // fixed, because it silently succeeded.
+            let w = self.word_at_cursor();
+            if matches!(
+                w.as_str(),
+                "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "FOREIGN" | "CHECK" | "EXCLUDE"
+            ) {
+                return Err(self.err_here(format!(
+                    "ALTER TABLE … ADD {w} adds a TABLE CONSTRAINT, and mpedb's constraints                      are fixed at CREATE TABLE — a rigid schema is what its type checking                      rests on. Recreate the table with the constraint"
+                )));
+            }
             self.eat_word("COLUMN"); // optional, as in sqlite/PG
             let cname = self.ident("column name")?;
             // The SAME declared-type grammar CREATE TABLE uses — `varchar(100)`
@@ -1504,6 +1725,25 @@ impl<'a> Parser<'a> {
             self.expect_row_level_security()?;
             RlsAction::Disable
         } else {
+            // The partitioning verbs get their own sentence before the
+            // catch-all, for the same reason CREATE TABLE does: the generic
+            // message names the last thing the parser happened to try
+            // (row-level security) rather than the thing that was written.
+            if matches!(self.word_at_cursor().as_str(), "ATTACH" | "DETACH") {
+                return Err(self.err_here(PARTITIONING));
+            }
+            // Every other ALTER TABLE action names ITSELF. The old message
+            // named row-level security — the last branch the parser happened to
+            // try — for statements about constraints, ownership, inheritance
+            // and column types. The corpus writes ALTER (266), SET (86), OWNER
+            // (35), INHERIT (28), VALIDATE (19), RESET (18) and more, and each
+            // of them was told about a feature it had not mentioned.
+            let found = self.word_at_cursor();
+            if !found.is_empty() && found != "…" {
+                return Err(self.err_here(format!(
+                    "ALTER TABLE … {found} is not supported — mpedb implements RENAME                      (table and column), ADD/DROP COLUMN, and ENABLE/FORCE/DISABLE ROW                      LEVEL SECURITY"
+                )));
+            }
             return Err(self.err_here("expected ENABLE, FORCE, or DISABLE ROW LEVEL SECURITY"));
         };
         Ok(DdlStmt::AlterRls { table, action })

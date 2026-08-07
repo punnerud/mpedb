@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 
 fn scratch(name: &str) -> PathBuf {
-    let p = std::env::temp_dir()
+    let p = mpedb_testkit::scratch_base()
         .join("mpedb-sqlitefmt-tests")
         .join(format!("{name}-{}.db", std::process::id()));
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();

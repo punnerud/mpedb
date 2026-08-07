@@ -217,6 +217,16 @@ fn access_outer_cols(a: &AccessPath, keep: &mut [bool]) {
         // A full scan has no key, and an FTS query tree carries literal terms
         // only — neither can name the outer row.
         AccessPath::FullScan | AccessPath::FtsScan { .. } => {}
+        // A series CAN name the outer row: `t JOIN generate_series(1, t.n)`
+        // resolves its stop bound per outer row, so those slots must survive
+        // pruning exactly as an index nested loop's key does.
+        AccessPath::Series { start, stop, step } => {
+            for p in [Some(start), Some(stop), step.as_ref()].into_iter().flatten() {
+                if let KeyPart::OuterCol(i) = p {
+                    set(keep, *i);
+                }
+            }
+        }
     }
 }
 

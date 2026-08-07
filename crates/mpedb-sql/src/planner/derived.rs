@@ -38,7 +38,7 @@ pub(super) fn plan_derived_select(
     schema: &Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
-    mode: BareGroupBy,
+    mode: Dialect,
     host_udfs: &HostUdfSet,
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
@@ -134,6 +134,9 @@ pub(super) fn plan_derived_select(
     let outer_ast = ast::SelectStmt {
         table: Some(name.clone()),
         from_derived: None,
+        // The outer reads the MATERIALIZED body by name; a series, if the body
+        // had one, was consumed building that body.
+        from_series: None,
         alias: None,
         joins: s.joins.clone(),
         distinct: s.distinct,

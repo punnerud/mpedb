@@ -53,7 +53,14 @@ pub(super) fn plan_on_conflict(
         let mut usable = vec![format!("({})", pk_names.join(", "))];
         // Only UNIQUE indexes can witness a conflict; a non-unique index
         // never can (several rows may share the values).
-        for ix in table.indexes.iter().filter(|ix| ix.unique) {
+        for ix in table
+            .indexes
+            .iter()
+            .filter(|ix| ix.unique && !ix.has_expression_part())
+        {
+            // An expression index cannot be an ON CONFLICT target — there are no
+            // column NAMES to write in the conflict clause — and its ordinals
+            // carry a sentinel that panics if used to index `columns`.
             let names: Vec<&str> = ix
                 .columns
                 .iter()

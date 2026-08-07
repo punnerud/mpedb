@@ -408,11 +408,11 @@ impl SqliteOverlay {
     /// base adopts in place when the overlay is empty; with unpushed deltas
     /// it refuses (reconcile is post-v2).
     fn open_bracket(&mut self) -> Result<ReadBracket> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = mpedb_core::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             match ReadBracket::open(&self.base).map_err(oerr)? {
                 BracketOutcome::Busy => {
-                    if std::time::Instant::now() > deadline {
+                    if mpedb_core::Instant::now() > deadline {
                         return Err(Error::Unsupported(
                             "base busy: a sqlite writer held the base for the whole 2s \
                              backoff window — retry the statement"
@@ -1313,12 +1313,12 @@ impl SqliteOverlay {
 }
 
 fn retake_shared(base: &Path) -> Result<SharedLock> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = mpedb_core::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if let Some(l) = SharedLock::acquire(base).map_err(oerr)? {
             return Ok(l);
         }
-        if std::time::Instant::now() > deadline {
+        if mpedb_core::Instant::now() > deadline {
             return Err(Error::Unsupported(
                 "could not re-take the base SHARED within 5s".into(),
             ));

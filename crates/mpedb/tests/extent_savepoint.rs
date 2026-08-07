@@ -98,7 +98,7 @@ fn parked_runs_drain_on_release_and_commit() {
 fn tempdir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    let d = std::env::temp_dir().join(format!(
+    let d = mpedb_testkit::scratch_base().join(format!(
         "mpedb-extsp-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)

@@ -51,6 +51,13 @@ pub mod collab;
 pub mod sync;
 mod exec;
 mod multifile;
+/// Where mpedb puts files it must create but never means to keep — the temp
+/// member behind `CREATE TEMPORARY TABLE`, and anything else with a lifetime
+/// shorter than the database. `MPEDB_TEST_DIR`, then `/dev/shm`, then the
+/// platform temp dir. Exported so a harness that drives mpedb can put ITS
+/// scratch on the same volume: when the two disagree, one full tmpfs makes
+/// only half a run flap, which is far harder to diagnose than all of it.
+pub use multifile::ephemeral_dir;
 pub mod sqlscript;
 mod policy_store;
 mod registry;
@@ -746,11 +753,11 @@ pub struct Database {
     /// renamed table fails immediately and loudly, rather than silently
     /// asserting nothing for the rest of the deployment's life.
     require_policy: std::collections::HashSet<u32>,
-    /// GROUP BY column-strictness dialect ([`BareGroupBy`], COMPAT.md), from
-    /// `[compat] bare_group_by` (default sqlite) — or `postgres` for a
+    /// GROUP BY column-strictness dialect ([`Dialect`], COMPAT.md), from
+    /// `[compat] dialect` (default sqlite) — or `postgres` for a
     /// PostgreSQL-imported mirror. Passed into every `prepare` so a bare column
     /// is accepted (sqlite) or refused (postgres) per the data's origin.
-    bare_group_by: mpedb_types::BareGroupBy,
+    dialect: mpedb_types::Dialect,
     /// This process's sync role (#157). Read once at open; it changes nothing
     /// about how a statement executes, only what a collaborative verdict is
     /// allowed to CLAIM — a replica's local commit is not the authority's word.
@@ -937,7 +944,7 @@ impl Database {
             // config-free attach enforces what the FILE carries, and
             // `require_policy` is a config-declared deployment assertion.
             require_policy: std::collections::HashSet::new(),
-            bare_group_by: mpedb_types::BareGroupBy::default(),
+            dialect: mpedb_types::Dialect::default(),
             role: crate::sync::Role::Standalone,
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
@@ -969,7 +976,7 @@ impl Database {
     /// different route.
     fn with_stored_compat(mut self) -> Result<Database> {
         let t = self.tunables()?;
-        self.bare_group_by = t.bare_group_by;
+        self.dialect = t.dialect;
         self.fk_enforce
             .store(t.foreign_keys, std::sync::atomic::Ordering::Relaxed);
         Ok(self)
@@ -1012,7 +1019,7 @@ impl Database {
         let checks = compile_schema_checks(&config.schema)?;
         stage("checks");
         let path = config.options.path.clone();
-        let bare_group_by = config.options.bare_group_by;
+        let dialect = config.options.dialect;
         let role = crate::sync::Role::parse(&config.options.sync_role)?;
         // Resolve the §6.3 assertions against the schema now: an unknown name is
         // a config error, not a no-op assertion nobody notices.
@@ -1071,7 +1078,7 @@ impl Database {
             path,
             storage,
             require_policy,
-            bare_group_by,
+            dialect,
             role,
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
@@ -1112,20 +1119,20 @@ impl Database {
         let have_record = self.sys_record_get(crate::costlayer::NS_TUNE, b"current")?.is_some();
         let mut want = stored.clone();
 
-        if o.bare_group_by_named {
-            if have_record && stored.bare_group_by != o.bare_group_by {
+        if o.dialect_named {
+            if have_record && stored.dialect != o.dialect {
                 return Err(Error::Config(format!(
-                    "compat.bare_group_by = `{}` but the database records `{}`. The FILE \
+                    "compat.dialect = `{}` but the database records `{}`. The FILE \
                      decides the dialect — it travels with the data, and a config that \
                      silently overrode it is what let a PostgreSQL mirror reopen lenient. \
-                     Change it deliberately with `mpedb tune set <db> bare_group_by={}`, \
+                     Change it deliberately with `mpedb tune set <db> dialect={}`, \
                      or drop the config key.",
-                    crate::costlayer::dialect_name(o.bare_group_by),
-                    crate::costlayer::dialect_name(stored.bare_group_by),
-                    crate::costlayer::dialect_name(o.bare_group_by),
+                    crate::costlayer::dialect_name(o.dialect),
+                    crate::costlayer::dialect_name(stored.dialect),
+                    crate::costlayer::dialect_name(o.dialect),
                 )));
             }
-            want.bare_group_by = o.bare_group_by;
+            want.dialect = o.dialect;
         }
         if o.foreign_keys_named {
             if have_record && stored.foreign_keys != o.foreign_keys {
@@ -1146,10 +1153,77 @@ impl Database {
         if !have_record && want != crate::costlayer::Tunables::default() {
             self.put_gen_bumped(crate::costlayer::NS_TUNE, &want.encode_public())?;
         }
-        self.bare_group_by = want.bare_group_by;
+        self.dialect = want.dialect;
         self.fk_enforce
             .store(want.foreign_keys, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The SQL dialect this HANDLE compiles under.
+    pub fn dialect(&self) -> mpedb_types::Dialect {
+        self.dialect
+    }
+
+    /// Compile under a different dialect from here on — the per-SESSION half of
+    /// the sqlite-vs-PostgreSQL switch.
+    ///
+    /// The file still RECORDS a dialect, and that record is still what a
+    /// config-free attach starts from: it is the answer to "what does this data
+    /// mean", and a `dump` or a mirror daemon must not silently loosen it. What
+    /// this method adds is a session that deliberately says otherwise — a
+    /// PostgreSQL wire connection into a database that also serves sqlite
+    /// callers through the C-API shim, at the same time, over the same file.
+    ///
+    /// That is safe because the two dialects differ only in what SQL MEANS, not
+    /// in what is stored: mpedb's columns are rigidly typed either way, so no
+    /// row written under one dialect is unreadable under the other. The one
+    /// thing that had to move for this to hold is the plan registry key, which
+    /// now carries the dialect (`registry::plan_subkey`) — without that, the two
+    /// sessions would evict each other's plans for the same SQL text.
+    ///
+    /// Selecting `Postgres` in a build without the `pg-dialect` feature is a
+    /// named refusal at the first `prepare`, not here: this call only records an
+    /// intent.
+    /// A consistent raw image of the whole database, as bytes.
+    ///
+    /// The alternative — dumping to SQL and parsing it back — is what a wasm
+    /// build has had to do, because there is no filesystem there to
+    /// `VACUUM INTO`. This copies the pages that are already contiguous
+    /// instead: no `SELECT` per table, no literal per value, no hex expansion
+    /// per blob byte, and no parse on the way back.
+    ///
+    /// Blocks no writer. See `mpedb_core::backup` for why that is sound rather
+    /// than optimistic.
+    ///
+    /// The result is the DATA region only, up to the snapshot's high water — so
+    /// a mostly-empty 64 MiB database backs up to a few pages, not 64 MiB.
+    pub fn backup(&self) -> Result<Vec<u8>> {
+        self.engine.backup()
+    }
+
+    /// Restore a [`Database::backup`] into a database this process just created.
+    ///
+    /// The target must be empty and must have been created with the same
+    /// `max_readers` — the reader table's width decides where the data region
+    /// starts, so a mismatch would place every page at the wrong id. Both are
+    /// refused by name rather than half-applied.
+    pub fn restore_backup(&self, bytes: &[u8]) -> Result<()> {
+        self.engine.restore_backup(bytes)?;
+        // Every cached plan was compiled against the schema this file had a
+        // moment ago, which was the seed's. The catalog is now someone else's.
+        self.cache.write().expect(POISON).clear();
+        Ok(())
+    }
+
+    pub fn set_dialect(&mut self, dialect: mpedb_types::Dialect) {
+        if dialect != self.dialect {
+            // The plan cache is keyed by hash alone and is per-handle, so it
+            // would happily hand a sqlite plan to a PG statement with the same
+            // hash. The registry key separates them on disk; this separates
+            // them in memory.
+            self.cache.write().expect(POISON).clear();
+        }
+        self.dialect = dialect;
     }
 
     /// How this handle is backed ([`mpedb_types::StorageKind`]).
@@ -1579,7 +1653,7 @@ impl Database {
             &bundle,
             &catalog,
             &views,
-            self.bare_group_by,
+            self.dialect,
             &udfs,
             &cost,
         );
@@ -1611,7 +1685,7 @@ impl Database {
     pub fn access_report(&self, sql: &str) -> Result<AccessReport> {
         // DDL compiles to no plan — the facade applies it against the catalog
         // directly — so it is described by its parse, not by a footprint.
-        if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
+        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.dialect)? {
             return Ok(access::ddl_access(&ddl));
         }
         let (plan, _explain) = self.compile_maybe_explain(sql)?;
@@ -1870,7 +1944,7 @@ impl Database {
     }
 
     pub fn plan_footprint(&self, sql: &str) -> Result<(PlanHash, Footprint)> {
-        if mpedb_sql::parse_ddl(sql)?.is_some() {
+        if mpedb_sql::parse_ddl_dialect(sql, self.dialect)?.is_some() {
             return Err(Error::Unsupported(
                 "DDL compiles to no plan and has no footprint".into(),
             ));
@@ -1949,7 +2023,7 @@ impl Database {
             schema,
             &catalog,
             &views,
-            self.bare_group_by,
+            self.dialect,
             &udfs,
             &cost,
         );
@@ -2245,7 +2319,7 @@ impl Database {
         };
         // RLS DDL (CREATE/DROP POLICY, ALTER TABLE … ROW LEVEL SECURITY) mutates
         // the catalog rather than compiling to a plan — apply it directly.
-        if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
+        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.dialect)? {
             return self.apply_ddl(ddl);
         }
         let (plan, is_explain) = self.compile_maybe_explain(sql)?;
@@ -2443,7 +2517,7 @@ impl Database {
                 return self.query_attached_only(&db, &sql, params);
             }
         };
-        if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
+        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.dialect)? {
             return self.apply_ddl(ddl);
         }
         let (plan, is_explain) = self.compile_maybe_explain(sql)?;
@@ -2629,11 +2703,11 @@ impl Database {
     /// The busy policy as a per-call deadline: `None` = block indefinitely.
     /// Computed at each write entry so the whole statement (lock wait
     /// included) shares one budget.
-    pub(crate) fn busy_deadline(&self) -> Option<std::time::Instant> {
+    pub(crate) fn busy_deadline(&self) -> Option<mpedb_core::Instant> {
         let ms = self.busy_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
         u64::try_from(ms)
             .ok()
-            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms))
+            .map(|ms| mpedb_core::Instant::now() + std::time::Duration::from_millis(ms))
     }
 
     /// True when a bounded busy policy is in force (`set_busy_timeout(Some)`).
@@ -2778,6 +2852,81 @@ impl Database {
     /// Prefix-bounded (#124): keys are `<ns>\0<key>`, so `[<ns>\0, <ns>\x01)`
     /// is exactly this namespace — no neighbouring family (least of all the
     /// plan registry, which shares this keyspace) is ever materialised.
+    /// Every key in the system keyspace, WITH its namespace prefix intact.
+    ///
+    /// Unlike [`Database::sys_record_scan`], which strips the namespace and
+    /// takes one at a time, this is deliberately whole-keyspace and
+    /// prefix-preserving: its callers are the ones that must reason about which
+    /// stores exist rather than about one they already know. Table-id
+    /// compaction (`mpedb_core::compact`) is the reason it exists — it has to
+    /// classify EVERY key, including keys belonging to a store it has never
+    /// heard of, because an unclassified store is how compaction goes silently
+    /// wrong.
+    /// What a table-id compaction would do to THIS database, writing nothing.
+    ///
+    /// Answers the question an operator actually has before taking a database
+    /// down: how much of the id budget is tombstones, and what would be
+    /// rewritten. Safe on a live database — it reads one snapshot.
+    /// Reclaim the table-id budget: dense ids, tombstones gone.
+    ///
+    /// Requires the database EXCLUSIVE — no other reader, no other writer. That
+    /// is not caution, it is the correctness argument: between renumbering the
+    /// schema and renumbering the records keyed by the old ids there is an
+    /// instant where the two disagree, and the only reason that window is safe
+    /// is that nobody can look into it. DESIGN-DROP-TABLE §0 rejected ONLINE id
+    /// reuse for exactly the window this closes by being offline.
+    ///
+    /// Published plans are DROPPED rather than renumbered — each carries table
+    /// ids inside its own bytes and inside its footprint, so a renumbered plan
+    /// would name a different table and still validate. Callers re-prepare.
+    ///
+    /// One transaction: a crash leaves the old ids, untouched.
+    pub fn compact_ids(&self) -> Result<mpedb_core::engine::Rewritten> {
+        self.refresh_schema_if_stale()?;
+        // The reader table counts THIS process's reader too if one is open;
+        // there is none here, so any live reader is somebody else.
+        let others = self.engine.live_readers();
+        if others > 0 {
+            return Err(Error::Unsupported(format!(
+                "compact-ids needs the database to itself: {others} reader(s) are attached.                  Renumbering is safe only while nobody can observe the instant between the                  schema moving and the records keyed by the old ids moving"
+            )));
+        }
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
+        let done = match w.compact_table_ids() {
+            Ok(d) => d,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        };
+        w.commit()?;
+        // Every cached plan was compiled against the old numbering.
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(done)
+    }
+
+    /// This database's lifetime `CREATE TABLE` budget — see
+    /// [`mpedb_types::config::DbOptions::max_tables`].
+    pub fn max_tables(&self) -> usize {
+        self.engine.max_tables()
+    }
+
+    pub fn compact_plan(&self) -> Result<mpedb_core::compact::CompactPlan> {
+        self.refresh_schema_if_stale()?;
+        let bundle = self.schema();
+        let dead: Vec<bool> = bundle.schema.tables.iter().map(|t| t.dead).collect();
+        let keys = self.sys_keys()?;
+        Ok(mpedb_core::compact::plan(&dead, &keys))
+    }
+
+    pub fn sys_keys(&self) -> Result<Vec<Vec<u8>>> {
+        let r = self.engine.begin_read()?;
+        let all = r.sys_scan();
+        r.finish()?;
+        Ok(all?.into_iter().map(|(k, _)| k).collect())
+    }
+
     pub fn sys_record_scan(&self, ns: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         check_sys_ns(ns)?;
         let mut prefix = Vec::with_capacity(ns.len() + 1);
@@ -2834,7 +2983,7 @@ impl Database {
             return Ok(plan);
         }
         let blob = plan.encode();
-        let subkey = plan_subkey(&hash);
+        let subkey = plan_subkey(&hash, self.dialect);
 
         // READ-FIRST probe: is an identical record already published?
         let published = {
@@ -2868,7 +3017,7 @@ impl Database {
             // `TransactionTests`: con1 holds an implicit txn, con2's
             // first-compile SELECT must read, not error.
             let w = if self.busy_bounded() {
-                match self.engine.begin_write_deadline(Some(std::time::Instant::now())) {
+                match self.engine.begin_write_deadline(Some(mpedb_core::Instant::now())) {
                     Ok(w) => Some(w),
                     Err(Error::Busy) => None, // opportunistic: skip publication
                     Err(e) => return Err(e),
@@ -2877,7 +3026,7 @@ impl Database {
                 Some(self.engine.begin_write()?)
             };
             if let Some(mut w) = w {
-                match registry::insert_plan(&mut w, &hash, sql, &blob, self.bare_group_by) {
+                match registry::insert_plan(&mut w, &hash, sql, &blob, self.dialect) {
                     Ok(true) => w.commit()?,
                     Ok(false) => w.abort(),
                     Err(e) => {
@@ -2909,14 +3058,14 @@ impl Database {
         if let Some(p) = self.cache.read().expect(POISON).get(hash) {
             return Ok(p.clone());
         }
-        let subkey = plan_subkey(hash);
+        let subkey = plan_subkey(hash, self.dialect);
         let record = {
             let r = self.engine.begin_read()?;
             let rec = r.sys_get(&subkey)?;
             r.finish()?;
             rec.ok_or(Error::UnknownPlan(*hash))?
         };
-        let plan = Arc::new(decode_registry_plan(&record, hash, &self.schema(), self.bare_group_by)?);
+        let plan = Arc::new(decode_registry_plan(&record, hash, &self.schema(), self.dialect)?);
         self.cache
             .write()
             .expect(POISON)
@@ -3381,7 +3530,7 @@ impl WriteSession<'_> {
     /// transaction can still be described (#95). An authorization gate must be
     /// able to describe every statement it lets through, including those.
     pub fn access_report(&self, sql: &str) -> Result<AccessReport> {
-        if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
+        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.db.dialect)? {
             return Ok(access::ddl_access(&ddl));
         }
         let schema = self.txn.schema_bundle();
@@ -3552,7 +3701,7 @@ impl WriteSession<'_> {
         // session's transaction so the schema change lives in the txn's COW
         // catalog pages and commits/rolls back atomically with the session's
         // DML — never a mid-transaction commit.
-        if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
+        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.db.dialect)? {
             return self.apply_ddl(ddl);
         }
         // Compile against THIS session's schema view — which includes any DDL
@@ -3706,7 +3855,7 @@ impl WriteSession<'_> {
                 self.db.resolve_db_refs_hook(sql)?,
                 multifile::DbRoute::Passthrough
             )
-            || mpedb_sql::parse_ddl(sql)?.is_some()
+            || mpedb_sql::parse_ddl_dialect(sql, self.db.dialect)?.is_some()
         {
             return Ok(None);
         }
@@ -4111,7 +4260,7 @@ impl WriteSession<'_> {
         if let Some(p) = self.db.cache.read().expect(POISON).get(hash) {
             return Ok(p.clone());
         }
-        let subkey = plan_subkey(hash);
+        let subkey = plan_subkey(hash, self.db.dialect);
         let Some(record) = self.txn.sys_get(&subkey)? else {
             return Err(Error::UnknownPlan(*hash));
         };
@@ -4119,7 +4268,7 @@ impl WriteSession<'_> {
             &record,
             hash,
             &self.db.schema(),
-            self.db.bare_group_by,
+            self.db.dialect,
         )?);
         // last_used_txn refresh rides on this transaction (commits or rolls
         // back with it — best-effort bookkeeping either way). A failed put
@@ -4622,6 +4771,39 @@ impl WriteSession<'_> {
                 if_not_exists,
             } => {
                 self.create_view_in_txn(&name, &select_sql, if_not_exists)?;
+            }
+            // Compiled and written INSIDE this transaction, the same shape
+            // CREATE VIEW takes above: two sys records (the content-addressed
+            // IR blob and the name binding) plus a schema-generation bump, so
+            // the function appears exactly when the transaction commits and not
+            // before. Routing it to `Database::create_function` instead would
+            // take the writer lock a second time from inside a write session —
+            // a self-deadlock, and the whole reason views have an in-txn twin.
+            DdlStmt::CreateFunction { source, .. } => {
+                let r = crate::spellfn::compile_function_records(
+                    crate::spellfn::SpellLang::PlPgSql,
+                    &source,
+                )?;
+                self.txn.sys_put(&r.blob_key, &r.blob)?;
+                self.txn.sys_put(&r.name_key, &r.record)?;
+                self.txn.bump_schema_gen();
+            }
+            // The twin, in the same transaction for the same reason: only the
+            // NAME binding is removed. The content-addressed blob stays, and
+            // that is deliberate — another name, or a registered plan carrying
+            // this function's hash, may still reference it, and
+            // content-addressed storage never breaks a pinned reference.
+            DdlStmt::DropFunction { name, if_exists } => {
+                let key = crate::sys_record_subkey(crate::spellfn::NS_FUNC, name.as_bytes())?;
+                let existed = self.txn.sys_delete(&key)?;
+                if !existed && !if_exists {
+                    return Err(Error::Bind(format!(
+                        "DROP FUNCTION: no stored function named `{name}`"
+                    )));
+                }
+                if existed {
+                    self.txn.bump_schema_gen();
+                }
             }
             // DROP INDEX frees a B-tree and renumbers the catalog roots above
             // it — engine work that the in-session DDL path does not carry, so
@@ -5346,7 +5528,7 @@ primary_key = ["id"]
 
         // 1. Garbage bytes under the plan's own subkey.
         let mut w = db.engine.begin_write().unwrap();
-        w.sys_put(&plan_subkey(&h), b"total garbage, not a record")
+        w.sys_put(&plan_subkey(&h, mpedb_types::Dialect::Sqlite), b"total garbage, not a record")
             .unwrap();
         w.commit().unwrap();
         // Fresh handle (empty local cache) must hit the registry and reject.
@@ -5361,9 +5543,9 @@ primary_key = ["id"]
         let other = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1 AND id > 0", &db.schema())
             .unwrap();
         assert_ne!(other.hash(), h);
-        let rec = registry::encode_record("mismatch", &other.encode(), mpedb_types::BareGroupBy::Sqlite, 1);
+        let rec = registry::encode_record("mismatch", &other.encode(), mpedb_types::Dialect::Sqlite, 1);
         let mut w = db.engine.begin_write().unwrap();
-        w.sys_put(&plan_subkey(&h), &rec).unwrap();
+        w.sys_put(&plan_subkey(&h, mpedb_types::Dialect::Sqlite), &rec).unwrap();
         w.commit().unwrap();
         let db3 = Database::open_with_config(cfg.clone()).unwrap();
         assert!(matches!(
@@ -5396,9 +5578,9 @@ primary_key = ["id"]
         .unwrap();
         let foreign = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1", &other_schema).unwrap();
         let fh = foreign.hash();
-        let rec = registry::encode_record("foreign", &foreign.encode(), mpedb_types::BareGroupBy::Sqlite, 1);
+        let rec = registry::encode_record("foreign", &foreign.encode(), mpedb_types::Dialect::Sqlite, 1);
         let mut w = db.engine.begin_write().unwrap();
-        w.sys_put(&plan_subkey(&fh), &rec).unwrap();
+        w.sys_put(&plan_subkey(&fh, mpedb_types::Dialect::Sqlite), &rec).unwrap();
         w.commit().unwrap();
         let db4 = Database::open_with_config(cfg.clone()).unwrap();
         assert!(matches!(
@@ -5428,10 +5610,10 @@ primary_key = ["id"]
         for garbage in [
             &b""[..],
             &b"short"[..],
-            &registry::encode_record("sql", b"not a plan blob", mpedb_types::BareGroupBy::Sqlite, 3)[..],
+            &registry::encode_record("sql", b"not a plan blob", mpedb_types::Dialect::Sqlite, 3)[..],
         ] {
             assert!(matches!(
-                decode_registry_plan(garbage, &h, &db.schema(), mpedb_types::BareGroupBy::Sqlite),
+                decode_registry_plan(garbage, &h, &db.schema(), mpedb_types::Dialect::Sqlite),
                 Err(Error::UnknownPlan(x)) if x == h
             ));
         }
@@ -5523,7 +5705,7 @@ primary_key = ["id"]
         assert_eq!(count(&db), 4);
         let r = db.engine.begin_read().unwrap();
         for h in hashes.iter().chain(std::iter::once(&fourth)) {
-            assert!(r.sys_get(&plan_subkey(h)).unwrap().is_some(), "{h:?} evicted");
+            assert!(r.sys_get(&plan_subkey(h, mpedb_types::Dialect::Sqlite)).unwrap().is_some(), "{h:?} evicted");
         }
         r.finish().unwrap();
 
@@ -5596,7 +5778,7 @@ primary_key = ["id"]
         // are EXACTLY the rest — a fixed partition with no sort tie-break.
         for &i in &[0usize, 1, registry::EVICT_BATCH - 1] {
             assert!(
-                !present.contains(&plan_subkey(&hashes[i])),
+                !present.contains(&plan_subkey(&hashes[i], mpedb_types::Dialect::Sqlite)),
                 "plan #{i} (among the oldest {}) should have been evicted",
                 registry::EVICT_BATCH
             );
@@ -5607,14 +5789,14 @@ primary_key = ["id"]
         // verify the recomputed content hash.
         let schema = db.schema();
         for &i in &[registry::EVICT_BATCH, registry::EVICT_BATCH + 1, total - 1] {
-            let key = plan_subkey(&hashes[i]);
+            let key = plan_subkey(&hashes[i], mpedb_types::Dialect::Sqlite);
             assert!(present.contains(&key), "plan #{i} should have survived");
             let rec = r.sys_get(&key).unwrap().expect("survivor record present");
-            decode_registry_plan(&rec, &hashes[i], &schema, mpedb_types::BareGroupBy::Sqlite)
+            decode_registry_plan(&rec, &hashes[i], &schema, mpedb_types::Dialect::Sqlite)
                 .unwrap_or_else(|e| panic!("survivor plan #{i} must cold-load, got {e:?}"));
         }
         // An evicted hash leaves no record, so the cold path reports UnknownPlan.
-        assert!(r.sys_get(&plan_subkey(&hashes[0])).unwrap().is_none());
+        assert!(r.sys_get(&plan_subkey(&hashes[0], mpedb_types::Dialect::Sqlite)).unwrap().is_none());
         r.finish().unwrap();
         db.verify().unwrap();
     }
@@ -5704,7 +5886,7 @@ primary_key = ["id"]
         // the hash-equality check, so it legitimately IS in the registry.
         {
             let r = db2.engine.begin_read().unwrap();
-            let rec = r.sys_get(&plan_subkey(&ins.hash)).unwrap();
+            let rec = r.sys_get(&plan_subkey(&ins.hash, mpedb_types::Dialect::Sqlite)).unwrap();
             r.finish().unwrap();
             assert!(rec.is_none(), "detached plan leaked into the registry");
         }
@@ -5726,7 +5908,7 @@ primary_key = ["id"]
         ));
         // Still not in the registry after executing.
         let r = db2.engine.begin_read().unwrap();
-        assert!(r.sys_get(&plan_subkey(&ins.hash)).unwrap().is_none());
+        assert!(r.sys_get(&plan_subkey(&ins.hash, mpedb_types::Dialect::Sqlite)).unwrap().is_none());
         r.finish().unwrap();
         db2.verify().unwrap();
     }

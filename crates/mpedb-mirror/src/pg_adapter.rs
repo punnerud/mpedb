@@ -714,7 +714,7 @@ mod tests {
     use mpedb::{Database, ExecResult};
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir()
+        let p = mpedb_testkit::scratch_base()
             .join("mpedb-mirror-tests")
             .join(format!("{name}-{}.mpedb", std::process::id()));
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

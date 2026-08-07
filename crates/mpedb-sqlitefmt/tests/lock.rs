@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 
 fn mkdb(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("mpedb-lock-tests");
+    let dir = mpedb_testkit::scratch_base().join("mpedb-lock-tests");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{name}-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&p);

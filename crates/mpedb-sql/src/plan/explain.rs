@@ -200,6 +200,9 @@ impl CompiledPlan {
                     .map(|t| format!("{} ({cte_role})", t.name))
                     .unwrap_or_else(|| format!("({cte_role})"));
             }
+            if id == super::SERIES_TABLE {
+                return "generate_series (generated rows)".to_string();
+            }
             schema
                 .table(id)
                 .map(|t| t.name.clone())
@@ -208,6 +211,8 @@ impl CompiledPlan {
         let col_namer = |id: u32| {
             let t = if id == super::CTE_TABLE {
                 cte_def.clone()
+            } else if id == super::SERIES_TABLE {
+                Some(super::series_def().clone())
             } else {
                 schema.table(id).cloned()
             };
@@ -293,6 +298,10 @@ impl CompiledPlan {
                             AccessPath::IndexPoint { .. } => "index",
                             AccessPath::PkRange { .. } | AccessPath::IndexRange { .. } => "range",
                             AccessPath::FtsScan { .. } => "fts",
+                            // A series is generated, not read, so it is never a
+                            // cartesian step even with a constant ON: the row
+                            // count is the bounds, not the other side's size.
+                            AccessPath::Series { .. } => "series",
                             // A held FullScan whose whole residual ON is the
                             // constant TRUE has no predicate linking it to
                             // anything already read: a cartesian step.
@@ -777,6 +786,16 @@ impl CompiledPlan {
         };
         match a {
             AccessPath::FullScan => "FullScan".into(),
+            AccessPath::Series { start, stop, step } => {
+                let mut items = vec![
+                    self.render_part_outer(start, outer),
+                    self.render_part_outer(stop, outer),
+                ];
+                if let Some(p) = step {
+                    items.push(self.render_part_outer(p, outer));
+                }
+                format!("Series({})", items.join(", "))
+            }
             AccessPath::PkPoint(parts) => {
                 let items: Vec<String> = schema
                     .table(table)

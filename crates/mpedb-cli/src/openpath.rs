@@ -53,6 +53,26 @@ fn is_sqlite(path: &Path) -> bool {
     f.read_exact(&mut m).is_ok() && &m == SQLITE_MAGIC
 }
 
+/// Is this an `mpedb backup` file? If so, the message that says what to do.
+///
+/// Only the magic is read — eight bytes — so this costs nothing on the path
+/// where the answer is no, and it is right for a backup someone named
+/// `project.db`.
+fn backup_refusal(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut m = [0u8; 8];
+    let mut f = std::fs::File::open(path).ok()?;
+    f.read_exact(&mut m).ok()?;
+    (m == mpedb_core::backup::MAGIC).then(|| {
+        format!(
+            "{} is an mpedb BACKUP, not a database — it holds the data pages without the \
+             lock area or reader table. Put it back with: mpedb restore {} <new.mpedb>",
+            path.display(),
+            path.display()
+        )
+    })
+}
+
 /// `app.db` → `app.db.mpedb` — the sidecar keeps the base's FULL name so two
 /// bases differing only in extension cannot collide on one sidecar.
 fn sidecar(base: &Path) -> PathBuf {
@@ -412,6 +432,14 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
     // A path that does not exist yet routes on what it WOULD be: a pending
     // sqlite base is an overlay session exactly like an existing one, it just
     // creates the base on its first statement.
+    // A BACKUP is not a database, and saying so is the whole point. Without
+    // this the mpedb reader gets it and reports "file size is not a valid mpedb
+    // database" — true, and it names neither what the file IS nor what to do
+    // with it. `sniff`ing by magic rather than by extension, exactly as the
+    // sqlite detection above does: the name is a hint, the bytes are the fact.
+    if let Some(msg) = backup_refusal(p) {
+        return runtime(msg);
+    }
     let sqlite_target = is_sqlite(p) || pending.as_ref().is_some_and(PendingCreate::is_sqlite_base);
     if sqlite_target && !mirror {
         return run_overlay(p, mode, reconcile, rest, pending);

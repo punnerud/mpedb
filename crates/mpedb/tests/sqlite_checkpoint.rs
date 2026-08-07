@@ -7,7 +7,7 @@ use mpedb::{LockMode, ReconcilePolicy, SqliteOverlay, Value};
 use rusqlite::Connection;
 
 fn setup(tag: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir()
+    let p = mpedb_testkit::scratch_base()
         .join("mpedb-checkpoint-tests")
         .join(format!("cp-{tag}-{}.db", std::process::id()));
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -115,7 +115,7 @@ fn checkpoint_roundtrip_against_the_library() {
 
 #[test]
 fn text_pk_deltas_checkpoint_into_the_base() {
-    let p = std::env::temp_dir()
+    let p = mpedb_testkit::scratch_base()
         .join("mpedb-checkpoint-tests")
         .join(format!("cp-textpk-{}.db", std::process::id()));
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();

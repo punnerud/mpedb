@@ -417,6 +417,34 @@ fn create_refuses_at_the_id_ceiling() {
     assert_eq!(s.tables.len(), MAX_TABLES);
     let err = s.with_added_table(tbl("overflow")).unwrap_err();
     assert!(format!("{err}").contains("exhausted"), "{err}");
+    // The refusal has to say what to DO about it — an operator who is out of
+    // ids at 4096 has two ways forward and no way to guess either from
+    // "exhausted".
+    assert!(format!("{err}").contains("compact-ids"), "{err}");
+    assert!(format!("{err}").contains("max_tables"), "{err}");
+}
+
+/// `[database] max_tables` binds the MINT, and the ceiling binds the mint's
+/// config. Cheap to test at a small cap, which is the point: the budget is a
+/// parameter now, so exercising it no longer costs 4096 tables.
+#[test]
+fn configured_cap_bounds_the_mint() {
+    let mut s = Schema::new(vec![tbl("a")]).unwrap();
+    s = s.with_added_table_capped(tbl("b"), 3).unwrap();
+    s = s.with_added_table_capped(tbl("c"), 3).unwrap();
+    let err = s.with_added_table_capped(tbl("d"), 3).unwrap_err();
+    assert!(format!("{err}").contains('3'), "{err}");
+
+    // A tombstone still SPENDS its slot — that is the whole shape of the
+    // problem the cap describes, and a cap that counted only live tables
+    // would quietly make the budget mean something else.
+    let s2 = s.with_dropped_table(2).unwrap();
+    assert_eq!(s2.tables.len(), 3);
+    assert!(s2.with_added_table_capped(tbl("d"), 3).is_err());
+
+    // A config may not authorise minting past what a decoder accepts.
+    let huge = s.with_added_table_capped(tbl("d"), usize::MAX);
+    assert!(huge.is_ok(), "a cap above the ceiling clamps, it does not fail");
 }
 
 /// An implicit-rowid table (#94): visible columns plus a trailing hidden

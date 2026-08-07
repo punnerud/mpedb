@@ -23,7 +23,7 @@ pub(super) fn plan_recursive_cte(
     schema: &Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
-    mode: BareGroupBy,
+    mode: Dialect,
     host_udfs: &HostUdfSet,
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,

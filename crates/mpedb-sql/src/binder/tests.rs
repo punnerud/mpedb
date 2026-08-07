@@ -383,7 +383,7 @@
         let t = table();
         let (e, n) = parse_expr_only("coalesce(30, 1.5)").unwrap();
         let mut b = Binder::new(&t, n, true);
-        b.set_dialect(BareGroupBy::Postgres);
+        b.set_dialect(Dialect::Postgres);
         let err = format!("{}", b.bind_expr(&e).unwrap_err());
         assert!(err.contains("CAST"), "{err}");
     }

@@ -1,8 +1,8 @@
-//! Config-selectable LIKE dialect (`[compat] bare_group_by`, COMPAT.md).
+//! Config-selectable LIKE dialect (`[compat] dialect`, COMPAT.md).
 //!
 //! LIKE strictness rides the SAME compat dialect signal as GROUP BY (#87): the
 //! sqlite default is lenient (case-INsensitive for ASCII, and a numeric operand
-//! is coerced to text), while `bare_group_by = "postgres"` — the dialect a PG
+//! is coerced to text), while `dialect = "postgres"` — the dialect a PG
 //! `mirror import` produces — is strict (case-SENSITIVE, and a numeric operand
 //! is refused). The dialect is baked into the compiled plan: sqlite emits
 //! `Instr::Like`, postgres emits `Instr::LikeCs`.

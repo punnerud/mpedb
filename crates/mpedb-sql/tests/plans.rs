@@ -546,9 +546,9 @@ fn a_compound_orders_by_name_over_a_derived_arm() {
 /// both accept and emit the same bytes is a bug, not a row to add.
 #[test]
 fn every_dialect_gate_either_refuses_or_changes_the_plan() {
-    use mpedb_types::BareGroupBy;
+    use mpedb_types::Dialect;
     let s = schema();
-    let compile = |sql: &str, d: BareGroupBy| {
+    let compile = |sql: &str, d: Dialect| {
         mpedb_sql::prepare_maybe_explain_with_views(
             sql,
             &s,
@@ -576,8 +576,8 @@ fn every_dialect_gate_either_refuses_or_changes_the_plan() {
     ];
 
     for (what, sql) in gates {
-        let lite = compile(sql, BareGroupBy::Sqlite);
-        let pg = compile(sql, BareGroupBy::Postgres);
+        let lite = compile(sql, Dialect::Sqlite);
+        let pg = compile(sql, Dialect::Postgres);
         match (lite, pg) {
             // One refuses: the dialects cannot be confused, which is the point.
             (Ok(_), Err(_)) | (Err(_), Ok(_)) | (Err(_), Err(_)) => {}

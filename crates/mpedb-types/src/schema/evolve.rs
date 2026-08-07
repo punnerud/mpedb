@@ -6,7 +6,54 @@ impl Schema {
     /// table takes the lowest free id (= the current count while ids are
     /// dense), and the vec stays id-sorted (creation order). Flags normalize
     /// and indexes derive exactly as at seed.
-    pub fn with_added_table(&self, mut def: TableDef) -> Result<Schema> {
+    /// The same schema with dead slots removed and live tables renumbered
+    /// densely — plus the `(old, new)` map that says what moved.
+    ///
+    /// The counterpart to no-reuse (DESIGN-DROP-TABLE §0): ids are never
+    /// recycled ONLINE precisely so no persisted `table_id` can ever alias, and
+    /// this is the offline batch that reclaims them once, with the database
+    /// exclusive. It is the escape hatch §0 named and deferred.
+    ///
+    /// Order is preserved, so an id only ever moves DOWN. That is not cosmetic:
+    /// it makes "did this table move" a one-line check for anyone auditing a
+    /// compaction afterwards, and it keeps the map monotone, which is what lets
+    /// the caller rewrite records in any order without an id colliding with one
+    /// it has not reached yet.
+    pub fn compacted(&self) -> Result<(Schema, Vec<(u32, u32)>)> {
+        let mut tables = Vec::with_capacity(self.tables.len());
+        let mut map = Vec::new();
+        for t in self.tables.iter().filter(|t| !t.dead) {
+            let new_id = tables.len() as u32;
+            map.push((t.id, new_id));
+            let mut t = t.clone();
+            t.id = new_id;
+            tables.push(t);
+        }
+        let schema = Schema { tables };
+        // Validated here rather than trusted: renumbering touches the one
+        // invariant every downstream `bundle.x[id]` site rests on
+        // (`position == id`), so a bug in this loop must not reach a file.
+        schema.validate()?;
+        Ok((schema, map))
+    }
+
+    /// [`Schema::with_added_table`] with the mint ceiling given explicitly.
+    ///
+    /// The cap is a per-database RESOURCE decision (`[database] max_tables`),
+    /// so it arrives from the caller rather than from a constant: `Schema` has
+    /// no config and should not grow one. Clamped to
+    /// [`crate::MAX_TABLES_CEILING`] — a config may lower the bound or raise it
+    /// within reason, but it may not raise it past what the format's readers
+    /// are prepared to accept.
+    pub fn with_added_table_capped(&self, def: TableDef, cap: usize) -> Result<Schema> {
+        self.add_table_bounded(def, cap.min(crate::MAX_TABLES_CEILING))
+    }
+
+    pub fn with_added_table(&self, def: TableDef) -> Result<Schema> {
+        self.add_table_bounded(def, MAX_TABLES)
+    }
+
+    fn add_table_bounded(&self, mut def: TableDef, cap: usize) -> Result<Schema> {
         // `tables.len()` (live + dead) is the monotone id high-water: dead
         // slots are never removed and ids are NEVER reused (DESIGN-DROP-TABLE
         // §0 — reuse would require a crash-atomic distributed purge of every
@@ -14,10 +61,12 @@ impl Schema {
         // exists to prevent; the bounded-limit + offline `regenerate` compaction
         // is the deliberate trade). Fail closed at MAX_TABLES — now a cost
         // bound (tombstone bloat), not a bitmap width (DESIGN-TABLE-CAP).
-        if self.tables.len() >= MAX_TABLES {
-            return Err(Error::Schema(
-                "table-id space exhausted (MAX_TABLES lifetime creates); rebuild required".into(),
-            ));
+        if self.tables.len() >= cap {
+            return Err(Error::Schema(format!(
+                "table-id space exhausted ({cap} LIFETIME creates — ids are never reused, so \
+                 dropped tables keep their slot). `mpedb compact-ids` reclaims the slots of \
+                 dropped tables; `[database] max_tables` raises the budget"
+            )));
         }
         def.id = self.tables.len() as u32;
         def.dead = false;

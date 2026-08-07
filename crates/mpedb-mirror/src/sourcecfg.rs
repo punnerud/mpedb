@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn refuses_a_group_or_world_readable_secret() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("mpedb-cfg-{}", std::process::id()));
+        let dir = mpedb_testkit::scratch_base().join(format!("mpedb-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("src.toml");
         let _ = std::fs::remove_file(&p);
@@ -268,7 +268,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_new_refuses_to_clobber() {
-        let dir = std::env::temp_dir().join(format!("mpedb-cfg2-{}", std::process::id()));
+        let dir = mpedb_testkit::scratch_base().join(format!("mpedb-cfg2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("src.toml");
         let _ = std::fs::remove_file(&p);
@@ -281,7 +281,7 @@ mod tests {
     /// Round-trip through the file, including a DSN with TOML metacharacters.
     #[test]
     fn write_then_load_round_trips_a_hostile_dsn() {
-        let dir = std::env::temp_dir().join(format!("mpedb-cfg3-{}", std::process::id()));
+        let dir = mpedb_testkit::scratch_base().join(format!("mpedb-cfg3-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("src.toml");
         let _ = std::fs::remove_file(&p);

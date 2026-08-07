@@ -15,13 +15,13 @@
 
 use crate::ast::{Expr, Stmt};
 use crate::token::{tokenize, Kw, SpTok, Tok};
-use mpedb_types::{Error, Result};
+use mpedb_types::{Dialect, Error, Result};
 
 mod ddl;
 mod dml;
 mod expr;
 mod select;
-pub(crate) use ddl::parse_ddl;
+pub(crate) use ddl::parse_ddl_dialect;
 
 #[cfg(test)]
 mod tests;
@@ -290,6 +290,26 @@ fn alias_select_items(src: &str, names: &[String]) -> std::result::Result<String
 /// as `(name, body-source-text)` pairs (#CTE). The caller folds them into the
 /// view catalog so `crate::view::inline_views` flattens a `FROM cte` reference
 /// exactly as it flattens a view — no planner/plan-bytes/executor change.
+/// Parse under an explicit dialect — the compile road's entry point.
+///
+/// `parse_statement_ctes` keeps the sqlite dialect so every existing caller,
+/// every fragment re-parse and every corpus record means exactly what it did.
+pub(crate) fn parse_statement_ctes_dialect(
+    sql: &str,
+    host_aggs: &[(String, i32)],
+    window_aggs: &[String],
+    ops: &crate::binder::OpSet,
+    dialect: Dialect,
+) -> Result<(Stmt, bool, u16, CteDefs)> {
+    let toks = crate::token::tokenize_dialect(sql, dialect)?;
+    let mut p = Parser::new(sql, toks);
+    p.host_aggs = host_aggs.to_vec();
+    p.window_aggs = window_aggs.to_vec();
+    p.ops = ops.clone();
+    p.dialect = dialect;
+    p.statement_tail()
+}
+
 pub(crate) fn parse_statement_ctes(
     sql: &str,
     // HOST aggregate `(name, n_arg)` registrations (design/DESIGN-UDF.md stage
@@ -448,6 +468,13 @@ struct Parser<'a> {
     /// can no longer see it. Written by every `select_core`, read immediately
     /// after by `compound_chain` — nothing parses a core in between.
     neg_limit_in_core: bool,
+    /// The dialect this statement is being parsed under.
+    ///
+    /// The GRAMMAR differs, not just the semantics: PostgreSQL's `~` is an
+    /// INFIX regex operator where sqlite's is prefix bitwise-NOT, and `::` is a
+    /// cast where sqlite has no such operator at all. Defaults to
+    /// [`Dialect::Sqlite`], so every existing caller parses exactly as before.
+    dialect: Dialect,
 }
 
 impl<'a> Parser<'a> {
@@ -456,6 +483,7 @@ impl<'a> Parser<'a> {
             src,
             toks,
             pos: 0,
+            dialect: Dialect::Sqlite,
             style: ParamStyle::Unset,
             next_question: 0,
             max_params: 0,
@@ -564,6 +592,21 @@ impl<'a> Parser<'a> {
         self.next_question = sub.next_question;
         self.max_params = self.max_params.max(sub.max_params);
         Ok(e)
+    }
+
+    /// The next token as it was WRITTEN, uppercased — keyword or identifier.
+    ///
+    /// Used only for error text, so a token with no source span (there is none
+    /// in practice) degrades to an ellipsis rather than panicking.
+    fn word_at_cursor(&self) -> String {
+        match self.toks.get(self.pos) {
+            Some(t) => self
+                .src
+                .get(t.pos..t.end)
+                .map(|w| w.to_uppercase())
+                .unwrap_or_else(|| "…".into()),
+            None => "…".into(),
+        }
     }
 
     fn err_here(&self, msg: impl Into<String>) -> Error {
@@ -712,11 +755,38 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consume every remaining token.
+    ///
+    /// For the ONE statement whose grammar lives somewhere else: `CREATE
+    /// FUNCTION … LANGUAGE plpgsql` is handed to `mpedb_spell::plpgsql` as
+    /// source text, so this parser must recognise it and then get out of the
+    /// way. Without this the shared end-of-input check fires on the function's
+    /// own name and reports `unexpected trailing input` for a statement that
+    /// parsed fine.
+    pub(crate) fn consume_rest(&mut self) {
+        self.pos = self.toks.len();
+    }
+
     fn expect_eof(&mut self) -> Result<()> {
-        match self.peek() {
-            None => Ok(()),
-            Some(t) => Err(self.err_here(format!("unexpected trailing input `{t:?}`"))),
+        if self.peek().is_none() {
+            return Ok(());
         }
+        // The word as WRITTEN, from the source span — not `{tok:?}`.
+        //
+        // The debug form is the tokenizer's private vocabulary: a statement
+        // ending in `CASCADE` reported ``unexpected trailing input
+        // `Ident("cascade")` ``, which names a Rust enum variant the reader has
+        // never seen and quotes a lower-cased copy of their own word inside it.
+        // `word_at_cursor` reads the bytes they typed, which is the same source
+        // the unsupported-statement refusal already uses for the same reason.
+        //
+        // It is also what makes the refusal GROUPABLE: the corpus oracle keys
+        // its work list on the message, and a debug-formatted token buries the
+        // one thing that distinguishes 1 900 refusals from each other.
+        Err(self.err_here(format!(
+            "unexpected trailing input `{}`",
+            self.word_at_cursor()
+        )))
     }
 
     // ---- word / identifier helpers (shared with parser::ddl) ---------
@@ -951,10 +1021,24 @@ impl<'a> Parser<'a> {
                     let name = self.savepoint_name("a savepoint name after RELEASE")?;
                     Ok(Stmt::Release(name))
                 } else {
-                    Err(self.err_here(
-                        "expected a statement (SELECT, VALUES, INSERT, UPDATE, DELETE, \
-                         BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE)",
-                    ))
+                    // Name the WORD that was found, not just the list of ones
+                    // that would have worked. Without it, 1 990 corpus
+                    // statements collapsed into one indistinguishable cause and
+                    // there was no way to tell a `GRANT` from a `MERGE` from a
+                    // typo — the ranked work list could not rank them.
+                    // The word is UNQUOTED on purpose. The oracle's cause list
+                    // groups messages by shape and replaces anything quoted
+                    // with `_`, so a backticked word would collapse `GRANT`,
+                    // `MERGE` and `COMMENT` into one indistinguishable row —
+                    // which is exactly what this message existed to prevent.
+                    // Unquoted, the list splits by statement type and ranks
+                    // them, which is the whole point of naming it at all.
+                    Err(self.err_here(format!(
+                        "unsupported statement {} — mpedb implements SELECT, VALUES, \
+                         INSERT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
+                         RELEASE, and the CREATE/DROP/ALTER forms in its DDL",
+                        self.word_at_cursor()
+                    )))
                 }
             }
         }

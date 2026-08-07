@@ -1544,6 +1544,26 @@ impl Database {
             DdlStmt::CreateVirtualTable(spec) => {
                 return self.apply_create_virtual_table(spec);
             }
+            // The SAME path `mpedb fn define <target> f.sql` takes: compile the
+            // whole statement through the plpgsql frontend, store it
+            // content-addressed, bump the schema generation. Routing it here
+            // rather than duplicating the store is what makes a `pg_dump`
+            // replayed as SQL and a file handed to the CLI produce byte-
+            // identical stored functions.
+            DdlStmt::DropFunction { name, if_exists } => {
+                let found = self.drop_function(&name)?;
+                if !found && !if_exists {
+                    return Err(Error::Bind(format!(
+                        "DROP FUNCTION: no stored function named `{name}`"
+                    )));
+                }
+                return Ok(ExecResult::Affected(0));
+            }
+            DdlStmt::CreateFunction { source, .. } => {
+                let (_name, _hash) =
+                    self.create_function(crate::spellfn::SpellLang::PlPgSql, &source)?;
+                return Ok(ExecResult::Affected(0));
+            }
             DdlStmt::DropTable { name, if_exists } => {
                 return self.apply_drop_table(&name, if_exists);
             }

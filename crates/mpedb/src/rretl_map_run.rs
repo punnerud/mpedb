@@ -349,7 +349,7 @@ impl crate::Database {
     pub fn rretl_map_run(&self, name: &str, opts: &RunOptions) -> Result<MapRunReport> {
         let spec = self.load_map(name)?;
         let resolved = self.resolve_map(&spec)?;
-        let started = std::time::Instant::now();
+        let started = mpedb_core::Instant::now();
         let lease_secs = opts
             .lease_secs
             .unwrap_or_else(|| opts.max_secs.map(|s| s + 60).unwrap_or(300));

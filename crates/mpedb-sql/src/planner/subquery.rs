@@ -111,7 +111,7 @@ pub(super) fn lift_subqueries<'a>(
     schema: &'a Schema,
     n_params: u16,
     catalog: &'a PolicyCatalog,
-    mode: BareGroupBy,
+    mode: Dialect,
     host_udfs: &'a HostUdfSet,
     row_count: RowCountFn<'a>,
     consts: &'a mut Vec<Value>,
@@ -139,6 +139,7 @@ pub(super) fn lift_subqueries<'a>(
         table: s.table.clone(),
         // Carried for the same reason `Correlate::rewrite_select` carries it.
         from_derived: s.from_derived.clone(),
+        from_series: s.from_series.clone(),
         alias: s.alias.clone(),
         joins: s
             .joins
@@ -253,7 +254,7 @@ pub(super) fn lift_dml_where<'a>(
     schema: &'a Schema,
     n_params: u16,
     catalog: &'a PolicyCatalog,
-    mode: BareGroupBy,
+    mode: Dialect,
     host_udfs: &'a HostUdfSet,
     row_count: RowCountFn<'a>,
     consts: &'a mut Vec<Value>,
@@ -287,7 +288,7 @@ struct Lift<'a> {
     catalog: &'a PolicyCatalog,
     /// GROUP BY strictness dialect (COMPAT.md), carried so a subquery's own
     /// aggregate is planned under the SAME mode as the outer statement.
-    mode: BareGroupBy,
+    mode: Dialect,
     /// Host-registered scalar UDFs (design/DESIGN-UDF.md), carried so a subquery
     /// can call the same UDFs as the outer statement.
     host_udfs: &'a HostUdfSet,
@@ -942,6 +943,7 @@ impl<'a> Correlate<'a, '_> {
             // reaches it. Dropping it turned the statement FROM-less, which is
             // a wrong answer (one synthetic row) rather than a refusal.
             from_derived: s.from_derived.clone(),
+            from_series: s.from_series.clone(),
             alias: s.alias.clone(),
             joins: s
                 .joins

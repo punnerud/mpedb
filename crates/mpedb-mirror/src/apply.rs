@@ -216,7 +216,7 @@ mod tests {
     use rusqlite::Connection;
 
     fn tmp(name: &str, ext: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir()
+        let p = mpedb_testkit::scratch_base()
             .join("mpedb-mirror-tests")
             .join(format!("{name}-{}.{ext}", std::process::id()));
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

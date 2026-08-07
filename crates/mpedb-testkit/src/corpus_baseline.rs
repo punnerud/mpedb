@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn round_trip_through_the_file_format_carries_the_root() {
-        let dir = std::env::temp_dir().join(format!("mpedb-baseline-{}", std::process::id()));
+        let dir = crate::scratch_base().join(format!("mpedb-baseline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("baseline.tsv");
         let mut t = Table::new();
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn a_truncated_line_is_a_named_error_not_a_zero_row() {
-        let dir = std::env::temp_dir().join(format!("mpedb-baseline-bad-{}", std::process::id()));
+        let dir = crate::scratch_base().join(format!("mpedb-baseline-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("bad.tsv");
         std::fs::write(&p, "# root /r\na\t1\t2\n").unwrap();
@@ -466,7 +466,7 @@ mod tests {
     fn a_baseline_without_a_root_is_refused_by_name() {
         // A rootless baseline cannot key a subset run, so accepting one would
         // reintroduce exactly the bug the root exists to prevent.
-        let dir = std::env::temp_dir().join(format!("mpedb-baseline-noroot-{}", std::process::id()));
+        let dir = crate::scratch_base().join(format!("mpedb-baseline-noroot-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("noroot.tsv");
         std::fs::write(&p, "a\t1\t1\t0\t0\t0\t0\t0\n").unwrap();

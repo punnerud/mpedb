@@ -819,6 +819,7 @@ fn try_count_only(
         AccessPath::PkPoint(_)
         | AccessPath::IndexPoint { .. }
         | AccessPath::IndexRange { .. }
+        | AccessPath::Series { .. }
         | AccessPath::FtsScan { .. } => return Ok(None),
     };
     ctx.count_rows_range(
@@ -1050,6 +1051,7 @@ fn try_fused_fold(
         AccessPath::PkPoint(_)
         | AccessPath::IndexPoint { .. }
         | AccessPath::IndexRange { .. }
+        | AccessPath::Series { .. }
         | AccessPath::FtsScan { .. } => return Ok(None),
     };
     let mut accs = agg

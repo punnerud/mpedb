@@ -311,7 +311,8 @@ fn fold(
             }
         }
         AccessPath::FullScan => c.acc_full += 1,
-        AccessPath::FtsScan { .. } => {
+        // Neither reads a table, so neither can want an index.
+        AccessPath::FtsScan { .. } | AccessPath::Series { .. } => {
             c.skipped_shape += 1;
             return;
         }

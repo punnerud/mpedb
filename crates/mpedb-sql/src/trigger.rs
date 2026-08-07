@@ -144,7 +144,7 @@ pub fn compile_trigger_body(
             schema,
             map.len() as u16,
             &PolicyCatalog::empty(),
-            mpedb_types::BareGroupBy::Sqlite,
+            mpedb_types::Dialect::Sqlite,
             // A trigger body cannot call host UDFs (stage 1): it is compiled at
             // CREATE TRIGGER time, out of any connection's UDF scope.
             &crate::binder::HostUdfSet::default(),

@@ -463,7 +463,7 @@ mod tests {
     use mpedb_types::Durability;
 
     fn open_test(name: &str) -> (Shm, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join("mpedb-ring-tests");
+        let dir = crate::test_scratch().join("mpedb-ring-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(format!("{}-{}", name, std::process::id()));
         let _ = std::fs::remove_file(&p);

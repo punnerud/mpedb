@@ -205,7 +205,10 @@ impl Schema {
         let has_index_collations = version >= 14;
         let has_fts_module = version >= 18;
         let ntables = read_u32(buf, &mut pos)? as usize;
-        if ntables > MAX_TABLES {
+        // The CEILING, not the configured cap: this bounds what a FILE can
+        // make this decoder believe, and a hostile file must not be able to
+        // raise its own limit by naming a bigger one.
+        if ntables > crate::MAX_TABLES_CEILING {
             return Err(Error::Corrupt("table count out of range".into()));
         }
         // `.min(256)`: `ntables` comes from untrusted bytes and MAX_TABLES is

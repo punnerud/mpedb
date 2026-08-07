@@ -67,7 +67,7 @@ use mpedb_types::{
     keycode, Concurrency, Error, KeyAccess, KeyPart, PlanHash, Result, Schema, Value,
 };
 use std::sync::Arc;
-use std::time::Instant;
+use mpedb_core::Instant;
 
 const SEP: char = '\x1f';
 

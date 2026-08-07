@@ -101,6 +101,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod commit;
+mod compact;
+pub use compact::Rewritten;
 mod extent;
 mod fts;
 mod freelist;
@@ -900,6 +902,9 @@ pub struct Engine {
     /// Per-statement-execution work-row budget (#74), copied into each txn's
     /// [`WorkMeter`] at begin. `0` = unlimited.
     work_budget: u64,
+    /// Lifetime `CREATE TABLE` budget (`[database] max_tables`). Read on the
+    /// DDL path only — one comparison per `CREATE TABLE`, never per row.
+    max_tables: usize,
     /// Live-cell budget on join materialization (#74 extension): the SQL
     /// executor's nested-loop join reads it via the txn and bounds the
     /// `Value` cells its intermediate product holds. `0` = unlimited.
@@ -974,6 +979,7 @@ impl Engine {
             flusher,
             extent_threshold: None,
             work_budget: config.options.max_work_rows,
+            max_tables: config.options.max_tables,
             join_cells_budget: config.options.max_join_cells,
             query_threads: config.options.max_query_threads,
             check_compiler: std::sync::RwLock::new(None),
@@ -1185,6 +1191,9 @@ impl Engine {
             // `dump`/verify pass legitimately scans whole tables and a row count
             // is exactly what it would refuse.
             work_budget: 0,
+            // A tooling handle creates no tables; the ordinary default is the
+            // honest value and would be enforced if one somehow did.
+            max_tables: mpedb_types::MAX_TABLES,
             // The JOIN-CELL budget is not in that class and gets the ordinary
             // default. Nothing this handle exists for materializes an n-way
             // product — but this is also the handle behind `mpedb <file.mpedb>`,
@@ -1226,6 +1235,13 @@ impl Engine {
     /// How many reader slots on this file are occupied right now (this
     /// process's own included) — the parallel fold's politeness signal, see
     /// [`crate::shm::Shm::live_readers`].
+    /// This database's lifetime `CREATE TABLE` budget (`[database]
+    /// max_tables`). Per-process like `durability`: it bounds what THIS
+    /// process will mint, not what the file may contain.
+    pub fn max_tables(&self) -> usize {
+        self.max_tables
+    }
+
     pub fn live_readers(&self) -> u32 {
         self.shm.live_readers()
     }
@@ -1596,7 +1612,7 @@ impl Engine {
     ) -> Vec<u32> {
         debug_assert_eq!(tables.len(), seen.len());
         debug_assert_eq!(tables.len(), keys.len());
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = crate::os::Instant::now() + timeout;
         // Announce before the first look. Announcing after would open the
         // window this whole protocol exists to close: a commit that lands
         // between the look and the park would see no waiters, skip the wake,
@@ -1672,13 +1688,68 @@ impl Engine {
             if !changed.is_empty() {
                 break changed;
             }
-            let now = std::time::Instant::now();
+            let now = crate::os::Instant::now();
             if now >= deadline {
                 break Vec::new();
             }
             crate::os::futex_wait(word, expect, deadline - now);
         };
         out
+    }
+
+    /// A consistent raw image of the whole database (`crate::backup`).
+    ///
+    /// Runs under an ordinary read transaction and blocks no writer — see that
+    /// module for why the COW discipline is what makes that safe. The reader is
+    /// held open across the copy and released after, which is the entire
+    /// synchronisation.
+    pub fn backup(&self) -> Result<Vec<u8>> {
+        let txn = self.begin_read()?;
+        let out = crate::backup::write_backup(&self.shm, &txn.meta);
+        // The reader must come off the table whichever way the copy went; a
+        // leaked pin holds the freelist's reuse floor down forever.
+        txn.finish()?;
+        out
+    }
+
+    /// Write a backup into THIS database, which must be one this process just
+    /// created and has not written to.
+    ///
+    /// Deliberately not a "restore over the top": the emptiness check is what
+    /// keeps this from being a way to half-overwrite a live database. A partial
+    /// restore is indistinguishable from corruption, so the only safe shape is
+    /// onto a fresh file that can simply be deleted if it fails.
+    pub fn restore_backup(&self, bytes: &[u8]) -> Result<crate::backup::BackupInfo> {
+        // `schema_gen == 0` is the emptiness test, NOT `txn_id == 0`, and the
+        // difference was a bug found by the round-trip suite: a freshly created
+        // database has ALREADY committed once — seeding the schema is a commit
+        // — so a txn-id test refuses every legitimate target. `schema_gen`
+        // counts DDL commits since creation and is exactly zero on a file
+        // nobody has shaped.
+        //
+        // What it does not catch: a database seeded WITH tables by its config
+        // and then filled with rows only. That one has run no DDL and would be
+        // overwritten. Said plainly rather than guarded badly — the guard is
+        // against restoring onto a database someone BUILT, and the honest shape
+        // of this operation is "into a file you just created".
+        let meta = self.shm.newest_meta()?;
+        if meta.schema_gen != 0 {
+            return Err(mpedb_types::Error::Config(
+                "restore: this database has had DDL run on it. Restore into a database this \
+                 process just created — a half-restored file cannot be told from a corrupt one"
+                    .into(),
+            ));
+        }
+        // The writer lock for the whole copy. A restore writes pages OUTSIDE
+        // the commit protocol, so nothing in that protocol stops a concurrent
+        // writer from allocating into the same range; without this the two
+        // interleave and the result is neither database.
+        let _owner_dead = self.shm.writer_lock()?;
+        let out = crate::backup::apply_backup(&self.shm, bytes);
+        self.shm.writer_unlock();
+        let info = out?;
+        self.reload_schema_from_catalog()?;
+        Ok(info)
     }
 
     pub fn begin_read(&self) -> Result<ReadTxn<'_>> {
@@ -1734,7 +1805,7 @@ impl Engine {
     /// next poll into an acquire, never a hang past the deadline.
     pub fn begin_write_deadline(
         &self,
-        deadline: Option<std::time::Instant>,
+        deadline: Option<crate::os::Instant>,
     ) -> Result<WriteTxn<'_>> {
         let Some(deadline) = deadline else {
             return self.begin_write();
@@ -1764,7 +1835,7 @@ impl Engine {
                 }
                 Err(e) => return Err(e),
             }
-            let now = std::time::Instant::now();
+            let now = crate::os::Instant::now();
             if now >= deadline {
                 return Err(Error::Busy);
             }

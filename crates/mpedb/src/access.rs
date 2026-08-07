@@ -190,6 +190,11 @@ pub fn ddl_access(ddl: &DdlStmt) -> AccessReport {
     let actions = match ddl {
         DdlStmt::CreateTable(s) => vec![create(K::Table, &s.name, None)],
         DdlStmt::CreateVirtualTable(s) => vec![create(K::VirtualTable, &s.name, None)],
+        // A stored function is not a table-shaped object: it has no schema
+        // slot, no rows and no keyspace, so there is no table-level access to
+        // classify. The name is only known after the frontend has parsed the
+        // body, which this classifier does not do.
+        DdlStmt::CreateFunction { .. } | DdlStmt::DropFunction { .. } => Vec::new(),
         DdlStmt::DropTable { name, .. } => vec![drop(K::Table, name, None)],
         DdlStmt::CreateIndex { name, table, .. } => {
             vec![create(K::Index, name, Some(table))]
@@ -360,5 +365,9 @@ fn collect_access_cols(schema: &Schema, table: u32, access: &AccessPath, out: &m
         AccessPath::FullScan => {}
         // An FTS match consults the inverted index over every indexed column.
         AccessPath::FtsScan { .. } => out.extend(0..t.columns.len() as u16),
+        // A series reads no column of any table — it has no table. (The early
+        // `schema.table(table)` above already returns for the sentinel; this
+        // arm is what makes that a decision rather than an accident.)
+        AccessPath::Series { .. } => {}
     }
 }

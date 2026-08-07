@@ -74,6 +74,11 @@ fn access_key_and_indexes(a: &AccessPath) -> (KeyAccess, u64) {
         // `tables_read`, set by the caller) covers the inverted-index tree,
         // whose reserved `index_no` sits far above the 64-bit bitmap.
         AccessPath::FtsScan { .. } => (KeyAccess::Full, 1),
+        // A series reads NO keyspace — its rows are generated. The caller does
+        // not put the sentinel in `tables_read` at all, so this pair is only
+        // ever the shape the caller discards; `Full`/`1` is the conservative
+        // spelling in case that ever stops being true.
+        AccessPath::Series { .. } => (KeyAccess::Full, 1),
     }
 }
 
@@ -112,13 +117,23 @@ fn select_footprint(sp: &SelectPlan, schema: &Schema) -> Result<Footprint> {
         // rightly reject u32::MAX as out of range. The recursive-CTE working
         // table (CTE_TABLE) is likewise not a catalog table: it lives in memory
         // and reads no real page, so it sets no bit either.
+        // `generate_series` (SERIES_TABLE) is the third: its rows are
+        // GENERATED, so it reads no page, sets no bit, and conflicts with no
+        // writer — which is exactly true, and is why a series in a statement
+        // cannot make that statement conflict with anything it does not
+        // otherwise touch.
+        let sentinel = |id: u32| {
+            id == crate::plan::DUAL_TABLE
+                || id == crate::plan::CTE_TABLE
+                || id == crate::plan::SERIES_TABLE
+        };
         let mut tables_read = TableSet::new();
-        if *table != crate::plan::DUAL_TABLE && *table != crate::plan::CTE_TABLE {
+        if !sentinel(*table) {
             tables_read.insert(checked_table(*table, schema)?);
         }
         let mut key_access = key_access;
         for j in joins {
-            if j.table != crate::plan::CTE_TABLE {
+            if !sentinel(j.table) {
                 tables_read.insert(checked_table(j.table, schema)?);
             }
             let (jkey, jidx) = access_key_and_indexes(&j.access);

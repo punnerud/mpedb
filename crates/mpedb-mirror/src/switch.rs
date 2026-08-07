@@ -293,7 +293,7 @@ mod tests {
     use rusqlite::Connection;
 
     fn tmp(name: &str, ext: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir()
+        let p = mpedb_testkit::scratch_base()
             .join("mpedb-mirror-tests")
             .join(format!("{name}-{}.{ext}", std::process::id()));
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -750,7 +750,7 @@ mod tests {
     fn freeze_must_work_when_the_file_is_full() {
         use crate::import::{import_sqlite, ImportOptions};
         use rusqlite::Connection;
-        let dir = std::env::temp_dir().join("mpedb-regen-probe");
+        let dir = mpedb_testkit::scratch_base().join("mpedb-regen-probe");
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join(format!("s-{}.db", std::process::id()));
         let dest = dir.join(format!("d-{}.mpedb", std::process::id()));

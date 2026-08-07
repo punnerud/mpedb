@@ -726,3 +726,54 @@ fn a_temp_view_over_a_temp_table_reads_the_temp_table() {
     assert_eq!(mpedb_rows(&f.main, "SELECT tv.a FROM tv WHERE tv.a = 5")[0][0], Value::Int(5));
     assert_eq!(mpedb_rows(&f.main, "SELECT x.a FROM tv AS x WHERE x.a = 6")[0][0], Value::Int(6));
 }
+
+/// A connection that CLOSES without detaching must leave no ephemeral file
+/// behind. `DETACH` has always unlinked; a plain close did not, so every
+/// connection that used a TEMPORARY table left 16 MB on disk forever.
+///
+/// It is not a tidiness point. Seven passes of PostgreSQL's regress corpus left
+/// 2 513 such files in the scratch directory, and the run after that reported
+/// 656 divergences which were entirely the measurement tripping over its own
+/// litter — two files that had run clean the pass before both timed out.
+#[test]
+fn closing_a_connection_unlinks_the_temp_members_file() {
+    let dir = mpedb_testkit::scratch_base();
+    let before: Vec<_> = std::fs::read_dir(&dir)
+        .expect("scratch dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| n.to_string_lossy().starts_with("mpedb-temp-"))
+        .collect();
+
+    let path = format!(
+        "{}/temp_unlink_{}.mpedb",
+        scratch_dir(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    );
+    {
+        let db = seed_db(&path, &["CREATE TABLE base (a INTEGER PRIMARY KEY)"], &[]);
+        db.query("CREATE TEMPORARY TABLE t (a INTEGER PRIMARY KEY)", &[])
+            .expect("temp table");
+        db.query("INSERT INTO t (a) VALUES (1)", &[]).expect("insert");
+        let live: Vec<_> = std::fs::read_dir(&dir)
+            .expect("scratch dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().starts_with("mpedb-temp-"))
+            .collect();
+        assert!(
+            live.len() > before.len(),
+            "the temp member's file must exist while the connection does"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let after: Vec<_> = std::fs::read_dir(&dir)
+        .expect("scratch dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| n.to_string_lossy().starts_with("mpedb-temp-"))
+        .collect();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "closing the connection must unlink its temp member: {after:?} vs {before:?}"
+    );
+}

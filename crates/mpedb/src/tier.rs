@@ -121,6 +121,7 @@ impl Database {
                 path: dest.to_path_buf(),
                 size_bytes,
                 max_readers: 64,
+                max_tables: mpedb_types::MAX_TABLES,
                 durability,
                 concurrency: Concurrency::Serial,
                 extent_threshold: default_extent_threshold(),
@@ -132,10 +133,10 @@ impl Database {
                 // a cold tier is created here, so there is nothing to argue with.
                 foreign_keys: false,
                 foreign_keys_named: false,
-                bare_group_by_named: false,
+                dialect_named: false,
                 max_query_threads: 0,
                 require_policy: Default::default(),
-                bare_group_by: Default::default(),
+                dialect: Default::default(),
                 // A cold tier is opened by the drainer, not by an application:
                 // it has no sync role of its own.
                 sync_role: "standalone".to_string(),

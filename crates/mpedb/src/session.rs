@@ -101,7 +101,7 @@ pub(crate) fn resolve_params_timed<'a>(
     // execute was measurable on the prepare+bind SELECT hot path (~tens of ns).
     #[cfg(feature = "leakstat")]
     {
-        let t = std::time::Instant::now();
+        let t = mpedb_core::Instant::now();
         let r = resolve_params(plan, user_params, session);
         mpedb_core::engine::leakstat::add(
             &mpedb_core::engine::leakstat::EXEC_NS_RESOLVE,

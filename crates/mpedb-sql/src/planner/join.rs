@@ -165,6 +165,12 @@ pub(super) fn rewrite_right_join<'s>(
     Ok(Some(ast::SelectStmt {
         table: Some(j0.table.clone()),
         from_derived: None,
+        // The swap moves join operand 0 into the base position, so the OLD base
+        // is pushed into the join chain — where a series has no representation
+        // yet. `rewrite_right_join` refuses that combination by name before
+        // building this; dropping it here would turn the series into a
+        // FROM-less DUAL, one synthetic row, a wrong answer.
+        from_series: None,
         alias: j0.alias.clone(),
         joins,
         distinct: s.distinct,
@@ -196,7 +202,7 @@ pub(super) fn plan_join_select<'s>(
     schema: &'s Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
-    mode: BareGroupBy,
+    mode: Dialect,
     host_udfs: &HostUdfSet,
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
@@ -240,7 +246,7 @@ fn plan_join_select_inner<'s>(
     schema: &'s Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
-    mode: BareGroupBy,
+    mode: Dialect,
     host_udfs: &HostUdfSet,
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
@@ -1031,7 +1037,10 @@ fn extract_join_access(
             // costs an inner full scan; guessing costs rows that exist.
             // (design/DESIGN-WORKLOAD-INDEXES.md §5.5; the same refusal
             // `agg_index_choice` makes.)
-            if ix.predicate.is_some() {
+            // …and an EXPRESSION index for the same class of reason: its key is
+            // a computed value the join has no way to pin, and `pins[col]` with
+            // the `INDEX_EXPR_COL` sentinel is an out-of-bounds panic.
+            if ix.predicate.is_some() || ix.has_expression_part() {
                 continue;
             }
             let mut cis = Vec::new();

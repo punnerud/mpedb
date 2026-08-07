@@ -28,6 +28,13 @@ log-based engine), and the hardware published when the hardware is the answer.
 - One crate: `cargo test -p mpedb-core` (also: mpedb-types, mpedb-sql, mpedb, mpedb-cli)
 - Lint (keep clean): `cargo clippy --workspace --all-targets -- -D warnings`
 - Slow/instrumented tests are `#[ignore]`d: `cargo test -p mpedb-core -- --ignored`
+- **Point every test's scratch at a real volume**: `MPEDB_TEST_DIR=/path cargo test …`.
+  `mpedb_testkit::scratch_base` (and `mpedb_core::test_scratch`, which spells the
+  same knob because the testkit depends on the facade that depends on the core)
+  read it. Without it the suite writes to the root filesystem, and a full disk
+  does not announce itself as one: it has surfaced as a flapping measurement, as
+  two corpus files "hanging", and as `ld: signal 7 [Bus error]` asking for an
+  LLVM bug report.
 
 ## Crate map (dependency order)
 
@@ -35,7 +42,16 @@ log-based engine), and the hardware published when the hardware is the answer.
   bytes + blake3 hash, TOML Config, memcmp-ordered key encoding (`keycode`), stack-based
   expression IR with SQL 3VL (`expr`), plan Footprint/PlanHash. Everything decodable is
   bounds-checked: corrupt input must yield `Error::Corrupt`, never a panic.
-- `crates/mpedb-core` — the engine. `pagestore` (COW page discipline; in-memory TestStore
+- `crates/mpedb-core` — the engine. `backup` (RAW whole-database copy:
+  `Database::backup()` / `restore_backup()`, `mpedb backup|restore` — the
+  data pages up to the snapshot's high water, so the file is sized by the
+  DATA and not by the arena. Takes NO lock: committed pages are immutable
+  and a pinned reader holds the reuse floor, so the snapshot is frozen
+  while writers continue. The lock/reader/ring pages are NOT copied — they
+  are process state — which is why `max_readers` rides in the header and is
+  checked: it decides where the data region starts, so a mismatch would
+  place every page at the wrong id, silently), `pagestore` (COW page
+  discipline; in-memory TestStore
   for model tests), `btree` (COW B+tree, overflow chains, model-tested against BTreeMap),
   `row` (null bitmap + fixed + varlen codec), `shm` (mmap, init via flock+fallocate, meta
   double-buffer with atomics/fences, robust ERRORCHECK mutex, reader table with packed

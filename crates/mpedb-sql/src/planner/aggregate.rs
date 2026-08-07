@@ -91,7 +91,7 @@ fn lift_aggs(
     // GROUP BY strictness (COMPAT.md): `Postgres` refuses a bare column outright;
     // `Sqlite` gives it a slot in the grouped tuple's `bare` region and lets the
     // caller decide (after folding) whether it survives.
-    mode: BareGroupBy,
+    mode: Dialect,
     // Per aggregate: `(func, arg, distinct, filter)`. The last element is the
     // optional `FILTER (WHERE …)` predicate AST, kept in the dedup key so two
     // otherwise-identical aggregates with DIFFERENT filters stay separate slots.
@@ -164,14 +164,14 @@ fn lift_aggs(
             match keys.cols.iter().position(|g| *g == Some(idx)) {
                 Some(pos) => E::Col(format!("__g{pos}"), false),
                 None => match mode {
-                    BareGroupBy::Postgres => {
+                    Dialect::Postgres => {
                         return Err(bind_err(format!(
                             "column `{}` must appear in GROUP BY or be inside an aggregate \
                              — otherwise there is no single value for it in the group",
                             scope.slot_name(idx)
                         )))
                     }
-                    BareGroupBy::Sqlite => {
+                    Dialect::Sqlite => {
                         let j = match bare.iter().position(|(c, _, _)| *c == idx) {
                             Some(j) => j,
                             None => {
@@ -430,7 +430,7 @@ pub(super) fn plan_aggregate_select(
     // single min/max (witness row), or (over a single INTEGER-PK table) sqlite's
     // lowest-rowid pick — and refuses only what it cannot reproduce exactly (the
     // arbitrary case over a join or a non-rowid PK).
-    mode: BareGroupBy,
+    mode: Dialect,
     _consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
     // The cost seam (stage C): its `columnar` signal prices a full-column
@@ -1155,6 +1155,12 @@ fn agg_index_choice(
     }
     let mut best: Option<(usize, usize)> = None; // (columns, position)
     for (pos, ix) in t.indexes.iter().enumerate() {
+        // An expression index is never an access path
+        // (`IndexDef::has_expression_part`), and its ordinals carry a
+        // sentinel that panics if used to index `columns`.
+        if ix.has_expression_part() {
+            continue;
+        }
         if pos >= 63 {
             break; // beyond the footprint bitmap — never chosen
         }

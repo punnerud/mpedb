@@ -19,7 +19,7 @@
 //!   `'axb' LIKE 'a%b' ESCAPE '%'` is FALSE;
 //! - an escaped literal still folds ASCII case under the sqlite dialect.
 //!
-//! The PostgreSQL dialect (`bare_group_by = "postgres"`, `Instr::LikeCsEsc`)
+//! The PostgreSQL dialect (`dialect = "postgres"`, `Instr::LikeCsEsc`)
 //! cannot be cross-checked against sqlite — its whole point is that it does NOT
 //! fold case — so it is pinned directly, and the case-agnostic subset is
 //! asserted to agree with the sqlite-dialect database as well.

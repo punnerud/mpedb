@@ -60,10 +60,10 @@ mod tests {
 
     #[test]
     fn list_decodes_and_clear_removes_parked() {
-        let src = std::env::temp_dir()
+        let src = mpedb_testkit::scratch_base()
             .join("mpedb-mirror-tests")
             .join(format!("conf-src-{}.db", std::process::id()));
-        let mid = std::env::temp_dir()
+        let mid = mpedb_testkit::scratch_base()
             .join("mpedb-mirror-tests")
             .join(format!("conf-mid-{}.mpedb", std::process::id()));
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();

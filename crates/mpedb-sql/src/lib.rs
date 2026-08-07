@@ -21,6 +21,10 @@ mod binder;
 mod dbref;
 mod ddl;
 mod parser;
+// The PostgreSQL-only surface, addable and removable as ONE piece — see
+// `pg/mod.rs` for why it is a module rather than scattered dialect branches.
+// Only `pg::api` is public; everything else under it is compiler internals.
+pub mod pg;
 mod plan;
 mod planner;
 mod policy;
@@ -31,8 +35,10 @@ mod view;
 pub use binder::{HostUdfSet, OpSet, SpellFnSet};
 pub use planner::sequence;
 pub use dbref::{
-    inline_temp_views, rename_identifier, rename_table_in_ddl, rewrite_temp_ddl,
-    mangle as mangle_db_table, parse_attach, resolve_db_refs, AttachStmt, DbResolution, DbScope,
+    inline_temp_views, inline_temp_views_dialect, rename_identifier, rename_identifier_dialect,
+    rename_table_in_ddl, rename_table_in_ddl_dialect, rewrite_temp_ddl, rewrite_temp_ddl_dialect,
+    mangle as mangle_db_table, parse_attach, parse_attach_dialect, resolve_db_refs,
+    resolve_db_refs_dialect, AttachStmt, DbResolution, DbScope,
 };
 pub use ddl::{
     CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, CreateVirtualTableSpec,
@@ -48,7 +54,7 @@ pub use plan::{
     JoinKind, OrderOver,
     parallel_fold_shape, LimitVal, PlanOnConflict, PlanStmt, PolicyStamp, Projection, DerivedPlan, dual_def,
     RecursiveCtePlan, SelectPlan, SetOp, SortDir, SubBody, SubPlan, SubPlanKind, WinInt,
-    WindowFunc, WindowSpec, CTE_TABLE, DUAL_TABLE,
+    WindowFunc, WindowSpec, CTE_TABLE, DUAL_TABLE, SERIES_TABLE, series_def,
 };
 pub use planner::{
     magnitude, row_prune, secondary_indexes, set_mpee_enabled, CostSource, Mask, RowCountFn,
@@ -78,7 +84,13 @@ pub const STATEMENT_INSTANT_KEY: &str = "@statement_instant";
 /// DML/query text (design/DESIGN-MULTIDB.md §3.1). The facade calls this before
 /// compiling, and applies any DDL against the catalog directly.
 pub fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
-    parser::parse_ddl(sql)
+    parse_ddl_dialect(sql, Dialect::Sqlite)
+}
+
+/// [`parse_ddl`] under an explicit dialect. The facade passes the session's;
+/// the plain wrapper keeps sqlite so every existing caller is unchanged.
+pub fn parse_ddl_dialect(sql: &str, dialect: Dialect) -> Result<Option<DdlStmt>> {
+    parser::parse_ddl_dialect(sql, dialect)
 }
 
 pub use parser::TxnControl;
@@ -97,7 +109,7 @@ pub fn parse_txn_control(sql: &str) -> Option<TxnControl> {
 
 // Re-export the shared types a plan consumer needs.
 pub use mpedb_types::{
-    BareGroupBy, Collation, ColumnDef, ColumnType, DefaultExpr, Error, ExprProgram, Footprint,
+    Dialect, Collation, ColumnDef, ColumnType, DefaultExpr, Error, ExprProgram, Footprint,
     Instr, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef,
     TableKind, Tokenizer, Value, FORMAT_VERSION,
 };
@@ -126,7 +138,7 @@ pub fn prepare_with_row_counts(
         schema,
         &PolicyCatalog::empty(),
         &view::ViewCatalog::new(),
-        BareGroupBy::default(),
+        Dialect::default(),
         &HostUdfSet::default(),
         row_count,
     )?
@@ -162,7 +174,7 @@ pub fn prepare_maybe_explain_with_policies(
         schema,
         catalog,
         &view::ViewCatalog::new(),
-        BareGroupBy::default(),
+        Dialect::default(),
         &HostUdfSet::default(),
         NO_ROW_COUNTS,
     )
@@ -173,14 +185,14 @@ pub fn prepare_maybe_explain_with_policies(
 /// query naming a view is flattened onto the view's base table before planning
 /// (design/DESIGN-VIEW.md). `compat` decides whether a bare (non-aggregated,
 /// non-grouped) column is accepted (sqlite) or refused (postgres) — the facade
-/// passes the database's configured [`BareGroupBy`]; the simpler `prepare*`
-/// wrappers default to [`BareGroupBy::Sqlite`].
+/// passes the database's configured [`Dialect`]; the simpler `prepare*`
+/// wrappers default to [`Dialect::Sqlite`].
 pub fn prepare_maybe_explain_with_views(
     sql: &str,
     schema: &Schema,
     catalog: &PolicyCatalog,
     views: &ViewCatalog,
-    compat: BareGroupBy,
+    compat: Dialect,
     // Host-registered scalar UDFs visible to the compiling connection
     // (design/DESIGN-UDF.md). Empty for callers that register none — then
     // function resolution is exactly as before. Threaded alongside `compat`.
@@ -191,8 +203,13 @@ pub fn prepare_maybe_explain_with_views(
     // `myagg(DISTINCT x) FILTER (WHERE …)` is aggregate grammar, and the branch
     // has to be chosen before the argument list is read (design/DESIGN-UDF.md
     // stage 2). Host SCALARS still resolve in the binder, unchanged.
-    let (mut stmt, is_explain, n_params, ctes) =
-        parser::parse_statement_ctes(sql, host_udfs.aggs(), host_udfs.window_aggs(), &host_udfs.ops)?;
+    let (mut stmt, is_explain, n_params, ctes) = parser::parse_statement_ctes_dialect(
+        sql,
+        host_udfs.aggs(),
+        host_udfs.window_aggs(),
+        &host_udfs.ops,
+        compat,
+    )?;
     // A `WITH` CTE is a statement-scoped named view. Pass the CTE bodies to
     // `inline_views` in a SECOND catalog kept distinct from the persistent views,
     // so a `FROM cte` reference is spliced by the keep-alias machinery (`cte.col`

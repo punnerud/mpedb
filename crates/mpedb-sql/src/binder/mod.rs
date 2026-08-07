@@ -12,7 +12,7 @@
 
 use crate::ast::{self, BinOp, UnOp};
 use mpedb_types::{
-    exact_float_as_int, Affinity, BareGroupBy, CmpKind, Collation, ColumnDef, ColumnType, Error,
+    exact_float_as_int, Affinity, Dialect, CmpKind, Collation, ColumnDef, ColumnType, Error,
     ExprProgram, Instr, Result, ScalarFn, TableDef, Value,
 };
 
@@ -58,7 +58,7 @@ pub(crate) enum BExpr {
     IsDistinct(Box<BExpr>, Box<BExpr>, bool),
     /// LHS LIKE 'pattern' with a text-LITERAL pattern. The bool is
     /// `case_insensitive`: `true` under the sqlite dialect (ASCII case-folded,
-    /// the default), `false` under the PostgreSQL dialect (`bare_group_by =
+    /// the default), `false` under the PostgreSQL dialect (`dialect =
     /// "postgres"`, case-SENSITIVE). It picks the opcode at compile time —
     /// [`Instr::Like`] vs [`Instr::LikeCs`](mpedb_types::expr) — so the plan is
     /// self-describing and two dialects hash to distinct plans. The last field
@@ -345,17 +345,17 @@ pub(crate) struct Binder<'a> {
     /// answer would silently change under something already written.
     allow_instant: bool,
     /// The compat dialect (COMPAT.md). Reused as the LIKE-strictness signal
-    /// exactly as it is the GROUP BY strictness signal (#87): [`BareGroupBy::Sqlite`]
+    /// exactly as it is the GROUP BY strictness signal (#87): [`Dialect::Sqlite`]
     /// (default) compiles case-INsensitive LIKE that coerces a numeric operand to
-    /// text; [`BareGroupBy::Postgres`] compiles case-SENSITIVE LIKE
+    /// text; [`Dialect::Postgres`] compiles case-SENSITIVE LIKE
     /// ([`Instr::LikeCs`]) and refuses a numeric operand. Set by the planner from
     /// the database's configured dialect (`set_dialect`); defaults to Sqlite so
     /// CHECK/policy binders and tests keep the sqlite behavior.
-    bare_group_by: BareGroupBy,
+    dialect: Dialect,
     /// Host-registered scalar UDFs in scope (design/DESIGN-UDF.md). Set by the
     /// planner from the database's per-connection registry (`set_host_udfs`);
     /// empty for CHECK/policy binders and tests, so their function resolution is
-    /// unchanged. Survives `rescope` like `bare_group_by` — a UDF call can appear
+    /// unchanged. Survives `rescope` like `dialect` — a UDF call can appear
     /// at any nesting depth or over the grouped tuple.
     host_udfs: HostUdfSet,
 }
@@ -402,17 +402,17 @@ impl<'a> Binder<'a> {
             // and, later, policy predicates); disallowed in CHECK constraints.
             allow_context: allow_params,
             allow_instant: allow_params,
-            bare_group_by: BareGroupBy::default(),
+            dialect: Dialect::default(),
             host_udfs: HostUdfSet::default(),
         }
     }
 
     /// Select the compat dialect (COMPAT.md) that governs LIKE strictness. The
     /// planner calls this right after constructing a root binder so the database's
-    /// configured [`BareGroupBy`] reaches the LIKE binding site; `rescope`d
+    /// configured [`Dialect`] reaches the LIKE binding site; `rescope`d
     /// binders inherit it. Mirrors [`set_allow_excluded`](Self::set_allow_excluded).
-    pub fn set_dialect(&mut self, mode: BareGroupBy) {
-        self.bare_group_by = mode;
+    pub fn set_dialect(&mut self, mode: Dialect) {
+        self.dialect = mode;
     }
 
     /// Install the HOST-registered scalar UDFs in scope for this binder
@@ -482,7 +482,7 @@ impl<'a> Binder<'a> {
             allow_instant: self.allow_instant,
             // The compat dialect is a database-wide fact, so it survives a scope
             // change (a join's per-table rescopes must keep the same LIKE rules).
-            bare_group_by: self.bare_group_by,
+            dialect: self.dialect,
             // Host UDFs are a per-connection fact and likewise survive a rescope
             // (a UDF over the grouped tuple, or in a join operand, must resolve).
             host_udfs: self.host_udfs,
@@ -497,7 +497,7 @@ impl<'a> Binder<'a> {
     /// sqlite accepts" widening (truthiness, the bool/int bridge); the
     /// PostgreSQL dialect keeps mpedb's original rigid refusals.
     pub(crate) fn sqlite_dialect(&self) -> bool {
-        self.bare_group_by == BareGroupBy::Sqlite
+        self.dialect == Dialect::Sqlite
     }
 
     /// Bring `excluded.<col>` in or out of scope (ON CONFLICT DO UPDATE only).
@@ -691,7 +691,7 @@ impl<'a> Binder<'a> {
             // integer column is exactly `CAST(x AS INTEGER)` — lossless and
             // sqlite-identical. This is Django's `SET flag = (a = b)` shape.
             Some(ColumnType::Bool)
-                if col.ty == ColumnType::Int64 && self.bare_group_by == BareGroupBy::Sqlite =>
+                if col.ty == ColumnType::Int64 && self.dialect == Dialect::Sqlite =>
             {
                 fold_maybe(BExpr::Cast(Box::new(b), Affinity::Integer), self.suppress_fold)
             }
@@ -702,7 +702,7 @@ impl<'a> Binder<'a> {
             // testing it to TRUE would be a wrong answer on read-back. A clean
             // refusal is the honest outcome, and Django only ever sends 0/1.
             Some(ColumnType::Int64)
-                if col.ty == ColumnType::Bool && self.bare_group_by == BareGroupBy::Sqlite =>
+                if col.ty == ColumnType::Bool && self.dialect == Dialect::Sqlite =>
             {
                 match &b {
                     BExpr::Const(Value::Int(i @ (0 | 1))) => Ok(BExpr::Const(Value::Bool(*i == 1))),
@@ -897,7 +897,7 @@ impl<'a> Binder<'a> {
                 // coerces to text. PostgreSQL dialect: case-SENSITIVE, and a
                 // non-text operand is refused (rigid) — both keyed off the
                 // same signal, for the pattern exactly as for the subject.
-                let ci = self.bare_group_by == BareGroupBy::Sqlite;
+                let ci = self.dialect == Dialect::Sqlite;
                 let l = like_glob_operand(l, lt, "LIKE", ci)?;
                 let e = match pat.as_ref() {
                     // A text LITERAL keeps the const-pool form — every LIKE
@@ -960,7 +960,7 @@ impl<'a> Binder<'a> {
                 // GLOB is always case-SENSITIVE in both dialects; only the
                 // coercion follows the dialect (coerce under sqlite, refuse
                 // under PG), for the pattern exactly as for the subject.
-                let coerce = self.bare_group_by == BareGroupBy::Sqlite;
+                let coerce = self.dialect == Dialect::Sqlite;
                 let l = like_glob_operand(l, lt, "GLOB", coerce)?;
                 let g = match pat.as_ref() {
                     ast::Expr::Lit(Value::Text(p)) => {

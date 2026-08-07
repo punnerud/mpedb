@@ -97,6 +97,15 @@ pub(crate) fn resolve_order_collation(name: &str, host: &[String]) -> Result<mpe
     if let Some(c) = Collation::parse(name) {
         return Ok(mpedb_types::OrderColl::Native(c));
     }
+    // PostgreSQL's `default` collation, which psql attaches to every name
+    // comparison in `\d <table>`. mpedb compares text BYTEWISE and the database
+    // reports `C` for its collation everywhere else (pg_database.datcollate,
+    // information_schema.columns.collation_name), so BINARY is not an
+    // approximation of it — it IS it, under the name PostgreSQL uses when it
+    // means "whatever the database's is".
+    if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("C") {
+        return Ok(mpedb_types::OrderColl::Native(Collation::Binary));
+    }
     if let Some(h) = host.iter().find(|h| h.eq_ignore_ascii_case(name)) {
         return Ok(mpedb_types::OrderColl::Host(h.clone()));
     }
@@ -125,6 +134,11 @@ pub(crate) fn peel_order_collate<'a>(
 /// Resolve a collation NAME (as written after `COLLATE`) to a built-in, or a
 /// clean bind error naming the unsupported collation.
 pub(crate) fn resolve_collation(name: &str) -> Result<Collation> {
+    // See `resolve_order_collation`: `default` and `C` both name mpedb's
+    // bytewise ordering, which is what the catalog reports everywhere.
+    if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("C") {
+        return Ok(Collation::Binary);
+    }
     Collation::parse(name).ok_or_else(|| bind_err(format!("no such collation sequence: {name}")))
 }
 

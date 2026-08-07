@@ -30,6 +30,7 @@ how.
 - [Migrating a sqlite3 database](#migrating-a-sqlite3-database)
 - [Many processes](#many-processes)
 - [The CLI](#the-cli)
+  - [`dump` or `backup`?](#dump-or-backup)
 - [Python](#python)
 
 ---
@@ -43,6 +44,7 @@ path = "app.mpedb"
 size_mb = 64
 max_readers = 128
 durability = "wal"
+# max_tables = 4096   # LIFETIME CREATE TABLE budget — see below
 
 [[table]]
 name = "users"
@@ -130,7 +132,23 @@ Two consequences worth knowing up front:
   ```
 
   A new table takes the next free id and **nothing renumbers** — a table's id is
-  stored, not its sort position (#47), and a dropped id is never reused. Other
+  stored, not its sort position (#47), and a dropped id is never reused. That
+  last part has a consequence worth knowing before you meet it: **`max_tables`
+  (default 4096) is a LIFETIME budget, not a live one.** A dropped table keeps
+  its slot forever, so a workload that creates and drops — a staging table per
+  night, a table per tenant — spends the budget on tombstones and eventually
+  cannot create a table with almost nothing live. Two ways out, in this order:
+
+  ```sh
+  mpedb compact-ids app.mpedb              # what would it reclaim? (safe on a live DB)
+  mpedb compact-ids app.mpedb --apply      # reclaim it (needs the DB exclusive)
+  ```
+
+  Compaction renumbers to dense ids and moves every record keyed by one, in one
+  crash-atomic transaction; it drops the published-plan registry, so the next
+  `prepare` recompiles. Raising `max_tables` is the other way, and the second
+  choice on purpose: the schema record grows ~17 B per tombstone and is
+  re-encoded on every DDL. Other
   processes pick up the change on their next statement. Still a config change or
   rebuild (`mpedb mirror regenerate`): `DEFAULT`/`CHECK`/foreign keys, `ADD COLUMN`
   with `NOT NULL`/`UNIQUE`, and `DROP COLUMN`.
@@ -492,6 +510,8 @@ mpedb prepare <target> "<SQL>"          # compile + publish, print the hash
 mpedb call <target> <hash> [params…]    # execute a published plan
 mpedb proc define|call|list …           # stored procedures
 mpedb dump <file.mpedb> [--data]        # config-free schema/row dump
+mpedb backup <target> <out.mpebak>      # the whole database, verbatim
+mpedb restore <in.mpebak> <target>      # and back again
 mpedb bench <config.toml> | --auto
 mpedb mirror import|export|pull|push|sync|switch|conflicts|resolve|regenerate
 
@@ -500,6 +520,42 @@ mpedb stress|crash|collide|powerloss|mirror-collide …
 ```
 
 Run `mpedb` with no arguments for the full list.
+
+### `dump` or `backup`?
+
+Both produce "the database as a file", and they are for different things.
+
+| | `dump` | `backup` |
+|---|---|---|
+| contents | schema and rows, as SQL text | the B+trees, verbatim |
+| restores by | parsing each statement | copying pages |
+| readable elsewhere | yes — it is SQL | no |
+| indexes | rebuilt from the rows | carried |
+| size | the data, spelled out | the data, as stored |
+
+So `dump` is for reading and for moving data somewhere else; `backup` is for
+getting the same database back, quickly. On eight megabytes of blobs the raw
+copy was **3.8 ms against 18.1 ms** — and the SQL figure is before compression
+and before the parse on the way back, where a hex literal costs twice its
+bytes. (`cargo test -p mpedb --release --test backup_roundtrip -- --ignored
+raw_copy` runs that measurement.)
+
+A backup is sized by the DATA, not by the arena: a 64 MiB database holding a
+few rows backs up to a few pages. Neither form blocks a writer.
+
+```sh
+mpedb backup app.toml nightly.mpebak
+mpedb restore nightly.mpebak recovered.mpedb   # creates it, sized from the file
+```
+
+`restore` into a path that does not exist creates it, taking the reader-slot
+count and the size from the backup itself. Into a `config.toml` it uses that
+config and refuses a mismatch by name — an explicit geometry is a decision, and
+the reader table's width is what decides where the data pages live.
+
+The target must be a database nothing has been created in. A half-restored file
+cannot be told from a corrupt one, so the only safe shape is one you can delete
+and try again.
 
 `<target>` is a config file **or** a `.mpedb` directly — the file knows its own
 schema, so a mirror needs no config at all.

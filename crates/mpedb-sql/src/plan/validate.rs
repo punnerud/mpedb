@@ -462,6 +462,9 @@ impl CompiledPlan {
                 return cte_td
                     .ok_or_else(|| corrupt("CTE working table outside a recursive CTE / derived table"));
             }
+            if id == super::SERIES_TABLE {
+                return Ok(super::series_def());
+            }
             schema
                 .table(id)
                 .ok_or_else(|| corrupt(format!("table id {id} out of range")))
@@ -494,6 +497,17 @@ impl CompiledPlan {
                         return Err(corrupt("keyed access on a FROM-less select"));
                     }
                     super::dual_def()
+                } else if *table == super::SERIES_TABLE {
+                    // The series sentinel takes exactly ONE access path and no
+                    // other table takes that one. Both directions matter: a
+                    // forged plan pointing a keyed access at the sentinel would
+                    // have the executor probe a key tree that does not exist,
+                    // and a `Series` access on a REAL table would have it
+                    // synthesise rows for a table that has its own.
+                    if !matches!(access, AccessPath::Series { .. }) {
+                        return Err(corrupt("non-series access on generate_series"));
+                    }
+                    super::series_def()
                 } else if *table == super::CTE_TABLE {
                     // The recursive CTE's working table: no PK and no indexes, so
                     // the ONLY sound access over it is a FullScan (the executor
@@ -523,6 +537,12 @@ impl CompiledPlan {
                         return Err(corrupt("order-junk columns leave no output"));
                     }
                 }
+                // The reverse of the sentinel rule above: a `Series` access
+                // anywhere else would have the executor synthesise rows for a
+                // table that has its own.
+                if matches!(access, AccessPath::Series { .. }) && *table != super::SERIES_TABLE {
+                    return Err(corrupt("series access on a real table"));
+                }
                 self.check_access(access, t, None, ptypes)?;
                 // With a join the "base row" IS the joined row, so every width
                 // below moves. Getting this wrong is not cosmetic: a program
@@ -550,6 +570,13 @@ impl CompiledPlan {
                     // the same reason as in the outer position — no key tree.
                     if j.table == super::CTE_TABLE && !matches!(j.access, AccessPath::FullScan) {
                         return Err(corrupt("keyed access on a recursive CTE working table"));
+                    }
+                    if (j.table == super::SERIES_TABLE)
+                        != matches!(j.access, AccessPath::Series { .. })
+                    {
+                        return Err(corrupt(
+                            "generate_series takes only a series access, and only it takes one",
+                        ));
                     }
                     // FULL needs the inner side enumerated and held: single
                     // join, FullScan access — the executor's unmatched-inner
@@ -1213,6 +1240,10 @@ impl CompiledPlan {
                 // An FtsScan carries a literal query tree, no key parts, so it
                 // can never read a correlated subplan slot.
                 AccessPath::FtsScan { .. } => Ok(()),
+                AccessPath::Series { start, stop, step } => [Some(start), Some(stop), step.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .try_for_each(&mut check),
             }
         };
         key_parts_ok(&sp.access)?;
@@ -1697,6 +1728,37 @@ impl CompiledPlan {
                         return Err(corrupt("IndexRange bound must have exactly one part"));
                     }
                     self.check_key_part(&bound.parts[0], ty, outer, ptypes)?;
+                }
+                Ok(())
+            }
+            AccessPath::Series { start, stop, step } => {
+                // The three bounds are int64 — the column type `series_def`
+                // declares, and the type the executor counts in. A `Const` that
+                // is a string or a `Param` typed text is refused here rather
+                // than coerced at run time: a series whose bound has to be cast
+                // is a series whose row COUNT depends on the cast, and that is
+                // not a decision to make below the validator.
+                //
+                // NOT `check_key_part` for a constant, and that difference is
+                // load-bearing: that one refuses a NULL, because a NULL can
+                // never match a KEY. A NULL series BOUND is legal — it is the
+                // empty series, PostgreSQL's answer for `generate_series(1,
+                // NULL)`. Routed through the key-part rule, such a plan
+                // COMPILED and then failed to decode, so it worked in the
+                // process that planned it and was corrupt to every other one.
+                for p in [Some(start), Some(stop), step.as_ref()].into_iter().flatten() {
+                    match p {
+                        KeyPart::Const(i) => {
+                            let v = self
+                                .consts
+                                .get(*i as usize)
+                                .ok_or_else(|| corrupt("series const out of range"))?;
+                            if !v.is_null() && !v.fits(ColumnType::Int64) {
+                                return Err(corrupt("series bound const is not an integer"));
+                            }
+                        }
+                        other => self.check_key_part(other, ColumnType::Int64, outer, ptypes)?,
+                    }
                 }
                 Ok(())
             }

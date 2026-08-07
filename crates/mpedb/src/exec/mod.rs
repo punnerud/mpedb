@@ -304,6 +304,12 @@ fn table_def<'a>(
     // recursive CTE. Nested Derived compound arms (format 58) install theirs
     // via [`with_working_table_def`] for the outer scan; top-level
     // PlanStmt::Derived / RecursiveCte carry theirs on the statement node.
+    // `FROM generate_series(…)`: one column, generated. The def is static —
+    // unlike the CTE working table, a series' shape does not depend on which
+    // statement is running.
+    if table == mpedb_sql::SERIES_TABLE {
+        return Ok(Cow::Borrowed(mpedb_sql::series_def()));
+    }
     if table == mpedb_sql::CTE_TABLE {
         if let Some(def) = ACTIVE_WORKING_TABLE.with(|c| c.borrow().clone()) {
             return Ok(Cow::Owned(def));

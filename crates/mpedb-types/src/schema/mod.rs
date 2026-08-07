@@ -368,6 +368,28 @@ pub struct IndexDef {
 /// the sentinel cannot collide with a real ordinal.
 pub const INDEX_EXPR_COL: u16 = u16::MAX;
 
+impl IndexDef {
+    /// Does any key part of this index compute a value rather than read a
+    /// column?
+    ///
+    /// Such an index is **never an access path**: its key holds a computed
+    /// value, and matching a query's expression against a stored one is a
+    /// problem this planner does not solve. `secondary_indexes` has said so
+    /// since v13 — but the planner also enumerates `table.indexes` DIRECTLY in
+    /// six places, and each of those indexed `table.columns` with
+    /// [`INDEX_EXPR_COL`] and PANICKED.
+    ///
+    /// Found by the PostgreSQL regress differential, which is full of
+    /// expression indexes; the sqlite corpus has none, so nothing had ever
+    /// reached those lines with the sentinel. Both spellings are checked —
+    /// a non-empty `exprs` and the ordinal sentinel — because a schema decoded
+    /// from bytes is untrusted and may carry one without the other.
+    pub fn has_expression_part(&self) -> bool {
+        !self.exprs.iter().all(Option::is_none)
+            || self.columns.contains(&INDEX_EXPR_COL)
+    }
+}
+
 /// Distinguishes an ordinary table from a full-text-search virtual table
 /// (`CREATE VIRTUAL TABLE … USING fts5(…)`, design/DESIGN-FTS.md §1). An FTS
 /// table is stored like any table — an auto `rowid` INTEGER PK plus its declared
@@ -564,7 +586,17 @@ impl TableDef {
     fn renumber_columns(&mut self, shift: impl Fn(&mut u16)) {
         self.primary_key.iter_mut().for_each(&shift);
         for ix in &mut self.indexes {
-            ix.columns.iter_mut().for_each(&shift);
+            // [`INDEX_EXPR_COL`] is NOT an ordinal — it marks a key part that is
+            // an expression, so there is no column position for it to move to.
+            // Shifting it was an arithmetic overflow on `u16::MAX + 1`, i.e. a
+            // PANIC on any ALTER TABLE ADD COLUMN against a table carrying an
+            // expression index. Skipping it is the only meaning the sentinel
+            // has: it stays exactly what it was.
+            for c in ix.columns.iter_mut() {
+                if *c != INDEX_EXPR_COL {
+                    shift(c);
+                }
+            }
         }
         for fk in &mut self.foreign_keys {
             fk.columns.iter_mut().for_each(&shift);

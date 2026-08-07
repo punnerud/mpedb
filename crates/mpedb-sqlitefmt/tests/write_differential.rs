@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn scratch(name: &str, img: &[u8]) -> PathBuf {
-    let p = std::env::temp_dir()
+    let p = mpedb_testkit::scratch_base()
         .join("mpedb-sqlitefmt-tests")
         .join(format!("{name}-{}.db", std::process::id()));
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();

@@ -5,6 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "mpedb SQL front-end: parser, binder, planner, content-hashed plans"
 
+[features]
+# Compile in the PostgreSQL-only SQL surface (`src/pg/`): `::` casts, dollar
+# quoting, ILIKE, the regex operators, pg_catalog/information_schema, the PG
+# function set and type names.
+#
+# OFF by default, and the default build is byte-identical to what it was before
+# the feature existed. It gates only what is COMPILED; it must never change the
+# plan format, the row format or the schema's canonical bytes — a file written
+# by one build has to stay readable by the other. `Dialect::Postgres` exists in
+# both; without this feature, selecting it is a named refusal.
+pg-dialect = []
+
 [dependencies]
 mpedb-types = { workspace = true }
 blake3 = { workspace = true }

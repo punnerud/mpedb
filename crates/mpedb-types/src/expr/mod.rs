@@ -85,7 +85,7 @@ pub enum Instr {
     /// SQL LIKE with pattern from the const pool (supports % and _).
     Like(u16),
     /// Case-SENSITIVE LIKE (PostgreSQL dialect); otherwise identical to
-    /// [`Instr::Like`]. Emitted for a `bare_group_by = "postgres"` database,
+    /// [`Instr::Like`]. Emitted for a `dialect = "postgres"` database,
     /// where `'a' LIKE 'A'` is FALSE. See [`like_match_cs`](ops::like_match_cs).
     LikeCs(u16),
     /// `x LIKE <pattern> ESCAPE <c>` — like [`Instr::Like`], with a SECOND

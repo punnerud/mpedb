@@ -42,7 +42,12 @@ pub fn agg_servable_by_index(
     };
     let Some(arg) = &call.arg else {
         // count(*): counts NULL rows too, so the tree must omit nothing.
-        return f == F::Count && !ix.columns.is_empty() && ix.columns.iter().all(|&c| not_null(c));
+        return f == F::Count
+            && !ix.columns.is_empty()
+            // An expression key part has no column whose NOT NULL could make the
+            // count exact, and its ordinal panics `not_null`.
+            && !ix.has_expression_part()
+            && ix.columns.iter().all(|&c| not_null(c));
     };
     // The argument must be the bare leading index column…
     let lead = match ix.columns.first() {

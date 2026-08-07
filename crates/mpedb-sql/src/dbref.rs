@@ -39,7 +39,7 @@
 //!   name, so it asks for aliases instead of risking a wrong answer).
 
 use crate::token::{self, Kw, SpTok, Tok};
-use mpedb_types::{Error, Result};
+use mpedb_types::{Dialect, Error, Result};
 use std::collections::HashSet;
 
 /// The name scope a statement resolves against: main's table/view names and
@@ -110,6 +110,11 @@ pub enum AttachStmt {
 /// parameters, probe P18); v1 accepts a string literal only and refuses the
 /// rest by name.
 pub fn parse_attach(sql: &str) -> Result<Option<AttachStmt>> {
+    parse_attach_dialect(sql, Dialect::Sqlite)
+}
+
+/// [`parse_attach`] under an explicit dialect.
+pub fn parse_attach_dialect(sql: &str, dialect: Dialect) -> Result<Option<AttachStmt>> {
     let head_is = |word: &str| {
         sql.trim_start()
             .get(..word.len())
@@ -118,7 +123,7 @@ pub fn parse_attach(sql: &str) -> Result<Option<AttachStmt>> {
     if !head_is("ATTACH") && !head_is("DETACH") {
         return Ok(None);
     }
-    let toks = token::tokenize(sql)?;
+    let toks = token::tokenize_dialect(sql, dialect)?;
     let mut toks = toks.as_slice();
     // Strip one trailing semicolon (the tokenizer keeps it).
     if let [rest @ .., last] = toks {
@@ -318,7 +323,17 @@ struct Edit {
 /// it against what it had before accepting it; see
 /// `Schema::with_renamed_column`'s contract. Do not use it without that check.
 pub fn rename_identifier(sql: &str, old: &str, new: &str) -> Result<String> {
-    let toks = token::tokenize(sql)?;
+    rename_identifier_dialect(sql, old, new, Dialect::Sqlite)
+}
+
+/// [`rename_identifier`] under an explicit dialect.
+pub fn rename_identifier_dialect(
+    sql: &str,
+    old: &str,
+    new: &str,
+    dialect: Dialect,
+) -> Result<String> {
+    let toks = token::tokenize_dialect(sql, dialect)?;
     let mut out = String::with_capacity(sql.len() + 8);
     let mut cut = 0usize;
     for t in &toks {
@@ -360,7 +375,17 @@ pub fn rename_identifier(sql: &str, old: &str, new: &str) -> Result<String> {
 /// a table and one of its columns may share a name, and only the header is
 /// being retargeted here.
 pub fn rename_table_in_ddl(sql: &str, old: &str, new: &str) -> Result<Option<String>> {
-    let toks = token::tokenize(sql)?;
+    rename_table_in_ddl_dialect(sql, old, new, Dialect::Sqlite)
+}
+
+/// [`rename_table_in_ddl`] under an explicit dialect.
+pub fn rename_table_in_ddl_dialect(
+    sql: &str,
+    old: &str,
+    new: &str,
+    dialect: Dialect,
+) -> Result<Option<String>> {
+    let toks = token::tokenize_dialect(sql, dialect)?;
     // Match a structural word against the SOURCE SPAN, not against `Tok::Ident`.
     // Several of the words this walks are RESERVED — `ON` is `Kw::On` — and an
     // `is_word` check silently never matches those, so the whole `CREATE INDEX`
@@ -436,7 +461,16 @@ pub fn rename_table_in_ddl(sql: &str, old: &str, new: &str) -> Result<Option<Str
 /// [`resolve_db_refs`] all see a statement they already handle, and nothing
 /// downstream grows a notion of temp-ness.
 pub fn rewrite_temp_ddl(sql: &str) -> Result<Option<String>> {
-    let toks = token::tokenize(sql)?;
+    rewrite_temp_ddl_dialect(sql, Dialect::Sqlite)
+}
+
+/// [`rewrite_temp_ddl`] under an explicit dialect.
+///
+/// This is the one that matters most: `CREATE TEMPORARY TABLE` opens 76 of the
+/// 222 PostgreSQL regress files, and a session that cannot rewrite it fails
+/// every later statement in the file with "no such table".
+pub fn rewrite_temp_ddl_dialect(sql: &str, dialect: Dialect) -> Result<Option<String>> {
+    let toks = token::tokenize_dialect(sql, dialect)?;
     let at = |i: usize, w: &str| toks.get(i).is_some_and(|t| is_word(&t.tok, w));
     if !at(0, "CREATE") {
         return Ok(None);
@@ -488,6 +522,15 @@ pub fn inline_temp_views(
     sql: &str,
     views: &std::collections::HashMap<String, String>,
 ) -> Result<Option<String>> {
+    inline_temp_views_dialect(sql, views, Dialect::Sqlite)
+}
+
+/// [`inline_temp_views`] under an explicit dialect.
+pub fn inline_temp_views_dialect(
+    sql: &str,
+    views: &std::collections::HashMap<String, String>,
+    dialect: Dialect,
+) -> Result<Option<String>> {
     const MAX_ROUNDS: usize = 8;
     if views.is_empty() {
         return Ok(None);
@@ -495,7 +538,7 @@ pub fn inline_temp_views(
     let mut cur = sql.to_string();
     let mut changed = false;
     for _ in 0..MAX_ROUNDS {
-        let toks = token::tokenize(&cur)?;
+        let toks = token::tokenize_dialect(&cur, dialect)?;
         if toks.is_empty() {
             break;
         }
@@ -542,7 +585,16 @@ pub fn inline_temp_views(
 /// Resolve every table reference in `sql` against `scope` and rewrite
 /// (see the module docs for the full contract).
 pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
-    let toks = token::tokenize(sql)?;
+    resolve_db_refs_dialect(sql, scope, Dialect::Sqlite)
+}
+
+/// [`resolve_db_refs`] under an explicit dialect.
+pub fn resolve_db_refs_dialect(
+    sql: &str,
+    scope: &DbScope,
+    dialect: Dialect,
+) -> Result<DbResolution> {
+    let toks = token::tokenize_dialect(sql, dialect)?;
     if toks.is_empty() {
         return Ok(DbResolution::MainOnly(sql.to_string()));
     }

@@ -74,7 +74,7 @@ fn memory_backing_file() -> Result<File> {
         // across processes, the timestamp covers a recycled pid racing a
         // crash-orphaned name in the unlink window below.
         static MEM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir();
+        let dir = crate::test_scratch();
         let path = dir.join(format!(
             "mpedb-mem-{}-{}-{}",
             crate::os::process_id(),
@@ -4172,7 +4172,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("mpedb-shm-tests");
+        let dir = crate::test_scratch().join("mpedb-shm-tests");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(format!("{}-{}", name, std::process::id()))
     }

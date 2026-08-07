@@ -41,6 +41,11 @@ pub const FN_BUDGET: Budget = Budget { instrs: 250_000, db_calls: 0, rows: 0 };
 pub enum SpellLang {
     Python,
     Rust,
+    /// PostgreSQL's procedural language, for MIGRATION: the unit is a whole
+    /// `CREATE FUNCTION … LANGUAGE plpgsql` statement, which is what `pg_dump`
+    /// writes. Its frontend refuses every SQL-bearing form by name, so the
+    /// no-SQL rule below is one a plpgsql body cannot reach.
+    PlPgSql,
 }
 
 /// One stored function, as `list_functions` reports it.
@@ -110,39 +115,62 @@ pub(crate) fn call_spell_fn(proc: &Proc, args: &[Value]) -> Result<Value> {
     }
 }
 
+/// Everything a stored function needs written, computed WITHOUT a transaction.
+pub(crate) struct FuncRecords {
+    pub name: String,
+    pub hash: String,
+    pub blob_key: Vec<u8>,
+    pub blob: Vec<u8>,
+    pub name_key: Vec<u8>,
+    pub record: Vec<u8>,
+}
+
+/// Compile a stored function to the exact two sys records that define it.
+///
+/// Split out of [`crate::Database::create_function`] because there are TWO
+/// writers: that one, which takes the writer lock itself, and the in-session
+/// `CREATE FUNCTION` DDL, which is already inside a write transaction and would
+/// SELF-DEADLOCK taking it again. Both must produce byte-identical records —
+/// a `pg_dump` replayed as SQL and the same file handed to `mpedb fn define`
+/// have to yield the same content hash, or the two paths silently store
+/// different functions under one name.
+pub(crate) fn compile_function_records(lang: SpellLang, source: &str) -> Result<FuncRecords> {
+    let skeleton = match lang {
+        SpellLang::Python => mpedb_spell::py::compile(source)?,
+        SpellLang::Rust => mpedb_spell::rs::compile(source)?,
+        SpellLang::PlPgSql => mpedb_spell::plpgsql::compile(source)?,
+    };
+    if !skeleton.calls.is_empty() {
+        return Err(Error::Unsupported(
+            "a stored SQL function cannot run SQL — use a stored procedure \
+             (`mpedb proc define`) for database work"
+                .into(),
+        ));
+    }
+    let proc = Proc::new(
+        skeleton.name.clone(),
+        skeleton.argc,
+        skeleton.nlocals,
+        Vec::new(),
+        skeleton.consts,
+        skeleton.instrs,
+    )?;
+    let blob = proc.encode();
+    let hash = proc.hash();
+    let name = skeleton.name;
+    let record = encode_func_record(&hash.0, proc.argc);
+    let blob_key = crate::sys_record_subkey(NS_FUNC_HASH, &hash.0)?;
+    let name_key = crate::sys_record_subkey(NS_FUNC, name.as_bytes())?;
+    Ok(FuncRecords { name, hash: hash.to_string(), blob_key, blob, name_key, record })
+}
+
 impl crate::Database {
     /// Define (or redefine) a stored SQL function from source. The function's
     /// NAME and ARITY come from the definition itself (`def double(x):` is
     /// `double/1`) — there is nothing to keep in sync. Returns (name, hash).
     pub fn create_function(&self, lang: SpellLang, source: &str) -> Result<(String, String)> {
-        let skeleton = match lang {
-            SpellLang::Python => mpedb_spell::py::compile(source)?,
-            SpellLang::Rust => mpedb_spell::rs::compile(source)?,
-        };
-        if !skeleton.calls.is_empty() {
-            return Err(Error::Unsupported(
-                "a stored SQL function cannot run SQL — use a stored procedure \
-                 (`mpedb proc define`) for database work"
-                    .into(),
-            ));
-        }
-        let proc = Proc::new(
-            skeleton.name.clone(),
-            skeleton.argc,
-            skeleton.nlocals,
-            Vec::new(),
-            skeleton.consts,
-            skeleton.instrs,
-        )?;
-        let blob = proc.encode();
-        let hash = proc.hash();
-        let name = skeleton.name;
-
-        // One commit: blob + name binding + generation bump land together —
-        // the view-DDL shape (`apply_create_view`), applied to functions.
-        let record = encode_func_record(&hash.0, proc.argc);
-        let blob_key = crate::sys_record_subkey(NS_FUNC_HASH, &hash.0)?;
-        let name_key = crate::sys_record_subkey(NS_FUNC, name.as_bytes())?;
+        let FuncRecords { name, hash, blob_key, blob, name_key, record } =
+            compile_function_records(lang, source)?;
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         let res = (|| {
             w.sys_put(&blob_key, &blob)?;
@@ -161,7 +189,7 @@ impl crate::Database {
         // schema bundle so the gen gate sees the bump immediately.
         self.cache.write().expect(crate::POISON).clear();
         let _ = self.engine.reload_schema_from_catalog();
-        Ok((name, hash.to_string()))
+        Ok((name, hash))
     }
 
     /// Remove a stored function's NAME binding. The content-addressed blob

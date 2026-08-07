@@ -485,7 +485,7 @@ impl<'a> Binder<'a> {
         rt: Ty,
     ) -> Result<(BExpr, Ty, BExpr, Ty)> {
         use ColumnType::{Bool, Int64};
-        if self.bare_group_by != BareGroupBy::Sqlite {
+        if self.dialect != Dialect::Sqlite {
             return Ok((l, lt, r, rt)); // PostgreSQL: `flag = 1` stays an error
         }
         // Fold a 0/1 int literal into the bool domain.

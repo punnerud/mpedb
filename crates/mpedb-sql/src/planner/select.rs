@@ -321,13 +321,84 @@ fn expand_implicit_rowid_star(s: &ast::SelectStmt, table: &TableDef) -> ast::Sel
     ast::SelectStmt { items: Some(items), ..s.clone() }
 }
 
+/// `FROM generate_series(start, stop[, step])` → the access path that generates
+/// its rows.
+///
+/// The bounds bind in a scope with NO columns — the series column cannot appear
+/// in its own bounds, and no other table is in scope in the first FROM position
+/// — so each must fold to a constant or be a bare parameter. Anything else is a
+/// named refusal rather than a silent fallback: `AccessPath::Series` carries
+/// `KeyPart`s, and the reason is written on the variant.
+fn series_access(
+    a: &ast::SeriesArgs,
+    n_params: u16,
+    mode: Dialect,
+    host_udfs: &HostUdfSet,
+    consts: &mut Vec<Value>,
+) -> Result<AccessPath> {
+    let mut binder = Binder::new(crate::plan::dual_def(), n_params, true);
+    binder.set_dialect(mode);
+    binder.set_host_udfs(host_udfs);
+    let mut part = |e: &ast::Expr, which: &str| -> Result<KeyPart> {
+        // Refused on the AST, BEFORE binding, and that ordering is four
+        // measured wrong answers.
+        //
+        // PostgreSQL's `generate_series('nan'::numeric, 100, 10)` is an error —
+        // it has a numeric series and NaN is not a legal bound for it. mpedb
+        // has no NaN-carrying numeric, so `'nan'::numeric` takes sqlite's CAST
+        // rule and folds to the INTEGER 0, at which point the series is
+        // indistinguishable from a written `generate_series(0, 100, 10)` and
+        // ANSWERS where PostgreSQL refuses. `'inf'` the same. Neither the
+        // folded VALUE nor its type can see it after the fact — both say
+        // `Int(0)` — so the cast has to be caught while it is still written
+        // down.
+        //
+        // This also refuses `generate_series(1::numeric, 3::numeric)`, which
+        // PostgreSQL accepts. That is the intended trade: mpedb has no numeric
+        // or timestamp series, and a refusal is its contract where an invented
+        // answer is not.
+        if let ast::Expr::Cast(_, ty) = e {
+            let t = mpedb_types::ColumnType::declared(ty).0;
+            if t != mpedb_types::ColumnType::Int64 {
+                return Err(bind_err(format!(
+                    "generate_series's {which} argument casts to `{ty}` — mpedb has only an \
+                     INTEGER series, and it will not count from whatever that cast happens \
+                     to fold to (PostgreSQL's numeric and timestamp series are separate \
+                     functions, with their own out-of-range errors)"
+                )));
+            }
+        }
+        let (b, _ty) = binder.bind_expr(e)?;
+        // NOT `atoms::as_atom`: that one rejects a NULL constant, because a
+        // NULL can never match a KEY. A NULL SERIES BOUND is different — it is
+        // the empty series, which is what PostgreSQL returns and what
+        // `series_rows` implements. Refusing it here would make that branch
+        // unreachable and turn a legal query into an error.
+        if let BExpr::Const(v) = &b {
+            return Ok(KeyPart::Const(push_plan_const(consts, v.clone())?));
+        }
+        match atoms::as_atom(&b) {
+            Some(at) => at.to_key_part(consts),
+            None => Err(bind_err(format!(
+                "generate_series's {which} argument must be a constant or a parameter — \
+                 mpedb resolves a series once, before any row exists, so it cannot \
+                 read a column or call a function that depends on one"
+            ))),
+        }
+    };
+    let start = part(&a.start, "first")?;
+    let stop = part(&a.stop, "second")?;
+    let step = a.step.as_ref().map(|e| part(e, "third")).transpose()?;
+    Ok(AccessPath::Series { start, stop, step })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_select<'s>(
     s: &ast::SelectStmt,
     schema: &'s Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
-    mode: BareGroupBy,
+    mode: Dialect,
     host_udfs: &HostUdfSet,
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
@@ -418,13 +489,37 @@ pub(super) fn plan_select<'s>(
     let eff_params = n_params + subplans.len() as u16;
     let correlated: Vec<bool> = subplans.iter().map(|p| !p.outer_args.is_empty()).collect();
 
-    let (table_id, table) = match &s.table {
-        Some(name) => resolve_table_cte(schema, cte, name)?,
+    // `FROM generate_series(…)` resolves to the SERIES sentinel and its
+    // one-column def. Read before `s.table`, which the parser leaves `None`
+    // whenever this is `Some` — the two are mutually exclusive at parse time.
+    let series_access = s
+        .from_series
+        .as_deref()
+        .map(|a| series_access(a, n_params, mode, host_udfs, consts))
+        .transpose()?;
+    // PostgreSQL names the output column after the alias — `AS g` gives a
+    // column `g`, `AS g(n)` gives `n`, and no alias gives `generate_series`.
+    // The name is the result HEADER, so this is a wrong answer if it drifts,
+    // not a missing feature; the def is built per statement for that reason.
+    let series_td;
+    let (table_id, table) = match (&series_access, &s.table) {
+        (Some(_), _) => {
+            let a = s.from_series.as_deref().expect("series access implies from_series");
+            let col = a
+                .columns
+                .first()
+                .or(s.alias.as_ref())
+                .map_or("generate_series", |x| x.as_str());
+            let tbl = s.alias.as_deref().unwrap_or("generate_series");
+            series_td = crate::plan::series_def_named(tbl, col);
+            (crate::plan::SERIES_TABLE, &series_td)
+        }
+        (None, Some(name)) => resolve_table_cte(schema, cte, name)?,
         // FROM-less: the DUAL sentinel and a zero-column def. The whole plain
         // pipeline below works over width 0 — access degrades to FullScan
         // (no columns can pin a key), the executor yields ONE empty row, and
         // ORDER BY by name errors exactly as sqlite's "no such column".
-        None => {
+        (None, None) => {
             if s.items.is_none() {
                 return Err(bind_err("SELECT * without a FROM clause — no tables specified"));
             }
@@ -442,6 +537,22 @@ pub(super) fn plan_select<'s>(
     // ORDER-BY ordinal bound, DISTINCT) needs no special-casing — the same trick
     // the USING-star and RIGHT-JOIN rewrites already use. Explicit-PK tables keep
     // the `None` fast path unchanged.
+    // `SELECT *` over a series whose column was RENAMED: rewrite to an explicit
+    // aliased item. A bare `Projection::Column(0)` takes its output name from
+    // the def the EXECUTOR resolves, which is the static one — so the rows
+    // would be right and the header wrong. The alias makes the name travel in
+    // the projection, where it cannot drift.
+    let series_star;
+    let s = if s.items.is_none() && table_id == crate::plan::SERIES_TABLE {
+        let col = table.columns[0].name.clone();
+        series_star = ast::SelectStmt {
+            items: Some(vec![(ast::Expr::Col(col.clone(), false), Some(col))]),
+            ..s.clone()
+        };
+        &series_star
+    } else {
+        s
+    };
     let rowid_star;
     let s = if s.items.is_none() && table.implicit_rowid {
         rowid_star = expand_implicit_rowid_star(s, table);
@@ -510,7 +621,7 @@ pub(super) fn plan_select<'s>(
     // still becomes a Point/Range access and footprints only narrow (§3.3).
     // A FROM-less statement reads no table, so there is no table whose policy
     // could apply — and `table_id` is the DUAL sentinel, not a catalog key.
-    let policy = if s.table.is_some() {
+    let policy = if s.table.is_some() && series_access.is_none() {
         read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Select)?
     } else {
         None
@@ -529,6 +640,10 @@ pub(super) fn plan_select<'s>(
         // row set) — never run access extraction over it (its empty PK would
         // vacuously satisfy a PkPoint, exactly the dual hazard). The whole
         // predicate stays as the residual filter.
+        // A series generates its rows from the access path itself; there is no
+        // keyspace to extract a probe from, so the whole predicate stays as the
+        // residual filter — the same shape as the CTE working table below.
+        None if let Some(a) = series_access.clone() => (a, merge_and(bound_where, policy)),
         None if table_id == CTE_TABLE => (AccessPath::FullScan, merge_and(bound_where, policy)),
         None if s.table.is_some() => extract_access(merge_and(bound_where, policy), table, consts)?,
         None => (AccessPath::FullScan, merge_and(bound_where, policy)),
@@ -774,6 +889,25 @@ pub(super) fn plan_select<'s>(
         order_by.clear();
     }
 
+    // A bare `Projection::Column(i)` takes its output name from the def the
+    // EXECUTOR resolves, and for the series sentinel that is the STATIC one.
+    // So whenever the column was renamed by an alias, the name has to travel in
+    // the projection instead. Applied here, after every projection is built, so
+    // `SELECT *`, `SELECT g` and `SELECT g.n` are all covered by one rule
+    // rather than three rewrites that could disagree.
+    if table_id == crate::plan::SERIES_TABLE {
+        let col = &table.columns[0].name;
+        if col != "generate_series" {
+            for p in &mut projection {
+                if matches!(p, Projection::Column(0)) {
+                    *p = Projection::Expr {
+                        name: col.clone(),
+                        program: compile_program(&BExpr::Col(0))?,
+                    };
+                }
+            }
+        }
+    }
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Select(SelectPlan {

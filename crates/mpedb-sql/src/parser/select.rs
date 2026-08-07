@@ -11,10 +11,26 @@
 use super::{
     ParamStyle, Parser, MAX_COMPOUND_ARMS, MAX_FROM_TABLES, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS,
 };
-use crate::ast::{CompoundStmt, Expr, JoinClause, JoinKind, SelectStmt, Stmt};
+use crate::ast::{CompoundStmt, Expr, JoinClause, JoinKind, SelectStmt, SeriesArgs, Stmt};
 use crate::plan::{LimitVal, SetOp, SortDir};
 use crate::token::{Kw, Tok};
 use mpedb_types::{ident_eq, Error, Result, Value};
+
+/// `AT TIME ZONE` — refused, not aliased, and not silently accepted.
+///
+/// It CONVERTS between a wall-clock timestamp and an absolute one, using a
+/// named zone's rules including its history of transitions. mpedb's
+/// `Timestamp` is microseconds since the epoch in UTC — one point on the line,
+/// with no zone attached — so there is nothing for the operator to convert
+/// between, and no zone database to convert with.
+///
+/// Accepting it as a no-op would be the worse answer: the rows would come back
+/// looking converted and be unchanged.
+const AT_TIME_ZONE: &str = "`AT TIME ZONE` converts between a wall-clock \
+     timestamp and an absolute one, using a named zone's transition history. \
+     mpedb's TIMESTAMP is microseconds since the epoch in UTC — one point on \
+     the line, with no zone attached — so there is nothing to convert between \
+     and no zone database to convert with";
 
 /// Re-spell a bare ORDER BY key to the SELECT-item alias it names, when the two
 /// differ only in ASCII case.
@@ -68,6 +84,7 @@ fn from_less_select(items: Vec<(Expr, Option<String>)>) -> SelectStmt {
     SelectStmt {
         table: None,
         from_derived: None,
+        from_series: None,
         alias: None,
         joins: Vec::new(),
         distinct: false,
@@ -83,6 +100,63 @@ fn from_less_select(items: Vec<(Expr, Option<String>)>) -> SelectStmt {
 }
 
 impl<'a> Parser<'a> {
+    /// The named refusal for a table function in `FROM`.
+    ///
+    /// `generate_series` gets the exact rewrite that works, because it is the
+    /// one whose semantics mpedb can already express — 578 of the corpus's
+    /// 1 823 FROM-position calls are it, and the rest need either a stored
+    /// procedural language or an array/JSON type mpedb does not have.
+    /// `generate_series( start , stop [, step] )` — the parens and the two or
+    /// three arguments. The cursor sits on the `(`.
+    ///
+    /// Arity is checked HERE rather than at bind time so the message names the
+    /// function: PostgreSQL has `generate_series` over timestamps too, and a
+    /// four-argument call is that overload, not a typo.
+    fn series_args(&mut self) -> Result<SeriesArgs> {
+        self.expect(&Tok::LParen, "`(` after generate_series")?;
+        let start = self.expr()?;
+        self.expect(&Tok::Comma, "`,` between generate_series arguments")?;
+        let stop = self.expr()?;
+        let step = if self.eat(&Tok::Comma) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        if self.peek() == Some(&Tok::Comma) {
+            return Err(self.err_here(
+                "generate_series takes 2 or 3 arguments — the 4-argument form is \
+                 PostgreSQL's timestamp overload, which mpedb does not have",
+            ));
+        }
+        self.expect(&Tok::RParen, "`)` to close generate_series")?;
+        Ok(SeriesArgs { start, stop, step, columns: Vec::new() })
+    }
+
+    fn table_function_refusal(&self, name: &str) -> Error {
+        let lower = name.to_ascii_lowercase();
+        let hint = match lower.as_str() {
+            "generate_series" => {
+                " — mpedb generates it in the FIRST `FROM` position only \
+                 (`FROM generate_series(1, 10)`); here, write it as \
+                 `WITH RECURSIVE s(i) AS (SELECT <start> UNION ALL \
+                 SELECT i+<step> FROM s WHERE i < <stop>)` and select from `s`"
+            }
+            "unnest" | "json_populate_record" | "jsonb_populate_record"
+            | "json_to_record" | "jsonb_to_record" | "string_to_table" => {
+                " — it produces rows from an array or JSON value, and mpedb has \
+                 neither a storable array type nor a JSON row expander"
+            }
+            _ => "",
+        };
+        Error::Parse {
+            pos: self.here(),
+            msg: format!(
+                "`{name}(…)` is a table function in FROM position, and mpedb has no \
+                 table-function planner{hint}"
+            ),
+        }
+    }
+
     /// Standalone `VALUES (a, b), (c, d), …` — a top-level row-returning
     /// statement (sqlite). Desugared HERE, at parse time, into the equivalent
     /// compound `SELECT a, b UNION ALL SELECT c, d UNION ALL …` of FROM-less
@@ -292,12 +366,12 @@ impl<'a> Parser<'a> {
         // FROM is optional (sqlite/PG): `SELECT 3+5` reads no table and
         // evaluates over ONE synthetic empty row. WHERE/ORDER BY/LIMIT
         // still parse below -- sqlite allows `SELECT 3 WHERE 1`.
-        let (table, from_derived, from_alias, joins) = if self.eat_kw(Kw::From) {
+        let (table, from_derived, from_series, from_alias, joins) = if self.eat_kw(Kw::From) {
             // A `(` immediately followed by SELECT is a derived table
             // `FROM (SELECT …) [AS] alias` (#74) — distinct from a `( join
             // group )`, whose paren wraps table names. The view-inline pass
             // flattens a simple derived body before planning; the rest refuse.
-            let (table, from_derived, from_alias, mut from_parens) = if self.peek()
+            let (table, from_derived, from_series, from_alias, mut from_parens) = if self.peek()
                 == Some(&Tok::LParen)
                 && matches!(self.peek_at(1), Some(Tok::Kw(Kw::Select)))
             {
@@ -311,7 +385,7 @@ impl<'a> Parser<'a> {
                 // The alias names the derived columns; optional, as in sqlite
                 // (accept bare or `AS` form here).
                 let from_alias = self.opt_table_alias()?;
-                (None, Some(Box::new(inner)), from_alias, 0usize)
+                (None, Some(Box::new(inner)), None, from_alias, 0usize)
             } else {
                 // `FROM ( a JOIN b ON … )` — parens around a join group. For the
                 // left-deep chains this grammar builds they are associativity
@@ -324,8 +398,55 @@ impl<'a> Parser<'a> {
                     from_parens += 1;
                 }
                 let table = self.ident("table name")?;
+                // `FROM generate_series(start, stop[, step])` — the one table
+                // function mpedb GENERATES rather than refuses. 578 of the
+                // corpus's 803 calls are in this position (89 more are a comma
+                // or JOIN operand, 116 sit in a SELECT list), which is why the
+                // base position came first and why the other two still refuse
+                // by name below.
+                if table.eq_ignore_ascii_case("generate_series")
+                    && self.peek() == Some(&Tok::LParen)
+                {
+                    let mut args = self.series_args()?;
+                    let from_alias = self.opt_table_alias()?;
+                    // `AS g(n)` — the column alias list, legal only after an
+                    // alias. PostgreSQL renames the output column from it, and
+                    // that name is the result HEADER, so dropping it would be a
+                    // wrong answer rather than a missing feature.
+                    if from_alias.is_some() && self.eat(&Tok::LParen) {
+                        loop {
+                            args.columns.push(self.ident("column alias")?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(&Tok::RParen, "`)` to close the column alias list")?;
+                        if args.columns.len() != 1 {
+                            return Err(self.err_here(format!(
+                                "generate_series has ONE column, so its alias list takes one \
+                                 name, not {}",
+                                args.columns.len()
+                            )));
+                        }
+                    }
+                    (None, None, Some(Box::new(args)), from_alias, from_parens)
+                } else {
+                // A TABLE FUNCTION in FROM position — `generate_series(1, 10)`,
+                // `unnest(a)`, `rngfunct(1) WITH ORDINALITY`. mpedb has no
+                // table-function planner, and without this the `(` reaches the
+                // generic tail check and reports `unexpected trailing input
+                // \`LParen\``, which names neither the function nor the reason.
+                //
+                // 3 126 statements in PostgreSQL's regress corpus land here —
+                // the second-largest refusal cause — and every one of them read
+                // as a mystery. A named refusal is the contract: mpedb refuses
+                // by name, never confusingly.
+                if self.peek() == Some(&Tok::LParen) {
+                    return Err(self.table_function_refusal(&table));
+                }
                 let from_alias = self.opt_table_alias()?;
-                (Some(table), None, from_alias, from_parens)
+                (Some(table), None, None, from_alias, from_parens)
+                }
             };
             let mut joins = Vec::new();
             // ONE left-deep chain where `,` and the JOIN keywords are equal
@@ -416,9 +537,9 @@ impl<'a> Parser<'a> {
                     "at most {MAX_FROM_TABLES} tables in a join"
                 )));
             }
-            (table, from_derived, from_alias, joins)
+            (table, from_derived, from_series, from_alias, joins)
         } else {
-            (None, None, None, Vec::new())
+            (None, None, None, None, Vec::new())
         };
         let where_clause = if self.eat_kw(Kw::Where) {
             Some(self.expr()?)
@@ -481,6 +602,7 @@ impl<'a> Parser<'a> {
         Ok(SelectStmt {
             table,
             from_derived,
+            from_series,
             alias: from_alias,
             joins,
             distinct,
@@ -513,6 +635,14 @@ impl<'a> Parser<'a> {
             return Ok((e, Some(self.ident("select-item alias")?)));
         }
         if matches!(self.peek(), Some(Tok::Ident(_))) && self.peek_compound_op().is_none() {
+            // `AT` is the one bare word after an expression that is NOT an
+            // alias. `SELECT ts AT TIME ZONE 'UTC'` read as `ts AS AT` and then
+            // reported `unexpected trailing input \`TIME\`` — a message about
+            // the wrong word, for a construct the reader never suspected was
+            // being aliased. 150 refusals in PostgreSQL's regress corpus.
+            if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("AT")) {
+                return Err(self.err_here(AT_TIME_ZONE));
+            }
             return Ok((e, Some(self.ident("select-item alias")?)));
         }
         Ok((e, None))

@@ -1,0 +1,35 @@
+# The listening socket, owned by systemd rather than by mpedb.
+#
+# This unit is the entire "server". Nothing of mpedb is running while it waits;
+# the first connection is what brings a process into being, and that process
+# exits when the connection closes.
+
+[Unit]
+Description=mpedb PostgreSQL wire socket
+Documentation=file:///usr/share/doc/mpedb/deploy/README.md
+
+[Socket]
+# libpq does not take a socket PATH — it takes a DIRECTORY and appends
+# `.s.PGSQL.<port>` itself. The filename here is that convention spelled out, so
+# `psql -h /run/mpedb` finds it.
+ListenStream=/run/mpedb/.s.PGSQL.5432
+
+# Accept=yes is the load-bearing line: systemd accepts each connection and
+# spawns ONE instance of the template unit with that connection on stdin. With
+# Accept=no it would pass a LISTENING socket instead and mpedb-pg would need
+# --listen-fd, which keeps a process alive across connections.
+Accept=yes
+
+# The peer of a unix socket is authenticated by filesystem permissions. That is
+# the whole access-control story, and it is the same fence mpedb already relies
+# on for the database file itself.
+SocketMode=0660
+SocketUser=mpedb
+SocketGroup=mpedb
+
+# The socket lives in its own directory so the mode above is not fighting /run's.
+RuntimeDirectory=mpedb
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=sockets.target

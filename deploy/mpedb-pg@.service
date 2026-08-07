@@ -1,0 +1,39 @@
+# One connection, one process, then nothing.
+#
+# Instantiated by mpedb-pg.socket (Accept=yes), which hands the accepted
+# connection over on stdin. `--inherited-fd` is what reads it.
+
+[Unit]
+Description=mpedb PostgreSQL connection %i
+Requires=mpedb-pg.socket
+After=mpedb-pg.socket
+
+[Service]
+Type=simple
+User=mpedb
+Group=mpedb
+
+# StandardInput=socket is the other half of Accept=yes. Output goes to the
+# journal so a refusal is greppable per connection.
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+
+ExecStart=/usr/local/bin/mpedb-pg serve --inherited-fd /var/lib/mpedb/app.mpedb
+
+# The process is short-lived by design, so the usual hardening costs nothing.
+# NoNewPrivileges and PrivateTmp in particular are free here.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/mpedb
+# No network namespace at all: this process never opens a socket. If it ever
+# tried, this line would stop it — which is a useful thing to have said out loud.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+# A connection that dies takes only itself with it. Restart would be wrong:
+# there is no connection left to serve.
+Restart=no

@@ -41,6 +41,17 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT 1 UNION SELECT 2",
         "SELECT 15 UNION SELECT id FROM users",
         "SELECT (SELECT 3)",
+        // `generate_series` (format 71): the SERIES sentinel and its access
+        // path must survive encode/decode/validate/hash and the truncation and
+        // bit-flip fuzz. All three bound kinds appear — a folded constant, a
+        // bare parameter, a NULL (the empty series, which the ordinary key-part
+        // rule would have called corrupt), and the explicit step.
+        "SELECT * FROM generate_series(1, 10)",
+        "SELECT * FROM generate_series(1, 10, 3)",
+        "SELECT * FROM generate_series($1, $2, $3)",
+        "SELECT * FROM generate_series(1, NULL)",
+        "SELECT * FROM generate_series(1, 10) AS g(n) WHERE n > 4 ORDER BY n DESC LIMIT 2",
+        "SELECT count(*), sum(g) FROM generate_series(1, 10) AS s(g)",
         // IN (SELECT ...) (#70, format 11): LIST-kind subplan + InParam.
         "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)",
         "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM orders) AND active",
@@ -186,6 +197,50 @@ fn roundtrip_every_sample() {
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         assert_eq!(p.hash(), q.hash(), "hash instability for {sql}");
     }
+}
+
+/// The series bytes (format 71) get their own sweep: every truncation through
+/// the three bounds and the optional-step presence byte must Err, never panic,
+/// and a plan whose access tag is rewritten to the series tag over a REAL table
+/// must be refused as corrupt rather than executed.
+#[test]
+fn decode_rejects_truncation_and_a_forged_series_over_a_real_table() {
+    let s = test_schema();
+    for sql in [
+        "SELECT * FROM generate_series(1, 10)",
+        "SELECT * FROM generate_series($1, $2, $3)",
+        "SELECT * FROM generate_series(1, NULL)",
+        "SELECT count(*) FROM generate_series(1, 10) AS g(n) WHERE n > 3",
+    ] {
+        let p = prepare(sql, &s).unwrap();
+        let _ = p.explain(&s); // must not panic on the series access
+        let bytes = p.encode();
+        let q = CompiledPlan::decode(&bytes, &s).expect(sql);
+        assert_eq!(p, q, "roundtrip mismatch for {sql}");
+        assert_eq!(p.hash(), q.hash(), "hash instability for {sql}");
+        for cut in 0..bytes.len() {
+            assert!(
+                CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+                "truncation at {cut} must fail for {sql}"
+            );
+        }
+    }
+    // The sentinel rule, both directions, over the WIRE rather than over the
+    // planner: a series access is meaningless on a table that has its own rows,
+    // and the series sentinel takes nothing else. Forged by flipping the access
+    // tag byte in a real plan's bytes — which is exactly the shape a corrupt or
+    // hostile registry entry would have.
+    let real = prepare("SELECT * FROM users", &s).unwrap().encode();
+    let mut forged = real.clone();
+    let tag = forged
+        .windows(1)
+        .position(|w| w == [super::ACCESS_FULL])
+        .expect("a FullScan tag is in there somewhere");
+    forged[tag] = super::ACCESS_SERIES;
+    assert!(
+        CompiledPlan::decode(&forged, &s).is_err(),
+        "a series access forged onto a real table must be refused"
+    );
 }
 
 /// The COLLATE bytes (format 28) get their own truncation sweep: a collated

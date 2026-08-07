@@ -456,6 +456,7 @@ pub fn errno() -> i32 {
 // Imports arrive in the `mpedb` module, so the embedder's import object is
 // `{ mpedb: { … } }` — named rather than the default `env`, so a page that
 // embeds several wasm modules keeps them apart.
+#[cfg(not(feature = "js-clock"))]
 #[link(wasm_import_module = "mpedb")]
 extern "C" {
     /// Milliseconds since the Unix epoch, from the embedder (`Date.now()`).
@@ -465,4 +466,13 @@ extern "C" {
     /// than stubbed. Missing it fails instantiation loudly, which is the right
     /// failure — a silently-1970 database would answer `date('now')` wrongly.
     pub fn mpedb_host_now_ms() -> f64;
+}
+
+/// With `js-clock`, the embedder is wasm-bindgen: its generated glue only
+/// populates the `wbg` import module and cannot supply `{ mpedb: { … } }`,
+/// so the clock routes through js-sys instead. Still the embedder's
+/// `Date.now()`, still never a silent 1970.
+#[cfg(feature = "js-clock")]
+pub unsafe fn mpedb_host_now_ms() -> f64 {
+    js_sys::Date::now()
 }

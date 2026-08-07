@@ -882,3 +882,253 @@ fn per_table_star_parses_as_a_marker_item() {
         );
     }
 }
+
+/// Declarative partitioning names ITSELF, in all four spellings.
+///
+/// Before this, each landed on whichever check the parser happened to reach
+/// last: `PARTITION OF` on `expected (`, `PARTITION BY` on the generic
+/// end-of-input complaint, and `ATTACH`/`DETACH` on "expected ENABLE, FORCE, or
+/// DISABLE ROW LEVEL SECURITY" — a message about a different feature entirely.
+/// Three of the four therefore pointed the reader somewhere useless.
+///
+/// It matters more than tidiness here because partitioning is ~1 900 statements
+/// of PostgreSQL's own corpus: a work list built from these messages read it as
+/// a scatter of punctuation problems.
+#[test]
+fn every_partitioning_form_refuses_by_naming_partitioning() {
+    for sql in [
+        "CREATE TABLE m (a INTEGER PRIMARY KEY, b INTEGER) PARTITION BY RANGE (b)",
+        "CREATE TABLE c PARTITION OF m FOR VALUES FROM (1) TO (10)",
+        "ALTER TABLE m ATTACH PARTITION c FOR VALUES FROM (1) TO (5)",
+        "ALTER TABLE m DETACH PARTITION c",
+    ] {
+        let e = crate::parse_ddl(sql).unwrap_err().to_string();
+        assert!(
+            e.contains("declarative partitioning is not implemented"),
+            "{sql}\n  got: {e}"
+        );
+    }
+}
+
+/// …and the ALTER TABLE forms that DO work are untouched. A refusal added in
+/// front of a working path is the way that path quietly stops working.
+#[test]
+fn the_alter_table_forms_that_work_still_parse() {
+    for sql in [
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE t FORCE ROW LEVEL SECURITY",
+        "ALTER TABLE t DISABLE ROW LEVEL SECURITY",
+        "ALTER TABLE t ADD COLUMN z INTEGER",
+        "ALTER TABLE t DROP COLUMN z",
+        "ALTER TABLE t RENAME TO u",
+    ] {
+        assert!(crate::parse_ddl(sql).is_ok(), "{sql}");
+    }
+}
+
+/// The trailing-input message names the word as WRITTEN, not the tokenizer's
+/// debug form.
+///
+/// `Ident("partition")` is a Rust enum variant with a lower-cased copy of the
+/// user's word inside it. It also split ONE cause into two in the corpus work
+/// list — 202 under `Ident("partition")` and 149 under `Ident("PARTITION")` —
+/// because the debug form carries the spelling the user happened to use.
+#[test]
+fn trailing_input_names_the_word_the_user_wrote() {
+    // NOT `SELECT 1 FROM t GARBAGE` — that parses, as `FROM t AS GARBAGE`.
+    // The tail has to come after something no alias can follow.
+    for sql in [
+        "SELECT 1 FROM t LIMIT 1 GARBAGE",
+        "SELECT 1 FROM t ORDER BY a GARBAGE",
+        "DELETE FROM t GARBAGE",
+    ] {
+        let e = parse_statement(sql).unwrap_err().to_string();
+        assert!(e.contains("`GARBAGE`"), "{sql}\n  got: {e}");
+        assert!(!e.contains("Ident("), "the debug form leaked in `{sql}`: {e}");
+    }
+}
+
+/// `AT TIME ZONE` names itself instead of being swallowed as an alias.
+///
+/// `SELECT ts AT TIME ZONE 'UTC'` read as `ts AS AT` and then complained about
+/// `TIME` — a message about the wrong word entirely, for a construct the reader
+/// had no reason to think was being aliased. 150 refusals in PostgreSQL's own
+/// corpus arrived that way.
+///
+/// The escape hatch is the ordinary one and is asserted here: a QUOTED `"at"`
+/// is still an alias, because quoting is how you name anything after a keyword.
+#[test]
+fn at_time_zone_names_itself_rather_than_being_read_as_an_alias() {
+    let e = parse_statement("SELECT b AT TIME ZONE 'UTC' FROM t")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("AT TIME ZONE"), "{e}");
+    assert!(!e.contains("TIME`"), "it still blamed the wrong word: {e}");
+
+    // Ordinary aliases are untouched, bare and quoted.
+    for sql in [
+        "SELECT b tid FROM t",
+        "SELECT b AS tid FROM t",
+        "SELECT b \"at\" FROM t",
+        "SELECT 1 x, 2 y",
+    ] {
+        assert!(parse_statement(sql).is_ok(), "{sql}");
+    }
+}
+
+/// `ALTER <kind>` names the KIND, not what the parser wanted next.
+///
+/// ``expected `TABLE` `` was 422 statements in PostgreSQL's regress corpus
+/// being told about the parser's cursor. The problem is not that `TABLE` was
+/// missing — it is that mpedb has no `ALTER TYPE`, and only the message can say
+/// so. Same shape the CREATE and DROP paths already use.
+#[test]
+fn alter_names_the_object_kind_it_cannot_alter() {
+    for (sql, kind) in [
+        ("ALTER TYPE e ADD VALUE 'x'", "ALTER TYPE"),
+        ("ALTER SEQUENCE s RESTART", "ALTER SEQUENCE"),
+        ("ALTER INDEX i RENAME TO j", "ALTER INDEX"),
+        ("ALTER ROLE r NOLOGIN", "ALTER ROLE"),
+    ] {
+        let e = crate::parse_ddl(sql).unwrap_err().to_string();
+        assert!(e.contains(kind), "{sql}\n  got: {e}");
+    }
+}
+
+/// …and every ALTER TABLE form that works is untouched.
+#[test]
+fn the_alter_table_forms_still_parse_after_the_kind_check() {
+    for sql in [
+        "ALTER TABLE t ADD COLUMN b INTEGER",
+        "ALTER TABLE t DROP COLUMN b",
+        "ALTER TABLE t RENAME TO u",
+        "ALTER TABLE t RENAME COLUMN a TO b",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+    ] {
+        assert!(crate::parse_ddl(sql).is_ok(), "{sql}");
+    }
+}
+
+/// `DROP FUNCTION` parses every spelling `pg_dump` writes.
+///
+/// It is the counterpart to `CREATE FUNCTION`, and the pair has to exist
+/// together: a dump you can replay but not undo is a migration you can only
+/// run once. 228 statements in the corpus's forty heaviest files were refused
+/// for want of it.
+#[test]
+fn drop_function_parses_the_forms_a_dump_writes() {
+    use crate::ddl::DdlStmt;
+    for (sql, name, if_exists) in [
+        ("DROP FUNCTION f", "f", false),
+        ("DROP FUNCTION IF EXISTS f", "f", true),
+        ("DROP FUNCTION public.f", "f", false),
+        ("DROP FUNCTION f(integer)", "f", false),
+        ("DROP FUNCTION f(integer, text) CASCADE", "f", false),
+        ("DROP FUNCTION IF EXISTS public.f(int) RESTRICT", "f", true),
+    ] {
+        match crate::parse_ddl(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+            Some(DdlStmt::DropFunction { name: n, if_exists: ie }) => {
+                assert_eq!(n, name, "{sql}");
+                assert_eq!(ie, if_exists, "{sql}");
+            }
+            other => panic!("{sql} parsed as {other:?}"),
+        }
+    }
+}
+
+/// An unterminated argument list is an error, not a silent consume-to-EOF.
+#[test]
+fn drop_function_with_an_unterminated_signature_is_refused() {
+    assert!(crate::parse_ddl("DROP FUNCTION f(integer").is_err());
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT` must not become a COLUMN named `CONSTRAINT`.
+///
+/// It did, and it SUCCEEDED, which is what makes it the worst kind of bug:
+/// `ALTER TABLE t ADD CONSTRAINT c CHECK (id > 0)` reported `affected: 0` and
+/// left the table with a phantom column that `SELECT *` showed, and a violation
+/// read ``CHECK violation: t.CONSTRAINT failed``. `COLUMN` is optional in this
+/// grammar, so the constraint keyword landed in the slot the column name was
+/// read from.
+#[test]
+fn add_constraint_is_refused_rather_than_read_as_a_column_name() {
+    for sql in [
+        "ALTER TABLE t ADD CONSTRAINT c CHECK (id > 0)",
+        "ALTER TABLE t ADD PRIMARY KEY (id)",
+        "ALTER TABLE t ADD UNIQUE (id)",
+        "ALTER TABLE t ADD FOREIGN KEY (id) REFERENCES u (id)",
+        "ALTER TABLE t ADD CHECK (id > 0)",
+        "ALTER TABLE t ADD EXCLUDE USING gist (c WITH &&)",
+    ] {
+        let e = crate::parse_ddl(sql).unwrap_err().to_string();
+        assert!(e.contains("TABLE CONSTRAINT"), "{sql}\n  got: {e}");
+    }
+}
+
+/// …and both spellings of ADD COLUMN still work, including the one where
+/// `COLUMN` is omitted — which is the spelling the refusal above had to be
+/// careful not to break.
+#[test]
+fn add_column_still_parses_with_and_without_the_column_keyword() {
+    for sql in [
+        "ALTER TABLE t ADD COLUMN z INTEGER",
+        "ALTER TABLE t ADD z INTEGER",
+        "ALTER TABLE t ADD COLUMN z TEXT DEFAULT 'x'",
+        "ALTER TABLE t ADD z",
+    ] {
+        assert!(crate::parse_ddl(sql).is_ok(), "{sql}");
+    }
+}
+
+/// Every other ALTER TABLE action names itself rather than row-level security.
+#[test]
+fn alter_table_actions_name_themselves_not_the_last_branch_tried() {
+    for (sql, word) in [
+        ("ALTER TABLE t ALTER COLUMN id TYPE bigint", "ALTER"),
+        ("ALTER TABLE t SET SCHEMA s", "SET"),
+        ("ALTER TABLE t OWNER TO bob", "OWNER"),
+        ("ALTER TABLE t INHERIT p", "INHERIT"),
+        ("ALTER TABLE t VALIDATE CONSTRAINT c", "VALIDATE"),
+    ] {
+        let e = crate::parse_ddl(sql).unwrap_err().to_string();
+        assert!(e.contains(word), "{sql}\n  got: {e}");
+        assert!(!e.contains("expected ENABLE"), "still blaming RLS: {e}");
+    }
+}
+
+/// Array and row constructors name themselves — one message for one missing
+/// TYPE, where there used to be five unrelated ones.
+///
+/// `ARRAY[1,2]` said ``unknown column `ARRAY` ``, `ARRAY(SELECT …)` said
+/// "expected an expression", `ROW(1,2)` said ``unknown function `row()` ``, and
+/// `= ANY(ARRAY[1])` said "expected `)` closing the argument list". A work list
+/// built from those read one gap as four.
+#[test]
+fn array_and_row_constructors_name_themselves() {
+    for sql in [
+        "SELECT ARRAY[1,2,3]",
+        "SELECT ARRAY(SELECT 1)",
+        "SELECT ROW(1,2)",
+        "SELECT * FROM t WHERE id = ANY(ARRAY[1])",
+        "SELECT ARRAY [1,2]",
+    ] {
+        let e = parse_statement(sql).unwrap_err().to_string();
+        assert!(e.contains("array and row constructors"), "{sql}\n  got: {e}");
+    }
+}
+
+/// …and `array` / `row` as ordinary NAMES keep working. That is the whole
+/// reason the check looks for the bracket or paren rather than the word: a
+/// refusal on the word alone would break every column called either.
+#[test]
+fn array_and_row_are_still_ordinary_identifiers() {
+    for sql in [
+        "SELECT array FROM k",
+        "SELECT row FROM k",
+        "SELECT array, row FROM k",
+        "SELECT k.array FROM k",
+        "SELECT 1 AS array",
+    ] {
+        assert!(parse_statement(sql).is_ok(), "{sql}");
+    }
+}

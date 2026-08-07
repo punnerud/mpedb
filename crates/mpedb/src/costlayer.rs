@@ -69,9 +69,9 @@ pub struct Tunables {
     /// `dump`, the mirror daemon, the C-API shim, `mpedb <file>` — reopened it
     /// LENIENT, because `open_from_file` had no `[compat]` to read and fell to
     /// the default. Recorded here, the file answers instead.
-    pub bare_group_by: mpedb_types::BareGroupBy,
+    pub dialect: mpedb_types::Dialect,
     /// Whether `PRAGMA foreign_keys` starts ON for connections to this
-    /// database. Same argument as `bare_group_by`, same silent-loosening bug:
+    /// database. Same argument as `dialect`, same silent-loosening bug:
     /// a file whose keys were declared and enforced became unenforced the
     /// moment a tool opened it without the config that said so.
     ///
@@ -88,7 +88,7 @@ impl Default for Tunables {
         Tunables {
             ndv_discount: true,
             recursive_triggers: false,
-            bare_group_by: mpedb_types::BareGroupBy::Sqlite,
+            dialect: mpedb_types::Dialect::Sqlite,
             foreign_keys: false,
         }
     }
@@ -103,10 +103,10 @@ impl Tunables {
 
     fn encode(&self) -> Vec<u8> {
         format!(
-            "ndv_discount={}\nrecursive_triggers={}\nbare_group_by={}\nforeign_keys={}\n",
+            "ndv_discount={}\nrecursive_triggers={}\ndialect={}\nforeign_keys={}\n",
             self.ndv_discount,
             self.recursive_triggers,
-            dialect_name(self.bare_group_by),
+            dialect_name(self.dialect),
             self.foreign_keys
         )
         .into_bytes()
@@ -133,10 +133,14 @@ impl Tunables {
                 Some(("recursive_triggers", v)) => {
                     t.recursive_triggers = parse_bool("recursive_triggers", v)?
                 }
-                Some(("bare_group_by", v)) => {
-                    t.bare_group_by = parse_dialect(v).ok_or_else(|| {
+                // `bare_group_by` is the name this key was WRITTEN under before
+                // the dialect reached the tokenizer. Reading both costs one
+                // pattern and keeps every already-written file openable; only
+                // `dialect` is ever written back.
+                Some(("dialect" | "bare_group_by", v)) => {
+                    t.dialect = parse_dialect(v).ok_or_else(|| {
                         Error::Corrupt(format!(
-                            "tunable bare_group_by has unknown value `{v}` — \
+                            "tunable dialect has unknown value `{v}` — \
                              known: sqlite, postgres"
                         ))
                     })?
@@ -145,7 +149,7 @@ impl Tunables {
                 _ => {
                     return Err(Error::Corrupt(format!(
                         "unknown tunable line `{line}` — known: ndv_discount, \
-                         recursive_triggers, bare_group_by, foreign_keys"
+                         recursive_triggers, dialect, foreign_keys"
                     )))
                 }
             }
@@ -172,9 +176,9 @@ impl Tunables {
                 self.recursive_triggers = parse_bool("recursive_triggers", v)?;
                 Ok(())
             }
-            Some(("bare_group_by", v)) => {
-                self.bare_group_by = parse_dialect(v).ok_or_else(|| {
-                    Error::Unsupported(format!("bare_group_by takes sqlite|postgres, got `{v}`"))
+            Some(("dialect" | "bare_group_by", v)) => {
+                self.dialect = parse_dialect(v).ok_or_else(|| {
+                    Error::Unsupported(format!("dialect takes sqlite|postgres, got `{v}`"))
                 })?;
                 Ok(())
             }
@@ -184,7 +188,7 @@ impl Tunables {
             }
             _ => Err(Error::Unsupported(format!(
                 "unknown tunable `{assignment}` — known: ndv_discount=true|false, \
-                 recursive_triggers=true|false, bare_group_by=sqlite|postgres, \
+                 recursive_triggers=true|false, dialect=sqlite|postgres, \
                  foreign_keys=true|false"
             ))),
         }
@@ -193,17 +197,17 @@ impl Tunables {
 
 /// The stored spelling of a dialect — the SAME two words `[compat]` uses, so a
 /// config and a `tune set` cannot disagree about how to say the same thing.
-pub fn dialect_name(d: mpedb_types::BareGroupBy) -> &'static str {
+pub fn dialect_name(d: mpedb_types::Dialect) -> &'static str {
     match d {
-        mpedb_types::BareGroupBy::Sqlite => "sqlite",
-        mpedb_types::BareGroupBy::Postgres => "postgres",
+        mpedb_types::Dialect::Sqlite => "sqlite",
+        mpedb_types::Dialect::Postgres => "postgres",
     }
 }
 
-fn parse_dialect(v: &str) -> Option<mpedb_types::BareGroupBy> {
+fn parse_dialect(v: &str) -> Option<mpedb_types::Dialect> {
     match v {
-        "sqlite" => Some(mpedb_types::BareGroupBy::Sqlite),
-        "postgres" => Some(mpedb_types::BareGroupBy::Postgres),
+        "sqlite" => Some(mpedb_types::Dialect::Sqlite),
+        "postgres" => Some(mpedb_types::Dialect::Postgres),
         _ => None,
     }
 }
@@ -250,6 +254,17 @@ impl crate::Database {
         let skeleton = match lang {
             crate::spellfn::SpellLang::Python => mpedb_spell::py::compile(source)?,
             crate::spellfn::SpellLang::Rust => mpedb_spell::rs::compile(source)?,
+            // The plpgsql frontend's unit is a whole `CREATE FUNCTION …
+            // LANGUAGE plpgsql` statement — it exists to eat what `pg_dump`
+            // writes. A cost policy is an mpedb concept with no PostgreSQL
+            // spelling, so there is nothing for it to compile.
+            crate::spellfn::SpellLang::PlPgSql => {
+                return Err(Error::Unsupported(
+                    "a cost policy is written in the Python or Rust subset; plpgsql compiles \
+                     a whole CREATE FUNCTION statement, which a cost policy is not"
+                        .into(),
+                ))
+            }
         };
         if !skeleton.calls.is_empty() {
             return Err(Error::Unsupported(

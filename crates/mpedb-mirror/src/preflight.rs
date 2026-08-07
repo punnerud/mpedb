@@ -684,7 +684,7 @@ mod tests {
         use crate::import::{import_sqlite, ImportOptions};
         use rusqlite::Connection;
 
-        let dir = std::env::temp_dir().join("mpedb-mirror-tests");
+        let dir = mpedb_testkit::scratch_base().join("mpedb-mirror-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join(format!("pf-src-{}.db", std::process::id()));
         let dest = dir.join(format!("pf-dest-{}.mpedb", std::process::id()));
@@ -800,7 +800,7 @@ mod tests {
         use crate::import::{import_sqlite, ImportOptions};
         use rusqlite::Connection;
 
-        let dir = std::env::temp_dir().join("mpedb-mirror-tests");
+        let dir = mpedb_testkit::scratch_base().join("mpedb-mirror-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let pid = std::process::id();
         let mk = |t: &str| dir.join(format!("ad-{t}-{pid}.db"));
