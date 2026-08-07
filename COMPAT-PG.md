@@ -405,6 +405,26 @@ coarse; it is not allowed to launder. Integers are now compared as integers
 before the float path sees them, and non-finite values never reach the
 tolerance test.
 
+**Every ranked line now says where it LIVES**, on both lists — the split of
+last resort, and the only one available when a shape has no message left to
+group on. It is printed as a name when one file holds at least a third, and as
+a spread otherwise, because both are findings:
+
+```
+   628  text values differ
+        spread over 51 files, none holding a third (top: jsonpath.sql, 137)
+    27  mpedb ANSWERED, PostgreSQL: invalid input syntax for type numeric: _
+        all in numeric.sql
+    43  … violates foreign key constraint _
+        35 of 43 in foreign_key.sql (over 5 files)
+```
+
+The first version printed the file name only when concentrated and nothing
+otherwise — so the two largest shapes printed nothing at all, and "nothing"
+reads as "not measured" rather than as "everywhere". A spread of 51 files is
+as much of an answer as a concentration in one, and it is the answer that says
+"this is a hundred small jobs, not one".
+
 The rule the module is built on, stated because it is one edit away from being
 broken: **classifying never changes a verdict.** A classifier that recognises
 `character(n)` padding is two lines from a comparator that forgives it, and

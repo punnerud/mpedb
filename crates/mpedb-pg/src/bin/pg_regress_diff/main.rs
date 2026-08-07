@@ -272,6 +272,7 @@ fn run(args: &[String]) -> Result<i32, String> {
                 let ex: String = c.example.chars().take(110).collect();
                 println!("          e.g. {ex}");
             }
+            print_concentration(c);
         }
         let tail: u32 = ranked.iter().skip(shown).map(|(_, c)| c.count).sum();
         if tail > 0 {
@@ -304,6 +305,7 @@ fn run(args: &[String]) -> Result<i32, String> {
             if ex.trim() != s.trim() {
                 println!("          e.g. {ex}");
             }
+            print_concentration(c);
         }
         let tail: u32 = ranked.iter().skip(shown).map(|(_, c)| c.count).sum();
         if tail > 0 {
@@ -555,6 +557,23 @@ struct Cause {
     count: u32,
     code: String,
     example: String,
+    /// Which corpus files this shape occurs in, and how often.
+    ///
+    /// The splitting field of last resort, and the one that works when there
+    /// is no other. A shape that is 628 statements spread over 90 files is a
+    /// general gap; the same 628 concentrated in `jsonb.sql` is one feature
+    /// with a name. Those are different jobs and the count alone cannot tell
+    /// them apart — which is the same lesson as every other split in this
+    /// harness, applied to the buckets that have no message left to split on.
+    files: std::collections::BTreeMap<String, u32>,
+}
+
+impl Cause {
+    /// The file this shape leans on hardest, and how much of it that is.
+    fn concentration(&self) -> Option<(&str, u32, usize)> {
+        let (f, n) = self.files.iter().max_by_key(|(f, n)| (**n, std::cmp::Reverse(f.as_str())))?;
+        Some((f, *n, self.files.len()))
+    }
 }
 
 /// Record one divergence shape.
@@ -563,6 +582,39 @@ struct Cause {
 /// same ranking, the same "top N plus a tail", and the same discipline that a
 /// key groups while an example illustrates. A second bespoke struct would have
 /// drifted from the first within a round.
+/// Where a shape LIVES — the split of last resort.
+///
+/// Printed for every ranked line, cheap, and it answers the one question the
+/// count cannot when there is no message left to group on: is this a general
+/// gap or one file's feature? 628 "text values differ" spread over 90 files is
+/// a hundred small jobs; the same 628 with 400 in `jsonb.sql` is one.
+///
+/// The FILE COUNT always, the file NAME only when it is a finding. Naming the
+/// top file of an evenly-spread shape would give a reader a name to act on
+/// where there is nothing there; withholding the spread entirely would hide
+/// that the spread is itself the answer. The first run of this made exactly
+/// that mistake — the two largest shapes printed nothing at all, and "nothing"
+/// reads as "not measured" rather than as "everywhere".
+fn print_concentration(c: &Cause) {
+    let Some((file, n, distinct)) = c.concentration() else {
+        return;
+    };
+    if distinct == 1 {
+        println!("          all in {file}.sql");
+    } else if n * 3 >= c.count {
+        println!(
+            "          {n} of {} in {file}.sql (over {distinct} files)",
+            c.count
+        );
+    } else {
+        // Spread thin: a general gap, not one file's feature. Worth as much as
+        // a concentration and easy to mistake for an absence of information.
+        println!(
+            "          spread over {distinct} files, none holding a third (top: {file}.sql, {n})"
+        );
+    }
+}
+
 /// The FAMILY totals for the buckets that are deliberately split by name.
 ///
 /// Splitting `unknown function` and `table function in FROM` by name is what
@@ -604,13 +656,14 @@ fn print_families(ranked: &[(&String, &Cause)], families: &[&str]) {
     }
 }
 
-fn note(map: &mut std::collections::HashMap<String, Cause>, s: divergence::Shape) {
+fn note(map: &mut std::collections::HashMap<String, Cause>, s: divergence::Shape, file: &str) {
     let e = map.entry(s.key).or_insert_with(|| Cause {
         code: "-".into(),
         example: s.example.clone(),
         ..Cause::default()
     });
     e.count += 1;
+    *e.files.entry(file.to_string()).or_default() += 1;
     if e.example.is_empty() {
         e.example = s.example;
     }
@@ -635,6 +688,10 @@ fn diff_file(
     // UTF-8 by construction, so a win1252 collation file was never going to be
     // a comparison it could win — but that is a result to RECORD, not a reason
     // to stop.
+    let fname = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let sql = String::from_utf8_lossy(&raw).into_owned();
     let all = statements(&sql);
@@ -732,14 +789,15 @@ fn diff_file(
                             cascade.independent += 1;
                         }
                     }
-                    causes
+                    let c = causes
                         .entry(cause_key(&e.message))
                         .or_insert_with(|| Cause {
                             code: e.code.clone(),
                             example: e.message.clone(),
                             ..Cause::default()
-                        })
-                        .count += 1;
+                        });
+                    c.count += 1;
+                    *c.files.entry(fname.clone()).or_default() += 1;
                 }
             }
             // PostgreSQL refusing what mpedb ACCEPTS is also a divergence: mpedb
@@ -753,6 +811,7 @@ fn diff_file(
                         pe.as_ref().map(|e| cause_shape(&e.message)).as_deref(),
                         y,
                     ),
+                    &fname,
                 );
             }
             (Some(Outcome::Rows(x)), Some(Outcome::Rows(y))) => match compare(x, y, stmt) {
@@ -770,6 +829,7 @@ fn diff_file(
                             &rows(y),
                             has_top_level_order_by(stmt),
                         ),
+                        &fname,
                     );
                 }
             },
@@ -778,15 +838,15 @@ fn diff_file(
             // dropping the tail is how a file scores well by dying early.
             (None, Some(_)) => {
                 c.diverged += 1;
-                note(diffs, divergence::transcript_ended_early("PostgreSQL"));
+                note(diffs, divergence::transcript_ended_early("PostgreSQL"), &fname);
             }
             (Some(_), None) => {
                 c.diverged += 1;
-                note(diffs, divergence::transcript_ended_early("mpedb"));
+                note(diffs, divergence::transcript_ended_early("mpedb"), &fname);
             }
             _ => {
                 c.diverged += 1;
-                note(diffs, divergence::transcript_ended_early("both"));
+                note(diffs, divergence::transcript_ended_early("both"), &fname);
             }
         }
     }
