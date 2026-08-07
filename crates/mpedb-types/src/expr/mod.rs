@@ -56,6 +56,17 @@ pub enum Instr {
     Mul,
     Div,
     Mod,
+    /// `/` and `%` under the PostgreSQL dialect: a zero divisor RAISES
+    /// ([`Error::DivisionByZero`]) instead of yielding NULL.
+    ///
+    /// Separate opcodes rather than a runtime flag, mirroring
+    /// [`Instr::Like`] vs [`Instr::LikeCs`]: the dialect is a COMPILE-time
+    /// property, so it belongs in the plan bytes. Two dialects then hash to
+    /// two plans, and the shared plan registry cannot serve one session's
+    /// semantics to another's — which a flag read at eval time would do the
+    /// moment two differently-configured processes attach to one file.
+    DivStrict,
+    ModStrict,
     Neg,
     And,
     Or,
@@ -571,7 +582,13 @@ impl ExprProgram {
                         }),
                     });
                 }
-                Instr::Add | Instr::Sub | Instr::Mul | Instr::Div | Instr::Mod => {
+                Instr::Add
+                | Instr::Sub
+                | Instr::Mul
+                | Instr::Div
+                | Instr::Mod
+                | Instr::DivStrict
+                | Instr::ModStrict => {
                     let b = stack.pop().expect("validated");
                     let a = stack.pop().expect("validated");
                     stack.push(arith(instr, a, b)?);
@@ -1109,6 +1126,10 @@ fn arith(op: Instr, a: Value, b: Value) -> Result<Value> {
             Instr::Div => Int(x.checked_div(y).ok_or(Error::ArithmeticOverflow)?),
             Instr::Mod if y == 0 => Null,
             Instr::Mod => Int(x.checked_rem(y).ok_or(Error::ArithmeticOverflow)?),
+            // PostgreSQL raises 22012 rather than yielding NULL.
+            Instr::DivStrict | Instr::ModStrict if y == 0 => return Err(Error::DivisionByZero),
+            Instr::DivStrict => Int(x.checked_div(y).ok_or(Error::ArithmeticOverflow)?),
+            Instr::ModStrict => Int(x.checked_rem(y).ok_or(Error::ArithmeticOverflow)?),
             _ => unreachable!(),
         }),
         (Float(x), Float(y)) => Ok(match op {
@@ -1120,6 +1141,13 @@ fn arith(op: Instr, a: Value, b: Value) -> Result<Value> {
             Instr::Div => Float(x / y),
             Instr::Mod if y == 0.0 => Null,
             Instr::Mod => Float(x % y),
+            // The float path raises too. PostgreSQL's `1.0 / 0` is an error,
+            // not an infinity — IEEE division is not what SQL asked for.
+            Instr::DivStrict | Instr::ModStrict if y == 0.0 => {
+                return Err(Error::DivisionByZero)
+            }
+            Instr::DivStrict => Float(x / y),
+            Instr::ModStrict => Float(x % y),
             _ => unreachable!(),
         }),
         (a, b) => Err(Error::TypeMismatch(format!(

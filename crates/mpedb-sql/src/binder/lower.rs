@@ -330,6 +330,8 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 BinOp::Mul => Instr::Mul,
                 BinOp::Div => Instr::Div,
                 BinOp::Mod => Instr::Mod,
+                BinOp::DivStrict => Instr::DivStrict,
+                BinOp::ModStrict => Instr::ModStrict,
                 BinOp::Eq => Instr::Eq,
                 BinOp::Ne => Instr::Ne,
                 BinOp::Lt => Instr::Lt,

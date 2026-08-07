@@ -737,7 +737,7 @@ fn pops(i: &Instr) -> Option<usize> {
         Neg | Not | IsNull | IsNotNull | ToFloat | Cast(_) | Like(_) | LikeCs(_)
         | LikeEsc(..) | LikeCsEsc(..) | Glob(_) | Regexp(_) | InParam(_) | Affinity(_)
         | BitNot => 1,
-        Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | Mod | And | Or
+        Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | Mod | DivStrict | ModStrict | And | Or
         | IsNotDistinct | IsDistinct | Concat | BitAnd | BitOr | Shl | Shr | CmpColl(..)
         | CmpClass(..) | LikeDyn | LikeCsDyn | GlobDyn | RegexpDyn | LikeDynEsc(_)
         | LikeCsDynEsc(_) => 2,

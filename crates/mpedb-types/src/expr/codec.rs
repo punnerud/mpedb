@@ -80,6 +80,11 @@ const OP_IN_PARAM_COLL: u8 = 63;
 /// n-ary byte-level `||` — see [`Instr::ConcatN`] (plan §8, format 70).
 const OP_CONCAT_N: u8 = 64;
 
+/// PostgreSQL-dialect `/` and `%`: a zero divisor raises rather than yielding
+/// NULL. Two opcodes, not a flag — see [`Instr::DivStrict`].
+const OP_DIV_STRICT: u8 = 65;
+const OP_MOD_STRICT: u8 = 66;
+
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
     pub fn encode_into(&self, buf: &mut Vec<u8>) {
@@ -171,6 +176,8 @@ impl ExprProgram {
                 Instr::Mul => buf.push(OP_MUL),
                 Instr::Div => buf.push(OP_DIV),
                 Instr::Mod => buf.push(OP_MOD),
+                Instr::DivStrict => buf.push(OP_DIV_STRICT),
+                Instr::ModStrict => buf.push(OP_MOD_STRICT),
                 Instr::Neg => buf.push(OP_NEG),
                 Instr::And => buf.push(OP_AND),
                 Instr::Or => buf.push(OP_OR),
@@ -324,6 +331,8 @@ impl ExprProgram {
                 OP_MUL => Instr::Mul,
                 OP_DIV => Instr::Div,
                 OP_MOD => Instr::Mod,
+                OP_DIV_STRICT => Instr::DivStrict,
+                OP_MOD_STRICT => Instr::ModStrict,
                 OP_NEG => Instr::Neg,
                 OP_AND => Instr::And,
                 OP_OR => Instr::Or,

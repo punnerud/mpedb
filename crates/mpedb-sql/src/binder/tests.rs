@@ -388,6 +388,50 @@
         assert!(err.contains("CAST"), "{err}");
     }
 
+    /// A zero divisor is NULL under sqlite and an ERROR under PostgreSQL, and
+    /// the dialect must reach the OPCODE rather than a runtime flag.
+    #[test]
+    fn division_by_zero_raises_under_postgres_and_stays_null_under_sqlite() {
+        use mpedb_types::expr::Instr;
+
+        let bind = |sql: &str, d: Dialect| {
+            let t = table();
+            let (e, n) = parse_expr_only(sql).unwrap();
+            let mut b = Binder::new(&t, n, true);
+            b.set_dialect(d);
+            b.bind_expr(&e)
+        };
+
+        // sqlite: folds to NULL, exactly as before. This is the no-loss half
+        // and it is the reason the change is two opcodes and not one edit to
+        // `arith`.
+        let (e, _) = bind("1 / 0", Dialect::Sqlite).expect("sqlite folds");
+        assert!(matches!(e, BExpr::Const(Value::Null)), "{e:?}");
+        let (e, _) = bind("7 % 0", Dialect::Sqlite).expect("sqlite folds");
+        assert!(matches!(e, BExpr::Const(Value::Null)), "{e:?}");
+
+        // PostgreSQL: the fold EVALUATES the program, so a constant divisor
+        // refuses at bind time rather than at execution. Same outcome for the
+        // caller, one round trip earlier.
+        let err = bind("1 / 0", Dialect::Postgres).unwrap_err();
+        assert!(format!("{err}").contains("division by zero"), "{err}");
+        let err = bind("7 % 0", Dialect::Postgres).unwrap_err();
+        assert!(format!("{err}").contains("division by zero"), "{err}");
+        // Floats too: PostgreSQL's `1.0 / 0` is an error, not an infinity.
+        let err = bind("1.0 / 0.0", Dialect::Postgres).unwrap_err();
+        assert!(format!("{err}").contains("division by zero"), "{err}");
+
+        // A NON-constant divisor must compile, and to the STRICT opcode — the
+        // whole point is that the plan bytes say which dialect made them.
+        let (e, _) = bind("id / 2", Dialect::Postgres).expect("binds");
+        let p = super::lower::compile_program(&e).expect("compiles");
+        assert!(p.instrs.contains(&Instr::DivStrict), "{:?}", p.instrs);
+        let (e, _) = bind("id / 2", Dialect::Sqlite).expect("binds");
+        let p = super::lower::compile_program(&e).expect("compiles");
+        assert!(p.instrs.contains(&Instr::Div), "{:?}", p.instrs);
+        assert!(!p.instrs.contains(&Instr::DivStrict));
+    }
+
     #[test]
     fn function_arity_and_types_are_compile_errors() {
         assert!(bind_err_msg("lower(id)").contains("must be text"));

@@ -521,7 +521,16 @@ const MAX_JOINS: usize = 63;
 //     nested loop already has instead of needing LATERAL as a separate
 //     concept. Additive: a format-70 reader hits an unknown access tag and
 //     says `bad access path tag 6` rather than misreading it.
-const PLAN_FORMAT: u8 = 71;
+//  72: `Instr::DivStrict` / `Instr::ModStrict` (opcodes 65/66) — `/` and `%`
+//     under `dialect = "postgres"`, where a zero divisor RAISES 22012 instead
+//     of yielding sqlite's NULL. Two opcodes rather than one flag read at eval
+//     time, for the reason the LIKE family gives at format 41: the dialect is
+//     a compile-time property, so it must land in the plan HASH. A shared
+//     registry serves plans by hash to every attached process, and a flag would
+//     let a sqlite-dialect session execute a plan compiled with PostgreSQL's
+//     semantics — the same bytes meaning two things. Purely additive: a
+//     format-71 reader rejects opcode 65 as unknown.
+const PLAN_FORMAT: u8 = 72;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

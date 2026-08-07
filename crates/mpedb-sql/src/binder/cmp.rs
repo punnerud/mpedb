@@ -238,7 +238,28 @@ impl<'a> Binder<'a> {
                 let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Text)))
             }
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+            // `DivStrict`/`ModStrict` are listed for exhaustiveness only: this
+            // function binds a PARSED operator, and the parser never produces
+            // them — the rewrite below is what creates them, on the way out.
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::DivStrict
+            | BinOp::ModStrict => {
+                // The ONE place the dialect turns `/` into `/`-that-raises.
+                // sqlite yields NULL on a zero divisor and PostgreSQL raises
+                // 22012, and the difference is not cosmetic: a NULL flows on
+                // through a WHERE as "not true" and the row silently vanishes,
+                // where an error stops the statement. Rewritten here, on the
+                // BOUND tree, so the choice is a compile-time property that
+                // reaches the plan hash — never a flag consulted per row.
+                let op = match op {
+                    BinOp::Div if self.dialect == Dialect::Postgres => BinOp::DivStrict,
+                    BinOp::Mod if self.dialect == Dialect::Postgres => BinOp::ModStrict,
+                    other => other,
+                };
                 let (l, r, ty) = self.unify_operands(l, lt, r, rt, "arithmetic on")?;
                 if let Some(t) = ty {
                     // `Any` is admitted for the same reason comparison admits

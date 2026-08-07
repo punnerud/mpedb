@@ -196,6 +196,16 @@ pub(crate) enum BinOp {
     Mul,
     Div,
     Mod,
+    /// `/` and `%` bound under [`Dialect::Postgres`](mpedb_types::Dialect):
+    /// a zero divisor RAISES rather than yielding sqlite's NULL.
+    ///
+    /// BOUND-ONLY. The parser never produces these — the surface syntax is
+    /// `/` and `%` in both dialects, and the binder rewrites them once it
+    /// knows which dialect the session is in. That is the same shape `LIKE`
+    /// uses for case sensitivity: one syntax, two opcodes, the dialect
+    /// resolved at COMPILE time so it lands in the plan hash.
+    DivStrict,
+    ModStrict,
     Eq,
     Ne,
     Lt,

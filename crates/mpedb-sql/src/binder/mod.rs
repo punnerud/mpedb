@@ -179,6 +179,10 @@ fn op_symbol(op: BinOp) -> &'static str {
         BinOp::Mul => "*",
         BinOp::Div => "/",
         BinOp::Mod => "%",
+        // Same surface syntax — the OPCODE carries the dialect, exactly as
+        // with Like vs LikeCs. A reader of an EXPLAIN sees the SQL they wrote.
+        BinOp::DivStrict => "/",
+        BinOp::ModStrict => "%",
         BinOp::Eq => "=",
         BinOp::Ne => "<>",
         BinOp::Lt => "<",

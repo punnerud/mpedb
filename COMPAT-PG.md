@@ -221,11 +221,11 @@ real volume — see the notes below on why both of those qualifiers matter):
 
 | outcome | statements | share |
 |---|---:|---:|
-| **match** — both answered, identically | 9 182 | 22.6 % |
+| **match** — both answered, identically | 9 181 | 22.6 % |
 | **order-only** — same rows, different order, no `ORDER BY` asked | 20 | 0.0 % |
-| **both refused** — both errored | 7 454 | 18.4 % |
-| **refused** — PostgreSQL answered, mpedb refused by name | 20 819 | 51.3 % |
-| **DIVERGED** — both answered, differently | 3 101 | 7.6 % |
+| **both refused** — both errored | 7 474 | 18.4 % |
+| **refused** — PostgreSQL answered, mpedb refused by name | 20 829 | 51.3 % |
+| **DIVERGED** — both answered, differently | 3 072 | 7.6 % |
 
 Agreement (match + order-only + both-refused) is **41.0 %**. Divergence — the
 only number that means something is WRONG — is **7.6 %**.
@@ -368,7 +368,7 @@ are not that at all:
 | 27 | `invalid input syntax for type numeric` | **mpedb's sqlite CAST rule** |
 | 27 | `no schema has been selected to create in` | environment, not a question about mpedb |
 | 22 | `current transaction is aborted` | PostgreSQL's cascade again |
-| 22 | `division by zero` | **mpedb answering where PostgreSQL raises** |
+| 22 | `division by zero` | **FIXED** — see below |
 | 560 | 206 further reasons | a tail |
 
 So roughly 276 of the top are PostgreSQL declining because of something that
@@ -429,6 +429,50 @@ The rule the module is built on, stated because it is one edit away from being
 broken: **classifying never changes a verdict.** A classifier that recognises
 `character(n)` padding is two lines from a comparator that forgives it, and
 forgiving it would turn 19 wrong answers into 19 silent ones.
+
+### The first item off that list: division by zero
+
+sqlite yields NULL on a zero divisor; PostgreSQL raises 22012. The difference
+is not cosmetic — a NULL flows on through a `WHERE` as "not true", so the row
+silently vanishes and the caller sees a short result rather than an error.
+
+Fixed as two OPCODES, `Instr::DivStrict` / `Instr::ModStrict`, chosen by the
+binder when the session dialect is PostgreSQL (PLAN\_FORMAT 72). Not a flag
+read at eval time, and the reason is the one the LIKE family already gives:
+the dialect is a COMPILE-time property, so it has to reach the plan HASH. The
+plan registry is shared in the catalog and serves plans by hash to every
+attached process; a runtime flag would let a sqlite-dialect session execute a
+plan compiled with PostgreSQL's semantics — the same bytes meaning two things.
+
+sqlite loses nothing: `1/0` still folds to NULL, and there is a test that
+asserts both dialects in the same function rather than trusting that they were
+checked separately.
+
+**Measured: divergence 3 101 → 3 072.** 18 of the 29 became agreement
+(both engines refuse); the rest became named refusals, mostly in `float4`/
+`float8`, where mpedb's operand handling produces a zero divisor PostgreSQL
+never sees.
+
+**And one statement went the other way, which is the part worth reading.**
+`select_having.sql` lost a match:
+
+```sql
+-- and just to prove that we aren't scanning the table:
+SELECT 1 AS one FROM test_having WHERE 1/a = 1 HAVING 1 < 2;
+```
+
+PostgreSQL answers `1`. Its own comment says why: a degenerate aggregate with
+a constant `HAVING` and no `GROUP BY` returns one row WITHOUT scanning, so
+`1/a` is never evaluated and `a = 0` never divides. mpedb scans, and now
+raises.
+
+That match was a COINCIDENCE. mpedb was scanning all along; `1/0` gave NULL,
+the `a = 0` row was filtered out as not-true, and the `a = 1` row produced the
+same answer by a different route. The change did not take a capability away —
+it made a planner gap that was already there stop hiding behind a NULL. The
+gap is now its own item, which is the correct place for it. Same pattern as
+`'NaN'::numeric` and as `plpgsql.sql`: **a feature that works exposes an older
+one that does not, and the score moving the wrong way is how you find out.**
 
 ### The ranked work list
 

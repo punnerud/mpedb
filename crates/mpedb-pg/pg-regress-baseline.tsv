@@ -15,7 +15,7 @@ brin	13	0	10	36	0
 brin_bloom	3	0	11	24	0
 brin_multi	32	0	10	43	0
 btree_index	33	0	7	33	0
-case	39	1	0	19	2
+case	39	1	1	19	1
 char	16	0	2	4	10
 circle	10	0	0	6	6
 cluster	89	1	14	65	24
@@ -60,14 +60,14 @@ drop_operator	0	0	0	12	0
 encoding	23	0	24	20	0
 enum	32	0	10	101	26
 equivclass	22	0	0	37	0
-errors	3	0	71	1	11
+errors	3	0	82	1	0
 euc_kr	0	0	0	2	0
 event_trigger	33	0	25	115	1
 explain	15	0	15	11	0
 expressions	30	0	1	44	0
 fast_default	114	0	0	138	12
-float4	12	0	9	44	35
-float8	17	0	19	95	38
+float4	12	0	9	48	31
+float8	17	0	19	99	34
 foreign_data	80	0	131	324	3
 foreign_key	382	0	166	485	120
 functional_deps	15	0	10	11	4
@@ -95,7 +95,7 @@ insert	26	0	99	254	8
 insert_conflict	78	0	33	113	10
 int2	3	0	48	23	2
 int4	11	0	53	26	4
-int8	8	0	125	25	9
+int8	8	0	129	25	5
 interval	28	0	153	138	22
 join	248	8	130	132	6
 join_hash	157	0	1	94	1
@@ -120,7 +120,7 @@ merge	120	0	343	23	18
 misc	7	0	29	25	0
 misc_functions	7	0	38	54	4
 misc_sanity	1	0	0	2	2
-money	21	0	0	11	77
+money	21	0	1	11	76
 multirangetypes	43	0	38	440	83
 mvcc	8	0	1	2	0
 name	9	0	12	12	7
@@ -149,7 +149,7 @@ portals_p2	2	0	39	0	0
 prepare	0	0	15	18	0
 prepared_xacts	23	0	13	34	13
 privileges	188	0	348	287	149
-psql	99	0	54	245	19
+psql	99	0	54	246	18
 psql_crosstab	4	0	0	4	0
 publication	142	0	119	377	11
 random	1	0	0	13	0
@@ -170,7 +170,7 @@ security_label	8	0	8	12	0
 select	21	0	25	20	10
 select_distinct	27	0	10	22	0
 select_distinct_on	0	0	5	0	0
-select_having	18	0	1	0	4
+select_having	17	0	1	1	4
 select_implicit	28	0	6	8	2
 select_into	7	0	19	30	1
 select_parallel	12	0	140	15	14
@@ -196,7 +196,7 @@ time	12	0	4	15	13
 timestamp	10	0	14	129	4
 timestamptz	47	0	19	230	58
 timetz	4	0	6	39	8
-transactions	209	0	47	139	89
+transactions	209	0	50	139	86
 triggers	248	0	79	678	42
 truncate	60	0	15	96	22
 tsdicts	0	0	9	122	0
