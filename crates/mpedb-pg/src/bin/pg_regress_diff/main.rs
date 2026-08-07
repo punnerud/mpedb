@@ -43,6 +43,8 @@
 //! export MPEDB_PG_REGRESS=$PWD/postgresql-16.14/src/test/regress
 //! ```
 
+mod divergence;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -215,13 +217,14 @@ fn run(args: &[String]) -> Result<i32, String> {
     let mut totals = Counts::default();
     let mut per_file: Vec<(String, Counts)> = Vec::new();
     let mut causes: std::collections::HashMap<String, Cause> = std::collections::HashMap::new();
+    let mut diffs: std::collections::HashMap<String, Cause> = std::collections::HashMap::new();
     let mut cascade = Cascade::default();
     for f in &files {
         let name = f
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let c = diff_file(f, show, &mut causes, &mut cascade)?;
+        let c = diff_file(f, show, &mut causes, &mut diffs, &mut cascade)?;
         println!(
             "{name:<24} match {:<6} order-only {:<6} both-refused {:<6} refused {:<6} DIVERGED {}",
             c.matched, c.order_only, c.both_refused, c.refused, c.diverged
@@ -249,6 +252,33 @@ fn run(args: &[String]) -> Result<i32, String> {
         100.0 * f64::from(totals.diverged) / f64::from(n),
     );
 
+    if !diffs.is_empty() {
+        let mut ranked: Vec<(&String, &Cause)> = diffs.iter().collect();
+        ranked.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
+        let shown = 20.min(ranked.len());
+        // Printed FIRST, and above the refusal list, because it is the column
+        // that means something is WRONG. A refusal is a feature mpedb does not
+        // have; a divergence is an answer mpedb gets differently, and a reader
+        // scrolling one screen should meet that one.
+        println!(
+            "\nWHERE mpedb ANSWERS DIFFERENTLY — top {shown} of {} shapes, ranked.\n\
+             Both engines answered; the answers disagree. This is the only column \
+             that means something is wrong.",
+            ranked.len()
+        );
+        for (shape, c) in ranked.iter().take(shown) {
+            println!("  {:>6}  {}", c.count, shape);
+            if !c.example.trim().is_empty() {
+                let ex: String = c.example.chars().take(110).collect();
+                println!("          e.g. {ex}");
+            }
+        }
+        let tail: u32 = ranked.iter().skip(shown).map(|(_, c)| c.count).sum();
+        if tail > 0 {
+            println!("  {tail:>6}  … in {} further shapes", ranked.len() - shown);
+        }
+    }
+
     if !causes.is_empty() {
         let mut ranked: Vec<(&String, &Cause)> = causes.iter().collect();
         // Descending by count, then by shape so equal counts print stably.
@@ -275,6 +305,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         if tail > 0 {
             println!("  {tail:>6}  … in {} further causes", ranked.len() - shown);
         }
+        print_families(&ranked);
     }
 
     // The `unknown table` split, printed whenever there is one to print.
@@ -522,6 +553,66 @@ struct Cause {
     example: String,
 }
 
+/// Record one divergence shape.
+///
+/// Same container as the refusal causes on purpose: the two lists want the
+/// same ranking, the same "top N plus a tail", and the same discipline that a
+/// key groups while an example illustrates. A second bespoke struct would have
+/// drifted from the first within a round.
+/// The FAMILY totals for the buckets that are deliberately split by name.
+///
+/// Splitting `unknown function` and `table function in FROM` by name is what
+/// turned two collapsed lines into work lists — and it threw away the number a
+/// collapsed line was good at: how big the family is. Both readings are needed
+/// and they answer different questions. The family says how much a whole
+/// SUBSYSTEM is worth; the split says whether that total is one item or a tail,
+/// and therefore whether the total is reachable at all.
+///
+/// `table function in FROM` is the case that proves it. Collapsed, it read as
+/// ~950 statements of "table functions" — one feature. Split, its LARGEST
+/// member is `check_estimated_rows`, a plpgsql helper the corpus defines for
+/// its own use and that nothing will ever implement as a builtin. The family
+/// total is real; the share of it a table-function planner would collect is
+/// not, and only both numbers together say so.
+fn print_families(ranked: &[(&String, &Cause)]) {
+    const FAMILIES: &[&str] = &["unknown function `", "table function in FROM `"];
+    for fam in FAMILIES {
+        let members: Vec<&(&String, &Cause)> =
+            ranked.iter().filter(|(k, _)| k.starts_with(fam)).collect();
+        if members.is_empty() {
+            continue;
+        }
+        let total: u32 = members.iter().map(|(_, c)| c.count).sum();
+        let biggest = members.iter().map(|(_, c)| c.count).max().unwrap_or(0);
+        let name = fam.trim_end_matches(" `").trim_end_matches('`');
+        println!(
+            "\n  FAMILY `{name}`: {total} refusals over {} distinct names; \
+             biggest single name {biggest} ({:.0}% of the family).",
+            members.len(),
+            100.0 * f64::from(biggest) / f64::from(total.max(1))
+        );
+        for (k, c) in members.iter().take(6) {
+            println!("      {:>6}  {}", c.count, k);
+        }
+        if members.len() > 6 {
+            let rest: u32 = members.iter().skip(6).map(|(_, c)| c.count).sum();
+            println!("      {rest:>6}  … {} further names", members.len() - 6);
+        }
+    }
+}
+
+fn note(map: &mut std::collections::HashMap<String, Cause>, s: divergence::Shape) {
+    let e = map.entry(s.key).or_insert_with(|| Cause {
+        code: "-".into(),
+        example: s.example.clone(),
+        ..Cause::default()
+    });
+    e.count += 1;
+    if e.example.is_empty() {
+        e.example = s.example;
+    }
+}
+
 #[derive(PartialEq, Debug, Clone)]
 struct ErrText {
     code: String,
@@ -532,6 +623,7 @@ fn diff_file(
     path: &Path,
     show: bool,
     causes: &mut std::collections::HashMap<String, Cause>,
+    diffs: &mut std::collections::HashMap<String, Cause>,
     cascade: &mut Cascade,
 ) -> Result<Counts, String> {
     // Two of the corpus files are deliberately NOT UTF-8 (`collate.windows.
@@ -650,16 +742,43 @@ fn diff_file(
             // PostgreSQL refusing what mpedb ACCEPTS is also a divergence: mpedb
             // answered a question PostgreSQL declined, which is a wrong answer in
             // the direction nobody looks for.
-            (Some(Outcome::Error(_)), Some(Outcome::Rows(_))) => c.diverged += 1,
+            (Some(Outcome::Error(_)), Some(Outcome::Rows(y))) => {
+                c.diverged += 1;
+                note(diffs, divergence::pg_refused_mpedb_answered(y));
+            }
             (Some(Outcome::Rows(x)), Some(Outcome::Rows(y))) => match compare(x, y, stmt) {
                 Verdict::Same => c.matched += 1,
                 Verdict::OrderOnly => c.order_only += 1,
-                Verdict::Different => c.diverged += 1,
+                Verdict::Different => {
+                    c.diverged += 1;
+                    // Classify AFTER the verdict, never instead of it — see
+                    // `divergence`'s module docs on why that ordering is the
+                    // whole safety property.
+                    note(
+                        diffs,
+                        divergence::classify(
+                            &rows(x),
+                            &rows(y),
+                            has_top_level_order_by(stmt),
+                        ),
+                    );
+                }
             },
             // A transcript that ran short means one engine stopped answering —
             // counted as a divergence rather than skipped, because silently
             // dropping the tail is how a file scores well by dying early.
-            _ => c.diverged += 1,
+            (None, Some(_)) => {
+                c.diverged += 1;
+                note(diffs, divergence::transcript_ended_early("PostgreSQL"));
+            }
+            (Some(_), None) => {
+                c.diverged += 1;
+                note(diffs, divergence::transcript_ended_early("mpedb"));
+            }
+            _ => {
+                c.diverged += 1;
+                note(diffs, divergence::transcript_ended_early("both"));
+            }
         }
     }
     Ok(c)
@@ -687,12 +806,10 @@ enum Verdict {
 /// way to tell the two apart from outside. The over-report is visible in the
 /// `DIVERGED` column and named here rather than silently corrected.
 fn compare(pg: &str, mp: &str, stmt: &str) -> Verdict {
-    let (a, b) = (normalise(pg), normalise(mp));
-    if a == b {
+    let (mut la, mut lb) = (rows(pg), rows(mp));
+    if la == lb {
         return Verdict::Same;
     }
-    let mut la: Vec<&str> = a.lines().collect();
-    let mut lb: Vec<&str> = b.lines().collect();
     if la.len() != lb.len() {
         return Verdict::Different;
     }
@@ -746,20 +863,23 @@ fn has_top_level_order_by(stmt: &str) -> bool {
     false
 }
 
-/// Differences that are formatting rather than answers.
+/// A transcript as ROWS, with the only difference that is formatting removed.
 ///
 /// Kept to the minimum that is defensible. Trailing whitespace and a trailing
 /// newline are psql's layout, not the engine's answer. Nothing else is
 /// normalised — in particular, numbers are NOT reformatted, because a float
 /// printed differently IS a different answer and hiding it here would be the
 /// exact self-deception this harness exists to prevent.
-fn normalise(s: &str) -> String {
-    s.lines()
-        .map(|l| l.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim_end()
-        .to_string()
+///
+/// A `Vec` of rows rather than a rejoined `String`, and that is a FIX rather
+/// than a tidy-up. Rejoining collapsed one distinction psql draws precisely:
+/// a result of ONE EMPTY ROW is `"\n"` and a result of NO ROWS is `""`, and
+/// `lines().join("\n")` maps both to `""`. The harness then called them equal
+/// — a false MATCH, in the direction that flatters the score. Splitting into
+/// rows and never rejoining keeps the count, which is the whole content of
+/// that distinction.
+fn rows(s: &str) -> Vec<&str> {
+    s.lines().map(str::trim_end).collect()
 }
 
 /// The marker psql echoes between statements so one batch can be split back
@@ -1035,6 +1155,24 @@ fn cause_key(msg: &str) -> String {
         let rest = &msg[at + MARK.len()..];
         if let Some(name) = rest.split('`').next() {
             return format!("unknown function `{name}`");
+        }
+    }
+    // The table-function bucket, for the fifth time in this file's history and
+    // for the same reason. `\`f(…)\` is a table function in FROM position` is
+    // ONE line of ~950 with one example under it, and the example (`unnest`)
+    // is one arbitrary member. The NAME is the whole content: `unnest` needs an
+    // array type, `generate_series` in a non-first position needs a join-side
+    // row source, and `rngfunct` is a corpus-local PL/pgSQL function that will
+    // never be implemented. Those are three different jobs and one number.
+    const TF: &str = "is a table function in FROM position";
+    if let Some(at) = msg.find(TF) {
+        // The name is the backticked token before the marker: `f(…)`.
+        let before = &msg[..at];
+        if let Some(open) = before.rfind('`') {
+            if let Some(start) = before[..open].rfind('`') {
+                let name = &before[start + 1..open];
+                return format!("table function in FROM `{name}`");
+            }
         }
     }
     // `expected \`X\`` — the parser's other catch-all. WHAT it expected is the
@@ -1544,6 +1682,25 @@ SELECT 1;"), vec!["select 10 as a", "SELECT 1"]);
             cause_key("SQL parse error at byte 22: unexpected trailing input `Ident(\"cascade\")`"),
             "unexpected trailing input `Ident(\"cascade\")`"
         );
+        // The table-function bucket keeps its name for the same reason — three
+        // different jobs (an array type, a join-side row source, a corpus-local
+        // function nobody will implement) were one line.
+        assert_eq!(
+            cause_key(
+                "SQL parse error at byte 14: `unnest(…)` is a table function in FROM \
+                 position, and mpedb has no table-function planner — it produces rows \
+                 from an array or JSON value"
+            ),
+            "table function in FROM `unnest(…)`"
+        );
+        assert_eq!(
+            cause_key(
+                "SQL parse error at byte 14: `generate_series(…)` is a table function in \
+                 FROM position, and mpedb has no table-function planner — mpedb generates \
+                 it in the FIRST `FROM` position only"
+            ),
+            "table function in FROM `generate_series(…)`"
+        );
         // Everything else still collapses, or the list is 20 000 lines long.
         assert_eq!(
             cause_key("bind error: unknown table `minmaxtest1`"),
@@ -1634,6 +1791,24 @@ SELECT 1;"), vec!["select 10 as a", "SELECT 1"]);
             compare("a|1\nb|2", "a|1", "SELECT x FROM t"),
             Verdict::Different
         ));
+    }
+
+    /// One empty row is not no rows.
+    ///
+    /// psql spells the difference exactly — `SELECT ''` prints `"\n"` and
+    /// `SELECT 1 WHERE false` prints `""` — and the old normaliser rejoined
+    /// rows with `"\n"`, which maps both to `""`. The harness then scored
+    /// them as a MATCH. Narrow, and in the one direction that matters: it
+    /// could only ever turn a wrong answer into agreement, never the reverse.
+    #[test]
+    fn a_single_empty_row_does_not_match_no_rows_at_all() {
+        assert!(matches!(compare("\n", "", "SELECT ''"), Verdict::Different));
+        assert!(matches!(compare("", "\n", "SELECT ''"), Verdict::Different));
+        // Two empty rows against one is the same question one row further on.
+        assert!(matches!(compare("\n\n", "\n", "SELECT ''"), Verdict::Different));
+        // …and the trailing newline psql always writes is still not an answer.
+        assert!(matches!(compare("a|1\n", "a|1", "SELECT x FROM t"), Verdict::Same));
+        assert!(matches!(compare("", "", "SELECT 1 WHERE false"), Verdict::Same));
     }
 
     #[test]

@@ -210,25 +210,36 @@ Fidelity notes worth knowing:
 
 ### The differential against PostgreSQL 16.14
 
-`crates/mpedb-pg/src/bin/pg_regress_diff.rs` sends each of PostgreSQL's own
+`crates/mpedb-pg/src/bin/pg_regress_diff/` sends each of PostgreSQL's own
 `src/test/regress/sql/*.sql` through BOTH a throwaway PG 16.14 cluster and
 mpedb, and diffs the two transcripts **against each other**. The `.out` files
 are not used at all — they carry PostgreSQL's error wording, OID numbering and
 `EXPLAIN` output, none of which mpedb can or should reproduce.
 
-**Full run, all 222 files, 40 474 statements** (PostgreSQL 16.14, measured on a
+**Full run, all 222 files, 40 576 statements** (PostgreSQL 16.14, measured on a
 real volume — see the notes below on why both of those qualifiers matter):
 
 | outcome | statements | share |
 |---|---:|---:|
-| **match** — both answered, identically | 9 132 | 22.6 % |
+| **match** — both answered, identically | 9 182 | 22.6 % |
 | **order-only** — same rows, different order, no `ORDER BY` asked | 20 | 0.0 % |
-| **both refused** — both errored | 7 653 | 18.9 % |
-| **refused** — PostgreSQL answered, mpedb refused by name | 20 595 | 50.9 % |
-| **DIVERGED** — both answered, differently | 3 074 | 7.6 % |
+| **both refused** — both errored | 7 454 | 18.4 % |
+| **refused** — PostgreSQL answered, mpedb refused by name | 20 819 | 51.3 % |
+| **DIVERGED** — both answered, differently | 3 101 | 7.6 % |
 
-Agreement (match + order-only + both-refused) is **41.5 %**. Divergence — the
+Agreement (match + order-only + both-refused) is **41.0 %**. Divergence — the
 only number that means something is WRONG — is **7.6 %**.
+
+**One of those matches was not a match, and a class of them never could be.**
+psql spells the difference between a result of ONE EMPTY ROW (`"\n"`) and a
+result of NO ROWS (`""`) exactly. The normaliser split transcripts into lines
+and rejoined them with `"\n"`, which maps both to `""` — so the harness scored
+that pair as agreement. It is closed by keeping the transcript as ROWS and
+never rejoining. The hole was narrow and it ran in exactly one direction: it
+could only ever turn a wrong answer into a match, never the reverse. How often
+the corpus hit it is not claimed here — the two runs either side of the fix
+also moved by the corpus's own nondeterminism, and separating the two was not
+possible after the fact.
 
 Run to run the totals move by a handful of statements (a `match` here, a
 `both-refused` there). That is the corpus's own nondeterminism — OIDs, `now()`,
@@ -315,27 +326,86 @@ measurement tool that can be stopped by the thing it measures cannot finish, and
 an unfinished run measures nothing. The hang is open; a hang is the same class
 of contract violation as a panic.
 
+### The divergence work list — the column that means WRONG
+
+For every round until this one, `diverged` was one number. `refused` had a
+ranked cause list that rewrote the roadmap twice; the column that means an
+answer is WRONG had nothing — not even an example. The harness now classifies
+each divergence by the shape of the DIFFERENCE (`divergence.rs`), and ranks it
+the same way:
+
+| statements | shape |
+|---:|---|
+| **1 061** | **mpedb ANSWERED what PostgreSQL refused** |
+| 628 | text values differ (the residual catch-all) |
+| 518 | row count: mpedb returned **NO** rows |
+| 131 | row count: mpedb returned MORE rows |
+| 106 | integers that are not equal |
+| 105 | row count: mpedb returned FEWER rows |
+| 83 | one side empty, the other not |
+| 73 | PostgreSQL returned no rows, mpedb returned some |
+| 49 | same number, different rendering |
+| 37 | one side is infinity or NaN, the other is not |
+| 49 | NULL against a value (26 PG-NULL, 23 mpedb-NULL) |
+| 19 | row ORDER differs **under an explicit `ORDER BY`** |
+| 19 | trailing spaces — PostgreSQL PADS (`character(n)`), mpedb does not |
+| 32 | field-count and float-precision shapes |
+
+**A third of the wrong answers are mpedb accepting what PostgreSQL rejects.**
+1 061 of 3 101. That is the direction nobody looks for — every other line is
+mpedb getting a question wrong, and this one is mpedb taking a question that
+should have been refused. It is also the direction in which "improving
+compatibility" makes things worse, which this document already warned about in
+the abstract (`EXPLAIN`, `COPY`) without knowing it was the largest item.
+
+**Second, 518 statements where mpedb answers with NO ROWS.** A feature that
+silently returns nothing is worse than one that refuses: a refusal is visible
+in the refusal column and in the caller's error handler, and an empty result
+looks like data.
+
+**Third, 19 statements where mpedb returns the right rows in the wrong order
+under an explicit `ORDER BY`.** That class could not exist as a separate line
+before — without an `ORDER BY` the comparator correctly calls a reordering
+agreement, so the ones that DID ask were mixed in with wrong values.
+
+Two of the classifier's own labels were wrong in its first run, and both were
+the same mistake: **giving the largest possible disagreement a reassuring
+name.** `infinity` vs `0` was reported as "agree to ~1e-12", because
+`(inf − 0).abs() <= inf * 1e-12` is true. `9223372036854775808` vs
+`9223372036854776000` was reported as "same number, different rendering",
+because two different integers share one `f64`. A classifier is allowed to be
+coarse; it is not allowed to launder. Integers are now compared as integers
+before the float path sees them, and non-finite values never reach the
+tolerance test.
+
+The rule the module is built on, stated because it is one edit away from being
+broken: **classifying never changes a verdict.** A classifier that recognises
+`character(n)` padding is two lines from a comparator that forgives it, and
+forgiving it would turn 19 wrong answers into 19 silent ones.
+
 ### The ranked work list
 
 The harness records mpedb's SQLSTATE and message for every statement PostgreSQL
 answered and mpedb refused, groups them by SHAPE (anything quoted → `_`, digit
-runs → `N`) and ranks them. **393 distinct causes over 20 684 refusals** — the
+runs → `N`) and ranks them. **1 392 distinct causes over 20 819 refusals** — the
 cause list got FINER as the refusals themselves got more specific, which is the
 point of naming a refusal. The top, with a real example under each:
 
 | refusals | SQLSTATE | cause | example |
 |---:|---|---|---|
-| 1 875 | 42P01 | unknown table | **86 % CASCADE** from an earlier failed `CREATE` — counted, see below. ~260 is the real content |
-| **1 369** | 42601 | **declarative partitioning** | `PARTITION BY` / `PARTITION OF` / `ATTACH PARTITION` — one message, gathered from three |
-| 1 075 | 42601 | unexpected character `\` | psql meta-commands the harness passes through |
-| 946 | 42601 | **table function in `FROM`** | `unnest(…)`, `rngfunct(1) WITH ORDINALITY` — `generate_series` in the first `FROM` position now EXECUTES |
-| 921 | 42601 | parse: `expected …` | ``expected `TABLE` `` — `CREATE <thing the DDL grammar does not know>` |
-| 790 | 25P02 | transaction aborted | cascade from an earlier failure inside a block |
-| 604 | 42601 | parse: `expected )` closing the argument list | |
-| 483 | 42601 | parse: expected an expression | |
-| 418 | 42601 | `ALTER TABLE … ROW LEVEL SECURITY` | other `ALTER TABLE` forms |
-| 316 | 42601 | parse: `expected (` | |
-| ~2 150 | 42883 | unknown function — **404 DISTINCT names**, biggest 127 | a long tail, scattered below the cutoff; see below |
+| 2 056 | 42P01 | unknown table | **79 % CASCADE** from an earlier failed `CREATE` — counted, see below. 551 is the real content |
+| **1 386** | 42601 | **declarative partitioning** | `PARTITION BY` / `PARTITION OF` / `ATTACH PARTITION` — one message, gathered from three |
+| 831 | 42601 | containment / jsonb-path operators | `@>`, `<@`, `@?`, `@@` — one message, named |
+| 754 | 25P02 | transaction aborted | cascade from an earlier failure inside a block |
+| 493 | 42601 | parse: `expected )` closing the argument list | |
+| 439 | 42601 | parse: expected an expression | |
+| 397 | 42P01 | `DROP TABLE`: no such table | mostly cascade, same shape as row 1 |
+| 380 | 42601 | table function `check_estimated_rows(…)` | a plpgsql helper the CORPUS defines — see the family table below |
+| 318 | 42601 | parse: `expected (` | |
+| 281 | 42601 | empty quoted identifier | |
+| 278 | 42601 | array / row constructors | `ARRAY[…]`, `ARRAY(SELECT …)`, `ROW(…)` |
+| **2 169** | 42883 | unknown function — **404 DISTINCT names**, biggest 127 | a long tail; the FAMILY total, see below |
+| **969** | 42601 | table functions in `FROM` — **107 names**, biggest 380 | the FAMILY total, see below |
 
 **Partitioning is the second-largest item in the corpus, and nothing said so
 until the messages were fixed.** `PARTITION BY`, `PARTITION OF` and `ATTACH
@@ -344,14 +414,42 @@ PARTITION` each landed on whichever check the parser happened to reach last —
 ENABLE, FORCE, or DISABLE ROW LEVEL SECURITY", which is a message about a
 different feature entirely. Three of the four spellings pointed the reader
 somewhere useless, and the work list read the whole thing as a scatter of
-punctuation problems. One named refusal gathers 1 369 statements: `expected (`
+punctuation problems. One named refusal gathers 1 386 statements: `expected (`
 fell 1 098 → 316, the RLS message 656 → 418, and the `PARTITION` tail to zero.
 
 The totals did not move, and that is correct — these are refusals either way.
 What changed is that the second-biggest job in the corpus is now visible as one.
 
-**Four times now, one number has stood for a population nobody had looked
-inside, and four times the reading was wrong while the number was right.**
+**A split needs its family total back, and the table-function bucket is why.**
+
+Splitting `unknown function` by name turned one line into a work list. Doing
+the same to `table function in FROM` did too — and the result says the opposite
+of what the collapsed line said:
+
+| family | refusals | distinct names | biggest single name |
+|---|---:|---:|---|
+| `unknown function` | 2 169 | 404 | `pg_input_is_valid()` — 127 (6 %) |
+| `table function in FROM` | 969 | 107 | `check_estimated_rows()` — **380 (39 %)** |
+
+`check_estimated_rows` is not a function anyone will implement. It is a
+plpgsql helper the corpus **defines for its own use** in `stats_ext.sql`, and
+39 % of the "table functions" bucket is calls to it. So a table-function
+planner does not collect 969 statements; it collects them only in the company
+of `LANGUAGE plpgsql … RETURNS TABLE`, which is a different item on this list
+(35 row-returning functions in the plpgsql frontend's own reasons). The second
+and third names — `pg_input_error_info` (110) and `json_populate_record` (57) —
+need a record type and a JSON expander respectively. Three jobs, one line.
+
+But the split also DELETED a number the collapsed line was good at: how big the
+family is. Both readings answer different questions — the family says what a
+whole subsystem is worth, the split says whether that total is one item or a
+tail, and therefore whether the total is reachable at all. The report now
+prints both, and that is the general rule: **a bucket split by name needs a
+family rollup, or the next reader reconstructs the wrong total by adding up the
+top few lines.**
+
+**Five times now, one number has stood for a population nobody had looked
+inside, and five times the reading was wrong while the number was right.**
 
 | the line | what it looked like | what it was |
 |---|---|---|
@@ -359,6 +457,7 @@ inside, and four times the reading was wrong while the number was right.**
 | `unexpected trailing input` 1 933 | statement-tail keywords (`CASCADE`) | PARTITION; the corpus has 48 CASCADEs |
 | tail `TIME` 150 | a type-name gap | `AT TIME ZONE`, swallowed as an alias |
 | `unknown table` 1 875 | the #1 item | 86 % shadow of the items below it |
+| `table function in FROM` 969 | one feature: table functions | 107 names; 39 % is ONE corpus-local plpgsql helper |
 
 None of those counts was wrong. The INTERPRETATION was, every time, and always
 for the same reason: an aggregate with one example under it reads as a
@@ -460,11 +559,19 @@ panics. The ranked reasons are the work list — 98 `RETURNS trigger`, 45
 `RAISE`, 35 row-returning (`SETOF`/`TABLE`), 14 cursors, 11 `OUT` parameters.
 
 `plpgsql.sql` moved 240 → 254 match and 542 → 517 refused. Its divergences rose
-32 → 51, and those are NOT the frontend being wrong: they are `character(20)`
-columns, which PostgreSQL pads with trailing spaces and mpedb stores unpadded.
-The statements simply reach further into the file now. Same pattern as the
-`'NaN'::numeric` case — a feature that works exposes an older gap, and saying
-so is the point of counting divergence separately.
+32 → 51, and those are NOT the frontend being wrong: the statements simply
+reach further into the file now. Same pattern as the `'NaN'::numeric` case — a
+feature that works exposes an older gap, and saying so is the point of counting
+divergence separately.
+
+> **Correction, once the divergence column was classified rather than
+> described.** This paragraph used to attribute those 51 to `character(20)`
+> padding — PostgreSQL pads, mpedb stores unpadded. Padding is real and it is
+> **19 statements in the whole corpus**, 0.6 % of the divergence column. The
+> claim was reasonable, unmeasured, and wrong by two orders of magnitude, and
+> it is the same mistake this document catalogues below for the *refusal*
+> column: an example read as a description. The list built to catch it in one
+> column had not been pointed at the other.
 
 **The biggest line in that table is mostly a SHADOW of the lines below it, and
 that is now counted rather than claimed.**
@@ -472,15 +579,19 @@ that is now counted rather than claimed.**
 `unknown table` sat at #1 in every measurement this session. The harness now
 remembers, per file, which `CREATE TABLE`s mpedb refused, and classifies each
 later `unknown table X` as a CONSEQUENCE (the create was refused earlier in the
-same file) or an INDEPENDENT gap. Over the 40 heaviest files — 23 072 of 40 474
-statements, holding 1 487 of the refusals:
+same file) or an INDEPENDENT gap. Over the WHOLE corpus — all 222 files, no
+subset and no extrapolation:
 
-> **1 275 of 1 487 are consequences (86 %); 212 are not.**
+> **2 103 of 2 654 are consequences (79 %); 551 are not.**
 
 So the corpus's largest single item is largely the second-order cost of the
-refusals ranked above it. Fixing those removes it; it is not its own job.
-Scaled, the real content is around 260 — which puts it BELOW partitioning
-(1 369), psql meta-commands (1 075) and table functions in `FROM` (946).
+refusals ranked above it. Fixing those removes it; it is not its own job. The
+real content is **551**, which puts it below partitioning (1 386) and level
+with the containment/jsonb-path operators (831). An earlier round measured this
+over the 40 heaviest files and scaled — 86 %, ~260 — and both the share and the
+remainder moved once it was measured on everything. The extrapolation was
+directionally right and quantitatively wrong, which is the ordinary fate of an
+extrapolation from the heaviest members of a skewed population.
 
 The name extractor is a text scan rather than a parse, deliberately: the
 statement already failed to parse in at least one engine, so a parser is the
@@ -491,9 +602,8 @@ spelling the corpus uses AND against `CREATE INDEX`/`VIEW`/`FUNCTION`, because a
 false positive there would quietly inflate the consequence bucket and flatter
 the split.
 
-Caveat, stated rather than buried: 40 files of 222. The subset is the heaviest
-by refusal count — where the bucket actually lives — which is deliberate, not
-random, and not the same as the whole corpus.
+(The caveat that used to sit here — "40 files of 222, chosen as the heaviest" —
+is retired: the split runs over every file now.)
 
 The same list is what produced the `EXPLAIN` exclusion above — and that one is
 worth stating as a general rule, because it is the failure mode a coverage

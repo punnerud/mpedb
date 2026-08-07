@@ -44,4 +44,4 @@ path = "src/bin/mpedb_pg.rs"
 # it is driven by hand at named commits — not on every `cargo test`.
 [[bin]]
 name = "pg_regress_diff"
-path = "src/bin/pg_regress_diff.rs"
+path = "src/bin/pg_regress_diff/main.rs"
