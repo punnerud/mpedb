@@ -632,12 +632,43 @@ repro403   HUNG after 120s at statement 403 of 403
            stuck on: COMMIT
 ```
 
-403 statements is not minimal, and the seven statements around the `COMMIT`
-extracted on their own do NOT hang: the block that stalls is
-`BEGIN; INSERT (violates a DEFERRABLE FK); UPDATE (of a primary key); COMMIT`,
-and it only stalls given the schema the 400 statements before it built. Which
-is worth stating plainly, because the tempting next move — "extract the
-statements and reduce" — was tried and produced a file that runs clean.
+From there the reproducer shrank to **five statements**:
+
+```sql
+CREATE TEMP TABLE t ( id int primary key, fk int );
+BEGIN;
+INSERT INTO t VALUES (0, 20);
+UPDATE t SET id = id + 1;      -- fails: cannot update primary key column
+COMMIT;                        -- HANGS
+```
+
+Remove any one ingredient and it runs: a MAIN table instead of `TEMP` is fine,
+one write instead of two is fine, a second write that SUCCEEDS is fine. The
+foreign key is irrelevant — the version with no `REFERENCES` at all hangs too —
+and so is `DEFERRABLE`, which is where the trail started and where it would
+have stayed without reducing.
+
+It points at the TEMP schema. A temp table lives in an ATTACHED member
+(`multifile.rs`), `commit_block` opens ONE `WriteSession` on the main database
+and replays the log into it, and a statement touching only the member forwards
+to that member's own handle. `multifile.rs`'s own module docs say that
+"cross-file statements inside an open `WriteSession`" are **refused by name**.
+That refusal does not cover this path, and instead of a refusal the second
+write stops.
+
+**Two false trails, both from the instrument, both worth writing down:**
+
+1. The shrink ran CONCURRENTLY with a full `cargo test --workspace`. The
+   watchdog measures WALL CLOCK. Every result from that window was
+   uninterpretable and had to be thrown away — the same rule as any A/B whose
+   arms do not share a host, applied to a timeout.
+2. The reduction script used `timeout 70` around a harness whose watchdog is
+   120 s. A hang was killed before it could be reported and read as a PASS.
+   Four "this ingredient is not needed" conclusions were wrong.
+
+Both are caught by the same thing, and it is now in the script: **a null
+control in the same batch — a case KNOWN to hang.** An instrument that cannot
+be shown to detect the effect is not evidence of its absence.
 
 ### The ranked work list
 
