@@ -117,6 +117,19 @@ pub struct Options {
 impl<S: Read + Write> Session<S> {
     pub fn new(io: S, opts: Options) -> Session<S> {
         let pid = std::process::id() as i32;
+        // A v3-protocol client IS talking to PostgreSQL, and PostgreSQL has no
+        // `PRAGMA foreign_keys`: referential integrity is not optional there.
+        // mpedb's default is sqlite's — OFF, the only default that leaves an
+        // existing file's behaviour unchanged — which over this protocol means
+        // a client's `REFERENCES` is accepted and then not enforced. That is a
+        // wrong answer, and one no v3 client has a way to ask about.
+        //
+        // Set on the CONNECTION, not on the database: this is the same
+        // per-connection pragma `PRAGMA foreign_keys = ON` flips, so a
+        // sqlite-dialect process attached to the same file keeps its own
+        // setting. The wire protocol decides for its own connections and for
+        // nothing else.
+        opts.db.set_fk_enforced(true);
         Session {
             io,
             db: opts.db,

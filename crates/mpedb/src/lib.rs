@@ -4634,7 +4634,10 @@ impl WriteSession<'_> {
                     self.txn.create_table(sh)?;
                 }
             }
-            DdlStmt::DropTable { name, if_exists } => {
+            // `cascade` is not consulted on this path: it is the WriteSession
+            // (explicit-transaction) form, and the orphan-row refusal it would
+            // suppress lives on the autocommit path in `apply_drop_table`.
+            DdlStmt::DropTable { name, if_exists, cascade: _ } => {
                 let id = match schema.schema.table_id(&name) {
                     Some(id) => id,
                     None => {

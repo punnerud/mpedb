@@ -1253,7 +1253,12 @@ impl Database {
         Ok(ExecResult::Affected(0))
     }
 
-    pub(crate) fn apply_drop_table(&self, name: &str, if_exists: bool) -> Result<ExecResult> {
+    pub(crate) fn apply_drop_table(
+        &self,
+        name: &str,
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<ExecResult> {
         // Resolve the name against a fresh schema view (another process may have
         // created/dropped since our last statement). The write txn re-checks the
         // gen and `drop_table` re-validates the id against its own captured
@@ -1272,7 +1277,11 @@ impl Database {
         // (measured, 3.45.1: dropping a parent with live children fails), so a
         // table something still points at cannot go. Checked here rather than
         // per row because the answer is the same for all of them.
-        if self.fk_enforced() {
+        // `CASCADE` says drop it anyway. PostgreSQL means "drop the dependent
+        // CONSTRAINT too"; mpedb leaves the child's key definition dangling,
+        // which is sqlite's answer and the one that already happens when
+        // enforcement is off — the child's next write says `no such table`.
+        if self.fk_enforced() && !cascade {
             let bundle = self.engine.schema();
             let sc = &bundle.schema;
             if let Some(t) = sc.tables.iter().find(|t| t.id == id && !t.dead) {
@@ -1564,8 +1573,8 @@ impl Database {
                     self.create_function(crate::spellfn::SpellLang::PlPgSql, &source)?;
                 return Ok(ExecResult::Affected(0));
             }
-            DdlStmt::DropTable { name, if_exists } => {
-                return self.apply_drop_table(&name, if_exists);
+            DdlStmt::DropTable { name, if_exists, cascade } => {
+                return self.apply_drop_table(&name, if_exists, cascade);
             }
             DdlStmt::AlterRenameTable { table, new_name } => {
                 return self.apply_alter_rename(&table, |w, id| w.alter_rename_table(id, &new_name));

@@ -259,7 +259,15 @@ pub enum DdlStmt {
     /// a catalog mutation: the slot is tombstoned in place and its id is never
     /// reused (DESIGN-DROP-TABLE §0). `if_exists` suppresses the missing-table
     /// error, matching sqlite/PG.
-    DropTable { name: String, if_exists: bool },
+    /// `cascade` is PostgreSQL's `DROP TABLE t CASCADE`: drop `t` even though
+    /// something still points at it. It changes ONE thing — the orphan-row
+    /// refusal that `PRAGMA foreign_keys = ON` imposes — and it is not
+    /// PostgreSQL's full meaning, which also drops the dependent CONSTRAINT.
+    /// mpedb leaves the child's key definition in place and DANGLING, which is
+    /// sqlite's behaviour and is already what happens when a parent is dropped
+    /// with enforcement off: the child's next write says `no such table`.
+    /// Stated rather than glossed, because the difference is visible.
+    DropTable { name: String, if_exists: bool, cascade: bool },
     /// `ALTER TABLE <t> RENAME TO <new>` (#47 stage 5) — pure schema metadata,
     /// no data rewrite (same id, same trees). Applied by the facade.
     AlterRenameTable { table: String, new_name: String },
@@ -706,11 +714,47 @@ mod tests {
     fn drop_table_parses() {
         assert_eq!(
             parse_ddl("DROP TABLE orders").unwrap().unwrap(),
-            DdlStmt::DropTable { name: "orders".into(), if_exists: false }
+            DdlStmt::DropTable {
+                name: "orders".into(),
+                if_exists: false,
+                cascade: false
+            }
         );
         assert_eq!(
             parse_ddl("DROP TABLE IF EXISTS orders").unwrap().unwrap(),
-            DdlStmt::DropTable { name: "orders".into(), if_exists: true }
+            DdlStmt::DropTable {
+                name: "orders".into(),
+                if_exists: true,
+                cascade: false
+            }
+        );
+        // PostgreSQL's dependency words parse, and only CASCADE changes
+        // anything. Refusing them left the table STANDING, which made the
+        // file's next CREATE of that name a duplicate and every statement
+        // after it point at the wrong table.
+        assert_eq!(
+            parse_ddl("DROP TABLE orders CASCADE").unwrap().unwrap(),
+            DdlStmt::DropTable {
+                name: "orders".into(),
+                if_exists: false,
+                cascade: true
+            }
+        );
+        assert_eq!(
+            parse_ddl("DROP TABLE orders RESTRICT").unwrap().unwrap(),
+            DdlStmt::DropTable {
+                name: "orders".into(),
+                if_exists: false,
+                cascade: false
+            }
+        );
+        assert_eq!(
+            parse_ddl("DROP TABLE IF EXISTS orders CASCADE").unwrap().unwrap(),
+            DdlStmt::DropTable {
+                name: "orders".into(),
+                if_exists: true,
+                cascade: true
+            }
         );
     }
 

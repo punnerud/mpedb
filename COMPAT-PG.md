@@ -221,13 +221,13 @@ real volume — see the notes below on why both of those qualifiers matter):
 
 | outcome | statements | share |
 |---|---:|---:|
-| **match** — both answered, identically | 9 180 | 22.6 % |
+| **match** — both answered, identically | 9 277 | 22.9 % |
 | **order-only** — same rows, different order, no `ORDER BY` asked | 20 | 0.0 % |
-| **both refused** — both errored | 7 486 | 18.4 % |
-| **refused** — PostgreSQL answered, mpedb refused by name | 20 829 | 51.3 % |
-| **DIVERGED** — both answered, differently | 3 059 | 7.5 % |
+| **both refused** — both errored | 7 502 | 18.5 % |
+| **refused** — PostgreSQL answered, mpedb refused by name | 20 727 | 51.1 % |
+| **DIVERGED** — both answered, differently | 3 050 | 7.5 % |
 
-Agreement (match + order-only + both-refused) is **41.0 %**. Divergence — the
+Agreement (match + order-only + both-refused) is **41.4 %**. Divergence — the
 only number that means something is WRONG — is **7.5 %**.
 
 **One of those matches was not a match, and a class of them never could be.**
@@ -364,7 +364,7 @@ are not that at all:
 | 144 | `relation _ does not exist` | PostgreSQL's OWN cascade — its earlier `CREATE` failed, mpedb's did not |
 | 83 | `type _ does not exist` | the same, for types |
 | 58 | `invalid input syntax for type json` | **mpedb accepting bad JSON** |
-| 42 | `violates foreign key constraint _` | **mpedb not enforcing an FK PostgreSQL does** |
+| 42 | `violates foreign key constraint _` | **FIXED** — the wire protocol was running with enforcement off |
 | 27 | `invalid input syntax for type numeric` | **mpedb's sqlite CAST rule** |
 | 27 | `no schema has been selected to create in` | environment, not a question about mpedb |
 | 22 | `current transaction is aborted` | PostgreSQL's cascade again |
@@ -505,6 +505,67 @@ alone said "27 numeric input problems" and the split says three jobs:
 The `'NaN'::numeric` row is the one this document already names as a root
 cause. It is visible here as a SECOND-order effect — nine statements whose
 complaint is about `int2`, caused entirely by a cast three steps earlier.
+
+### The third and fourth: the wire protocol enforces referential integrity,
+### and `DROP TABLE … CASCADE` parses
+
+These two are one item, because the first is only safe with the second, and
+finding that out took a measurement.
+
+**mpedb ran the differential with foreign keys OFF.** `[compat] foreign_keys`
+defaults to false — sqlite's default, and the only one that leaves an existing
+file's behaviour unchanged. Over the v3 protocol that is a wrong answer with no
+way for a client to notice: PostgreSQL has no `PRAGMA foreign_keys`, and a
+client's `REFERENCES` was being accepted and then not enforced. `Session::new`
+now turns it on for its own CONNECTION — not for the database, so a
+sqlite-dialect process attached to the same file keeps its own setting.
+
+Turning it on alone REMOVED 40 divergences and COST 14 matches, all but one of
+them in `foreign_key.sql`, and the 13 looked like a gap in mpedb's foreign-key
+resolver: `foreign key mismatch - "FKTABLE" referencing "PKTABLE"`. They were
+not. They were the shadow of one unsupported keyword:
+
+```
+DROP TABLE PKTABLE CASCADE   ->  parse error: unexpected trailing input `CASCADE`
+CREATE TABLE PKTABLE (...)   ->  schema error: duplicate table name
+CREATE TABLE FKTABLE (ftest1 int REFERENCES PKTABLE MATCH FULL, ...)
+```
+
+The DROP failed, so the old `PKTABLE` — whose primary key is a two-column
+composite — was still standing; the new single-column one was refused as a
+duplicate; and `FKTABLE` then referenced a parent whose key has the wrong
+arity. The resolver was right. Everything downstream of the keyword was wrong.
+
+So `DROP TABLE … CASCADE | RESTRICT` now parses. `RESTRICT` is the default and
+keeps the orphan-row refusal that enforcement imposes; `CASCADE` drops anyway.
+That is NOT PostgreSQL's full meaning, which also drops the dependent
+CONSTRAINT — mpedb leaves the child's key definition dangling, which is
+sqlite's behaviour and already what happens with enforcement off. Stated rather
+than glossed: the child keeps its rows, and its next write says `no such
+table`.
+
+**Measured, the two together, against the corpus:**
+
+| | before | after |
+|---|---:|---:|
+| match | 9 180 | **9 277** |
+| both-refused | 7 488 | 7 502 |
+| refused | 20 829 | **20 727** |
+| DIVERGED | 3 058 | **3 050** |
+| agreement | 41.1 % | **41.4 %** |
+
+Twenty-two files moved and **exactly one lost agreement, by one statement** —
+`truncate.sql`, where `DROP TABLE truncate_a` is now blocked because the
+list-form drop four statements earlier (`DROP TABLE a,b,c,d,e CASCADE`) is
+still refused on the comma. The same shadow, one syntax further out.
+
+`updatable_views` is the interesting row: divergence rose 88 → 115 while
+agreement rose 19 and refusals fell 46. Both at once, and both for the same
+reason — 46 statements that used to fail at parse now RUN, and what runs is
+partly right and partly wrong. A rise in the divergence column is not
+automatically a regression; it can be the price of getting far enough into a
+file to be wrong in a new place, and only the refusal column falling at the
+same time tells the two apart.
 
 ### The ranked work list
 

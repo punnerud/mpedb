@@ -376,3 +376,65 @@ fn a_raised_budget_does_not_make_the_file_unreadable() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// `DROP TABLE t CASCADE` drops `t` even though a child still points at it —
+/// and `RESTRICT`, like the bare form, still refuses.
+///
+/// The reason this is worth a test rather than a parser assertion: refusing the
+/// KEYWORD is not a small failure. The parse error left the table standing, so
+/// the next `CREATE` of that name failed as a duplicate and every statement
+/// after it referenced the WRONG table. That is how one unsupported word cost
+/// 13 statements in one corpus file.
+#[test]
+fn drop_table_cascade_overrides_the_orphan_refusal_and_restrict_does_not() {
+    let dir = mpedb_testkit::scratch_base_str();
+    let path = format!("{dir}/fkcascade-{}.mpedb", std::process::id());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-wal"));
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 32\nmax_readers = 8\n\n\
+         [compat]\nforeign_keys = true\n\n\
+         [[table]]\nname = \"seed\"\nprimary_key = [\"id\"]\n\
+         [[table.column]]\nname = \"id\"\ntype = \"int64\"\n"
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).expect("config")).expect("open");
+    assert!(db.fk_enforced(), "the test needs enforcement ON to mean anything");
+
+    let setup = |n: u32| {
+        q(&db, &format!("CREATE TABLE par{n} (a INTEGER PRIMARY KEY)"));
+        q(&db, &format!("CREATE TABLE chi{n} (b INTEGER PRIMARY KEY, a INTEGER REFERENCES par{n})"));
+        db.query(&format!("INSERT INTO par{n} (a) VALUES (1)"), &[]).expect("parent row");
+        db.query(&format!("INSERT INTO chi{n} (b, a) VALUES (1, 1)"), &[]).expect("child row");
+    };
+
+    // Bare: refused, because a child with rows points at it.
+    setup(1);
+    let err = db.query("DROP TABLE par1", &[]).expect_err("a live child blocks");
+    assert!(format!("{err}").contains("FOREIGN KEY"), "{err}");
+
+    // RESTRICT means the same thing spelled out.
+    setup(2);
+    let err = db.query("DROP TABLE par2 RESTRICT", &[]).expect_err("RESTRICT blocks too");
+    assert!(format!("{err}").contains("FOREIGN KEY"), "{err}");
+
+    // CASCADE drops it.
+    setup(3);
+    q(&db, "DROP TABLE par3 CASCADE");
+    // …and the child's rows are still there, which is what PostgreSQL leaves
+    // behind too (it drops the CONSTRAINT, not the rows).
+    let ExecResult::Rows { rows, .. } = q(&db, "SELECT b FROM chi3") else {
+        panic!("expected rows")
+    };
+    assert_eq!(rows.len(), 1);
+    // The key definition is left DANGLING — sqlite's behaviour, and the
+    // documented difference from PostgreSQL, which would have dropped it.
+    let err = db
+        .query("INSERT INTO chi3 (b, a) VALUES (2, 1)", &[])
+        .expect_err("a dangling key refuses the child's next write");
+    assert!(format!("{err}").contains("no such table"), "{err}");
+
+    // The whole point of accepting the keyword: the name is FREE afterwards.
+    q(&db, "CREATE TABLE par3 (a INTEGER PRIMARY KEY, extra TEXT)");
+
+    let _ = std::fs::remove_file(&path);
+}

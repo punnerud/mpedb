@@ -1475,7 +1475,22 @@ impl<'a> Parser<'a> {
             false
         };
         let name = self.ident("table name")?;
-        Ok(DdlStmt::DropTable { name, if_exists })
+        // `CASCADE` / `RESTRICT` — PostgreSQL's dependency policy, and unlike
+        // `DROP FUNCTION` it is not free here: mpedb HAS one dependency to
+        // decide about, the orphan-row refusal `PRAGMA foreign_keys = ON`
+        // imposes. `RESTRICT` is the default and keeps it; `CASCADE` drops
+        // anyway. Refusing the words outright was the old behaviour and it cost
+        // far more than the two keywords: the parse error left the table
+        // standing, so the file's NEXT `CREATE` of the same name failed as a
+        // duplicate, and every statement after that referenced the WRONG table.
+        // 13 statements in `foreign_key.sql` alone.
+        let cascade = if self.eat_word("CASCADE") {
+            true
+        } else {
+            let _ = self.eat_word("RESTRICT");
+            false
+        };
+        Ok(DdlStmt::DropTable { name, if_exists, cascade })
     }
 
     fn parse_drop_policy(&mut self) -> Result<DdlStmt> {
