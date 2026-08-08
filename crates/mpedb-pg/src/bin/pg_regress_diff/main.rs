@@ -1387,7 +1387,16 @@ fn run_with_timeout(
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(Stuck { at: None, err: Some(e) }),
         Err(_) => Err(Stuck {
-            at: Some(seen.load(std::sync::atomic::Ordering::Relaxed)),
+            // MINUS ONE: the startup handshake ends with its own
+            // `ReadyForQuery`, before any query runs, so the frame count is
+            // one ahead of the completed-query count. Without this the report
+            // names the statement AFTER the one that is stuck — which it did,
+            // on its first real use, pointing at a `BEGIN` that cannot block
+            // while the `COMMIT` before it was the one that never returned.
+            at: Some(
+                seen.load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(1),
+            ),
             err: None,
         }),
     }
@@ -1888,6 +1897,10 @@ SELECT 1;"), vec!["select 10 as a", "SELECT 1"]);
             v.extend_from_slice(body);
             v
         };
+        // (This test drives `Pipe` directly, so there is no startup handshake
+        // and no off-by-one to subtract — the subtraction lives in
+        // `run_with_timeout`, which is where the handshake happens.)
+        //
         // A DataRow whose single value is the text "Z" — one byte that would
         // fool a scanner and must not fool this one.
         let mut d = 1i16.to_be_bytes().to_vec();

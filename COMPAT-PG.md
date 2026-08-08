@@ -610,6 +610,35 @@ Counted on FRAME boundaries, not by scanning the output for the byte `Z`: a
 progress counter would name the wrong statement exactly when a hang makes it
 matter. There is a test for that, and for a frame split across two writes.
 
+**It named the wrong statement on its first real use anyway.** The startup
+handshake ends with its own `ReadyForQuery`, before any query runs, so the
+frame count is one ahead of the completed-query count — and the report pointed
+at a `BEGIN`, which cannot block, instead of the `COMMIT` before it, which
+never returned. The `BEGIN` was a plausible-looking answer: it is a
+transaction verb, and "the transaction machinery is stuck" reads as a
+diagnosis. It was off by one.
+
+The thing that caught it was not re-reading the code. It was that the named
+statement did not make sense — a `BEGIN` in this session sets two fields and
+clears a `Vec`. **A tool that names something has to name something falsifiable,
+and this one did.** The version that said "this file hung" could not be wrong
+about anything.
+
+With it fixed, the reproducer is one command and needs no code change at all —
+rewrite the corpus file's list-drops as single drops and run that file:
+
+```
+repro403   HUNG after 120s at statement 403 of 403
+           stuck on: COMMIT
+```
+
+403 statements is not minimal, and the seven statements around the `COMMIT`
+extracted on their own do NOT hang: the block that stalls is
+`BEGIN; INSERT (violates a DEFERRABLE FK); UPDATE (of a primary key); COMMIT`,
+and it only stalls given the schema the 400 statements before it built. Which
+is worth stating plainly, because the tempting next move — "extract the
+statements and reduce" — was tried and produced a file that runs clean.
+
 ### The ranked work list
 
 The harness records mpedb's SQLSTATE and message for every statement PostgreSQL
