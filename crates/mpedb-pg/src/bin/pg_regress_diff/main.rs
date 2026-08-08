@@ -738,13 +738,21 @@ fn diff_file(
     // short-lived measurement process. The file is recorded as hung and the run
     // continues, which is the whole point.
     let mp = match run_with_timeout(stmts.clone(), FILE_TIMEOUT) {
-        Some(t) => t?,
-        None => {
+        Ok(t) => t,
+        Err(Stuck { err: Some(e), .. }) => return Err(e),
+        Err(Stuck { at, .. }) => {
+            let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            let culprit = at
+                .and_then(|i| stmts.get(i))
+                .map(|s| s.chars().take(140).collect::<String>())
+                .unwrap_or_else(|| "<unknown: no query completed>".into());
             println!(
-                "{:<24} HUNG after {}s — mpedb did not finish this file; \
-                 counted as all-diverged",
-                path.file_stem().unwrap_or_default().to_string_lossy(),
-                FILE_TIMEOUT.as_secs()
+                "{name:<24} HUNG after {}s at statement {} of {}; counted as all-diverged\n\
+                 {:24} stuck on: {culprit}",
+                FILE_TIMEOUT.as_secs(),
+                at.map(|i| i + 1).unwrap_or(0),
+                stmts.len(),
+                ""
             );
             return Ok(Counts {
                 diverged: stmts.len() as u32,
@@ -1357,15 +1365,42 @@ fn cause_shape(msg: &str) -> String {
 const FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Run the mpedb arm on another thread and give up on it after `limit`.
+/// Run the file, and on a timeout report WHICH STATEMENT was in flight.
+///
+/// The old version returned `None` and the caller printed "this file hung".
+/// That is a collapsed line with nothing inside it — the same shape this
+/// harness has learned five times not to trust — and it is the least useful
+/// possible form for the one failure that stops all measurement. The worker
+/// publishes a count of completed queries; on a timeout the next statement is
+/// the culprit, named.
 fn run_with_timeout(
     stmts: Vec<String>,
     limit: std::time::Duration,
-) -> Option<Result<Vec<Outcome>, String>> {
+) -> Result<Vec<Outcome>, Stuck> {
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = progress.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(mpedb_transcript(&stmts));
+        let _ = tx.send(mpedb_transcript(&stmts, progress));
     });
-    rx.recv_timeout(limit).ok()
+    match rx.recv_timeout(limit) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(Stuck { at: None, err: Some(e) }),
+        Err(_) => Err(Stuck {
+            at: Some(seen.load(std::sync::atomic::Ordering::Relaxed)),
+            err: None,
+        }),
+    }
+}
+
+/// Why a file produced no transcript.
+struct Stuck {
+    /// Index of the statement that never returned, if it timed out. The count
+    /// is of COMPLETED queries, so the one in flight is at that index —
+    /// off-by-one only if the session died between finishing and answering,
+    /// which would be an error rather than a timeout.
+    at: Option<usize>,
+    err: Option<String>,
 }
 
 /// Run the whole file through mpedb, IN PROCESS.
@@ -1374,7 +1409,10 @@ fn run_with_timeout(
 /// transcript comes from driving one over a pipe — the same harness
 /// `tests/wire.rs` uses. That removes a listening socket, a spawn and a port
 /// from a tool whose only job is to compare answers.
-fn mpedb_transcript(stmts: &[String]) -> Result<Vec<Outcome>, String> {
+fn mpedb_transcript(
+    stmts: &[String],
+    progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<Vec<Outcome>, String> {
     let db = fresh_db()?;
     let mut input = startup_packet();
     for s in stmts {
@@ -1387,6 +1425,8 @@ fn mpedb_transcript(stmts: &[String]) -> Result<Vec<Outcome>, String> {
     let pipe = Pipe {
         input: std::io::Cursor::new(input),
         output: Vec::new(),
+        done: progress,
+        scanned: 0,
     };
     let mut sess = mpedb_pg::Session::new(
         pipe,
@@ -1414,6 +1454,12 @@ fn fresh_db() -> Result<mpedb::Database, String> {
 struct Pipe {
     input: std::io::Cursor<Vec<u8>>,
     output: Vec<u8>,
+    /// Completed simple queries, published for the watchdog thread.
+    done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// How far `output` has been walked for `ReadyForQuery` frames. The walk
+    /// resumes here rather than restarting, so counting is O(bytes) over the
+    /// whole run and not O(bytes²).
+    scanned: usize,
 }
 
 impl std::io::Read for Pipe {
@@ -1425,6 +1471,26 @@ impl std::io::Read for Pipe {
 impl std::io::Write for Pipe {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.output.extend_from_slice(buf);
+        // A `ReadyForQuery` ends one simple query. Counting them from the
+        // WRITE side is what lets the watchdog name the statement that did not
+        // finish instead of the file that contains it — see `run_with_timeout`.
+        //
+        // Counted on frame boundaries, not by scanning for the byte: a `Z` can
+        // appear inside a row value, and a data-dependent progress counter
+        // would name the wrong statement exactly when it matters most.
+        let mut i = self.scanned;
+        while i + 5 <= self.output.len() {
+            let len =
+                i32::from_be_bytes(self.output[i + 1..i + 5].try_into().unwrap()) as usize;
+            if len < 4 || i + 1 + len > self.output.len() {
+                break;
+            }
+            if self.output[i] == b'Z' {
+                self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            i += 1 + len;
+        }
+        self.scanned = i;
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1798,6 +1864,50 @@ SELECT 1;"), vec!["select 10 as a", "SELECT 1"]);
             cause_key("bind error: unknown table `minmaxtest1`"),
             cause_key("bind error: unknown table `other`")
         );
+    }
+
+    /// The progress counter counts FRAMES, not bytes that look like frames.
+    ///
+    /// The claim in `Pipe::write` is that a `Z` inside a row VALUE must not be
+    /// counted, because a data-dependent progress counter would name the wrong
+    /// statement exactly when a hang makes it matter. Asserted rather than
+    /// asserted-in-a-comment.
+    #[test]
+    fn the_hang_watchdogs_progress_counter_counts_frames_not_bytes() {
+        use std::io::Write as _;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut p = Pipe {
+            input: std::io::Cursor::new(Vec::new()),
+            output: Vec::new(),
+            done: done.clone(),
+            scanned: 0,
+        };
+        let frame = |tag: u8, body: &[u8]| {
+            let mut v = vec![tag];
+            v.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+            v.extend_from_slice(body);
+            v
+        };
+        // A DataRow whose single value is the text "Z" — one byte that would
+        // fool a scanner and must not fool this one.
+        let mut d = 1i16.to_be_bytes().to_vec();
+        d.extend_from_slice(&1i32.to_be_bytes());
+        d.push(b'Z');
+        p.write_all(&frame(b'D', &d)).unwrap();
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Now a real ReadyForQuery.
+        p.write_all(&frame(b'Z', b"I")).unwrap();
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // And one arriving SPLIT across two writes — the wire does that, and a
+        // walker that restarted or gave up on a partial frame would either
+        // miscount or count twice.
+        let z = frame(b'Z', b"I");
+        p.write_all(&z[..3]).unwrap();
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 1);
+        p.write_all(&z[3..]).unwrap();
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

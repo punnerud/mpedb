@@ -567,6 +567,49 @@ automatically a regression; it can be the price of getting far enough into a
 file to be wrong in a new place, and only the refusal column falling at the
 same time tells the two apart.
 
+### A change that was measured, and then thrown away
+
+`DROP TABLE a, b, c` — the comma list — is the obvious next item after
+`CASCADE`, for the same reason: refusing the comma fails the WHOLE statement,
+so none of the tables go and the file's later `CREATE`s of those names are
+duplicates. It was built, tested (resolve every name before dropping any; a
+child inside the list does not block its own parent), and measured:
+
+> Fifteen files improved — `alter_table` +10 agreement, `triggers` +4,
+> `updatable_views` +2, seven more +1 each. And `foreign_key.sql` **HUNG**.
+
+Not slowly: the watchdog was raised from 120 s to 900 s and the file still did
+not finish. So the change was reverted, in full, and the finding kept. What is
+known about the hang:
+
+- The autocommit path does not hang. Every one of the file's 1 158 statements
+  runs under `mpedb exec` without stalling.
+- The **repl** path does not hang either — the whole file, in ONE process, same
+  config (`foreign_keys = true`, `dialect = "postgres"`), finishes in under
+  90 s.
+- Only the WIRE path hangs (`mpedb_pg::Session` over an in-memory database,
+  with statements buffered into `txn_log` and replayed by `commit_block`).
+- It is only REACHABLE with the list, because more `DROP`s succeeding is what
+  gets the file far enough in to reach it.
+
+That is a real bug and it is now its own item rather than a shipped hang.
+
+**The harness change that came out of it is the lasting part.** "This file
+hung" is a collapsed line with nothing inside it — the exact shape this
+document has learned five times not to trust — and it is the least useful
+possible form for the one failure that stops all measurement. The mpedb worker
+now publishes a count of completed queries, and a timeout names the statement:
+
+```
+foreign_key  HUNG after 120s at statement 1153 of 1158; counted as all-diverged
+             stuck on: UPDATE fkpart13_t1 SET a = 2 WHERE a = 1
+```
+
+Counted on FRAME boundaries, not by scanning the output for the byte `Z`: a
+`ReadyForQuery` tag can appear inside a row value, and a data-dependent
+progress counter would name the wrong statement exactly when a hang makes it
+matter. There is a test for that, and for a frame split across two writes.
+
 ### The ranked work list
 
 The harness records mpedb's SQLSTATE and message for every statement PostgreSQL
