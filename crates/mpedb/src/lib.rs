@@ -4595,6 +4595,54 @@ impl WriteSession<'_> {
         }
     }
 
+    /// One name of a `DROP TABLE` list, inside this session's transaction.
+    ///
+    /// Split out so the list is a loop rather than a nested block: everything
+    /// here is per-table, and the only thing the list changes is how many
+    /// times it runs. `schema` is the session's CAPTURED view, so a name
+    /// dropped earlier in the same list still resolves in it — harmless,
+    /// because `drop_table` rejects an id it has already freed.
+    fn drop_one_table(
+        &mut self,
+        schema: &std::sync::Arc<mpedb_core::engine::SchemaBundle>,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<()> {
+        let Some(id) = schema.schema.table_id(name) else {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(Error::Bind(format!("DROP TABLE: no such table `{name}`")));
+        };
+        // An fts4 vtab owns its five shadows — all six drop in this txn (gated
+        // on the MODULE tag, never guessed from names).
+        let shadow_ids: Vec<u32> = match schema
+            .schema
+            .tables
+            .iter()
+            .find(|t| t.id == id && !t.dead)
+            .map(|t| t.kind)
+        {
+            Some(mpedb_types::TableKind::Fts {
+                module: mpedb_types::FtsModule::Fts4,
+                ..
+            }) => ["_content", "_docsize", "_segdir", "_segments", "_stat"]
+                .iter()
+                .filter_map(|sfx| schema.schema.table_id(&format!("{name}{sfx}")))
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Cascade: a dropped table's triggers are dead — remove their records
+        // in the same commit (DESIGN-TRIGGERS §3.1).
+        crate::trigger::cascade_drop_triggers(&mut self.txn, id)?;
+        self.txn.drop_table(id)?;
+        for sid in shadow_ids {
+            crate::trigger::cascade_drop_triggers(&mut self.txn, sid)?;
+            self.txn.drop_table(sid)?;
+        }
+        Ok(())
+    }
+
     /// The DDL dispatch for [`apply_ddl`](Self::apply_ddl): resolve names against
     /// this session's CURRENT schema view and call the engine DDL primitive on
     /// `self.txn`. Any error (or the rollback / reload) is handled by the caller.
@@ -4636,42 +4684,13 @@ impl WriteSession<'_> {
             }
             // `cascade` is not consulted on this path: it is the WriteSession
             // (explicit-transaction) form, and the orphan-row refusal it would
-            // suppress lives on the autocommit path in `apply_drop_table`.
-            DdlStmt::DropTable { name, if_exists, cascade: _ } => {
-                let id = match schema.schema.table_id(&name) {
-                    Some(id) => id,
-                    None => {
-                        if if_exists {
-                            return Ok(ExecResult::Affected(0));
-                        }
-                        return Err(Error::Bind(format!("DROP TABLE: no such table `{name}`")));
-                    }
-                };
-                // An fts4 vtab owns its five shadows — all six drop in this
-                // txn (gated on the MODULE tag, never guessed from names).
-                let shadow_ids: Vec<u32> = match schema
-                    .schema
-                    .tables
-                    .iter()
-                    .find(|t| t.id == id && !t.dead)
-                    .map(|t| t.kind)
-                {
-                    Some(mpedb_types::TableKind::Fts {
-                        module: mpedb_types::FtsModule::Fts4,
-                        ..
-                    }) => ["_content", "_docsize", "_segdir", "_segments", "_stat"]
-                        .iter()
-                        .filter_map(|sfx| schema.schema.table_id(&format!("{name}{sfx}")))
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                // Cascade: a dropped table's triggers are dead — remove their
-                // records in the same commit (DESIGN-TRIGGERS §3.1).
-                crate::trigger::cascade_drop_triggers(&mut self.txn, id)?;
-                self.txn.drop_table(id)?;
-                for sid in shadow_ids {
-                    crate::trigger::cascade_drop_triggers(&mut self.txn, sid)?;
-                    self.txn.drop_table(sid)?;
+            // suppress lives on the autocommit path in `apply_drop_tables`.
+            //
+            // The LIST is genuinely atomic here — one transaction — which the
+            // autocommit path cannot promise.
+            DdlStmt::DropTable { names, if_exists, cascade: _ } => {
+                for name in &names {
+                    self.drop_one_table(&schema, name, if_exists)?;
                 }
             }
             DdlStmt::AlterRenameTable { table, new_name } => {

@@ -1474,7 +1474,14 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let name = self.ident("table name")?;
+        // A LIST, because PostgreSQL and sqlite both take one and the corpus
+        // uses it constantly. Refusing the comma was not a small gap: the
+        // WHOLE statement failed, so none of the tables went and the file's
+        // later `CREATE`s of those names failed as duplicates.
+        let mut names = vec![self.ident("table name")?];
+        while self.eat(&Tok::Comma) {
+            names.push(self.ident("table name")?);
+        }
         // `CASCADE` / `RESTRICT` — PostgreSQL's dependency policy, and unlike
         // `DROP FUNCTION` it is not free here: mpedb HAS one dependency to
         // decide about, the orphan-row refusal `PRAGMA foreign_keys = ON`
@@ -1490,7 +1497,7 @@ impl<'a> Parser<'a> {
             let _ = self.eat_word("RESTRICT");
             false
         };
-        Ok(DdlStmt::DropTable { name, if_exists, cascade })
+        Ok(DdlStmt::DropTable { names, if_exists, cascade })
     }
 
     fn parse_drop_policy(&mut self) -> Result<DdlStmt> {

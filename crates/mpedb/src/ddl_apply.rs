@@ -1253,11 +1253,58 @@ impl Database {
         Ok(ExecResult::Affected(0))
     }
 
+    /// `DROP TABLE a, b, c [CASCADE|RESTRICT]`.
+    ///
+    /// Names are RESOLVED FIRST, all of them, before anything is dropped. A
+    /// missing name in the middle would otherwise leave the ones before it
+    /// gone and the ones after it standing, and a half-applied DROP is the one
+    /// outcome a caller cannot reason about. (Each name still commits on its
+    /// own — this is the autocommit path — so the guarantee is "nothing starts
+    /// unless every name resolves", not full atomicity. The `WriteSession`
+    /// path IS atomic; see `Database::drop_one_table`.)
+    ///
+    /// The list is also what the orphan check has to see: `DROP TABLE parent,
+    /// child` is legal in PostgreSQL because the child is going too, and
+    /// checking each name against the whole schema would refuse it on the
+    /// parent. The set is passed down so a child inside it does not block.
+    pub(crate) fn apply_drop_tables(
+        &self,
+        names: &[String],
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<ExecResult> {
+        self.engine.refresh_schema_if_stale()?;
+        let mut ids = Vec::with_capacity(names.len());
+        {
+            let bundle = self.engine.schema();
+            for n in names {
+                match bundle.schema.table_id(n) {
+                    Some(id) => ids.push(id),
+                    None if if_exists => {}
+                    None => {
+                        return Err(Error::Bind(format!("DROP TABLE: no such table `{n}`")))
+                    }
+                }
+            }
+        }
+        for n in names {
+            // Re-checked per name: an earlier drop in this same list bumped
+            // the schema gen, so the view taken above is stale by now for
+            // everything except the question it answered.
+            if self.engine.schema().schema.table_id(n).is_none() {
+                continue;
+            }
+            self.apply_drop_table(n, if_exists, cascade, &ids)?;
+        }
+        Ok(ExecResult::Affected(0))
+    }
+
     pub(crate) fn apply_drop_table(
         &self,
         name: &str,
         if_exists: bool,
         cascade: bool,
+        also_dropping: &[u32],
     ) -> Result<ExecResult> {
         // Resolve the name against a fresh schema view (another process may have
         // created/dropped since our last statement). The write txn re-checks the
@@ -1285,7 +1332,11 @@ impl Database {
             let bundle = self.engine.schema();
             let sc = &bundle.schema;
             if let Some(t) = sc.tables.iter().find(|t| t.id == id && !t.dead) {
-                for other in sc.tables.iter().filter(|o| !o.dead && o.id != id) {
+                for other in sc
+                    .tables
+                    .iter()
+                    .filter(|o| !o.dead && o.id != id && !also_dropping.contains(&o.id))
+                {
                     for fk in &other.foreign_keys {
                         if !fk.parent.eq_ignore_ascii_case(&t.name) {
                             continue;
@@ -1573,8 +1624,8 @@ impl Database {
                     self.create_function(crate::spellfn::SpellLang::PlPgSql, &source)?;
                 return Ok(ExecResult::Affected(0));
             }
-            DdlStmt::DropTable { name, if_exists, cascade } => {
-                return self.apply_drop_table(&name, if_exists, cascade);
+            DdlStmt::DropTable { names, if_exists, cascade } => {
+                return self.apply_drop_tables(&names, if_exists, cascade);
             }
             DdlStmt::AlterRenameTable { table, new_name } => {
                 return self.apply_alter_rename(&table, |w, id| w.alter_rename_table(id, &new_name));

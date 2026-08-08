@@ -221,13 +221,13 @@ real volume — see the notes below on why both of those qualifiers matter):
 
 | outcome | statements | share |
 |---|---:|---:|
-| **match** — both answered, identically | 9 335 | 23.0 % |
+| **match** — both answered, identically | 9 390 | 23.1 % |
 | **order-only** — same rows, different order, no `ORDER BY` asked | 20 | 0.0 % |
 | **both refused** — both errored | 7 522 | 18.5 % |
-| **refused** — PostgreSQL answered, mpedb refused by name | 20 804 | 51.3 % |
-| **DIVERGED** — both answered, differently | 2 895 | 7.1 % |
+| **refused** — PostgreSQL answered, mpedb refused by name | 20 753 | 51.1 % |
+| **DIVERGED** — both answered, differently | 2 893 | 7.1 % |
 
-Agreement (match + order-only + both-refused) is **41.6 %**. Divergence — the
+Agreement (match + order-only + both-refused) is **41.7 %**. Divergence — the
 only number that means something is WRONG — is **7.1 %**.
 
 **One of those matches was not a match, and a class of them never could be.**
@@ -567,7 +567,35 @@ automatically a regression; it can be the price of getting far enough into a
 file to be wrong in a new place, and only the refusal column falling at the
 same time tells the two apart.
 
-### A change that was measured, and then thrown away
+### The change that was thrown away, then re-applied
+
+`DROP TABLE a, b, c` — the comma list — was built, measured, and reverted
+because it hung `foreign_key.sql`. With the hang fixed (above) it went back in
+unchanged, and this time it was measured with nothing else running:
+
+| | before | after |
+|---|---:|---:|
+| match | 9 335 | **9 390** |
+| refused | 20 804 | **20 752** |
+| DIVERGED | 2 895 | **2 893** |
+| agreement | 41.6 % | **41.7 %** |
+
+Fifteen files moved. `foreign_key` alone gained 39 agreements; `alter_table`
+10, `triggers` 4. Exactly one file lost: `truncate`, −7 agreement, +12
+refusals, **−5 divergences**. That is the "reaches further into the file"
+shape again — the list-drops now succeed, so statements that used to die on a
+comma reach `TRUNCATE` itself, which mpedb refuses by name. Five wrong answers
+traded for twelve named refusals is the right direction; seven agreements lost
+with them is the price, stated rather than netted away.
+
+The rules that make the list more than a loop, both tested: every name is
+resolved BEFORE anything is dropped (a half-applied `DROP` is the one outcome
+a caller cannot reason about), and a child INSIDE the list does not block its
+own parent — `DROP TABLE parent, child` is legal in PostgreSQL because the
+child is going too, and checking each name against the whole schema would
+refuse it on the parent.
+
+### An earlier version of that change, and why it was thrown away
 
 `DROP TABLE a, b, c` — the comma list — is the obvious next item after
 `CASCADE`, for the same reason: refusing the comma fails the WHOLE statement,

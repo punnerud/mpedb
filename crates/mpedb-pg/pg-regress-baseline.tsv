@@ -1,9 +1,9 @@
 # file	match	order_only	both_refused	refused	diverged
 advisory_lock	8	0	19	10	1
-aggregates	95	0	122	203	10
+aggregates	96	0	122	202	10
 alter_generic	43	0	110	179	0
 alter_operator	2	0	8	23	0
-alter_table	485	0	342	745	74
+alter_table	495	0	342	734	75
 amutils	1	0	4	5	0
 arrays	28	0	71	356	0
 async	0	0	3	8	0
@@ -46,7 +46,7 @@ create_procedure	11	0	25	68	5
 create_role	10	0	64	62	8
 create_schema	4	0	15	8	0
 create_table	21	0	113	184	7
-create_table_like	14	0	5	34	1
+create_table_like	15	0	5	33	1
 create_type	3	0	34	43	5
 create_view	128	0	39	115	19
 database	3	0	0	13	0
@@ -69,9 +69,9 @@ fast_default	114	0	0	138	12
 float4	12	0	9	48	31
 float8	17	0	19	99	34
 foreign_data	81	0	131	323	3
-foreign_key	388	0	189	489	87
+foreign_key	426	0	189	451	87
 functional_deps	15	0	10	11	4
-generated	37	0	33	25	21
+generated	38	0	33	24	21
 geometry	1	0	155	4	0
 gin	10	0	0	42	0
 gist	11	0	4	34	1
@@ -89,7 +89,7 @@ indexing	23	0	63	454	19
 indirect_toast	4	0	7	17	0
 inet	31	0	4	39	31
 infinite_recurse	1	0	1	1	0
-inherit	139	0	37	348	31
+inherit	139	0	37	347	32
 init_privs	0	0	0	4	0
 insert	26	0	99	254	8
 insert_conflict	78	0	33	113	10
@@ -116,7 +116,7 @@ maintain_every	6	0	0	8	2
 matview	27	0	24	106	5
 md5	0	0	0	14	0
 memoize	39	0	8	18	0
-merge	120	0	343	23	18
+merge	120	0	342	23	19
 misc	7	0	29	25	0
 misc_functions	7	0	38	54	4
 misc_sanity	1	0	0	2	2
@@ -162,7 +162,7 @@ reloptions	0	0	27	22	14
 replica_identity	9	0	8	26	10
 returning	10	0	10	33	24
 roleattributes	0	0	0	80	0
-rowsecurity	315	0	77	245	32
+rowsecurity	316	0	77	244	32
 rowtypes	25	0	50	131	17
 rules	283	0	23	231	79
 sanity_check	1	0	1	2	0
@@ -175,12 +175,12 @@ select_implicit	28	0	6	8	2
 select_into	7	0	19	30	1
 select_parallel	12	0	140	15	14
 select_views	13	0	17	14	0
-sequence	45	0	86	120	9
+sequence	46	0	86	119	9
 spgist	9	0	2	19	0
 sqljson	11	0	36	89	3
-stats	139	0	107	171	17
-stats_ext	117	0	62	635	0
-strings	87	0	77	272	11
+stats	140	0	107	170	17
+stats_ext	118	0	62	634	0
+strings	88	0	77	271	11
 subscription	29	0	58	69	0
 subselect	106	0	38	58	8
 sysviews	2	0	0	19	0
@@ -197,8 +197,8 @@ timestamp	10	0	14	129	4
 timestamptz	47	0	19	230	58
 timetz	4	0	6	39	8
 transactions	209	0	50	139	86
-triggers	253	0	79	674	41
-truncate	59	0	15	97	22
+triggers	257	0	79	670	41
+truncate	52	0	15	109	17
 tsdicts	0	0	9	122	0
 tsearch	29	0	53	354	0
 tsrf	8	0	10	49	0
@@ -209,7 +209,7 @@ type_sanity	7	0	0	51	3
 typed_table	2	0	10	16	0
 unicode	0	0	2	12	0
 union	49	0	42	55	1
-updatable_views	214	0	219	404	115
+updatable_views	216	0	219	402	115
 update	40	0	47	184	12
 uuid	0	0	7	30	1
 vacuum	80	0	52	137	17

@@ -195,7 +195,9 @@ pub fn ddl_access(ddl: &DdlStmt) -> AccessReport {
         // classify. The name is only known after the frontend has parsed the
         // body, which this classifier does not do.
         DdlStmt::CreateFunction { .. } | DdlStmt::DropFunction { .. } => Vec::new(),
-        DdlStmt::DropTable { name, .. } => vec![drop(K::Table, name, None)],
+        DdlStmt::DropTable { names, .. } => {
+            names.iter().map(|n| drop(K::Table, n, None)).collect()
+        }
         DdlStmt::CreateIndex { name, table, .. } => {
             vec![create(K::Index, name, Some(table))]
         }

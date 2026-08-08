@@ -438,3 +438,51 @@ fn drop_table_cascade_overrides_the_orphan_refusal_and_restrict_does_not() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// `DROP TABLE parent, child` — the list, and the two rules that make it more
+/// than a loop.
+#[test]
+fn a_drop_list_resolves_every_name_first_and_a_child_in_it_does_not_block() {
+    let dir = mpedb_testkit::scratch_base_str();
+    let path = format!("{dir}/droplist-{}.mpedb", std::process::id());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-wal"));
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 32\nmax_readers = 8\n\n\
+         [compat]\nforeign_keys = true\n\n\
+         [[table]]\nname = \"seed\"\nprimary_key = [\"id\"]\n\
+         [[table.column]]\nname = \"id\"\ntype = \"int64\"\n"
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).expect("config")).expect("open");
+
+    q(&db, "CREATE TABLE par (a INTEGER PRIMARY KEY)");
+    q(&db, "CREATE TABLE chi (b INTEGER PRIMARY KEY, a INTEGER REFERENCES par)");
+    db.query("INSERT INTO par (a) VALUES (1)", &[]).expect("parent row");
+    db.query("INSERT INTO chi (b, a) VALUES (1, 1)", &[]).expect("child row");
+
+    // NOTHING STARTS unless every name resolves — a half-applied DROP is the
+    // one outcome a caller cannot reason about.
+    let err = db
+        .query("DROP TABLE par, nosuch", &[])
+        .expect_err("a missing name refuses the whole list");
+    assert!(format!("{err}").contains("nosuch"), "{err}");
+    assert!(
+        db.query("SELECT a FROM par", &[]).is_ok(),
+        "par must survive a list that never started"
+    );
+
+    // A CHILD INSIDE THE LIST does not block its own parent. Checking each
+    // name against the whole schema would refuse this on `par`, and
+    // PostgreSQL accepts it because the child is going too.
+    q(&db, "DROP TABLE par, chi");
+    assert!(db.query("SELECT a FROM par", &[]).is_err());
+    assert!(db.query("SELECT b FROM chi", &[]).is_err());
+
+    // IF EXISTS makes a missing name a no-op rather than a refusal, and the
+    // present ones still go.
+    q(&db, "CREATE TABLE keep (a INTEGER PRIMARY KEY)");
+    q(&db, "DROP TABLE IF EXISTS keep, alsonosuch");
+    assert!(db.query("SELECT a FROM keep", &[]).is_err());
+
+    let _ = std::fs::remove_file(&path);
+}

@@ -267,7 +267,7 @@ pub enum DdlStmt {
     /// sqlite's behaviour and is already what happens when a parent is dropped
     /// with enforcement off: the child's next write says `no such table`.
     /// Stated rather than glossed, because the difference is visible.
-    DropTable { name: String, if_exists: bool, cascade: bool },
+    DropTable { names: Vec<String>, if_exists: bool, cascade: bool },
     /// `ALTER TABLE <t> RENAME TO <new>` (#47 stage 5) — pure schema metadata,
     /// no data rewrite (same id, same trees). Applied by the facade.
     AlterRenameTable { table: String, new_name: String },
@@ -715,7 +715,7 @@ mod tests {
         assert_eq!(
             parse_ddl("DROP TABLE orders").unwrap().unwrap(),
             DdlStmt::DropTable {
-                name: "orders".into(),
+                names: vec!["orders".into()],
                 if_exists: false,
                 cascade: false
             }
@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(
             parse_ddl("DROP TABLE IF EXISTS orders").unwrap().unwrap(),
             DdlStmt::DropTable {
-                name: "orders".into(),
+                names: vec!["orders".into()],
                 if_exists: true,
                 cascade: false
             }
@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(
             parse_ddl("DROP TABLE orders CASCADE").unwrap().unwrap(),
             DdlStmt::DropTable {
-                name: "orders".into(),
+                names: vec!["orders".into()],
                 if_exists: false,
                 cascade: true
             }
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(
             parse_ddl("DROP TABLE orders RESTRICT").unwrap().unwrap(),
             DdlStmt::DropTable {
-                name: "orders".into(),
+                names: vec!["orders".into()],
                 if_exists: false,
                 cascade: false
             }
@@ -751,11 +751,33 @@ mod tests {
         assert_eq!(
             parse_ddl("DROP TABLE IF EXISTS orders CASCADE").unwrap().unwrap(),
             DdlStmt::DropTable {
-                name: "orders".into(),
+                names: vec!["orders".into()],
                 if_exists: true,
                 cascade: true
             }
         );
+        // A LIST. Refusing the comma failed the WHOLE statement, so none of
+        // the tables went and the file's later CREATEs were duplicates.
+        assert_eq!(
+            parse_ddl("DROP TABLE a, b, c").unwrap().unwrap(),
+            DdlStmt::DropTable {
+                names: vec!["a".into(), "b".into(), "c".into()],
+                if_exists: false,
+                cascade: false
+            }
+        );
+        assert_eq!(
+            parse_ddl("DROP TABLE IF EXISTS a,b CASCADE").unwrap().unwrap(),
+            DdlStmt::DropTable {
+                names: vec!["a".into(), "b".into()],
+                if_exists: true,
+                cascade: true
+            }
+        );
+        // A trailing comma stays an error: accepting it would make
+        // `DROP TABLE a,` mean `DROP TABLE a`, and a typo that silently means
+        // something is worse than one that stops.
+        assert!(parse_ddl("DROP TABLE a,").is_err());
     }
 
     #[test]
