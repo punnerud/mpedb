@@ -642,11 +642,19 @@ UPDATE t SET id = id + 1;      -- fails: cannot update primary key column
 COMMIT;                        -- HANGS
 ```
 
-Remove any one ingredient and it runs: a MAIN table instead of `TEMP` is fine,
-one write instead of two is fine, a second write that SUCCEEDS is fine. The
-foreign key is irrelevant — the version with no `REFERENCES` at all hangs too —
-and so is `DEFERRABLE`, which is where the trail started and where it would
-have stayed without reducing.
+Reduced all the way, the trigger is simpler than that five-line file makes it
+look: **two writes to an ATTACHED member inside one `BEGIN`/`COMMIT` block.**
+A main-table version is fine. ONE write inside the block is fine. The foreign
+key is irrelevant (the version with no `REFERENCES` at all spins), `DEFERRABLE`
+is irrelevant, and so is `TEMP` — an ordinary `ATTACH ':memory:' AS aux` with
+two writes to `aux.t` spins identically.
+
+The reduction had to be walked back once, and the walk-back is the useful part.
+An earlier pass concluded "a second write that SUCCEEDS is fine", from a run of
+variants that all used a `timeout` shorter than the harness's own watchdog (see
+below). Re-run correctly, `INSERT` followed by a SUCCEEDING `UPDATE` spins just
+the same — so the failing statement was never an ingredient, and the whole
+`DEFERRABLE` / primary-key-update story the trail began with was scenery.
 
 **It SPINS — 84 % of a core — rather than blocking.** With the process wedged,
 one thread sits in `futex_wait` (the harness waiting on its worker) and the
@@ -655,13 +663,14 @@ it is not a lock nobody releases, it is a loop nobody leaves. Two minutes of
 `ps -L` said more than an hour of reading the transaction code, and it is the
 measurement that should have come first.
 
-It points at the TEMP schema. A temp table lives in an ATTACHED member
-(`multifile.rs`), `commit_block` opens ONE `WriteSession` on the main database
-and replays the log into it, and a statement touching only the member forwards
+It points at attached-member writes inside an open transaction. A temp table
+lives in an ATTACHED member (`multifile.rs`); `commit_block` opens ONE
+`WriteSession` on the main database and replays the log into it, and a
+statement touching only the member takes `DbRoute::AttachedOnly` and forwards
 to that member's own handle. `multifile.rs`'s own module docs say that
 "cross-file statements inside an open `WriteSession`" are **refused by name**.
-That refusal does not cover this path, and instead of a refusal the second
-write stops.
+The `AttachedOnly` arm does not refuse — it forwards — and the second forward
+inside one block never returns.
 
 **Two false trails, both from the instrument, both worth writing down:**
 
