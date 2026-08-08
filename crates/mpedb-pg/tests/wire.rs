@@ -478,3 +478,111 @@ fn show_answers_the_settings_a_driver_asks_for_at_connect() {
         .collect();
     assert!(completions.contains(&"SET".to_string()), "{completions:?}");
 }
+
+/// **KNOWN BUG, currently failing — `#[ignore]`d for that reason and no other.**
+///
+/// Two writes to an ATTACHED member inside one `BEGIN`/`COMMIT` block never
+/// return. The session buffers an explicit transaction into `txn_log` and
+/// replays it in `commit_block` under ONE `WriteSession` on the main database;
+/// a statement touching only the member takes `DbRoute::AttachedOnly` and
+/// forwards to that member's own handle, and the SECOND forward inside a block
+/// spins. `multifile.rs`'s module docs say cross-file statements inside an open
+/// `WriteSession` are refused BY NAME — that refusal does not cover this arm.
+///
+/// It SPINS (84 % of a core) rather than blocking, which is why this test uses
+/// a worker thread and a deadline rather than expecting a `Busy` error.
+///
+/// Kept as an executable statement of the bug rather than prose: the reproducer
+/// took a corpus differential, a per-statement watchdog and two false trails to
+/// find, and the next person should get it back with one command.
+///
+/// A main-table version is fine, and ONE write in the block is fine — both are
+/// asserted here, so a fix cannot be "make everything refuse".
+#[test]
+#[ignore = "known bug: two member writes in one transaction block spin; see COMPAT-PG.md"]
+fn two_writes_to_an_attached_member_in_one_block_must_terminate() {
+    fn run(stmts: &[&str], limit: std::time::Duration) -> bool {
+        let owned: Vec<String> = stmts.iter().map(|s| s.to_string()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut input = startup_packet();
+            for s in &owned {
+                input.extend_from_slice(&query(s));
+            }
+            input.extend_from_slice(&terminate());
+            let pipe = Pipe {
+                input: Cursor::new(input),
+                output: Vec::new(),
+            };
+            let mut sess = mpedb_pg::Session::new(
+                pipe,
+                mpedb_pg::Options {
+                    db: db(),
+                    server_version: mpedb_pg::server_version(),
+                    require_password: false,
+                },
+            );
+            let _ = sess.run_for_test();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(limit).is_ok()
+    }
+    let limit = std::time::Duration::from_secs(20);
+
+    // The controls: neither of these may regress into a hang, and neither may
+    // be "fixed" by refusing member writes outright.
+    assert!(
+        run(
+            &[
+                "CREATE TABLE m (id int primary key, v int)",
+                "BEGIN",
+                "INSERT INTO m VALUES (0, 20)",
+                "UPDATE m SET v = v + 1",
+                "COMMIT",
+            ],
+            limit
+        ),
+        "two writes to a MAIN table in one block must terminate"
+    );
+    assert!(
+        run(
+            &[
+                "CREATE TEMP TABLE t (id int primary key, v int)",
+                "BEGIN",
+                "INSERT INTO t VALUES (0, 20)",
+                "COMMIT",
+            ],
+            limit
+        ),
+        "ONE write to a member in one block must terminate"
+    );
+
+    // The bug.
+    assert!(
+        run(
+            &[
+                "CREATE TEMP TABLE t (id int primary key, v int)",
+                "BEGIN",
+                "INSERT INTO t VALUES (0, 20)",
+                "UPDATE t SET v = v + 1",
+                "COMMIT",
+            ],
+            limit
+        ),
+        "two writes to a TEMP member in one block must terminate"
+    );
+    assert!(
+        run(
+            &[
+                "ATTACH ':memory:' AS aux",
+                "CREATE TABLE aux.t (id int primary key, v int)",
+                "BEGIN",
+                "INSERT INTO aux.t VALUES (0, 20)",
+                "UPDATE aux.t SET v = v + 1",
+                "COMMIT",
+            ],
+            limit
+        ),
+        "two writes to an ATTACHed member in one block must terminate"
+    );
+}
