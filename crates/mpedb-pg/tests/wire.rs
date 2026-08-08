@@ -479,27 +479,25 @@ fn show_answers_the_settings_a_driver_asks_for_at_connect() {
     assert!(completions.contains(&"SET".to_string()), "{completions:?}");
 }
 
-/// **KNOWN BUG, currently failing — `#[ignore]`d for that reason and no other.**
+/// Two writes to an ATTACHED member inside one `BEGIN`/`COMMIT` block must
+/// terminate. They did not — this was a HANG, and the test landed `#[ignore]`d
+/// and failing before the cause was found.
 ///
-/// Two writes to an ATTACHED member inside one `BEGIN`/`COMMIT` block never
-/// return. The session buffers an explicit transaction into `txn_log` and
-/// replays it in `commit_block` under ONE `WriteSession` on the main database;
-/// a statement touching only the member takes `DbRoute::AttachedOnly` and
-/// forwards to that member's own handle, and the SECOND forward inside a block
-/// spins. `multifile.rs`'s module docs say cross-file statements inside an open
-/// `WriteSession` are refused BY NAME — that refusal does not cover this arm.
+/// The cause was an unmatched decrement: `try_begin_exclusive_write` is
+/// CONDITIONAL and its release was not, so a txn on the member that never took
+/// the exclusive still decremented the thread-local nesting depth. Main's
+/// `exclusive_write` flag stayed set with the depth at 0, and the next private
+/// read read that as a foreign writer and spun on its own thread
+/// (`WriteTxn::end_exclusive_if_taken`).
 ///
-/// It SPINS (84 % of a core) rather than blocking, which is why this test uses
-/// a worker thread and a deadline rather than expecting a `Busy` error.
+/// It SPUN (84 % of a core) rather than blocking, which is why this test uses a
+/// worker thread and a deadline rather than expecting a `Busy` error — and why
+/// it keeps that shape now that it passes: a regression here is a hang, and a
+/// hang in a test suite is a stuck CI job, not a red one.
 ///
-/// Kept as an executable statement of the bug rather than prose: the reproducer
-/// took a corpus differential, a per-statement watchdog and two false trails to
-/// find, and the next person should get it back with one command.
-///
-/// A main-table version is fine, and ONE write in the block is fine — both are
-/// asserted here, so a fix cannot be "make everything refuse".
+/// A main-table version and a one-write version are asserted alongside, so a
+/// future "fix" cannot be "make everything refuse".
 #[test]
-#[ignore = "known bug: two member writes in one transaction block spin; see COMPAT-PG.md"]
 fn two_writes_to_an_attached_member_in_one_block_must_terminate() {
     fn run(stmts: &[&str], limit: std::time::Duration) -> bool {
         let owned: Vec<String> = stmts.iter().map(|s| s.to_string()).collect();

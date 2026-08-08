@@ -608,7 +608,7 @@ impl<'e> WriteTxn<'e> {
         // Commit wins: discard undo images (published meta now owns the dirtied pages).
         self.inplace_undo.clear();
         self.finished = true;
-        self.eng.shm.end_exclusive_write();
+        self.end_exclusive_if_taken();
         self.eng.shm.writer_unlock();
         Ok(())
     }
@@ -621,12 +621,32 @@ impl<'e> WriteTxn<'e> {
     pub fn abort(mut self) {
         self.restore_inplace_undo();
         self.finished = true;
-        self.eng.shm.end_exclusive_write();
+        self.end_exclusive_if_taken();
         self.eng.shm.writer_unlock();
     }
 }
 
 impl WriteTxn<'_> {
+    /// Release the private exclusive-write flag — ONLY if this txn took it.
+    ///
+    /// `try_begin_exclusive_write` is conditional (private `:memory:` with no
+    /// reader pins); the release was not, and an unmatched decrement of the
+    /// thread-local nesting depth is a hang. The depth is per-THREAD and shared
+    /// across engines, while the flag is per-shm: a txn on a second database
+    /// that never took the exclusive still decremented, driving the count below
+    /// the real nesting level. The next private read on the FIRST database then
+    /// saw `exclusive_write = 1` with depth 0 — a foreign writer, as far as the
+    /// pin loop could tell — and spun forever waiting for its own thread.
+    ///
+    /// Reproduced as two writes to an ATTACHED member inside one
+    /// `BEGIN`/`COMMIT` block over the wire protocol, which is exactly that
+    /// shape: main holds the exclusive, the member's txn releases it.
+    fn end_exclusive_if_taken(&self) {
+        if self.in_place {
+            self.eng.shm.end_exclusive_write();
+        }
+    }
+
     /// Put exclusive in-place pages back to their pre-txn bytes (abort path).
     pub(super) fn restore_inplace_undo(&mut self) {
         for (id, bytes) in self.inplace_undo.drain() {
@@ -641,7 +661,7 @@ impl Drop for WriteTxn<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.restore_inplace_undo();
-            self.eng.shm.end_exclusive_write();
+            self.end_exclusive_if_taken();
             self.eng.shm.writer_unlock();
         }
     }

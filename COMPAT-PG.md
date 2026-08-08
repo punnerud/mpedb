@@ -663,6 +663,25 @@ it is not a lock nobody releases, it is a loop nobody leaves. Two minutes of
 `ps -L` said more than an hour of reading the transaction code, and it is the
 measurement that should have come first.
 
+**FIXED.** The cause is an unmatched decrement, three frames below where the
+trail was pointing. `Shm::try_begin_exclusive_write` is CONDITIONAL — a private
+`:memory:` database with no reader pins takes an in-place exclusive and nothing
+else does — and `WriteTxn`'s three release sites called `end_exclusive_write`
+UNCONDITIONALLY. The nesting depth it decrements is per-THREAD and shared
+across engines, while the flag it guards is per-shm. So a transaction on the
+MEMBER, which never took an exclusive, still decremented; main's
+`exclusive_write` stayed set with the depth at 0; and the next private read on
+MAIN read that as a FOREIGN writer and spun waiting for its own thread.
+
+`WriteTxn::end_exclusive_if_taken` gates the release on the same `in_place`
+flag the acquisition already recorded. The reproducer's test now passes in
+0.07 s, and it keeps its worker-thread-and-deadline shape rather than becoming
+a plain assertion: a regression here is a HANG, and a hang in a test suite is a
+stuck CI job rather than a red one.
+
+Everything below is what the trail looked like before the cause was found. It
+is kept because the route to it is the reusable part.
+
 It points at attached-member writes inside an open transaction. A temp table
 lives in an ATTACHED member (`multifile.rs`); `commit_block` opens ONE
 `WriteSession` on the main database and replays the log into it, and a
