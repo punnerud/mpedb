@@ -221,14 +221,14 @@ real volume — see the notes below on why both of those qualifiers matter):
 
 | outcome | statements | share |
 |---|---:|---:|
-| **match** — both answered, identically | 9 277 | 22.9 % |
+| **match** — both answered, identically | 9 335 | 23.0 % |
 | **order-only** — same rows, different order, no `ORDER BY` asked | 20 | 0.0 % |
-| **both refused** — both errored | 7 502 | 18.5 % |
-| **refused** — PostgreSQL answered, mpedb refused by name | 20 727 | 51.1 % |
-| **DIVERGED** — both answered, differently | 3 050 | 7.5 % |
+| **both refused** — both errored | 7 522 | 18.5 % |
+| **refused** — PostgreSQL answered, mpedb refused by name | 20 804 | 51.3 % |
+| **DIVERGED** — both answered, differently | 2 895 | 7.1 % |
 
-Agreement (match + order-only + both-refused) is **41.4 %**. Divergence — the
-only number that means something is WRONG — is **7.5 %**.
+Agreement (match + order-only + both-refused) is **41.6 %**. Divergence — the
+only number that means something is WRONG — is **7.1 %**.
 
 **One of those matches was not a match, and a class of them never could be.**
 psql spells the difference between a result of ONE EMPTY ROW (`"\n"`) and a
@@ -678,6 +678,18 @@ flag the acquisition already recorded. The reproducer's test now passes in
 0.07 s, and it keeps its worker-thread-and-deadline shape rather than becoming
 a plain assertion: a regression here is a HANG, and a hang in a test suite is a
 stuck CI job rather than a red one.
+
+**And it unblocked a whole corpus file that had been hanging in plain sight.**
+`temp.sql` stood at `0 / 0 / 0 / 0 / 162` in the baseline — every statement
+counted as diverged, which is what "the file hung" is recorded as. It now reads
+58 match, 19 both-refused, 78 refused, **7 diverged**. Corpus-wide, divergence
+fell 3 050 → **2 895** and agreement rose to **41.6 %**: the largest single
+movement of the session, from a bug the oracle had been reporting for as long
+as it has existed and nobody could read.
+
+That is the cost of a collapsed line, paid in full. A row of all-diverged is
+indistinguishable from a file that genuinely disagrees 162 times, and the
+baseline recorded it as a fact about mpedb's SQL surface for every run since.
 
 Everything below is what the trail looked like before the cause was found. It
 is kept because the route to it is the reusable part.
