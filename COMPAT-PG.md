@@ -648,6 +648,13 @@ foreign key is irrelevant — the version with no `REFERENCES` at all hangs too 
 and so is `DEFERRABLE`, which is where the trail started and where it would
 have stayed without reducing.
 
+**It SPINS — 84 % of a core — rather than blocking.** With the process wedged,
+one thread sits in `futex_wait` (the harness waiting on its worker) and the
+other is `R` at 84 % CPU. That rules out the first thing anyone would look for:
+it is not a lock nobody releases, it is a loop nobody leaves. Two minutes of
+`ps -L` said more than an hour of reading the transaction code, and it is the
+measurement that should have come first.
+
 It points at the TEMP schema. A temp table lives in an ATTACHED member
 (`multifile.rs`), `commit_block` opens ONE `WriteSession` on the main database
 and replays the log into it, and a statement touching only the member forwards
