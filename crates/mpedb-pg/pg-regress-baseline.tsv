@@ -125,7 +125,7 @@ multirangetypes	43	0	38	440	83
 mvcc	8	0	1	2	0
 name	9	0	12	12	7
 namespace	10	0	3	13	2
-numeric	593	0	54	227	143
+numeric	593	0	68	227	129
 numeric_big	506	0	10	19	17
 numerology	22	0	33	28	5
 object_address	5	0	35	41	0

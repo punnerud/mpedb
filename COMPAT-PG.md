@@ -221,14 +221,14 @@ real volume — see the notes below on why both of those qualifiers matter):
 
 | outcome | statements | share |
 |---|---:|---:|
-| **match** — both answered, identically | 9 181 | 22.6 % |
+| **match** — both answered, identically | 9 180 | 22.6 % |
 | **order-only** — same rows, different order, no `ORDER BY` asked | 20 | 0.0 % |
-| **both refused** — both errored | 7 474 | 18.4 % |
+| **both refused** — both errored | 7 486 | 18.4 % |
 | **refused** — PostgreSQL answered, mpedb refused by name | 20 829 | 51.3 % |
-| **DIVERGED** — both answered, differently | 3 072 | 7.6 % |
+| **DIVERGED** — both answered, differently | 3 059 | 7.5 % |
 
 Agreement (match + order-only + both-refused) is **41.0 %**. Divergence — the
-only number that means something is WRONG — is **7.6 %**.
+only number that means something is WRONG — is **7.5 %**.
 
 **One of those matches was not a match, and a class of them never could be.**
 psql spells the difference between a result of ONE EMPTY ROW (`"\n"`) and a
@@ -473,6 +473,38 @@ it made a planner gap that was already there stop hiding behind a NULL. The
 gap is now its own item, which is the correct place for it. Same pattern as
 `'NaN'::numeric` and as `plpgsql.sql`: **a feature that works exposes an older
 one that does not, and the score moving the wrong way is how you find out.**
+
+### And the second: math domain errors
+
+`sqrt(-1)`, `ln(0)`, `ln(-1)` — sqlite answers NULL, PostgreSQL raises. Five
+strict `ScalarFn` codes (`SqrtStrict`, `LnStrict`, `Log10Strict`, `Log2Strict`,
+`LogBaseStrict`; PLAN\_FORMAT 73), chosen by the binder on the RESOLVED
+function rather than on the name, so a future alias cannot pick up the sqlite
+form by spelling.
+
+**`pow` and `exp` are deliberately NOT in that list.** Both engines already
+return an infinity there, so a strict form would turn agreement into refusal —
+which is the failure mode a compatibility change invites, and the reason this
+document's rule is "the cheapest way to move a compatibility metric is to
+accept syntax you cannot answer correctly", read in reverse.
+
+**Measured: `numeric.sql` divergence 143 → 129, and its match count did not
+move at all.** All 14 became both-refused. Corpus divergence 3 072 → 3 059.
+
+The bucket that produced this item is worth writing down, because the count
+alone said "27 numeric input problems" and the split says three jobs:
+
+| statements | PostgreSQL's reason | job |
+|---:|---|---|
+| 27 | `invalid input syntax for type numeric` | sqlite's permissive TEXT→number affinity at INSERT |
+| 14 | logarithm / square root of a non-positive | **done** |
+| 10 | `numeric field overflow` | `numeric(p,s)` precision and scale not enforced |
+| 9 | `cannot convert NaN/infinity to smallint` | `'NaN'::numeric` folds to `0`, so the int cast has nothing to refuse |
+| 6 | `smallint/integer/bigint out of range` | integer width not enforced on a cast |
+
+The `'NaN'::numeric` row is the one this document already names as a root
+cause. It is visible here as a SECOND-order effect — nine statements whose
+complaint is about `int2`, caused entirely by a cast three steps earlier.
 
 ### The ranked work list
 

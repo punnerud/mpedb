@@ -432,6 +432,63 @@
         assert!(!p.instrs.contains(&Instr::DivStrict));
     }
 
+    /// `sqrt(-1)` and `ln(0)` are NULL in sqlite and ERRORS in PostgreSQL —
+    /// the same shape as division by zero, and the same fix.
+    #[test]
+    fn math_domain_errors_raise_under_postgres_and_stay_null_under_sqlite() {
+        let bind = |sql: &str, d: Dialect| {
+            let t = table();
+            let (e, n) = parse_expr_only(sql).unwrap();
+            let mut b = Binder::new(&t, n, true);
+            b.set_dialect(d);
+            b.bind_expr(&e)
+        };
+
+        // A CALL is never const-folded (see `fold`: reproducing `call_scalar`'s
+        // NULL rules there is not worth a special case), so unlike the
+        // division case these bind cleanly and the difference shows at EVAL.
+        // Which is the honest place to test it — this is a runtime rule.
+        let run = |sql: &str, d: Dialect| {
+            let (e, _) = bind(sql, d).unwrap_or_else(|e| panic!("{sql} must bind: {e}"));
+            super::lower::compile_program(&e)
+                .expect("compiles")
+                .eval(&[], &[])
+        };
+
+        for sql in ["sqrt(-1)", "ln(0)", "ln(-1)", "log10(0)", "log2(-2)"] {
+            assert_eq!(
+                run(sql, Dialect::Sqlite).unwrap_or_else(|e| panic!("{sql}: {e}")),
+                Value::Null,
+                "sqlite must keep NULL for {sql}"
+            );
+            assert!(run(sql, Dialect::Postgres).is_err(), "{sql} must raise");
+        }
+
+        // PostgreSQL separates the two non-positive cases, and so does mpedb:
+        // a caller reading "of zero" knows which mistake it made.
+        let err = format!("{}", run("ln(0)", Dialect::Postgres).unwrap_err());
+        assert!(err.contains("logarithm of zero"), "{err}");
+        let err = format!("{}", run("ln(-1)", Dialect::Postgres).unwrap_err());
+        assert!(err.contains("negative number"), "{err}");
+        let err = format!("{}", run("sqrt(-1)", Dialect::Postgres).unwrap_err());
+        assert!(err.contains("square root"), "{err}");
+
+        // What must NOT change: a value INSIDE the domain answers identically
+        // in both dialects, and `exp`/`pow` are untouched because sqlite and
+        // PostgreSQL already agree there (both yield an infinity). Making
+        // those strict would turn agreement into refusal.
+        for sql in ["sqrt(4)", "ln(1)", "exp(1000)", "pow(0, -1)"] {
+            let pg = run(sql, Dialect::Postgres);
+            let lite = run(sql, Dialect::Sqlite);
+            assert!(pg.is_ok(), "{sql} must still answer under postgres");
+            assert_eq!(
+                pg.unwrap(),
+                lite.unwrap(),
+                "{sql} must answer the SAME in both dialects"
+            );
+        }
+    }
+
     #[test]
     fn function_arity_and_types_are_compile_errors() {
         assert!(bind_err_msg("lower(id)").contains("must be text"));

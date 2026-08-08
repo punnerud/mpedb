@@ -231,6 +231,26 @@ pub enum ScalarFn {
     /// node's own type separates them — which is why the pair is evaluated as a
     /// unit here, where that type is still in hand.
     JsonQuoteExtract = 69,
+
+    /// `sqrt`, `ln`, `log10`, `log2`, `log(b, x)` under the PostgreSQL
+    /// dialect: a DOMAIN error raises instead of yielding sqlite's NULL.
+    ///
+    /// Five codes rather than one flag, for the reason [`Instr::DivStrict`]
+    /// gives: the dialect is a compile-time property and belongs in the plan
+    /// hash, because one registry serves plans by hash to processes that may
+    /// be configured differently.
+    ///
+    /// A domain error is NOT the same as a NULL ARGUMENT: `ln(NULL)` is NULL
+    /// in both dialects, and it never reaches here — the NULL-propagation rule
+    /// runs before the call. So the strict form can raise on every NULL it
+    /// would otherwise have produced, without having to tell two kinds of NULL
+    /// apart afterwards. Trying to do that at the opcode level is what makes a
+    /// blanket "strict call" wrapper impossible.
+    SqrtStrict = 70,
+    LnStrict = 71,
+    Log10Strict = 72,
+    Log2Strict = 73,
+    LogBaseStrict = 74,
 }
 
 impl ScalarFn {
@@ -304,6 +324,11 @@ impl ScalarFn {
             67 => ScalarFn::VecCosine,
             68 => ScalarFn::Splice,
             69 => ScalarFn::JsonQuoteExtract,
+            70 => ScalarFn::SqrtStrict,
+            71 => ScalarFn::LnStrict,
+            72 => ScalarFn::Log10Strict,
+            73 => ScalarFn::Log2Strict,
+            74 => ScalarFn::LogBaseStrict,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -330,6 +355,11 @@ impl ScalarFn {
                 argc == 1 || argc == 2
             }
             ScalarFn::Sqrt | ScalarFn::Sign | ScalarFn::Ceil | ScalarFn::Floor => argc == 1,
+            ScalarFn::SqrtStrict
+            | ScalarFn::LnStrict
+            | ScalarFn::Log10Strict
+            | ScalarFn::Log2Strict => argc == 1,
+            ScalarFn::LogBaseStrict => argc == 2,
             ScalarFn::Substr => argc == 2 || argc == 3,
             ScalarFn::Instr | ScalarFn::Pow | ScalarFn::VecL2 | ScalarFn::VecCosine => argc == 2,
             ScalarFn::Replace => argc == 3,
@@ -392,6 +422,14 @@ impl ScalarFn {
             ScalarFn::Rtrim => "rtrim",
             ScalarFn::Instr => "instr",
             ScalarFn::Sqrt => "sqrt",
+            // The NAME a user wrote, in both dialects — the code carries the
+            // dialect, so an error message must not invent a spelling nobody
+            // typed.
+            ScalarFn::SqrtStrict => "sqrt",
+            ScalarFn::LnStrict => "ln",
+            ScalarFn::Log10Strict => "log10",
+            ScalarFn::Log2Strict => "log2",
+            ScalarFn::LogBaseStrict => "log",
             ScalarFn::Pow => "pow",
             ScalarFn::Sign => "sign",
             ScalarFn::Ceil => "ceil",
@@ -568,6 +606,15 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
     // For `x > 0` the result is finite, so no extra guard is needed after.
     let log_or_null =
         |x: f64, f: fn(f64) -> f64| if x > 0.0 { Value::Float(f(x)) } else { Value::Null };
+    let log_or_raise = |x: f64, f: fn(f64) -> f64| -> Result<Value> {
+        if x > 0.0 {
+            Ok(Value::Float(f(x)))
+        } else if x == 0.0 {
+            Err(Error::DomainError("cannot take logarithm of zero".into()))
+        } else {
+            Err(Error::DomainError("cannot take logarithm of a negative number".into()))
+        }
+    };
     Ok(match f {
         ScalarFn::Lower => Value::Text(text(&args[0])?.to_lowercase()),
         ScalarFn::Upper => Value::Text(text(&args[0])?.to_uppercase()),
@@ -719,6 +766,16 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
         // sqrt of a negative and pow with a non-real result are NULL (sqlite),
         // and both always return a float regardless of the argument types.
         ScalarFn::Sqrt => float_or_null(num(&args[0])?.sqrt()),
+        // PostgreSQL: a negative argument is an ERROR, not a NaN and not NULL.
+        ScalarFn::SqrtStrict => {
+            let x = num(&args[0])?;
+            if x < 0.0 {
+                return Err(Error::DomainError(
+                    "cannot take square root of a negative number".into(),
+                ));
+            }
+            float_or_null(x.sqrt())
+        }
         ScalarFn::Pow => float_or_null(num(&args[0])?.powf(num(&args[1])?)),
         ScalarFn::Sign => match &args[0] {
             Value::Int(i) => Value::Int(i.signum()),
@@ -810,6 +867,12 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
         ScalarFn::Ln => log_or_null(num(&args[0])?, f64::ln),
         ScalarFn::Log10 => log_or_null(num(&args[0])?, f64::log10),
         ScalarFn::Log2 => log_or_null(num(&args[0])?, f64::log2),
+        // PostgreSQL separates the two non-positive cases by MESSAGE, and the
+        // separation is worth keeping: zero and negative are different
+        // mistakes, and a caller reading "of zero" knows which one it made.
+        ScalarFn::LnStrict => log_or_raise(num(&args[0])?, f64::ln)?,
+        ScalarFn::Log10Strict => log_or_raise(num(&args[0])?, f64::log10)?,
+        ScalarFn::Log2Strict => log_or_raise(num(&args[0])?, f64::log2)?,
         // log(b, x): sqlite requires the base b > 1 (it checks ln(b) > 0) and
         // x > 0, else NULL. The result is ln(x)/ln(b) = `x.log(b)`, finite there.
         ScalarFn::LogBase => {
@@ -820,6 +883,22 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
             } else {
                 Value::Null
             }
+        }
+        ScalarFn::LogBaseStrict => {
+            let b = num(&args[0])?;
+            let x = num(&args[1])?;
+            // The ARGUMENT is checked before the base: PostgreSQL reports what
+            // is wrong with `x` first, and reproducing the order is free.
+            log_or_raise(x, f64::ln)?;
+            if b <= 0.0 {
+                return Err(Error::DomainError(
+                    "cannot take logarithm of a negative number".into(),
+                ));
+            }
+            if b == 1.0 {
+                return Err(Error::DomainError("division by zero".into()));
+            }
+            Value::Float(x.log(b))
         }
         ScalarFn::Sin => float_or_null(num(&args[0])?.sin()),
         ScalarFn::Cos => float_or_null(num(&args[0])?.cos()),

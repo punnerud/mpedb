@@ -170,6 +170,15 @@ pub enum Error {
     Busy,
     DivisionByZero,
     ArithmeticOverflow,
+    /// A function was given an argument OUTSIDE ITS DOMAIN — `sqrt(-1)`,
+    /// `ln(0)` — under a dialect that raises rather than yielding NULL.
+    ///
+    /// Its own variant rather than a `TypeMismatch`: the argument's TYPE is
+    /// fine, and calling it a type error would send a reader looking for a
+    /// cast that is not the problem. The message carries the wording, because
+    /// PostgreSQL distinguishes "of zero" from "of a negative number" and the
+    /// distinction says which mistake the caller made.
+    DomainError(String),
     /// A statement exceeded one of its deterministic per-execution budgets
     /// (#74): `used` units of `kind` crossed `limit` while evaluating `which`
     /// (a coarse but correct attribution of where the work went — a scan, a
@@ -266,6 +275,7 @@ impl fmt::Display for Error {
                  the busy timeout"
             ),
             Error::DivisionByZero => write!(f, "division by zero"),
+            Error::DomainError(m) => write!(f, "{m}"),
             Error::ArithmeticOverflow => write!(f, "arithmetic overflow"),
             Error::RuntimeBudget { kind, limit, used, which } => write!(
                 f,

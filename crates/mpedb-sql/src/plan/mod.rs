@@ -530,7 +530,13 @@ const MAX_JOINS: usize = 63;
 //     let a sqlite-dialect session execute a plan compiled with PostgreSQL's
 //     semantics — the same bytes meaning two things. Purely additive: a
 //     format-71 reader rejects opcode 65 as unknown.
-const PLAN_FORMAT: u8 = 72;
+//  73: `ScalarFn::{SqrtStrict, LnStrict, Log10Strict, Log2Strict,
+//     LogBaseStrict}` (tags 70..74) — the same dialect split as 72, for the
+//     five math functions whose DOMAIN error PostgreSQL raises and sqlite
+//     answers NULL for. `pow`/`exp` are deliberately absent: both engines
+//     already return an infinity there, so a strict form would turn agreement
+//     into refusal. Additive: a format-72 reader rejects tag 70 as unknown.
+const PLAN_FORMAT: u8 = 73;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

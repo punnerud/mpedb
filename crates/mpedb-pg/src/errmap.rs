@@ -34,6 +34,7 @@ pub const CHECK_VIOLATION: &str = "23514";
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 pub const DIVISION_BY_ZERO: &str = "22012";
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+pub const INVALID_PARAMETER_VALUE: &str = "22023";
 pub const DISK_FULL: &str = "53100";
 pub const OUT_OF_MEMORY: &str = "53200";
 pub const QUERY_CANCELED: &str = "57014";
@@ -82,6 +83,11 @@ pub fn sqlstate(e: &Error) -> (&'static str, String) {
         // ---- runtime --------------------------------------------------------
         Error::ArithmeticOverflow => NUMERIC_VALUE_OUT_OF_RANGE,
         Error::DivisionByZero => DIVISION_BY_ZERO,
+        // 22023 invalid_parameter_value. PostgreSQL uses the narrower 2201E /
+        // 2201F for the logarithm and power cases; one class-22 code that is
+        // correct for every domain error beats five that have to be kept in
+        // step with which function raised.
+        Error::DomainError(_) => INVALID_PARAMETER_VALUE,
         Error::RuntimeBudget { .. } => QUERY_CANCELED,
         Error::OutOfMemory { .. } => OUT_OF_MEMORY,
         Error::DbFull => DISK_FULL,

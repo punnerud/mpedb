@@ -383,6 +383,27 @@ impl<'a> Binder<'a> {
                 )));
             }
         };
+        // The five math functions whose DOMAIN error PostgreSQL raises and
+        // sqlite answers NULL for. Rewritten here, once, on the resolved
+        // function rather than on the name — so a future alias (`log` for
+        // `ln`, say) cannot pick up the sqlite form by spelling.
+        //
+        // `pow`/`exp` are deliberately NOT here: sqlite returns Inf and so
+        // does PostgreSQL, so there is nothing to make strict. Adding them
+        // would turn agreement into refusal, which is the failure mode a
+        // compatibility change invites.
+        let f = if self.dialect == Dialect::Postgres {
+            match f {
+                ScalarFn::Sqrt => ScalarFn::SqrtStrict,
+                ScalarFn::Ln => ScalarFn::LnStrict,
+                ScalarFn::Log10 => ScalarFn::Log10Strict,
+                ScalarFn::Log2 => ScalarFn::Log2Strict,
+                ScalarFn::LogBase => ScalarFn::LogBaseStrict,
+                other => other,
+            }
+        } else {
+            f
+        };
         // Which argument of this function is sqlite's TIMESTRING (the only
         // position a `'now'` can occupy — every later argument is a modifier,
         // and modifiers are refused wholesale).
@@ -456,6 +477,11 @@ impl<'a> Binder<'a> {
             // or float, unpinned like abs/round) but ALWAYS return a float; `pi`
             // is nullary and also returns a float. sign always returns an integer.
             ScalarFn::Sqrt
+            | ScalarFn::SqrtStrict
+            | ScalarFn::LnStrict
+            | ScalarFn::Log10Strict
+            | ScalarFn::Log2Strict
+            | ScalarFn::LogBaseStrict
             | ScalarFn::Pow
             | ScalarFn::Exp
             | ScalarFn::Ln
@@ -978,6 +1004,11 @@ impl<'a> Binder<'a> {
             // always float.
             BExpr::Call(
                 ScalarFn::Sqrt
+                | ScalarFn::SqrtStrict
+                | ScalarFn::LnStrict
+                | ScalarFn::Log10Strict
+                | ScalarFn::Log2Strict
+                | ScalarFn::LogBaseStrict
                 | ScalarFn::Pow
                 | ScalarFn::Exp
                 | ScalarFn::Ln
