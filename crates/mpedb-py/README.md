@@ -1,5 +1,11 @@
 # mpedb — a drop-in `sqlite3` replacement
 
+[![PyPI](https://img.shields.io/pypi/v/mpedb.svg)](https://pypi.org/project/mpedb/)
+[![Python](https://img.shields.io/pypi/pyversions/mpedb.svg)](https://pypi.org/project/mpedb/)
+[![Linux](https://github.com/punnerud/mpedb/actions/workflows/linux.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/linux.yml)
+[![macOS](https://github.com/punnerud/mpedb/actions/workflows/macos.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/macos.yml)
+[![Windows](https://github.com/punnerud/mpedb/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/windows.yml)
+
 A multi-process embedded database engine with PostgreSQL-grade concurrency
 (MVCC snapshots, lock-free readers) behind the `sqlite3` API you already use.
 Swap one import and existing code runs unchanged:
@@ -18,9 +24,10 @@ print(conn.execute("SELECT name FROM users").fetchall())
 pip install mpedb
 ```
 
-CPython **3.12+** (`abi3`: one wheel per platform covers every 3.12+ version).
-Wheels for Linux x86-64 and macOS arm64, published automatically when the full
-engine test suite is green on CI.
+CPython **3.10+** (`abi3`: one wheel per platform covers every 3.10+ version).
+Wheels for Linux (x86-64, aarch64, armv7), Windows x86-64 and macOS (arm64
+and Intel x86-64, each built and suite-tested natively on its own hardware),
+published automatically when the full engine test suite is green on CI.
 
 ## The path decides the engine
 

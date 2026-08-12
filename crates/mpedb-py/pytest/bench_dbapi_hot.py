@@ -1,11 +1,11 @@
-#!/usr/bin/env python3.12
+#!/usr/bin/env python3
 """N2 instrument: the consumer's microbench cells, mpedb dbapi vs stdlib
 sqlite3 side by side. Named bench_* so pytest never collects it; run
 directly, with the built module on PYTHONPATH:
 
     cargo build --release -p mpedb-py
     mkdir -p /tmp/mpedb-pymod && cp target/release/libmpedb_py.so /tmp/mpedb-pymod/mpedb.so
-    PYTHONPATH=/tmp/mpedb-pymod python3.12 crates/mpedb-py/pytest/bench_dbapi_hot.py
+    PYTHONPATH=/tmp/mpedb-pymod python3 crates/mpedb-py/pytest/bench_dbapi_hot.py
 
 Cells (mirrors mpedb2/bench shapes; ratio > 1 = sqlite3 wins):
     insert_txn      BEGIN; 10k parameterized INSERTs; ROLLBACK

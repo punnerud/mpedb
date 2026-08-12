@@ -181,7 +181,7 @@ log-based engine), and the hardware published when the hardware is the answer.
   mpedb-capi, so a box without /dev/fuse never compiles it: `cargo build --manifest-path
   crates/mpedb-fs/Cargo.toml`; `fuser` with default-features off, so no
   libfuse headers, mounting via `fusermount3`.
-- `crates/mpedb-py` — PyO3 module `mpedb` (abi3-py312, GIL released around engine calls);
+- `crates/mpedb-py` — PyO3 module `mpedb` (abi3-py310, GIL released around engine calls);
   build: `cargo build --release -p mpedb-py`, ship `libmpedb_py.so` as `mpedb.so`.
 
 ## Invariants that bite

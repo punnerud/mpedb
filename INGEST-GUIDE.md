@@ -19,8 +19,8 @@ that is `PYSPELL-RRETL.md`, and §8 shows where the two meet.
 ## 1. Setup
 
 ```sh
-pip install mpedb          # Linux x86-64/aarch64, macOS arm64, Windows x86-64;
-                           # CPython 3.12+
+pip install mpedb          # Linux x86-64/aarch64/armv7, macOS arm64/x86-64, Windows x86-64;
+                           # CPython 3.10+
 ```
 
 A database is a four-line TOML; you create tables with ordinary SQL.

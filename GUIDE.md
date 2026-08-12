@@ -570,7 +570,7 @@ db.query("INSERT INTO users (id, email) VALUES ($1, $2)", [2, 42])
 # ProgrammingError: value of type int64 cannot be inserted into column `email`
 ```
 
-Built as `abi3-py312`, with the GIL released around engine calls — so threads
+Built as `abi3-py310`, with the GIL released around engine calls — so threads
 doing database work actually run concurrently.
 
 ---

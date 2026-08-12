@@ -2,7 +2,8 @@
 #
 # Built with maturin: the Rust cdylib becomes `mpedb/_native` inside the
 # pure-Python package under python/ (the routing + compat shims live there).
-# abi3-py312: one wheel per platform covers CPython 3.12+.
+# abi3-py310: one wheel per platform covers CPython 3.10+ (3.10/3.11 are
+# still in security-fix support until Oct 2026 / Oct 2027).
 
 [build-system]
 requires = ["maturin>=1.5,<2"]
@@ -10,17 +11,20 @@ build-backend = "maturin"
 
 [project]
 name = "mpedb"
-version = "0.2.9"
+version = "0.3.0"
 description = "Drop-in sqlite3 replacement: multi-process embedded database with MVCC snapshots, content-hashed plans, and a sqlite-backed sync mode for .db files"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = { text = "mpedb License 1.0 (source-available; see LICENSE)" }
 authors = [{ name = "Morten Punnerud-Engelstad" }]
 keywords = ["database", "sqlite3", "embedded", "mvcc", "sql"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Rust",
   "Topic :: Database",
   "Topic :: Database :: Database Engines/Servers",

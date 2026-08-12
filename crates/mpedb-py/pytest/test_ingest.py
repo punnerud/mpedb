@@ -1,11 +1,11 @@
-#!/usr/bin/env python3.12
+#!/usr/bin/env python3
 """Ingest through the Python surface — the INGEST-GUIDE.md contract.
 
 Plain Python, no pytest. Run with the built module on PYTHONPATH:
 
     cargo build --release -p mpedb-py
     mkdir -p /tmp/mpedb-pymod && cp target/release/libmpedb_py.so /tmp/mpedb-pymod/mpedb.so
-    PYTHONPATH=/tmp/mpedb-pymod python3.12 crates/mpedb-py/pytest/test_ingest.py
+    PYTHONPATH=/tmp/mpedb-pymod python3 crates/mpedb-py/pytest/test_ingest.py
 
 This is the guide's fetcher, executed against a fake "external system" that
 lives in a dict: a delta that lies about `updated_at`, the dump that catches

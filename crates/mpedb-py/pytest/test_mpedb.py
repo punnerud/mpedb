@@ -1,11 +1,11 @@
-#!/usr/bin/env python3.12
+#!/usr/bin/env python3
 """End-to-end tests for the mpedb Python module.
 
 Plain Python, no pytest. Run with the built module on PYTHONPATH:
 
     cargo build --release -p mpedb-py
     mkdir -p /tmp/mpedb-pymod && cp target/release/libmpedb_py.so /tmp/mpedb-pymod/mpedb.so
-    PYTHONPATH=/tmp/mpedb-pymod python3.12 crates/mpedb-py/pytest/test_mpedb.py /tmp/mpedb-pytest
+    PYTHONPATH=/tmp/mpedb-pymod python3 crates/mpedb-py/pytest/test_mpedb.py /tmp/mpedb-pytest
 
 The working directory argument (default: a fresh temp dir) holds the config
 and database file. The suite is re-runnable against the same directory: on a

@@ -1,11 +1,11 @@
-#!/usr/bin/env python3.12
+#!/usr/bin/env python3
 """Reversible ETL through the Python surface — the PYSPELL-RRETL.md contract.
 
 Plain Python, no pytest. Run with the built module on PYTHONPATH:
 
     cargo build --release -p mpedb-py
     mkdir -p /tmp/mpedb-pymod && cp target/release/libmpedb_py.so /tmp/mpedb-pymod/mpedb.so
-    PYTHONPATH=/tmp/mpedb-pymod python3.12 crates/mpedb-py/pytest/test_rretl.py
+    PYTHONPATH=/tmp/mpedb-pymod python3 crates/mpedb-py/pytest/test_rretl.py
 
 This is the guide's image walkthrough, executed: strip colour from packed-RGB
 pixels (the chroma offsets are the residual), let the "user" retouch and crop

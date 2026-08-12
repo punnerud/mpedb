@@ -35,10 +35,26 @@ env:
 
 jobs:
   macos:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Apple Silicon; macos-15-intel is the LAST Intel
+        # image GitHub will host (macos-13 retired Dec 2025, Intel support
+        # ends with this image in Aug 2027). Worth a leg while it exists:
+        # same FLD-2 lock construction, but x86-64's TSO memory model versus
+        # ARM's weaker ordering — the fence pairs of design/DESIGN.md §4.3
+        # face a different memory model on each runner. pypi.yml builds and
+        # suite-tests the x86-64 wheel on this same image; this leg is the
+        # engine-level (crash-harness) coverage behind it.
+        runner: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          # rust-cache does not key on matrix values by itself — without
+          # this the two legs would poach each other's caches.
+          key: ${{ matrix.runner }}
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: toolchain
         run: rustc --version && cargo --version && cargo clippy --version && sqlite3 --version

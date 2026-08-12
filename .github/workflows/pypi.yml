@@ -43,23 +43,48 @@ jobs:
             echo "mpedb $v is not on PyPI — full gate + wheel fan run"
           fi
 
-  # The binding's OWN suite, every push. Run TWICE against one directory —
-  # its documented mode, and how it exercises persistence across process
-  # restarts (that second run is what caught #163: live DDL leaving a table
-  # behind).
-  pysuite:
+  # The binding's OWN suite, every push. The wheel is abi3-py310, so ONE
+  # build covers every supported CPython — built once here, then the suite
+  # fans out over 3.10..3.13 below (the fan legs are pure-Python, no rust
+  # toolchain, ~a minute each). This artifact is NOT published: it is not a
+  # manylinux-audited build, and publish deliberately downloads only
+  # `wheel-*` + `sdist`.
+  pywheel:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pysuite-wheel
+          path: dist
+
+  # Run TWICE against one directory — its documented mode, and how it
+  # exercises persistence across process restarts (that second run is what
+  # caught #163: live DDL leaving a table behind). The matrix floor (3.10)
+  # is what backs `requires-python = ">=3.10"`; windows.yml runs the same
+  # suite at the floor on its platform.
+  pysuite:
+    needs: pywheel
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: pysuite-wheel
+          path: dist
       - name: the python suite, twice against one directory
         run: |
           set -e
@@ -136,19 +161,48 @@ jobs:
           name: wheel-windows
           path: dist
 
+  # Two THIN wheels, each built natively on the hardware it targets — and the
+  # exact artifact that uploads is first installed and run through the python
+  # suite on that same hardware (the mac twin of windows.yml's gate; Linux
+  # gets it from pysuite). arm64 on macos-14; x86-64 on macos-15-intel, the
+  # last Intel image GitHub will host (retires Aug 2027) — native-built and
+  # suite-run beats a cross-compiled universal2 half nothing ever executed.
+  # Python pins mirror the logic elsewhere: the FLOOR (3.10) on Intel, the
+  # ceiling on arm — pysuite's Linux matrix owns the versions in between.
   wheel-macos:
     needs: [version, pysuite, test]
     if: needs.version.outputs.new == 'true'
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+            python: "3.13"
+          - runner: macos-15-intel
+            arch: x86_64
+            python: "3.10"
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
       - uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
+      - name: the suite against the wheel that is about to upload
+        run: |
+          set -e
+          pip install --find-links dist --no-index mpedb
+          d=$(mktemp -d)
+          python crates/mpedb-py/pytest/test_mpedb.py "$d"
+          python crates/mpedb-py/pytest/test_mpedb.py "$d"
+          python crates/mpedb-py/pytest/test_sync.py "$(mktemp -d)"
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-macos
+          name: wheel-macos-${{ matrix.arch }}
           path: dist
 
   sdist:
@@ -170,10 +224,17 @@ jobs:
     needs: [wheel-linux, wheel-macos, wheel-windows, sdist]
     runs-on: ubuntu-latest
     steps:
+      # Only the release artifacts — `pysuite-wheel` (the every-push test
+      # build, not manylinux-audited) must never reach twine.
       - uses: actions/download-artifact@v4
         with:
+          pattern: wheel-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
       - name: publish to PyPI
         env:
           TWINE_USERNAME: __token__

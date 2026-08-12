@@ -58,8 +58,8 @@ revert:   y  ──inverse───▶ x      (EXACT undo; refuses if anything w
 ## 1. Setup
 
 ```sh
-pip install mpedb          # Linux x86-64/aarch64, macOS arm64, Windows x86-64;
-                           # CPython 3.12+
+pip install mpedb          # Linux x86-64/aarch64/armv7, macOS arm64/x86-64, Windows x86-64;
+                           # CPython 3.10+
 ```
 
 or from a checkout:

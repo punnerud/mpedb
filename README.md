@@ -4,6 +4,8 @@
 [![macOS](https://github.com/punnerud/mpedb/actions/workflows/macos.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/macos.yml)
 [![Windows](https://github.com/punnerud/mpedb/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/windows.yml)
 [![Pages](https://github.com/punnerud/mpedb/actions/workflows/pages.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/pages.yml)
+[![PyPI](https://img.shields.io/pypi/v/mpedb.svg)](https://pypi.org/project/mpedb/)
+[![Python](https://img.shields.io/pypi/pyversions/mpedb.svg)](https://pypi.org/project/mpedb/)
 
 **An embedded, multi-process, shared-memory database in Rust — a measured
 drop-in for sqlite3, with PostgreSQL-grade concurrency on top.**
@@ -71,8 +73,8 @@ the database — and adds what sqlite lacks:
 
 **Python** — a drop-in `sqlite3` replacement, published to
 [PyPI](https://pypi.org/project/mpedb/) automatically whenever the full test
-suite is green on `main` (Linux x86-64/aarch64/armv7 + macOS arm64 wheels,
-CPython 3.12+):
+suite is green on `main` (Linux x86-64/aarch64/armv7, Windows x86-64 +
+macOS arm64/x86-64 wheels, CPython 3.10+):
 
 ```sh
 pip install mpedb
@@ -459,7 +461,7 @@ is locked".
 | `mpedb` | Facade: `Database`/`Workspace`, prepare/execute/query, write sessions, session context, RLS policy storage + injection, shared plan registry. |
 | `mpedb-sdk` | Caching client session. |
 | `mpedb-proc` | PySpell-style Python/Rust → budgeted IR stored procedures, streaming cursors. |
-| `mpedb-py` | PyO3 module (`abi3-py312`), GIL released around engine calls. |
+| `mpedb-py` | PyO3 module (`abi3-py310`), GIL released around engine calls. |
 | `mpedb-capi` | The libsqlite3 ABI shim: a cdylib exporting sqlite3's C-API (`libmpedb_sqlite3.so`), `LD_PRELOAD`ed or linked by any libsqlite3 consumer — CPython's `sqlite3`, language bindings, tools. Its own workspace; status in [C-API-COMPAT.md](C-API-COMPAT.md). |
 | `mpedb-mirror` | Bidirectional sqlite3/PostgreSQL ⇄ mpedb mirroring: import, incremental diff-pull under load, write-back, epoch-fenced authority switch. Round-trip differential export/diff is sqlite-only; the CLI drives sqlite only (PostgreSQL is library-level today). |
 | `mpedb-cli` | The `mpedb` binary: repl / exec / prepare / call / dump / stress / crash / powerloss / bench / proc / mirror. |
