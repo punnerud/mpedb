@@ -24,6 +24,20 @@ concurrency:
   group: pypi-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  # Same CI-speed knobs as linux.yml/windows.yml (motivation there): no
+  # incremental on throwaway runners, line-tables-only debuginfo — the wheels
+  # strip symbols anyway ([tool.maturin] strip = true), so this changes build
+  # TIME, not the shipped artifact. sccache is NOT set globally here the way
+  # the platform workflows do it: the maturin builds run inside manylinux
+  # containers where a host-level RUSTC_WRAPPER would name a binary that does
+  # not exist — each build step opts in via the action's own `sccache` input,
+  # which installs it inside the build environment.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+  CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+
 jobs:
   version:
     runs-on: ubuntu-latest
@@ -55,9 +69,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A red run's compile work is still worth keeping — today's flake
+          # rebuilt the world for nothing.
+          cache-on-failure: true
       - uses: PyO3/maturin-action@v1
         with:
           command: build
+          sccache: "true"
           args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
       - uses: actions/upload-artifact@v4
         with:
@@ -101,10 +120,18 @@ jobs:
     needs: version
     if: needs.version.outputs.new == 'true'
     runs-on: ubuntu-latest
+    # Plain cargo (no container), so the platform workflows' sccache setup
+    # applies as-is here.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: workspace tests
         run: cargo test --workspace
       - name: capi tests (own workspace)
@@ -135,10 +162,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
         if: matrix.target != 'x86_64'
+      # The container mounts the workspace, so ./target survives into the
+      # host-side cache — the QEMU legs (the expensive ones) skip recompiling
+      # what the last release already built. sccache only on x86_64: the
+      # emulated containers would need an sccache binary of THEIR arch.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wheel-${{ matrix.target }}
+          cache-on-failure: true
       - uses: PyO3/maturin-action@v1
         with:
           command: build
           target: ${{ matrix.target }}
+          sccache: ${{ matrix.target == 'x86_64' && 'true' || 'false' }}
           args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
           manylinux: auto
       - uses: actions/upload-artifact@v4
@@ -152,9 +188,13 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: PyO3/maturin-action@v1
         with:
           command: build
+          sccache: "true"
           args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
       - uses: actions/upload-artifact@v4
         with:
@@ -188,9 +228,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+          cache-on-failure: true
       - uses: PyO3/maturin-action@v1
         with:
           command: build
+          sccache: "true"
           args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
       - name: the suite against the wheel that is about to upload
         run: |
