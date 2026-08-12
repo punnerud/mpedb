@@ -34,9 +34,9 @@ fn churn_debug() {
     }
     let _ = std::fs::remove_file(&cfg.options.path);
     let _ = std::fs::remove_file(crate::shm::wal_path(&cfg.options.path));
-    if let Some(dir) = cfg.options.path.parent() {
-        let _ = std::fs::remove_dir(dir); // succeeds only once the dir is empty
-    }
+    // The shared mpedb-engine-tests dir stays: "remove_dir succeeds only once
+    // the dir is empty" races a concurrent test's create_dir_all → open
+    // window — see wal_cleanup in shm.rs for the flake this caused.
 }
 
 /// Phase-3 ceiling measurement: decompose a serial autocommit PK-point

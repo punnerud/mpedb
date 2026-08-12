@@ -4522,12 +4522,13 @@ mod tests {
     fn wal_cleanup(p: &std::path::Path) {
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(wal_path(p));
-        // Drop the shared test dir once the last file is gone — remove_dir
-        // only succeeds on an empty directory, so concurrent tests keep it
-        // alive and only the final teardown actually removes it.
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::remove_dir(dir);
-        }
+        // The shared test dir is deliberately LEFT standing. Removing it here
+        // ("remove_dir only succeeds on an empty directory") looked safe, but
+        // raced: a STARTING test's create_dir_all sees the dir and returns, a
+        // finishing test's remove_dir then catches it still empty — the
+        // starter has not created its file yet — and the starter's Shm::open
+        // lands in a deleted directory. CI hit that exact NotFound. An empty
+        // dir left in the scratch base costs nothing.
     }
 
     /// Simulate one engine commit at the shm level: fill `page_id` with
