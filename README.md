@@ -4,8 +4,8 @@
 [![macOS](https://github.com/punnerud/mpedb/actions/workflows/macos.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/macos.yml)
 [![Windows](https://github.com/punnerud/mpedb/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/windows.yml)
 [![Pages](https://github.com/punnerud/mpedb/actions/workflows/pages.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/pages.yml)
-[![PyPI](https://img.shields.io/pypi/v/mpedb.svg)](https://pypi.org/project/mpedb/)
-[![Python](https://img.shields.io/pypi/pyversions/mpedb.svg)](https://pypi.org/project/mpedb/)
+[![PyPI](https://img.shields.io/pypi/v/mpedb.svg?v=2)](https://pypi.org/project/mpedb/)
+[![Python](https://img.shields.io/pypi/pyversions/mpedb.svg?v=2)](https://pypi.org/project/mpedb/)
 
 **An embedded, multi-process, shared-memory database in Rust — a measured
 drop-in for sqlite3, with PostgreSQL-grade concurrency on top.**
