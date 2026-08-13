@@ -783,6 +783,30 @@ will visit. Space cost is identical; the logical size grows but is sparse below
 recovery replays more, the next commit retries — failing a commit that is already
 durable and acknowledged would be a lie.
 
+**Darwin's selective arm, and the guard that keeps it honest.** Step (1) says WHOLE
+mapping, and on Linux it is one: `msync(MS_SYNC)` there is dirty-tag driven, so the
+call costs what is dirty. On Darwin it costs the RANGE WIDTH — measured M3 Pro, 2.4 ms
+for 1 GiB against ~0.3 ms for 4 MiB — so a 1 GiB file would pay milliseconds per
+checkpoint to flush a few dozen pages. There, step (1) instead msyncs exactly the page
+ids appearing in the records `[wal_ckpt, target)`, plus both meta slots. Those are by
+construction the pages COW commits dirtied since the last checkpoint, so the main file
+still ends up containing every commit the log could recover.
+
+That arm is a **selective flush driven by reading the log back**, and it therefore has
+a failure mode the whole-mapping call does not: the walk stops at the first malformed
+record, and a caller that advanced `wal_ckpt` to `target` anyway would declare durable
+a range flushed only to that point — and then punch away the very records that could
+have recovered the rest. Bookkeeping ahead of the data is how SQLite's 2025 WAL-reset
+bug lost pages, and the shape is the same even though the mechanism (a copy, racing a
+concurrent write) is not: mpedb writes pages into the mapping at commit and checkpoints
+under the writer lock, so neither of those two ingredients exists here.
+
+So `wal_msync_logged_pages` returns whether it REACHED `target`, and anything less
+falls back to `msync_range(0, len)` — the same call the Linux arm makes unconditionally.
+The optimisation may stand in for the stated invariant only when it demonstrably
+covered the range; on any anomaly the invariant itself runs. It can only ever flush
+more, never less. The recovery argument below is unchanged, and now true of both arms.
+
 **Attach/recovery.** On a live system (no reboot) the mapping is coherent shared
 memory and always current — attach never replays. Replay runs exactly once per boot
 epoch, in the §4.2 boot-id path in `post_attach`, under the init flock, BEFORE the

@@ -2295,8 +2295,7 @@ impl Shm {
         // 1. main file catches up to the log
         if wal_ckpt_full_msync() || cfg!(target_os = "linux") {
             self.msync_range(0, self.len)?;
-        } else {
-            self.wal_msync_logged_pages(ckpt, target)?;
+        } else if self.wal_msync_logged_pages(ckpt, target)? {
             // Both meta slots may have been published by post-ckpt commits
             // (write_meta_slot stores into the mmap without an msync in wal
             // mode). Recovery does not trust metas, but a post-checkpoint
@@ -2304,6 +2303,17 @@ impl Shm {
             // we just declared redundant — msync them explicitly.
             self.msync_page(META_PAGE_A)?;
             self.msync_page(META_PAGE_B)?;
+        } else {
+            // The scan did not reach `target`, so the pages it collected are a
+            // PREFIX of what this checkpoint is about to declare durable —
+            // and `wal_ckpt` is advanced to `target` unconditionally below,
+            // after which the records that could have recovered the rest are
+            // punched away. Bookkeeping outrunning the data it claims is the
+            // one way a checkpoint loses an acknowledged commit, so the
+            // anomaly path does what §5.4 says a checkpoint does: msync the
+            // WHOLE mapping. It can only ever flush more, never less, and it
+            // is the same call the Linux arm makes on every checkpoint.
+            self.msync_range(0, self.len)?;
         }
         if self.durability == Durability::Async {
             self.wal_len().fetch_max(target, Ordering::AcqRel);
@@ -2320,9 +2330,19 @@ impl Shm {
     /// msync every data page image in WAL records `[from, to)`. Used by the
     /// Darwin checkpoint arm so a multi-hundred-MiB mapping does not pay for
     /// a full-file `msync` when only the logged pages changed.
-    fn wal_msync_logged_pages(&self, from: u64, to: u64) -> Result<()> {
+    ///
+    /// Returns whether the scan actually REACHED `to`. It is a selective flush
+    /// driven by reading the log back, and every malformed-record path below
+    /// stops the walk — so a caller that advanced the checkpoint watermark
+    /// regardless would declare durable a range whose tail was never flushed,
+    /// and then reclaim the records that could have recovered it. §5.4 states
+    /// the invariant the recovery path leans on as a FULL-MAPPING msync; this
+    /// arm may only stand in for it when it covered the whole range, and says
+    /// so here rather than leaving the caller to assume it.
+    #[must_use = "false means the range was not covered — the caller must msync the whole mapping"]
+    fn wal_msync_logged_pages(&self, from: u64, to: u64) -> Result<bool> {
         if to <= from {
-            return Ok(());
+            return Ok(true);
         }
         let wal = self.wal_file()?;
         let mut off = from;
@@ -2378,7 +2398,9 @@ impl Shm {
             )?;
             i += 1;
         }
-        Ok(())
+        // `>=`, not `==`: a record may straddle `to`, and the loop flushes it
+        // whole. Overshooting the range is coverage, not a gap.
+        Ok(off >= to)
     }
 
     /// Reboot-path WAL recovery (§5.4 wal). Caller: exclusive flock held, no
@@ -4796,6 +4818,65 @@ mod tests {
         // page 'pg' was NOT replayed (its record is below ckpt) — the
         // checkpoint's full-mapping msync is what guarantees it: still intact
         assert!(shm.page(pg).unwrap().iter().all(|&b| b == 0x11));
+        wal_cleanup(&p);
+    }
+
+    /// The selective Darwin checkpoint flush must SAY when it fell short.
+    ///
+    /// It reads the log back to decide which pages to msync, so a malformed
+    /// record stops the walk — and the caller advances `wal_ckpt` to `target`
+    /// regardless, then punches away the records below it. Declaring a range
+    /// durable that was only flushed up to its first bad record is the one way
+    /// a checkpoint loses an acknowledged commit, and it is the shape SQLite's
+    /// 2025 WAL-reset bug had (bookkeeping ahead of the data). The answer is
+    /// not to make the scan cleverer: it is to make it report, so the caller
+    /// can fall back to the whole-mapping msync §5.4 specifies.
+    ///
+    /// Exercised directly rather than through `wal_checkpoint_if`, because the
+    /// selective arm is `cfg!(target_os = "linux")`-gated OFF here — the
+    /// coverage decision is the part that must hold on every platform.
+    #[test]
+    fn a_selective_checkpoint_flush_reports_a_range_it_could_not_cover() {
+        let (shm, p) = wal_open_test("ckptcover");
+        let pg = shm.data_start;
+        commit_one(&shm, 1, pg, 0x11);
+        commit_one(&shm, 2, pg + 1, 0x22);
+        let end = shm.wal_len().load(Ordering::Acquire);
+
+        // A clean log: the scan reaches the end and says so.
+        assert!(shm.wal_msync_logged_pages(0, end).unwrap());
+        // An empty range is covered vacuously — not a failure to report.
+        assert!(shm.wal_msync_logged_pages(end, end).unwrap());
+        assert!(shm.wal_msync_logged_pages(end, 0).unwrap());
+
+        // Corrupt the FIRST record's magic. The walk now stops at offset 0,
+        // so the second commit's page is never flushed — and the caller must
+        // not be told the range is durable.
+        {
+            use std::os::unix::fs::FileExt as _;
+            let wal = std::fs::OpenOptions::new()
+                .write(true)
+                .open(wal_path(&p))
+                .unwrap();
+            wal.write_all_at(b"XXXX", 0).unwrap();
+        }
+        assert!(
+            !shm.wal_msync_logged_pages(0, end).unwrap(),
+            "a scan that stopped at the first record must not claim the range"
+        );
+        // …and a range that starts AFTER the damage is still coverable, so the
+        // report is about what was walked, not a blanket refusal once a file
+        // has any bad byte in it.
+        let second = {
+            let wal = std::fs::File::open(wal_path(&p)).unwrap();
+            let mut hdr = [0u8; WAL_HDR_LEN];
+            // The corrupted first record's length field is untouched.
+            read_full_at(&wal, &mut hdr, 0).unwrap();
+            u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as u64
+        };
+        assert!(second > 0 && second < end);
+        assert!(shm.wal_msync_logged_pages(second, end).unwrap());
+
         wal_cleanup(&p);
     }
 
