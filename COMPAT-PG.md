@@ -206,6 +206,71 @@ Fidelity notes worth knowing:
 | `\d <table>` | ❌ — needs `format_type()`, `array_to_string()` and a `CASE` shape mpedb does not parse |
 | arbitrary SQL | ✅ |
 
+## The other benchmark: real ORMs, and what it says
+
+The differential below asks *what SQL does mpedb refuse*, against PostgreSQL's
+own corpus. That corpus has a ceiling that is not about mpedb: large parts of
+it test PostgreSQL's internals — partitioning, `EXPLAIN` output, extensions,
+procedural languages, the catalog as SUBJECT — so 100 % there is not a
+meaningful target. What an application asks of PostgreSQL is a different and
+much smaller surface, and **100 % of that is meaningful**, because it is what
+"migrate a PostgreSQL app onto mpedb" actually means.
+
+`workbench/satest` runs **SQLAlchemy's third-party dialect compliance suite** —
+the bar SQLAlchemy publishes for dialects outside its tree — against `mpedb-pg`
+over psycopg2. First measurement, with `requirements.py` empty so nothing is
+excluded by declaration:
+
+| | |
+|---|---:|
+| passed | **53** |
+| failed | 121 |
+| errors | 1 300 |
+| skipped | 85 |
+| **pass rate** | **3.6 %** |
+
+**And 92.5 % of every error is one construct in one statement.** Ranked by the
+message the driver surfaced:
+
+| errors | share | cause |
+|---:|---:|---|
+| **1 316** | **92.5 %** | `x = ANY (ARRAY[…])` — refused by the array/row-constructor gate |
+| 93 | 6.5 % | `duplicate table name` (cascade: teardown never ran) |
+| 11 | 0.8 % | `DECLARE` (server-side cursors) |
+| 2 | 0.1 % | a parse error |
+
+All 1 316 are the SAME query — SQLAlchemy's `has_table`, which every test's
+setup calls:
+
+```sql
+SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class
+  JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace
+ WHERE pg_catalog.pg_class.relname = $1
+   AND pg_catalog.pg_class.relkind = ANY (ARRAY[$2,$3,$4,$5,$6])
+   AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid)
+   AND pg_catalog.pg_namespace.nspname != $7
+```
+
+**The catalog surface is not the gap.** The identical query with `IN (…)` in
+place of `= ANY (ARRAY[…])` returns the right answer today — `pg_class`,
+`pg_namespace`, the `oid` join and `pg_table_is_visible()` all work. What is
+missing is one expression form, and `x = ANY (ARRAY[a,b,c])` is exactly
+`x IN (a,b,c)`; mpedb has `IN`.
+
+That is worth stating plainly because the corpus's own conclusion — "most of
+what is missing is GRAMMAR" — is right about a different grammar. The ORM needs
+a small, enumerable surface and one desugaring, not statement-level coverage.
+
+### Gate 0: one connection at a time
+
+Before any of that: `mpedb-pg serve --unix` accepts SERIALLY, by design (the
+model is one process per connection, systemd providing the parallelism). Every
+ORM holds a pool, so the suite hung on its second connection. `workbench/
+forkserve.py` runs the server the way it is meant to run. This is not a bug and
+not a limitation — but it is a deployment fact any benchmark has to reproduce,
+and nothing in the corpus could have surfaced it, because `psql` opens one
+connection.
+
 ## What is measured
 
 ### The differential against PostgreSQL 16.14
