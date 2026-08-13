@@ -75,6 +75,15 @@ pub(crate) enum Tok {
     Tilde,
     LParen,
     RParen,
+    /// `[` and `]` — POSTGRES DIALECT ONLY.
+    ///
+    /// sqlite spends `[` on identifier quoting (`[my table]`), so there it can
+    /// never be a bracket: `ARRAY[1,2]` lexes as `ARRAY` followed by a quoted
+    /// identifier called `1,2`. PostgreSQL has no bracket quoting and spends
+    /// the byte on subscripts and array constructors, so the dialect has to
+    /// pick — the same trade `:` and `$` already make in `pg/lex.rs`.
+    LBracket,
+    RBracket,
     Comma,
     Semicolon,
     /// `.` — only ever used to qualify a table with a database alias

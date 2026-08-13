@@ -584,3 +584,83 @@ fn two_writes_to_an_attached_member_in_one_block_must_terminate() {
         "two writes to an ATTACHed member in one block must terminate"
     );
 }
+
+/// `x = ANY (ARRAY[…])` is PostgreSQL's spelling of `IN`, and it is the single
+/// construct that stood between mpedb and every ORM.
+///
+/// Measured, not guessed: it accounted for **1 316 of 1 422** driver-surfaced
+/// errors in SQLAlchemy's dialect compliance suite — all of them the same
+/// `has_table` probe, which every test's setup calls. Everything else in that
+/// probe (`pg_class`, `pg_namespace`, the `oid` join, `pg_table_is_visible`)
+/// already worked.
+///
+/// Driven over the wire rather than at the parser, because the dialect is a
+/// SESSION property: a parser test would have to set it by hand and would pass
+/// even if the session forgot to.
+#[test]
+fn quantified_array_comparison_is_in_and_only_where_it_really_is() {
+    let rows = |bytes: &[u8]| -> Vec<Vec<String>> {
+        frames(bytes)
+            .into_iter()
+            .filter(|(t, _)| *t == b'D')
+            .map(|(_, b)| {
+                let n = i16::from_be_bytes(b[0..2].try_into().unwrap()) as usize;
+                let mut at = 2usize;
+                (0..n)
+                    .map(|_| {
+                        let l = i32::from_be_bytes(b[at..at + 4].try_into().unwrap());
+                        at += 4;
+                        if l < 0 {
+                            "NULL".into()
+                        } else {
+                            let s = String::from_utf8_lossy(&b[at..at + l as usize]).into_owned();
+                            at += l as usize;
+                            s
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let err = |bytes: &[u8]| -> String {
+        frames(bytes)
+            .into_iter()
+            .find(|(t, _)| *t == b'E')
+            .map(|(_, b)| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+
+    // `= ANY` is IN: present matches, absent does not, and an absent value is
+    // FALSE rather than an error.
+    let out = run(vec![query("SELECT nick FROM users WHERE nick = ANY (ARRAY['ada','nobody'])")]);
+    assert_eq!(rows(&out), vec![vec!["ada".to_string()]], "= ANY should match ada only");
+
+    // `<> ALL` is NOT IN.
+    let out = run(vec![query("SELECT nick FROM users WHERE nick <> ALL (ARRAY['ada'])")]);
+    assert_eq!(rows(&out), vec![vec!["linus".to_string()]], "<> ALL should exclude ada");
+
+    // An empty array is a legal, false, membership test — not a parse error.
+    let out = run(vec![query("SELECT nick FROM users WHERE nick = ANY (ARRAY[])")]);
+    assert!(rows(&out).is_empty(), "= ANY over an empty array matches nothing");
+
+    // The six combinations that are NOT membership tests are refused BY NAME,
+    // and the refusal names the operator that was WRITTEN. `= ALL (ARRAY[1,2])`
+    // is false for every value; answering it as `IN` would say true for 1.
+    for (sql, op) in [
+        ("SELECT 1 WHERE 1 = ALL (ARRAY[1,2])", "= ALL"),
+        ("SELECT 1 WHERE 1 <> ANY (ARRAY[1,2])", "<> ANY"),
+        ("SELECT 1 WHERE 3 > ALL (ARRAY[1,2])", "> ALL"),
+        ("SELECT 1 WHERE 3 >= ANY (ARRAY[1,2])", ">= ANY"),
+        ("SELECT 1 WHERE 0 < ANY (ARRAY[1,2])", "< ANY"),
+        ("SELECT 1 WHERE 0 <= ALL (ARRAY[1,2])", "<= ALL"),
+    ] {
+        let e = err(&run(vec![query(sql)]));
+        assert!(e.contains("membership test"), "{sql} must be refused: {e}");
+        assert!(e.contains(op), "the refusal must name `{op}` as written: {e}");
+    }
+
+    // ARRAY outside a quantified comparison stays refused — mpedb has no array
+    // VALUE, and this change did not invent one.
+    let e = err(&run(vec![query("SELECT ARRAY[1,2]")]));
+    assert!(e.contains("array and row constructors"), "{e}");
+}

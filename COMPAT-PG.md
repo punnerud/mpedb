@@ -221,16 +221,22 @@ the bar SQLAlchemy publishes for dialects outside its tree — against `mpedb-pg
 over psycopg2. First measurement, with `requirements.py` empty so nothing is
 excluded by declaration:
 
-| | |
-|---|---:|
-| passed | **53** |
-| failed | 121 |
-| errors | 1 300 |
-| skipped | 85 |
-| **pass rate** | **3.6 %** |
+| | baseline | after `= ANY (ARRAY[…])` |
+|---|---:|---:|
+| passed | 53 | **137** |
+| failed | 121 | 304 |
+| errors | 1 300 | 811 |
+| skipped | 85 | 168 |
+| **pass rate** | **3.6 %** | **10.9 %** |
 
-**And 92.5 % of every error is one construct in one statement.** Ranked by the
-message the driver surfaced:
+**One construct took the pass rate from 3.6 % to 10.9 %** — 53 passing tests to
+137. Errors fell 1 300 → 811 and *failures rose* 121 → 304, which is the shape
+to expect and the one worth naming: a test that used to die in `setUp` now runs
+and fails on its own terms. Moving an error to a failure is progress even
+though the red count goes up.
+
+**And 92.5 % of every error was one construct in one statement.** Ranked by the
+message the driver surfaced, at the baseline:
 
 | errors | share | cause |
 |---:|---:|---|
@@ -261,6 +267,44 @@ That is worth stating plainly because the corpus's own conclusion — "most of
 what is missing is GRAMMAR" — is right about a different grammar. The ORM needs
 a small, enumerable surface and one desugaring, not statement-level coverage.
 
+### What it took, and the byte that was in the way
+
+`[` — the fourth contested byte, and contested harder than the three
+`pg/lex.rs` already trades. sqlite does not merely spell something else with
+it, it SWALLOWS to the `]`: under the sqlite lexer `ARRAY[1,2]` is `ARRAY`
+followed by an identifier literally named `1,2`. That is why the array
+constructor was **unparseable** rather than merely unsupported, and why no
+amount of parser work could have reached it. The PG dialect now takes the
+bracket back; sqlite keeps its quoting, and a test asserts both.
+
+The desugaring itself lives at the comparison tier, not as an array VALUE —
+mpedb has no array type, and inventing one to serve a membership test would be
+a data model bought for a syntax. Only the two combinations that ARE membership
+tests are translated:
+
+* `= ANY (…)` → `IN`  ·  `<> ALL (…)` → `NOT IN`
+
+The other six are refused by name, and the refusal names the operator as
+WRITTEN. `= ALL (ARRAY[1,2])` is false for every value; answering it as `IN`
+would say true for 1 — a quiet wrong answer, which is the whole reason the
+mapping is not "whatever parses".
+
+### The next one, already measured
+
+The distribution after the change, and it is the same shape a third time:
+
+| errors | share | cause |
+|---:|---:|---|
+| **767** | **81.4 %** | `COMMENT ON …` — and **749 of them are one statement** from one shared fixture |
+| 37 | 3.9 % | `pg_catalog.pg_sequence` missing |
+| 26 | 2.8 % | `duplicate table name` (teardown cascade) |
+| 19 | 2.0 % | `CREATE SEQUENCE` |
+| 10 | 1.1 % | `nextval()` |
+| 84 | 8.9 % | a tail of 12 more |
+
+Sequences are the real feature underneath three of those lines. `COMMENT` is
+metadata and is the cheap one.
+
 ### Gate 0: one connection at a time
 
 Before any of that: `mpedb-pg serve --unix` accepts SERIALLY, by design (the
@@ -286,11 +330,11 @@ real volume — see the notes below on why both of those qualifiers matter):
 
 | outcome | statements | share |
 |---|---:|---:|
-| **match** — both answered, identically | 9 390 | 23.1 % |
+| **match** — both answered, identically | 9 394 | 23.2 % |
 | **order-only** — same rows, different order, no `ORDER BY` asked | 20 | 0.0 % |
 | **both refused** — both errored | 7 522 | 18.5 % |
 | **refused** — PostgreSQL answered, mpedb refused by name | 20 753 | 51.1 % |
-| **DIVERGED** — both answered, differently | 2 893 | 7.1 % |
+| **DIVERGED** — both answered, differently | 2 871 | 7.1 % |
 
 Agreement (match + order-only + both-refused) is **41.7 %**. Divergence — the
 only number that means something is WRONG — is **7.1 %**.

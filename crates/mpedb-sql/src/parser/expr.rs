@@ -360,11 +360,91 @@ impl<'a> Parser<'a> {
                 break; // non-chaining: leftover op is a trailing-input error
             }
             self.pos += 1;
+            // `x = ANY (ARRAY[…])` / `x <> ALL (ARRAY[…])` — PostgreSQL's
+            // spelling of IN / NOT IN, and the one every ORM's catalog probe
+            // uses. Desugared HERE rather than given an array VALUE, because
+            // mpedb has no array type and inventing one to serve a membership
+            // test would be a data model bought for a syntax.
+            if self.dialect == Dialect::Postgres && self.peek_quantified_array() {
+                e = self.quantified_array_suffix(op, e)?;
+                seen_cmp = true;
+                continue;
+            }
             let r = self.bit_expr()?;
             e = Expr::Binary(op, Box::new(e), Box::new(r));
             seen_cmp = true;
         }
         Ok(e)
+    }
+
+    /// `ANY (ARRAY[` or `ALL (ARRAY[` sits next.
+    fn peek_quantified_array(&self) -> bool {
+        let quant = matches!(self.peek(), Some(Tok::Ident(w))
+            if w.eq_ignore_ascii_case("ANY") || w.eq_ignore_ascii_case("ALL"));
+        quant
+            && matches!(self.peek_at(1), Some(Tok::LParen))
+            && matches!(self.peek_at(2), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("ARRAY"))
+            && matches!(self.peek_at(3), Some(Tok::LBracket))
+    }
+
+    /// Turn `<lhs> <op> ANY|ALL (ARRAY[e, …])` into an `IN` / `NOT IN`.
+    ///
+    /// Only two of the eight (operator × quantifier) combinations ARE a
+    /// membership test:
+    ///
+    /// * `= ANY (…)` — true when lhs equals SOME element → `IN`
+    /// * `<> ALL (…)` — true when lhs differs from EVERY element → `NOT IN`
+    ///
+    /// The rest mean something else entirely (`> ALL` is "greater than the
+    /// maximum", `= ALL` is "every element is equal") and are refused by name.
+    /// Mapping them onto `IN` because they parse would be a wrong answer, and
+    /// a quiet one — `x = ALL (ARRAY[1,2])` is FALSE for every x, where `IN`
+    /// would say true for 1.
+    ///
+    /// NULL semantics come out right because they are `IN`'s: mpedb's
+    /// `InList` is the 3VL membership test, which is what PostgreSQL's
+    /// `= ANY` is defined as.
+    fn quantified_array_suffix(&mut self, op: BinOp, lhs: Expr) -> Result<Expr> {
+        let pos = self.here();
+        let quant_any = matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("ANY"));
+        let negated = match (op, quant_any) {
+            (BinOp::Eq, true) => false,
+            (BinOp::Ne, false) => true,
+            _ => {
+                return Err(Error::Parse {
+                    pos,
+                    msg: format!(
+                        "`{} {} (ARRAY[…])` is not a membership test — mpedb desugars only                          `= ANY` (IN) and `<> ALL` (NOT IN); the other quantified forms                          compare against the whole array and have no IN spelling",
+                        // The operator the user WROTE. Printing a guess here
+                        // (the first version said `<>` for every non-`=`) makes
+                        // the refusal name a statement nobody typed.
+                        match op {
+                            BinOp::Eq => "=",
+                            BinOp::Ne => "<>",
+                            BinOp::Lt => "<",
+                            BinOp::Le => "<=",
+                            BinOp::Gt => ">",
+                            _ => ">=",
+                        },
+                        if quant_any { "ANY" } else { "ALL" }
+                    ),
+                })
+            }
+        };
+        self.pos += 3; // ANY|ALL, `(`, ARRAY
+        self.expect(&Tok::LBracket, "`[` opening the array constructor")?;
+        let mut items = Vec::new();
+        if !matches!(self.peek(), Some(Tok::RBracket)) {
+            loop {
+                items.push(self.expr()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBracket, "`]` closing the array constructor")?;
+        self.expect(&Tok::RParen, "`)` closing ANY/ALL")?;
+        Ok(Expr::InList(Box::new(lhs), items, negated))
     }
 
     /// The bitwise tier: `&`, `|`, `<<`, `>>`, all at ONE precedence level and
@@ -1646,11 +1726,15 @@ impl<'a> Parser<'a> {
             // `[name]` quoting means the tokenizer has already turned
             // `ARRAY[1,2,3]` into `ARRAY` followed by a bracket-quoted
             // identifier `1,2,3`, so there is no `[` token left to match on.
-            let next_is_bracket = self
-                .toks
-                .get(self.pos)
-                .and_then(|t| self.src[t.end..].trim_start().chars().next())
-                == Some('[');
+            // Under the PG dialect `[` is a real token (`pg/lex.rs`); under
+            // sqlite it was swallowed into a bracket-quoted identifier, so
+            // there the only evidence left is the SOURCE byte.
+            let next_is_bracket = matches!(self.peek_at(1), Some(Tok::LBracket))
+                || self
+                    .toks
+                    .get(self.pos)
+                    .and_then(|t| self.src[t.end..].trim_start().chars().next())
+                    == Some('[');
             let is_array = w.eq_ignore_ascii_case("ARRAY")
                 && (next_is_bracket || matches!(self.peek_at(1), Some(Tok::LParen)));
             let is_row = w.eq_ignore_ascii_case("ROW") && matches!(self.peek_at(1), Some(Tok::LParen));

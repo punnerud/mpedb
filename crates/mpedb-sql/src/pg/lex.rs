@@ -69,6 +69,13 @@ pub(crate) fn special(b: &[u8], i: usize) -> Result<Option<(Tok, usize)>> {
                 return Ok(None);
             }
         }
+        // `[` / `]`. sqlite reads `[name]` as a QUOTED IDENTIFIER; PostgreSQL
+        // has no such quoting and uses the byte for subscripts and `ARRAY[…]`.
+        // Handing it to the sqlite arm here would turn `ARRAY[1,2]` into an
+        // identifier literally named `1,2` — which is how the array
+        // constructor came to be unparseable rather than merely unsupported.
+        b'[' => (Tok::LBracket, i + 1),
+        b']' => (Tok::RBracket, i + 1),
         b'!' => match (b.get(i + 1), b.get(i + 2)) {
             (Some(b'~'), Some(b'*')) => (Tok::NotTildeStar, i + 3),
             (Some(b'~'), _) => (Tok::NotTilde, i + 2),
@@ -232,6 +239,46 @@ mod tests {
         assert_eq!(
             pg("a != b"),
             vec![Tok::Ident("a".into()), Tok::Ne, Tok::Ident("b".into())]
+        );
+    }
+
+    /// `[` is the fourth contested byte, and it is contested HARDER than the
+    /// other three: sqlite does not merely spell something else with it, it
+    /// swallows everything up to the `]` into an identifier. So `ARRAY[1,2]`
+    /// under the sqlite lexer is `ARRAY` followed by a name literally called
+    /// `1,2` — which is why the array constructor was unPARSEABLE rather than
+    /// merely unsupported, and why no amount of parser work could have reached
+    /// it without this.
+    #[test]
+    fn the_postgres_dialect_takes_the_bracket_back_from_identifier_quoting() {
+        assert_eq!(
+            pg("ARRAY[1,2]"),
+            vec![
+                Tok::Ident("ARRAY".into()),
+                Tok::LBracket,
+                Tok::Int(1),
+                Tok::Comma,
+                Tok::Int(2),
+                Tok::RBracket
+            ]
+        );
+        // …and sqlite keeps its quoting, unchanged. Both spellings have to
+        // survive: this is a dialect trade, not a fix.
+        let lite = tokenize_dialect("ARRAY[1,2]", Dialect::Sqlite)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.tok)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lite,
+            vec![Tok::Ident("ARRAY".into()), Tok::QuotedIdent("1,2".into(), false)]
+        );
+        // A bracketed NAME under PG is now three tokens, which is correct for
+        // that dialect — `t[1]` is a subscript there, never a table called
+        // `1`.
+        assert_eq!(
+            pg("t[1]"),
+            vec![Tok::Ident("t".into()), Tok::LBracket, Tok::Int(1), Tok::RBracket]
         );
     }
 
