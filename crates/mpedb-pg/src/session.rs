@@ -84,12 +84,17 @@ pub struct Session<S: Read + Write> {
     /// model against mpedb's single writer: rather than hold the writer lock
     /// from `BEGIN` to `COMMIT` (which blocks every other process for as long
     /// as the client is thinking), the block is REPLAYED as one mpedb
-    /// transaction at `COMMIT`. Reads inside the block run against the
-    /// session's snapshot, so the block still sees its own writes.
+    /// transaction at `COMMIT`.
     ///
-    /// The visible difference from PostgreSQL: a constraint violation is
-    /// reported at COMMIT rather than at the offending statement. That is
-    /// stated in COMPAT-PG.md rather than hidden.
+    /// The block DOES see its own writes, and the mechanism is
+    /// [`Self::exec_in_block`]: every statement inside the block replays this
+    /// log into a write transaction, runs, takes its answer and rolls back.
+    ///
+    /// This comment used to claim the property came from "the session's
+    /// snapshot". It did not, and nothing tested it, so a buffered `INSERT`
+    /// returned a fabricated `Affected(0)` and an in-block `SELECT` read the
+    /// PRE-transaction state. A property asserted in prose is a property
+    /// nobody checks — `wire.rs` now checks this one.
     txn_log: Vec<(String, Vec<Value>)>,
     pid: i32,
     secret: i32,
