@@ -8,7 +8,7 @@
 //! `Parser` are visible to descendants. This file holds only the DDL grammar.
 
 use super::Parser;
-use crate::ddl::{
+use crate::ddl::{CommentTarget, 
     CreatePolicySpec, CreateTriggerSpec, DdlStmt, RlsAction, TriggerBodySpec, TriggerEvent,
     TriggerTiming,
 };
@@ -141,6 +141,11 @@ pub(crate) fn parse_ddl_dialect(
                     msg: unsupported_create_msg(&found),
                 });
             }
+        }
+        // `COMMENT ON …`. Its own verb, not a CREATE/ALTER sub-form.
+        Some("comment") => {
+            p.advance();
+            p.parse_comment()?
         }
         Some("drop") => {
             p.advance();
@@ -1148,6 +1153,65 @@ impl<'a> Parser<'a> {
             using_src,
             check_src,
         }))
+    }
+
+    /// `COMMENT ON { TABLE t | COLUMN t.c | CONSTRAINT c ON t } IS text`.
+    ///
+    /// The three forms an ORM emits from a table definition. Everything else
+    /// PostgreSQL can comment on — a schema, a type, a function, an operator
+    /// class — is refused by name: mpedb does not model most of them, and a
+    /// comment on an object that does not exist here would be write-only
+    /// storage that no reflection could ever return.
+    fn parse_comment(&mut self) -> Result<DdlStmt> {
+        // `expect_kw`, not `expect_word`: ON is a tokenizer KEYWORD, so it
+        // never arrives as a plain identifier and `expect_word("ON")` refuses
+        // every COMMENT ever written.
+        self.expect_kw(Kw::On, "ON")?;
+        let target = if self.eat_word("TABLE") {
+            CommentTarget::Table(self.ident("table name")?)
+        } else if self.eat_word("COLUMN") {
+            // Always `table.column`: PostgreSQL rejects a bare column name
+            // here because it would be ambiguous across tables, and so does
+            // this — a one-part name is a mistake worth naming.
+            let first = self.ident("table name")?;
+            if !self.eat(&Tok::Dot) {
+                return Err(self.err_here(
+                    "COMMENT ON COLUMN needs a qualified name (`table.column`)",
+                ));
+            }
+            CommentTarget::Column { table: first, column: self.ident("column name")? }
+        } else if self.eat_word("CONSTRAINT") {
+            // `CONSTRAINT <name> ON <table>` — the name comes FIRST here,
+            // which is the reverse of the COLUMN form above.
+            let name = self.ident("constraint name")?;
+            self.expect_kw(Kw::On, "ON")?;
+            CommentTarget::Constraint { table: self.ident("table name")?, name }
+        } else {
+            let found = self.word_at_cursor();
+            return Err(self.err_here(format!(
+                "COMMENT ON {found} is not supported — mpedb comments TABLE,                  COLUMN and CONSTRAINT, the three an ORM emits from a table                  definition; the rest name objects mpedb does not model, and a                  comment on one could never be read back"
+            ).as_str()));
+        };
+        // Keyword, like ON above.
+        self.expect_kw(Kw::Is, "IS")?;
+        // `IS NULL` REMOVES the comment — PostgreSQL has no `DROP COMMENT`.
+        let text = if self.eat_kw(Kw::Null) {
+            None
+        } else {
+            match self.peek() {
+                Some(Tok::Str(s)) => {
+                    let s = s.clone();
+                    self.advance();
+                    Some(s)
+                }
+                _ => {
+                    return Err(self.err_here(
+                        "COMMENT ON … IS needs a string literal or NULL",
+                    ))
+                }
+            }
+        };
+        Ok(DdlStmt::Comment { target, text })
     }
 
     fn parse_create_view(&mut self) -> Result<DdlStmt> {

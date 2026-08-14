@@ -289,6 +289,70 @@ WRITTEN. `= ALL (ARRAY[1,2])` is false for every value; answering it as `IN`
 would say true for 1 — a quiet wrong answer, which is the whole reason the
 mapping is not "whatever parses".
 
+### After it: COMMENT, three empty catalog relations, and three declared exclusions
+
+`COMMENT ON { TABLE | COLUMN | CONSTRAINT }` is stored (sys-keyspace, beside
+views and triggers — a comment moves nothing that plans or executes, so putting
+it in the schema's canonical bytes would make documenting a table a change of
+`schema_hash`). `IS NULL` removes one, which is PostgreSQL's spelling; there is
+no `DROP COMMENT`. Everything else PostgreSQL can comment on is refused by
+name.
+
+`pg_sequence`, `pg_opclass` and `pg_collation` were ADDED AS EMPTY relations.
+mpedb has no objects of any of those kinds, and that is exactly the argument: an
+ORM's reflection joins them unconditionally, so a MISSING relation is an error
+the client cannot interpret while an EMPTY one is the truth — this database has
+none, so the join contributes no rows.
+
+`requirements.py` gained its first three entries, each with the argument in its
+docstring: `schemas`, `sequences`, `server_side_cursors`. The rule that file
+follows is that an exclusion is only honest when mpedb refuses the feature BY
+NAME — a refused feature is measured as unsupported, a silently-wrong one would
+be hidden.
+
+**What that bought, and what it did not.** Errors collapsed 811 → 17. Pass count
+moved 137 → **139**. The exclusions removed errors by converting them to skips;
+they did not make tests pass. Stating both numbers is the point:
+
+| | passed | failed | errors | skipped |
+|---|---:|---:|---:|---:|
+| baseline | 53 | 121 | 1 300 | 85 |
+| after `= ANY (ARRAY[…])` | 137 | 304 | 811 | 168 |
+| after COMMENT + relations + exclusions | 139 | 538 | 17 | 686 |
+
+Each fix moved the blocker one statement further into the same fixture rather
+than clearing it: `= ANY (ARRAY[…])` → `COMMENT ON CONSTRAINT` → `CREATE TABLE
+test_schema.users` → `pg_sequence` → `pg_opclass` → `pg_collation`. Layered
+blocking is what a fixture-driven suite does, and it is why the pass count is
+the honest headline and the error count is not.
+
+### The wrong answer under all of it
+
+Everything above is a missing feature. This is not:
+
+```
+BEGIN;
+INSERT INTO t (id,v) VALUES (1,10);   -- reports rowcount 0   ← FABRICATED
+SELECT v FROM t WHERE id=1;           -- returns []           ← OWN WRITE INVISIBLE
+COMMIT;
+SELECT v FROM t WHERE id=1;           -- returns [(10,)]
+```
+
+Inside an explicit transaction the session BUFFERS DML into `txn_log` and
+returns `Affected(0)` without executing it, while reads are not buffered and
+run against the pre-transaction state. So a client loses read-your-own-writes
+and gets a row count that was never counted.
+
+It is there for a reason — replaying the block as one mpedb transaction at
+COMMIT keeps the writer lock off the client's think-time, and DDL cannot go in
+the buffer because mpedb's DDL takes its own write transaction and self-
+deadlocks inside an open `WriteSession` (measured: one `CREATE TEMPORARY TABLE`
+inside a block stalled a corpus run for twelve minutes). But the cost was never
+named, and it is two silent wrong answers rather than one honest refusal.
+
+Every suite test that writes and then reads in one transaction fails on it,
+which is most of the 538.
+
 ### The next one, already measured
 
 The distribution after the change, and it is the same shape a third time:

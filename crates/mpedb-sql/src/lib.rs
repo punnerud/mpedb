@@ -41,7 +41,7 @@ pub use dbref::{
     resolve_db_refs_dialect, AttachStmt, DbResolution, DbScope,
 };
 pub use ddl::{
-    CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, CreateVirtualTableSpec,
+    CommentTarget, CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, CreateVirtualTableSpec,
     DdlStmt, RlsAction, TriggerBodySpec, TriggerEvent, TriggerTiming,
 };
 pub use trigger::{

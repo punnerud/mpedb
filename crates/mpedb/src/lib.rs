@@ -4682,6 +4682,18 @@ impl WriteSession<'_> {
                     self.txn.create_table(sh)?;
                 }
             }
+            // A COMMENT is metadata in the sys keyspace, and the WriteSession
+            // path applies DDL through `self.txn`. Routing it to the
+            // autocommit applier would commit inside an open transaction, so
+            // it is refused by name here — the same answer this path gives
+            // every DDL form it does not carry.
+            DdlStmt::Comment { .. } => {
+                return Err(Error::Unsupported(
+                    "COMMENT ON inside an open transaction is not supported \
+                     (run it in autocommit)"
+                        .into(),
+                ));
+            }
             // `cascade` is not consulted on this path: it is the WriteSession
             // (explicit-transaction) form, and the orphan-row refusal it would
             // suppress lives on the autocommit path in `apply_drop_tables`.

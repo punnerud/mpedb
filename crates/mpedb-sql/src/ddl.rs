@@ -219,6 +219,22 @@ pub struct CreateTriggerSpec {
     pub if_not_exists: bool,
 }
 
+/// What a `COMMENT ON` names.
+///
+/// PostgreSQL comments some two dozen object kinds; these are the three every
+/// ORM emits from a table definition, and the rest are refused by name rather
+/// than silently accepted — a comment on an object mpedb does not model would
+/// otherwise be write-only.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommentTarget {
+    Table(String),
+    /// `COMMENT ON COLUMN t.c` — always qualified; PostgreSQL requires it.
+    Column { table: String, column: String },
+    /// `COMMENT ON CONSTRAINT c ON t` — note the reversed order, which is
+    /// PostgreSQL's own and the reason this is not just another two-name form.
+    Constraint { table: String, name: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlStmt {
     CreateTable(CreateTableSpec),
@@ -317,6 +333,15 @@ pub enum DdlStmt {
     /// captured as source text and re-parsed + flattened into referencing
     /// queries (design/DESIGN-VIEW.md). Applied by the facade as a catalog mutation.
     CreateView { name: String, select_sql: String, if_not_exists: bool },
+    /// `COMMENT ON <target> IS { 'text' | NULL }` — PostgreSQL's object
+    /// documentation. `None` text is the DROP spelling: PostgreSQL has no
+    /// `DROP COMMENT`, setting it to NULL is how a comment is removed.
+    ///
+    /// Comments are pure metadata: nothing plans, executes or validates
+    /// differently because of one. They are stored anyway rather than accepted
+    /// and discarded, because a client that writes one and reads back nothing
+    /// has been told a lie by a statement that reported success.
+    Comment { target: CommentTarget, text: Option<String> },
     /// `DROP VIEW [IF EXISTS] <name>` (#73).
     DropView { name: String, if_exists: bool },
     CreatePolicy(CreatePolicySpec),
@@ -346,7 +371,8 @@ pub enum DdlStmt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse_ddl;
+    use crate::{parse_ddl, parse_ddl_dialect};
+    use mpedb_types::Dialect;
 
     #[test]
     fn ordinary_sql_is_not_ddl() {
@@ -778,6 +804,64 @@ mod tests {
         // `DROP TABLE a,` mean `DROP TABLE a`, and a typo that silently means
         // something is worse than one that stops.
         assert!(parse_ddl("DROP TABLE a,").is_err());
+    }
+
+    /// `COMMENT ON` in the three forms an ORM emits, plus the ones that must
+    /// stay refused.
+    ///
+    /// PG dialect throughout: `COMMENT` is not sqlite syntax, and parsing it
+    /// under the sqlite dialect would be inventing a statement that dialect
+    /// does not have.
+    #[test]
+    fn comment_on_parses_its_three_targets() {
+        let pg = |s: &str| parse_ddl_dialect(s, Dialect::Postgres);
+        assert_eq!(
+            pg("COMMENT ON TABLE users IS 'the users'").unwrap().unwrap(),
+            DdlStmt::Comment {
+                target: CommentTarget::Table("users".into()),
+                text: Some("the users".into())
+            }
+        );
+        assert_eq!(
+            pg("COMMENT ON COLUMN users.test2 IS 'a number'").unwrap().unwrap(),
+            DdlStmt::Comment {
+                target: CommentTarget::Column {
+                    table: "users".into(),
+                    column: "test2".into()
+                },
+                text: Some("a number".into())
+            }
+        );
+        // The CONSTRAINT form reverses the order — name first, THEN the table.
+        // Getting that backwards would silently comment the wrong object.
+        assert_eq!(
+            pg("COMMENT ON CONSTRAINT ck ON users IS 'c'").unwrap().unwrap(),
+            DdlStmt::Comment {
+                target: CommentTarget::Constraint {
+                    table: "users".into(),
+                    name: "ck".into()
+                },
+                text: Some("c".into())
+            }
+        );
+        // `IS NULL` REMOVES a comment — PostgreSQL has no `DROP COMMENT`, and
+        // storing the empty string instead would make "no comment" and "a
+        // comment that is empty" the same thing.
+        assert_eq!(
+            pg("COMMENT ON TABLE users IS NULL").unwrap().unwrap(),
+            DdlStmt::Comment {
+                target: CommentTarget::Table("users".into()),
+                text: None
+            }
+        );
+
+        // Refused, each for its own reason and each BY NAME.
+        let msg = |s: &str| format!("{}", pg(s).unwrap_err());
+        assert!(msg("COMMENT ON SCHEMA public IS 'x'").contains("SCHEMA"));
+        assert!(msg("COMMENT ON FUNCTION f() IS 'x'").contains("FUNCTION"));
+        assert!(msg("COMMENT ON COLUMN test2 IS 'x'").contains("qualified"));
+        assert!(msg("COMMENT ON TABLE users IS 42").contains("string literal"));
+        assert!(msg("COMMENT ON TABLE users").contains("IS"));
     }
 
     #[test]

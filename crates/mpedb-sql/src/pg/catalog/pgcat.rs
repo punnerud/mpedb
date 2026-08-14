@@ -229,6 +229,66 @@ pub(crate) const RELATIONS: &[CatalogRelation] = &[
         ],
         rows: pg_am,
     },
+    // Two relations mpedb has NO objects for, and that is exactly why they
+    // exist here. An ORM's reflection joins them unconditionally, so a MISSING
+    // relation is an error the client cannot interpret, while an EMPTY one is
+    // the truthful answer: this database has no sequences and no operator
+    // classes, so the join contributes no rows. Measured: `pg_sequence` was 89
+    // driver errors in SQLAlchemy's suite and `pg_opclass` another 54, both
+    // inside column- and index-reflection queries that ask for nothing else
+    // mpedb lacks.
+    CatalogRelation {
+        name: "pg_sequence",
+        schema: PgCatalog,
+        columns: &[
+            ("seqrelid", C::Int64),
+            ("seqtypid", C::Int64),
+            ("seqstart", C::Int64),
+            ("seqincrement", C::Int64),
+            ("seqmax", C::Int64),
+            ("seqmin", C::Int64),
+            ("seqcache", C::Int64),
+            ("seqcycle", C::Bool),
+        ],
+        rows: empty,
+    },
+    CatalogRelation {
+        // Same reasoning as `pg_sequence`/`pg_opclass`: mpedb has one
+        // collation family (`crate::Collation`) and no catalog objects for it,
+        // so the honest row set is empty. Reflection LEFT JOINs it to find a
+        // column's non-default collation; no rows means "every column uses the
+        // default", which is true here.
+        name: "pg_collation",
+        schema: PgCatalog,
+        columns: &[
+            ("oid", C::Int64),
+            ("collname", C::Text),
+            ("collnamespace", C::Int64),
+            ("collowner", C::Int64),
+            ("collprovider", C::Text),
+            ("collisdeterministic", C::Bool),
+            ("collencoding", C::Int64),
+            ("collcollate", C::Text),
+            ("collctype", C::Text),
+        ],
+        rows: empty,
+    },
+    CatalogRelation {
+        name: "pg_opclass",
+        schema: PgCatalog,
+        columns: &[
+            ("oid", C::Int64),
+            ("opcmethod", C::Int64),
+            ("opcname", C::Text),
+            ("opcnamespace", C::Int64),
+            ("opcowner", C::Int64),
+            ("opcfamily", C::Int64),
+            ("opcintype", C::Int64),
+            ("opcdefault", C::Bool),
+            ("opckeytype", C::Int64),
+        ],
+        rows: empty,
+    },
     CatalogRelation {
         name: "pg_description",
         schema: PgCatalog,

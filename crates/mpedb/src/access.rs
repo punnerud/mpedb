@@ -202,6 +202,16 @@ pub fn ddl_access(ddl: &DdlStmt) -> AccessReport {
             vec![create(K::Index, name, Some(table))]
         }
         DdlStmt::DropIndex { name, .. } => vec![drop(K::Index, name, None)],
+        // A comment is metadata ON a table, so it needs the same authority as
+        // altering that table — not a new kind of its own.
+        DdlStmt::Comment { target, .. } => {
+            let t = match target {
+                mpedb_sql::CommentTarget::Table(t) => t,
+                mpedb_sql::CommentTarget::Column { table, .. } => table,
+                mpedb_sql::CommentTarget::Constraint { table, .. } => table,
+            };
+            vec![Access::Alter { table: t.clone() }]
+        }
         DdlStmt::CreateView { name, .. } => vec![create(K::View, name, None)],
         DdlStmt::DropView { name, .. } => vec![drop(K::View, name, None)],
         DdlStmt::CreateTrigger(s) => vec![create(K::Trigger, &s.name, Some(&s.table))],

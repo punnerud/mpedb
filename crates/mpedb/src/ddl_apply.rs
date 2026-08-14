@@ -11,6 +11,20 @@
 //! at the next statement's `refresh_schema_if_stale` / `gate_cache_on_schema`.
 
 use super::*;
+use mpedb_sql::CommentTarget;
+
+/// Sys-keyspace prefix for a stored COMMENT.
+///
+/// The subkey spells the target so the three kinds cannot collide:
+/// `cmnt/t/<table>`, `cmnt/c/<table>.<column>`, `cmnt/k/<table>.<name>`. A
+/// comment is pure metadata — nothing plans or executes differently for one —
+/// so it lives beside views and triggers rather than in the schema's canonical
+/// bytes, where it would move `schema_hash` and make documenting a table a
+/// format change.
+pub(crate) const COMMENT_PREFIX: &[u8] = b"cmnt/";
+/// Exclusive upper bound for a `sys_scan_range` over every comment (#124):
+/// `/` is 0x2f, so `0` (0x30) is the first subkey past the family.
+pub(crate) const COMMENT_PREFIX_END: &[u8] = b"cmnt0";
 
 /// Sys-keyspace prefix for a stored view: `view/<name>` → its SELECT source.
 pub(crate) const VIEW_PREFIX: &[u8] = b"view/";
@@ -141,6 +155,123 @@ impl Database {
         self.cache.write().expect(POISON).clear();
         let _ = self.engine.reload_schema_from_catalog();
         Ok(ExecResult::Affected(0))
+    }
+
+    /// The sys-keyspace subkey a comment target is stored under.
+    ///
+    /// Lower-cased, because every other name lookup in mpedb is
+    /// case-insensitive and a comment that could only be read back with the
+    /// same capitalisation would be a trap rather than a feature.
+    pub(crate) fn comment_key(target: &CommentTarget) -> Vec<u8> {
+        let mut k = COMMENT_PREFIX.to_vec();
+        match target {
+            CommentTarget::Table(t) => {
+                k.extend_from_slice(b"t/");
+                k.extend_from_slice(t.to_lowercase().as_bytes());
+            }
+            CommentTarget::Column { table, column } => {
+                k.extend_from_slice(b"c/");
+                k.extend_from_slice(table.to_lowercase().as_bytes());
+                k.push(b'.');
+                k.extend_from_slice(column.to_lowercase().as_bytes());
+            }
+            CommentTarget::Constraint { table, name } => {
+                k.extend_from_slice(b"k/");
+                k.extend_from_slice(table.to_lowercase().as_bytes());
+                k.push(b'.');
+                k.extend_from_slice(name.to_lowercase().as_bytes());
+            }
+        }
+        k
+    }
+
+    /// `COMMENT ON <target> IS { 'text' | NULL }`.
+    ///
+    /// The TABLE must exist, for both the table and the column form: a comment
+    /// on nothing is storage no reflection could ever return, and accepting it
+    /// would make `COMMENT ON TABLE typo IS '…'` a silent success. The COLUMN
+    /// is checked too, for the same reason.
+    ///
+    /// A CONSTRAINT name is NOT checked. mpedb does not carry a named-check
+    /// catalog that could answer "does this constraint exist", and refusing
+    /// every constraint comment because of that would reject the one form ORMs
+    /// emit most. The comment is stored against `(table, name)` and read back
+    /// by the same key — write-and-read-back is honest even when the name
+    /// cannot be validated, and the table it hangs off IS checked.
+    pub(crate) fn apply_comment(
+        &self,
+        target: &CommentTarget,
+        text: Option<&str>,
+    ) -> Result<ExecResult> {
+        self.engine.refresh_schema_if_stale()?;
+        {
+            let bundle = self.engine.schema();
+            let (table, column) = match target {
+                CommentTarget::Table(t) => (t, None),
+                CommentTarget::Column { table, column } => (table, Some(column)),
+                CommentTarget::Constraint { table, .. } => (table, None),
+            };
+            let Some(id) = bundle.schema.table_id(table) else {
+                return Err(Error::Bind(format!("COMMENT ON: no such table `{table}`")));
+            };
+            if let Some(col) = column {
+                let t = bundle.schema.table(id).expect("table_id returned a live id");
+                if !t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                    return Err(Error::Bind(format!(
+                        "COMMENT ON COLUMN: no such column `{col}` in table `{table}`"
+                    )));
+                }
+            }
+        }
+        let key = Self::comment_key(target);
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
+        let res = (|| {
+            match text {
+                // `IS NULL` is PostgreSQL's spelling of "remove the comment";
+                // storing the absence would make an empty comment and a
+                // removed one indistinguishable on read. Deleting something
+                // that was never there is a no-op, not an error — PostgreSQL
+                // accepts it too.
+                None => {
+                    w.sys_delete(&key)?;
+                }
+                Some(t) => w.sys_put(&key, t.as_bytes())?,
+            };
+            w.bump_schema_gen();
+            Ok(())
+        })();
+        match res {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+
+    /// Every stored comment as `(subkey-after-the-prefix, text)`.
+    ///
+    /// Prefix-bounded like `list_views`, and for the same reason (#124): this
+    /// shares the sys keyspace with the plan registry, so an unbounded scan
+    /// would cost O(bytes ever registered).
+    pub fn list_comments(&self) -> Result<Vec<(String, String)>> {
+        let r = self.engine.begin_read()?;
+        let scan = r.sys_scan_range(COMMENT_PREFIX, COMMENT_PREFIX_END);
+        r.finish()?;
+        Ok(scan?
+            .into_iter()
+            .filter_map(|(subkey, value)| {
+                subkey.strip_prefix(COMMENT_PREFIX).map(|rest| {
+                    (
+                        String::from_utf8_lossy(rest).into_owned(),
+                        String::from_utf8_lossy(&value).into_owned(),
+                    )
+                })
+            })
+            .collect())
     }
 
     /// `DROP VIEW [IF EXISTS] <name>`.
@@ -1670,6 +1801,9 @@ impl Database {
             }
             DdlStmt::DropIndex { name, if_exists } => {
                 return self.apply_drop_index(&name, if_exists);
+            }
+            DdlStmt::Comment { target, text } => {
+                return self.apply_comment(&target, text.as_deref());
             }
             DdlStmt::CreateView { name, select_sql, if_not_exists } => {
                 return self.apply_create_view(&name, &select_sql, if_not_exists);
