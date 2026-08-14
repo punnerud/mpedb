@@ -664,3 +664,56 @@ fn quantified_array_comparison_is_in_and_only_where_it_really_is() {
     let e = err(&run(vec![query("SELECT ARRAY[1,2]")]));
     assert!(e.contains("array and row constructors"), "{e}");
 }
+
+/// A transaction block must see its own writes, and report row counts it
+/// actually counted.
+///
+/// Both were wrong, silently, and neither was a missing feature. Inside
+/// `BEGIN`…`COMMIT` the session buffered DML and returned `Affected(0)` — a
+/// number invented so the client had something to read — while reads ran
+/// against the PRE-transaction state. The doc comment on `txn_log` asserted
+/// the opposite ("the block still sees its own writes"), which is how it
+/// survived: a property claimed in prose and never in a test, and `psql` — the
+/// only client the pg_regress corpus drives — never checks it, because those
+/// transactions do not read back what they wrote. The first ORM did, and 136
+/// of SQLAlchemy's compliance tests turned green when it was fixed.
+///
+/// The rollback half is covered by
+/// `a_rolled_back_block_leaves_nothing_behind`, and it is load-bearing for
+/// this fix rather than incidental: each in-block statement replays the log
+/// into a write transaction and ROLLS IT BACK, so the log stays the only
+/// record. Drop that rollback and the block would commit itself one statement
+/// at a time.
+#[test]
+fn a_transaction_block_sees_its_own_writes_and_counts_its_own_rows() {
+    let out = run(vec![
+        query("BEGIN"),
+        query("INSERT INTO users VALUES (9,'turing',NULL)"),
+        query("SELECT nick FROM users WHERE id = 9"),
+        query("UPDATE users SET nick = 'church' WHERE id = 9"),
+        query("SELECT nick FROM users WHERE id = 9"),
+        query("COMMIT"),
+        query("SELECT nick FROM users WHERE id = 9"),
+    ]);
+
+    // Row counts are REAL — `INSERT 0 1` and `UPDATE 1`, not the fabricated
+    // zeroes the buffer used to return.
+    let tags: Vec<String> = frames(&out)
+        .iter()
+        .filter(|(t, _)| *t == b'C')
+        .map(|(_, b)| String::from_utf8_lossy(b).trim_end_matches('\0').to_string())
+        .collect();
+    assert!(tags.contains(&"INSERT 0 1".to_string()), "{tags:?}");
+    assert!(tags.contains(&"UPDATE 1".to_string()), "{tags:?}");
+
+    // The first in-block read sees the INSERT, the second sees the UPDATE, and
+    // the post-COMMIT read agrees with both.
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![Some("turing".into())],
+            vec![Some("church".into())],
+            vec![Some("church".into())],
+        ]
+    );
+}

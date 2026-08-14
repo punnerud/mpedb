@@ -109,6 +109,13 @@ pub(crate) fn resolve(name: &str, argc: usize) -> Option<Result<PgFunc>> {
         // IS what this call would have returned — the identity is the honest
         // implementation.
         "pg_get_expr" | "pg_get_indexdef" | "pg_get_constraintdef" => PgFunc::FirstArg,
+        // `pg_get_serial_sequence(table, column)` names the sequence a column
+        // draws from, and NULL when it draws from none. mpedb has no sequence
+        // objects at all — `CREATE SEQUENCE` and `nextval()` are both refused
+        // by name — so NULL is not a stand-in here, it is the true answer for
+        // every column in every mpedb database. Reflection asks it per column
+        // and treats NULL as "not serial", which is correct.
+        "pg_get_serial_sequence" => PgFunc::ConstOfAny(Value::Null),
         "pg_typeof" => PgFunc::TypeOf,
         // The privilege family: one role, and the OS is the fence.
         "has_table_privilege" | "has_column_privilege" | "has_database_privilege"

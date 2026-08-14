@@ -619,9 +619,16 @@ impl<S: Read + Write> Session<S> {
         // would. That is a real difference, and it is the honest one to take —
         // buffering it would not have made it atomic either (mpedb commits the
         // schema change on its own), it would only have hidden the deadlock.
-        if self.in_explicit_txn && is_dml(trimmed) {
-            self.txn_log.push((trimmed.to_string(), params.to_vec()));
-            return Ok(Answer::Affected(write_tag(trimmed, 0)));
+        // Only USER statements take the block path. A catalog query reads the
+        // SCHEMA, which a transaction block never changes — DDL is not
+        // buffered (see above) — so routing one through the block's replay
+        // would send it to the user database, where `pg_type` does not exist.
+        // Measured as an INTERNALERROR that killed the whole suite run.
+        if self.in_explicit_txn
+            && (is_dml(trimmed) || returns_rows(trimmed))
+            && matches!(catalog::route(trimmed), catalog::Route::User)
+        {
+            return self.exec_in_block(trimmed, params);
         }
 
         let result = match catalog::route(trimmed) {
@@ -655,6 +662,67 @@ impl<S: Read + Write> Session<S> {
             }),
             Err(e) => Err(e),
         }
+    }
+
+    /// Run one statement of an explicit transaction block, against the state
+    /// the block has actually built.
+    ///
+    /// The block is still REPLAYED at COMMIT rather than held open across the
+    /// client's think-time (see `txn_log`), so the effects of the statements
+    /// before this one exist nowhere but in that log. To answer this statement
+    /// correctly they have to exist SOMEWHERE, so: open a write transaction,
+    /// replay the log into it, run this statement, take its answer — and
+    /// ABORT. Nothing is published; the log stays the source of truth and
+    /// COMMIT replays it once more, for real.
+    ///
+    /// This replaced two silent wrong answers, which is why it is worth what
+    /// it costs:
+    ///
+    /// * a buffered `INSERT` used to report `Affected(0)` — a row count that
+    ///   was never counted, invented so the client had something to read;
+    /// * a `SELECT` inside the block ran against the PRE-transaction state, so
+    ///   a client lost read-your-own-writes. The doc comment on `txn_log`
+    ///   claimed the opposite ("the block still sees its own writes"), which
+    ///   is how the gap survived: the property was asserted in prose and never
+    ///   in a test, and `psql` — the only client the corpus runs — never
+    ///   checks it, because the corpus's transactions do not read back what
+    ///   they wrote.
+    ///
+    /// **The cost, named rather than buried: this is O(n²) over a block.** The
+    /// nth statement replays the n−1 before it. For an ORM's transactions
+    /// (a handful of statements) that is nothing; for a block of thousands it
+    /// is a wall, and the fix for that is to hold one `WriteSession` open
+    /// across the block instead — which needs the session restructured, since
+    /// a `WriteSession` borrows the `Database` this struct owns.
+    ///
+    /// A statement that FAILS here fails now, at the statement that caused it,
+    /// rather than at COMMIT. That is closer to PostgreSQL than the behaviour
+    /// it replaces, and it is why the failed statement is not appended: the
+    /// block continues from the last state that worked.
+    fn exec_in_block(&mut self, sql: &str, params: &[Value]) -> Result<Answer, Error> {
+        self.db.set_dialect(Dialect::Postgres);
+        let mut w = self.db.begin()?;
+        let replay = (|| -> Result<ExecResult, Error> {
+            for (s, p) in &self.txn_log {
+                w.query(s, p)?;
+            }
+            w.query(sql, params)
+        })();
+        // ABORT either way. On success the log — not the engine — carries the
+        // block forward; on failure there is nothing to keep.
+        w.rollback();
+        let result = replay?;
+        if is_dml(sql) {
+            self.txn_log.push((sql.to_string(), params.to_vec()));
+        }
+        Ok(match result {
+            ExecResult::Rows { columns, rows } => Answer::Rows { columns, rows },
+            ExecResult::Affected(n) => Answer::Affected(write_tag(sql, n)),
+            ExecResult::Explain(text) => Answer::Rows {
+                columns: vec!["QUERY PLAN".into()],
+                rows: text.lines().map(|l| vec![Value::Text(l.to_string())]).collect(),
+            },
+        })
     }
 
     /// Replay a buffered transaction block as ONE mpedb write transaction.

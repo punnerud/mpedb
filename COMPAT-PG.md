@@ -350,8 +350,31 @@ deadlocks inside an open `WriteSession` (measured: one `CREATE TEMPORARY TABLE`
 inside a block stalled a corpus run for twelve minutes). But the cost was never
 named, and it is two silent wrong answers rather than one honest refusal.
 
-Every suite test that writes and then reads in one transaction fails on it,
-which is most of the 538.
+Every suite test that writes and then reads in one transaction failed on it.
+
+**Fixed, and it was worth +136 tests.** Each statement inside a block now
+replays the log into a write transaction, runs, takes its answer and ROLLS
+BACK — so the log stays the only record, `COMMIT` still replays it once for
+real, and `ROLLBACK` still throws it away. Row counts are counted rather than
+invented, and a read sees the writes before it.
+
+The cost is named rather than buried: **this is O(n²) over a block**, since the
+nth statement replays the n−1 before it. For an ORM's transactions that is
+nothing; for a block of thousands it is a wall, and the fix for that is to hold
+one `WriteSession` open across the block — which needs the session
+restructured, because a `WriteSession` borrows the `Database` the session owns.
+
+A statement that fails now fails AT the statement rather than at `COMMIT`,
+which is closer to PostgreSQL than what it replaced.
+
+| | passed | failed | errors | skipped |
+|---|---:|---:|---:|---:|
+| baseline | 53 | 121 | 1 300 | 85 |
+| `= ANY (ARRAY[…])` | 137 | 304 | 811 | 168 |
+| COMMENT + relations + exclusions | 139 | 538 | 17 | 686 |
+| **read-your-own-writes** | **275** | 402 | 17 | 686 |
+
+Pass rate among attempted tests: 3.6 % → 10.9 % → 20.0 % → **39.6 %**.
 
 ### The next one, already measured
 
