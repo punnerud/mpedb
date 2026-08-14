@@ -376,6 +376,41 @@ which is closer to PostgreSQL than what it replaced.
 
 Pass rate among attempted tests: 3.6 % → 10.9 % → 20.0 % → **39.6 %**.
 
+### Where the remaining 402 are, and why the last four changes moved nothing
+
+**241 of 402 — 60 % — are `ComponentReflectionTest`**, and every one of its
+methods (`get_columns`, `get_indexes`, `get_pk_constraint`, `get_foreign_keys`,
+…) issues a query that fails on the same two things. So the reflection API is
+one item, not fourteen.
+
+`pg_get_serial_sequence()` (answers NULL — mpedb has no sequence objects, so
+that is the true answer and not a stand-in) and `json_build_object` /
+`json_build_array` (aliases of sqlite's `json_object` / `json_array`: same
+argument order, same pairing, same result) both landed and both moved the pass
+count by ZERO. That is not a failed change; it is layered blocking. A
+reflection query names four things mpedb lacks, so clearing one reveals the
+next and no test passes until all are gone:
+
+```
+= ANY (ARRAY[…]) → COMMENT ON CONSTRAINT → CREATE TABLE test_schema.users
+  → pg_sequence → pg_opclass → pg_collation → pg_get_serial_sequence
+  → json_build_object → format_type → array_agg(… ORDER BY …)
+```
+
+The honest way to read that chain: the pass count is the only number that
+counts, and it does not move until a whole query works. The error count moves
+every time and means much less.
+
+**The last two links are named.** `format_type(oid, typmod)` needs a real
+per-row scalar (its first argument is a column, so it cannot fold at bind time)
+plus a short-name → SQL-spelling table, since mpedb stores `int4` where
+PostgreSQL prints `integer`. And `array_agg(x ORDER BY y)` needs an ARRAY VALUE
+TYPE: the wire layer picks a column's OID from `Value::column_type()`, so
+sending an array OID means having an array type, and returning the literal
+`{a,b,c}` as TEXT would hand SQLAlchemy a string where it wants a list — a
+different failure, not a pass. That one is a type-system feature and gets its
+own design rather than an expedient.
+
 ### The next one, already measured
 
 The distribution after the change, and it is the same shape a third time:

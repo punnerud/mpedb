@@ -136,6 +136,17 @@ pub(crate) fn resolve(name: &str, argc: usize) -> Option<Result<PgFunc>> {
         // PG's strpos(haystack, needle) is sqlite's instr(haystack, needle) —
         // identical, including the 1-based result and the 0-for-absent rule.
         "strpos" => PgFunc::Alias("instr"),
+        // PostgreSQL's variadic JSON constructors are sqlite's under another
+        // name — same argument order, same key/value pairing, same result.
+        // `json_build_object('a',1,'b',2)` IS `json_object('a',1,'b',2)`.
+        // Aliasing is the whole implementation; writing a second one would be
+        // two things to keep agreeing about NULL and about duplicate keys.
+        //
+        // Worth more than its size: SQLAlchemy's `get_columns` — the query the
+        // whole reflection API is built on — calls `json_build_object` to
+        // gather a column's identity options.
+        "json_build_object" => PgFunc::Alias("json_object"),
+        "json_build_array" => PgFunc::Alias("json_array"),
         // …but position(needle IN haystack) reads the other way round. The
         // parser lowers the `IN` form to a two-argument call in written order,
         // so the swap belongs here, once, rather than in the grammar.
