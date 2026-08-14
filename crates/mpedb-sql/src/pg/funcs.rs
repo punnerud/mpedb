@@ -49,6 +49,13 @@ pub(crate) enum PgFunc {
     ConstOfAny(Value),
     /// Evaluate to the first argument unchanged.
     FirstArg,
+    /// Bind to a mpedb SCALAR that exists only for the PostgreSQL dialect.
+    ///
+    /// Separate from [`PgFunc::Alias`], which names a function the sqlite
+    /// dialect also has. This one is reachable ONLY through this table, so
+    /// `format_type` cannot be called from a sqlite-dialect statement — which
+    /// is right, because it names PostgreSQL's type system and nothing else.
+    Scalar(mpedb_types::ScalarFn),
     /// `pg_typeof(x)` — the PostgreSQL type NAME of the argument's static type.
     ///
     /// Its own variant because it needs something no rewrite can express: the
@@ -145,6 +152,11 @@ pub(crate) fn resolve(name: &str, argc: usize) -> Option<Result<PgFunc>> {
         // Worth more than its size: SQLAlchemy's `get_columns` — the query the
         // whole reflection API is built on — calls `json_build_object` to
         // gather a column's identity options.
+        // `format_type(oid, typmod)` renders a type the way reflection expects
+        // to read it: `integer`, `character varying(50)`, `numeric(8,4)`. It
+        // cannot fold at bind time — its first argument is
+        // `pg_attribute.atttypid`, a column — so it is a real scalar.
+        "format_type" => PgFunc::Scalar(mpedb_types::ScalarFn::FormatType),
         "json_build_object" => PgFunc::Alias("json_object"),
         "json_build_array" => PgFunc::Alias("json_array"),
         // …but position(needle IN haystack) reads the other way round. The
@@ -201,6 +213,9 @@ fn check_arity(name: &str, f: &PgFunc, argc: usize) -> Result<()> {
         PgFunc::FirstArg => None,
         PgFunc::TypeOf => Some(1),
         PgFunc::Alias(_) | PgFunc::ConstOfAny(_) | PgFunc::AlwaysTrue => None,
+        // Arity is the scalar's own business, checked where every other
+        // scalar's is.
+        PgFunc::Scalar(_) => None,
     };
     match want {
         Some(n) if argc != n => Err(unsupported(&format!(

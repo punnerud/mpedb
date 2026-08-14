@@ -536,7 +536,13 @@ const MAX_JOINS: usize = 63;
 //     answers NULL for. `pow`/`exp` are deliberately absent: both engines
 //     already return an infinity there, so a strict form would turn agreement
 //     into refusal. Additive: a format-72 reader rejects tag 70 as unknown.
-const PLAN_FORMAT: u8 = 73;
+//  74: `ScalarFn::FormatType` (tag 75) — PostgreSQL's `format_type(oid,
+//     typmod)`, the type name reflection reads. A real per-row scalar because
+//     its first argument is `pg_attribute.atttypid`, a COLUMN, so it cannot
+//     fold at bind time. Reachable only through `pg::funcs`, so no
+//     sqlite-dialect statement can name it. Additive: a format-73 reader
+//     rejects tag 75 as unknown.
+const PLAN_FORMAT: u8 = 74;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

@@ -394,22 +394,41 @@ next and no test passes until all are gone:
 ```
 = ANY (ARRAY[…]) → COMMENT ON CONSTRAINT → CREATE TABLE test_schema.users
   → pg_sequence → pg_opclass → pg_collation → pg_get_serial_sequence
-  → json_build_object → format_type → array_agg(… ORDER BY …)
+  → json_build_object → format_type → derived table in a LEFT JOIN
+  → array_agg(… ORDER BY …)
 ```
 
 The honest way to read that chain: the pass count is the only number that
 counts, and it does not move until a whole query works. The error count moves
 every time and means much less.
 
-**The last two links are named.** `format_type(oid, typmod)` needs a real
-per-row scalar (its first argument is a column, so it cannot fold at bind time)
-plus a short-name → SQL-spelling table, since mpedb stores `int4` where
-PostgreSQL prints `integer`. And `array_agg(x ORDER BY y)` needs an ARRAY VALUE
-TYPE: the wire layer picks a column's OID from `Value::column_type()`, so
-sending an array OID means having an array type, and returning the literal
-`{a,b,c}` as TEXT would hand SQLAlchemy a string where it wants a list — a
-different failure, not a pass. That one is a type-system feature and gets its
-own design rather than an expedient.
+`format_type(oid, typmod)` is now built — a real per-row scalar
+(`ScalarFn::FormatType`, PLAN\_FORMAT 74), because its first argument is a
+COLUMN and cannot fold at bind time, plus a short-name → SQL-spelling table
+since mpedb stores `int4` where PostgreSQL prints `integer`. It answers
+`integer`, `character varying(50)`, `numeric(8,4)`, `timestamp without time
+zone` and `???` for an oid it does not know, all checked against what
+PostgreSQL prints. A NULL modifier means NO modifier rather than no answer,
+so it runs ahead of the null gate — propagating there would make every column
+without a length report a NULL type, which is most of them.
+
+It cleared its 89 errors and moved the pass count by zero, and the chain
+advanced one more link.
+
+**The two that remain are features, not fixes.**
+
+`array_agg(x ORDER BY y)` — 145 errors, 43 % of the remainder — needs an ARRAY
+VALUE TYPE. The wire layer picks a column's OID from `Value::column_type()`, so
+sending an array OID means HAVING an array type; returning the literal
+`{a,b,c}` as TEXT would hand SQLAlchemy a string where it wants a list, which
+is a different failure rather than a pass.
+
+A derived table with an aggregate body in JOIN position — 89 errors — is
+refused by name today: materialization exists only for the FIRST join, INNER,
+with a plain ON, and SQLAlchemy's reflection puts one in a LEFT OUTER JOIN.
+Generalising it is planner work.
+
+Both gate the same 241 tests, and neither is worth an expedient.
 
 ### The next one, already measured
 

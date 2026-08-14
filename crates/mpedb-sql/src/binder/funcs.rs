@@ -53,6 +53,20 @@ impl<'a> Binder<'a> {
                             Some(ColumnType::Text),
                         ));
                     }
+                    PgFunc::Scalar(f) => {
+                        let mut bound = Vec::with_capacity(args.len());
+                        for a in args {
+                            bound.push(self.bind_expr(a)?.0);
+                        }
+                        if !f.arity_ok(bound.len() as u8) {
+                            return Err(bind_err(format!(
+                                "{}() called with {} argument(s)",
+                                f.name(),
+                                bound.len()
+                            )));
+                        }
+                        return Ok((BExpr::Call(f, bound), Some(ColumnType::Text)));
+                    }
                     PgFunc::AlwaysTrue => {
                         return Ok((BExpr::Const(Value::Bool(true)), Some(ColumnType::Bool)))
                     }
@@ -476,6 +490,11 @@ impl<'a> Binder<'a> {
             // sqrt/pow and the transcendental math functions take numbers (int
             // or float, unpinned like abs/round) but ALWAYS return a float; `pi`
             // is nullary and also returns a float. sign always returns an integer.
+            // `format_type(oid, typmod)`: an integer oid and an integer
+            // modifier in, a type NAME out. Listed here so the arity/type
+            // table stays the one place a scalar's shape is declared, even
+            // though only `pg::funcs` can reach it.
+            ScalarFn::FormatType => (&[], Some(ColumnType::Text)),
             ScalarFn::Sqrt
             | ScalarFn::SqrtStrict
             | ScalarFn::LnStrict

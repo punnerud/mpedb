@@ -92,6 +92,7 @@ pub(crate) mod funcs {
         AlwaysTrue,
         Alias(&'static str),
         AliasSwap2(&'static str),
+        Scalar(mpedb_types::ScalarFn),
     }
 
     /// Resolves nothing: every name falls through to the ordinary function

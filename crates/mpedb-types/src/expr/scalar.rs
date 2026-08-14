@@ -246,6 +246,13 @@ pub enum ScalarFn {
     /// would otherwise have produced, without having to tell two kinds of NULL
     /// apart afterwards. Trying to do that at the opcode level is what makes a
     /// blanket "strict call" wrapper impossible.
+    /// `format_type(oid, typmod)` — the SQL name a client sees in reflection.
+    ///
+    /// A real per-row scalar rather than a bind-time fold, because its first
+    /// argument is a COLUMN (`pg_attribute.atttypid`) in every query that
+    /// asks for it. PostgreSQL-dialect only: the binder reaches it through
+    /// `pg::funcs`, so no sqlite statement can name it.
+    FormatType = 75,
     SqrtStrict = 70,
     LnStrict = 71,
     Log10Strict = 72,
@@ -325,6 +332,7 @@ impl ScalarFn {
             68 => ScalarFn::Splice,
             69 => ScalarFn::JsonQuoteExtract,
             70 => ScalarFn::SqrtStrict,
+            75 => ScalarFn::FormatType,
             71 => ScalarFn::LnStrict,
             72 => ScalarFn::Log10Strict,
             73 => ScalarFn::Log2Strict,
@@ -360,6 +368,9 @@ impl ScalarFn {
             | ScalarFn::Log10Strict
             | ScalarFn::Log2Strict => argc == 1,
             ScalarFn::LogBaseStrict => argc == 2,
+            // PostgreSQL allows the one-argument form too (`format_type(oid)`
+            // is `format_type(oid, NULL)`), and reflection uses both.
+            ScalarFn::FormatType => argc == 1 || argc == 2,
             ScalarFn::Substr => argc == 2 || argc == 3,
             ScalarFn::Instr | ScalarFn::Pow | ScalarFn::VecL2 | ScalarFn::VecCosine => argc == 2,
             ScalarFn::Replace => argc == 3,
@@ -430,6 +441,7 @@ impl ScalarFn {
             ScalarFn::Log10Strict => "log10",
             ScalarFn::Log2Strict => "log2",
             ScalarFn::LogBaseStrict => "log",
+            ScalarFn::FormatType => "format_type",
             ScalarFn::Pow => "pow",
             ScalarFn::Sign => "sign",
             ScalarFn::Ceil => "ceil",
@@ -545,6 +557,21 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
     // denotes NULL — so it too runs ahead of the null gate.
     if matches!(f, ScalarFn::Quote) {
         return sqlite_quote(&args[0]);
+    }
+    // `format_type(oid, NULL)` is `format_type(oid)`: a NULL modifier means
+    // "no modifier", not "no answer". Propagating it would make every column
+    // without a length or precision report a NULL type name, which is most of
+    // them — and reflection would read that as a column of unknown type.
+    if matches!(f, ScalarFn::FormatType) {
+        let Value::Int(oid) = &args[0] else {
+            // A NULL oid IS a NULL answer: there is no type to name.
+            return Ok(Value::Null);
+        };
+        let typmod = match args.get(1) {
+            Some(Value::Int(m)) => Some(*m as i32),
+            _ => None,
+        };
+        return Ok(Value::Text(crate::pgtype::format_type(*oid as u32, typmod)));
     }
     // The JSON functions that must SEE a NULL rather than propagate it.
     // `json_quote(NULL)` is the text `null`; the writers turn a NULL VALUE
@@ -884,6 +911,8 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
                 Value::Null
             }
         }
+        // Handled above the null gate — a NULL modifier is not a NULL answer.
+        ScalarFn::FormatType => unreachable!("format_type runs before the null gate"),
         ScalarFn::LogBaseStrict => {
             let b = num(&args[0])?;
             let x = num(&args[1])?;

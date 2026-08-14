@@ -160,6 +160,61 @@ const ALIASES: &[(&str, &str)] = &[
     ("serial2", "int2"),
 ];
 
+/// The SQL spelling PostgreSQL's `format_type()` prints for a base type.
+///
+/// The inverse of [`ALIASES`] cannot be derived from it: that table is
+/// many-to-one (`integer` and `int` both mean `int4`), so the canonical
+/// direction has to be chosen rather than computed. Anything absent here
+/// prints its own short name, which is what PostgreSQL does for the types
+/// that have no separate SQL spelling (`text`, `bytea`, `uuid`, `json`).
+pub fn sql_spelling(short: &str) -> &str {
+    match short {
+        "bool" => "boolean",
+        "int2" => "smallint",
+        "int4" => "integer",
+        "int8" => "bigint",
+        "float4" => "real",
+        "float8" => "double precision",
+        "varchar" => "character varying",
+        "bpchar" => "character",
+        "timestamp" => "timestamp without time zone",
+        "timestamptz" => "timestamp with time zone",
+        "time" => "time without time zone",
+        "timetz" => "time with time zone",
+        other => other,
+    }
+}
+
+/// `format_type(oid, typmod)` — the type name a client sees in reflection.
+///
+/// `typmod` is PostgreSQL's packed modifier, and its encoding is per-type
+/// rather than general: for the character types it is `length + 4`, for
+/// `numeric` it is `((precision << 16) | scale) + 4`. A `typmod` below 0 (or
+/// NULL, which arrives here as `None`) means "no modifier", which is the
+/// common case and the reason this is not simply a lookup.
+pub fn format_type(oid: u32, typmod: Option<i32>) -> String {
+    let Some(t) = by_oid(oid) else {
+        // PostgreSQL prints `???` for an oid it cannot resolve. Saying so is
+        // better than inventing a plausible type name for a value that came
+        // from somewhere unexpected.
+        return "???".into();
+    };
+    let name = sql_spelling(t.name);
+    let Some(m) = typmod.filter(|m| *m >= 4) else {
+        return name.into();
+    };
+    match t.name {
+        "varchar" | "bpchar" => format!("{name}({})", m - 4),
+        "numeric" => {
+            let packed = m - 4;
+            format!("{name}({},{})", packed >> 16, packed & 0xffff)
+        }
+        // Every other type either takes no modifier or takes one mpedb never
+        // stores; printing the bare name is what PostgreSQL does there too.
+        _ => name.into(),
+    }
+}
+
 /// Strip a type modifier and collapse whitespace: `NUMERIC(10, 2)` →
 /// `numeric`, `DOUBLE   PRECISION` → `double precision`.
 ///
@@ -226,6 +281,41 @@ pub fn default_oid(ty: ColumnType) -> u32 {
         C::Blob => 17,
         C::Timestamp => 1184,
         C::Any => 25,
+    }
+}
+
+#[cfg(test)]
+mod format_type_tests {
+    use super::*;
+
+    /// `format_type` is what reflection reads a column's type through, so a
+    /// wrong answer here is a wrong SCHEMA, not a wrong value.
+    #[test]
+    fn format_type_prints_what_postgresql_prints() {
+        // The SQL spelling, not mpedb's short name — reflection matches on
+        // `integer`, never on `int4`.
+        assert_eq!(format_type(23, None), "integer");
+        assert_eq!(format_type(25, Some(-1)), "text");
+        assert_eq!(format_type(1114, Some(-1)), "timestamp without time zone");
+
+        // A NULL/absent modifier means NO modifier, not "no answer". Getting
+        // this wrong makes every column without a length report a NULL type,
+        // which is most of them.
+        assert_eq!(format_type(1043, None), "character varying");
+
+        // typmod encodings, which are per-type rather than general:
+        // characters carry `length + 4`…
+        assert_eq!(format_type(1043, Some(54)), "character varying(50)");
+        // …and numeric packs precision and scale into one int, `+ 4`.
+        assert_eq!(format_type(1700, Some((8 << 16 | 4) + 4)), "numeric(8,4)");
+        // A type that takes no modifier ignores one rather than inventing
+        // syntax for it.
+        assert_eq!(format_type(23, Some(8)), "integer");
+
+        // An oid mpedb does not know prints PostgreSQL's own `???`. Naming a
+        // plausible type for a value that came from somewhere unexpected is
+        // the one answer that could not be checked by the caller.
+        assert_eq!(format_type(999_999, None), "???");
     }
 }
 
