@@ -426,7 +426,16 @@ is a different failure rather than a pass.
 A derived table with an aggregate body in JOIN position — 89 errors — is
 refused by name today: materialization exists only for the FIRST join, INNER,
 with a plain ON, and SQLAlchemy's reflection puts one in a LEFT OUTER JOIN.
-Generalising it is planner work.
+
+The obvious route is blocked, and that is worth writing down. `view.rs`'s own
+comment says `JOIN (SELECT …) AS d` IS `WITH d AS (…) … JOIN d`, so hoisting
+the body into a CTE looks like a free generalisation. It is not:
+`flatten_cte_join` re-parses a CTE from TEXT and refuses a body carrying
+parameters, because a re-parsed body renumbers `?` from zero and would silently
+read the wrong bound value — and reflection queries are full of parameters. The
+derived-JOIN path has no such restriction precisely because it parses INLINE.
+So the work is to extend MATERIALIZATION to any join position and kind, in the
+planner and executor.
 
 Both gate the same 241 tests, and neither is worth an expedient.
 
