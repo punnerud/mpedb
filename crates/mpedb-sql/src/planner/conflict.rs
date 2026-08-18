@@ -141,7 +141,7 @@ pub(super) fn plan_on_conflict(
 
 /// Compile a `RETURNING` clause into a projection over the written row.
 pub(super) fn plan_returning(
-    r: Option<&Option<Vec<ast::Expr>>>,
+    r: &crate::ast::ReturningClause,
     binder: &mut Binder,
     table: &mpedb_types::TableDef,
 ) -> Result<Option<Vec<Projection>>> {
@@ -154,21 +154,46 @@ pub(super) fn plan_returning(
         ));
     };
     let mut proj = Vec::with_capacity(items.len());
-    for e in items {
-        match e {
-            ast::Expr::Col(name, _) => {
+    for (e, alias) in items {
+        // An explicit alias RENAMES the output column, so it cannot take the
+        // bare-column path: `Projection::Column` reports the TABLE's name for
+        // it, which is the one thing the alias was written to change. The
+        // expression path carries a name, so it is the one that can honour it —
+        // and `RETURNING t.id, t.id AS id__1` needs exactly that, since the two
+        // items are the same column told apart only by the alias.
+        if let Some(name) = alias {
+            let (b, _) = binder.bind_expr(e)?;
+            proj.push(Projection::Expr {
+                program: compile_program(&b)?,
+                name: name.clone(),
+            });
+            continue;
+        }
+        // A bare column, in either spelling. `t.id` is `Expr::Qualified` and
+        // used to fall to the expression arm below, where the display name is
+        // `?column?` — so a client that read the result by column name found
+        // nothing, for a RETURNING list that named its columns perfectly well.
+        let bare = match e {
+            ast::Expr::Col(name, _) => Some(name),
+            ast::Expr::Qualified(q, name) if mpedb_types::ident::ident_eq(q, &table.name) => {
+                Some(name)
+            }
+            _ => None,
+        };
+        match bare {
+            Some(name) => {
                 let i = table
                     .columns
                     .iter()
-                    .position(|c| c.name == *name)
+                    .position(|c| mpedb_types::ident::ident_eq(&c.name, name))
                     .ok_or_else(|| bind_err(format!("unknown column `{name}` in RETURNING")))?;
                 proj.push(Projection::Column(i as u16));
             }
-            other => {
-                let (b, _) = binder.bind_expr(other)?;
+            None => {
+                let (b, _) = binder.bind_expr(e)?;
                 proj.push(Projection::Expr {
                     program: compile_program(&b)?,
-                    name: render_expr_name(other),
+                    name: render_expr_name(e),
                 });
             }
         }
@@ -176,7 +201,11 @@ pub(super) fn plan_returning(
     Ok(Some(proj))
 }
 
-/// A display name for a RETURNING expression item.
+/// A display name for a RETURNING expression item that named no alias.
+///
+/// PostgreSQL's own fallback for an unnameable expression is `?column?`, and a
+/// bare column keeps its own name. A QUALIFIED column never reaches here — it
+/// resolves to `Projection::Column` above, which is where its name comes from.
 fn render_expr_name(e: &ast::Expr) -> String {
     match e {
         ast::Expr::Col(c, _) => c.clone(),

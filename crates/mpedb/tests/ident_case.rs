@@ -582,6 +582,16 @@ fn insert_update_and_upsert_column_lists_fold() {
         "SELECT abc, def FROM t",
         true,
     );
+    // The RETURNING column list folds too: `plan_returning` resolves a bare
+    // column through `ident_eq`, the same way the rest of the engine names a
+    // column, so `RETURNING ABC` finds `Abc`. It also resolves a QUALIFIED one
+    // (`t.Abc`) to the column rather than to an unnameable expression — which
+    // is what used to make the header read `?column?`.
+    agree(
+        &["CREATE TABLE t(Abc INTEGER PRIMARY KEY, dEf INT)"],
+        "INSERT INTO t VALUES(9,9) RETURNING ABC, t.DEF AS renamed",
+        true,
+    );
 }
 
 /// The known planner-side residuals: mpedb REFUSES, sqlite answers. Pinned so
@@ -602,8 +612,10 @@ fn planner_owned_residuals_refuse_rather_than_differ() {
         "INSERT INTO t VALUES(1,2) ON CONFLICT(ABC) DO UPDATE SET dEf=2",
         // DO UPDATE SET column list, planner/mod.rs ~:762
         "INSERT INTO t VALUES(1,2) ON CONFLICT(Abc) DO UPDATE SET DEF=2",
-        // RETURNING column list, planner/mod.rs ~:840
-        "INSERT INTO t VALUES(9,9) RETURNING ABC",
+        // The RETURNING column list USED to be here. It folds now — the lookup
+        // in `plan_returning` goes through `ident_eq` like every other table
+        // lookup — so the case moved up into the positive battery, which is what
+        // this battery's own message asks for when one of them starts working.
     ] {
         let got = db.query(bad, &[]);
         assert!(

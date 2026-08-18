@@ -138,6 +138,14 @@ pub(crate) struct CompoundStmt {
 
 
 
+/// A `RETURNING` clause: `None` = absent, `Some(None)` = `RETURNING *`,
+/// `Some(Some(items))` = an explicit list of `expr [[AS] alias]`.
+///
+/// The alias is the name the result HEADER carries, so it travels with the
+/// expression rather than being dropped at the parser: a client that looks a
+/// column up by the name it asked for must find it.
+pub(crate) type ReturningClause = Option<Option<Vec<(Expr, Option<String>)>>>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InsertStmt {
     pub table: String,
@@ -151,7 +159,7 @@ pub(crate) struct InsertStmt {
     pub select: Option<Box<SelectStmt>>,
     pub on_conflict: OnConflict,
     /// `RETURNING` items; `Some(None)` = `RETURNING *`.
-    pub returning: Option<Option<Vec<Expr>>>,
+    pub returning: ReturningClause,
 }
 
 /// `ON CONFLICT` action.
@@ -179,14 +187,14 @@ pub(crate) struct UpdateStmt {
     pub table: String,
     pub set: Vec<(String, Expr)>,
     pub where_clause: Option<Expr>,
-    pub returning: Option<Option<Vec<Expr>>>,
+    pub returning: ReturningClause,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DeleteStmt {
     pub table: String,
     pub where_clause: Option<Expr>,
-    pub returning: Option<Option<Vec<Expr>>>,
+    pub returning: ReturningClause,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -337,7 +337,7 @@ pub(super) fn plan_insert(
     }
 
     let on_conflict = plan_on_conflict(&s.on_conflict, &mut binder, table, table_id, consts)?;
-    let returning = plan_returning(s.returning.as_ref(), &mut binder, table)?;
+    let returning = plan_returning(&s.returning, &mut binder, table)?;
 
     let (mut param_types, mut context_keys, mut list_keys) = binder.into_parts();
     // Merge the source query's inferences into this statement's (INSERT …
@@ -489,7 +489,7 @@ pub(super) fn plan_update(
     let with_check = write_check(&mut binder, catalog, table_id, &table.name, PolicyCmd::Update)?
         .map(|b| compile_program(&b))
         .transpose()?;
-    let returning = plan_returning(s.returning.as_ref(), &mut binder, table)?;
+    let returning = plan_returning(&s.returning, &mut binder, table)?;
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Update {
@@ -579,7 +579,7 @@ pub(super) fn plan_delete(
     let (access, residual) = extract_access(gather_pred, table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
     let post_filter = corr_pred.map(|e| compile_program(&e)).transpose()?;
-    let returning = plan_returning(s.returning.as_ref(), &mut binder, table)?;
+    let returning = plan_returning(&s.returning, &mut binder, table)?;
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Delete {

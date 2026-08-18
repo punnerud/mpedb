@@ -207,19 +207,35 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `RETURNING * | expr, …`
-    fn returning_clause(&mut self) -> Result<Option<Option<Vec<Expr>>>> {
+    /// `RETURNING * | expr [[AS] alias], …`
+    ///
+    /// The alias is PostgreSQL's and it is not decoration: it is the name the
+    /// result header carries, and a client that looks a column up by it gets
+    /// nothing when the header says something else. SQLAlchemy's
+    /// insertmanyvalues path sends `RETURNING t.id, t.value, t.id AS id__1` —
+    /// the same column twice, told apart only by the alias.
+    fn returning_clause(&mut self) -> Result<crate::ast::ReturningClause> {
         if !self.eat_kw(Kw::Returning) {
             return Ok(None);
         }
         if self.eat(&Tok::Star) {
             return Ok(Some(None));
         }
-        let mut items = vec![self.expr()?];
+        let mut items = vec![self.returning_item()?];
         while self.eat(&Tok::Comma) {
-            items.push(self.expr()?);
+            items.push(self.returning_item()?);
         }
         Ok(Some(Some(items)))
+    }
+
+    /// One `RETURNING` item and its optional alias.
+    ///
+    /// This IS a select item — same expression grammar, same alias spellings,
+    /// same bare-word traps (`AT TIME ZONE` is not an alias) — so it goes
+    /// through the same parser rather than a second copy that would have to
+    /// learn each of those separately.
+    fn returning_item(&mut self) -> Result<(Expr, Option<String>)> {
+        self.select_item()
     }
 
     pub(super) fn update_stmt(&mut self) -> Result<Stmt> {

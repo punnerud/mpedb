@@ -443,12 +443,14 @@ fn rewrite_row_in_select(s: &mut ast::SelectStmt, scope: &RowScope, map: &mut Ro
 }
 
 fn rewrite_row_in_returning(
-    r: &mut Option<Option<Vec<Expr>>>,
+    r: &mut crate::ast::ReturningClause,
     scope: &RowScope,
     map: &mut RowMap,
 ) -> Result<()> {
     if let Some(Some(items)) = r {
-        for e in items {
+        // The ALIAS is a name, never a row reference — nothing in it can name
+        // NEW/OLD, so only the expression is walked.
+        for (e, _alias) in items {
             rewrite_row_in_expr(e, scope, map)?;
         }
     }

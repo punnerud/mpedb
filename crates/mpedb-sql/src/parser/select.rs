@@ -622,7 +622,7 @@ impl<'a> Parser<'a> {
     /// unambiguous because everything that can otherwise follow an item
     /// (FROM, WHERE, GROUP, ORDER, LIMIT, `,`, `;`, EOF) is a keyword token
     /// or not an identifier at all. A quoted identifier is always an alias.
-    fn select_item(&mut self) -> Result<(Expr, Option<String>)> {
+    pub(super) fn select_item(&mut self) -> Result<(Expr, Option<String>)> {
         let e = self.expr()?;
         if self.eat_kw(Kw::As) {
             return Ok((e, Some(self.ident("alias after AS")?)));
