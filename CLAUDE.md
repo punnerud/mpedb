@@ -29,7 +29,7 @@ log-based engine), and the hardware published when the hardware is the answer.
 - Lint (keep clean): `cargo clippy --workspace --all-targets -- -D warnings`
 - Slow/instrumented tests are `#[ignore]`d: `cargo test -p mpedb-core -- --ignored`
 - **Point every test's scratch at a real volume**: `MPEDB_TEST_DIR=/path cargo test …`.
-  `mpedb_testkit::scratch_base` (and `mpedb_core::test_scratch`, which spells the
+  `mpedb_testkit::scratch_base` (and `mpedb_core::scratch_dir`, which spells the
   same knob because the testkit depends on the facade that depends on the core)
   read it. Without it the suite writes to the root filesystem, and a full disk
   does not announce itself as one: it has surfaced as a flapping measurement, as

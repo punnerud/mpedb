@@ -18,8 +18,20 @@
 /// left 1 189 directories and 652 MB behind. That volume is 38 GB on the
 /// machine this is developed on; when it filled, `ld` died with a bus error
 /// mid-link and the failure looked like a compiler bug rather than a full disk.
-#[cfg(test)]
-pub(crate) fn test_scratch() -> std::path::PathBuf {
+///
+/// NOT `#[cfg(test)]`, and that is load-bearing in two directions. The
+/// `:memory:` path off Linux is production code that needs a scratch directory,
+/// so gating this to test builds did not compile there at all. And an
+/// INTEGRATION test links the library WITHOUT `cfg(test)`, so gating it would
+/// send those runs' ephemeral files to the OS temp dir — which is the litter
+/// this exists to prevent, just somewhere else. The knob is opt-in: unset means
+/// `temp_dir()`, which is what a real deployment gets.
+// Unused on Linux outside tests: there the `:memory:` path is `memfd_create`
+// and never touches a directory. Kept unconditional rather than cfg'd to the
+// platforms that call it, because that cfg would be a third place to keep in
+// step with `shm.rs`'s own two arms.
+#[allow(dead_code)]
+pub(crate) fn scratch_dir() -> std::path::PathBuf {
     match std::env::var_os("MPEDB_TEST_DIR") {
         Some(d) if !d.is_empty() => {
             let d = std::path::PathBuf::from(d);
