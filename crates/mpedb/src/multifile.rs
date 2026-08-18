@@ -351,6 +351,12 @@ impl Drop for AttachState {
             drop(m);
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+            // The writer-lock sidecar exists only where the lock is a FILE —
+            // macOS and Windows, on FLD-2 flock (`mpedb_core::os`). Linux keeps
+            // that lock in the shared-memory lock page, which is why the leak
+            // was invisible here for as long as the branch was only ever built
+            // and tested on Linux.
+            let _ = std::fs::remove_file(format!("{}.wlock", path.display()));
         }
     }
 }
@@ -619,6 +625,7 @@ impl Database {
                             drop(member);
                             let _ = std::fs::remove_file(&path);
                             let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+                            let _ = std::fs::remove_file(format!("{}.wlock", path.display()));
                         }
                         Ok(ExecResult::Affected(0))
                     }

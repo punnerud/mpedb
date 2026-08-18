@@ -54,6 +54,10 @@ impl<T> Drop for Owned<T> {
             // The WAL sidecar is part of the database. Leaving it behind also
             // leaves the next run to open a database beside a foreign log.
             let _ = std::fs::remove_file(format!("{}-wal", p.display()));
+            // Same on the test side: on macOS and Windows the writer lock is a
+            // sidecar file, and a suite that leaves one per database litters the
+            // scratch volume exactly as the WAL used to.
+            let _ = std::fs::remove_file(format!("{}.wlock", p.display()));
         }
     }
 }
