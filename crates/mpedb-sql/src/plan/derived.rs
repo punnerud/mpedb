@@ -205,7 +205,7 @@ pub(crate) fn cte_working_table_def(
         primary_key: Vec::new(),
         indexes: Vec::new(),
         dead: false,
-        implicit_rowid: false, autoincrement: false,
+        implicit_rowid: false, autoincrement: false, pk_name: None,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     }

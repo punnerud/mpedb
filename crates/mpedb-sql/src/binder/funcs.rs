@@ -76,6 +76,25 @@ impl<'a> Binder<'a> {
                         };
                         return self.bind_expr(first);
                     }
+                    PgFunc::SiblingColumn(col) => {
+                        // The rendered answer lives on the relation the OID came
+                        // from, so the qualifier has to be carried over: `c.oid`
+                        // becomes `c.condef`, and an unqualified `oid` becomes an
+                        // unqualified reference the ordinary scope rules resolve.
+                        let sibling = match args.first() {
+                            Some(ast::Expr::Qualified(t, _)) => {
+                                ast::Expr::Qualified(t.clone(), col.to_string())
+                            }
+                            Some(ast::Expr::Col(_, _)) => ast::Expr::Col(col.to_string(), false),
+                            _ => {
+                                return Err(bind_err(format!(
+                                    "{name}() is supported only over a catalog \
+                                     column (e.g. pg_constraint.oid)"
+                                )))
+                            }
+                        };
+                        return self.bind_expr(&sibling);
+                    }
                     PgFunc::Alias(real) => return self.bind_func(real, args),
                     PgFunc::AliasSwap2(real) => {
                         let swapped = [args[1].clone(), args[0].clone()];

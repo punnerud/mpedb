@@ -140,11 +140,18 @@ fn build(schema: &Schema, comments: &[(String, String)]) -> Result<Database, Str
         db.query(&ddl, &[])
             .map_err(|e| format!("catalog table {table}: {e}"))?;
 
-        let Some(rows) = mpedb_sql::pg::api::catalog_rows(
-            &format!("{}.{}", rel.schema, rel.name),
-            schema,
-        ) else {
-            continue;
+        // `pg_description` is the one relation whose rows do not come from the
+        // schema: a comment is a sys-keyspace record the caller read for us.
+        let rows = if rel.name == "pg_description" {
+            mpedb_sql::pg::api::description_rows(schema, comments)
+        } else {
+            match mpedb_sql::pg::api::catalog_rows(
+                &format!("{}.{}", rel.schema, rel.name),
+                schema,
+            ) {
+                Some(r) => r,
+                None => continue,
+            }
         };
         if rows.is_empty() {
             continue;
@@ -350,7 +357,7 @@ mod tests {
     fn several_catalog_relations_can_be_joined_in_one_query() {
         let schema = crate::testutil::sample_schema();
         let mut cat = SessionCatalog::new();
-        let db = cat.ensure(&schema, 1).expect("catalog builds");
+        let db = cat.ensure(&schema, 1, &[]).expect("catalog builds");
         let got = db
             .query(
                 "SELECT c.relname, n.nspname FROM pg_class c \
@@ -379,7 +386,7 @@ mod tests {
     fn a_three_way_join_of_the_shape_psql_backslash_d_sends_also_works() {
         let schema = crate::testutil::sample_schema();
         let mut cat = SessionCatalog::new();
-        let db = cat.ensure(&schema, 1).expect("catalog builds");
+        let db = cat.ensure(&schema, 1, &[]).expect("catalog builds");
         let got = db
             .query(
                 "SELECT a.attname FROM pg_class c \
@@ -406,11 +413,11 @@ mod tests {
     fn the_catalog_is_rebuilt_when_the_schema_generation_moves() {
         let schema = crate::testutil::sample_schema();
         let mut cat = SessionCatalog::new();
-        cat.ensure(&schema, 1).unwrap();
+        cat.ensure(&schema, 1, &[]).unwrap();
         assert_eq!(cat.built_for_gen, 1);
         // A DDL on another connection bumps the generation; the next statement
         // here must not answer from the old rows.
-        cat.ensure(&schema, 2).unwrap();
+        cat.ensure(&schema, 2, &[]).unwrap();
         assert_eq!(cat.built_for_gen, 2);
     }
 
@@ -418,7 +425,7 @@ mod tests {
     fn information_schema_relations_are_queryable_under_their_flattened_names() {
         let schema = crate::testutil::sample_schema();
         let mut cat = SessionCatalog::new();
-        let db = cat.ensure(&schema, 1).unwrap();
+        let db = cat.ensure(&schema, 1, &[]).unwrap();
         let got = db
             .query(
                 "SELECT table_name FROM information_schema_tables ORDER BY table_name",

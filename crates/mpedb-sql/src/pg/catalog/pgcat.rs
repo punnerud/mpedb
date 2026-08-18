@@ -15,7 +15,8 @@
 
 use super::{
     attrdef_oid, column_type_len, column_type_name, column_type_oid, constraint_oid, index_oid,
-    int, live_tables, reltype_oid, table_oid, text, CatalogRelation,
+    has_declared_pk, int, live_tables, reltype_oid, table_oid, text, visible_columns,
+    CatalogRelation,
     CatalogSchema::{InformationSchema, PgCatalog},
     INFORMATION_SCHEMA_NS_OID, PG_CATALOG_NS_OID, PUBLIC_NS_OID,
 };
@@ -125,6 +126,10 @@ pub(crate) const RELATIONS: &[CatalogRelation] = &[
             ("typtypmod", C::Int64),
             ("typndims", C::Int64),
             ("typcollation", C::Int64),
+            // A DOMAIN's default expression, as text. mpedb has no domains, so
+            // it is always NULL — but reflection SELECTs it by name, and a
+            // missing column fails the whole query rather than the one field.
+            ("typdefault", C::Text),
         ],
         rows: pg_type,
     },
@@ -146,6 +151,10 @@ pub(crate) const RELATIONS: &[CatalogRelation] = &[
             ("indisready", C::Bool),
             ("indislive", C::Bool),
             ("indisreplident", C::Bool),
+            // PostgreSQL 15's `NULLS NOT DISTINCT` on a unique index. mpedb has
+            // no such option, so it is always false — but reflection SELECTs it
+            // by name and a missing column fails the whole query.
+            ("indnullsnotdistinct", C::Bool),
             ("indkey", C::Text),
             ("indcollation", C::Text),
             ("indclass", C::Text),
@@ -180,6 +189,14 @@ pub(crate) const RELATIONS: &[CatalogRelation] = &[
             ("conkey", C::Text),
             ("confkey", C::Text),
             ("conbin", C::Text),
+            // NOT a PostgreSQL column: it is what `pg_get_constraintdef(oid)`
+            // returns, precomputed. That function needs the SCHEMA to answer —
+            // a `ScalarFn` has none — so the PG surface binds the call to this
+            // sibling column instead (`PgFunc::SiblingColumn`, pg/funcs.rs).
+            // Reflection parses this text with a REGEX, so it is not cosmetic:
+            // it is where foreign keys, unique and check constraints are read
+            // from.
+            ("condef", C::Text),
         ],
         rows: pg_constraint,
     },
@@ -270,6 +287,21 @@ pub(crate) const RELATIONS: &[CatalogRelation] = &[
             ("collencoding", C::Int64),
             ("collcollate", C::Text),
             ("collctype", C::Text),
+        ],
+        rows: empty,
+    },
+    CatalogRelation {
+        // ENUM labels. mpedb has no `CREATE TYPE … AS ENUM`, so this is always
+        // EMPTY — but reflection JOINs it to read a column's enum labels, and
+        // a missing relation fails the whole query where an empty one just
+        // contributes no rows.
+        name: "pg_enum",
+        schema: PgCatalog,
+        columns: &[
+            ("oid", C::Int64),
+            ("enumtypid", C::Int64),
+            ("enumsortorder", C::Float64),
+            ("enumlabel", C::Text),
         ],
         rows: empty,
     },
@@ -426,7 +458,7 @@ fn pg_namespace(_: &Schema) -> Vec<Vec<Value>> {
 fn pg_class(schema: &Schema) -> Vec<Vec<Value>> {
     let mut out = Vec::new();
     for t in live_tables(schema) {
-        let has_index = !t.indexes.is_empty() || !t.primary_key.is_empty();
+        let has_index = !t.indexes.is_empty() || has_declared_pk(t);
         out.push(vec![
             int(table_oid(t.id)),
             text(&t.name),
@@ -452,8 +484,13 @@ fn pg_class(schema: &Schema) -> Vec<Vec<Value>> {
             text("p"),
             // relkind 'r' = ordinary table.
             text("r"),
-            int(t.columns.len() as i64),
-            int(t.columns.iter().filter(|c| c.check.is_some()).count() as i64),
+            int(visible_columns(t).len() as i64),
+            int(
+                visible_columns(t)
+                    .iter()
+                    .filter(|c| c.check.is_some())
+                    .count() as i64,
+            ),
             Value::Bool(false),
             Value::Bool(false),
             Value::Bool(false),
@@ -518,8 +555,16 @@ fn pg_class(schema: &Schema) -> Vec<Vec<Value>> {
 /// which is what a client would see had the index been created there.
 fn index_names(t: &mpedb_types::TableDef) -> Vec<(u32, String)> {
     let mut out = Vec::new();
-    if !t.primary_key.is_empty() {
-        out.push((0, format!("{}_pkey", t.name)));
+    if has_declared_pk(t) {
+        // In PostgreSQL a PRIMARY KEY constraint and its backing index share ONE
+        // name, so the declared one — when there is one — has to be reported for
+        // both or a client sees two unrelated objects.
+        out.push((
+            0,
+            t.pk_name
+                .clone()
+                .unwrap_or_else(|| format!("{}_pkey", t.name)),
+        ));
     }
     for (i, idx) in t.indexes.iter().enumerate() {
         let n = i as u32 + 1;
@@ -559,7 +604,7 @@ fn index_width(t: &mpedb_types::TableDef, index_no: u32) -> usize {
 fn pg_attribute(schema: &Schema) -> Vec<Vec<Value>> {
     let mut out = Vec::new();
     for t in live_tables(schema) {
-        for (i, c) in t.columns.iter().enumerate() {
+        for (i, c) in visible_columns(t).iter().enumerate() {
             let oid = column_type_oid(c.ty);
             out.push(vec![
                 int(table_oid(t.id)),
@@ -584,8 +629,28 @@ fn pg_attribute(schema: &Schema) -> Vec<Vec<Value>> {
                 text(storage_for(c.ty)),
                 text(align_for(c.ty)),
                 Value::Bool(!c.nullable),
-                Value::Bool(c.default.is_some()),
+                // `atthasdef` — whether pg_attrdef has a row for this column.
+                // The rowid alias has no DECLARED default and one REPORTED one
+                // (see `rowid_alias_default`), so both have to be counted here
+                // or the client never reads the row that exists.
+                Value::Bool(c.default.is_some() || rowid_alias_default(t, i).is_some()),
                 Value::Bool(false),
+                // `attidentity` — whether the column is an IDENTITY column,
+                // PostgreSQL 10's `GENERATED … AS IDENTITY`. mpedb's generated
+                // key is the ROWID ALIAS (#94), a single-column INTEGER PRIMARY
+                // KEY that auto-assigns `max+1`, and that is reported as a
+                // SERIAL — a sequence-backed DEFAULT — not as an identity.
+                //
+                // The distinction is not cosmetic. An identity column is
+                // reflected by reading the SEQUENCE OBJECT behind it
+                // (`pg_get_serial_sequence` → `pg_sequence.seqstart` and the
+                // rest), and mpedb has no sequence objects, so that read comes
+                // back empty and the column reflects as NOT autoincrementing —
+                // measured, with `attidentity = 'd'` set. A serial is reflected
+                // from the DEFAULT TEXT alone, which mpedb can state truthfully.
+                // SQLAlchemy's own comment in that query says the same thing
+                // from the other side: `attidentity != ''` is what keeps a
+                // serial from being mistaken for an identity.
                 text(""),
                 text(if c.generated.is_some() { "s" } else { "" }),
                 Value::Bool(false),
@@ -603,6 +668,35 @@ fn pg_attribute(schema: &Schema) -> Vec<Vec<Value>> {
         }
     }
     out
+}
+
+/// The DEFAULT a rowid-alias column REPORTS: PostgreSQL's `serial` shape.
+///
+/// A single-column INTEGER PRIMARY KEY auto-assigns `max+1` (#94). PostgreSQL
+/// spells that a `serial`, which is not a type but a DEFAULT reading from a
+/// sequence, and reflection recognises the column as auto-assigning by matching
+/// `nextval\('…'\)` against this text. mpedb has no sequence OBJECT — `nextval()`
+/// refuses by name — so nothing here can be followed to one; the sequence name
+/// is PostgreSQL's derived one (`<table>_<column>_seq`), which is the name a
+/// client would find had the column been declared `SERIAL`.
+///
+/// `None` for every other column, including a composite PK and a non-integer
+/// one: neither auto-assigns, and saying they did would make a client omit the
+/// value on INSERT and get a NOT NULL violation.
+fn rowid_alias_default(t: &mpedb_types::TableDef, i: usize) -> Option<String> {
+    let c = t.columns.get(i)?;
+    if c.ty != mpedb_types::ColumnType::Int64 || t.primary_key.as_slice() != [i as u16] {
+        return None;
+    }
+    // A DECLARED default wins: the column supplies its value from that, and
+    // reporting a sequence over the top would name a source that is not used.
+    if c.default.is_some() {
+        return None;
+    }
+    Some(format!(
+        "nextval('{}_{}_seq'::regclass)",
+        t.name, c.name
+    ))
 }
 
 fn storage_for(ty: mpedb_types::ColumnType) -> &'static str {
@@ -646,6 +740,8 @@ fn pg_type(_: &Schema) -> Vec<Vec<Value>> {
                 int(-1),
                 int(0),
                 int(if t.name == "text" { 100 } else { 0 }),
+                // typdefault: a domain-only field, and mpedb has no domains.
+                Value::Null,
             ]
         })
         .collect()
@@ -714,6 +810,9 @@ fn pg_index(schema: &Schema) -> Vec<Vec<Value>> {
                 Value::Bool(true),
                 Value::Bool(true),
                 Value::Bool(false),
+                // indnullsnotdistinct: mpedb's unique index treats NULLs as
+                // distinct, which is the SQL default and PostgreSQL's.
+                Value::Bool(false),
                 text(indkey),
                 text(zeros.clone()),
                 text(zeros.clone()),
@@ -729,6 +828,109 @@ fn pg_index(schema: &Schema) -> Vec<Vec<Value>> {
                 },
             ]);
         }
+    }
+    out
+}
+
+/// `pg_description` rows from the comments mpedb has STORED.
+///
+/// Not a `CatalogRelation::rows` function, because those see only the schema
+/// and a comment does not live there — it is a sys-keyspace record, read by
+/// `Database::list_comments`. So the caller passes them in and this maps them
+/// onto PostgreSQL's `(objoid, classoid, objsubid)` addressing.
+///
+/// `objsubid` is the ATTNUM for a column comment and `0` for a table's, which
+/// is exactly how reflection tells the two apart in one join.
+/// The value of a named column in a row of relation `rel`.
+///
+/// The position comes from the relation's OWN column list rather than from a
+/// literal index: these row vectors are positional, and a column inserted in the
+/// middle would otherwise make every reader below it quietly read its neighbour.
+fn column_of(rel: &str, col: &str, row: &[Value]) -> Option<Value> {
+    let rel = super::lookup(rel)?;
+    let i = rel.columns.iter().position(|(c, _)| *c == col)?;
+    row.get(i).cloned()
+}
+
+pub fn description_rows(schema: &Schema, comments: &[(String, String)]) -> Vec<Vec<Value>> {
+    // The class a comment's object belongs to: `pg_class` for a table or one of
+    // its columns, `pg_constraint` for a constraint.
+    const PG_CLASS_OID: i64 = 1259;
+    const PG_CONSTRAINT_OID: i64 = 2606;
+    let mut out = Vec::new();
+    // Built once, and ONLY if a constraint comment is present. Reading the OIDs
+    // out of the rows `pg_constraint` itself produces is what keeps the two from
+    // drifting: the numbering is positional (`next_oid` walks pk, then uniques,
+    // then foreign keys, then checks), so a second implementation of that walk
+    // would hang a comment on a different constraint the first time either side
+    // grew a case.
+    let mut con_rows: Option<Vec<Vec<Value>>> = None;
+    for (subkey, body) in comments {
+        // `t/<table>`, `c/<table>.<column>`, `k/<table>.<constraint>` — the
+        // spellings `Database::comment_key` writes.
+        let (kind, rest) = match subkey.split_once('/') {
+            Some(p) => p,
+            None => continue,
+        };
+        let (table, sub) = match kind {
+            "t" => (rest, None),
+            "c" | "k" => match rest.split_once('.') {
+                Some((t, c)) => (t, Some(c)),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let Some(t) = live_tables(schema).find(|t| t.name.eq_ignore_ascii_case(table))
+        else {
+            continue;
+        };
+        let objsubid = match (kind, sub) {
+            ("c", Some(col)) => {
+                // 1-based attnum, and a column that no longer exists simply has
+                // no row — a DROP COLUMN leaves the comment behind in the sys
+                // keyspace and reflection must not invent an attnum for it.
+                match t.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col)) {
+                    Some(i) => i as i64 + 1,
+                    None => continue,
+                }
+            }
+            // A CONSTRAINT comment addresses the CONSTRAINT, so it is keyed by
+            // that object's OID and class — not by the table's, which would
+            // report a foreign key's comment as the table's own.
+            ("k", Some(name)) => {
+                let rows = con_rows.get_or_insert_with(|| pg_constraint(schema));
+                let want_rel = Value::Int(table_oid(t.id));
+                let hit = rows.iter().find(|r| {
+                    column_of("pg_constraint", "conrelid", r) == Some(want_rel.clone())
+                        && matches!(
+                            column_of("pg_constraint", "conname", r),
+                            Some(Value::Text(ref n)) if n.eq_ignore_ascii_case(name)
+                        )
+                });
+                // A comment on a constraint that no longer exists has no row,
+                // for the same reason a dropped column's does not: the sys
+                // keyspace keeps the comment, and inventing an OID for it would
+                // attach the text to whatever now occupies that slot.
+                let Some(row) = hit else { continue };
+                let Some(Value::Int(oid)) = column_of("pg_constraint", "oid", row) else {
+                    continue;
+                };
+                out.push(vec![
+                    int(oid),
+                    int(PG_CONSTRAINT_OID),
+                    int(0),
+                    text(body.clone()),
+                ]);
+                continue;
+            }
+            _ => 0,
+        };
+        out.push(vec![
+            int(table_oid(t.id)),
+            int(PG_CLASS_OID),
+            int(objsubid),
+            text(body.clone()),
+        ]);
     }
     out
 }
@@ -756,10 +958,22 @@ fn pg_constraint(schema: &Schema) -> Vec<Vec<Value>> {
                     .join(",")
             )
         };
-        if !t.primary_key.is_empty() {
+        // The column list a constraint definition renders, quoted PG's way.
+        let collist = |cols: &[u16]| {
+            cols.iter()
+                .map(|&c| match t.columns.get(c as usize) {
+                    Some(col) => quote_ident(&col.name),
+                    None => "?column?".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if has_declared_pk(t) {
             out.push(constraint_row(
                 next_oid(t.id, &mut nth),
-                format!("{}_pkey", t.name),
+                t.pk_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_pkey", t.name)),
                 "p",
                 table_oid(t.id),
                 index_oid(t.id, 0),
@@ -768,17 +982,31 @@ fn pg_constraint(schema: &Schema) -> Vec<Vec<Value>> {
                 String::new(),
                 false,
                 Value::Null,
+                format!("PRIMARY KEY ({})", collist(&t.primary_key)),
             ));
         }
+        let names = index_names(t);
         for (i, idx) in t.indexes.iter().enumerate() {
-            if !idx.unique {
+            // A unique index is a CONSTRAINT only if one was declared.
+            // PostgreSQL reports a bare `CREATE UNIQUE INDEX` in `pg_index`
+            // alone, and a client that reads it out of here instead re-creates
+            // the index as a `UniqueConstraint` — the same enforcement under a
+            // different object, with nothing in the output to say so.
+            if !idx.unique || !idx.from_constraint {
                 continue;
             }
             let n = i as u32 + 1;
             out.push(constraint_row(
                 next_oid(t.id, &mut nth),
-                idx.name
-                    .clone()
+                // The SAME name the backing index reports: in PostgreSQL a
+                // unique constraint and its index share one name, and that
+                // shared name is how a client pairs the two (SQLAlchemy's
+                // `duplicates_index`). Two spellings would report the pair as
+                // two unrelated objects.
+                names
+                    .iter()
+                    .find(|(no, _)| *no == n)
+                    .map(|(_, nm)| nm.clone())
                     .unwrap_or_else(|| format!("{}_{}_key", t.name, n)),
                 "u",
                 table_oid(t.id),
@@ -788,16 +1016,55 @@ fn pg_constraint(schema: &Schema) -> Vec<Vec<Value>> {
                 String::new(),
                 false,
                 Value::Null,
+                format!("UNIQUE ({})", collist(&idx.columns)),
             ));
         }
         for (i, fk) in t.foreign_keys.iter().enumerate() {
             // The parent's OID has to be looked up by NAME: a FK records the
             // referenced table's name, not its id, because the parent may not
             // exist when the child is declared.
-            let parent = live_tables(schema)
-                .find(|p| mpedb_types::ident::ident_eq(&p.name, &fk.parent))
-                .map(|p| table_oid(p.id))
-                .unwrap_or(0);
+            let parent_def =
+                live_tables(schema).find(|p| mpedb_types::ident::ident_eq(&p.name, &fk.parent));
+            let parent = parent_def.map(|p| table_oid(p.id)).unwrap_or(0);
+            // `REFERENCES t` with no column list means the parent's PRIMARY KEY
+            // — resolved HERE because the parent exists by now, even though it
+            // did not when the child was declared (ForeignKeyDef's own docs).
+            let parent_cols: Vec<String> = if !fk.parent_columns.is_empty() {
+                fk.parent_columns.iter().map(|c| quote_ident(c)).collect()
+            } else {
+                match parent_def {
+                    Some(p) => p
+                        .primary_key
+                        .iter()
+                        .filter_map(|&c| p.columns.get(c as usize))
+                        .map(|c| quote_ident(&c.name))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            };
+            // `confkey` is the parent's column ORDINALS, which needs the same
+            // resolution: a name list has to be looked up in the parent.
+            let confkey = match parent_def {
+                Some(p) if !fk.parent_columns.is_empty() => {
+                    let ords: Vec<u16> = fk
+                        .parent_columns
+                        .iter()
+                        .filter_map(|name| {
+                            p.columns
+                                .iter()
+                                .position(|c| mpedb_types::ident::ident_eq(&c.name, name))
+                                .map(|i| i as u16)
+                        })
+                        .collect();
+                    if ords.len() == fk.parent_columns.len() {
+                        attnums(&ords)
+                    } else {
+                        String::new()
+                    }
+                }
+                Some(p) => attnums(&p.primary_key),
+                None => String::new(),
+            };
             out.push(constraint_row(
                 next_oid(t.id, &mut nth),
                 fk.name
@@ -808,9 +1075,10 @@ fn pg_constraint(schema: &Schema) -> Vec<Vec<Value>> {
                 0,
                 parent,
                 attnums(&fk.columns),
-                String::new(),
+                confkey,
                 fk.deferred,
                 Value::Null,
+                fk_def(fk, &collist(&fk.columns), &parent_cols),
             ));
         }
         for (i, c) in t.columns.iter().enumerate() {
@@ -826,6 +1094,11 @@ fn pg_constraint(schema: &Schema) -> Vec<Vec<Value>> {
                     String::new(),
                     false,
                     text(check),
+                    // PostgreSQL renders a CHECK with the expression in its own
+                    // parentheses inside the constraint's — SQLAlchemy's
+                    // `CHECK \((.+)\)` strips one level and keeps the rest, so
+                    // one pair of parentheses too few loses the outer operator.
+                    format!("CHECK (({check}))"),
                 ));
             }
         }
@@ -851,6 +1124,7 @@ fn constraint_row(
     confkey: String,
     deferred: bool,
     conbin: Value,
+    condef: String,
 ) -> Vec<Value> {
     vec![
         int(oid),
@@ -880,7 +1154,65 @@ fn constraint_row(
             text(confkey)
         },
         conbin,
+        text(condef),
     ]
+}
+
+/// PostgreSQL's `pg_get_constraintdef` text for a FOREIGN KEY.
+///
+/// The shape is fixed by what reads it: SQLAlchemy matches
+/// `FOREIGN KEY \((.*?)\) REFERENCES (?:(t)\.)?(t)\((cols)\)` and then optional
+/// MATCH / ON UPDATE / ON DELETE / DEFERRABLE clauses, each separated by a
+/// SINGLE space. The schema qualifier is left off deliberately — mpedb has one
+/// namespace and PostgreSQL itself omits it when the schema is on the
+/// search_path, which is the case reflection is written for.
+fn fk_def(fk: &mpedb_types::schema::ForeignKeyDef, child_cols: &str, parent_cols: &[String]) -> String {
+    use mpedb_types::schema::FkAction;
+    let action = |a: FkAction| match a {
+        FkAction::NoAction => None,
+        FkAction::Restrict => Some("RESTRICT"),
+        FkAction::Cascade => Some("CASCADE"),
+        FkAction::SetNull => Some("SET NULL"),
+        FkAction::SetDefault => Some("SET DEFAULT"),
+    };
+    let mut def = format!(
+        "FOREIGN KEY ({child_cols}) REFERENCES {}({})",
+        quote_ident(&fk.parent),
+        parent_cols.join(", ")
+    );
+    // PostgreSQL prints ON UPDATE before ON DELETE, and prints neither when the
+    // action is NO ACTION (the default).
+    if let Some(a) = action(fk.on_update) {
+        def.push_str(&format!(" ON UPDATE {a}"));
+    }
+    if let Some(a) = action(fk.on_delete) {
+        def.push_str(&format!(" ON DELETE {a}"));
+    }
+    if fk.deferred {
+        def.push_str(" DEFERRABLE INITIALLY DEFERRED");
+    }
+    def
+}
+
+/// Quote an identifier the way PostgreSQL renders one inside a definition:
+/// bare when it is already a lowercase unquoted identifier, double-quoted (with
+/// embedded quotes doubled) otherwise.
+///
+/// PostgreSQL also quotes a bare identifier that collides with a RESERVED WORD;
+/// this does not, because the keyword set lives in the tokenizer and duplicating
+/// it here would be a second copy to keep in step. The consumer unquotes either
+/// way, so the difference is textual only.
+fn quote_ident(name: &str) -> String {
+    let bare = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if bare {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
 }
 
 fn pg_database(_: &Schema) -> Vec<Vec<Value>> {
@@ -928,10 +1260,17 @@ fn pg_am(_: &Schema) -> Vec<Vec<Value>> {
 fn pg_attrdef(schema: &Schema) -> Vec<Vec<Value>> {
     let mut out = Vec::new();
     for t in live_tables(schema) {
-        for (i, c) in t.columns.iter().enumerate() {
-            if c.default.is_none() {
-                continue;
-            }
+        for (i, c) in visible_columns(t).iter().enumerate() {
+            // Either a DECLARED default or the rowid alias's reported serial —
+            // never both, and `rowid_alias_default` is what decides.
+            let adbin = match (&c.default, rowid_alias_default(t, i)) {
+                (Some(_), _) => match &c.default_text {
+                    Some(t) => text(t),
+                    None => Value::Null,
+                },
+                (None, Some(seq)) => text(seq),
+                (None, None) => continue,
+            };
             out.push(vec![
                 int(attrdef_oid(t.id, i)),
                 int(table_oid(t.id)),
@@ -940,10 +1279,7 @@ fn pg_attrdef(schema: &Schema) -> Vec<Vec<Value>> {
                 // anyway; they call pg_get_expr() on it. mpedb keeps the DDL
                 // TEXT the default was written with, which is what that call
                 // would have returned.
-                match &c.default_text {
-                    Some(t) => text(t),
-                    None => Value::Null,
-                },
+                adbin,
             ]);
         }
     }
@@ -958,7 +1294,7 @@ fn pg_tables(schema: &Schema) -> Vec<Vec<Value>> {
                 text(&t.name),
                 text(OWNER_NAME),
                 Value::Null,
-                Value::Bool(!t.indexes.is_empty() || !t.primary_key.is_empty()),
+                Value::Bool(!t.indexes.is_empty() || has_declared_pk(t)),
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(false),
@@ -1030,13 +1366,8 @@ mod tests {
     }
 
     fn col(name: &str, col: &str, row: &[Value]) -> Value {
-        let rel = lookup(name).unwrap();
-        let i = rel
-            .columns
-            .iter()
-            .position(|(c, _)| *c == col)
-            .unwrap_or_else(|| panic!("{name} has no column {col}"));
-        row[i].clone()
+        super::column_of(name, col, row)
+            .unwrap_or_else(|| panic!("{name} has no column {col}"))
     }
 
     #[test]
@@ -1186,5 +1517,45 @@ mod tests {
         assert!(names.contains(&Value::Text("public".into())));
         assert!(names.contains(&Value::Text("pg_catalog".into())));
         assert!(names.contains(&Value::Text("information_schema".into())));
+    }
+
+    #[test]
+    fn a_foreign_key_renders_the_definition_reflection_parses() {
+        // The minimal repro for the whole `condef` column: a table name that
+        // needs quoting, which is what SQLAlchemy's BizarroCharacterTest uses.
+        // Every character of this text is load-bearing — reflection reads
+        // foreign keys by REGEX over it, so an extra space or a missing paren
+        // is a key that reflects as none.
+        use mpedb_types::schema::{ForeignKeyDef, TableDef};
+        let child = TableDef {
+            foreign_keys: vec![ForeignKeyDef {
+                columns: vec![1],
+                parent: "(2)".into(),
+                parent_columns: vec!["(3)".into()],
+                on_delete: mpedb_types::schema::FkAction::Cascade,
+                on_update: mpedb_types::schema::FkAction::NoAction,
+                deferred: false,
+                name: Some("fk_other".into()),
+            }],
+            ..super::super::tests::table_for_test(1, "other", vec!["id", "ref"], vec![0])
+        };
+        let parent = super::super::tests::table_for_test(0, "(2)", vec!["(3)"], vec![0]);
+        let schema = Schema::new(vec![parent, child]).expect("valid");
+        let rows = pg_constraint(&schema);
+        let defs: Vec<String> = rows
+            .iter()
+            .map(|r| match col("pg_constraint", "condef", r) {
+                Value::Text(s) => s,
+                v => panic!("{v:?}"),
+            })
+            .collect();
+        assert!(
+            defs.contains(&"FOREIGN KEY (ref) REFERENCES \"(2)\"(\"(3)\") ON DELETE CASCADE".into()),
+            "{defs:?}"
+        );
+        // The parent's own key still renders, and the child's, so a client that
+        // asks for all constraints on one table gets both kinds.
+        assert!(defs.contains(&"PRIMARY KEY (\"(3)\")".into()), "{defs:?}");
+        assert!(defs.contains(&"PRIMARY KEY (id)".into()), "{defs:?}");
     }
 }

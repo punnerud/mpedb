@@ -989,7 +989,8 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::LParen, "(")?;
         let mut columns: Vec<crate::ddl::CreateColumnSpec> = Vec::new();
         let mut table_pk: Vec<String> = Vec::new();
-        let mut uniques: Vec<Vec<String>> = Vec::new();
+        let mut pk_name: Option<String> = None;
+        let mut uniques: Vec<crate::ddl::UniqueSpec> = Vec::new();
         let mut checks: Vec<String> = Vec::new();
         let mut foreign_keys: Vec<crate::ddl::ForeignKeySpec> = Vec::new();
         loop {
@@ -1006,9 +1007,13 @@ impl<'a> Parser<'a> {
                     return Err(self.err_here("duplicate table-level PRIMARY KEY"));
                 }
                 table_pk = self.paren_ident_list()?;
+                pk_name = named.clone();
                 self.conflict_clause("a PRIMARY KEY constraint")?;
             } else if self.eat_word("UNIQUE") {
-                uniques.push(self.paren_ident_list()?);
+                uniques.push(crate::ddl::UniqueSpec {
+                    columns: self.paren_ident_list()?,
+                    name: named.clone(),
+                });
                 self.conflict_clause("a UNIQUE constraint")?;
             } else if self.eat_word("CHECK") {
                 checks.push(self.capture_paren_source()?);
@@ -1064,6 +1069,7 @@ impl<'a> Parser<'a> {
             },
             columns,
             table_pk,
+            pk_name,
             uniques,
             checks,
             foreign_keys,

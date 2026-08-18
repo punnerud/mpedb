@@ -599,6 +599,9 @@ pub(crate) fn create_bookkeeping(
         name: name.into(),
         columns,
         table_pk: pk.iter().map(|c| (*c).to_string()).collect(),
+        // Bookkeeping tables are built from SPECS, never from SQL text, and
+        // nothing reflects them — so there is no constraint name to keep.
+        pk_name: None,
         uniques: Vec::new(),
         checks: Vec::new(),
         foreign_keys: Vec::new(),

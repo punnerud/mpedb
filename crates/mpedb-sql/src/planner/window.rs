@@ -438,7 +438,7 @@ pub(super) fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableD
         primary_key: vec![0],
         indexes: Vec::new(),
         dead: false,
-        implicit_rowid: false, autoincrement: false,
+        implicit_rowid: false, autoincrement: false, pk_name: None,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     }

@@ -101,6 +101,7 @@ pub(crate) mod funcs {
         AlwaysTrue,
         Alias(&'static str),
         AliasSwap2(&'static str),
+        SiblingColumn(&'static str),
         Scalar(mpedb_types::ScalarFn),
     }
 

@@ -421,7 +421,7 @@ fn stale_plan_surfaces_plan_invalidated() {
         columns: vec![col("id"), col("balance"), col("extra")],
         primary_key: vec![0],
         indexes: vec![],
-        dead: false,
+        dead: false, pk_name: None,
         implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),

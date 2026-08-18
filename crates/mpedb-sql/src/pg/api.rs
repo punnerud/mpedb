@@ -48,6 +48,24 @@ pub fn catalog_rows(qualified_or_bare: &str, schema: &Schema) -> Option<Vec<Vec<
 ///
 /// A statement that does not parse is not an error here — it returns nothing
 /// and the ordinary compile path produces the real diagnostic.
+/// `pg_description` rows for the comments mpedb has stored.
+///
+/// Separate from [`catalog_rows`] because a comment is NOT in the schema: it is
+/// a sys-keyspace record, and only the caller holding the database can read it
+/// (`Database::list_comments`). Pass those pairs here and this addresses them
+/// the way PostgreSQL does — `objsubid` is the attnum for a column comment and
+/// `0` for a table's.
+#[cfg(feature = "pg-dialect")]
+pub fn description_rows(schema: &Schema, comments: &[(String, String)]) -> Vec<Vec<Value>> {
+    super::catalog::pgcat::description_rows(schema, comments)
+}
+
+/// Without the feature there is no catalog to describe.
+#[cfg(not(feature = "pg-dialect"))]
+pub fn description_rows(_schema: &Schema, _comments: &[(String, String)]) -> Vec<Vec<Value>> {
+    Vec::new()
+}
+
 pub fn catalog_references(sql: &str) -> Vec<(&'static str, &'static str)> {
     use crate::token::{tokenize_dialect, Tok};
     let Ok(toks) = tokenize_dialect(sql, Dialect::Postgres) else {

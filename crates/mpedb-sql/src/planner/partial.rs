@@ -220,7 +220,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: Vec::new(),
-            dead: false,
+            dead: false, pk_name: None,
             implicit_rowid: false, autoincrement: false,
             kind: mpedb_types::TableKind::Standard,
             foreign_keys: Vec::new(),
@@ -235,6 +235,7 @@ mod tests {
             predicate: pred.map(|s| s.to_string()),
             exprs: Vec::new(),
             name: None,
+            from_constraint: false,
         }
     }
 

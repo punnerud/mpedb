@@ -294,7 +294,7 @@ impl SqliteAttach {
                         columns: cols,
                         primary_key: vec![ipk as u16],
                         indexes: vec![],
-                        dead: false,
+                        dead: false, pk_name: None,
                         implicit_rowid: false, autoincrement: false,
                         kind: mpedb_types::TableKind::Standard,
                         foreign_keys: Vec::new(),
@@ -337,7 +337,7 @@ impl SqliteAttach {
                         columns: cols,
                         primary_key: vec![i as u16],
                         indexes: vec![],
-                        dead: false,
+                        dead: false, pk_name: None,
                         implicit_rowid: false, autoincrement: false,
                         kind: mpedb_types::TableKind::Standard,
                         foreign_keys: Vec::new(),
@@ -362,7 +362,7 @@ impl SqliteAttach {
                         columns: cols,
                         primary_key: vec![pk as u16],
                         indexes: vec![],
-                        dead: false,
+                        dead: false, pk_name: None,
                         // HIDDEN, exactly as #94 made it on the native path.
                         // The base table has no INTEGER PRIMARY KEY, so this
                         // `rowid` is mpedb's synthesis of sqlite's implicit one

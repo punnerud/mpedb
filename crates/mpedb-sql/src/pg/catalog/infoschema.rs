@@ -120,7 +120,7 @@ pub(crate) const COLUMNS_COLUMNS: &[(&str, C)] = &[
 pub(crate) fn columns(schema: &Schema) -> Vec<Vec<Value>> {
     let mut out = Vec::new();
     for t in live_tables(schema) {
-        for (i, c) in t.columns.iter().enumerate() {
+        for (i, c) in super::visible_columns(t).iter().enumerate() {
             let (prec, radix, scale) = match c.ty {
                 C::Int64 => (Some(64), Some(2), Some(0)),
                 C::Float64 => (Some(53), Some(2), None),
@@ -209,8 +209,8 @@ pub(crate) fn table_constraints(schema: &Schema) -> Vec<Vec<Value>> {
         ]);
     };
     for t in live_tables(schema) {
-        if !t.primary_key.is_empty() {
-            push(format!("{}_pkey", t.name), &t.name, "PRIMARY KEY", false);
+        if super::has_declared_pk(t) {
+            push(t.pk_name.clone().unwrap_or_else(|| format!("{}_pkey", t.name)), &t.name, "PRIMARY KEY", false);
         }
         for (i, idx) in t.indexes.iter().enumerate() {
             if idx.unique {
@@ -288,8 +288,8 @@ pub(crate) fn key_column_usage(schema: &Schema) -> Vec<Vec<Value>> {
                 ]);
             }
         };
-        if !t.primary_key.is_empty() {
-            push(format!("{}_pkey", t.name), &t.primary_key, false);
+        if super::has_declared_pk(t) {
+            push(t.pk_name.clone().unwrap_or_else(|| format!("{}_pkey", t.name)), &t.primary_key, false);
         }
         for (i, idx) in t.indexes.iter().enumerate() {
             if idx.unique {

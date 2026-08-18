@@ -8,7 +8,12 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(18u8); // schema encoding version (v18: fts MODULE tag)
+        // v19: the column-type tag space grew by Date/Time/Numeric. The LAYOUT
+        // is identical to v18 — what changed is which tag bytes are legal — so
+        // the bump exists to make an old reader refuse by VERSION rather than
+        // by an unknown tag three fields deeper in.
+        // v20: IndexDef.from_constraint and TableDef.pk_name.
+        buf.push(20u8); // schema encoding version
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -146,6 +151,9 @@ impl Schema {
                         Some(c) => *c as u8 + 1,
                     });
                 }
+                // Constraint provenance (v20): whether this unique index exists
+                // because a UNIQUE constraint was declared. One byte per index.
+                buf.push(ix.from_constraint as u8);
             }
             // FOREIGN KEYs (v12). Almost every table has none, so the common
             // case is a single zero u16 — the same "one length word" price the
@@ -176,6 +184,16 @@ impl Schema {
                     }
                 }
             }
+            // The PRIMARY KEY constraint's declared name (v20). Absent (0) for
+            // every key written without one, so a table that named none grows by
+            // a single zero byte.
+            match &t.pk_name {
+                None => buf.push(0),
+                Some(n) => {
+                    buf.push(1);
+                    write_str(&mut buf, n);
+                }
+            }
         }
         buf
     }
@@ -192,7 +210,7 @@ impl Schema {
         // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name;
         // v12 = TableDef.foreign_keys; v13 = IndexDef.exprs.
         // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if !(9..=18).contains(&version) {
+        if !(9..=20).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
@@ -204,6 +222,9 @@ impl Schema {
         let has_index_exprs = version >= 13;
         let has_index_collations = version >= 14;
         let has_fts_module = version >= 18;
+        // v20 added TWO fields, and one flag gates both: they went in
+        // together, so a file has both or neither.
+        let has_index_from_constraint = version >= 20;
         let ntables = read_u32(buf, &mut pos)? as usize;
         // The CEILING, not the configured cap: this bounds what a FILE can
         // make this decoder believe, and a hostile file must not be able to
@@ -488,6 +509,23 @@ impl Schema {
                 } else {
                     Vec::new()
                 };
+                // Constraint provenance (v20). A file written before v20 did not
+                // record it, and the answer that matches how those files
+                // BEHAVED is `unique`: every unique index reported itself as a
+                // constraint, because that was the only thing the catalog could
+                // say. Reading it back as anything else would change what an
+                // existing database reflects as.
+                let from_constraint = if has_index_from_constraint {
+                    let tag = *buf.get(pos).ok_or_else(err)?;
+                    pos += 1;
+                    match tag {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(Error::Corrupt("bad index constraint tag".into())),
+                    }
+                } else {
+                    unique
+                };
                 indexes.push(IndexDef {
                     collations,
                     columns: cols,
@@ -495,6 +533,7 @@ impl Schema {
                     predicate,
                     exprs,
                     name,
+                    from_constraint,
                 });
             }
             // Reconstruct the in-memory convenience flags from the index
@@ -575,6 +614,23 @@ impl Schema {
                     });
                 }
             }
+            // The PRIMARY KEY's declared name (v20). A file older than that
+            // never stored one, which is the same thing as not having named it.
+            let pk_name = if has_index_from_constraint {
+                match *buf.get(pos).ok_or_else(err)? {
+                    0 => {
+                        pos += 1;
+                        None
+                    }
+                    1 => {
+                        pos += 1;
+                        Some(read_str(buf, &mut pos)?)
+                    }
+                    _ => return Err(Error::Corrupt("bad primary key name tag".into())),
+                }
+            } else {
+                None
+            };
             tables.push(TableDef {
                 id,
                 name,
@@ -586,6 +642,7 @@ impl Schema {
                 implicit_rowid,
                 autoincrement,
                 foreign_keys,
+                pk_name,
             });
         }
         if pos != buf.len() {

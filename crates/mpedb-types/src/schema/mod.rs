@@ -401,6 +401,22 @@ pub struct IndexDef {
     /// it names the column (`UNIQUE constraint failed: t.a`), not the index.
     /// It changes how the key is ENCODED, not what value it holds.
     pub collations: Vec<Option<crate::value::Collation>>,
+    /// Whether this index EXISTS BECAUSE OF A CONSTRAINT — a table-level
+    /// `UNIQUE (…)`, a named `CONSTRAINT u UNIQUE (…)`, or the column flag that
+    /// spells the same thing — rather than because someone wrote
+    /// `CREATE UNIQUE INDEX`. On the wire since canonical-bytes **v20**.
+    ///
+    /// mpedb enforces both the same way, with one B-tree, so this bit changes
+    /// nothing about storage or planning. What it changes is what the catalog
+    /// can SAY: PostgreSQL reports a constraint-backed unique index in BOTH
+    /// `pg_constraint` and `pg_index`, and a bare `CREATE UNIQUE INDEX` in
+    /// `pg_index` ONLY. Without the bit every unique index answered as a
+    /// constraint, so a reflecting client re-created `Index(unique=True)` as a
+    /// `UniqueConstraint` — a wrong answer that no error reports.
+    ///
+    /// Always `false` when `unique` is false: a non-unique index is never a
+    /// constraint.
+    pub from_constraint: bool,
 }
 
 /// `IndexDef::columns[i]` for a key part that is an EXPRESSION, not a column.
@@ -507,6 +523,15 @@ pub struct TableDef {
     /// v17) — which is the whole of what the keyword adds and the whole of what
     /// it costs.
     pub autoincrement: bool,
+    /// `CONSTRAINT <name> PRIMARY KEY (…)` — the name the PRIMARY KEY constraint
+    /// was declared with, on the wire since canonical-bytes **v20**.
+    ///
+    /// `None` for every key declared without one, which reports PostgreSQL's
+    /// derived `<table>_pkey` at the catalog surface rather than storing a name
+    /// nobody wrote. Kept for the same reason a UNIQUE constraint's name is
+    /// (`IndexDef::name`): a reflecting client reads it back and re-creates the
+    /// table with it, so dropping it renamed the author's constraint.
+    pub pk_name: Option<String>,
     /// FOREIGN KEYs declared on this table, in declaration order. Empty for
     /// almost every table — and the write path's first question is
     /// `is_empty()`, so a table without one pays NOTHING for the feature.
@@ -663,6 +688,7 @@ impl TableDef {
         TableDef {
             id,
             name: String::new(),
+            pk_name: None,
             columns: Vec::new(),
             primary_key: Vec::new(),
             indexes: Vec::new(),
@@ -1036,6 +1062,11 @@ fn normalize_and_derive(t: &mut TableDef) {
             // Derived from a column flag: there never was a name to keep.
             exprs: Vec::new(),
             name: None,
+            // `x TEXT UNIQUE` IS a constraint — in PostgreSQL and in sqlite
+            // both, the column flag is shorthand for a table-level `UNIQUE (x)`
+            // — so it answers as one. `indexed = true` is not, and cannot be:
+            // it produces a non-unique index.
+            from_constraint: c.unique,
         })
         .collect();
     for e in explicit {

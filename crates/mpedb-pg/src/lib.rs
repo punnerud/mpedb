@@ -85,7 +85,7 @@ pub(crate) mod testutil {
             columns,
             primary_key: pk,
             indexes: vec![],
-            dead: false,
+            dead: false, pk_name: None,
             kind: TableKind::Standard,
             implicit_rowid: false,
             autoincrement: false,

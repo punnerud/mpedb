@@ -4688,17 +4688,49 @@ impl WriteSession<'_> {
                     self.txn.create_table(sh)?;
                 }
             }
-            // A COMMENT is metadata in the sys keyspace, and the WriteSession
-            // path applies DDL through `self.txn`. Routing it to the
-            // autocommit applier would commit inside an open transaction, so
-            // it is refused by name here — the same answer this path gives
-            // every DDL form it does not carry.
-            DdlStmt::Comment { .. } => {
-                return Err(Error::Unsupported(
-                    "COMMENT ON inside an open transaction is not supported \
-                     (run it in autocommit)"
-                        .into(),
-                ));
+            // A COMMENT is metadata in the sys keyspace, written through THIS
+            // transaction so it commits and rolls back with the rest of the
+            // block — PostgreSQL's DDL is transactional, and a `COMMENT ON`
+            // that outlived a `ROLLBACK` would be the same wrong answer a
+            // surviving `CREATE TABLE` was.
+            //
+            // It used to be refused here, because the autocommit applier opens
+            // its OWN transaction and committing inside an open one is not a
+            // thing. The fix is not to route it there: it is to do the two
+            // sys-keyspace writes directly, which is all that applier does
+            // once its validation has run.
+            DdlStmt::Comment { target, text } => {
+                let (table, column) = match &target {
+                    mpedb_sql::CommentTarget::Table(t) => (t, None),
+                    mpedb_sql::CommentTarget::Column { table, column } => (table, Some(column)),
+                    mpedb_sql::CommentTarget::Constraint { table, .. } => (table, None),
+                };
+                // Validated against THIS transaction's schema, so a table
+                // created earlier in the same block is visible — which is
+                // exactly the case that made this worth doing.
+                let bundle = self.txn.schema_bundle();
+                let Some(id) = bundle.schema.table_id(table) else {
+                    return Err(Error::Bind(format!("COMMENT ON: no such table `{table}`")));
+                };
+                if let Some(col) = column {
+                    let t = bundle.schema.table(id).expect("table_id returned a live id");
+                    if !t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                        return Err(Error::Bind(format!(
+                            "COMMENT ON COLUMN: no such column `{col}` in table `{table}`"
+                        )));
+                    }
+                }
+                let key = crate::Database::comment_key(&target);
+                match text.as_deref() {
+                    // `IS NULL` removes it; deleting what was never there is a
+                    // no-op, as in PostgreSQL.
+                    None => {
+                        self.txn.sys_delete(&key)?;
+                    }
+                    Some(t) => self.txn.sys_put(&key, t.as_bytes())?,
+                }
+                self.txn.bump_schema_gen();
+                return Ok(ExecResult::Affected(0));
             }
             // `cascade` is not consulted on this path: it is the WriteSession
             // (explicit-transaction) form, and the orphan-row refusal it would
@@ -5610,7 +5642,7 @@ primary_key = ["id"]
             }],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false,
+            dead: false, pk_name: None,
             implicit_rowid: false, autoincrement: false,
             kind: mpedb_types::TableKind::Standard,
             foreign_keys: Vec::new(),
@@ -6018,7 +6050,7 @@ primary_key = ["id"]
             }],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false,
+            dead: false, pk_name: None,
             implicit_rowid: false, autoincrement: false,
             kind: mpedb_types::TableKind::Standard,
             foreign_keys: Vec::new(),

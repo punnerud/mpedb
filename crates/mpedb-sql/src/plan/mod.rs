@@ -633,6 +633,7 @@ pub fn series_def_named(table: &str, column: &str) -> mpedb_types::TableDef {
         primary_key: Vec::new(),
         indexes: Vec::new(),
         dead: false,
+        pk_name: None,
         implicit_rowid: false,
         autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
@@ -654,7 +655,7 @@ pub fn dual_def() -> &'static mpedb_types::TableDef {
         primary_key: Vec::new(),
         indexes: Vec::new(),
         dead: false,
-        implicit_rowid: false, autoincrement: false,
+        implicit_rowid: false, autoincrement: false, pk_name: None,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),
     })

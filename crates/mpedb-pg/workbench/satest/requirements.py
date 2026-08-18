@@ -51,3 +51,36 @@ class Requirements(SuiteRequirements):
         have, and `DECLARE` is refused by name.
         """
         return exclusions.closed()
+
+    @property
+    def unique_constraints_reflect_as_index(self):
+        """A unique CONSTRAINT also reflects as an INDEX.
+
+        The one OPENING in this file, and it is here because the default is
+        `closed()` while both mpedb and PostgreSQL are open: a UNIQUE constraint
+        is enforced by an index, that index has a `pg_index` row, and
+        `get_indexes` therefore returns it carrying `duplicates_constraint` —
+        measured, and byte-for-byte the shape PostgreSQL's own dialect produces
+        (which is why SQLAlchemy's postgresql requirements declare it open too).
+
+        Leaving it closed made `test_get_multi_indexes` expect ZERO indexes on a
+        table with two unique constraints, so the suite was measuring the
+        DEFAULT's assumption rather than the dialect — real PostgreSQL fails that
+        comparison identically.
+        """
+        return exclusions.open()
+
+    @property
+    def reflects_pk_names(self):
+        """A PRIMARY KEY constraint's DECLARED name reflects back.
+
+        The second OPENING, and it is here because the engine outgrew the
+        default: `CONSTRAINT email_ad_pk PRIMARY KEY (…)` used to reflect as the
+        derived `<table>_pkey`, and now the declared name is stored
+        (`TableDef::pk_name`, canonical bytes v20) and reported by both
+        `pg_constraint` and the backing index.
+
+        The suite asserts this INVERTED — `with reflects_pk_names.fail_if()` —
+        so leaving it closed turns the fix into an "unexpected success" failure.
+        """
+        return exclusions.open()

@@ -277,7 +277,7 @@ pub fn to_table_def(src: &PgTable) -> Result<TableDef> {
         columns,
         primary_key: src.pk.iter().map(|&i| i as u16).collect(),
         indexes: vec![],
-        dead: false,
+        dead: false, pk_name: None,
         implicit_rowid: false, autoincrement: false,
         kind: mpedb_types::TableKind::Standard,
         foreign_keys: Vec::new(),

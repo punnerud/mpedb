@@ -5,7 +5,8 @@ use mpedb::{ExecResult, Schema, Value};
 use mpedb_types::DefaultExpr;
 
 /// Raw cell rendering for tab-separated output: Text is printed unquoted,
-/// blobs as `0x…` hex, NULL as `NULL`, timestamps as µs since the epoch.
+/// blobs as `0x…` hex, NULL as `NULL`, timestamps as µs since the epoch,
+/// dates as days since it and times as µs since midnight.
 pub fn value_str(v: &Value) -> String {
     match v {
         Value::Null => "NULL".to_owned(),
@@ -167,7 +168,7 @@ mod tests {
                 columns: vec![col(n), col(&format!("c {n}"))],
                 primary_key: vec![0],
                 indexes: vec![],
-                dead: false,
+                dead: false, pk_name: None,
                 kind: TableKind::Standard,
                 implicit_rowid: false, autoincrement: false,
                 foreign_keys: Vec::new(),

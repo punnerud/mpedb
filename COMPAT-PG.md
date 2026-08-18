@@ -145,8 +145,7 @@ surface on top of it.
 
 ## Types
 
-The core set maps onto mpedb's seven column types. `numeric` is carried as
-canonical TEXT — lossless, and identical to PostgreSQL's own wire form.
+The core set maps onto mpedb's ten column types.
 
 | PostgreSQL | mpedb | Fidelity |
 |---|---|---|
@@ -159,9 +158,10 @@ canonical TEXT — lossless, and identical to PostgreSQL's own wire form.
 | `varchar(n)`, `bpchar(n)`, `name`, `char` | Text | widened — **the length is not enforced** |
 | `bytea` | Blob | exact |
 | `timestamp`, `timestamptz` | Timestamp (µs, UTC) | exact |
-| `date` | Timestamp | widened (midnight UTC) |
-| `time` | Int64 (µs since midnight) | widened |
-| `numeric`, `json`, `jsonb` | Text | via canonical text |
+| `date` | Date (days since the epoch) | exact |
+| `time` | Time (µs since midnight) | exact |
+| `numeric` | Numeric (exact decimal) | exact |
+| `json`, `jsonb` | Text | via canonical text |
 | `uuid` | Blob (16 bytes) | via bytes |
 | `interval`, `timetz` | — | ❌ named refusal |
 | anything else | — | ❌ unknown type |
@@ -169,6 +169,71 @@ canonical TEXT — lossless, and identical to PostgreSQL's own wire form.
 The OIDs are PostgreSQL's own, from `pg_type.dat`. They are ABI: every client
 has them compiled in, and a wrong one makes psycopg silently produce the wrong
 Python type with no error to notice.
+
+### The DDL resolves a PG type through the PG table, not through sqlite
+
+`date`, `time` and `numeric` used to be carried by wider mpedb types — a
+midnight `Timestamp`, an `Int64`, a `Text`. Each was lossless as STORAGE and
+wrong as a TYPE: the client got back something other than what it sent, and
+`pg_attribute` reported a `DATE` column as `text`, so reflection was wrong
+before any value was read.
+
+The cause was one line: every column type, in every dialect, was resolved by
+`ColumnType::declared` — **sqlite's affinity rules**, which read the SPELLING.
+`bytea` contains no `BLOB` and `date` contains no `INT`, so both fell through
+to "unrecognised" and became a typeless column with NUMERIC affinity. Under the
+PostgreSQL dialect the name now goes through the same type table the mirror and
+the wire protocol read, and a name outside it is a NAMED refusal instead of a
+column that accepts anything.
+
+The affinity follows the resolved TYPE, not the name. That is not only tidier:
+`Schema::validate` refuses a rigid column whose affinity contradicts its type,
+so taking the type from one rule and the affinity from the other made every
+`CREATE TABLE` with a `date`, `time`, `numeric` or `bytea` column fail.
+
+### `CAST` under this dialect parses; it does not take a prefix
+
+sqlite's `CAST` takes a leading numeric PREFIX, so `'2020-01-02'` casts to the
+integer **2020**. psycopg2 renders every Python `date`/`time`/`datetime`
+parameter as `'…'::date`, which made that the ORDINARY write path rather than
+an edge case — a wrong answer on every insert of a date.
+
+Under the PostgreSQL dialect a cast to `date`, `time`, `timestamp` or `numeric`
+parses the whole string and reports PostgreSQL's own
+`invalid input syntax for type <t>: "…"` when it cannot. It is a separate
+opcode (`Instr::CastType`, PLAN_FORMAT 75) rather than a flag on the existing
+one, for the reason `DivStrict`/`ModStrict` are separate: the plan is
+content-hashed, so two dialects that disagree about the answer must hash to two
+plans. **sqlite's rule is untouched** — the affinity cast still turns
+`'2020-01-02'` into 2020 for a sqlite-dialect statement, because that is what
+sqlite does.
+
+The same conversion — literally the same function, not a second copy of its
+rules — runs on the way INTO a column, which is how a `timestamp` written to a
+`date` column gets truncated the way PostgreSQL truncates it. The only
+difference is the failure mode: a cast raises, a store leaves the value for the
+type check to refuse by name.
+
+### `numeric` is exact, and stores its scale
+
+A `Numeric` holds the digits a client wrote, including the trailing zeros that
+carry the SCALE: `Decimal("1.00")` reads back as `Decimal("1.00")`, not as `1`.
+
+Ordering is by VALUE, and that needs its own encoding: the key is written as
+`± 0.d₁d₂… × 10^E` with a normalised significand, so memcmp order IS numeric
+order. Keying the canonical text instead would have sorted `10` below `9` in
+every index and UNIQUE tree. The two forms are deliberately different
+functions: `parse_numeric` is the stored form (scale kept), `canonical_numeric`
+is the key and comparison form (scale erased). So `1.0` and `1.00` store
+distinctly, key identically, and are one group and one UNIQUE key — **which is
+PostgreSQL's own answer**, since `numeric` equality is by value.
+
+Arithmetic is exact for `+ - * / %` between two decimals, and between a decimal
+and an integer, computed on a common i128 mantissa. Beyond 38 significant
+digits it is a NAMED refusal that says to `CAST` to `double precision` — never
+a quiet fall back to f64, which would throw away the digits the type exists to
+keep. A `float8` operand DOES widen the decimal, because that is PostgreSQL's
+own promotion rule and the float has already lost them.
 
 ## Catalog
 
@@ -415,17 +480,156 @@ without a length report a NULL type, which is most of them.
 It cleared its 89 errors and moved the pass count by zero, and the chain
 advanced one more link.
 
-**The two that remain are features, not fixes.**
+### Then the wall stopped being grammar
 
-`array_agg(x ORDER BY y)` — 145 errors, 43 % of the remainder — needs an ARRAY
-VALUE TYPE. The wire layer picks a column's OID from `Value::column_type()`, so
-sending an array OID means HAVING an array type; returning the literal
-`{a,b,c}` as TEXT would hand SQLAlchemy a string where it wants a list, which
-is a different failure rather than a pass.
+Four changes in a row each cleared their own errors and moved the pass count by
+**zero**. That is the signal that the remaining failures are not more of the
+same: every one of them ran into the same thing from a different direction, and
+it was not a missing function. **mpedb's type surface was sqlite's**, and a
+PostgreSQL client asks for more. Three measurements said it plainly:
 
-A derived table with an aggregate body in JOIN position — 89 errors — is
-refused by name today: materialization exists only for the FIRST join, INNER,
-with a plain ON, and SQLAlchemy's reflection puts one in a LEFT OUTER JOIN.
+```
+SELECT '2020-01-02'::date              -> 2020        (integer!)
+SELECT '03:04:05'::time                -> 3
+INSERT Decimal("1.0") into NUMERIC(18,14)  -> reads back 1      (int)
+INSERT Decimal("1e-14")                    -> reads back 1e-14  (float)
+```
+
+The first two are data corruption on the ORDINARY write path, since psycopg2
+renders every Python date parameter as `'…'::date`. And a `DATE` column
+reported itself as `text` to `pg_attribute`, so the reflection tests would have
+answered wrongly even once their queries ran.
+
+`date`, `time` and `numeric` are now real storage types (see **Types** above),
+resolved through the PG type table, cast strictly, and rendered on the wire as
+PostgreSQL renders them.
+
+Measured on the same suite, against the run above:
+
+| | passed | failed | errors | fixed | regressed |
+|---|---:|---:|---:|---:|---:|
+| baseline | 275 | 402 | 17 | — | — |
+| real storage types | 284 | 393 | 17 | 9 | 0 |
+| parser + dbref | 302 | 376 | 16 | 27 | 0 |
+| strict `uuid`/`bytea` | 307 | 371 | 16 | 32 | 0 |
+| declared-type OIDs | 324 | 354 | 15 | 55 | 0 |
+| schema staleness | 361 | 325 | 7 | 87 | 0 |
+| exact-decimal arithmetic | 364 | 322 | 7 | 90 | 0 |
+| derived table in a JOIN | 364 | 322 | 7 | 90 | 0 |
+| `pg_type.typdefault`, `pg_enum` | 364 | 322 | 7 | 90 | 0 |
+| aggregate `ORDER BY` | 396 | 290 | 7 | 121 | 0 |
+| `LIMIT ALL` | **400** | 286 | **7** | **125** | **0** |
+
+Every row is diffed BY TEST NAME, not by totals, and that is not pedantry —
+the totals alone hid four things:
+
+* an intermediate state where the affinity contradicted the resolved type and
+  every `CREATE TABLE` with such a column failed (67 errors);
+* rigid columns correctly REFUSING a value they had previously stored wrongly,
+  which reads as a regression in a count and is an improvement in kind;
+* a "1 regression" that was the measuring database polluted by hand-run `psql`
+  probes — the workbench now has a SEPARATE probe server for that;
+* five "regressions" that were the pre-existing `duplicate table name` cascade
+  landing on a different set of tests, in a run that reduced that cascade from
+  52 to 34.
+
+### The other kind of wrong answer: a stale schema
+
+`RowDescription` used to take every column's type OID from the first non-NULL
+VALUE. That cannot distinguish `uuid` from `bytea` (both are `Blob`), so a
+`uuid` column was announced as `bytea` and the client got bytes where it was
+promised a UUID. It also cannot answer at all for an EMPTY result.
+
+The DECLARED type is the authority where the plan can name one, and the value
+is the fallback for anything computed. Two things had to move with it: the
+DataRow must render what the RowDescription PROMISED (announcing `uuid` while
+sending `\x8e20…` makes the client raise "badly formed hexadecimal UUID
+string"), and the session has to `refresh_schema_if_stale` before reading the
+catalog — a just-committed `CREATE TABLE` was invisible to the same session's
+next reflection query.
+
+### DDL is not transactional here — measured, not assumed
+
+PostgreSQL's DDL is transactional; `BEGIN; CREATE TABLE t …; ROLLBACK` leaves
+no `t`. mpedb-pg applies DDL immediately, so it does leave one, and the next
+statement wanting that name gets `duplicate table name`.
+
+Buffering DDL into the block was BUILT and MEASURED rather than argued about.
+Two of its three obstacles fell: `COMMENT ON` became transactional (it used to
+open its own transaction and commit, so it was refused inside one), and a
+block's own catalog queries kept seeing its buffered DDL by reading the catalog
+off a replay of the log. The third did not: `CREATE INDEX` in the reflection
+fixtures then failed 749 times, and the suite went to 347 passing with **508**
+regressions. Shipping that would trade one wrong answer for a much larger set,
+so it is reverted, the two independent pieces are kept, and
+`a_rolled_back_block_does_not_undo_its_ddl_yet` pins the divergence so it fails
+the day someone fixes it.
+
+### The wall came down one link at a time
+
+Three of those rows moved the pass count by **zero**, and that is the shape of
+this wall rather than a failure: `ComponentReflectionTest`'s queries need every
+link before any of them answers. Materializing a derived table in a JOIN slot
+revealed a missing `pg_type.typdefault`; that revealed a missing `pg_enum`;
+that revealed the aggregate `ORDER BY` — and when the last one landed, 32 tests
+came through at once.
+
+The discipline that made it tractable: run the actual query BY HAND after each
+link. It names the next blocker exactly, where re-running the suite only shows
+a total that has not moved.
+
+**What remains is a feature, not a fix.**
+
+`array_agg` is now BUILT — `AggFn::ArrayAgg` accumulating into a `Value::List`,
+rendered in PostgreSQL's own array representation (`{a,NULL,"b, c"}`, with the
+quoting rule and the bare null marker), and described with the array OID its
+ELEMENT type picks so a client decodes a list of ints as ints. It keeps NULLs,
+which is PostgreSQL's rule and the opposite of every other aggregate here, and
+it is NULL over an empty group rather than `{}`.
+
+It moved the pass count by **zero**, and that was expected: it is a link in the
+chain, not the end of it. The array has no `ColumnType` — there is no storable
+array column, and the row codec still refuses one — so this is a RESULT type
+only, which is exactly what `SELECT array_agg(x) … GROUP BY y` needs and no
+more. What is still missing is `array_agg(x ORDER BY y)`, whose ORDER BY inside
+the argument list does not parse.
+
+A derived table with an aggregate body in JOIN position is now MATERIALIZED IN
+PLACE, and the fix was far smaller than §5.7's sketch suggested. The machinery
+was already reachable: a join operand's name resolves through
+`resolve_table_cte` exactly as the leading FROM's does, and `derived.rs`
+already counted the alias appearing in `outer.joins`. The refusal lived
+UPSTREAM, in the Stage-B flattener, which would only MOVE a derived body into
+the leading FROM — a swap that is a row-set identity for an INNER join and not
+for a LEFT one. So the INNER swap stays (it plans better) and everything else
+materializes where it stands, moving nothing.
+
+`agg(x ORDER BY k)` — PostgreSQL's AGGREGATE ORDER BY — is built
+(`AggCall.order_by`, PLAN\_FORMAT 77). It is per AGGREGATE, not per statement:
+`array_agg(v ORDER BY o), array_agg(v ORDER BY o DESC)` in one SELECT answers
+`{a,b,c} | {c,b,a}`, which is exactly why it cannot be folded into the
+statement's own ORDER BY. The executor buffers the group with its sort keys and
+replays it sorted at finish, so an order-INSENSITIVE aggregate is unaffected,
+and every fast path that assumes scan-order accumulation declines to the
+general fold.
+
+Two bugs in that work are worth recording, because a green build showed
+neither. The materialized-source decision was derived TWICE and the two
+disagreed, so a statement carrying both a swapped `from_derived` and a
+join-derived took its BODY from one and its outer SHAPE from the other — a
+FROM-less SELECT with joins hanging off nothing. And the ORDER BY key columns
+were not registered in the column-prune mask, so the scan pruned the key away
+and handed the evaluator a short row: `column index N out of row bounds`, an
+internal error rather than a wrong answer, and only because the bound is
+checked.
+
+**`unnest()` is what is left** — 184 errors, 88 % of the remainder. It is a
+SET-RETURNING function in the SELECT list (`unnest(indkey) AS attnum`), which
+expands one row into many, and PostgreSQL evaluates several of them in
+LOCKSTEP, padding the short ones with NULL. That needs a row-expanding
+projection, and `pg_index.indkey` to BE an array rather than the text
+PostgreSQL prints for an `int2vector`. The array VALUE type now exists, so the
+missing half is the expansion.
 
 The obvious route is blocked, and that is worth writing down. `view.rs`'s own
 comment says `JOIN (SELECT …) AS d` IS `WITH d AS (…) … JOIN d`, so hoisting
@@ -454,6 +658,93 @@ The distribution after the change, and it is the same shape a third time:
 
 Sequences are the real feature underneath three of those lines. `COMMENT` is
 metadata and is the cheap one.
+
+### Then the queries ran, and the ANSWERS were the work
+
+With the chain complete, `ComponentReflectionTest` stopped erroring and started
+DISAGREEING — which is a different problem and a better one, because every
+disagreement names one field. Each row below is one change, name-diffed against
+the previous run; **no row cost a single previously-passing test.**
+
+| passed | change |
+|---:|---|
+| 511 | the chain complete (previous section) |
+| **587** | `pg_get_constraintdef` renders the constraint |
+| **601** | a unique INDEX is not a unique CONSTRAINT |
+| **603** | the implicit rowid leaves the catalog |
+| **620** | the rowid alias is a SERIAL, not an IDENTITY |
+| **636** | a comment on a constraint addresses the CONSTRAINT |
+| **657** | the declared PRIMARY KEY name survives |
+
+**`pg_get_constraintdef` handed back its OID**, on the documented reasoning that
+the call is only made over DOMAINS. That was wrong: SQLAlchemy reads FOREIGN
+KEY, UNIQUE and CHECK reflection out of that text with a REGEX, so an integer
+there is `TypeError: expected string or bytes-like object, got 'int'` and every
+foreign key in the database reflects as none. 32 tests, all of
+`BizarroCharacterTest`, failed on that one substitution.
+
+It cannot be a `ScalarFn`: rendering a constraint needs the SCHEMA, and a scalar
+gets a bare OID. But the relation that OID indexes is BUILT from the schema, so
+the answer is computed there and carried as a `pg_constraint.condef` column, and
+the call binds to it — `PgFunc::SiblingColumn`, which takes the qualifier from
+its first argument so `c.oid` becomes `c.condef`. Every call site in SQLAlchemy
+spells it over that column, which is why a syntactic rewrite is enough.
+
+**A unique index and a unique constraint are different objects**, and mpedb had
+one bit for both. PostgreSQL reports a constraint-backed unique index in BOTH
+`pg_constraint` and `pg_index`, and a bare `CREATE UNIQUE INDEX` in `pg_index`
+ONLY — so a client reflecting mpedb re-created `Index(unique=True)` as a
+`UniqueConstraint`: the same enforcement under the wrong object, with nothing in
+the output to say so. `IndexDef::from_constraint` (canonical bytes **v20**) is
+the missing bit, and `UniqueSpec` carries the declared name that went with it,
+because `CONSTRAINT uq_email UNIQUE (email)` was reflecting under a name mpedb
+had invented.
+
+**The implicit rowid was visible only to the catalog.** A table declared with no
+PRIMARY KEY gets one anyway — a real trailing column named `rowid` (#94) — and
+`SELECT *` does not expand to it, and sqlite hides its own from
+`PRAGMA table_info`. `pg_attribute` listed it and `pg_constraint` reported a
+PRIMARY KEY on it, so a two-column table reflected as three columns with a key
+its author never wrote. `visible_columns` / `has_declared_pk` are the two
+predicates, applied in `pg_class`, `pg_attribute`, `pg_constraint`, `pg_index`
+and `information_schema` together.
+
+**A SERIAL, not an IDENTITY, and that choice is measured.** The rowid alias
+auto-assigns `max+1`, and PostgreSQL has two vocabularies for that. Reporting
+`attidentity = 'd'` was tried first and moved the pass count by **zero**:
+reflection resolves an identity column by reading the SEQUENCE OBJECT behind it
+(`pg_get_serial_sequence` → `pg_sequence.seqstart` and the rest), mpedb has no
+sequence objects, so the read came back empty and the column still reflected as
+not autoincrementing. A serial is read from the DEFAULT TEXT alone —
+`nextval('<table>_<column>_seq'::regclass)` in `pg_attrdef` — which mpedb can
+state truthfully, and it moved 17 tests. SQLAlchemy's own comment in that query
+says the same thing from the other side: `attidentity != ''` is what keeps a
+serial from being mistaken for an identity.
+
+**Two of the remaining failures were the suite's declarations, not the engine.**
+`SuiteRequirements` defaults `unique_constraints_reflect_as_index` and
+`reflects_pk_names` to `closed()`, and both are open for mpedb — the first has
+been true since `from_constraint` landed, the second since `pk_name` did. The
+second is asserted INVERTED (`with reflects_pk_names.fail_if():`), so leaving it
+closed turned the fix into an "unexpected success" failure. `requirements.py`
+now carries the two OPENINGS, each argued in its docstring, next to the three
+exclusions — and real PostgreSQL needs the same two declarations, which is the
+test that they are claims about the dialect rather than about mpedb.
+
+#### The control arm, and the host that moved it
+
+`cargo test --workspace` (223 suites), `clippy --all-targets -D warnings`, and
+both satellite workspaces (`mpedb-pg`, `mpedb-capi`) are green. The sqlite
+corpus — the arm that must NOT move — compared 622 files and came back 2 records
+short in `select4.test`, both attributed to `comma-join`.
+
+That was the host, not the change. The join-cell ceiling is
+`min(config, MemAvailable/4/40)`, read once per process (`clamp_to_memory`), and
+two 8-way comma joins in that file sit just under it: 3855/3857 with
+`MemAvailable` at 1.37 GB, and **3857/3857 with `--join-cells 0`**, the
+documented unlimited opt-out that skips the clamp. Worth writing down because
+the failure reads exactly like a real regression in the one arm whose whole job
+is to be stable.
 
 ### Gate 0: one connection at a time
 

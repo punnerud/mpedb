@@ -76,6 +76,18 @@ pub(crate) enum PgFunc {
     Alias(&'static str),
     /// The same function with its two arguments the other way round.
     AliasSwap2(&'static str),
+    /// Bind to ANOTHER COLUMN of the relation the first argument came from.
+    ///
+    /// For the `pg_get_*def` family, which renders a catalog object as the DDL
+    /// text that would recreate it. A [`PgFunc::Scalar`] cannot do that — it
+    /// gets a bare OID and has no schema to look it up in — but the catalog
+    /// relation that OID indexes is BUILT from the schema, so the answer can be
+    /// computed there and carried as a column. The call
+    /// `pg_get_constraintdef(c.oid)` then IS `c.condef`, qualifier and all.
+    ///
+    /// The first argument must be a column reference; anything else is refused
+    /// by name, because there is no relation to take the sibling from.
+    SiblingColumn(&'static str),
 }
 
 /// Resolve a PostgreSQL function name.
@@ -115,7 +127,26 @@ pub(crate) fn resolve(name: &str, argc: usize) -> Option<Result<PgFunc>> {
         // the DDL TEXT rather than a parse tree, so `pg_attrdef.adbin` already
         // IS what this call would have returned — the identity is the honest
         // implementation.
-        "pg_get_expr" | "pg_get_indexdef" | "pg_get_constraintdef" => PgFunc::FirstArg,
+        // `pg_get_expr(indpred, indrelid)` hands back its FIRST argument, which
+        // is right: mpedb stores a partial index's predicate as the very text
+        // PostgreSQL would render, so `pg_index.indpred` already IS the answer.
+        "pg_get_expr" => PgFunc::FirstArg,
+        // `pg_get_constraintdef(oid, …)` renders a constraint as its DDL text.
+        // It USED to hand back the OID, on the reasoning that the call is only
+        // made over DOMAINS — which was wrong: SQLAlchemy reads FOREIGN KEY,
+        // UNIQUE and CHECK reflection out of this text with a regex, so an
+        // integer here is `TypeError: expected string or bytes-like object, got
+        // 'int'` and every foreign key on the database reflects as none.
+        // `pg_constraint.condef` holds the rendered text (pg/catalog/pgcat.rs).
+        "pg_get_constraintdef" => PgFunc::SiblingColumn("condef"),
+        // `pg_get_indexdef(oid, k, pretty)` renders the k-th KEY EXPRESSION of
+        // an index, and its first argument is an OID — so returning that made a
+        // `CASE` whose other arm is the column NAME mix `int` with `text` and
+        // refuse. NULL instead: honest ("mpedb cannot render it here" — a
+        // ScalarFn has no schema to read the expression from), typed by the
+        // other arm, and reached ONLY for an expression index part, since
+        // SQLAlchemy guards the call with `attnum = 0`.
+        "pg_get_indexdef" => PgFunc::ConstOfAny(mpedb_types::Value::Null),
         // `pg_get_serial_sequence(table, column)` names the sequence a column
         // draws from, and NULL when it draws from none. mpedb has no sequence
         // objects at all — `CREATE SEQUENCE` and `nextval()` are both refused
@@ -221,6 +252,9 @@ fn check_arity(name: &str, f: &PgFunc, argc: usize) -> Result<()> {
         PgFunc::FirstArg => None,
         PgFunc::TypeOf => Some(1),
         PgFunc::Alias(_) | PgFunc::ConstOfAny(_) | PgFunc::AlwaysTrue => None,
+        // `pg_get_constraintdef(oid)` and `pg_get_constraintdef(oid, pretty)`
+        // are both spelled by clients; only the first argument is read.
+        PgFunc::SiblingColumn(_) => None,
         // Arity is the scalar's own business, checked where every other
         // scalar's is.
         PgFunc::Scalar(_) => None,

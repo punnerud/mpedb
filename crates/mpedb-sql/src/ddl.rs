@@ -97,8 +97,11 @@ pub struct CreateTableSpec {
     /// Table-level `PRIMARY KEY (…)`; empty when a column carries the
     /// inline `PRIMARY KEY` flag instead.
     pub table_pk: Vec<String>,
+    /// `CONSTRAINT <name> PRIMARY KEY (…)` — the declared name, kept for the
+    /// same reason a UNIQUE constraint's is: reflection reads it back.
+    pub pk_name: Option<String>,
     /// Table-level `UNIQUE (…)` groups — composite unique indexes (#55).
-    pub uniques: Vec<Vec<String>>,
+    pub uniques: Vec<UniqueSpec>,
     /// Table-level `CHECK (<expr>)` bodies, as SOURCE text. A table CHECK may
     /// name any column, so unlike a column CHECK it belongs to no single
     /// column; the facade folds them into one row-level constraint.
@@ -922,7 +925,13 @@ mod tests {
         assert_eq!(s.columns.len(), 4);
         assert!(s.columns.iter().all(|c| !c.pk));
         assert_eq!(s.table_pk, vec!["order_id", "line_no"]);
-        assert_eq!(s.uniques, vec![vec!["order_id".to_string(), "sku".to_string()]]);
+        assert_eq!(
+            s.uniques,
+            vec![crate::ddl::UniqueSpec {
+                columns: vec!["order_id".to_string(), "sku".to_string()],
+                name: None,
+            }]
+        );
     }
 
     #[test]
@@ -1165,16 +1174,21 @@ mod tests {
 
     /// `CONSTRAINT <name>` in front of any table- or column-level constraint.
     ///
-    /// The NAME is parsed and DROPPED: sqlite keeps it only to quote back in an
-    /// error message, mpedb's constraint errors already name the table and the
-    /// column, and storing a name nothing reads would be a schema-hash input
-    /// that buys nothing. Duplicate names are therefore not diagnosed either —
-    /// nor are they by sqlite (verified: it accepts two `CONSTRAINT dup`).
+    /// The NAME is parsed and dropped for PRIMARY KEY and CHECK: sqlite keeps it
+    /// only to quote back in an error message, mpedb's constraint errors already
+    /// name the table and the column, and storing a name nothing reads would be a
+    /// schema-hash input that buys nothing. Duplicate names are therefore not
+    /// diagnosed either — nor are they by sqlite (verified: it accepts two
+    /// `CONSTRAINT dup`).
+    ///
+    /// UNIQUE is the exception, and it is not a style choice: PostgreSQL names a
+    /// unique constraint's backing index after the constraint, so a reflecting
+    /// client reads the name back and re-creates the table with it. Dropping it
+    /// made `CONSTRAINT uq_email UNIQUE (email)` reflect under a name mpedb had
+    /// invented. FOREIGN KEY keeps its name for the same reason (v12).
     #[test]
-    fn named_constraints_parse_and_the_name_is_dropped() {
+    fn named_constraints_parse_and_only_unique_keeps_the_name() {
         use mpedb_types::Value;
-        // Table level: the constraint itself survives, byte for byte the same
-        // spec an unnamed one produces.
         let named = create_table(
             "CREATE TABLE t (a INT, b INT, CONSTRAINT t_pk PRIMARY KEY (a), \
              CONSTRAINT t_ab UNIQUE (a, b), CONSTRAINT t_ck CHECK (a > 0))",
@@ -1182,9 +1196,25 @@ mod tests {
         let bare = create_table(
             "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a), UNIQUE (a, b), CHECK (a > 0))",
         );
-        assert_eq!(named, bare);
-        assert_eq!(named.table_pk, vec!["a"]);
-        assert_eq!(named.uniques, vec![vec!["a".to_string(), "b".to_string()]]);
+        // Everything but the UNIQUE name is byte for byte what the unnamed form
+        // produces — including the PRIMARY KEY and the CHECK.
+        assert_eq!(named.table_pk, bare.table_pk);
+        assert_eq!(named.checks, bare.checks);
+        assert_eq!(named.columns, bare.columns);
+        assert_eq!(
+            named.uniques,
+            vec![crate::ddl::UniqueSpec {
+                columns: vec!["a".to_string(), "b".to_string()],
+                name: Some("t_ab".to_string()),
+            }]
+        );
+        assert_eq!(
+            bare.uniques,
+            vec![crate::ddl::UniqueSpec {
+                columns: vec!["a".to_string(), "b".to_string()],
+                name: None,
+            }]
+        );
         assert_eq!(named.checks, vec!["a > 0".to_string()]);
 
         // Column level: every constraint word may carry a name, and several

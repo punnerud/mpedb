@@ -179,6 +179,35 @@ pub(crate) fn live_tables(schema: &Schema) -> impl Iterator<Item = &mpedb_types:
     schema.tables.iter().filter(|t| !t.dead && !t.name.is_empty())
 }
 
+/// The columns a CLIENT can see: every declared column except the IMPLICIT
+/// ROWID.
+///
+/// A table declared without a PRIMARY KEY gets one anyway — a real trailing
+/// column named `rowid` carrying the key (#94) — because the engine keys every
+/// table by its PK tree. Nothing else exposes it: `SELECT *` does not expand to
+/// it, and sqlite hides its own rowid from `PRAGMA table_info` the same way. The
+/// catalog was the one surface that did, which made a two-column table reflect
+/// as three columns with a primary key its author never wrote.
+///
+/// The rowid is appended LAST, so dropping it leaves every other column's
+/// 1-based `attnum` exactly where it was.
+pub(crate) fn visible_columns(t: &mpedb_types::TableDef) -> &[mpedb_types::ColumnDef] {
+    if t.implicit_rowid && !t.columns.is_empty() {
+        &t.columns[..t.columns.len() - 1]
+    } else {
+        &t.columns
+    }
+}
+
+/// Whether the table has a PRIMARY KEY a client should be told about.
+///
+/// False for an implicit rowid: that key is mpedb's storage decision, not
+/// something the author declared, and reporting it makes a reflecting client
+/// re-create the table WITH a primary key on a column that does not exist for it.
+pub(crate) fn has_declared_pk(t: &mpedb_types::TableDef) -> bool {
+    !t.primary_key.is_empty() && !t.implicit_rowid
+}
+
 /// The PG type OID a column reports.
 pub(crate) fn column_type_oid(ty: ColumnType) -> i64 {
     i64::from(mpedb_types::pgtype::default_oid(ty))
@@ -239,12 +268,30 @@ mod tests {
             columns,
             primary_key: pk,
             indexes: vec![],
-            dead: false,
+            dead: false, pk_name: None,
             kind: TableKind::Standard,
             implicit_rowid: false,
             autoincrement: false,
             foreign_keys: Vec::new(),
         }
+    }
+
+    /// A table whose columns are all `Int64` and named as given — enough for a
+    /// constraint test, where the column TYPE is not what is under test.
+    pub(crate) fn table_for_test(
+        id: u32,
+        name: &str,
+        cols: Vec<&str>,
+        pk: Vec<u16>,
+    ) -> TableDef {
+        table(
+            id,
+            name,
+            cols.into_iter()
+                .map(|n| c(n, ColumnType::Int64, false, false, false))
+                .collect(),
+            pk,
+        )
     }
 
     /// A schema with the shapes that break naive catalog code: a COMPOSITE
@@ -352,6 +399,7 @@ mod tests {
                     name: None,
                     exprs: vec![None],
                     collations: vec![None],
+                    from_constraint: false,
                 })
                 .collect();
         }

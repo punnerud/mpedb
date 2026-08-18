@@ -473,7 +473,7 @@ fn fold_default_expr(
         columns: Vec::new(),
         primary_key: Vec::new(),
         indexes: Vec::new(),
-        dead: false,
+        dead: false, pk_name: None,
         kind: mpedb_types::TableKind::Standard,
         implicit_rowid: false, autoincrement: false,
         foreign_keys: Vec::new(),
@@ -566,6 +566,9 @@ pub(crate) fn table_def_from_spec(
     // sqlite's hidden auto-increment integer `rowid` synthesized as its sole key
     // (built below), rather than the historical "mpedb requires one" refusal.
     let mut implicit_rowid = false;
+    // Only a TABLE-LEVEL `CONSTRAINT n PRIMARY KEY (…)` carries a name; the
+    // inline column flag has nowhere to write one.
+    let pk_name = spec.pk_name.clone();
     let pk_names: Vec<String> = match (inline_pk.is_empty(), spec.table_pk.is_empty()) {
         (false, true) => {
             // Multiple inline `PRIMARY KEY` columns is almost always a
@@ -723,16 +726,21 @@ pub(crate) fn table_def_from_spec(
             Ok(mpedb_types::IndexDef {
                 collations: Vec::new(),
                 columns: group
+                    .columns
                     .iter()
                     .map(|n| col_index(n))
                     .collect::<Result<Vec<u16>>>()?,
                 unique: true,
                 predicate: None,
-                // An inline/table UNIQUE constraint. sqlite gives these an
-                // auto name (`sqlite_autoindex_…`) that DROP INDEX refuses to
-                // touch, so carrying none is the same reachable surface.
+                // An inline/table UNIQUE constraint. An UNNAMED one keeps no
+                // name: sqlite gives it an auto name (`sqlite_autoindex_…`) that
+                // DROP INDEX refuses to touch, so carrying none is the same
+                // reachable surface, and PostgreSQL's derived name is rendered
+                // at the catalog surface rather than stored as a fiction. A
+                // DECLARED name is kept — a client reflects it back.
                 exprs: Vec::new(),
-                name: None,
+                name: group.name.clone(),
+                from_constraint: true,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -804,6 +812,10 @@ pub(crate) fn table_def_from_spec(
         primary_key,
         indexes,
         dead: false,
+        // The DECLARED PRIMARY KEY name. An implicit rowid never had one — the
+        // key itself was mpedb's decision — and the catalog does not report that
+        // key at all, so carrying a name for it would be a name for nothing.
+        pk_name: if implicit_rowid { None } else { pk_name },
         implicit_rowid,
         autoincrement: spec.autoincrement,
         kind: mpedb_types::TableKind::Standard,
@@ -910,7 +922,7 @@ pub(crate) fn virtual_table_def_from_spec(
         columns,
         primary_key: vec![pk],
         indexes: Vec::new(),
-        dead: false,
+        dead: false, pk_name: None,
         implicit_rowid: true, autoincrement: false,
         kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer, module: spec.module },
         // An FTS shadow table is engine-owned; user DDL never attaches a key
@@ -1204,7 +1216,7 @@ pub(crate) fn fts4_shadow_defs(
             columns,
             primary_key: pk,
             indexes: Vec::new(),
-            dead: false,
+            dead: false, pk_name: None,
             implicit_rowid: false,
             autoincrement: false,
             kind: mpedb_types::TableKind::Standard,

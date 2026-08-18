@@ -37,6 +37,22 @@
 //! in a baseline keyed `evidence/slt_lang_reindex.test`. The 125-file
 //! every-fifth arm is the main consumer of this gate, so that bug made the gate
 //! useless exactly where it is used. Recorded root, re-keyed run, exact match.
+//!
+//! # One counted thing this gate cannot hold still: the HOST'S FREE MEMORY
+//!
+//! `Row` deliberately records no timings, because a busy machine would fail the
+//! gate on them. There is one number left that the machine still moves. The
+//! join-cell budget is `min(config, MemAvailable/4/40)`, probed ONCE per process
+//! (`clamp_to_memory` in `mpedb::exec::gather`), and `select4.test` holds two
+//! 8-way comma joins that sit just under it. Measured on the dev box
+//! 2026-08-17: **3855/3857 with `MemAvailable` at 1.37 GB, 3857/3857 with
+//! `--join-cells 0`** — the documented unlimited opt-out, which skips the clamp.
+//!
+//! So a REGRESSION reported only in `select4.test`, only under `comma-join`, is
+//! the host before it is the code. Re-run that one file with `--join-cells 0`
+//! before looking for a cause; if it passes clean, there is nothing to find.
+//! Do NOT regenerate the baseline for it — the recorded counts are the ones a
+//! machine with memory to spare produces, which is what the gate should hold.
 
 use std::collections::BTreeMap;
 use std::path::Path;

@@ -844,10 +844,18 @@ fn raw_to_config(
                         predicate: None,
                         exprs: Vec::new(),
                         name: None,
+                        // An `[[table.index]]` entry is `CREATE INDEX`'s config
+                        // twin, not a constraint: it declares a lookup
+                        // structure. The column flag `unique = true` is the one
+                        // that spells a constraint, and it is derived elsewhere.
+                        from_constraint: false,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
             tables.push(TableDef {
+                // A TOML table declares SHAPE, not constraint identity — there
+                // is no `CONSTRAINT <name>` to write there.
+                pk_name: None,
                 // Assigned by Schema::new (dense, name-sorted); the flags
                 // above are the single-column index sugar it derives from,
                 // and these explicit entries append after the derived ones.

@@ -2324,6 +2324,10 @@ impl<'e> WriteTxn<'e> {
                 name,
                 exprs: exprs.clone(),
                 collations: collations.clone(),
+                // This is the `CREATE INDEX` path — an index someone asked for
+                // by that name. A UNIQUE CONSTRAINT is declared with the table
+                // and built by the schema, never through here.
+                from_constraint: false,
             },
         )?;
         // The key-part programs for the index being built, from the SAME
