@@ -678,7 +678,10 @@ fn base_scan_columns(sp: &SelectPlan) -> std::collections::BTreeSet<u16> {
                 Projection::Column(c) => {
                     cols.insert(*c);
                 }
-                Projection::Expr { program, .. } => cols.extend(cols_in_program(program)),
+                Projection::Expr { program, .. }
+                | Projection::SetReturning { program, .. } => {
+                    cols.extend(cols_in_program(program))
+                }
             }
         }
     }

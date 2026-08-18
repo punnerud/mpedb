@@ -193,7 +193,9 @@ impl<'db> RowStream<'db> {
                     .get(*i as usize)
                     .map(|c| c.name.clone())
                     .ok_or_else(|| Error::Internal("projection column out of range".into())),
-                Projection::Expr { name, .. } => Ok(name.clone()),
+                Projection::Expr { name, .. } | Projection::SetReturning { name, .. } => {
+                    Ok(name.clone())
+                }
             })
             .collect::<Result<Vec<String>>>()?;
 
@@ -288,6 +290,15 @@ impl<'db> RowStream<'db> {
                         .get(*i as usize)
                         .cloned()
                         .ok_or_else(|| Error::Internal("projection column".into()))?,
+                    // The streaming surface hands back ONE row per source row
+                    // by construction; a row that expands has no place in it.
+                    Projection::SetReturning { .. } => {
+                        return Err(Error::Unsupported(
+                            "a set-returning function is not supported on the streaming \
+                             surface"
+                                .into(),
+                        ))
+                    }
                     Projection::Expr { program, .. } => program.eval(&row, &self.params)?,
                 });
             }

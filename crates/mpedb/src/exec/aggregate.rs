@@ -28,6 +28,18 @@ pub(super) enum Acc {
         /// exactly as [`Accum`] does for a native aggregate.
         coll: Collation,
     },
+    /// `agg(x ORDER BY k …)` — the group's inputs BUFFERED with their sort
+    /// keys, replayed into `inner` in that order at `finish`.
+    ///
+    /// Buffering is what the semantics require: the aggregate must see its
+    /// group in the written order, and the scan delivers it in the table's.
+    /// Only a call that WRITES an ORDER BY pays for it — everything else keeps
+    /// its streaming accumulator.
+    Ordered {
+        inner: Box<Acc>,
+        dirs: Vec<mpedb_sql::SortDir>,
+        rows: Vec<(Vec<Value>, Option<Value>, Vec<Value>)>,
+    },
 }
 
 impl Acc {
@@ -42,8 +54,32 @@ impl Acc {
     /// native aggregate), and the DISTINCT dedup key stays the FIRST argument —
     /// which is the only argument a DISTINCT call may have (the parser refuses
     /// `f(DISTINCT a, b)`).
+    /// Feed one row of an ORDER-BY'd aggregate, with the keys it sorts on.
+    pub(super) fn push_ordered(
+        &mut self,
+        keys: Vec<Value>,
+        v: Option<&Value>,
+        extra: &[Value],
+    ) -> Result<()> {
+        match self {
+            Acc::Ordered { rows, .. } => {
+                rows.push((keys, v.cloned(), extra.to_vec()));
+                Ok(())
+            }
+            // Not an ordered call: the keys were never evaluated.
+            _ => self.push_n(v, extra),
+        }
+    }
+
     fn push_n(&mut self, v: Option<&Value>, extra: &[Value]) -> Result<()> {
         match self {
+            // Reached only if a caller pushes without keys into an ordered
+            // accumulator; keep it total by ordering it after everything that
+            // has keys, which is what an absent key means.
+            Acc::Ordered { rows, .. } => {
+                rows.push((Vec::new(), v.cloned(), extra.to_vec()));
+                Ok(())
+            }
             Acc::Native(a) => a.push(v),
             Acc::ParSum(s) => match v {
                 // The gate admitted a bare int64 column, so anything else is a
@@ -78,6 +114,59 @@ impl Acc {
 
     fn finish(self) -> Result<Value> {
         match self {
+            Acc::Ordered { mut inner, dirs, mut rows } => {
+                // Sort by the keys, then replay. `Value::sort_cmp` is the same
+                // comparison the statement's ORDER BY uses, so an aggregate's
+                // ordering and a query's agree by construction; a pair it
+                // cannot order (`None` — mpedb's own types have no sqlite
+                // storage class to rank against) keeps the scan order, which
+                // is a stable tie-break rather than an invented one.
+                rows.sort_by(|a, b| {
+                    for (i, d) in dirs.iter().enumerate() {
+                        let (x, y) = (a.0.get(i), b.0.get(i));
+                        let ord = match (x, y) {
+                            (Some(x), Some(y)) => match (x.is_null(), y.is_null()) {
+                                (true, true) => std::cmp::Ordering::Equal,
+                                // NULL placement follows the direction, as it
+                                // does for a statement's ORDER BY.
+                                (true, false) => {
+                                    if d.nulls_first {
+                                        std::cmp::Ordering::Less
+                                    } else {
+                                        std::cmp::Ordering::Greater
+                                    }
+                                }
+                                (false, true) => {
+                                    if d.nulls_first {
+                                        std::cmp::Ordering::Greater
+                                    } else {
+                                        std::cmp::Ordering::Less
+                                    }
+                                }
+                                (false, false) => {
+                                    let c = x
+                                        .sort_cmp(y, Collation::Binary)
+                                        .unwrap_or(std::cmp::Ordering::Equal);
+                                    if d.desc {
+                                        c.reverse()
+                                    } else {
+                                        c
+                                    }
+                                }
+                            },
+                            _ => std::cmp::Ordering::Equal,
+                        };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                for (_, v, extra) in rows {
+                    inner.push_n(v.as_ref(), &extra)?;
+                }
+                inner.finish()
+            }
             Acc::Native(a) => Ok(a.finish()),
             Acc::ParSum(s) => s.finish(),
             // sqlite frees the aggregate context right after `xFinal`; consuming
@@ -140,6 +229,13 @@ impl PartAcc {
             Acc::Native(a) => Ok(PartAcc::Native(a)),
             Acc::ParSum(s) => Ok(PartAcc::Sum(s)),
             Acc::Host { .. } => Err(internal("a host aggregate reached the parallel fold")),
+            // The parallel fold splits the scan into segments, and an ORDER-BY'd
+            // aggregate's answer depends on the order it sees its group in —
+            // so it is never admitted to it (`can_parallelize` refuses the
+            // call). Reaching here is a broken gate, not a slow path.
+            Acc::Ordered { .. } => {
+                Err(internal("an ORDER BY'd aggregate reached the parallel fold"))
+            }
         }
     }
 }
@@ -247,6 +343,19 @@ pub(super) fn mint_accum(
 ) -> Result<Acc> {
     if par_sum && !a.distinct && a.func.native() == Some(mpedb_types::AggFn::Sum) {
         return Ok(Acc::ParSum(ParSum::default()));
+    }
+    // `agg(x ORDER BY k …)` wraps whatever accumulator it would otherwise be:
+    // the group is buffered with its keys and replayed sorted at finish, so
+    // the aggregate sees its input in the written order rather than the
+    // scan's. The wrapper is built ONLY for a call that writes an ORDER BY, so
+    // nothing else loses its streaming accumulator.
+    if !a.order_by.is_empty() {
+        let plain = AggCall { order_by: Vec::new(), ..a.clone() };
+        return Ok(Acc::Ordered {
+            inner: Box::new(mint_accum(&plain, host, false)?),
+            dirs: a.order_by.iter().map(|(_, d)| *d).collect(),
+            rows: Vec::new(),
+        });
     }
     let coll = a.coll;
     let Some(name) = a.func.host() else {
@@ -638,6 +747,27 @@ impl<'a> Folder<'a> {
                     continue;
                 }
             }
+            // An ORDER-BY'd call evaluates its keys over the SAME base row as
+            // its argument, and hands them along so the group can be replayed
+            // in that order at finish.
+            if !call.order_by.is_empty() {
+                let mut keys = Vec::with_capacity(call.order_by.len());
+                for (p, _) in &call.order_by {
+                    keys.push(p.eval_with_stack_host(&mut self.stack, row, row_params, host)?);
+                }
+                let v = match &call.arg {
+                    None => None,
+                    Some(p) => {
+                        Some(p.eval_with_stack_host(&mut self.stack, row, row_params, host)?)
+                    }
+                };
+                let mut extra = Vec::with_capacity(call.extra_args.len());
+                for p in &call.extra_args {
+                    extra.push(p.eval_with_stack_host(&mut self.stack, row, row_params, host)?);
+                }
+                entry.1[i].push_ordered(keys, v.as_ref(), &extra)?;
+                continue;
+            }
             match (&call.arg, self.fast_args[i]) {
                 // count(*): the ROW is the input, so nothing is evaluated and
                 // NULL cannot arise.
@@ -791,6 +921,7 @@ fn try_count_only(
             && !c.distinct
             && c.filter.is_none()
             && c.extra_args.is_empty()
+            && c.order_by.is_empty()
             && c.func.native() == Some(mpedb_types::AggFn::Count)
     };
     if filter.is_some()
@@ -877,6 +1008,10 @@ fn try_agg_index(
     // re-checking here costs nothing and keeps this path locally provable).
     if filter.is_some() || !agg.group_by.is_empty() || !agg.bare_cols.is_empty()
         || agg.aggs.is_empty()
+        // An AGGREGATE ORDER BY changes what the aggregate sees, so every
+        // shortcut that assumes scan-order accumulation declines to the
+        // general fold.
+        || agg.aggs.iter().any(|c| !c.order_by.is_empty())
     {
         return Ok(None);
     }
@@ -1010,7 +1145,11 @@ fn try_fused_fold(
     // ONE observed column across every call; `count(*)` observes none.
     let mut col: Option<u16> = None;
     for c in &agg.aggs {
-        if c.filter.is_some() || !c.extra_args.is_empty() || c.func.native().is_none() {
+        if c.filter.is_some()
+            || !c.extra_args.is_empty()
+            || !c.order_by.is_empty()
+            || c.func.native().is_none()
+        {
             return Ok(None);
         }
         match c.arg.as_ref().map(|p| p.instrs.as_slice()) {
@@ -1141,6 +1280,7 @@ fn try_fused_fold(
                 && agg.aggs.len() == 1
                 && !agg.aggs[0].distinct
                 && agg.aggs[0].filter.is_none()
+                && agg.aggs[0].order_by.is_empty()
                 && matches!(
                     agg.aggs[0].func,
                     mpedb_types::AggTarget::Native(mpedb_types::AggFn::Sum)
@@ -1291,7 +1431,11 @@ fn segment_group_columns(t: &TableDef, agg: &Aggregation) -> Option<Vec<(u16, mp
         }
     }
     for call in &agg.aggs {
-        if call.filter.is_some() || !call.extra_args.is_empty() || call.func.native().is_none() {
+        if call.filter.is_some()
+            || !call.extra_args.is_empty()
+            || !call.order_by.is_empty()
+            || call.func.native().is_none()
+        {
             return None;
         }
         match call.arg.as_ref().map(|p| p.instrs.as_slice()) {
@@ -1718,6 +1862,17 @@ pub(super) fn exec_aggregate(
                     .get(*i as usize)
                     .cloned()
                     .ok_or_else(|| internal("grouped projection column"))?,
+                // An aggregate's output is one row per GROUP; expanding it
+                // would mean expanding a group, which PostgreSQL does not do
+                // either (a set-returning function is not allowed with GROUP
+                // BY in the same select list).
+                Projection::SetReturning { .. } => {
+                    return Err(Error::Unsupported(
+                        "a set-returning function is not supported in an aggregate's \
+                         output list"
+                            .into(),
+                    ))
+                }
                 Projection::Expr { program, .. } => {
                     program.eval_host(&tuple, eval_params, ctx.host_fns())?
                 }
@@ -1753,7 +1908,9 @@ pub(super) fn exec_aggregate(
                 .get(*i as usize)
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| format!("col{i}")),
-            Projection::Expr { name, .. } => name.clone(),
+            Projection::Expr { name, .. } | Projection::SetReturning { name, .. } => {
+                name.clone()
+            }
         })
         .collect();
     Ok(ExecResult::Rows {

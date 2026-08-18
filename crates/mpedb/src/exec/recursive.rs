@@ -233,7 +233,8 @@ fn frontier_dedup(rc: &RecursiveCtePlan) -> Option<u16> {
             o.distinct
                 && o.projection.iter().all(|p| match p {
                     Projection::Column(c) => *c != k,
-                    Projection::Expr { program, .. } => !reads(program),
+                    Projection::Expr { program, .. }
+                    | Projection::SetReturning { program, .. } => !reads(program),
                 })
         }
     };

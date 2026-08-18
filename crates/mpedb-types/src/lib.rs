@@ -54,11 +54,26 @@ pub enum AggFn {
     /// separator, in scan order; NULL over an empty group. The two-argument
     /// (custom separator) form is refused by the parser in v1.
     GroupConcat = 7,
+    /// `array_agg(x)` — collect the group's values, in scan order, into a
+    /// [`Value::List`].
+    ///
+    /// The one aggregate whose result has no [`ColumnType`], because an array
+    /// is not a storable mpedb type: there is no column to put one in, no key
+    /// encoding and no ordering. It is a RESULT only — the row codec still
+    /// refuses a list, so nothing can write one to disk — which is exactly
+    /// what a PostgreSQL client asking `SELECT array_agg(x) … GROUP BY y`
+    /// needs, and no more.
+    ///
+    /// NULLs are KEPT. PostgreSQL's `array_agg` collects them (`{1,NULL,3}`),
+    /// unlike every other aggregate here, which skips them — so this one is
+    /// fed before the NULL gate.
+    ArrayAgg = 8,
 }
 
 impl AggFn {
     pub fn from_tag(t: u8) -> Option<AggFn> {
         Some(match t {
+            8 => AggFn::ArrayAgg,
             1 => AggFn::Count,
             2 => AggFn::Sum,
             3 => AggFn::Avg,
@@ -78,6 +93,7 @@ impl AggFn {
             AggFn::Max => "max",
             AggFn::Total => "total",
             AggFn::GroupConcat => "group_concat",
+            AggFn::ArrayAgg => "array_agg",
         }
     }
 

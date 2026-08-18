@@ -207,6 +207,9 @@ fn flatten_select(
     // body)`. Applied after the loop — `from_derived` is a single slot, so
     // only the FIRST INNER join can move into it.
     let mut move_body: Option<Box<SubqueryBody>> = None;
+    // How many join-position derived bodies have been left for the planner to
+    // materialize. At most one: the plan node carries a single body.
+    let mut derived_joins_seen = 0usize;
     for i in 0..s.joins.len() {
         let j = &mut s.joins[i];
         // Checked BEFORE the catalog names: for a derived operand `j.table`
@@ -246,15 +249,37 @@ fn flatten_select(
                         && s.from_derived.is_none()
                         && s.table.is_some();
                     if !movable {
-                        return Err(bind_err(format!(
-                            "the derived table `{}` in JOIN position has a body \
-                             that cannot be spliced (join/aggregate/DISTINCT/\
-                             compound bodies need materialization), and \
-                             materialization is only available for the FIRST \
-                             join, INNER, with a plain ON — write it as the \
-                             leading FROM source or as a CTE",
-                            j.table
-                        )));
+                        // Not swappable — a LEFT/RIGHT/FULL join is not
+                        // commutative, and neither is a later one. Leave the
+                        // body WHERE IT IS and let the planner materialize it
+                        // in place: `plan_derived_select` resolves the alias
+                        // through a `CteRef`, and `resolve_table_cte` is
+                        // already what a JOIN operand's name goes through, so
+                        // the working table is addressable from a join slot
+                        // without moving anything.
+                        //
+                        // Refused only when the statement already has a
+                        // materialized source: the plan node carries ONE body,
+                        // so two would need two working tables.
+                        // `move_body` counts: the swap that consumes it sets
+                        // `from_derived` AFTER this loop, so checking only the
+                        // field would let a movable join 0 and a
+                        // non-movable join 1 both claim the one body slot.
+                        if s.from_derived.is_some()
+                            || move_body.is_some()
+                            || derived_joins_seen > 0
+                        {
+                            return Err(bind_err(format!(
+                                "the derived table `{}` needs materialization and this \
+                                 statement already materializes another — mpedb \
+                                 materializes ONE derived source per statement; write \
+                                 the second as a CTE",
+                                j.table
+                            )));
+                        }
+                        derived_joins_seen += 1;
+                        j.derived = Some(Box::new(other));
+                        continue;
                     }
                     move_body = Some(Box::new(other));
                 }
@@ -708,7 +733,7 @@ fn rewrite_cte_cols(
             }
             Ok(())
         }
-        Expr::Agg(_, arg, _, filter, extra) => {
+        Expr::Agg(_, arg, _, filter, extra, _) => {
             if let Some(a) = arg {
                 rewrite_cte_cols(a, by_name, tname, ref_alias)?;
             }
@@ -1371,7 +1396,7 @@ fn expr_mentions(e: &Expr, hidden: &[String]) -> bool {
             items.iter().any(sub)
         }
         Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => sub(a),
-        Expr::Agg(_, arg, _, filter, extra) => {
+        Expr::Agg(_, arg, _, filter, extra, _) => {
             arg.as_deref().is_some_and(sub)
                 || extra.iter().any(sub)
                 || filter.as_deref().is_some_and(sub)
@@ -1496,7 +1521,7 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
         Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => rename_qualifier(a, from, to),
         // Both the aggregate ARGUMENT and its `FILTER (WHERE …)` may name the
         // derived alias — rename inside each.
-        Expr::Agg(_, arg, _, filter, extra) => {
+        Expr::Agg(_, arg, _, filter, extra, _) => {
             if let Some(a) = arg {
                 rename_qualifier(a, from, to);
             }
@@ -1686,7 +1711,7 @@ fn flatten_expr(
             }
             Ok(())
         }
-        Expr::Agg(_, arg, _, filter, extra) => {
+        Expr::Agg(_, arg, _, filter, extra, _) => {
             if let Some(a) = arg {
                 flatten_expr(a, views, ctes, depth)?;
             }
@@ -1786,7 +1811,7 @@ fn collect_expr_sources(e: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => collect_expr_sources(a, out),
-        Expr::Agg(_, arg, _, filter, extra) => {
+        Expr::Agg(_, arg, _, filter, extra, _) => {
             if let Some(a) = arg {
                 collect_expr_sources(a, out);
             }

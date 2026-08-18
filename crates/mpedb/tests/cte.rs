@@ -650,15 +650,36 @@ fn a_derived_table_joins_like_the_cte_it_is() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("materialization"), "{e}");
-    // A non-spliceable body NOT in first position (LEFT here) refuses by name.
-    let e = db
-        .query(
-            "SELECT u.x FROM u LEFT JOIN (SELECT max(id) AS m FROM t) AS d ON 1=1",
+    // A non-spliceable body in a LEFT join is MATERIALIZED IN PLACE. It used
+    // to refuse: the only materialization available was the INNER swap into
+    // the leading FROM, and a LEFT join is not commutative so the swap was not
+    // allowed. Now the working table is addressed from the join slot instead,
+    // which moves nothing.
+    let got = rows(
+        db.query(
+            "SELECT u.x FROM u LEFT JOIN (SELECT max(id) AS m FROM t) AS d ON 1=1 \
+             ORDER BY u.x",
             &[],
         )
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("materialization"), "{e}");
+        .unwrap(),
+    );
+    assert_eq!(got.len(), 6, "{got:?}");
+
+    // …and it is a REAL left join, not an inner one wearing the name. The body
+    // here yields one row whose `m` is NULL (an aggregate over no rows), so
+    // the ON is never true: LEFT keeps all six rows with a NULL right side,
+    // INNER would answer zero. This is the assertion that would catch
+    // materialization quietly dropping the join kind.
+    let got = rows(
+        db.query(
+            "SELECT u.x, d.m FROM u LEFT JOIN (SELECT max(id) AS m FROM t WHERE a > 1000) \
+             AS d ON d.m = u.oid ORDER BY u.x",
+            &[],
+        )
+        .unwrap(),
+    );
+    assert_eq!(got.len(), 6, "left join dropped rows: {got:?}");
+    assert!(got.iter().all(|r| r[1] == Value::Null), "right side not NULL-extended: {got:?}");
     drop(db);
     let _ = std::fs::remove_file(path);
 }
@@ -728,6 +749,81 @@ fn a_body_reference_the_body_cannot_resolve_does_not_capture_the_outer_scope() {
         .unwrap(),
     );
     assert_eq!(got, vec![vec![Value::Int(5), Value::Int(7)]]);
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+/// PostgreSQL's AGGREGATE ORDER BY — `agg(x ORDER BY k)` — fixes the order the
+/// aggregate consumes its group in, which is not the scan's and not the
+/// statement's.
+///
+/// The pass count cannot check this: a wrong order still returns an array of
+/// the right length. These assertions read the ELEMENTS.
+#[test]
+fn an_aggregate_orders_its_own_input() {
+    let (db, path) = open();
+    db.query("CREATE TABLE s (g INT, v TEXT, ord INT)", &[]).unwrap();
+    // Inserted in an order that is NEITHER the ascending nor the descending
+    // answer, so scan order cannot pass by accident.
+    for (g, v, o) in [(1, "c", 3), (1, "a", 1), (1, "b", 2), (2, "z", 9)] {
+        db.query(&format!("INSERT INTO s VALUES ({g}, '{v}', {o})"), &[]).unwrap();
+    }
+    let one = |sql: &str| -> String {
+        match &rows(db.query(sql, &[]).unwrap())[0][0] {
+            Value::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Text(s) => s.clone(),
+                    Value::Null => "NULL".into(),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            other => panic!("not an array: {other:?}"),
+        }
+    };
+    assert_eq!(one("SELECT array_agg(v ORDER BY ord) FROM s WHERE g = 1"), "a,b,c");
+    assert_eq!(one("SELECT array_agg(v ORDER BY ord DESC) FROM s WHERE g = 1"), "c,b,a");
+    // Without one it is SCAN order, which is what PostgreSQL promises too.
+    assert_eq!(one("SELECT array_agg(v) FROM s WHERE g = 1"), "c,a,b");
+
+    // Two aggregates in ONE select may order differently — the reason this
+    // cannot be folded into the statement's ORDER BY.
+    let r = rows(
+        db.query(
+            "SELECT array_agg(v ORDER BY ord), array_agg(v ORDER BY ord DESC) FROM s WHERE g = 1",
+            &[],
+        )
+        .unwrap(),
+    );
+    let txt = |v: &Value| match v {
+        Value::List(i) => i
+            .iter()
+            .map(|x| match x {
+                Value::Text(s) => s.clone(),
+                Value::Null => "NULL".into(),
+                o => format!("{o:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        o => panic!("{o:?}"),
+    };
+    assert_eq!(txt(&r[0][0]), "a,b,c");
+    assert_eq!(txt(&r[0][1]), "c,b,a");
+
+    // Grouped, and the ORDER BY key is not in the output.
+    let got = rows(
+        db.query("SELECT g, array_agg(v ORDER BY ord) FROM s GROUP BY g ORDER BY g", &[])
+            .unwrap(),
+    );
+    assert_eq!(got.len(), 2);
+    assert_eq!(txt(&got[0][1]), "a,b,c");
+    assert_eq!(txt(&got[1][1]), "z");
+
+    // An order-INSENSITIVE aggregate is unaffected by one, which is what makes
+    // buffering-and-replaying safe to apply uniformly.
+    let got = rows(db.query("SELECT count(v ORDER BY ord) FROM s WHERE g = 1", &[]).unwrap());
+    assert_eq!(got[0][0], Value::Int(3));
     drop(db);
     let _ = std::fs::remove_file(path);
 }

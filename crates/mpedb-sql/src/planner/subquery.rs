@@ -68,7 +68,7 @@ pub(super) fn expr_has_subquery(e: &ast::Expr) -> bool {
                 .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
                 || els.as_deref().is_some_and(expr_has_subquery)
         }
-        E::Agg(_, arg, _, filter, extra) => {
+        E::Agg(_, arg, _, filter, extra, _) => {
             arg.as_deref().is_some_and(expr_has_subquery)
                 || filter.as_deref().is_some_and(expr_has_subquery)
                 || extra.iter().any(expr_has_subquery)
@@ -514,7 +514,7 @@ impl Lift<'_> {
                     None => None,
                 },
             ),
-            E::Agg(f, arg, d, filter, extra) => E::Agg(
+            E::Agg(f, arg, d, filter, extra, ob) => E::Agg(
                 f.clone(),
                 match arg {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
@@ -529,6 +529,11 @@ impl Lift<'_> {
                 },
                 // …and so does one in a host aggregate's later arguments.
                 extra.iter().map(|x| self.rewrite(x)).collect::<Result<Vec<_>>>()?,
+                // An AGGREGATE ORDER BY key is an ordinary expression over the
+                // same base row, so a subquery in one lifts like any other.
+                ob.iter()
+                    .map(|(e, d)| Ok((self.rewrite(e)?, *d)))
+                    .collect::<Result<Vec<_>>>()?,
             ),
             // Windows are not descended into for subquery lifting (stage 1); a
             // subquery inside one reaches the binder's refusal unchanged.
@@ -1136,7 +1141,7 @@ impl<'a> Correlate<'a, '_> {
                     None => None,
                 },
             ),
-            E::Agg(f, arg, d, filter, extra) => E::Agg(
+            E::Agg(f, arg, d, filter, extra, ob) => E::Agg(
                 f.clone(),
                 match arg {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
@@ -1151,6 +1156,11 @@ impl<'a> Correlate<'a, '_> {
                 },
                 // …and so does one in a host aggregate's later arguments.
                 extra.iter().map(|x| self.rewrite(x)).collect::<Result<Vec<_>>>()?,
+                // An AGGREGATE ORDER BY key is an ordinary expression over the
+                // same base row, so a subquery in one lifts like any other.
+                ob.iter()
+                    .map(|(e, d)| Ok((self.rewrite(e)?, *d)))
+                    .collect::<Result<Vec<_>>>()?,
             ),
             // A window is not descended into for correlation rewriting (stage 1);
             // a window inside a subquery that references an enclosing row reaches

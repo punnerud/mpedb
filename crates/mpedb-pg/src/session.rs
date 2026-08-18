@@ -64,6 +64,9 @@ struct PendingRows {
     columns: Vec<String>,
     rows: Vec<Vec<Value>>,
     at: usize,
+    /// The statement text, kept so a resumed portal can still describe its
+    /// columns by their DECLARED type (see [`Session::describe_rows`]).
+    sql: String,
 }
 
 /// How the session is currently answering.
@@ -342,10 +345,16 @@ impl<S: Read + Write> Session<S> {
             }
             match self.exec_one(&stmt, &[]) {
                 Ok(Answer::Rows { columns, rows }) => {
-                    let fields = self.describe_rows(&columns, &rows);
+                    let fields = self.describe_rows(&stmt, &columns, &rows);
                     self.out.row_description(&fields);
                     for row in &rows {
-                        let vals: Vec<Option<Vec<u8>>> = row.iter().map(value::to_text).collect();
+                        let vals: Vec<Option<Vec<u8>>> = row
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| {
+                                value::to_text_as(v, fields[i].type_oid)
+                            })
+                            .collect();
                         self.out.data_row(&vals);
                     }
                     self.out.command_complete(&format!("SELECT {}", rows.len()));
@@ -514,6 +523,7 @@ impl<S: Read + Write> Session<S> {
                     columns,
                     rows,
                     at: 0,
+                    sql: p.sql.clone(),
                 },
                 Ok(Answer::Affected(tag)) => {
                     self.out.command_complete(&tag);
@@ -536,10 +546,14 @@ impl<S: Read + Write> Session<S> {
             max_rows as usize
         };
         let end = pending.rows.len().min(pending.at.saturating_add(limit));
-        let fields = self.describe_rows(&pending.columns, &pending.rows);
+        let fields = self.describe_rows(&pending.sql, &pending.columns, &pending.rows);
         self.out.row_description(&fields);
         for row in &pending.rows[pending.at..end] {
-            let vals: Vec<Option<Vec<u8>>> = row.iter().map(value::to_text).collect();
+            let vals: Vec<Option<Vec<u8>>> = row
+                .iter()
+                .enumerate()
+                .map(|(i, v)| value::to_text_as(v, fields[i].type_oid))
+                .collect();
             self.out.data_row(&vals);
         }
         let sent = end - pending.at;
@@ -642,15 +656,32 @@ impl<S: Read + Write> Session<S> {
                 self.db.query(trimmed, params)
             }
             catalog::Route::Catalog(refs) => {
+                // A DDL commit — this session's or another process's — bumps
+                // `schema_gen`, and the cached bundle has to be re-read or the
+                // catalog answers from BEFORE it. Now that a block's DDL
+                // commits through the replay, this session is the likeliest
+                // one to have just changed the schema it is about to read.
+                let _ = self.db.refresh_schema_if_stale();
                 // The bundle carries the generation it was loaded at, so one
                 // call answers both "what is the schema" and "is my catalog
                 // stale" — and answers them CONSISTENTLY, which two calls
                 // would not.
-                let bundle = self.db.schema();
+                //
+                // Inside a block it must be the schema the block has BUILT,
+                // not the committed one: now that DDL is buffered, a
+                // `CREATE TABLE` earlier in the block exists only in the log,
+                // and reflecting on it would otherwise report the table
+                // missing. Replaying gives a transaction that HAS the DDL
+                // (`WriteSession::schema` includes uncommitted DDL); the
+                // catalog is read off that and the transaction is dropped.
+                let bundle = self.block_schema().unwrap_or_else(|| self.db.schema());
                 let rewritten = catalog::rewrite(trimmed, &refs);
+                // The stored comments ride along: `pg_description` is built
+                // from them and they are not part of the schema.
+                let comments = self.db.list_comments().unwrap_or_default();
                 let cat = self
                     .cat
-                    .ensure(&bundle.schema, bundle.schema_gen)
+                    .ensure(&bundle.schema, bundle.schema_gen, &comments)
                     .map_err(Error::Internal)?;
                 cat.query(&rewritten, params)
             }
@@ -667,6 +698,26 @@ impl<S: Read + Write> Session<S> {
             }),
             Err(e) => Err(e),
         }
+    }
+
+    /// The schema as the open block has built it, or `None` when there is no
+    /// block (or its replay fails, in which case the caller falls back to the
+    /// committed schema — a description must never be the thing that errors).
+    fn block_schema(&mut self) -> Option<std::sync::Arc<mpedb::SchemaBundle>> {
+        if !self.in_explicit_txn || self.txn_log.is_empty() {
+            return None;
+        }
+        self.db.set_dialect(Dialect::Postgres);
+        let mut w = self.db.begin().ok()?;
+        for (s, p) in &self.txn_log {
+            if w.query(s, p).is_err() {
+                w.rollback();
+                return None;
+            }
+        }
+        let bundle = w.schema();
+        w.rollback();
+        Some(bundle)
     }
 
     /// Run one statement of an explicit transaction block, against the state
@@ -828,8 +879,24 @@ impl<S: Read + Write> Session<S> {
                 let ty = rows
                     .iter()
                     .find_map(|r| r.get(i).and_then(|v| v.column_type()));
-                let oid = ty
-                    .map(mpedb_types::pgtype::default_oid)
+                // An ARRAY has no `ColumnType` (it is not storable), so it
+                // cannot come from either source above — the element type
+                // decides which array type it is, and a client decodes by it.
+                // A DECLARED type still wins where there is one: `indkey` is an
+                // int2vector, which is an array PostgreSQL prints unbraced.
+                let array = rows.iter().find_map(|r| match r.get(i) {
+                    Some(Value::List(items)) => Some(
+                        declared
+                            .get(i)
+                            .copied()
+                            .flatten()
+                            .unwrap_or_else(|| value::array_oid_for(items)),
+                    ),
+                    _ => None,
+                });
+                let oid = array
+                    .or_else(|| declared.get(i).copied().flatten())
+                    .or_else(|| ty.map(mpedb_types::pgtype::default_oid))
                     .unwrap_or(25);
                 let type_len = mpedb_types::pgtype::by_oid(oid)
                     .map(|t| t.typlen)
@@ -900,6 +967,30 @@ fn is_txn_end(sql: &str) -> bool {
 ///
 /// DML only. DDL is deliberately absent — see `exec_one` for the deadlock that
 /// buys.
+/// **KNOWN DIVERGENCE — DDL is NOT transactional here.**
+///
+/// PostgreSQL's DDL is transactional: `BEGIN; CREATE TABLE t …; ROLLBACK`
+/// leaves no `t`. mpedb-pg applies DDL IMMEDIATELY instead of buffering it
+/// into the block, so a rolled-back `CREATE TABLE` survives and the next
+/// statement wanting that name gets `duplicate table name` — 52 of them in one
+/// SQLAlchemy suite run.
+///
+/// Buffering it was BUILT and MEASURED, and is not the whole fix:
+///
+/// * `COMMENT ON` had to become transactional first (it opened its own
+///   transaction and committed) — done, and kept: `WriteSession` now carries
+///   it, so that half is no longer in the way.
+/// * A block's own catalog queries must see the buffered DDL, or reflection
+///   inside the block reports the table missing. Also solved, by reading the
+///   catalog off a replay of the log rather than the committed schema.
+/// * What is NOT solved: `CREATE INDEX` in the reflection fixtures then failed
+///   with `duplicate table name` 749 times, and the suite went 324 → 347
+///   passing but 82 → 508 regressed. The cause is somewhere in how those
+///   fixtures interleave buffered and immediate statements, and it is not
+///   understood yet.
+///
+/// Shipping it in that state would trade one wrong answer for a much larger
+/// set, so it stays reverted with the pieces that stand on their own kept.
 fn is_dml(sql: &str) -> bool {
     let head = first_word(sql);
     matches!(head.as_str(), "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE")

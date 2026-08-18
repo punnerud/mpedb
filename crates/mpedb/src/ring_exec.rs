@@ -372,7 +372,10 @@ pub(crate) fn plan_cols(plan: &CompiledPlan) -> Option<u64> {
             for p in &sp.projection {
                 match p {
                     Projection::Column(c) => m |= 1u64 << (c & 63),
-                    Projection::Expr { program, .. } => m |= program.cols_read_mask(),
+                    Projection::Expr { program, .. }
+                    | Projection::SetReturning { program, .. } => {
+                        m |= program.cols_read_mask()
+                    }
                 }
             }
             Some(m)

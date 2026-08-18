@@ -40,7 +40,7 @@ pub(super) fn output_collations(
         .iter()
         .map(|p| match p {
             Projection::Column(i) => base.get(*i as usize).copied().unwrap_or(Collation::Binary),
-            Projection::Expr { .. } => Collation::Binary,
+            Projection::Expr { .. } | Projection::SetReturning { .. } => Collation::Binary,
         })
         .collect()
 }

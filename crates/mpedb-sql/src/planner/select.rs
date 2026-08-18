@@ -741,6 +741,26 @@ pub(super) fn plan_select<'s>(
         Some(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (item, alias) in items {
+                // SET-RETURNING functions, recognised BEFORE binding: `unnest`
+                // is otherwise a refused name, and the row expansion is a
+                // property of the PROJECTION rather than of the expression.
+                //
+                // `unnest(a)` compiles to just `a` — the array IS the set, and
+                // `Projection::SetReturning` is what turns it into rows.
+                // `generate_subscripts(a, 1)` compiles to the array `{1..n}`
+                // the same way.
+                if let Some((inner, srf_name)) = set_returning_arg(item)? {
+                    let (b, _) = binder.bind_expr(&inner)?;
+                    // The ELEMENT type is not the array's, and nothing static
+                    // can name it: decided per value, like every `Any`.
+                    out_types.push(Some(ColumnType::Any));
+                    let program = compile_program(&b)?;
+                    out.push(Projection::SetReturning {
+                        program,
+                        name: alias.clone().unwrap_or(srf_name),
+                    });
+                    continue;
+                }
                 let (b, ty) = binder.bind_expr(item)?;
                 out_types.push(ty);
                 out.push(match (b, alias) {
@@ -1003,7 +1023,7 @@ fn rewrite_where_aliases_rec(
                 rewrite_where_aliases_rec(item, aliases, scope);
             }
         }
-        ast::Expr::Agg(_, arg, _, filter, extra) => {
+        ast::Expr::Agg(_, arg, _, filter, extra, _) => {
             if let Some(a) = arg {
                 rewrite_where_aliases_rec(a, aliases, scope);
             }
@@ -1056,5 +1076,52 @@ fn rewrite_where_aliases_rec(
         {
             *e = (*expr).clone();
         }
+    }
+}
+
+/// Is this select-list item a SET-RETURNING function call? If so, the
+/// expression whose ARRAY it expands, and the default output name.
+///
+/// `unnest(a)` yields `a` itself — the array is already the set. Its
+/// two-argument and multi-array forms, and `WITH ORDINALITY`, are not here:
+/// each is a different expansion rule, and guessing one would be a wrong
+/// answer rather than a missing feature.
+///
+/// `generate_subscripts(a, dim)` requires `dim` to be the literal `1`. mpedb
+/// has no nested arrays, so no other dimension exists to describe, and a
+/// non-constant one is refused by name rather than assumed.
+pub(super) fn set_returning_arg(item: &ast::Expr) -> Result<Option<(ast::Expr, String)>> {
+    let ast::Expr::Func(name, args) = item else {
+        return Ok(None);
+    };
+    let lower = name.to_ascii_lowercase();
+    match (lower.as_str(), args.len()) {
+        ("unnest", 1) => Ok(Some((args[0].clone(), "unnest".to_string()))),
+        ("unnest", _) => Err(bind_err(
+            "unnest() takes ONE array here — the multi-array form expands its arguments in \
+             lockstep, which is a different rule and is not implemented",
+        )),
+        ("generate_subscripts", 2) => {
+            // The dimension must be 1, and it arrives two ways: as the
+            // literal, or as a bound PARAMETER — SQLAlchemy writes
+            // `generate_subscripts(a, %(param)s)` and binds 1. A parameter is
+            // accepted BECAUSE mpedb has only one dimension to offer: any
+            // other value would have to be refused at execute time, and
+            // there is no other value that is legal here.
+            match &args[1] {
+                ast::Expr::Lit(mpedb_types::Value::Int(1)) | ast::Expr::Param(_) => {}
+                _ => {
+                    return Err(bind_err(
+                        "generate_subscripts(a, dim) supports dim = 1 only — mpedb has no \
+                         nested arrays, so there is no second dimension to subscript",
+                    ))
+                }
+            }
+            Ok(Some((
+                ast::Expr::Func("__subscripts".to_string(), vec![args[0].clone()]),
+                "generate_subscripts".to_string(),
+            )))
+        }
+        _ => Ok(None),
     }
 }

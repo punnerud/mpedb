@@ -253,6 +253,16 @@ pub enum ScalarFn {
     /// asks for it. PostgreSQL-dialect only: the binder reaches it through
     /// `pg::funcs`, so no sqlite statement can name it.
     FormatType = 75,
+    /// `generate_subscripts(a, 1)` — the 1-based subscripts of an array, as an
+    /// ARRAY. PostgreSQL's is set-returning; this returns the whole set and the
+    /// PROJECTION expands it ([`crate::plan`]'s `SetReturning`), which is the
+    /// same split `unnest` uses: the function makes the array, the projection
+    /// makes the rows.
+    ///
+    /// One argument here, not two: the dimension must be the constant `1`
+    /// (mpedb has no nested arrays), and the planner checks it and drops it
+    /// rather than carrying a value that can only have one legal setting.
+    Subscripts = 76,
     SqrtStrict = 70,
     LnStrict = 71,
     Log10Strict = 72,
@@ -333,6 +343,7 @@ impl ScalarFn {
             69 => ScalarFn::JsonQuoteExtract,
             70 => ScalarFn::SqrtStrict,
             75 => ScalarFn::FormatType,
+            76 => ScalarFn::Subscripts,
             71 => ScalarFn::LnStrict,
             72 => ScalarFn::Log10Strict,
             73 => ScalarFn::Log2Strict,
@@ -371,6 +382,7 @@ impl ScalarFn {
             // PostgreSQL allows the one-argument form too (`format_type(oid)`
             // is `format_type(oid, NULL)`), and reflection uses both.
             ScalarFn::FormatType => argc == 1 || argc == 2,
+            ScalarFn::Subscripts => argc == 1,
             ScalarFn::Substr => argc == 2 || argc == 3,
             ScalarFn::Instr | ScalarFn::Pow | ScalarFn::VecL2 | ScalarFn::VecCosine => argc == 2,
             ScalarFn::Replace => argc == 3,
@@ -442,6 +454,7 @@ impl ScalarFn {
             ScalarFn::Log2Strict => "log2",
             ScalarFn::LogBaseStrict => "log",
             ScalarFn::FormatType => "format_type",
+            ScalarFn::Subscripts => "generate_subscripts",
             ScalarFn::Pow => "pow",
             ScalarFn::Sign => "sign",
             ScalarFn::Ceil => "ceil",
@@ -643,6 +656,18 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
         }
     };
     Ok(match f {
+        // `generate_subscripts(a, 1)` → `{1, 2, …, n}`. NULL in, NULL out (the
+        // projection reads that as the empty set, which is what PostgreSQL's
+        // set-returning version yields for a NULL array).
+        ScalarFn::Subscripts => match crate::value::array_elements(&args[0]) {
+            Some(items) => Value::List((1..=items.len() as i64).map(Value::Int).collect()),
+            None => {
+                return Err(Error::TypeMismatch(format!(
+                    "generate_subscripts() needs an array, got {}",
+                    args[0].type_name()
+                )))
+            }
+        },
         ScalarFn::Lower => Value::Text(text(&args[0])?.to_lowercase()),
         ScalarFn::Upper => Value::Text(text(&args[0])?.to_uppercase()),
         // CHARACTERS, not bytes: `length('æ')` is 1. A byte count would be a

@@ -207,6 +207,8 @@ fn timestamp_text(us: i64) -> String {
     }
 }
 
+
+
 /// Days-from-civil, inverted — Howard Hinnant's algorithm, which is exact for
 /// the whole i64 range and needs no calendar table.
 ///
@@ -406,6 +408,8 @@ fn parse_timestamp(s: &str) -> Result<i64, String> {
         .and_then(|v| v.checked_add(us))
         .ok_or_else(bad)
 }
+
+
 
 /// Split a trailing time zone off, returning the time part and the offset in
 /// seconds EAST of UTC. A missing zone reads as UTC, which is what mpedb's

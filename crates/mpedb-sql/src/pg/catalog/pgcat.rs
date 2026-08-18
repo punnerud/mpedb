@@ -676,6 +676,13 @@ fn pg_index(schema: &Schema) -> Vec<Vec<Value>> {
             // indkey is an int2vector: PostgreSQL renders it as SPACE-separated
             // 1-based attnums, and clients parse exactly that. Rendering it
             // comma-separated would parse as a single number in most of them.
+            //
+            // Stored as that TEXT rather than as a `Value::List`, because the
+            // catalog is MATERIALIZED into a real mpedb table and a list has no
+            // row encoding — `Any` excludes it by name. `unnest(indkey)` still
+            // works: the set-returning projection parses this external form,
+            // which is the one thing that knows what it means.
+            //
             // PostgreSQL's own convention: a `0` in int2vector `indkey` means
             // "this key part is an EXPRESSION — see indexprs", and every client
             // that reads indkey knows it. mpedb spells the same thing

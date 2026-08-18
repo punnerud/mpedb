@@ -321,7 +321,10 @@ fn select_base_cols(sp: &SelectPlan) -> Vec<u16> {
         for p in &sp.projection {
             match p {
                 Projection::Column(i) => cols.push(*i),
-                Projection::Expr { program, .. } => collect_prog_cols(program, &mut cols),
+                Projection::Expr { program, .. }
+                | Projection::SetReturning { program, .. } => {
+                    collect_prog_cols(program, &mut cols)
+                }
             }
         }
     }

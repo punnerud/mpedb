@@ -1117,6 +1117,12 @@ fn project_row(
                 .cloned()
                 .ok_or_else(|| internal("RETURNING column out of row bounds"))?,
             Projection::Expr { program, .. } => program.eval_host(row, params, host)?,
+            // RETURNING produces one row per WRITTEN row; PostgreSQL has no
+            // set-returning function there either, and `validate` already
+            // calls such a plan corrupt.
+            Projection::SetReturning { .. } => {
+                return Err(internal("a set-returning RETURNING item reached the executor"))
+            }
         });
     }
     Ok(out)
@@ -1131,7 +1137,9 @@ fn projection_names(proj: &[Projection], t: &TableDef) -> Vec<String> {
                 .get(*i as usize)
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| "?".to_string()),
-            Projection::Expr { name, .. } => name.clone(),
+            Projection::Expr { name, .. } | Projection::SetReturning { name, .. } => {
+                name.clone()
+            }
         })
         .collect()
 }

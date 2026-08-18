@@ -34,7 +34,9 @@ impl CompiledPlan {
                     .columns
                     .get(*n as usize)
                     .and_then(|c| c.decltype().map(str::to_string)),
-                Projection::Expr { .. } => None,
+                // Neither has a declared type: one is computed, and the
+                // other is computed AND expands the row.
+                Projection::Expr { .. } | Projection::SetReturning { .. } => None,
             })
             .collect()
     }
@@ -125,7 +127,9 @@ fn opt_prog_host_call(p: &Option<ExprProgram>) -> bool {
 fn projection_host_call(proj: &[Projection]) -> bool {
     proj.iter().any(|p| match p {
         Projection::Column(_) => false,
-        Projection::Expr { program, .. } => program.has_host_call(),
+        Projection::Expr { program, .. } | Projection::SetReturning { program, .. } => {
+            program.has_host_call()
+        }
     })
 }
 
@@ -266,7 +270,9 @@ fn opt_prog_spell_call(p: &Option<ExprProgram>) -> bool {
 fn projection_spell_call(proj: &[Projection]) -> bool {
     proj.iter().any(|p| match p {
         Projection::Column(_) => false,
-        Projection::Expr { program, .. } => program.has_spell_call(),
+        Projection::Expr { program, .. } | Projection::SetReturning { program, .. } => {
+            program.has_spell_call()
+        }
     })
 }
 

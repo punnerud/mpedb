@@ -536,6 +536,9 @@ impl CompiledPlan {
                     .map(|p| match p {
                         Projection::Column(i) => name(*i),
                         Projection::Expr { name, .. } => name.clone(),
+                        // Marked, so an EXPLAIN says which columns EXPAND the
+                        // row rather than just naming them.
+                        Projection::SetReturning { name, .. } => format!("{name} (set)"),
                     })
                     .collect();
                 // The junk columns are trailing and get trimmed before the

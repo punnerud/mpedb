@@ -187,7 +187,12 @@ impl Accum {
         };
         // Every other aggregate SKIPS NULL. This is the rule that separates
         // "summed nothing" from "saw no values" below.
-        if v.is_null() {
+        //
+        // `array_agg` is the exception, and PostgreSQL's: it COLLECTS nulls,
+        // so `array_agg(x)` over `1, NULL, 3` is `{1,NULL,3}` and not `{1,3}`.
+        // Dropping them would silently shorten the array and misalign it
+        // against any other aggregate taken over the same group.
+        if v.is_null() && self.func != AggFn::ArrayAgg {
             return Ok(());
         }
         // DISTINCT: a repeat of a value already accumulated in this group is
@@ -221,6 +226,18 @@ impl Accum {
                     )))
                 }
             },
+            AggFn::ArrayAgg => {
+                // In SCAN ORDER, which is what PostgreSQL's `array_agg`
+                // promises without an `ORDER BY` inside the call.
+                match self.acc.get_or_insert_with(|| Value::List(Vec::new())) {
+                    Value::List(items) => items.push(v.clone()),
+                    other => {
+                        return Err(Error::Internal(format!(
+                            "array_agg accumulator held a non-list value {other:?}"
+                        )))
+                    }
+                }
+            }
             AggFn::GroupConcat => {
                 // Concatenate the non-NULL values' text (raw, not the quoted
                 // Display form) with a ',' separator, in scan order.
@@ -386,6 +403,10 @@ impl Accum {
             AggFn::Sum | AggFn::Min | AggFn::Max | AggFn::GroupConcat => {
                 self.acc.unwrap_or(Value::Null)
             }
+            // NULL over an empty group, exactly as PostgreSQL: an empty array
+            // and "no rows at all" are different answers, and `{}` would be
+            // the wrong one.
+            AggFn::ArrayAgg => self.acc.unwrap_or(Value::Null),
         }
     }
 }
@@ -641,5 +662,52 @@ mod tests {
     fn sum_of_text_is_a_type_error() {
         let mut a = Accum::new(AggFn::Sum);
         assert!(a.push(Some(&Value::Text("x".into()))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod array_agg_tests {
+    use super::*;
+
+    fn agg(vals: &[Value]) -> Value {
+        let mut a = Accum::new(AggFn::ArrayAgg);
+        for v in vals {
+            a.push(Some(v)).unwrap();
+        }
+        a.finish()
+    }
+
+    /// Scan order, and NULLs KEPT — PostgreSQL's rule, and the one place this
+    /// aggregate differs from every other one here.
+    #[test]
+    fn it_collects_in_scan_order_and_keeps_nulls() {
+        assert_eq!(
+            agg(&[Value::Int(1), Value::Null, Value::Int(3)]),
+            Value::List(vec![Value::Int(1), Value::Null, Value::Int(3)])
+        );
+        // Order is the scan's, not sorted.
+        assert_eq!(
+            agg(&[Value::Int(3), Value::Int(1)]),
+            Value::List(vec![Value::Int(3), Value::Int(1)])
+        );
+        // Mixed types ride along; an array has no column to be rigid for.
+        assert_eq!(
+            agg(&[Value::Text("a".into()), Value::Int(2)]),
+            Value::List(vec![Value::Text("a".into()), Value::Int(2)])
+        );
+    }
+
+    /// NULL over an EMPTY group, not `{}`. "No rows at all" and "an array with
+    /// nothing in it" are different answers and PostgreSQL gives the first.
+    #[test]
+    fn an_empty_group_is_null_not_an_empty_array() {
+        assert_eq!(agg(&[]), Value::Null);
+    }
+
+    /// A group of only NULLs still produces an array — of nulls. This is the
+    /// case the NULL gate would have turned into `NULL`.
+    #[test]
+    fn a_group_of_nulls_is_an_array_of_nulls() {
+        assert_eq!(agg(&[Value::Null, Value::Null]), Value::List(vec![Value::Null, Value::Null]));
     }
 }

@@ -740,7 +740,8 @@ impl CompiledPlan {
                                     ));
                                 }
                             }
-                            Projection::Expr { program, .. } => {
+                            Projection::Expr { program, .. }
+                            | Projection::SetReturning { program, .. } => {
                                 self.check_program_width(program, proj_width, ptypes)?
                             }
                         }
@@ -777,7 +778,8 @@ impl CompiledPlan {
                                 return Err(corrupt("projection column out of range"));
                             }
                         }
-                        Projection::Expr { program, .. } => {
+                        Projection::Expr { program, .. }
+                            | Projection::SetReturning { program, .. } => {
                             self.check_program_width(program, proj_width, ptypes)?
                         }
                     }
@@ -1560,6 +1562,12 @@ impl CompiledPlan {
                     }
                 }
                 Projection::Expr { program, .. } => self.check_program(program, t, ptypes)?,
+                // RETURNING cannot expand rows: PostgreSQL has no
+                // set-returning function there either, and a plan claiming one
+                // is corrupt rather than merely unusual.
+                Projection::SetReturning { .. } => {
+                    return Err(corrupt("a set-returning RETURNING item"))
+                }
             }
         }
         Ok(())

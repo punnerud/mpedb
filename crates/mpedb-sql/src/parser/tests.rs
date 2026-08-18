@@ -443,6 +443,7 @@ fn order_by_takes_an_aggregate_not_just_a_name() {
                         None,
                         false,
                         None,
+                        Vec::new(),
                         Vec::new()
                     ),
                     SortDir::dir(true)

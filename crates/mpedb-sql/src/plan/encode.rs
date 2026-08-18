@@ -311,8 +311,12 @@ fn encode_projection(proj: &[Projection], buf: &mut Vec<u8>) {
                 buf.push(PROJ_COLUMN);
                 w_u16(buf, *i);
             }
-            Projection::Expr { program, name } => {
-                buf.push(PROJ_EXPR);
+            Projection::Expr { program, name } | Projection::SetReturning { program, name } => {
+                buf.push(if matches!(p, Projection::SetReturning { .. }) {
+                    PROJ_SET_RETURNING
+                } else {
+                    PROJ_EXPR
+                });
                 program.encode_into(buf);
                 buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
                 buf.extend_from_slice(name.as_bytes());
@@ -449,8 +453,13 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                         buf.push(PROJ_COLUMN);
                         w_u16(buf, *i);
                     }
-                    Projection::Expr { program, name } => {
-                        buf.push(PROJ_EXPR);
+                    Projection::Expr { program, name }
+                    | Projection::SetReturning { program, name } => {
+                        buf.push(if matches!(p, Projection::SetReturning { .. }) {
+                            PROJ_SET_RETURNING
+                        } else {
+                            PROJ_EXPR
+                        });
                         program.encode_into(buf);
                         buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
                         buf.extend_from_slice(name.as_bytes());
@@ -540,6 +549,15 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                         w_u16(buf, c.extra_args.len() as u16);
                         for p in &c.extra_args {
                             p.encode_into(buf);
+                        }
+                        // AGGREGATE ORDER BY (format 77). Empty for every call
+                        // that does not write one — which is every sqlite call
+                        // — so those plans encode one extra zero and nothing
+                        // else changes.
+                        w_u16(buf, c.order_by.len() as u16);
+                        for (p, d) in &c.order_by {
+                            p.encode_into(buf);
+                            buf.push(d.to_byte());
                         }
                     }
                     encode_opt_program(a.having.as_ref(), buf);

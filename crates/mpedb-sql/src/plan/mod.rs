@@ -542,7 +542,22 @@ const MAX_JOINS: usize = 63;
 //     fold at bind time. Reachable only through `pg::funcs`, so no
 //     sqlite-dialect statement can name it. Additive: a format-73 reader
 //     rejects tag 75 as unknown.
-const PLAN_FORMAT: u8 = 74;
+//  76: `Instr::CastPg`'s payload became a 4-byte PostgreSQL type OID instead
+//     of a one-byte mpedb `ColumnType`. The mpedb type cannot choose the
+//     PARSE: `uuid` and `bytea` are both `Blob` and read their text
+//     completely differently, and `'6f8b9c1e-…'::uuid` was the integer 6
+//     until this told them apart.
+//  75: `Instr::CastType` (opcode 67) — the PostgreSQL dialect's TYPED `CAST`,
+//     which parses the whole string and raises `invalid input syntax for type
+//     <t>` instead of taking sqlite's leading numeric prefix. A separate
+//     opcode rather than a flag so the two dialects hash to two plans, exactly
+//     as `DivStrict`/`ModStrict` (65/66) do. Additive: a format-74 reader
+//     rejects opcode 67 as unknown.
+//  77: `AggCall.order_by` — PostgreSQL's AGGREGATE ORDER BY
+//     (`array_agg(x ORDER BY k)`), compiled over the same base row the
+//     argument is. Empty for every sqlite call (no such grammar there), so a
+//     plan that does not write one grows by a single zero.
+const PLAN_FORMAT: u8 = 77;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1505,6 +1520,21 @@ pub struct AggCall {
     /// (and therefore the bare-column witness the extremum row carries) and the
     /// DISTINCT dedup fold. `Binary` for `count(*)`.
     pub coll: Collation,
+    /// `agg(x ORDER BY k [ASC|DESC], …)` (format 77) — PostgreSQL's AGGREGATE
+    /// ORDER BY, compiled over the SAME base row `arg` is.
+    ///
+    /// Empty for every call that does not write one, which is every sqlite
+    /// call: sqlite has no such grammar, so a plan compiled before this rides
+    /// the same bytes.
+    ///
+    /// It is per AGGREGATE, not per statement: two aggregates in one SELECT may
+    /// order their inputs differently, which is why it cannot be folded into
+    /// the statement's own ORDER BY. The executor buffers the group's
+    /// (key, value) pairs and replays them sorted before finishing — so an
+    /// order-INSENSITIVE aggregate gets the same answer it always did, and an
+    /// order-sensitive one (`array_agg`, `group_concat`) gets the one
+    /// PostgreSQL promises.
+    pub order_by: Vec<(ExprProgram, SortDir)>,
 }
 
 /// The compiled `ON CONFLICT` action.
@@ -1688,6 +1718,16 @@ pub enum Projection {
     Column(u16),
     /// A computed output column with its canonical display name.
     Expr { program: ExprProgram, name: String },
+    /// A SET-RETURNING output column (format 78): `unnest(a)`,
+    /// `generate_subscripts(a, 1)`. The program yields an ARRAY
+    /// ([`Value::List`]) and the ROW is expanded into one output row per
+    /// element — PostgreSQL's `ProjectSet`.
+    ///
+    /// Its own variant rather than a flag, so every consumer of a projection
+    /// has to say what it does with one: a path that treated this as an
+    /// ordinary `Expr` would emit ONE row holding the array instead of N rows
+    /// holding its elements, which is a wrong answer rather than an error.
+    SetReturning { program: ExprProgram, name: String },
 }
 
 // ---- wire tags -----------------------------------------------------------
@@ -1733,6 +1773,10 @@ const PART_OUTER_COL: u8 = 2;
 
 const PROJ_COLUMN: u8 = 0;
 const PROJ_EXPR: u8 = 1;
+/// A SET-RETURNING projection item (format 78) — see
+/// [`Projection::SetReturning`]. Same payload as `PROJ_EXPR`; the TAG is what
+/// says the row expands.
+const PROJ_SET_RETURNING: u8 = 2;
 
 const SRC_PARAM: u8 = 0;
 const SRC_CONST: u8 = 1;

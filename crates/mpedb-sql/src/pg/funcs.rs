@@ -157,6 +157,11 @@ pub(crate) fn resolve(name: &str, argc: usize) -> Option<Result<PgFunc>> {
         // cannot fold at bind time — its first argument is
         // `pg_attribute.atttypid`, a column — so it is a real scalar.
         "format_type" => PgFunc::Scalar(mpedb_types::ScalarFn::FormatType),
+        // The internal spelling the PLANNER lowers `generate_subscripts(a, 1)`
+        // to once it has checked the dimension. Not reachable from SQL: the
+        // leading underscores are not a legal identifier start for a call a
+        // client could write, and the public name stays set-returning.
+        "__subscripts" => PgFunc::Scalar(mpedb_types::ScalarFn::Subscripts),
         "json_build_object" => PgFunc::Alias("json_object"),
         "json_build_array" => PgFunc::Alias("json_array"),
         // …but position(needle IN haystack) reads the other way round. The
@@ -184,7 +189,10 @@ pub(crate) fn resolve(name: &str, argc: usize) -> Option<Result<PgFunc>> {
                  (SELECT <start> UNION ALL SELECT i+<step> FROM s WHERE i < <stop>)`",
             )))
         }
-        "unnest" | "array_agg" | "array_length" | "array_upper" | "array_lower" => {
+        // `array_agg` is no longer here: it is a real aggregate now
+        // (`AggFn::ArrayAgg`), producing a `Value::List`. The rest still need
+        // an array they can take APART, which is the half mpedb does not have.
+        "unnest" | "array_length" | "array_upper" | "array_lower" => {
             return Some(Err(unsupported(&format!(
                 "{lower}() needs an array type, and mpedb has none — there is no \
                  storable array column, so an array cannot be produced or consumed"
@@ -294,8 +302,8 @@ mod tests {
         let e = resolve("nextval", 1).unwrap().unwrap_err().to_string();
         assert!(e.contains("RETURNING id"), "{e}");
 
-        let e = resolve("array_agg", 1).unwrap().unwrap_err().to_string();
-        assert!(e.contains("array_agg"), "{e}");
+        let e = resolve("array_length", 1).unwrap().unwrap_err().to_string();
+        assert!(e.contains("array_length"), "{e}");
     }
 
     #[test]

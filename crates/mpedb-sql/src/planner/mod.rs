@@ -172,7 +172,9 @@ pub(crate) fn plan_statement(
         ast::Stmt::RollbackTo(n) => txn(PlanStmt::RollbackTo(n.clone())),
         // A surviving derived table (`FROM (SELECT …) t` the Stage-B flattener
         // could not splice) is MATERIALIZED — legal only here, at the top level.
-        ast::Stmt::Select(s) if s.from_derived.is_some() => {
+        ast::Stmt::Select(s)
+            if s.from_derived.is_some() || s.joins.iter().any(|j| j.derived.is_some()) =>
+        {
             derived::plan_derived_select(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
         }
         ast::Stmt::Select(s) => {

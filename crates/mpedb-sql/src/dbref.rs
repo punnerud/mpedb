@@ -1059,6 +1059,13 @@ fn collect_table_refs(toks: &[SpTok], head: usize) -> Result<Vec<TableRef>> {
     // change `depth`, so the commas/JOINs inside stay at the FROM list's own
     // depth, exactly as the parser consumes them between join steps).
     let mut paren_stack: Vec<bool> = Vec::new();
+    // Has a SELECT been seen directly inside each open paren? A `FROM` is a
+    // FROM CLAUSE only where a SELECT put one there. Inside a plain grouping
+    // or CALL paren it is part of an EXPRESSION —
+    // `extract(year FROM t.c)`, `trim(BOTH ' ' FROM t.c)` — and reading it as
+    // a clause made the next token a TABLE reference, so a qualified column
+    // came back as `no such table: t.c`.
+    let mut paren_saw_select: Vec<bool> = Vec::new();
     while i < toks.len() {
         let tok = &toks[i].tok;
         match tok {
@@ -1080,11 +1087,13 @@ fn collect_table_refs(toks: &[SpTok], head: usize) -> Result<Vec<TableRef>> {
                 }
                 let slack = in_table_slot && !subq;
                 paren_stack.push(slack);
+                paren_saw_select.push(false);
                 if !slack {
                     depth += 1;
                 }
             }
             Tok::RParen => {
+                paren_saw_select.pop();
                 if let Some(slack) = paren_stack.pop() {
                     if !slack {
                         depth = depth.saturating_sub(1);
@@ -1101,12 +1110,29 @@ fn collect_table_refs(toks: &[SpTok], head: usize) -> Result<Vec<TableRef>> {
                 expect_target = false;
             }
             Tok::Kw(Kw::From) => {
-                modes.push(FromMode {
-                    depth,
-                    expect_table: true,
-                    scope: next_scope,
-                });
-                next_scope += 1;
+                // Two `FROM`s are not clauses and must not open a table slot:
+                //
+                //   `x IS [NOT] DISTINCT FROM y` — the keyword pair is the
+                //     operator's own spelling. `DISTINCT` immediately before
+                //     `FROM` occurs nowhere else (`count(DISTINCT x) FROM t`
+                //     has the `)` between them).
+                //   `f(… FROM …)` — `extract(year FROM ts)`,
+                //     `trim(BOTH ' ' FROM s)`. Inside a paren that no SELECT
+                //     has opened a query in, `FROM` is part of the expression.
+                //
+                // A derived table keeps working: `FROM (SELECT … FROM t)`
+                // sets `paren_saw_select` on its own paren before the inner
+                // `FROM` is reached.
+                let after_distinct = i > 0 && matches!(toks[i - 1].tok, Tok::Kw(Kw::Distinct));
+                let in_expr_paren = paren_saw_select.last().is_some_and(|seen| !seen);
+                if !after_distinct && !in_expr_paren {
+                    modes.push(FromMode {
+                        depth,
+                        expect_table: true,
+                        scope: next_scope,
+                    });
+                    next_scope += 1;
+                }
             }
             Tok::Kw(Kw::Join) => {
                 if let Some(m) = modes.last_mut() {
@@ -1137,6 +1163,11 @@ fn collect_table_refs(toks: &[SpTok], head: usize) -> Result<Vec<TableRef>> {
                 }
             }
             Tok::Kw(Kw::Select) => {
+                // This paren now holds a QUERY, so a `FROM` inside it is a
+                // clause after all.
+                if let Some(seen) = paren_saw_select.last_mut() {
+                    *seen = true;
+                }
                 // A SELECT at a mode's own depth is the next compound arm
                 // (UNION SELECT …): that FROM list is over.
                 if modes.last().is_some_and(|m| m.depth == depth) {
@@ -1309,6 +1340,14 @@ mod tests {
                 panic!("expected Cross, got AttachedOnly({db}, {sql})")
             }
         }
+    }
+
+    pub(super) fn main_only_ok(sql: &str) -> mpedb_types::Result<String> {
+        Ok(match resolve_db_refs(sql, &scope())? {
+            DbResolution::MainOnly(s) => s,
+            DbResolution::Cross { sql, .. } => sql,
+            DbResolution::AttachedOnly { sql, .. } => sql,
+        })
     }
 
     fn main_only(sql: &str) -> String {
@@ -1539,5 +1578,48 @@ mod tests {
         assert_eq!(parse_attach("SELECT 1").unwrap(), None);
         // Bound-parameter path refused by name (probe P18 divergence).
         assert!(parse_attach("ATTACH ? AS x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod from_is_not_always_a_clause {
+    use super::tests::main_only_ok;
+
+    /// A `FROM` inside an EXPRESSION is not a FROM clause, and reading it as
+    /// one turned the next token into a TABLE reference — so a qualified
+    /// column came back as `no such table: t.c`.
+    ///
+    /// Three spellings, one bug: the `IS [NOT] DISTINCT FROM` operator, and
+    /// the `FROM` that separates a function's arguments in `extract` and
+    /// `trim`. All three are ordinary PostgreSQL that any ORM emits.
+    #[test]
+    fn an_expression_from_does_not_open_a_table_slot() {
+        for sql in [
+            "SELECT a FROM t WHERE t.a IS DISTINCT FROM t.b",
+            "SELECT a FROM t WHERE t.a IS NOT DISTINCT FROM t.b",
+            "SELECT extract(year FROM t.ts) FROM t",
+            "SELECT trim(BOTH ' ' FROM t.s) FROM t",
+        ] {
+            // The only table here is `t`; nothing may resolve `t.a`, `t.ts`
+            // or `t.s` as one.
+            let out = main_only_ok(sql);
+            assert!(out.is_ok(), "{sql}: {:?}", out.err());
+        }
+    }
+
+    /// The control: a derived table's inner FROM IS a clause, and still
+    /// resolves. Without this the fix could have suppressed every FROM inside
+    /// a paren and gone unnoticed.
+    #[test]
+    fn a_derived_tables_inner_from_is_still_a_clause() {
+        for sql in [
+            "SELECT * FROM (SELECT a FROM main.t) AS d",
+            "SELECT * FROM t JOIN (SELECT a FROM main.u) AS d ON d.a = t.a",
+        ] {
+            let out = main_only_ok(sql);
+            assert!(out.is_ok(), "{sql}: {:?}", out.err());
+            // `main.` stripped means the inner reference WAS seen as a table.
+            assert!(!out.unwrap().contains("main."), "{sql}");
+        }
     }
 }

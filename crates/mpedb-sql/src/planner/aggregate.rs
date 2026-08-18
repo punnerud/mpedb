@@ -114,7 +114,7 @@ fn lift_aggs(
         return Ok(E::Col(format!("__g{pos}"), false));
     }
     Ok(match e {
-        E::Agg(f, arg, distinct, filter, extra) => {
+        E::Agg(f, arg, distinct, filter, extra, agg_order) => {
             // The FILTER predicate rides in the dedup key: `count(*) FILTER
             // (WHERE a)` and `count(*) FILTER (WHERE b)` are two aggregates. So
             // do the EXTRA arguments — `f(a, b)` and `f(a, c)` are two calls.
@@ -124,6 +124,7 @@ fn lift_aggs(
                 *distinct,
                 filter.as_deref().cloned(),
                 extra.clone(),
+                agg_order.clone(),
             );
             // Reuse an identical aggregate rather than adding a slot: `SELECT
             // count(*) ... ORDER BY count(*)` is one aggregate named twice, and
@@ -283,14 +284,19 @@ struct GroupKeys<'a> {
 
 /// One aggregate CALL, as lifted out of the SELECT list / HAVING / ORDER BY
 /// before anything is bound: `(target, first argument, DISTINCT, FILTER,
-/// arguments after the first)`. The tuple IS the dedup key — two calls that
-/// agree on all five are one slot in the grouped tuple.
+/// arguments after the first, AGGREGATE ORDER BY)`. The tuple IS the dedup key
+/// — two calls that agree on all six are one slot in the grouped tuple.
+///
+/// The ORDER BY belongs in the key: `array_agg(x ORDER BY a)` and
+/// `array_agg(x ORDER BY b)` are two DIFFERENT aggregates over the same
+/// argument, and folding them into one slot would give both the same answer.
 type AggSpec = (
     mpedb_types::AggTarget,
     Option<ast::Expr>,
     bool,
     Option<ast::Expr>,
     Vec<ast::Expr>,
+    Vec<(ast::Expr, crate::plan::SortDir)>,
 );
 
 fn synthetic_grouped_table(
@@ -342,11 +348,16 @@ fn synthetic_grouped_table(
                 .unwrap_or_else(|| mpedb_types::Affinity::implied_by(ty)),
         });
     }
-    for (i, (f, _, _, _, _)) in aggs.iter().enumerate() {
+    for (i, (f, _, _, _, _, _)) in aggs.iter().enumerate() {
         let ty = match f.native() {
             Some(mpedb_types::AggFn::Count) => ColumnType::Int64,
             Some(mpedb_types::AggFn::Avg | mpedb_types::AggFn::Total) => ColumnType::Float64,
             Some(mpedb_types::AggFn::GroupConcat) => ColumnType::Text,
+            // An array is not a storable type, so the projection slot is
+            // declared `Any` — the same dynamic typing a host aggregate gets.
+            // The VALUE is a `Value::List`, which the row codec still refuses,
+            // so this can only ever be a RESULT.
+            Some(mpedb_types::AggFn::ArrayAgg) => ColumnType::Any,
             // SUM/MIN/MAX keep the argument's type.
             Some(_) => agg_types[i].unwrap_or(ColumnType::Int64),
             // A HOST aggregate returns whatever its `xFinal` writes — the same
@@ -617,7 +628,7 @@ pub(super) fn plan_aggregate_select(
     // it pins the bare-column witness to the lowest-rowid row (see
     // `decide_bare_cols`).
     let mut minmax_const = Vec::with_capacity(agg_specs.len());
-    for (f, arg, distinct, filt, extra) in &agg_specs {
+    for (f, arg, distinct, filt, extra, agg_order) in &agg_specs {
         let mut const_nonnull = false;
         // The argument's collating sequence (format 60): a TOP-LEVEL explicit
         // `COLLATE` is peeled and wins (rung 1 — `min(x COLLATE NOCASE)`, which
@@ -660,6 +671,12 @@ pub(super) fn plan_aggregate_select(
             }
             None => None,
         };
+        // The AGGREGATE ORDER BY keys, bound over the SAME base row as `arg`.
+        let mut order_by = Vec::with_capacity(agg_order.len());
+        for (e, d) in agg_order {
+            let (b, _) = binder.bind_expr(e)?;
+            order_by.push((compile_program(&b)?, *d));
+        }
         agg_types.push(ty);
         aggs.push(AggCall {
             func: f.clone(),
@@ -668,6 +685,7 @@ pub(super) fn plan_aggregate_select(
             filter,
             extra_args,
             coll,
+            order_by,
         });
     }
 
@@ -823,7 +841,7 @@ pub(super) fn plan_aggregate_select(
         let minmax_ix: Vec<usize> = agg_specs
             .iter()
             .enumerate()
-            .filter(|(_, (f, _, _, _, _))| {
+            .filter(|(_, (f, _, _, _, _, _))| {
                 matches!(f.native(), Some(mpedb_types::AggFn::Min | mpedb_types::AggFn::Max))
             })
             .map(|(i, _)| i)
@@ -1002,7 +1020,8 @@ pub(super) fn plan_aggregate_select(
             .iter()
             .flat_map(|p| match p {
                 Projection::Column(c) => vec![*c],
-                Projection::Expr { program, .. } => program
+                Projection::Expr { program, .. }
+                | Projection::SetReturning { program, .. } => program
                     .instrs
                     .iter()
                     .filter_map(|i| match i {
@@ -1186,8 +1205,8 @@ fn agg_item_name(e: &ast::Expr) -> String {
     match e {
         ast::Expr::Col(c, _) => c.clone(),
         ast::Expr::Qualified(_, c) => c.clone(),
-        ast::Expr::Agg(f, None, _, _, _) => format!("{}(*)", f.name()),
-        ast::Expr::Agg(f, Some(a), distinct, _, _) => format!(
+        ast::Expr::Agg(f, None, _, _, _, _) => format!("{}(*)", f.name()),
+        ast::Expr::Agg(f, Some(a), distinct, _, _, _) => format!(
             "{}({}{})",
             f.name(),
             if *distinct { "DISTINCT " } else { "" },

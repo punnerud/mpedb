@@ -592,6 +592,21 @@ fn plan_join_select_inner<'s>(
         Some(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (item, alias) in items {
+                // Set-returning functions, recognised before binding — the
+                // same fork the single-table path takes, and it has to be here
+                // too: `unnest(pg_index.indkey)` in SQLAlchemy's constraint
+                // query sits in a body whose FROM is a JOIN, so it never
+                // reaches the other loop.
+                if let Some((inner, srf_name)) = super::select::set_returning_arg(item)? {
+                    let (b, _) = binder.bind_expr(&inner)?;
+                    out_types.push(Some(ColumnType::Any));
+                    let program = compile_program(&b)?;
+                    out.push(Projection::SetReturning {
+                        program,
+                        name: alias.clone().unwrap_or(srf_name),
+                    });
+                    continue;
+                }
                 let (b, ty) = binder.bind_expr(item)?;
                 out_types.push(ty);
                 out.push(match (b, alias) {

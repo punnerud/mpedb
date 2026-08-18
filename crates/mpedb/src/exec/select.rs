@@ -626,7 +626,13 @@ pub(super) fn exec_select(
             // reason to project the ones being skipped. With it, the projection
             // is what gets deduplicated, so it must happen first and skip/take
             // moves to the end.
-            let (row_skip, row_take) = if *order_over == OrderOver::BaseRow {
+            // A row that EXPANDS cannot have the query's LIMIT applied to its
+            // SOURCE rows: PostgreSQL limits the OUTPUT, after expansion. So
+            // the bound is taken off the source here and applied below.
+            let has_srf = projection
+                .iter()
+                .any(|p| matches!(p, Projection::SetReturning { .. }));
+            let (row_skip, row_take) = if *order_over == OrderOver::BaseRow && !has_srf {
                 (skip, take)
             } else {
                 (0, usize::MAX)
@@ -649,7 +655,10 @@ pub(super) fn exec_select(
                             .get(*i as usize)
                             .cloned()
                             .ok_or_else(|| internal("projection column"))?,
-                        Projection::Expr { program, name, .. } => {
+                        Projection::Expr { program, name, .. }
+                        // The array itself; `expand_set_returning` below turns
+                        // it into rows.
+                        | Projection::SetReturning { program, name } => {
                             program
                                 .eval_host(&row, params, ctx.host_fns())
                                 .map_err(|e| name_decode_error(e, name))?
@@ -664,12 +673,21 @@ pub(super) fn exec_select(
                 // and the on-disk encoder answers by mpedb type — 3 values
                 // where sqlite sees 2). Text keys are folded under the output
                 // column's declared collation.
-                if *distinct
-                    && !seen.insert(keycode::encode_group_key(&orow, &distinct_colls))
-                {
-                    continue;
+                // Expanded BEFORE the dedup, so `DISTINCT` sees the rows the
+                // caller will: deduplicating the un-expanded row would compare
+                // arrays and keep every one of them.
+                for orow in expand_set_returning(orow, projection)? {
+                    if *distinct
+                        && !seen.insert(keycode::encode_group_key(&orow, &distinct_colls))
+                    {
+                        continue;
+                    }
+                    out.push(orow);
                 }
-                out.push(orow);
+            }
+            // The bound the source rows did not get.
+            if has_srf && *order_over == OrderOver::BaseRow {
+                out = out.into_iter().skip(skip).take(take).collect();
             }
             if *order_over != OrderOver::BaseRow {
                 gather::check_order_colls(order_by, ctx.host_colls())?;
@@ -907,14 +925,15 @@ fn try_exec_knn(
                     .get(*i as usize)
                     .cloned()
                     .ok_or_else(|| internal("projection column"))?,
-                Projection::Expr { program, name, .. } => {
+                Projection::Expr { program, name, .. }
+                | Projection::SetReturning { program, name } => {
                     program
                         .eval_host(row, params, ctx.host_fns())
                         .map_err(|e| name_decode_error(e, name))?
                 }
             });
         }
-        out.push(orow);
+        out.extend(expand_set_returning(orow, projection)?);
     }
     if *order_junk > 0 {
         let width = projection.len() - *order_junk as usize;
@@ -1114,7 +1133,9 @@ pub(super) fn select_output_columns(schema: &Schema, plan: &CompiledPlan, sp: &S
             .iter()
             .take(sp.projection.len() - sp.order_junk as usize)
             .map(|p| match p {
-                Projection::Expr { name, .. } => Ok(name.clone()),
+                Projection::Expr { name, .. } | Projection::SetReturning { name, .. } => {
+                    Ok(name.clone())
+                }
                 Projection::Column(_) => Err(internal("column projection on a FROM-less select")),
             })
             .collect();
@@ -1150,7 +1171,9 @@ pub(super) fn select_output_columns(schema: &Schema, plan: &CompiledPlan, sp: &S
         .take(sp.projection.len() - sp.order_junk as usize)
         .map(|p| match p {
             Projection::Column(i) => name_slot(*i as usize),
-            Projection::Expr { name, .. } => Ok(name.clone()),
+            Projection::Expr { name, .. } | Projection::SetReturning { name, .. } => {
+                Ok(name.clone())
+            }
         })
         .collect()
 }
@@ -1270,6 +1293,15 @@ fn exec_select_with(
                     .ok_or_else(|| internal("projection column"))?,
                 Projection::Expr { program, .. } => {
                     program.eval_host(&row, &scratch, ctx.host_fns())?
+                }
+                // The correlated pipeline streams one output row per outer
+                // row; a row that expands would break that correspondence.
+                Projection::SetReturning { .. } => {
+                    return Err(Error::Unsupported(
+                        "a set-returning function is not supported in a correlated \
+                         pipeline"
+                            .into(),
+                    ))
                 }
             });
         }
@@ -1475,6 +1507,58 @@ pub(super) fn correlated_survivors(
         if keep {
             out.push((row, scratch.clone()));
         }
+    }
+    Ok(out)
+}
+
+/// Expand one projected row over its SET-RETURNING columns — PostgreSQL's
+/// `ProjectSet`.
+///
+/// The SRF slots of `orow` hold ARRAYS; the result is one row per element, with
+/// every other column repeated. Several SRFs in one list expand in LOCKSTEP
+/// (PostgreSQL 10 and later): the row count is the LONGEST of them and a
+/// shorter one contributes NULL past its end. That rule is why this cannot be
+/// done one column at a time — doing so would give the CROSS product, which is
+/// what PostgreSQL did before 10 and no longer does.
+///
+/// Zero elements means zero rows: `unnest('{}')` drops the input row, exactly
+/// as an inner join against an empty set would.
+fn expand_set_returning(
+    orow: Vec<Value>,
+    projection: &[Projection],
+) -> Result<Vec<Vec<Value>>> {
+    let srf: Vec<usize> = projection
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| matches!(p, Projection::SetReturning { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    if srf.is_empty() {
+        return Ok(vec![orow]);
+    }
+    // Resolved ONCE per row, through the one function that decides what counts
+    // as an array — a `Value::List` a query produced, or PostgreSQL's external
+    // text form (`{1,2}` / `1 2`), which is how the catalog stores a vector.
+    let mut sets: Vec<Vec<Value>> = Vec::with_capacity(srf.len());
+    for &i in &srf {
+        sets.push(mpedb_types::value::array_elements(&orow[i]).ok_or_else(|| {
+            Error::TypeMismatch(format!(
+                "a set-returning function needs an array, got {}",
+                orow[i].type_name()
+            ))
+        })?);
+    }
+    // The LONGEST set decides the row count; a shorter one contributes NULL
+    // past its end, which is what `get` returning `None` says directly — no
+    // parallel length array to keep in step with the sets.
+    let n = sets.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let mut r = orow.clone();
+        for (&i, set) in srf.iter().zip(&sets) {
+            r[i] = set.get(k).cloned().unwrap_or(Value::Null);
+        }
+        out.push(r);
     }
     Ok(out)
 }

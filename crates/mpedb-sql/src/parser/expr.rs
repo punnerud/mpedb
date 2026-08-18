@@ -35,6 +35,40 @@ use mpedb_types::{Dialect, Error, Result, Value};
 /// The aggregate names, matched case-insensitively. Kept out of the scalar
 /// function table on purpose: a scalar runs per row, an aggregate consumes a
 /// group, and the parser must not let one become the other.
+impl Parser<'_> {
+    /// `[ORDER BY <expr> [ASC|DESC] [, …]]` inside an aggregate's argument
+    /// list, consumed just before the closing `)`.
+    ///
+    /// This is NOT the statement's ORDER BY and cannot be folded into it: it
+    /// orders ONE aggregate's input inside ONE group, and two aggregates in a
+    /// SELECT may order differently (`array_agg(a ORDER BY x), array_agg(b
+    /// ORDER BY y)` is legal PostgreSQL).
+    fn agg_order_by(&mut self) -> Result<Vec<(Expr, crate::plan::SortDir)>> {
+        if !self.peek_kw(Kw::Order) {
+            return Ok(Vec::new());
+        }
+        self.expect_kw(Kw::Order, "ORDER")?;
+        self.expect_kw(Kw::By, "BY")?;
+        let mut out = Vec::new();
+        loop {
+            let e = self.expr()?;
+            // NULL placement follows the direction, exactly as a statement's
+            // ORDER BY does — `SortDir::dir` is that one rule.
+            let dir = if self.eat_kw(Kw::Desc) {
+                crate::plan::SortDir::dir(true)
+            } else {
+                let _ = self.eat_kw(Kw::Asc);
+                crate::plan::SortDir::dir(false)
+            };
+            out.push((e, dir));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
 fn agg_fn(name: &str) -> Option<mpedb_types::AggFn> {
     use mpedb_types::AggFn::*;
     Some(match name.to_ascii_lowercase().as_str() {
@@ -45,6 +79,17 @@ fn agg_fn(name: &str) -> Option<mpedb_types::AggFn> {
         "max" => Max,
         "total" => Total,
         "group_concat" => GroupConcat,
+        // PostgreSQL-only in practice, but not dialect-gated here: the name is
+        // not a sqlite one, so recognising it costs sqlite nothing and a
+        // dialect fork in the NAME table would be a second place to forget.
+        "array_agg" => ArrayAgg,
+        // PostgreSQL's boolean aggregates. `bool_and` is `min` over a boolean
+        // and `bool_or` is `max` — mpedb's `Bool` orders false < true, so the
+        // extremum IS the conjunction/disjunction, with the same NULL-skipping
+        // and the same NULL over an empty group PostgreSQL gives. No new
+        // accumulator, and nothing that could disagree with one.
+        "bool_and" => Min,
+        "bool_or" => Max,
         _ => return None,
     })
 }
@@ -1069,6 +1114,8 @@ impl<'a> Parser<'a> {
             // cls)` is an N-ary contract and CPython's own suite registers 2-ary
             // and variadic ones. Every built-in leaves this empty.
             let mut host_extra: Vec<Expr> = Vec::new();
+            // `ORDER BY` inside the call — empty unless one is written.
+            let mut agg_order: Vec<(Expr, crate::plan::SortDir)> = Vec::new();
             let (arg, distinct): (Option<Box<Expr>>, bool) = if self.eat(&Tok::Star) {
                 self.expect(&Tok::RParen, "`)` closing count(*)")?;
                 if f_native != Some(mpedb_types::AggFn::Count) {
@@ -1156,6 +1203,12 @@ impl<'a> Parser<'a> {
                         target.name()
                     )));
                 } else {
+                    // PostgreSQL's AGGREGATE ORDER BY: `agg(x ORDER BY k …)`
+                    // fixes the order the aggregate consumes the group in.
+                    // sqlite has no such grammar, so this is reachable only
+                    // where a client writes it — and it is what made every
+                    // `array_agg(x ORDER BY y)` a parse error.
+                    agg_order = self.agg_order_by()?;
                     self.expect(&Tok::RParen, "`)` closing the argument list")?;
                 }
                 (Some(Box::new(arg)), distinct)
@@ -1231,7 +1284,7 @@ impl<'a> Parser<'a> {
                     spec,
                 });
             }
-            return Ok(Expr::Agg(target, arg, distinct, filter, host_extra));
+            return Ok(Expr::Agg(target, arg, distinct, filter, host_extra, agg_order));
         }
         let mut args = Vec::new();
         if self.peek() != Some(&Tok::RParen) {

@@ -488,12 +488,21 @@ pub(crate) enum Expr {
     /// rather than replacing it: every rule written about "the aggregate's
     /// argument" (DISTINCT dedup, the min/max bare-column witness, `count(*)`'s
     /// `None`) keeps meaning exactly what it meant.
+    /// The last field is `agg(x ORDER BY k [ASC|DESC], …)` — PostgreSQL's
+    /// AGGREGATE ORDER BY, which fixes the order the aggregate consumes its
+    /// group in. Empty for every call that does not write one, which is every
+    /// sqlite call: sqlite has no such grammar.
+    ///
+    /// It is not the statement's `ORDER BY` and cannot be folded into it: it
+    /// orders the AGGREGATE'S INPUT, per aggregate, inside one group, and two
+    /// aggregates in one SELECT may order differently.
     Agg(
         mpedb_types::AggTarget,
         Option<Box<Expr>>,
         bool,
         Option<Box<Expr>>,
         Vec<Expr>,
+        Vec<(Expr, crate::plan::SortDir)>,
     ),
     /// `<fn>(args) OVER (<spec>)` — a WINDOW function (design/DESIGN-WINDOW.md).
     ///

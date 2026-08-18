@@ -77,6 +77,15 @@ pub(super) fn exec_select_windowed(
                     .get(*i as usize)
                     .cloned()
                     .ok_or_else(|| internal("window projection column"))?,
+                // A window frame is defined over a fixed row set; expanding a
+                // row inside one would change the frame it was computed for.
+                Projection::SetReturning { .. } => {
+                    return Err(Error::Unsupported(
+                        "a set-returning function is not supported alongside a window \
+                         function"
+                            .into(),
+                    ))
+                }
                 Projection::Expr { program, .. } => {
                     program.eval_host(row, params, ctx.host_fns())?
                 }

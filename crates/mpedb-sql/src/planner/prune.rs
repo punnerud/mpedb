@@ -316,7 +316,11 @@ pub fn row_prune(
         for p in projection {
             match p {
                 Projection::Column(i) => set(&mut out, *i),
-                Projection::Expr { program, .. } => prog_cols(program, &mut out),
+                // The ARRAY the row expands over is read from the base row
+                // like any other operand — leaving it out would prune the
+                // column away and expand over nothing.
+                Projection::Expr { program, .. }
+                | Projection::SetReturning { program, .. } => prog_cols(program, &mut out),
             }
         }
     }
@@ -337,6 +341,14 @@ pub fn row_prune(
                 prog_cols(p, &mut out);
             }
             for p in &a.extra_args {
+                prog_cols(p, &mut out);
+            }
+            // An AGGREGATE ORDER BY key is read from the base row like any
+            // other operand. Leaving it out pruned the key column away and the
+            // scan handed the evaluator a row that stopped short of it —
+            // `column index N out of row bounds`, an internal error rather
+            // than a wrong answer, but only because the bound is checked.
+            for (p, _) in &a.order_by {
                 prog_cols(p, &mut out);
             }
         }

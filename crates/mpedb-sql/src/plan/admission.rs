@@ -76,7 +76,9 @@ pub fn agg_servable_by_index(
         // `min(nc COLLATE BINARY)`. A typeless (`any`) column stays refused:
         // its class-keyed image is not the fold's comparison for text.
         F::Min | F::Max => col.ty != ColumnType::Any && call.coll == col.collation,
-        F::GroupConcat => false, // concat order = scan order; the index would reorder it
+        // Both build an ORDERED accumulation in SCAN order, and an index
+        // walk would reorder it — a different array, not a faster one.
+        F::GroupConcat | F::ArrayAgg => false,
     }
 }
 

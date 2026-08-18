@@ -190,7 +190,9 @@ pub(super) fn plan_compound(
     let arity = out_types.len();
     let out_name = |sp: &SelectPlan, j: usize| -> Option<String> {
         match sp.projection.get(j)? {
-            Projection::Expr { name, .. } => Some(name.clone()),
+            Projection::Expr { name, .. } | Projection::SetReturning { name, .. } => {
+                Some(name.clone())
+            }
             Projection::Column(i) => {
                 let t = schema.table(sp.table)?;
                 // Only a single-table arm has unambiguous bare names; a

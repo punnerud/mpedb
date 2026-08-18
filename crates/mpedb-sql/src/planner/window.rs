@@ -169,6 +169,16 @@ fn resolve_window_func(
                 // SUM/MIN/MAX keep the argument's type; NULL over an all-NULL
                 // partition, like the grouped path.
                 AggFn::Sum | AggFn::Min | AggFn::Max => (arg_ty.unwrap_or(ColumnType::Int64), true),
+                // An array has no `ColumnType` — it is not storable — so
+                // there is nothing to declare for a window frame's output
+                // slot. Refused by name rather than given an invented type.
+                AggFn::ArrayAgg => {
+                    return Err(bind_err(
+                        "array_agg() as a WINDOW function is not supported — an array has no \
+                         column type, so a window frame has no slot to put one in; use the \
+                         GROUP BY form",
+                    ))
+                }
             };
             (P::Agg(*af), None, ty, nullable)
         }

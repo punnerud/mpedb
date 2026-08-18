@@ -239,6 +239,8 @@ pub(crate) fn cte_depth_guard(rc: &mpedb_sql::RecursiveCtePlan) -> Option<DepthG
     }
     // The transit: the recursive term carries column k as `k + s`, s ≥ 1.
     let step = match rc.recursive.projection.get(k as usize)? {
+        // Not the arithmetic-step shape this looks for.
+        Projection::SetReturning { .. } => return None,
         Projection::Expr { program, .. } => {
             let pi = program.instrs.as_slice();
             if pi.len() != 3 {
@@ -257,6 +259,7 @@ pub(crate) fn cte_depth_guard(rc: &mpedb_sql::RecursiveCtePlan) -> Option<DepthG
     }
     // The start: the anchor's column k is an integer constant.
     let start = match rc.anchor.projection.get(k as usize)? {
+        Projection::SetReturning { .. } => return None,
         Projection::Expr { program, .. } => {
             let pi = program.instrs.as_slice();
             if pi.len() != 1 {

@@ -59,9 +59,19 @@ impl SessionCatalog {
     /// twenty tables it does not read. That matters here more than it would in
     /// a resident server, because mpedb-pg is one process per connection — the
     /// cost would be paid at every connect.
-    pub fn ensure(&mut self, schema: &Schema, schema_gen: u64) -> Result<&Database, String> {
+    /// `comments` are the sys-keyspace COMMENT records
+    /// (`Database::list_comments`), which `pg_description` is built from: they
+    /// are not in the schema, so the caller — which holds the user database —
+    /// has to hand them over. A DDL commit bumps `schema_gen`, and a
+    /// `COMMENT ON` bumps it too, so the same cache key covers both.
+    pub fn ensure(
+        &mut self,
+        schema: &Schema,
+        schema_gen: u64,
+        comments: &[(String, String)],
+    ) -> Result<&Database, String> {
         if self.db.is_none() || self.built_for_gen != schema_gen {
-            self.db = Some(build(schema)?);
+            self.db = Some(build(schema, comments)?);
             self.built_for_gen = schema_gen;
         }
         Ok(self.db.as_ref().expect("just built"))

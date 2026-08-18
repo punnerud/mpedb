@@ -419,6 +419,17 @@ fn decode_projection(buf: &[u8], pos: &mut usize) -> Result<Vec<Projection>> {
                     .to_string();
                 Projection::Expr { program, name }
             }
+            PROJ_SET_RETURNING => {
+                let program = ExprProgram::decode(buf, pos)?;
+                let len = r_u32(buf, pos)? as usize;
+                if len > 1 << 20 {
+                    return Err(corrupt("projection name too long"));
+                }
+                let name = std::str::from_utf8(take(buf, pos, len)?)
+                    .map_err(|_| corrupt("invalid utf-8 in projection name"))?
+                    .to_string();
+                Projection::SetReturning { program, name }
+            }
             other => return Err(corrupt(format!("bad projection tag {other}"))),
         });
     }
@@ -860,6 +871,17 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                         for _ in 0..n_extra {
                             extra_args.push(ExprProgram::decode(buf, pos)?);
                         }
+                        let n_ob = r_u16(buf, pos)? as usize;
+                        if n_ob > MAX_COLUMNS {
+                            return Err(corrupt("aggregate ORDER BY with too many keys"));
+                        }
+                        let mut order_by = Vec::with_capacity(n_ob.min(MAX_COLUMNS));
+                        for _ in 0..n_ob {
+                            let p = ExprProgram::decode(buf, pos)?;
+                            let d = SortDir::from_byte(r_u8(buf, pos)?)
+                                .ok_or_else(|| corrupt("bad aggregate ORDER BY direction"))?;
+                            order_by.push((p, d));
+                        }
                         aggs.push(AggCall {
                             func: f,
                             arg,
@@ -867,6 +889,7 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                             filter,
                             extra_args,
                             coll,
+                            order_by,
                         });
                     }
                     let having = decode_opt_program(buf, pos)?;

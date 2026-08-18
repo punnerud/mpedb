@@ -43,12 +43,41 @@ pub(super) fn plan_derived_select(
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
-    let body_ast = s.from_derived.as_deref().expect("caller checked from_derived");
+    // The body materializes from ONE of two places, and the difference is
+    // only where the alias sits afterwards:
+    //
+    //   `FROM (body) d …`                  — the leading FROM
+    //   `FROM t LEFT JOIN (body) d ON c`   — a JOIN operand
+    //
+    // The second is reachable because a join's table name resolves through
+    // `resolve_table_cte` exactly as the leading one does, so the working
+    // table is addressable from either slot. What the join case must NOT do is
+    // move anything: a LEFT/RIGHT/FULL join is not commutative, and the swap
+    // the Stage-B flattener uses for an INNER join would change the answer.
+    // ONE decision, used for both the body and the outer rebuild. Deriving it
+    // twice let them disagree: a statement carrying both took its BODY from
+    // the FROM clause and its outer SHAPE from the join, producing a FROM-less
+    // SELECT with joins hanging off nothing.
+    let join_at = match s.from_derived {
+        Some(_) => None,
+        None => s.joins.iter().position(|j| j.derived.is_some()),
+    };
+    let body_ast = match (s.from_derived.as_deref(), join_at) {
+        (Some(b), _) => b,
+        (None, Some(k)) => s.joins[k].derived.as_deref().expect("position found it"),
+        (None, None) => return Err(Error::Internal("no derived source to materialize".into())),
+    };
     // The alias is how the outer addresses the body's columns. An alias-less
     // derived table (sqlite allows `FROM (SELECT …)`) gets a synthetic name no
     // identifier can spell, so it can never collide with a real table name nor
     // be referenced by one.
-    let name = s.alias.clone().unwrap_or_else(|| "(derived table)".to_string());
+    //
+    // In a JOIN the parser already put the alias in `j.table` (that is how the
+    // flattener addresses it), so it is the name to bind.
+    let name = match join_at {
+        None => s.alias.clone().unwrap_or_else(|| "(derived table)".to_string()),
+        Some(k) => s.joins[k].table.clone(),
+    };
 
     // Guard the PLANNING recursion below. The parser's budget is measured
     // against PARSE frames, and nested parens cost it well under 1 KB each —
@@ -131,14 +160,25 @@ pub(super) fn plan_derived_select(
     let def =
         crate::plan::cte_working_table_def(&name, &columns, &col_types, &col_affinities);
     let cte = CteRef { name: &name, def: &def };
+    // The outer keeps its own shape when the body came from a JOIN: the base
+    // table stays the base table, the join keeps its KIND and its `ON`, and
+    // only the body is removed — the alias now names the materialized rows.
+    let (outer_table, outer_alias, outer_joins) = match join_at {
+        None => (Some(name.clone()), None, s.joins.clone()),
+        Some(k) => {
+            let mut joins = s.joins.clone();
+            joins[k].derived = None;
+            (s.table.clone(), s.alias.clone(), joins)
+        }
+    };
     let outer_ast = ast::SelectStmt {
-        table: Some(name.clone()),
+        table: outer_table,
         from_derived: None,
         // The outer reads the MATERIALIZED body by name; a series, if the body
         // had one, was consumed building that body.
         from_series: None,
-        alias: None,
-        joins: s.joins.clone(),
+        alias: outer_alias,
+        joins: outer_joins,
         distinct: s.distinct,
         items: s.items.clone(),
         where_clause: s.where_clause.clone(),
@@ -305,6 +345,9 @@ pub(super) fn select_output_affinities(
             Projection::Column(i) => aff_slot(*i as usize),
             // A single `PushCol` IS a bare column wearing an alias — the same
             // shape `program_coll` recognises for a collation.
+            // A set-returning item's ELEMENT affinity is not the array's, and
+            // nothing downstream needs it: the derived body's slot is `Any`.
+            Projection::SetReturning { .. } => None,
             Projection::Expr { program, .. } => match program.instrs.as_slice() {
                 [mpedb_types::Instr::PushCol(i)] => aff_slot(*i as usize),
                 _ => None,
@@ -364,7 +407,9 @@ fn body_output_names(body: &SubBody, schema: &Schema) -> Vec<String> {
         .take(arm.projection.len() - junk)
         .map(|p| match p {
             Projection::Column(i) => name_slot(*i as usize),
-            Projection::Expr { name, .. } => name.clone(),
+            Projection::Expr { name, .. } | Projection::SetReturning { name, .. } => {
+                name.clone()
+            }
         })
         .collect()
 }

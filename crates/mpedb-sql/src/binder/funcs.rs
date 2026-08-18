@@ -495,6 +495,10 @@ impl<'a> Binder<'a> {
             // table stays the one place a scalar's shape is declared, even
             // though only `pg::funcs` can reach it.
             ScalarFn::FormatType => (&[], Some(ColumnType::Text)),
+            // Returns an ARRAY, which has no `ColumnType` — `Any`, like every
+            // other value typed per row. Its argument is unconstrained: the
+            // check that it IS an array happens where the array is read.
+            ScalarFn::Subscripts => (&[], Some(ColumnType::Any)),
             ScalarFn::Sqrt
             | ScalarFn::SqrtStrict
             | ScalarFn::LnStrict
