@@ -731,6 +731,45 @@ now carries the two OPENINGS, each argued in its docstring, next to the three
 exclusions — and real PostgreSQL needs the same two declarations, which is the
 test that they are claims about the dialect rather than about mpedb.
 
+### The VALUES table, and three links to reach it
+
+`FROM (VALUES (…), (…)) AS t(a, b)` is what SQLAlchemy's insertmanyvalues path
+emits, and mpedb refused it in three places one after another. Each fix moved the
+pass count by ZERO until the last one landed — the same layered blocking the
+reflection wall showed, and the same discipline got through it: run the client's
+actual statement by hand after each link, because it names the next blocker
+exactly where the suite only shows a total that has not moved.
+
+**The first refusal was DOCUMENTED, and the note had outlived its reason.**
+`values_stmt` said the derived position was impossible because "a multi-row
+VALUES is a compound, which a derived-table body (a single `SelectStmt`) cannot
+hold". True when written; false since a derived body became a `SubqueryBody` that
+holds either. Reading the comment and then checking whether it was still true is
+what turned this from a feature into a shared parser: `values_body` decides the
+shape, and both the statement form and the derived position use it.
+
+**The second was real.** A derived table was only ever materialized at the TOP
+level, so an `INSERT … SELECT` source refused it by name. `InsertSelect` now
+holds a `SelectSource` — the same two shapes a `CompoundArm` carries, sharing its
+codec — at PLAN_FORMAT 78. Three things had to mirror what a derived compound arm
+already does: the body's reserved slots widen `param_types`, the FOOTPRINT walks
+the BODY (the outer scans a working table, so reading only that reports an INSERT
+that reads nothing), and the executor dispatches to `exec_derived`, which returns
+the same `Rows` — so the write path never learns its source had a derived table.
+
+**The third was a wrong answer sitting next door.** `RETURNING t.id, t.value,
+t.id AS id__1` did not parse: the item grammar had no alias. Adding one exposed
+that a QUALIFIED item never resolved as a column at all — `Expr::Qualified` fell
+past the lookup to the expression fallback, whose display name is `?column?`. The
+value was right and the NAME was wrong, which is the shape that does not announce
+itself. Resolving it properly also made the lookup case-insensitive through
+`ident_eq`, which `ident_case.rs` had pinned as a known residual with a message
+asking for exactly that fix.
+
+657 -> 661, no previously passing test lost. The sqlite corpus is an EXACT match
+across all 622 files, which is the arm that matters here — the RETURNING grammar
+this widens is dialect-neutral.
+
 #### The control arm, and the host that moved it
 
 `cargo test --workspace` (223 suites), `clippy --all-targets -D warnings`, and
