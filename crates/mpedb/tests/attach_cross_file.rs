@@ -737,43 +737,49 @@ fn a_temp_view_over_a_temp_table_reads_the_temp_table() {
 /// litter — two files that had run clean the pass before both timed out.
 #[test]
 fn closing_a_connection_unlinks_the_temp_members_file() {
-    let dir = mpedb_testkit::scratch_base();
-    let before: Vec<_> = std::fs::read_dir(&dir)
-        .expect("scratch dir")
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .filter(|n| n.to_string_lossy().starts_with("mpedb-temp-"))
-        .collect();
-
     let path = format!(
         "{}/temp_unlink_{}.mpedb",
         scratch_dir(),
         UNIQ.fetch_add(1, Ordering::Relaxed)
     );
-    {
+    let member = {
         let db = seed_db(&path, &["CREATE TABLE base (a INTEGER PRIMARY KEY)"], &[]);
         db.query("CREATE TEMPORARY TABLE t (a INTEGER PRIMARY KEY)", &[])
             .expect("temp table");
         db.query("INSERT INTO t (a) VALUES (1)", &[]).expect("insert");
-        let live: Vec<_> = std::fs::read_dir(&dir)
-            .expect("scratch dir")
-            .filter_map(|e| e.ok().map(|e| e.file_name()))
-            .filter(|n| n.to_string_lossy().starts_with("mpedb-temp-"))
-            .collect();
+        // Ask the CONNECTION which file backs its `temp` schema instead of
+        // counting `mpedb-temp-*` in the scratch directory. That directory is
+        // shared by every test in this binary, so a sibling that also creates a
+        // TEMPORARY table lands in the count and the assertion becomes a race —
+        // which is exactly how it read on macOS, where the writer lock adds a
+        // second file per member and doubled the odds of tripping it. Naming our
+        // own member is exact and needs no settling.
+        let member = db
+            .attached_databases()
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("temp"))
+            .map(|(_, p)| p)
+            .expect("the temp schema has a backing file");
         assert!(
-            live.len() > before.len(),
-            "the temp member's file must exist while the connection does"
+            member.exists(),
+            "the temp member's file must exist while the connection does: {member:?}"
+        );
+        member
+    };
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !member.exists(),
+        "closing the connection must unlink its temp member: {member:?}"
+    );
+    // …and everything that belongs to it. `-wal` is the log; `.wlock` is the
+    // writer lock, which is a FILE only where the lock is one (macOS and
+    // Windows, on FLD-2 flock) and so leaked unnoticed for as long as this was
+    // only ever run on Linux.
+    for suffix in ["-wal", ".wlock"] {
+        let side = std::path::PathBuf::from(format!("{}{suffix}", member.display()));
+        assert!(
+            !side.exists(),
+            "closing the connection must unlink {side:?} too"
         );
     }
-
-    let _ = std::fs::remove_file(&path);
-    let after: Vec<_> = std::fs::read_dir(&dir)
-        .expect("scratch dir")
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .filter(|n| n.to_string_lossy().starts_with("mpedb-temp-"))
-        .collect();
-    assert_eq!(
-        after.len(),
-        before.len(),
-        "closing the connection must unlink its temp member: {after:?} vs {before:?}"
-    );
 }
