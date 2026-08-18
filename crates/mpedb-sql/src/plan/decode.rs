@@ -556,7 +556,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<PlanSt
                 name, columns, col_types, col_affinities, buf, pos, budget,
             )?))
         }
-        other => decode_stmt_rest(other, buf, pos),
+        other => decode_stmt_rest(other, buf, pos, budget),
     }
 }
 
@@ -1139,7 +1139,16 @@ fn decode_frame_bound(buf: &[u8], pos: &mut usize) -> Result<FrameBound> {
     })
 }
 
-fn decode_stmt_rest(tag: u8, buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
+/// `budget` is threaded for the ONE nested tree a DML statement can carry: an
+/// `INSERT … SELECT` source that is a MATERIALIZED derived plan (format 78).
+/// It is the same whole-plan tree budget every other nested decode draws from,
+/// so a hostile plan cannot buy extra depth by hiding it under an INSERT.
+fn decode_stmt_rest(
+    tag: u8,
+    buf: &[u8],
+    pos: &mut usize,
+    budget: &mut usize,
+) -> Result<PlanStmt> {
     match tag {
         STMT_INSERT => {
             let table = r_u32(buf, pos)?;
@@ -1164,8 +1173,14 @@ fn decode_stmt_rest(tag: u8, buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             }
             let from_select = match r_u8(buf, pos)? {
                 0 => None,
-                1 => {
-                    let plan = Box::new(decode_select(buf, pos)?);
+                tag @ (1 | 2) => {
+                    let plan = Box::new(if tag == 1 {
+                        crate::plan::SelectSource::Select(decode_select(buf, pos)?)
+                    } else {
+                        crate::plan::SelectSource::Derived(decode_derived_plan(
+                            buf, pos, budget,
+                        )?)
+                    });
                     let n = r_u16(buf, pos)? as usize;
                     if n > MAX_COLUMNS {
                         return Err(corrupt("INSERT … SELECT col_map out of range"));

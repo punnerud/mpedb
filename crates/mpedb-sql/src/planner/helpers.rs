@@ -256,7 +256,7 @@ pub(super) fn register_limit_params(
             sel(&rc.recursive, ptypes)?;
             sel(&rc.outer, ptypes)?;
         }
-        PlanStmt::Insert { from_select: Some(fs), .. } => sel(&fs.plan, ptypes)?,
+        PlanStmt::Insert { from_select: Some(fs), .. } => sel(fs.plan.output_select(), ptypes)?,
         _ => {}
     }
     for sub in subplans {

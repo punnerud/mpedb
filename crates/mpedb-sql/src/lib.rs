@@ -53,7 +53,7 @@ pub use plan::{
     FrameBound, FrameExclude, FrameMode, FtsQuery, FtsTerm, GroupKey, InsertSource, Join,
     JoinKind, OrderOver,
     parallel_fold_shape, LimitVal, PlanOnConflict, PlanStmt, PolicyStamp, Projection, DerivedPlan, dual_def,
-    RecursiveCtePlan, SelectPlan, SetOp, SortDir, SubBody, SubPlan, SubPlanKind, WinInt,
+    RecursiveCtePlan, SelectPlan, SelectSource, SetOp, SortDir, SubBody, SubPlan, SubPlanKind, WinInt,
     WindowFunc, WindowSpec, CTE_TABLE, DUAL_TABLE, SERIES_TABLE, series_def,
 };
 pub use planner::{

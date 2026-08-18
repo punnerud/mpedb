@@ -233,7 +233,9 @@ fn stmt_has_host_call(stmt: &PlanStmt) -> bool {
             rows.iter()
                 .flatten()
                 .any(|s| matches!(s, InsertSource::Expr(p) if p.has_host_call()))
-                || from_select.as_ref().is_some_and(|s| select_has_host_call(&s.plan))
+                || from_select
+                    .as_ref()
+                    .is_some_and(|s| select_has_host_call(s.plan.output_select()))
                 || opt_prog_host_call(with_check)
                 || returning.as_ref().is_some_and(|r| projection_host_call(r))
                 || on_conflict_host_call(on_conflict)
@@ -343,7 +345,9 @@ fn stmt_has_spell_call(stmt: &PlanStmt) -> bool {
                 || dp.body_subplans.iter().any(subplan_has_spell_call)
         }
         PlanStmt::Insert { from_select, with_check, on_conflict, returning, .. } => {
-            from_select.as_ref().is_some_and(|s| select_has_spell_call(&s.plan))
+            from_select
+                .as_ref()
+                .is_some_and(|s| select_has_spell_call(s.plan.output_select()))
                 || opt_prog_spell_call(with_check)
                 || returning.as_ref().is_some_and(|r| projection_spell_call(r))
                 || match on_conflict {

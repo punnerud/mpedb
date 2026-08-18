@@ -167,11 +167,27 @@ impl<'a> Parser<'a> {
     /// since a compound takes its output names from arm 0. A single tuple is a
     /// plain `Stmt::Select`; more than one becomes a `UNION ALL` compound.
     ///
-    /// Only the top-level statement form is handled here. `VALUES` as a
-    /// subquery/derived-table source (`FROM (VALUES …)`) is not: a multi-row
-    /// VALUES is a compound, which a derived-table body (a single `SelectStmt`)
-    /// cannot hold, and wiring that would reach into the view-flatten pass.
+    /// The STATEMENT form. `FROM (VALUES …)` uses the same body parser — see
+    /// [`Parser::values_body`], which is where the shape is decided — so the
+    /// arity rule, the row cap and the `column1..N` naming cannot drift between
+    /// the two positions.
     pub(super) fn values_stmt(&mut self) -> Result<Stmt> {
+        Ok(match self.values_body()? {
+            crate::ast::SubqueryBody::Select(s) => Stmt::Select(s),
+            crate::ast::SubqueryBody::Compound(c) => Stmt::Compound(c),
+        })
+    }
+
+    /// `VALUES (…), (…), …` as a row source, in either position.
+    ///
+    /// One tuple is a FROM-less `SELECT`; more than one is a `UNION ALL`
+    /// compound, which is what makes it usable as a derived-table body —
+    /// `from_derived` holds a [`crate::ast::SubqueryBody`], so a compound needs
+    /// no special case. (This used to be documented as the reason the derived
+    /// position was impossible: back then a derived body was a single
+    /// `SelectStmt`. Materializing a compound body removed that, and the note
+    /// outlived the limit.)
+    pub(super) fn values_body(&mut self) -> Result<crate::ast::SubqueryBody> {
         self.expect_kw(Kw::Values, "VALUES")?;
         let mut arms: Vec<SelectStmt> = Vec::new();
         loop {
@@ -224,16 +240,87 @@ impl<'a> Parser<'a> {
             }
         }
         if arms.len() == 1 {
-            return Ok(Stmt::Select(arms.into_iter().next().expect("one arm")));
+            return Ok(crate::ast::SubqueryBody::Select(
+                arms.into_iter().next().expect("one arm"),
+            ));
         }
         let ops = vec![SetOp::UnionAll; arms.len() - 1];
-        Ok(Stmt::Compound(CompoundStmt {
+        Ok(crate::ast::SubqueryBody::Compound(CompoundStmt {
             arms,
             ops,
             order_by: Vec::new(),
             limit: None,
             offset: None,
         }))
+    }
+
+    /// `(a, b, c)` after a table alias — the column-alias list.
+    ///
+    /// The opening paren has been PEEKED, not consumed. Shared by the
+    /// derived-table and table-function positions so the two cannot disagree
+    /// about an empty list or a trailing comma.
+    fn column_alias_list(&mut self) -> Result<Vec<String>> {
+        self.expect(&Tok::LParen, "`(` starting a column alias list")?;
+        let mut names = Vec::new();
+        loop {
+            names.push(self.ident("column alias")?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+            if names.len() >= MAX_SELECT_ITEMS {
+                return Err(self.err_here(format!(
+                    "too many column aliases (max {MAX_SELECT_ITEMS})"
+                )));
+            }
+        }
+        self.expect(&Tok::RParen, "`)` closing a column alias list")?;
+        Ok(names)
+    }
+
+    /// Apply `AS t(a, b)` to a derived body by RENAMING its first arm's output
+    /// aliases.
+    ///
+    /// The first arm is the right place and the only one: a compound takes its
+    /// output names from arm 0, which is also why `values_body` names only that
+    /// arm. Renaming here means nothing downstream needs a new field — no AST
+    /// node, no plan format change — because the names travel as the ordinary
+    /// select-item aliases they would have had if written out.
+    ///
+    /// Two refusals, both by name. A count mismatch is PostgreSQL's own error
+    /// and would otherwise silently leave the tail columns under their generated
+    /// names. And `SELECT *` cannot be renamed here: the columns are not known
+    /// until the schema is in hand, and inventing a mapping would rename the
+    /// wrong ones.
+    fn rename_derived_columns(
+        &mut self,
+        body: &mut crate::ast::SubqueryBody,
+        names: Vec<String>,
+    ) -> Result<()> {
+        let first = match body {
+            crate::ast::SubqueryBody::Select(s) => s,
+            crate::ast::SubqueryBody::Compound(c) => c
+                .arms
+                .first_mut()
+                .ok_or_else(|| self.err_here("a compound needs at least one arm"))?,
+        };
+        let Some(items) = first.items.as_mut() else {
+            return Err(self.err_here(
+                "a column alias list needs the derived table to name its columns; \
+                 `SELECT *` in the body does not",
+            ));
+        };
+        if items.len() != names.len() {
+            return Err(self.err_here(format!(
+                "the derived table has {} column(s) available but {} column alias(es) \
+                 were specified",
+                items.len(),
+                names.len()
+            )));
+        }
+        for (item, name) in items.iter_mut().zip(names) {
+            item.1 = Some(name);
+        }
+        Ok(())
     }
 
     /// `SELECT …`, or a compound chain `SELECT … UNION [ALL]/EXCEPT/INTERSECT
@@ -373,18 +460,40 @@ impl<'a> Parser<'a> {
             // flattens a simple derived body before planning; the rest refuse.
             let (table, from_derived, from_series, from_alias, mut from_parens) = if self.peek()
                 == Some(&Tok::LParen)
-                && matches!(self.peek_at(1), Some(Tok::Kw(Kw::Select)))
+                && matches!(
+                    self.peek_at(1),
+                    Some(Tok::Kw(Kw::Select)) | Some(Tok::Kw(Kw::Values))
+                )
             {
                 self.expect(&Tok::LParen, "(")?;
                 // A plain SELECT body, or a whole compound `SELECT … UNION …`
                 // (the same grammar a subquery position accepts). A compound
                 // body cannot be flattened onto a base table, so it is always
                 // MATERIALIZED (design/DESIGN-DERIVED-TABLES.md §5).
-                let inner = self.subquery_body()?;
+                //
+                // `VALUES (…), (…)` is the same thing spelled shorter: one row
+                // is a FROM-less SELECT, several are a `UNION ALL` compound, and
+                // the materializer needs no case for it. SQLAlchemy's
+                // insertmanyvalues path emits exactly this shape.
+                let mut inner = if self.peek() == Some(&Tok::Kw(Kw::Values)) {
+                    self.values_body()?
+                } else {
+                    self.subquery_body()?
+                };
                 self.expect(&Tok::RParen, "`)` to close the derived table")?;
                 // The alias names the derived columns; optional, as in sqlite
                 // (accept bare or `AS` form here).
                 let from_alias = self.opt_table_alias()?;
+                // `AS t(a, b)` — the column-alias list, legal only after an
+                // alias (PostgreSQL requires the alias). It RENAMES the derived
+                // columns, and those names are the result header and what an
+                // outer reference resolves against, so dropping them would be a
+                // wrong answer rather than a missing feature. Same rule the
+                // `generate_series` arm below already follows.
+                if from_alias.is_some() && self.peek() == Some(&Tok::LParen) {
+                    let names = self.column_alias_list()?;
+                    self.rename_derived_columns(&mut inner, names)?;
+                }
                 (None, Some(Box::new(inner)), None, from_alias, 0usize)
             } else {
                 // `FROM ( a JOIN b ON … )` — parens around a join group. For the
@@ -413,14 +522,8 @@ impl<'a> Parser<'a> {
                     // alias. PostgreSQL renames the output column from it, and
                     // that name is the result HEADER, so dropping it would be a
                     // wrong answer rather than a missing feature.
-                    if from_alias.is_some() && self.eat(&Tok::LParen) {
-                        loop {
-                            args.columns.push(self.ident("column alias")?);
-                            if !self.eat(&Tok::Comma) {
-                                break;
-                            }
-                        }
-                        self.expect(&Tok::RParen, "`)` to close the column alias list")?;
+                    if from_alias.is_some() && self.peek() == Some(&Tok::LParen) {
+                        args.columns.extend(self.column_alias_list()?);
                         if args.columns.len() != 1 {
                             return Err(self.err_here(format!(
                                 "generate_series has ONE column, so its alias list takes one \

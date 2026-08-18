@@ -35,7 +35,19 @@ pub(super) fn exec_stmt_rest(
             // tuple maps to the target columns via `col_map`, omitted columns
             // taking their DEFAULT / NULL.
             let built_rows: Vec<std::borrow::Cow<[Value]>> = if let Some(sel) = from_select {
-                let src = match exec_select(ctx, schema, plan, params, &sel.plan)? {
+                // A MATERIALIZED source (format 78) runs through the same
+                // function the statement level uses, and hands back the same
+                // `Rows` — the materialization is internal to it, so nothing
+                // here has to know whether the source had a derived table.
+                let res = match &*sel.plan {
+                    mpedb_sql::SelectSource::Select(sp) => {
+                        exec_select(ctx, schema, plan, params, sp)?
+                    }
+                    mpedb_sql::SelectSource::Derived(dp) => {
+                        super::recursive::exec_derived(ctx, schema, plan, params, dp)?
+                    }
+                };
+                let src = match res {
                     ExecResult::Rows { rows, .. } => rows,
                     _ => return Err(internal("INSERT … SELECT source produced no row set")),
                 };

@@ -166,27 +166,55 @@ pub(super) fn plan_insert(
     let mut sel_ctx: Vec<String> = Vec::new();
     let mut sel_list: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut sel_subplans: Vec<SubPlan> = Vec::new();
+    // Slots the source's MATERIALIZED body reserves, if it has one. They sit
+    // above this statement's own parameters, exactly as a compound arm's do, and
+    // `param_types` has to be widened to cover them or the executor's buffer is
+    // short of the slots the body fills.
+    let mut src_slots: u16 = 0;
     if let Some(sel_stmt) = &s.select {
-        let (sp_stmt, sp_pt, sp_ctx, sp_list, _sp_agg, sp_sub) =
-            plan_select(sel_stmt, schema, n_params, catalog, mode, host_udfs, row_count, consts, None, &[])?;
-        let PlanStmt::Select(sp) = sp_stmt else {
-            return Err(bind_err(
-                "INSERT … SELECT: a compound (UNION/EXCEPT/INTERSECT) source is not supported",
-            ));
+        // A source whose FROM is a derived table the flatten pass could not
+        // splice — `INSERT … SELECT … FROM (VALUES …) t(a, b)` is the shape
+        // SQLAlchemy's insertmanyvalues path emits — is MATERIALIZED, through
+        // the same planner the top level and a compound arm use. Routed here
+        // rather than in `plan_select`, which refuses a surviving derived table
+        // by name precisely so it can never be silently dropped.
+        let (sp_stmt, sp_pt, sp_ctx, sp_list, _sp_agg, sp_sub) = if sel_stmt.from_derived.is_some()
+            || sel_stmt.joins.iter().any(|j| j.derived.is_some())
+        {
+            super::derived::plan_derived_select(
+                sel_stmt, schema, n_params, catalog, mode, host_udfs, row_count, consts,
+            )?
+        } else {
+            plan_select(sel_stmt, schema, n_params, catalog, mode, host_udfs, row_count, consts, None, &[])?
         };
-        if sp.projection.len() != listed.len() {
+        let src = match sp_stmt {
+            PlanStmt::Select(sp) => crate::plan::SelectSource::Select(sp),
+            PlanStmt::Derived(dp) => {
+                src_slots = dp.reserved_slots();
+                crate::plan::SelectSource::Derived(dp)
+            }
+            _ => {
+                return Err(bind_err(
+                    "INSERT … SELECT: a compound (UNION/EXCEPT/INTERSECT) source is not supported",
+                ))
+            }
+        };
+        let width = src.output_select().projection.len();
+        if width != listed.len() {
             return Err(bind_err(format!(
-                "INSERT … SELECT: the source has {} column(s), but {} are expected",
-                sp.projection.len(),
+                "INSERT … SELECT: the source has {width} column(s), but {} are expected",
                 listed.len()
             )));
         }
         let col_map: Vec<Option<u16>> =
             slot_of_col.iter().map(|s| s.map(|x| x as u16)).collect();
-        from_select = Some(crate::plan::InsertSelect { plan: Box::new(sp), col_map });
+        from_select = Some(crate::plan::InsertSelect { plan: Box::new(src), col_map });
         sel_ptypes = sp_pt;
         sel_ctx = sp_ctx;
         sel_list = sp_list;
+        // A derived source's lifted subqueries belong to its BODY (they are
+        // filled while it materializes), so it hands back none — same as a
+        // derived compound arm.
         sel_subplans = sp_sub;
     }
 
@@ -346,6 +374,15 @@ pub(super) fn plan_insert(
     if from_select.is_some() {
         if param_types.len() < sel_ptypes.len() {
             param_types.resize(sel_ptypes.len(), None);
+        }
+        // A materialized source reserves slots ABOVE the parameters for its
+        // body's lifted subqueries. The executor sizes its value buffer from
+        // `param_types`, so a short vector leaves the body writing past the end
+        // of what the caller allocated — widen it here, the way `plan_compound`
+        // does for a derived arm.
+        let want = (n_params as usize).saturating_add(src_slots as usize);
+        if param_types.len() < want {
+            param_types.resize(want, None);
         }
         for (i, t) in sel_ptypes.into_iter().enumerate() {
             if let Some(t) = t {

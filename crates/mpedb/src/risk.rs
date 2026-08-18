@@ -66,7 +66,10 @@ impl RiskEstimate {
             PlanStmt::Select(sp) => sel(sp) || subs_correlated(&plan.subplans),
             PlanStmt::Compound(c) => c.arms.iter().any(arm_sel) || subs_correlated(&plan.subplans),
             PlanStmt::Insert { from_select, .. } => {
-                from_select.as_ref().is_some_and(|s| sel(&s.plan)) || subs_correlated(&plan.subplans)
+                from_select
+                    .as_ref()
+                    .is_some_and(|s| sel(s.plan.output_select()))
+                    || subs_correlated(&plan.subplans)
             }
             PlanStmt::Update { .. } | PlanStmt::Delete { .. } => subs_correlated(&plan.subplans),
             // A recursive CTE is a fixpoint: its cardinality is not statically
@@ -424,7 +427,11 @@ pub fn estimate_plan_risk(
         PlanStmt::Select(sp) => estimate_select(sp, &plan.subplans, schema, row_count),
         PlanStmt::Compound(c) => estimate_compound(c, &plan.subplans, schema, row_count),
         PlanStmt::Insert { table, from_select, rows, .. } => match from_select {
-            Some(sel) => estimate_select(&sel.plan, &plan.subplans, schema, row_count),
+            // The OUTER of a materialized source is what produces the rows the
+            // INSERT writes, so its estimate is the row count either way.
+            Some(sel) => {
+                estimate_select(sel.plan.output_select(), &plan.subplans, schema, row_count)
+            }
             None => Acc::new(
                 rows.len() as u64,
                 format!("insert of {} row(s) into \"{}\"", rows.len(), table_name(schema, *table)),

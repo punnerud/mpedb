@@ -387,12 +387,32 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
             // reports Corrupt for a perfectly well-formed statement.
             let mut tables_read = TableSet::new();
             if let Some(sel) = from_select {
-                if sel.plan.table != crate::plan::DUAL_TABLE
-                    && sel.plan.table != crate::plan::CTE_TABLE
+                // A MATERIALIZED derived source reads its tables in the BODY —
+                // the outer scans the working table, which is no catalog table
+                // at all. Walking only the outer would report an INSERT that
+                // reads nothing, and the footprint is what the write path uses
+                // to decide what it conflicts with.
+                let mut derived_fp = Footprint {
+                    tables_read: TableSet::new(),
+                    tables_written: TableSet::new(),
+                    indexes_used: 0,
+                    key_access: KeyAccess::Full,
+                    read_only: true,
+                };
+                let src = match &*sel.plan {
+                    crate::plan::SelectSource::Select(sp) => sp,
+                    crate::plan::SelectSource::Derived(dp) => {
+                        union_derived_reads(dp, schema, &mut derived_fp)?;
+                        &dp.outer
+                    }
+                };
+                tables_read.union_with(&derived_fp.tables_read);
+                if src.table != crate::plan::DUAL_TABLE
+                    && src.table != crate::plan::CTE_TABLE
                 {
-                    tables_read.insert(checked_table(sel.plan.table, schema)?);
+                    tables_read.insert(checked_table(src.table, schema)?);
                 }
-                for j in &sel.plan.joins {
+                for j in &src.joins {
                     if j.table != crate::plan::CTE_TABLE {
                         tables_read.insert(checked_table(j.table, schema)?);
                     }

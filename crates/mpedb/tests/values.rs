@@ -167,14 +167,31 @@ fn mismatched_arity_is_rejected() {
     assert!(err.is_err(), "ragged VALUES should be refused, got {err:?}");
 }
 
-/// `VALUES` as a derived-table / subquery source is not supported yet; it must
-/// fail cleanly (a parse/compile error), not mis-execute.
+/// `VALUES` IS a derived-table source. This test used to pin the refusal.
+///
+/// One tuple is a FROM-less SELECT and several are a `UNION ALL` compound, and a
+/// derived body holds either — so the materializer needed no case for it. The
+/// columns keep `VALUES`'s own names until an alias list renames them, which is
+/// PostgreSQL's rule and sqlite's.
 #[test]
-fn not_yet_a_subquery_source() {
+fn a_values_list_is_a_derived_table_source() {
     let d = db();
-    let err = d.query("SELECT * FROM (VALUES (1), (2))", &[]);
-    assert!(
-        err.is_err(),
-        "FROM (VALUES …) is out of scope and must be refused, got {err:?}"
+    let (cols, rows) = mpedb_out(&d, "SELECT * FROM (VALUES (1), (2))");
+    assert_eq!(cols, vec!["column1"]);
+    assert_eq!(rows, vec![vec!["1"], vec!["2"]]);
+
+    // `AS t(a, b)` renames the derived columns, and those names are what an
+    // outer reference resolves against — so this would not even bind if the
+    // alias list were parsed and dropped.
+    let (cols, rows) = mpedb_out(
+        &d,
+        "SELECT t.b, t.a FROM (VALUES (1, 10), (2, 20)) AS t(a, b) ORDER BY t.a",
     );
+    assert_eq!(cols, vec!["b", "a"]);
+    assert_eq!(rows, vec![vec!["10", "1"], vec!["20", "2"]]);
+
+    // A count mismatch is refused BY NAME rather than leaving the tail columns
+    // under the names the author thought they had replaced.
+    let err = d.query("SELECT * FROM (VALUES (1, 2)) AS t(only_one)", &[]);
+    assert!(err.is_err(), "an alias-list arity mismatch must refuse, got {err:?}");
 }

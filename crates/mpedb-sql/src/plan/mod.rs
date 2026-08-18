@@ -557,7 +557,15 @@ const MAX_JOINS: usize = 63;
 //     (`array_agg(x ORDER BY k)`), compiled over the same base row the
 //     argument is. Empty for every sqlite call (no such grammar there), so a
 //     plan that does not write one grows by a single zero.
-const PLAN_FORMAT: u8 = 77;
+//     ALSO in 77, recorded late: `PROJ_SET_RETURNING` (projection tag 2), the
+//     set-returning projection `unnest(a)` compiles to. Additive — a
+//     format-76 reader rejects tag 2 as unknown — but it is a format change
+//     and belongs in this list.
+//  78: an `INSERT … SELECT` source may be a MATERIALIZED derived plan, not just
+//     a plain select ([`SelectSource`]). The presence byte was already a tag
+//     (0 = no source, 1 = select), so tag 2 carries a `DerivedPlan` in the
+//     layout `encode_derived_plan` already writes for a compound arm.
+const PLAN_FORMAT: u8 = 78;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1611,8 +1619,37 @@ pub enum InsertSource {
 /// column's DEFAULT / NULL.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertSelect {
-    pub plan: Box<SelectPlan>,
+    pub plan: Box<SelectSource>,
     pub col_map: Vec<Option<u16>>,
+}
+
+/// A row source that is a plain [`SelectPlan`], or one whose FROM is a
+/// MATERIALIZED derived table (PLAN_FORMAT 78).
+///
+/// The same two shapes [`CompoundArm`] carries, and deliberately NOT that type:
+/// this one is an `INSERT … SELECT` source, and naming it after a compound arm
+/// would read as one at every site that touches it. The codec layout is
+/// identical, so `encode_derived_plan` / `decode_derived_plan` are shared.
+#[derive(Debug, Clone, PartialEq)]
+// Boxing either variant would only move the bytes: `InsertSelect` already holds
+// this behind a `Box`, so the enum is never inlined into a `PlanStmt`. Same
+// trade, same shape and the same `allow` as [`CompoundArm`].
+#[allow(clippy::large_enum_variant)]
+pub enum SelectSource {
+    Select(SelectPlan),
+    Derived(DerivedPlan),
+}
+
+impl SelectSource {
+    /// The Select that produces this source's output columns — the OUTER of a
+    /// derived source. What the arity check against the target column list and
+    /// EXPLAIN both need.
+    pub fn output_select(&self) -> &SelectPlan {
+        match self {
+            SelectSource::Select(sp) => sp,
+            SelectSource::Derived(dp) => &dp.outer,
+        }
+    }
 }
 
 /// Physical access path over the target table.

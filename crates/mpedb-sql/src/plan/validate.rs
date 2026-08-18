@@ -33,7 +33,7 @@ impl CompiledPlan {
                 }
                 self.validate_derived(dp, schema, ptypes, &mut budget)?;
             }
-            _other => self.validate_rest(schema)?,
+            _other => self.validate_rest(schema, &mut budget)?,
         }
         if !self.subplans.is_empty() {
             self.validate_subplans(schema, &mut budget)?;
@@ -809,7 +809,11 @@ impl CompiledPlan {
 
     /// The DML/txn arms of `validate` — split from the SELECT/compound arms
     /// only so `validate_select` can be shared with compound arms.
-    fn validate_rest(&self, schema: &Schema) -> Result<()> {
+    /// `budget` is the SAME whole-plan tree budget the statement-level arms
+    /// draw from: an `INSERT … SELECT` source may be a materialized derived
+    /// plan (format 78), and a nested tree hidden under a DML statement must
+    /// not buy depth the top level would have refused.
+    fn validate_rest(&self, schema: &Schema, budget: &mut usize) -> Result<()> {
         let ptypes = &self.param_types;
         let get_table = |id: u32| {
             schema
@@ -882,9 +886,19 @@ impl CompiledPlan {
                     if !rows.is_empty() {
                         return Err(corrupt("INSERT has both VALUES rows and a SELECT source"));
                     }
-                    // The embedded source query is re-validated in full.
-                    self.validate_select(&sel.plan, schema, ptypes)?;
-                    let width = sel.plan.projection.len();
+                    // The embedded source query is re-validated in FULL, and a
+                    // derived source through the same door a compound arm uses —
+                    // a decode that skipped the body would accept a plan whose
+                    // materialization step is corrupt.
+                    match &*sel.plan {
+                        crate::plan::SelectSource::Select(sp) => {
+                            self.validate_select(sp, schema, ptypes)?
+                        }
+                        crate::plan::SelectSource::Derived(dp) => {
+                            self.validate_derived(dp, schema, ptypes, budget)?
+                        }
+                    }
+                    let width = sel.plan.output_select().projection.len();
                     if sel.col_map.len() != t.columns.len() {
                         return Err(corrupt("INSERT … SELECT col_map width mismatch"));
                     }

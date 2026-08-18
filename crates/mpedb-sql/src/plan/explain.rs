@@ -623,8 +623,20 @@ impl CompiledPlan {
             } => {
                 let name = col_namer(*table);
                 out.push_str(&format!("Insert {}\n", table_name(*table)));
-                if from_select.is_some() {
-                    out.push_str("  source: SELECT\n");
+                if let Some(sel) = from_select {
+                    // Naming the materialization matters here: a derived source
+                    // runs a whole body before the first row is written, and an
+                    // EXPLAIN that says only "SELECT" hides the step whose cost
+                    // the reader came to see.
+                    match &*sel.plan {
+                        crate::plan::SelectSource::Select(_) => {
+                            out.push_str("  source: SELECT\n")
+                        }
+                        crate::plan::SelectSource::Derived(dp) => out.push_str(&format!(
+                            "  source: SELECT over materialized derived table \"{}\"\n",
+                            dp.name
+                        )),
+                    }
                 }
                 if let Some(w) = with_check {
                     out.push_str(&format!("  with check: {}\n", render_program(w, &name)));

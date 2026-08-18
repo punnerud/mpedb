@@ -717,8 +717,18 @@ fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             match from_select {
                 None => buf.push(0),
                 Some(sel) => {
-                    buf.push(1);
-                    encode_select(&sel.plan, buf);
+                    // 1 = a plain select, 2 = a MATERIALIZED derived source. The
+                    // derived layout is the one a compound arm already writes.
+                    match &*sel.plan {
+                        crate::plan::SelectSource::Select(sp) => {
+                            buf.push(1);
+                            encode_select(sp, buf);
+                        }
+                        crate::plan::SelectSource::Derived(dp) => {
+                            buf.push(2);
+                            encode_derived_plan(dp, buf);
+                        }
+                    }
                     w_u16(buf, sel.col_map.len() as u16);
                     for m in &sel.col_map {
                         match m {
