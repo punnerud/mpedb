@@ -120,6 +120,11 @@ pub(crate) enum BExpr {
     /// `CAST(x AS t)` — the target name has been folded to an [`Affinity`];
     /// conversion semantics live in [`Instr::Cast`](mpedb_types::expr).
     Cast(Box<BExpr>, Affinity),
+    /// `CAST(x AS t)` under the **PostgreSQL dialect**, carrying the PG type
+    /// OID: the conversion parses the whole text and RAISES instead of taking
+    /// a numeric prefix. Semantics live in
+    /// [`Instr::CastPg`](mpedb_types::expr).
+    CastPg(Box<BExpr>, u32),
     /// A comparison under an explicit collating sequence (task: COLLATE). The
     /// `BinOp` is one of the six comparison operators; TEXT operands compare
     /// under `Collation`. A distinct node from [`BExpr::Binary`] on purpose: the
@@ -1400,6 +1405,34 @@ impl<'a> Binder<'a> {
                  the SELECT list and WHERE of a plain (non-aggregate) SELECT",
             )),
             ast::Expr::Cast(a, tyname) => {
+                // Under the PostgreSQL dialect a cast to a date/time or an
+                // exact decimal takes the TYPED path: it parses the whole
+                // string or raises `invalid input syntax for type <t>`.
+                // sqlite's affinity rule would take a leading numeric prefix,
+                // which is how `'2020-01-02'::date` became the integer 2020 —
+                // on the ORDINARY write path, since psycopg2 renders every
+                // Python date parameter exactly that way.
+                //
+                // Only these four fork. Everything else keeps the affinity
+                // cast it already had, so nothing that was right changes.
+                if self.dialect == mpedb_types::Dialect::Postgres {
+                    if let Some(pg) = mpedb_types::pgtype::by_name(tyname) {
+                        if strict_pg_cast(pg.name) {
+                            let ty = pg.mpedb;
+                            let (a, _) = self.bind_expr(a)?;
+                            let e = fold_maybe(
+                                BExpr::CastPg(Box::new(a), pg.oid),
+                                self.suppress_fold,
+                            )?;
+                            let t = if let BExpr::Const(v) = &e {
+                                v.column_type()
+                            } else {
+                                ty
+                            };
+                            return Ok((e, t));
+                        }
+                    }
+                }
                 let aff = Affinity::from_type_name(tyname);
                 let (a, at) = self.bind_expr(a)?;
                 // A CAST's operand takes ANY type — converting is the whole
@@ -1448,4 +1481,28 @@ impl<'a> Binder<'a> {
             ast::Expr::RowValue(_) => Err(bind_err("row value misused")),
         }
     }
+}
+
+/// Which PostgreSQL types take the STRICT cast (`Instr::CastPg`) rather than
+/// sqlite's affinity rule.
+///
+/// The list is short on purpose: each entry is a MEASURED divergence where
+/// sqlite's leading-prefix rule gives a wrong answer, not a guess at what
+/// might differ.
+///
+/// * `date`/`time`/`timestamp`/`timestamptz` — `'2020-01-02'` was `2020`.
+/// * `numeric` — the exact decimal, whose scale the affinity rule drops.
+/// * `uuid` — `'6f8b9c1e-…'` was the integer `6`.
+/// * `bytea` — hex/escape text, which the numeric rule reads as a number.
+///
+/// Everything else keeps the affinity cast, which already agrees with
+/// PostgreSQL for it. `int4`/`float8` are the interesting non-entries: PG
+/// RAISES on `'abc'::int` where the affinity rule yields 0, so they belong
+/// here eventually — but nothing in the suites measures it yet, and this list
+/// grows on evidence.
+fn strict_pg_cast(name: &str) -> bool {
+    matches!(
+        name,
+        "date" | "time" | "timestamp" | "timestamptz" | "numeric" | "uuid" | "bytea"
+    )
 }

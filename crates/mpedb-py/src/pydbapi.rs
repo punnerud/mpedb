@@ -1110,6 +1110,9 @@ impl PyCursor {
                                 CT::Text => "TEXT",
                                 CT::Blob => "BLOB",
                                 CT::Timestamp => "TIMESTAMP",
+                                CT::Date => "DATE",
+                                CT::Time => "TIME",
+                                CT::Numeric => "NUMERIC",
                                 CT::Any => "",
                             }
                             .to_string()
@@ -1786,6 +1789,9 @@ fn render_create(t: &mpedb::TableDef) -> String {
             CT::Text => "TEXT",
             CT::Blob => "BLOB",
             CT::Timestamp => "TIMESTAMP",
+            CT::Date => "DATE",
+            CT::Time => "TIME",
+            CT::Numeric => "NUMERIC",
             CT::Any => "",
         }
         .to_string()

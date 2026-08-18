@@ -1181,7 +1181,10 @@ fn sqlite_quote(v: &Value) -> Result<Value> {
         // agree with; both render as the integer they already render as under
         // `||`, `CAST(… AS TEXT)` and `printf`, so the literal round-trips.
         Value::Bool(b) => (*b as i64).to_string(),
-        Value::Timestamp(t) => t.to_string(),
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => t.to_string(),
+        // A NUMERIC's canonical text IS its literal, so it round-trips as
+        // written — quoting it as text would round-trip to the wrong type.
+        Value::Numeric(n) => n.clone(),
         Value::Float(x) => match super::printf::quote_float(*x) {
             Some(bytes) => String::from_utf8(bytes).expect("quote_float is ASCII"),
             None => {
@@ -1269,8 +1272,15 @@ fn sqlite_typeof(v: &Value) -> &'static str {
         Value::Null => "null",
         // mpedb's Bool and Timestamp are integer storage: 0/1 and microseconds
         // since the epoch. Both read back as SQLITE_INTEGER through the C API.
-        Value::Int(_) | Value::Bool(_) | Value::Timestamp(_) => "integer",
+        Value::Int(_)
+        | Value::Bool(_)
+        | Value::Timestamp(_)
+        | Value::Date(_)
+        | Value::Time(_) => "integer",
         Value::Float(_) => "real",
+        // Storage is text (that is the exactness), but sqlite has no exact
+        // decimal, so what a C-API reader gets is a number, not a string.
+        Value::Numeric(_) => "real",
         Value::Text(_) => "text",
         Value::Blob(_) => "blob",
         Value::List(_) => "null",

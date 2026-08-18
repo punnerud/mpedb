@@ -72,6 +72,9 @@ fn decl_for(ty: ColumnType) -> &'static str {
         ColumnType::Text => "TEXT",
         ColumnType::Bool => "BOOLEAN",
         ColumnType::Timestamp => "TIMESTAMP",
+        ColumnType::Date => "DATE",
+        ColumnType::Time => "TIME",
+        ColumnType::Numeric => "NUMERIC",
         ColumnType::Blob => "BLOB",
         ColumnType::Any => "",
     }

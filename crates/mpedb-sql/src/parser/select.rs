@@ -833,6 +833,13 @@ impl<'a> Parser<'a> {
     /// `neg_limit_in_core` so `compound_chain` can still reject a `LIMIT`
     /// before a set operator, which absence alone no longer shows.
     fn limit_int(&mut self, what: &str) -> Result<Option<LimitVal>> {
+        // `LIMIT ALL` is PostgreSQL's spelling of "no limit" — the same answer
+        // a negative literal gives, and what SQLAlchemy emits for an
+        // offset-without-limit slice. Only LIMIT has it; `OFFSET ALL` is not
+        // PostgreSQL grammar, so the word is taken only where it means this.
+        if what.eq_ignore_ascii_case("LIMIT") && self.eat_word("ALL") {
+            return Ok(None);
+        }
         let save = self.pos;
         let neg = self.eat(&Tok::Minus);
         let pos = self.here();

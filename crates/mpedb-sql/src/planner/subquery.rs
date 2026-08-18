@@ -1213,7 +1213,8 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
         | BExpr::Like(a, _, _, _)
         | BExpr::Glob(a, _)
         | BExpr::Regexp(a, _)
-        | BExpr::Cast(a, _) => refs_correlated(a, sub_base, correlated),
+        | BExpr::Cast(a, _)
+        | BExpr::CastPg(a, _) => refs_correlated(a, sub_base, correlated),
         BExpr::Binary(_, a, bx)
         | BExpr::IsDistinct(a, bx, _)
         | BExpr::CollateCmp(_, a, bx, _)

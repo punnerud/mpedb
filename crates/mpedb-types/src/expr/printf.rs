@@ -137,7 +137,8 @@ fn arg_i64(v: &Value) -> i64 {
         Value::Text(s) => atoi64(s.as_bytes()),
         Value::Blob(b) => atoi64(b),
         // No sqlite equivalent; use the raw micros.
-        Value::Timestamp(t) => *t,
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => *t,
+        Value::Numeric(n) => atoi64(n.as_bytes()),
         Value::Null | Value::List(_) => 0,
     }
 }
@@ -150,7 +151,8 @@ fn arg_f64(v: &Value) -> f64 {
         Value::Float(f) => *f,
         Value::Text(s) => atof(s.as_bytes()),
         Value::Blob(b) => atof(b),
-        Value::Timestamp(t) => *t as f64,
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => *t as f64,
+        Value::Numeric(n) => atof(n.as_bytes()),
         Value::Null | Value::List(_) => 0.0,
     }
 }
@@ -167,7 +169,10 @@ fn arg_text(v: &Value) -> Option<Vec<u8>> {
         Value::Bool(b) => Some((*b as i64).to_string().into_bytes()),
         Value::Float(f) => Some(float_to_text(*f)),
         Value::Blob(b) => Some(b.clone()),
-        Value::Timestamp(t) => Some(t.to_string().into_bytes()),
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => {
+            Some(t.to_string().into_bytes())
+        }
+        Value::Numeric(n) => Some(n.as_bytes().to_vec()),
         Value::List(_) => Some(Vec::new()),
     }
 }

@@ -109,6 +109,21 @@ pub struct CreateTableSpec {
     pub foreign_keys: Vec<ForeignKeySpec>,
 }
 
+/// One table-level `UNIQUE (…)` constraint, still in column NAMES.
+///
+/// The declared NAME is carried rather than dropped because a reflecting client
+/// reads it back: PostgreSQL names a unique constraint's backing index after the
+/// constraint, so `CONSTRAINT uq_email UNIQUE (email)` has to reflect as
+/// `uq_email` and not as a name mpedb invented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueSpec {
+    pub columns: Vec<String>,
+    /// `CONSTRAINT <name> UNIQUE (…)`, or `None` for the bare form — which has
+    /// no name to keep, and gets PostgreSQL's derived one at the catalog surface
+    /// rather than a stored fiction.
+    pub name: Option<String>,
+}
+
 /// One parsed `REFERENCES` clause, still in NAMES. The facade resolves it
 /// against the live catalog into a [`mpedb_types::ForeignKeyDef`], which is
 /// where a missing table or a non-unique parent key becomes an error.

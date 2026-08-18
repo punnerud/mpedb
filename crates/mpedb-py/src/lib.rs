@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, Utc};
 use mpedb::{
     Database as Db, DetachedPlan, Error as DbError, ExecResult, PlanHash, Value, WriteSession,
 };
@@ -132,16 +132,43 @@ pub(crate) fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(dt) = obj.extract::<DateTime<FixedOffset>>() {
         return Ok(Value::Timestamp(dt.with_timezone(&Utc).timestamp_micros()));
     }
-    // Naive datetime: treated as UTC.
+    // Naive datetime: treated as UTC. Checked BEFORE date/time, because a
+    // `datetime` is also a `date` in Python and extracting it as one would
+    // silently drop the clock.
     if let Ok(dt) = obj.extract::<NaiveDateTime>() {
         return Ok(Value::Timestamp(dt.and_utc().timestamp_micros()));
     }
+    if let Ok(d) = obj.extract::<chrono::NaiveDate>() {
+        return Ok(Value::Date(
+            i64::from(d.num_days_from_ce()) - i64::from(UNIX_EPOCH_CE_DAYS),
+        ));
+    }
+    if let Ok(t) = obj.extract::<chrono::NaiveTime>() {
+        use chrono::Timelike;
+        return Ok(Value::Time(
+            i64::from(t.num_seconds_from_midnight()) * 1_000_000
+                + i64::from(t.nanosecond() / 1000),
+        ));
+    }
+    // `decimal.Decimal` binds as an exact decimal, never through a float.
+    if obj.get_type().name().is_ok_and(|n| n == "Decimal") {
+        let s = obj.str()?.extract::<String>()?;
+        if let Some(n) = mpedb::parse_numeric(&s) {
+            return Ok(Value::Numeric(n));
+        }
+    }
     Err(PyTypeError::new_err(format!(
         "cannot bind {} as an mpedb parameter \
-         (expected None, bool, int, float, str, bytes/bytearray, or datetime)",
+         (expected None, bool, int, float, str, bytes/bytearray, datetime, \
+         date, time, or Decimal)",
         obj.get_type()
     )))
 }
+
+/// Days from the proleptic-Gregorian epoch (year 1, day 1 — what chrono's
+/// `num_days_from_ce` counts) to 1970-01-01, which is where mpedb's `Date`
+/// counts from.
+const UNIX_EPOCH_CE_DAYS: i32 = 719_163;
 
 /// Value -> Python. Timestamps come back as timezone-aware
 /// `datetime.datetime` in UTC.
@@ -160,6 +187,31 @@ pub(crate) fn value_to_py<'py>(py: Python<'py>, v: Value) -> PyResult<Bound<'py,
                 ))
             })?
             .into_bound_py_any(py),
+        // The types a PostgreSQL client asks for, in the Python objects it
+        // expects back: `datetime.date`, `datetime.time`, `decimal.Decimal`.
+        // Anything else here would be the round trip silently failing — a
+        // `date` coming back as the integer 18_264 is the bug this whole type
+        // surface exists to close.
+        Value::Date(days) => chrono::NaiveDate::from_num_days_from_ce_opt(
+            days.saturating_add(i64::from(UNIX_EPOCH_CE_DAYS)).try_into().unwrap_or(i32::MAX),
+        )
+        .ok_or_else(|| OperationalError::new_err(format!("stored date out of range: {days} days")))?
+        .into_bound_py_any(py),
+        Value::Time(us) => chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+            (us.div_euclid(1_000_000)).try_into().unwrap_or(u32::MAX),
+            (us.rem_euclid(1_000_000) * 1000) as u32,
+        )
+        .ok_or_else(|| {
+            OperationalError::new_err(format!("stored time out of range: {us} microseconds"))
+        })?
+        .into_bound_py_any(py),
+        // Through `decimal.Decimal`'s TEXT constructor, which is exact — the
+        // float constructor is not, and this type exists precisely so the
+        // digits survive.
+        Value::Numeric(n) => py
+            .import("decimal")?
+            .getattr("Decimal")?
+            .call1((n,)),
         // A context list (§2.6) is param-only, so no query result can contain
         // one. Render it as a Python list anyway rather than erroring: this is
         // an output conversion, and the shape maps exactly.

@@ -13,8 +13,16 @@ use std::os::raw::c_int;
 pub fn sqlite_type(v: &Value) -> c_int {
     match v {
         Value::Null => SQLITE_NULL,
-        Value::Int(_) | Value::Bool(_) | Value::Timestamp(_) => SQLITE_INTEGER,
-        Value::Float(_) => SQLITE_FLOAT,
+        Value::Int(_)
+        | Value::Bool(_)
+        | Value::Timestamp(_)
+        | Value::Date(_)
+        | Value::Time(_) => SQLITE_INTEGER,
+        // sqlite has no exact decimal, and this shim answers as sqlite. FLOAT
+        // is what a `NUMERIC`-affinity column reports there; it must agree
+        // with `expr::scalar`'s `typeof`, which says `real` for the same
+        // reason — "typeof and column_type never disagree" is a total claim.
+        Value::Numeric(_) | Value::Float(_) => SQLITE_FLOAT,
         Value::Text(_) => SQLITE_TEXT,
         Value::Blob(_) => SQLITE_BLOB,
         // A context List is param-only and never appears in a result row; treat
@@ -118,7 +126,10 @@ pub fn as_bytes(v: &Value) -> Option<Vec<u8>> {
         Value::Blob(b) => Some(b.clone()),
         Value::Text(s) => Some(s.clone().into_bytes()),
         Value::Int(x) => Some(x.to_string().into_bytes()),
-        Value::Timestamp(t) => Some(t.to_string().into_bytes()),
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => {
+            Some(t.to_string().into_bytes())
+        }
+        Value::Numeric(n) => Some(n.clone().into_bytes()),
         Value::Bool(b) => Some((*b as i64).to_string().into_bytes()),
         Value::Float(f) => Some(fmt_float(*f).into_bytes()),
         Value::List(_) => Some(Vec::new()),

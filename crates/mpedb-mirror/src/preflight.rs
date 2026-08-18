@@ -236,7 +236,26 @@ fn check_value(c: &ColumnMap, v: &Value, kind: SourceKind) -> Option<(FindingKin
                 }
             }
         }
-        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Blob(_) | Value::Timestamp(_) => {}
+        // A real `numeric` column gets the same precision/scale check the text
+        // path above runs — the declaration is the source's, not mpedb's, and
+        // a value that will not fit it is a push that fails at the far end.
+        Value::Numeric(n) => {
+            let bt = base_type(&c.source_type).to_ascii_lowercase();
+            if kind != SourceKind::Sqlite && (bt == "numeric" || bt == "decimal") {
+                if let Some((p, sc)) = typmod(&c.source_type) {
+                    if let Some(f) = numeric_overflow(n, p, sc) {
+                        return Some((FindingKind::WontFit, f));
+                    }
+                }
+            }
+        }
+        Value::Int(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::Blob(_)
+        | Value::Timestamp(_)
+        | Value::Date(_)
+        | Value::Time(_) => {}
         Value::Null | Value::List(_) => {}
     }
 

@@ -166,9 +166,14 @@ fn parse_pk(s: &str, ct: ColumnType) -> Result<Value> {
             _ => return Err(Error::Corrupt(format!("bad bool PK `{s}`"))),
         },
         ColumnType::Text => Value::Text(s.to_string()),
-        ColumnType::Blob | ColumnType::Timestamp => {
+        ColumnType::Numeric => Value::Numeric(
+            mpedb_types::value::parse_numeric(s)
+                .ok_or_else(|| Error::Corrupt(format!("bad numeric PK `{s}`")))?,
+        ),
+        ColumnType::Blob | ColumnType::Timestamp | ColumnType::Date | ColumnType::Time => {
             return Err(Error::Unsupported(
-                "blob/timestamp primary keys are not yet supported for PostgreSQL pull".into(),
+                "blob/timestamp/date/time primary keys are not yet supported for PostgreSQL pull"
+                    .into(),
             ))
         }
     })
@@ -526,6 +531,12 @@ fn to_pg_text(v: &Value, c: &PgColumn) -> Option<String> {
         Value::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
         Value::Text(s) => Some(s.clone()),
         Value::Timestamp(us) => Some(us.to_string()),
+        // The integers mpedb stores; `pg_value_expr` casts them back.
+        Value::Date(d) => Some(d.to_string()),
+        Value::Time(t) => Some(t.to_string()),
+        // Its canonical text IS PostgreSQL's `numeric` input syntax, so this
+        // crosses exactly — no float in the middle.
+        Value::Numeric(n) => Some(n.clone()),
         Value::Blob(b) => Some(match c.pg_type.as_str() {
             "uuid" => uuid_string(b),
             _ => hex(b),

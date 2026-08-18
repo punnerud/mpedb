@@ -494,7 +494,33 @@ impl<'a> Parser<'a> {
         } else {
             joined
         };
-        let (ty, aff) = mpedb_types::ColumnType::declared(&joined);
+        // sqlite's affinity rules and PostgreSQL's type system are different
+        // languages, and running the PG dialect through the sqlite one is what
+        // made `DATE` a typeless column with NUMERIC affinity: the catalog
+        // reported it as `text`, and a `CAST` to it took sqlite's leading-number
+        // rule and turned '2020-01-02' into 2020.
+        //
+        // Under the PG dialect the declared name is resolved through the PG
+        // type table instead, which is the same table the mirror import and the
+        // wire protocol read — so a type resolves to ONE mpedb type no matter
+        // which door it came in. A name outside it is a NAMED refusal rather
+        // than a typeless column that accepts anything.
+        //
+        // The AFFINITY follows the TYPE, not the name. sqlite's affinity rule
+        // reads the spelling — `bytea` has no `BLOB` in it, `date` has no
+        // `INT` — so running a PG type name through it produces an affinity
+        // that contradicts the resolved type, and `Schema::validate` refuses
+        // exactly that ("column `x` is date with NUMERIC affinity"). It is
+        // also the right answer on its own terms: sqlite affinity is a rule
+        // about untyped storage, and a PG column is typed.
+        let (sqlite_ty, sqlite_aff) = mpedb_types::ColumnType::declared(&joined);
+        let (ty, aff) = if self.dialect == mpedb_types::Dialect::Postgres {
+            let ty =
+                crate::pg::types::column_type(&joined).map_err(|e| self.err_here(e.to_string()))?;
+            (ty, mpedb_types::Affinity::implied_by(ty))
+        } else {
+            (sqlite_ty, sqlite_aff)
+        };
         let decl = (!text.is_empty()).then(|| text.to_string());
         Ok((ty, aff, decl))
     }
@@ -712,6 +738,26 @@ impl<'a> Parser<'a> {
     /// column list to bind against — and the storage word defaults to `VIRTUAL`
     /// when absent, which is sqlite's default. Only ONE of the two words may
     /// appear: `STORED VIRTUAL` is a syntax error in sqlite and here.
+    /// The optional `( START WITH 1 INCREMENT BY 1 … )` after `AS IDENTITY`.
+    ///
+    /// Consumed and DROPPED, which is the same answer `serial` gets: mpedb's
+    /// generated key is the rowid-alias rule (#94) — a single-column
+    /// `INTEGER PRIMARY KEY` auto-assigns `max(rowid)+1` — and it has no
+    /// sequence to give a start or a step to. An identity column that is not
+    /// that shape simply has no auto-assignment, exactly as a non-PK `serial`
+    /// does not, and the difference is written down in COMPAT-PG.md rather
+    /// than papered over.
+    ///
+    /// `GENERATED ALWAYS AS IDENTITY` additionally REFUSES an explicit insert
+    /// in PostgreSQL, where mpedb's rowid alias accepts one. That is the same
+    /// widening `serial` already carries.
+    fn skip_identity_options(&mut self) -> Result<()> {
+        if self.peek() == Some(&Tok::LParen) {
+            let _ = self.capture_paren_source()?;
+        }
+        Ok(())
+    }
+
     fn parse_generated_tail(&mut self) -> Result<(String, mpedb_types::GeneratedKind)> {
         self.expect_kw(Kw::As, "AS")?;
         if self.peek() != Some(&Tok::LParen) {
@@ -836,11 +882,39 @@ impl<'a> Parser<'a> {
                 }
                 col.references = Some(self.references_clause(vec![col.name.clone()], None)?);
             } else if self.eat_word("GENERATED") {
-                // `GENERATED ALWAYS AS (…)`. The two words are one token pair in
-                // sqlite's grammar — `GENERATED` alone is absorbed into the
-                // declared TYPE there, which `declared_type`'s stop set makes
+                // TWO clauses share this word, and they mean different things:
+                //
+                //   GENERATED ALWAYS AS ( <expr> )                — sqlite's
+                //       generated column, handled below.
+                //   GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( … ) ]
+                //       — PostgreSQL's identity column, which is a SEQUENCE
+                //       default and not an expression at all.
+                //
+                // `GENERATED` alone is absorbed into the declared TYPE in
+                // sqlite's grammar, which `declared_type`'s stop set makes
                 // unreachable here, so a lone `GENERATED` is a clean error.
+                // `BY` is a KEYWORD token (`GROUP BY`, `ORDER BY`), so
+                // `eat_word` never matches it — the same trap the COMMENT
+                // parser hit with `ON`/`IS`. `DEFAULT`, `ALWAYS` and
+                // `IDENTITY` are ordinary identifiers and stay `*_word`.
+                if self.eat_kw(Kw::By) {
+                    self.expect_word("DEFAULT")?;
+                    self.expect_kw(Kw::As, "AS")?;
+                    self.expect_word("IDENTITY")?;
+                    self.skip_identity_options()?;
+                    continue;
+                }
                 self.expect_word("ALWAYS")?;
+                // `ALWAYS` forks: `AS IDENTITY` is the PG clause, `AS (` the
+                // sqlite one. Only the identity form consumes the `AS` here.
+                if matches!(self.peek(), Some(Tok::Kw(Kw::As)))
+                    && self.peek_word_at(1, "IDENTITY")
+                {
+                    self.expect_kw(Kw::As, "AS")?;
+                    self.expect_word("IDENTITY")?;
+                    self.skip_identity_options()?;
+                    continue;
+                }
                 if col.generated.is_some() {
                     return Err(self.err_here(format!(
                         "column `{}` is declared generated more than once",

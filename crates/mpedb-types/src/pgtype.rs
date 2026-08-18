@@ -102,22 +102,25 @@ pub const TYPES: &[PgType] = &[
     t("float8", 701, 8, Some(C::Float64), Exact),
     t("bpchar", 1042, -1, Some(C::Text), Widened),
     t("varchar", 1043, -1, Some(C::Text), Widened),
-    // A DATE is a day, and mpedb's Timestamp is microseconds. Round-tripping a
-    // date through it is lossless (midnight UTC); the widening verdict is what
-    // says a local write could produce a value PG's `date` cannot hold.
-    t("date", 1082, 4, Some(C::Timestamp), Widened),
-    // TIME has no date part, so it cannot be a Timestamp without inventing one.
-    // Microseconds since midnight is the honest carrier.
-    t("time", 1083, 8, Some(C::Int64), Widened),
+    // Days since the Unix epoch. It used to be carried as a Timestamp (midnight
+    // UTC) and a `time` as a plain Int64 — lossless as storage, but the CLIENT
+    // then got a `datetime` or an integer where it asked for a `date`, and a
+    // `DATE` column reported itself as `text` to every reflection query. Both
+    // are now types of their own, so the round trip is the same type it
+    // started as.
+    t("date", 1082, 4, Some(C::Date), Exact),
+    t("time", 1083, 8, Some(C::Time), Exact),
     t("timestamp", 1114, 8, Some(C::Timestamp), Exact),
     t("timestamptz", 1184, 8, Some(C::Timestamp), Exact),
     // No mapping: an interval is (months, days, micros) and collapsing it to a
     // single number is wrong for every calendar-aware operation.
     t("interval", 1186, 16, None, Exact),
     t("timetz", 1266, 12, None, Exact),
-    // Canonical decimal text. Lossless, and identical to PG's own wire text
-    // format — which is why this is the one carried type rather than a refusal.
-    t("numeric", 1700, -1, Some(C::Text), ViaText),
+    // An exact decimal, stored as the digits a client wrote. mpedb's `Numeric`
+    // keeps the SCALE (`1.00` reads back as `1.00`) and orders BY VALUE, which
+    // is what PostgreSQL's own `numeric` does — so this is `Exact` rather than
+    // the `ViaText` it was when the carrier was a plain `Text` column.
+    t("numeric", 1700, -1, Some(C::Numeric), Exact),
     t("uuid", 2950, 16, Some(C::Blob), ViaText),
     t("jsonb", 3802, -1, Some(C::Text), ViaText),
 ];
@@ -280,6 +283,9 @@ pub fn default_oid(ty: ColumnType) -> u32 {
         C::Text => 25,
         C::Blob => 17,
         C::Timestamp => 1184,
+        C::Date => 1082,
+        C::Time => 1083,
+        C::Numeric => 1700,
         C::Any => 25,
     }
 }
@@ -395,10 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn numeric_is_carried_as_text_and_says_so() {
-        let n = by_name("numeric").unwrap();
-        assert_eq!(n.mpedb, Some(C::Text));
-        assert_eq!(n.fidelity, ViaText);
+    fn numeric_date_and_time_are_types_of_their_own() {
+        // Each was carried by a wider type once, and each cost the client the
+        // type it asked for. `Exact` is the claim that no longer happens.
+        for (name, ty) in [
+            ("numeric", C::Numeric),
+            ("date", C::Date),
+            ("time", C::Time),
+        ] {
+            let t = by_name(name).unwrap();
+            assert_eq!(t.mpedb, Some(ty), "{name}");
+            assert_eq!(t.fidelity, Exact, "{name}");
+        }
     }
 
     #[test]
@@ -410,6 +424,9 @@ mod tests {
             C::Text,
             C::Blob,
             C::Timestamp,
+            C::Date,
+            C::Time,
+            C::Numeric,
             C::Any,
         ] {
             let oid = default_oid(ty);

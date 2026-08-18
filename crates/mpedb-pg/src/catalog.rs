@@ -90,7 +90,7 @@ pub fn table_name(schema: &str, name: &str) -> String {
     }
 }
 
-fn build(schema: &Schema) -> Result<Database, String> {
+fn build(schema: &Schema, comments: &[(String, String)]) -> Result<Database, String> {
     // A ZERO-table seed is legal (CLAUDE.md): the tables arrive via live DDL
     // below, which is exactly the shape this needs — the relation set is not
     // known until `catalog_relations()` is walked.
@@ -178,6 +178,9 @@ fn ddl_type(t: ColumnType) -> &'static str {
         ColumnType::Text => "TEXT",
         ColumnType::Blob => "BLOB",
         ColumnType::Timestamp => "TIMESTAMP",
+        ColumnType::Date => "DATE",
+        ColumnType::Time => "TIME",
+        ColumnType::Numeric => "NUMERIC",
         ColumnType::Any => "ANY",
     }
 }

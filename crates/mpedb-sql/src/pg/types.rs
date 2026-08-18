@@ -71,7 +71,10 @@ mod tests {
     fn a_resolvable_type_resolves() {
         assert_eq!(column_type("bigint").unwrap(), ColumnType::Int64);
         assert_eq!(column_type("varchar(64)").unwrap(), ColumnType::Text);
-        assert_eq!(column_type("numeric(10,2)").unwrap(), ColumnType::Text);
+        assert_eq!(column_type("numeric(10,2)").unwrap(), ColumnType::Numeric);
+        assert_eq!(column_type("date").unwrap(), ColumnType::Date);
+        assert_eq!(column_type("time").unwrap(), ColumnType::Time);
+        assert_eq!(column_type("timestamptz").unwrap(), ColumnType::Timestamp);
     }
 
     #[test]

@@ -242,6 +242,11 @@ pub fn converts_on_store(ty: ColumnType, affinity: Affinity, declared: bool) -> 
     match ty {
         ColumnType::Any => true,
         ColumnType::Int64 | ColumnType::Float64 | ColumnType::Text => declared,
+        // `Date`/`Time`/`Numeric` convert too, but NOT through affinity — see
+        // [`coerce_into`]. A literal in SQL has no type of its own in
+        // PostgreSQL either (`'2020-01-02'` is `unknown` until a column claims
+        // it), so this is that same coercion and not sqlite's guessing.
+        ColumnType::Date | ColumnType::Time | ColumnType::Numeric => declared,
         ColumnType::Bool | ColumnType::Timestamp | ColumnType::Blob => false,
     }
 }
@@ -265,13 +270,48 @@ fn affinity_can_change(affinity: Affinity, v: &Value) -> bool {
     }
 }
 
+/// The per-value guard, dispatching on the column's TYPE first.
+///
+/// For `Date`/`Time`/`Numeric` the conversion is [`coerce_into`], not affinity,
+/// so asking `affinity_can_change` would answer about the wrong rule — and it
+/// would answer `false` for the case that matters: a TEXT literal into a
+/// `Numeric` column, whose affinity is `Text` and whose `Text` arm only moves
+/// numbers. Everything else keeps sqlite's class check unchanged.
+fn value_can_change(ty: ColumnType, affinity: Affinity, v: &Value) -> bool {
+    match ty {
+        ColumnType::Date | ColumnType::Time | ColumnType::Numeric => {
+            !v.is_null() && v.column_type() != Some(ty)
+        }
+        _ => affinity_can_change(affinity, v),
+    }
+}
+
 /// [`converts_on_store`] applied: the value as this column stores it.
 pub fn store_into(ty: ColumnType, affinity: Affinity, declared: bool, v: Value) -> Value {
-    if converts_on_store(ty, affinity, declared) {
-        crate::expr::store_affinity(affinity, v)
-    } else {
-        v
+    if !converts_on_store(ty, affinity, declared) {
+        return v;
     }
+    match ty {
+        ColumnType::Date | ColumnType::Time | ColumnType::Numeric => coerce_into(ty, v),
+        _ => crate::expr::store_affinity(affinity, v),
+    }
+}
+
+/// A value on its way into a `Date`, `Time` or `Numeric` column.
+///
+/// This is the SAME conversion `CAST` performs under the PostgreSQL dialect —
+/// literally [`crate::expr::cast_typed`], not a second copy of its rules —
+/// because PostgreSQL treats them as one thing: a literal has no type until
+/// something claims it, and a `timestamp` written into a `date` column is
+/// truncated on assignment exactly as `::date` truncates it.
+///
+/// The difference is only what happens on failure. A cast RAISES; this leaves
+/// the value untouched for the type check that follows, which refuses it by
+/// name ("value of type text cannot be inserted into column `d` of type
+/// date"). So this can never turn a refusal into a wrong answer — the worst it
+/// does is nothing.
+fn coerce_into(ty: ColumnType, v: Value) -> Value {
+    crate::expr::cast_typed(&v, ty).unwrap_or(v)
 }
 
 impl ColumnDef {
@@ -658,7 +698,7 @@ impl TableDef {
     pub fn needs_store_affinity(&self, row: &[Value]) -> bool {
         row.iter()
             .zip(&self.columns)
-            .any(|(v, c)| c.converts_on_store() && affinity_can_change(c.affinity, v))
+            .any(|(v, c)| c.converts_on_store() && value_can_change(c.ty, c.affinity, v))
     }
 
     /// Apply each column's store-time affinity to a row about to be written —

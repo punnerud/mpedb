@@ -287,13 +287,21 @@ mod tests {
         // The load-bearing property: PG dialect ADDS spellings, it does not
         // reinterpret existing ones. Anything else would be a silent corpus
         // mover the moment a session picked postgres.
+        //
+        // `[` is the ONE deliberate exception, and it is not in this list: the
+        // PG dialect owns it as a SUBSCRIPT, so `[brack]` is three tokens there
+        // and one quoted identifier under sqlite. That trade is asserted
+        // explicitly (both halves) in
+        // `the_postgres_dialect_takes_the_bracket_back_from_identifier_quoting` — the
+        // point of keeping it out of here rather than dropping the property is
+        // that every OTHER byte still has to agree.
         for sql in [
             "SELECT a, b FROM t WHERE c = 1 AND d <> 'x'",
             "SELECT a || b, a -> 'k', a ->> 'k' FROM t",
             "SELECT ~a, a & b, a | b, a << 2, a >> 2 FROM t",
             "SELECT x'00ff', 1.5, .5, -3 FROM t",
             "INSERT INTO t VALUES ($1, ?, 'it''s')",
-            "SELECT \"quoted\", `back`, [brack] FROM t",
+            "SELECT \"quoted\", `back` FROM t",
             "SELECT a != b, a <= b, a >= b FROM t",
         ] {
             assert_eq!(lite(sql).unwrap(), pg(sql), "dialects disagreed on: {sql}");

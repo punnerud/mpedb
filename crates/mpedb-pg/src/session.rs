@@ -789,15 +789,38 @@ impl<S: Read + Write> Session<S> {
 
     /// Build the `RowDescription` for a result.
     ///
-    /// The type OID comes from the first non-NULL value in each column. That is
-    /// exact for every non-empty result and for every column that has at least
-    /// one value; an all-NULL or empty column reports `text`, which is what
-    /// PostgreSQL reports for an untyped NULL literal too. The alternative —
-    /// asking the compiled plan — only answers for columns that are bare
-    /// references to base-table columns (`CompiledPlan::output_decltypes`), so
-    /// it would be exact in a strict subset of these cases and wrong-looking in
-    /// the rest.
-    fn describe_rows(&self, columns: &[String], rows: &[Vec<Value>]) -> Vec<FieldDesc> {
+    /// Two sources, in this order:
+    ///
+    /// 1. **The DECLARED type**, where the plan can name one — an output column
+    ///    that is a bare reference to a base-table column
+    ///    (`CompiledPlan::output_decltypes`). This is the authority, because
+    ///    mpedb's STORAGE type is coarser than PostgreSQL's: `uuid` and `bytea`
+    ///    are both `Blob`, so a value alone reports `bytea` for a `uuid`
+    ///    column and the client hands back bytes where it was promised a UUID.
+    ///    It also answers for an EMPTY result, which a value never can.
+    /// 2. Otherwise the first non-NULL VALUE in the column — exact for
+    ///    anything computed, which has no declared type to read.
+    ///
+    /// An all-NULL, empty, computed column reports `text`, which is what
+    /// PostgreSQL reports for an untyped NULL literal too.
+    fn describe_rows(&self, sql: &str, columns: &[String], rows: &[Vec<Value>]) -> Vec<FieldDesc> {
+        // A statement the planner cannot compile here (a catalog query is
+        // REWRITTEN before execution, so the original text names tables this
+        // does not see) simply yields no declared types and falls through to
+        // the value — never an error, since this is only a description.
+        let declared: Vec<Option<u32>> = self
+            .db
+            .output_decltypes(sql)
+            .map(|v| {
+                v.into_iter()
+                    .map(|d| {
+                        d.as_deref()
+                            .and_then(mpedb_types::pgtype::by_name)
+                            .map(|t| t.oid)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         columns
             .iter()
             .enumerate()

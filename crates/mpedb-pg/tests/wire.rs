@@ -352,6 +352,59 @@ fn a_rolled_back_block_leaves_nothing_behind() {
     assert_eq!(rows(&out).last().unwrap(), &vec![Some("0".into())]);
 }
 
+/// **Pins a KNOWN DIVERGENCE**, so it is a fact on the record rather than a
+/// surprise: DDL is transactional in PostgreSQL, and is not here.
+///
+/// `BEGIN; CREATE TABLE rb …; ROLLBACK` leaves `rb` BEHIND, because DDL is
+/// applied immediately rather than buffered into the block (see `is_dml`).
+/// The next statement wanting that name gets `duplicate table name` — 52 of
+/// them in one SQLAlchemy suite run.
+///
+/// If you fix it, this test fails, and that is the point: change the `1` to a
+/// `0` and delete this paragraph.
+#[test]
+fn a_rolled_back_block_does_not_undo_its_ddl_yet() {
+    let out = run(vec![
+        query("BEGIN"),
+        query("CREATE TABLE rb (x INTEGER)"),
+        query("ROLLBACK"),
+        query("SELECT count(*) FROM pg_class WHERE relname = 'rb'"),
+    ]);
+    assert_eq!(rows(&out).last().unwrap(), &vec![Some("1".into())]);
+}
+
+/// The control for the test above: a COMMITTED block still applies its DDL.
+/// Without this, "undo the DDL" could have been implemented as "never apply
+/// it" and looked correct.
+#[test]
+fn a_committed_block_keeps_its_ddl() {
+    let out = run(vec![
+        query("BEGIN"),
+        query("CREATE TABLE kept (x INTEGER)"),
+        query("COMMIT"),
+        query("SELECT count(*) FROM pg_class WHERE relname = 'kept'"),
+    ]);
+    assert_eq!(rows(&out).last().unwrap(), &vec![Some("1".into())]);
+}
+
+/// A catalog query inside the block sees the DDL the block has done. Today
+/// that is because DDL is applied immediately; it kept holding when the DDL
+/// was buffered instead (the catalog is then read off a replay of the log),
+/// so this states the PROPERTY rather than either mechanism.
+#[test]
+fn an_in_block_catalog_query_sees_the_blocks_own_ddl() {
+    let out = run(vec![
+        query("BEGIN"),
+        query("CREATE TABLE midblock (x INTEGER)"),
+        query("SELECT count(*) FROM pg_class WHERE relname = 'midblock'"),
+        query("ROLLBACK"),
+    ]);
+    assert!(
+        rows(&out).iter().any(|r| r == &vec![Some("1".into())]),
+        "the block's own CREATE TABLE was invisible to its own catalog query"
+    );
+}
+
 #[test]
 fn a_failed_statement_inside_a_block_poisons_it_the_way_postgresql_does() {
     // Everything but ROLLBACK is refused until the block ends. Not reproducing

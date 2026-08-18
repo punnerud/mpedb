@@ -517,6 +517,14 @@ impl<'a> Parser<'a> {
         self.toks.get(self.pos).map(|t| &t.tok)
     }
 
+    /// Is the token `n` ahead the bare word `w`? The two-token lookahead
+    /// `GENERATED ALWAYS AS …` needs to tell `AS IDENTITY` (PostgreSQL's
+    /// identity column) from `AS (` (sqlite's generated column) BEFORE
+    /// consuming the `AS`.
+    fn peek_word_at(&self, n: usize, w: &str) -> bool {
+        matches!(self.peek_at(n), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(w))
+    }
+
     fn peek_at(&self, n: usize) -> Option<&Tok> {
         self.toks.get(self.pos + n).map(|t| &t.tok)
     }

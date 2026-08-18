@@ -37,9 +37,15 @@ pub fn encode_value_collated(buf: &mut Vec<u8>, v: &Value, coll: Collation) {
 pub fn encode_value(buf: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Null => buf.push(TAG_NULL),
-        Value::Int(x) | Value::Timestamp(x) => {
+        // `Date` and `Time` join this arm: all four are i64 scalars, and the
+        // sign-flipped big-endian image is the memcmp order of an i64.
+        Value::Int(x) | Value::Timestamp(x) | Value::Date(x) | Value::Time(x) => {
             buf.push(TAG_PRESENT);
             buf.extend_from_slice(&((*x as u64) ^ (1 << 63)).to_be_bytes());
+        }
+        Value::Numeric(n) => {
+            buf.push(TAG_PRESENT);
+            encode_numeric(buf, n);
         }
         Value::Float(x) => {
             buf.push(TAG_PRESENT);
@@ -220,6 +226,14 @@ const CLASS_TEXT: u8 = 0x02;
 const CLASS_BLOB: u8 = 0x03;
 const CLASS_BOOL: u8 = 0x04;
 const CLASS_TS: u8 = 0x05;
+/// Like `Bool`/`Timestamp`: mpedb-native, so a rank of its own above BLOB.
+const CLASS_DATE: u8 = 0x06;
+const CLASS_TIME: u8 = 0x07;
+/// NUMERIC groups by its CANONICAL text, so `1.0` and `1.00` are one group —
+/// PostgreSQL's own equality for the type. It does not share `CLASS_NUM` with
+/// Int/Float: a rigid numeric column holds only numerics, and merging the
+/// classes would need an exact decimal↔binary comparison to be correct.
+const CLASS_NUMERIC: u8 = 0x08;
 
 /// Numeric sub-tags, ordered. A number is keyed as `(floor, sub, [bits])`:
 /// `NUM_EXACT` means the value IS that integer (9 bytes, no `bits`), the other
@@ -286,12 +300,181 @@ pub fn encode_group_value(buf: &mut Vec<u8>, v: &Value, coll: Collation) {
             buf.push(CLASS_TS);
             buf.extend_from_slice(&((*x as u64) ^ (1 << 63)).to_be_bytes());
         }
+        Value::Date(x) => {
+            buf.push(CLASS_DATE);
+            buf.extend_from_slice(&((*x as u64) ^ (1 << 63)).to_be_bytes());
+        }
+        Value::Time(x) => {
+            buf.push(CLASS_TIME);
+            buf.extend_from_slice(&((*x as u64) ^ (1 << 63)).to_be_bytes());
+        }
+        Value::Numeric(n) => {
+            buf.push(CLASS_NUMERIC);
+            encode_numeric(buf, n);
+        }
         // Same reasoning as `encode_value`: a context list is param-only and
         // can never be a key.
         Value::List(_) => unreachable!(
             "a context list reached group-key encoding — it is param-only (DESIGN-MULTIDB §2.6)"
         ),
     }
+}
+
+/// Sign classes for [`encode_numeric`], in value order. A `numeric` is exact,
+/// so the encoding cannot go through an f64 — but it still has to be MEMCMP
+/// ordered, because this is what an index, a UNIQUE tree and a PK are keyed by
+/// and a wrong order there is a wrong answer, not a slow one.
+const DEC_NEG_INF: u8 = 0x00;
+const DEC_NEG: u8 = 0x01;
+const DEC_ZERO: u8 = 0x02;
+const DEC_POS: u8 = 0x03;
+const DEC_POS_INF: u8 = 0x04;
+/// Above everything, which is PostgreSQL's rule for `numeric` NaN — unlike
+/// float NaN, it is the LARGEST value rather than an incomparable one.
+const DEC_NAN: u8 = 0x05;
+/// Not a decimal at all. [`Value::Numeric`] is a public variant, so nothing
+/// stops a caller building one out of arbitrary text, and a key encoder may
+/// not panic and may not quietly file junk under a real number's key. It gets
+/// a class of its own, above every value, and round-trips as itself.
+const DEC_INVALID: u8 = 0x06;
+
+/// Encode an exact decimal so that memcmp order **is** numeric order.
+///
+/// The value is written in scientific form — `± 0.d₁d₂… × 10^E` with `d₁ ≠ 0`
+/// and no trailing zero — as `[sign class][E, biased BE u32][digits][0x00]`.
+/// Normalising the significand is what makes it INJECTIVE: `1230` has to key
+/// as `123 × 10⁴` and never as `1230 × 10⁴`, or one value would have two keys
+/// and a UNIQUE tree would hold it twice.
+///
+/// Digits are ASCII, so every one of them is above the `0x00` terminator: a
+/// shorter significand is a prefix and sorts BELOW the longer one that extends
+/// it (`0.5 < 0.51`), which is the order a decimal actually has.
+///
+/// For a NEGATIVE value every byte after the sign class is complemented —
+/// exponent and digits alike — which reverses the whole comparison in one
+/// step, terminator included (`0xFF` now sits above the complemented digits,
+/// so the longer significand sorts first and `-0.51 < -0.5`).
+///
+/// `1.0` and `1.00` key IDENTICALLY. That is not a lossy shortcut: PostgreSQL
+/// compares `numeric` by value, so they ARE one value, one group and one
+/// UNIQUE key. The stored row still holds the spelling that was written.
+pub(crate) fn encode_numeric(buf: &mut Vec<u8>, s: &str) {
+    // An exponent literal keys as the number it IS: `1e3` and `1000` are one
+    // value, and two keys for one value would be two rows under UNIQUE.
+    // `canonical_numeric` deliberately leaves exponents alone, so ask the
+    // strict parser for those and pay its allocation only when there is one.
+    let c = if s.bytes().any(|b| b == b'e' || b == b'E') {
+        crate::value::parse_numeric(s).unwrap_or_else(|| s.trim().to_string())
+    } else {
+        crate::value::canonical_numeric(s)
+    };
+    match c.as_str() {
+        "NaN" => return buf.push(DEC_NAN),
+        "Infinity" => return buf.push(DEC_POS_INF),
+        "-Infinity" => return buf.push(DEC_NEG_INF),
+        _ => {}
+    }
+    let (neg, body) = match c.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, c.as_str()),
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    // Not a plain decimal — see `DEC_INVALID`.
+    if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        buf.push(DEC_INVALID);
+        encode_bytes(buf, c.as_bytes());
+        return;
+    }
+    let all: String = format!("{int_part}{frac_part}");
+    let lead = all.len() - all.trim_start_matches('0').len();
+    let sig = all.trim_start_matches('0').trim_end_matches('0');
+    if sig.is_empty() {
+        return buf.push(DEC_ZERO);
+    }
+    // The point sits `int_part.len()` places into the digit string; dropping
+    // `lead` leading zeros moves it that much closer to the front.
+    let exp = int_part.len() as i64 - lead as i64;
+    let biased = ((exp as i32) as u32) ^ 0x8000_0000;
+
+    buf.push(if neg { DEC_NEG } else { DEC_POS });
+    if neg {
+        buf.extend(biased.to_be_bytes().iter().map(|b| !b));
+        buf.extend(sig.bytes().map(|b| !b));
+        buf.push(0xFF);
+    } else {
+        buf.extend_from_slice(&biased.to_be_bytes());
+        buf.extend_from_slice(sig.as_bytes());
+        buf.push(0x00);
+    }
+}
+
+/// The inverse of [`encode_numeric`]: rebuilds the canonical plain decimal.
+/// Every read is bounds-checked — a truncated or corrupt key is
+/// [`Error::Corrupt`], never a panic.
+pub(crate) fn decode_numeric(buf: &[u8], pos: &mut usize) -> Result<String> {
+    let err = || Error::Corrupt("truncated numeric key".into());
+    let cls = *buf.get(*pos).ok_or_else(err)?;
+    *pos += 1;
+    let neg = match cls {
+        DEC_NAN => return Ok("NaN".into()),
+        DEC_POS_INF => return Ok("Infinity".into()),
+        DEC_NEG_INF => return Ok("-Infinity".into()),
+        DEC_ZERO => return Ok("0".into()),
+        DEC_NEG => true,
+        DEC_POS => false,
+        DEC_INVALID => {
+            let bytes = decode_bytes(buf, pos)?;
+            return String::from_utf8(bytes)
+                .map_err(|_| Error::Corrupt("invalid utf-8 in numeric key".into()));
+        }
+        _ => return Err(Error::Corrupt(format!("invalid numeric key class {cls:#x}"))),
+    };
+    let raw = buf.get(*pos..*pos + 4).ok_or_else(err)?;
+    *pos += 4;
+    let mut b4 = [0u8; 4];
+    for (i, &x) in raw.iter().enumerate() {
+        b4[i] = if neg { !x } else { x };
+    }
+    let exp = ((u32::from_be_bytes(b4) ^ 0x8000_0000) as i32) as i64;
+
+    let term = if neg { 0xFF } else { 0x00 };
+    let mut sig = String::new();
+    loop {
+        let b = *buf.get(*pos).ok_or_else(err)?;
+        *pos += 1;
+        if b == term {
+            break;
+        }
+        let d = if neg { !b } else { b };
+        if !d.is_ascii_digit() {
+            return Err(Error::Corrupt("non-digit in numeric key".into()));
+        }
+        sig.push(d as char);
+        // The significand is bounded by the same limit the parser enforces, so
+        // a key claiming more than that is corrupt rather than merely large.
+        if sig.len() as i64 > crate::value::NUMERIC_MAX_WEIGHT {
+            return Err(Error::Corrupt("numeric key significand too long".into()));
+        }
+    }
+    if sig.is_empty() {
+        return Err(Error::Corrupt("empty numeric key significand".into()));
+    }
+    // Both bounds are the parser's, so a key that survives here rebuilds into
+    // a string whose length is bounded too.
+    if exp > crate::value::NUMERIC_MAX_WEIGHT
+        || sig.len() as i64 - exp > crate::value::NUMERIC_MAX_SCALE
+    {
+        return Err(Error::Corrupt(format!("numeric key exponent {exp} out of range")));
+    }
+    let plain = if exp <= 0 {
+        format!("0.{}{}", "0".repeat((-exp) as usize), sig)
+    } else if exp as usize >= sig.len() {
+        format!("{}{}", sig, "0".repeat(exp as usize - sig.len()))
+    } else {
+        let (a, b) = sig.split_at(exp as usize);
+        format!("{a}.{b}")
+    };
+    Ok(if neg { format!("-{plain}") } else { plain })
 }
 
 /// The numeric payload: `(floor as i64, sub-tag, [f64 image])`.
@@ -371,16 +554,24 @@ pub fn decode_value(buf: &[u8], pos: &mut usize, ty: ColumnType) -> Result<Value
     }
     match ty {
         ColumnType::Any => unreachable!("handled above"),
-        ColumnType::Int64 | ColumnType::Timestamp => {
+        // The four i64 scalars share one encoding and differ only in which
+        // `Value` they decode back to — the COLUMN says which, which is the
+        // whole reason these are separate types.
+        ColumnType::Int64
+        | ColumnType::Timestamp
+        | ColumnType::Date
+        | ColumnType::Time => {
             let raw = buf.get(*pos..*pos + 8).ok_or_else(err)?;
             *pos += 8;
             let x = (u64::from_be_bytes(raw.try_into().unwrap()) ^ (1 << 63)) as i64;
-            Ok(if ty == ColumnType::Int64 {
-                Value::Int(x)
-            } else {
-                Value::Timestamp(x)
+            Ok(match ty {
+                ColumnType::Int64 => Value::Int(x),
+                ColumnType::Timestamp => Value::Timestamp(x),
+                ColumnType::Date => Value::Date(x),
+                _ => Value::Time(x),
             })
         }
+        ColumnType::Numeric => Ok(Value::Numeric(decode_numeric(buf, pos)?)),
         ColumnType::Float64 => {
             let raw = buf.get(*pos..*pos + 8).ok_or_else(err)?;
             *pos += 8;
@@ -536,6 +727,24 @@ mod tests {
             ColumnType::Any => unreachable!("`any` cannot be a key column"),
             ColumnType::Int64 => Value::Int(rng.next() as i64 >> (rng.next() % 64)),
             ColumnType::Timestamp => Value::Timestamp(rng.next() as i64 >> (rng.next() % 64)),
+            ColumnType::Date => Value::Date(rng.next() as i64 >> (rng.next() % 64)),
+            ColumnType::Time => Value::Time(rng.next() as i64 >> (rng.next() % 64)),
+            // Canonical spellings only: `decode(encode(v)) == v` is the
+            // property under test, and decode answers with the canonical form
+            // by construction. That `1.0` and `1.00` share a key is a separate
+            // claim, pinned by `equal_values_share_one_key`.
+            ColumnType::Numeric => {
+                let specials = ["0", "NaN", "Infinity", "-Infinity"];
+                if rng.next().is_multiple_of(7) {
+                    let i = (rng.next() % specials.len() as u64) as usize;
+                    return Value::Numeric(specials[i].to_string());
+                }
+                let neg = rng.next().is_multiple_of(2);
+                let int = rng.next() % 100_000;
+                let frac = rng.next() % 100_000;
+                let s = crate::value::canonical_numeric(&format!("{int}.{frac:05}"));
+                Value::Numeric(if neg && s != "0" { format!("-{s}") } else { s })
+            }
             ColumnType::Float64 => {
                 let choices = [
                     f64::from_bits(rng.next()),
@@ -585,6 +794,9 @@ mod tests {
             ColumnType::Text,
             ColumnType::Blob,
             ColumnType::Timestamp,
+            ColumnType::Date,
+            ColumnType::Time,
+            ColumnType::Numeric,
         ];
         let mut rng = Rng(0x9e3779b97f4a7c15);
         for &ty in &types {
@@ -751,6 +963,10 @@ mod tests {
             ColumnType::Float64,
             ColumnType::Text,
             ColumnType::Blob,
+            ColumnType::Timestamp,
+            ColumnType::Date,
+            ColumnType::Time,
+            ColumnType::Numeric,
         ];
         let mut rng = Rng(0x243f6a8885a308d3);
         for _ in 0..20000 {
@@ -973,5 +1189,157 @@ mod tests {
         }
         assert!(decode_key(&[0x06], &[ColumnType::Any]).is_err());
         assert!(decode_key(&[0x04, 0x07], &[ColumnType::Any]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod numeric_key_tests {
+    use super::*;
+    use std::cmp::Ordering;
+    use crate::value::{numeric_cmp, parse_numeric};
+
+    fn enc(s: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        encode_numeric(&mut b, s);
+        b
+    }
+
+    fn dec(bytes: &[u8]) -> Result<String> {
+        let mut p = 0;
+        let out = decode_numeric(bytes, &mut p)?;
+        assert_eq!(p, bytes.len(), "decode must consume exactly its own bytes");
+        Ok(out)
+    }
+
+    /// The whole reason this encoding is not just the canonical text: memcmp
+    /// order has to BE numeric order, or an index answers wrong.
+    #[test]
+    fn memcmp_order_is_numeric_order() {
+        // Deliberately includes the pairs a lexical encoding gets wrong:
+        // 9 vs 10, 0.5 vs 0.51, and every sign crossing.
+        let ordered = [
+            "-Infinity",
+            "-12345678901234567890.5",
+            "-100",
+            "-10",
+            "-9.9",
+            "-9",
+            "-1.0001",
+            "-1",
+            "-0.51",
+            "-0.5",
+            "-0.00001",
+            "0",
+            "0.00001",
+            "0.5",
+            "0.51",
+            "1",
+            "1.0001",
+            "9",
+            "9.9",
+            "10",
+            "100",
+            "12345678901234567890.5",
+            "Infinity",
+            "NaN",
+        ];
+        for w in ordered.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            assert!(enc(a) < enc(b), "key order: {a} !< {b}");
+            assert_eq!(numeric_cmp(a, b), Ordering::Less, "value order: {a} !< {b}");
+        }
+    }
+
+    /// Equal by VALUE means equal by KEY — PostgreSQL's rule for the type, and
+    /// what makes `1.0` and `1.00` one row under a UNIQUE index.
+    #[test]
+    fn equal_values_share_one_key() {
+        for (a, b) in [
+            ("1.0", "1.00"),
+            ("1", "1.000"),
+            ("0", "-0"),
+            ("0", "0.000"),
+            ("+5", "5"),
+            ("0100", "100"),
+            ("-1.50", "-1.5"),
+        ] {
+            assert_eq!(enc(a), enc(b), "{a} vs {b}");
+            assert_eq!(numeric_cmp(a, b), Ordering::Equal, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn roundtrips_through_the_canonical_form() {
+        for s in [
+            "0", "1", "-1", "1.5", "-1.5", "0.5", "-0.5", "100", "-100", "0.00001", "-0.00001",
+            "1230", "123000000", "0.000000000000001", "NaN", "Infinity", "-Infinity",
+            "12345678901234567890.12345678901234567890",
+        ] {
+            assert_eq!(dec(&enc(s)).unwrap(), crate::value::canonical_numeric(s), "case {s}");
+        }
+        // Non-canonical spellings decode as the value, not as what was written.
+        assert_eq!(dec(&enc("1.00")).unwrap(), "1");
+        assert_eq!(dec(&enc("-0.000")).unwrap(), "0");
+        assert_eq!(dec(&enc("1e3")).unwrap(), "1000");
+    }
+
+    /// An exponent literal keys as the number it IS, so `1e3` and `1000` are
+    /// one key and cannot become two rows under a UNIQUE index.
+    #[test]
+    fn exponent_forms_key_as_their_expansion() {
+        for (a, b) in [("1e3", "1000"), ("1E3", "1000"), ("1.5e-3", "0.0015"), ("-2e2", "-200")] {
+            let pa = parse_numeric(a).unwrap();
+            assert_eq!(enc(&pa), enc(b), "{a} vs {b}");
+        }
+    }
+
+    /// Every decoder gets this, per the project convention: a truncated key is
+    /// `Corrupt`, never a panic and never a short read that succeeds.
+    #[test]
+    fn truncation_at_every_offset_is_corrupt_not_panic() {
+        for s in ["0", "1.5", "-1.5", "12345678901234567890.5", "NaN", "-Infinity"] {
+            let full = enc(s);
+            for n in 0..full.len() {
+                let mut p = 0;
+                let r = decode_numeric(&full[..n], &mut p);
+                assert!(r.is_err(), "{s} truncated to {n} bytes decoded as {r:?}");
+            }
+            assert!(dec(&full).is_ok(), "{s} full");
+        }
+    }
+
+    #[test]
+    fn corrupt_bytes_are_refused_by_name() {
+        // Unknown sign class.
+        assert!(decode_numeric(&[0x09], &mut 0).is_err());
+        // Positive class, exponent, then a non-digit before the terminator.
+        assert!(decode_numeric(&[DEC_POS, 0x80, 0, 0, 1, b'x', 0x00], &mut 0).is_err());
+        // Positive class with an EMPTY significand — `0` has its own class, so
+        // this cannot be a legal encoding of anything.
+        assert!(decode_numeric(&[DEC_POS, 0x80, 0, 0, 1, 0x00], &mut 0).is_err());
+    }
+
+    /// A numeric in a composite key round-trips beside its neighbours, and the
+    /// field boundary is exact — the terminator must not eat the next column.
+    #[test]
+    fn composite_key_with_a_numeric_column() {
+        let types = [ColumnType::Int64, ColumnType::Numeric, ColumnType::Text];
+        for n in ["0", "-1.5", "1000", "NaN"] {
+            let row = [
+                Value::Int(7),
+                Value::Numeric(n.to_string()),
+                Value::Text("tail".into()),
+            ];
+            let k = encode_key(&row);
+            assert_eq!(
+                decode_key(&k, &types).unwrap(),
+                vec![
+                    Value::Int(7),
+                    Value::Numeric(crate::value::canonical_numeric(n)),
+                    Value::Text("tail".into()),
+                ],
+                "{n}"
+            );
+        }
     }
 }

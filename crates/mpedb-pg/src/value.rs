@@ -18,6 +18,49 @@ use mpedb_types::Value;
 /// `None` means SQL NULL, which the caller writes as a -1 length rather than as
 /// any string — the difference between NULL and `''` never reaches this
 /// function.
+/// Render a value as the text of the PostgreSQL type the `RowDescription`
+/// promised, which is not always what the mpedb value renders as on its own.
+///
+/// The two MUST agree. `uuid` and `bytea` are both `Blob`, so once the
+/// description says `uuid` (from the column's declared type) a raw
+/// `\x8e2082b3…` in the data row makes the client raise "badly formed
+/// hexadecimal UUID string" — it was promised a UUID and handed bytea.
+pub fn to_text_as(v: &Value, oid: u32) -> Option<Vec<u8>> {
+    match (oid, v) {
+        // int2vector (22) and oidvector (30) are ARRAYS that PostgreSQL prints
+        // SPACE-separated and unbraced, not in the `{…}` array form — and
+        // clients parse exactly that. `pg_index.indkey` is the one every ORM
+        // reads, so getting this wrong changes what a reflected composite
+        // index looks like.
+        (22 | 30, Value::List(items)) => {
+            let parts: Vec<String> = items
+                .iter()
+                .map(|x| match to_text(x) {
+                    Some(b) => String::from_utf8_lossy(&b).into_owned(),
+                    None => "0".to_string(),
+                })
+                .collect();
+            Some(parts.join(" ").into_bytes())
+        }
+        // 2950 = uuid: canonical 8-4-4-4-12 lowercase hex.
+        (2950, Value::Blob(b)) if b.len() == 16 => {
+            let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+            Some(
+                format!(
+                    "{}-{}-{}-{}-{}",
+                    &hex[0..8],
+                    &hex[8..12],
+                    &hex[12..16],
+                    &hex[16..20],
+                    &hex[20..32]
+                )
+                .into_bytes(),
+            )
+        }
+        _ => to_text(v),
+    }
+}
+
 pub fn to_text(v: &Value) -> Option<Vec<u8>> {
     Some(match v {
         Value::Null => return None,
@@ -41,11 +84,82 @@ pub fn to_text(v: &Value) -> Option<Vec<u8>> {
             out
         }
         Value::Timestamp(us) => timestamp_text(*us).into_bytes(),
-        // A context list is a parameter-only value that can never be stored, so
-        // it can never be in a result row either. Rendering it as its debug
-        // form would be a wrong answer; there is no PG text for it.
-        Value::List(_) => return None,
+        // `date` and `time` print the way PostgreSQL prints them — the whole
+        // point of storing them as their own types rather than as integers is
+        // that the client gets a `datetime.date` back instead of `19723`.
+        Value::Date(days) => mpedb_types::value::date_text(*days).into_bytes(),
+        Value::Time(us) => mpedb_types::value::time_text(*us).into_bytes(),
+        // Nothing to convert: PostgreSQL's text form for `numeric` IS the
+        // canonical decimal string mpedb stores.
+        Value::Numeric(n) => n.as_bytes().to_vec(),
+        // An ARRAY, in PostgreSQL's own external representation. A list
+        // reaches here two ways: as the result of `array_agg`, and as the
+        // session-context list that is parameter-only — the second cannot be
+        // in a result row, so what this renders is always the first.
+        Value::List(items) => array_text(items),
     })
+}
+
+/// PostgreSQL's array external representation: `{1,2,3}`, `{}` for empty, the
+/// bare word `NULL` for a null element.
+///
+/// An element is quoted when it could not otherwise be read back: when it is
+/// empty, contains a delimiter, brace, quote, backslash or whitespace, or
+/// would be mistaken for the null marker. Inside quotes `"` and `\` escape.
+fn array_text(items: &[Value]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + items.len() * 8);
+    out.push(b'{');
+    for (i, v) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        match to_text(v) {
+            // A NULL ELEMENT is the unquoted word; `"NULL"` is the STRING.
+            None => out.extend_from_slice(b"NULL"),
+            Some(raw) => {
+                let needs_quote = raw.is_empty()
+                    || raw.eq_ignore_ascii_case(b"null")
+                    || raw.iter().any(|b| {
+                        matches!(b, b'{' | b'}' | b',' | b'"' | b'\\') || b.is_ascii_whitespace()
+                    });
+                if !needs_quote {
+                    out.extend_from_slice(&raw);
+                } else {
+                    out.push(b'"');
+                    for b in raw {
+                        if b == b'"' || b == b'\\' {
+                            out.push(b'\\');
+                        }
+                        out.push(b);
+                    }
+                    out.push(b'"');
+                }
+            }
+        }
+    }
+    out.push(b'}');
+    out
+}
+
+/// The `pg_type.oid` of the ARRAY whose elements are `v`.
+///
+/// PostgreSQL has one array type per element type and a client decodes by it,
+/// so this decides whether `array_agg(n)` comes back as a list of ints or a
+/// list of strings. Taken from the first non-NULL element, which is the same
+/// rule `RowDescription` uses for a scalar column; an all-NULL or empty array
+/// reports `text[]`, the one every element can be read as.
+pub fn array_oid_for(items: &[Value]) -> u32 {
+    match items.iter().find_map(|v| v.column_type()) {
+        Some(mpedb_types::ColumnType::Int64) => 1016,   // int8[]
+        Some(mpedb_types::ColumnType::Float64) => 1022, // float8[]
+        Some(mpedb_types::ColumnType::Bool) => 1000,    // bool[]
+        Some(mpedb_types::ColumnType::Blob) => 1001,    // bytea[]
+        Some(mpedb_types::ColumnType::Timestamp) => 1185, // timestamptz[]
+        Some(mpedb_types::ColumnType::Date) => 1182,    // date[]
+        Some(mpedb_types::ColumnType::Time) => 1183,    // time[]
+        Some(mpedb_types::ColumnType::Numeric) => 1231, // numeric[]
+        _ => 1009,                                      // text[]
+    }
 }
 
 fn hex_digit(n: u8) -> u8 {
@@ -147,6 +261,21 @@ pub fn from_text(raw: Option<&[u8]>, want: Option<mpedb_types::ColumnType>) -> R
         Some(C::Bool) => Value::Bool(parse_bool(s.trim())?),
         Some(C::Blob) => Value::Blob(parse_bytea(s)?),
         Some(C::Timestamp) => Value::Timestamp(parse_timestamp(s.trim())?),
+        // Through the shared calendar in `mpedb_types::value`: the store-time
+        // coercion and `CAST` parse dates with the same code, and three copies
+        // of a leap-year rule is three chances to disagree.
+        Some(C::Date) => Value::Date(
+            mpedb_types::value::parse_date_text(s)
+                .ok_or_else(|| format!("invalid input syntax for type date: \"{s}\""))?,
+        ),
+        Some(C::Time) => Value::Time(
+            mpedb_types::value::parse_time_text(s)
+                .ok_or_else(|| format!("invalid input syntax for type time: \"{s}\""))?,
+        ),
+        Some(C::Numeric) => Value::Numeric(
+            mpedb_types::value::parse_numeric(s)
+                .ok_or_else(|| format!("invalid input syntax for type numeric: \"{s}\""))?,
+        ),
     })
 }
 
@@ -493,5 +622,179 @@ mod tests {
         assert!(f("NaN").is_nan());
         assert_eq!(f("Infinity"), f64::INFINITY);
         assert_eq!(f("-Infinity"), f64::NEG_INFINITY);
+    }
+}
+
+#[cfg(test)]
+mod date_time_numeric_tests {
+    use super::*;
+
+    fn txt(v: &Value) -> String {
+        String::from_utf8(to_text(v).unwrap()).unwrap()
+    }
+
+    /// A `date` prints as a date and a `time` as a clock — the assertion that
+    /// was silently false while both were integers.
+    #[test]
+    fn they_print_the_way_postgresql_prints_them() {
+        assert_eq!(txt(&Value::Date(0)), "1970-01-01");
+        assert_eq!(txt(&Value::Date(18_263)), "2020-01-02");
+        assert_eq!(txt(&Value::Date(-1)), "1969-12-31");
+        assert_eq!(txt(&Value::Time(0)), "00:00:00");
+        assert_eq!(txt(&Value::Time(11_045_000_000)), "03:04:05");
+        assert_eq!(txt(&Value::Time(11_045_001_500)), "03:04:05.0015");
+        assert_eq!(txt(&Value::Time(86_399_999_999)), "23:59:59.999999");
+        // A numeric crosses as its own digits, with no float in the middle.
+        assert_eq!(txt(&Value::Numeric("1.00".into())), "1.00");
+        assert_eq!(
+            txt(&Value::Numeric("123456789012345678901234567890.5".into())),
+            "123456789012345678901234567890.5"
+        );
+    }
+
+    #[test]
+    fn a_client_literal_round_trips_through_the_parser() {
+        use mpedb_types::ColumnType as C;
+        for (ty, lit) in [
+            (C::Date, "2020-01-02"),
+            (C::Date, "1970-01-01"),
+            (C::Date, "0001-01-01"),
+            (C::Time, "03:04:05"),
+            (C::Time, "00:00:00"),
+            (C::Time, "23:59:59.999999"),
+            (C::Time, "03:04:05.0015"),
+            (C::Numeric, "1.00"),
+            (C::Numeric, "-0.0001"),
+            (C::Numeric, "12345678901234567890"),
+        ] {
+            let v = from_text(Some(lit.as_bytes()), Some(ty))
+                .unwrap_or_else(|e| panic!("{lit}: {e}"));
+            assert_eq!(txt(&v), lit, "{lit}");
+        }
+        // `HH:MM` is legal input; it prints back with the seconds PG prints.
+        let v = from_text(Some(b"03:04"), Some(mpedb_types::ColumnType::Time)).unwrap();
+        assert_eq!(txt(&v), "03:04:00");
+        // A numeric's canonical form is what comes back, not the spelling.
+        let v = from_text(Some(b"1e3"), Some(mpedb_types::ColumnType::Numeric)).unwrap();
+        assert_eq!(txt(&v), "1000");
+    }
+
+    /// Bad input is `invalid input syntax for type <t>`, naming the type — the
+    /// message PostgreSQL sends and SQLAlchemy's tests match on. Nothing here
+    /// may take a leading number and call it a value.
+    #[test]
+    fn bad_input_is_refused_by_name() {
+        use mpedb_types::ColumnType as C;
+        for (ty, lit, want) in [
+            (C::Date, "2020", "date"),
+            (C::Date, "2020-13-01", "date"),
+            (C::Date, "abc", "date"),
+            (C::Date, "2020-01-02 03:04:05", "date"),
+            (C::Time, "3", "time"),
+            (C::Time, "25:00:00", "time"),
+            (C::Time, "03:04:05+02", "time"),
+            (C::Numeric, "1.2.3", "numeric"),
+            (C::Numeric, "abc", "numeric"),
+        ] {
+            let e = from_text(Some(lit.as_bytes()), Some(ty))
+                .expect_err(&format!("{lit} should be refused"));
+            assert!(
+                e.contains("invalid input syntax for type") && e.contains(want),
+                "{lit}: {e}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod oid_aware_rendering {
+    use super::*;
+
+    /// The `RowDescription` and the `DataRow` must agree. Once the description
+    /// says `uuid` — which it does as soon as the column's DECLARED type is
+    /// read — sending the bytea spelling makes the client raise "badly formed
+    /// hexadecimal UUID string".
+    #[test]
+    fn a_uuid_column_renders_as_a_uuid_not_as_bytea() {
+        let raw: Vec<u8> = vec![
+            0x8e, 0x20, 0x82, 0xb3, 0x99, 0x60, 0x4d, 0x69, 0x92, 0x5a, 0x0f, 0xa5, 0xb9, 0x78,
+            0xc5, 0x4b,
+        ];
+        let v = Value::Blob(raw.clone());
+        assert_eq!(
+            String::from_utf8(to_text_as(&v, 2950).unwrap()).unwrap(),
+            "8e2082b3-9960-4d69-925a-0fa5b978c54b"
+        );
+        // …and the SAME bytes under the bytea oid keep the bytea spelling.
+        assert_eq!(
+            String::from_utf8(to_text_as(&v, 17).unwrap()).unwrap(),
+            "\\x8e2082b399604d69925a0fa5b978c54b"
+        );
+    }
+
+    /// A blob that is not 16 bytes is not a UUID however the description is
+    /// labelled; it keeps the bytea spelling rather than being truncated or
+    /// padded into one.
+    #[test]
+    fn a_wrong_length_blob_is_not_dressed_up_as_a_uuid() {
+        let v = Value::Blob(vec![1, 2, 3]);
+        assert_eq!(to_text_as(&v, 2950), to_text(&v));
+        assert_eq!(to_text_as(&Value::Null, 2950), None);
+    }
+}
+
+#[cfg(test)]
+mod array_rendering {
+    use super::*;
+
+    fn txt(v: &Value) -> String {
+        String::from_utf8(to_text(v).unwrap()).unwrap()
+    }
+
+    /// PostgreSQL's array external representation, including the two cases a
+    /// naive join gets wrong: an element that must be QUOTED, and a NULL
+    /// element, which is the bare word and not the string `"NULL"`.
+    #[test]
+    fn arrays_render_the_way_postgresql_renders_them() {
+        assert_eq!(txt(&Value::List(vec![])), "{}");
+        assert_eq!(
+            txt(&Value::List(vec![Value::Int(1), Value::Int(2)])),
+            "{1,2}"
+        );
+        assert_eq!(
+            txt(&Value::List(vec![
+                Value::Text("a".into()),
+                Value::Null,
+                Value::Text("b, c".into()),
+            ])),
+            "{a,NULL,\"b, c\"}"
+        );
+        // The STRING "NULL" is quoted so it cannot be read back as the marker,
+        // and an empty string needs quoting to exist at all.
+        assert_eq!(
+            txt(&Value::List(vec![Value::Text("NULL".into()), Value::Text(String::new())])),
+            "{\"NULL\",\"\"}"
+        );
+        // Quotes and backslashes escape.
+        assert_eq!(
+            txt(&Value::List(vec![Value::Text("a\"b\\c".into())])),
+            "{\"a\\\"b\\\\c\"}"
+        );
+        // Braces and whitespace force quoting too.
+        assert_eq!(txt(&Value::List(vec![Value::Text("{x}".into())])), "{\"{x}\"}");
+    }
+
+    /// The element type picks the ARRAY type, because the client decodes by
+    /// it: `array_agg(n)` must come back as a list of ints, not of strings.
+    #[test]
+    fn the_element_type_picks_the_array_oid() {
+        assert_eq!(array_oid_for(&[Value::Int(1)]), 1016);
+        assert_eq!(array_oid_for(&[Value::Text("a".into())]), 1009);
+        assert_eq!(array_oid_for(&[Value::Bool(true)]), 1000);
+        // A leading NULL does not decide it; the first typed element does.
+        assert_eq!(array_oid_for(&[Value::Null, Value::Int(1)]), 1016);
+        // All-NULL and empty fall back to text[], which every element reads as.
+        assert_eq!(array_oid_for(&[Value::Null]), 1009);
+        assert_eq!(array_oid_for(&[]), 1009);
     }
 }

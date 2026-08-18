@@ -737,6 +737,21 @@ fn encode_row(row: &[Value]) -> Vec<u8> {
                 out.push(6);
                 out.extend_from_slice(&t.to_le_bytes());
             }
+            // Tags follow `ColumnType`'s discriminants, so these three are 8/9/10
+            // and not the next free number — one numbering to get wrong.
+            Value::Date(d) => {
+                out.push(8);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            Value::Time(t) => {
+                out.push(9);
+                out.extend_from_slice(&t.to_le_bytes());
+            }
+            Value::Numeric(n) => {
+                out.push(10);
+                out.extend_from_slice(&(n.len() as u64).to_le_bytes());
+                out.extend_from_slice(n.as_bytes());
+            }
             // Never stored (the row codec refuses lists).
             Value::List(_) => out.push(7),
         }
@@ -1337,7 +1352,11 @@ fn to_sq(v: &Value) -> rusqlite::types::Value {
         Value::Bool(b) => S::Integer(*b as i64),
         Value::Text(t) => S::Text(t.clone()),
         Value::Blob(b) => S::Blob(b.clone()),
-        Value::Timestamp(t) => S::Integer(*t),
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => S::Integer(*t),
+        // sqlite has no exact decimal, so the canonical TEXT is what crosses —
+        // pushing it through a float is the precision loss the type prevents,
+        // and sqlite's own NUMERIC affinity will read the digits back.
+        Value::Numeric(n) => S::Text(n.clone()),
         // Never stored: the row codec refuses lists (DESIGN-MULTIDB §2.6).
         Value::List(_) => S::Null,
     }

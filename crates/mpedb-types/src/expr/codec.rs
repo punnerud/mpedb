@@ -84,6 +84,9 @@ const OP_CONCAT_N: u8 = 64;
 /// NULL. Two opcodes, not a flag — see [`Instr::DivStrict`].
 const OP_DIV_STRICT: u8 = 65;
 const OP_MOD_STRICT: u8 = 66;
+/// The PostgreSQL dialect's typed `CAST` — see [`Instr::CastPg`]. Payload is a
+/// 4-byte little-endian PostgreSQL type OID.
+const OP_CAST_PG: u8 = 67;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -190,6 +193,10 @@ impl ExprProgram {
                 Instr::Cast(aff) => {
                     buf.push(OP_CAST);
                     buf.push(aff as u8);
+                }
+                Instr::CastPg(oid) => {
+                    buf.push(OP_CAST_PG);
+                    buf.extend_from_slice(&oid.to_le_bytes());
                 }
                 Instr::Concat => buf.push(OP_CONCAT),
                 Instr::BitAnd => buf.push(OP_BIT_AND),
@@ -349,6 +356,18 @@ impl ExprProgram {
                         Affinity::from_tag(t)
                             .ok_or_else(|| Error::Corrupt("bad CAST affinity tag".into()))?,
                     )
+                }
+                OP_CAST_PG => {
+                    let raw = buf.get(*pos..*pos + 4).ok_or_else(err)?;
+                    *pos += 4;
+                    let oid = u32::from_le_bytes(raw.try_into().unwrap());
+                    // Validated HERE rather than at eval: a plan blob naming a
+                    // type this build does not have is corrupt, and a decoder
+                    // that accepts it would defer the error to a row.
+                    if crate::pgtype::by_oid(oid).is_none() {
+                        return Err(Error::Corrupt(format!("bad CAST PostgreSQL oid {oid}")));
+                    }
+                    Instr::CastPg(oid)
                 }
                 OP_CONCAT => Instr::Concat,
                 OP_BIT_AND => Instr::BitAnd,
@@ -560,7 +579,7 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     // Pops the probe scalar, pushes the 3VL result; the list comes
                     // from a param slot, not the stack, so the arity is not here.
                     Instr::InParam(_) | Instr::InParamColl(..) => (1, 1),
-                    Instr::Cast(_) | Instr::Affinity(_) => (1, 1),
+                    Instr::Cast(_) | Instr::CastPg(_) | Instr::Affinity(_) => (1, 1),
                     Instr::Concat => (2, 1),
                     Instr::ConcatN(n) => (n as usize, 1),
                     // n list elements plus the probe beneath them. n == 0 is the

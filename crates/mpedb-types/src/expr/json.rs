@@ -722,7 +722,12 @@ fn value_to_node<'a>(v: &Value, what: &str) -> Result<Node<'a>> {
         Value::Int(i) => Node::Num(Cow::Owned(i.to_string())),
         // mpedb's Timestamp has no sqlite counterpart; it renders as the
         // integer it renders as everywhere else (`quote`, `||`, CAST).
-        Value::Timestamp(t) => Node::Num(Cow::Owned(t.to_string())),
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => {
+            Node::Num(Cow::Owned(t.to_string()))
+        }
+        // A NUMERIC's canonical text is a JSON number as-is — routing it
+        // through f64 to emit it is the precision loss the type prevents.
+        Value::Numeric(n) => Node::Num(Cow::Owned(n.clone())),
         // JSON *has* booleans, and mpedb's Bool is a first-class type with no
         // sqlite counterpart to agree or disagree with, so it becomes a JSON
         // boolean rather than sqlite's 1/0 integer.
@@ -872,7 +877,13 @@ pub(super) fn json_valid(args: &[Value]) -> Result<Value> {
         },
         // A number's own text IS a JSON document, so sqlite answers 1 without
         // parsing anything (`json_valid(5)` and `json_valid(5.5)` are both 1).
-        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Timestamp(_) => Value::Int(1),
+        Value::Int(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::Timestamp(_)
+        | Value::Date(_)
+        | Value::Time(_)
+        | Value::Numeric(_) => Value::Int(1),
         // sqlite reads a BLOB as JSONB and answers 0 for anything that is not
         // one under grammar bit 1; mpedb agrees on the answer without needing
         // JSONB (`json_valid(x'6162')` is 0 in both).

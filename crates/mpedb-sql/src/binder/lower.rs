@@ -76,8 +76,15 @@ pub(super) fn cast_result_type(aff: Affinity, src: Ty) -> Ty {
         Affinity::Text => T::Text,
         Affinity::Blob => T::Blob,
         Affinity::Numeric => match src {
-            Some(T::Int64) | Some(T::Bool) | Some(T::Timestamp) => T::Int64,
+            // `Date`/`Time` are i64 scalars, so they land where `Timestamp`
+            // does — this is the sqlite affinity rule, which knows nothing
+            // about calendars.
+            Some(T::Int64) | Some(T::Bool) | Some(T::Timestamp) | Some(T::Date)
+            | Some(T::Time) => T::Int64,
             Some(T::Float64) => T::Float64,
+            // Already exact: numeric affinity has nothing to apply, and
+            // applying it anyway would demote the value to a float.
+            Some(T::Numeric) => T::Numeric,
             // text, blob, or an already-`Any` source → per-value at runtime.
             Some(T::Text) | Some(T::Blob) | Some(T::Any) => T::Any,
             // NULL / untyped-parameter source: no static type.
@@ -223,7 +230,7 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
         BExpr::Like(a, _, _, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Glob(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Regexp(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
-        BExpr::Cast(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
+        BExpr::Cast(a, _) | BExpr::CastPg(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         // Never foldable: the list is a session value, not a literal.
         BExpr::InParam(..) | BExpr::InParamColl(..) => false,
         // A CASE is branching control flow, not a value-in/value-out node; the
@@ -314,6 +321,10 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
         BExpr::Cast(a, t) => {
             emit(a, instrs, consts)?;
             instrs.push(Instr::Cast(*t));
+        }
+        BExpr::CastPg(a, oid) => {
+            emit(a, instrs, consts)?;
+            instrs.push(Instr::CastPg(*oid));
         }
         BExpr::ConcatN(ops) => {
             for a in ops {

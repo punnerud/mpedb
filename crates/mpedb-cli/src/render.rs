@@ -21,7 +21,11 @@ pub fn value_str(v: &Value) -> String {
             }
             out
         }
-        Value::Timestamp(t) => t.to_string(),
+        // Date and time render as the integers they are, exactly as Timestamp
+        // does: this surface prints STORED values, and the calendar rendering
+        // belongs where a type OID says how to read them (the PG wire layer).
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => t.to_string(),
+        Value::Numeric(n) => n.clone(),
         // Param-only (§2.6), so no result cell holds one — but render it rather
         // than panicking if one ever surfaces (e.g. an EXPLAIN of a bound param).
         Value::List(items) => {

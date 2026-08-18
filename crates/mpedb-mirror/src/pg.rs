@@ -72,19 +72,23 @@ pub fn map_pg_type(typname: &str) -> Option<ColumnType> {
 pub fn pg_map_policy(typname: &str, mapped: ColumnType) -> MapPolicy {
     match typname {
         // same width, same semantics, both directions
-        "int8" | "float8" | "bool" | "text" | "bytea" | "timestamptz" | "timestamp" => {
-            MapPolicy::Exact
-        }
+        // `date`/`time`/`numeric` moved here from `Widened`/`ViaText` with the
+        // storage-type work: each now has an mpedb type of the same shape, so
+        // there is no widening a local write could exploit and no text form in
+        // the middle. Keep this in step with `pgtype::PgType::fidelity`, which
+        // makes the same claim for the same three.
+        "int8" | "float8" | "bool" | "text" | "bytea" | "timestamptz" | "timestamp" | "date"
+        | "time" | "numeric" => MapPolicy::Exact,
         // mpedb's type is WIDER than the source column: import was lossless, but
         // a LOCAL write can now exceed what the source accepts. This is the
         // class that fails at the target's INSERT — `int4` holding 2147483648
         // is exactly the error the PG fidelity work hit — so the pre-flight
         // keys off it.
-        "int2" | "int4" | "float4" | "varchar" | "bpchar" | "citext" | "name" | "date" | "time" => {
+        "int2" | "int4" | "float4" | "varchar" | "bpchar" | "citext" | "name" => {
             MapPolicy::Widened
         }
         // preserved through a canonical text/byte form
-        "numeric" | "json" | "jsonb" => MapPolicy::ViaText,
+        "json" | "jsonb" => MapPolicy::ViaText,
         "uuid" => MapPolicy::ViaText,
         // Unknown types are rejected by map_pg_type before we get here; if that
         // ever changes, do not claim fidelity we have not reasoned about.
@@ -307,8 +311,13 @@ mod tests {
         assert_eq!(map_pg_type("varchar"), Some(ColumnType::Text));
         assert_eq!(map_pg_type("bytea"), Some(ColumnType::Blob));
         assert_eq!(map_pg_type("timestamptz"), Some(ColumnType::Timestamp));
-        assert_eq!(map_pg_type("date"), Some(ColumnType::Timestamp));
-        assert_eq!(map_pg_type("numeric"), Some(ColumnType::Text));
+        // `date`, `time` and `numeric` are types of their OWN since the PG
+        // storage-type work: carrying a date as a midnight Timestamp and a
+        // numeric as Text was lossless, but the far side then got back a
+        // different type than it sent.
+        assert_eq!(map_pg_type("date"), Some(ColumnType::Date));
+        assert_eq!(map_pg_type("time"), Some(ColumnType::Time));
+        assert_eq!(map_pg_type("numeric"), Some(ColumnType::Numeric));
         assert_eq!(map_pg_type("uuid"), Some(ColumnType::Blob));
         assert_eq!(map_pg_type("jsonb"), Some(ColumnType::Text));
         // unrepresentable → None

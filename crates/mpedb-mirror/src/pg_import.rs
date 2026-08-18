@@ -47,6 +47,16 @@ pub(crate) fn read_expr(c: &PgColumn) -> String {
         },
         // micros since the Unix epoch (timestamptz/timestamp/date)
         Some(ColumnType::Timestamp) => format!("(extract(epoch from {col}) * 1000000)::int8"),
+        // days since the Unix epoch, and micros since midnight — the same
+        // integers mpedb stores, so the client decodes them as int8 and no
+        // calendar arithmetic happens on this side.
+        Some(ColumnType::Date) => format!("({col}::date - DATE '1970-01-01')::int8"),
+        Some(ColumnType::Time) => {
+            format!("(extract(epoch from {col}::time) * 1000000)::int8")
+        }
+        // Text, because that is the only form that keeps every digit: the
+        // `postgres` client has no exact-decimal primitive without a feature.
+        Some(ColumnType::Numeric) => format!("{col}::numeric::text"),
         None => "NULL".to_string(), // unreachable: rejected at build_schema
     }
 }
@@ -77,6 +87,13 @@ pub(crate) fn read_value(row: &postgres::Row, i: usize, ty: ColumnType) -> Value
         ColumnType::Timestamp => row
             .get::<usize, Option<i64>>(i)
             .map_or(Value::Null, Value::Timestamp),
+        ColumnType::Date => row.get::<usize, Option<i64>>(i).map_or(Value::Null, Value::Date),
+        ColumnType::Time => row.get::<usize, Option<i64>>(i).map_or(Value::Null, Value::Time),
+        // A `numeric` PostgreSQL itself rendered is always parseable; if it
+        // somehow is not, keep the text rather than inventing a number.
+        ColumnType::Numeric => row.get::<usize, Option<String>>(i).map_or(Value::Null, |s| {
+            Value::Numeric(mpedb_types::value::parse_numeric(&s).unwrap_or(s))
+        }),
     }
 }
 
@@ -547,7 +564,11 @@ mod tests {
         assert_eq!(col("sku").source_type, "character varying(64)");
 
         // and the honest verdicts
-        assert_eq!(col("price").policy, MapPolicy::ViaText, "numeric->Text keeps the digits");
+        // Exact since `numeric` became a type of its own: the digits AND the
+        // scale survive, so there is no text form in the middle to be honest
+        // about. (This test is `#[ignore]`d for want of a PostgreSQL, which is
+        // why the claim had to be corrected by hand rather than by a red run.)
+        assert_eq!(col("price").policy, MapPolicy::Exact, "numeric is an exact decimal now");
         assert_eq!(col("qty").policy, MapPolicy::Widened, "int4->Int64: a local write can overflow it");
         assert_eq!(col("made").policy, MapPolicy::Exact);
         assert_eq!(col("tags").policy, MapPolicy::ViaText);

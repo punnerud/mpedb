@@ -73,6 +73,15 @@ pub(crate) mod types {
     pub(crate) fn is_serial(_decl: &str) -> bool {
         false
     }
+
+    /// INERT, per the rule above: without the feature there is no PG type
+    /// table to resolve against, so the declared name goes back through
+    /// sqlite's affinity rule — which is what the DDL did before the fork.
+    /// Refusing here would make a build without the feature reject schemas a
+    /// build with it accepts, for types that have nothing to do with it.
+    pub(crate) fn column_type(decl: &str) -> mpedb_types::Result<mpedb_types::ColumnType> {
+        Ok(mpedb_types::ColumnType::declared(decl).0)
+    }
 }
 
 #[cfg(not(feature = "pg-dialect"))]

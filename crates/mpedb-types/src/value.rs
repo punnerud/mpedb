@@ -31,6 +31,24 @@ pub enum ColumnType {
     /// Keeping the tag in the fixed slot leaves those untouched, and a rigid
     /// column pays nothing for a feature it does not use.
     Any = 7,
+    /// Days since the Unix epoch, UTC. PostgreSQL's `date`.
+    ///
+    /// Its own type rather than a [`ColumnType::Timestamp`] at midnight,
+    /// because the two are DIFFERENT PostgreSQL types and a client that asks
+    /// the catalog gets one answer for a column: reporting `timestamp` for a
+    /// `DATE` column is a wrong answer, and reflection reads exactly that.
+    Date = 8,
+    /// Microseconds since midnight. PostgreSQL's `time without time zone`.
+    Time = 9,
+    /// An EXACT decimal, stored as its canonical text.
+    ///
+    /// Text storage is not a shortcut: `pgtype.rs` already classifies
+    /// `numeric` as `ViaText` — "lossless as long as the far side is the same
+    /// type" — and a float cannot hold `1e-14` and `1.00` and tell them from
+    /// each other. ORDERING goes through the numeric key encoding, so it is by
+    /// VALUE: `1.0` and `1.00` store distinctly and key identically, which is
+    /// PostgreSQL's own equality rule for `numeric`, not a compromise.
+    Numeric = 10,
 }
 
 impl ColumnType {
@@ -43,6 +61,9 @@ impl ColumnType {
             5 => ColumnType::Blob,
             6 => ColumnType::Timestamp,
             7 => ColumnType::Any,
+            8 => ColumnType::Date,
+            9 => ColumnType::Time,
+            10 => ColumnType::Numeric,
             _ => return None,
         })
     }
@@ -56,6 +77,9 @@ impl ColumnType {
             "blob" | "bytes" => ColumnType::Blob,
             "timestamp" => ColumnType::Timestamp,
             "any" => ColumnType::Any,
+            "date" => ColumnType::Date,
+            "time" => ColumnType::Time,
+            "numeric" | "decimal" => ColumnType::Numeric,
             _ => return None,
         })
     }
@@ -185,6 +209,9 @@ impl ColumnType {
             ColumnType::Blob => "blob",
             ColumnType::Timestamp => "timestamp",
             ColumnType::Any => "any",
+            ColumnType::Date => "date",
+            ColumnType::Time => "time",
+            ColumnType::Numeric => "numeric",
         }
     }
 
@@ -201,6 +228,9 @@ impl ColumnType {
             ColumnType::Text => "TEXT",
             ColumnType::Blob => "BLOB",
             ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::Date => "DATE",
+            ColumnType::Time => "TIME",
+            ColumnType::Numeric => "NUMERIC",
             ColumnType::Any => return None,
         })
     }
@@ -293,9 +323,19 @@ impl Affinity {
     /// [`ColumnType::declared`], never from the storage type.
     pub fn implied_by(ty: ColumnType) -> Affinity {
         match ty {
-            ColumnType::Int64 | ColumnType::Bool | ColumnType::Timestamp => Affinity::Integer,
+            // `Date`/`Time` are i64 scalars like `Timestamp`, so a value that
+            // reaches them is an integer.
+            ColumnType::Int64
+            | ColumnType::Bool
+            | ColumnType::Timestamp
+            | ColumnType::Date
+            | ColumnType::Time => Affinity::Integer,
             ColumnType::Float64 => Affinity::Real,
-            ColumnType::Text => Affinity::Text,
+            // `Numeric` stores canonical TEXT, and its affinity has to say so:
+            // this is the affinity a value is COERCED to on the way in, and
+            // coercing a decimal to a float is the exactness loss the type
+            // exists to prevent.
+            ColumnType::Text | ColumnType::Numeric => Affinity::Text,
             ColumnType::Blob | ColumnType::Any => Affinity::Blob,
         }
     }
@@ -344,6 +384,12 @@ pub enum Value {
     Blob(Vec<u8>),
     /// Microseconds since the Unix epoch, UTC.
     Timestamp(i64),
+    /// Days since the Unix epoch, UTC — see [`ColumnType::Date`].
+    Date(i64),
+    /// Microseconds since midnight — see [`ColumnType::Time`].
+    Time(i64),
+    /// An exact decimal in canonical text form — see [`ColumnType::Numeric`].
+    Numeric(String),
     /// **A session-context list — a parameter value only, never a stored one**
     /// (design/DESIGN-MULTIDB.md §2.6). It exists so `col IN (current_setting('k'))`
     /// can bind a variable-length membership set to ONE reserved slot: the
@@ -373,6 +419,9 @@ impl Value {
             Value::Text(_) => ColumnType::Text,
             Value::Blob(_) => ColumnType::Blob,
             Value::Timestamp(_) => ColumnType::Timestamp,
+            Value::Date(_) => ColumnType::Date,
+            Value::Time(_) => ColumnType::Time,
+            Value::Numeric(_) => ColumnType::Numeric,
             // A list is not storable, so it has no column type. `fits` uses this
             // to reject it from every column, which is what we want: the only
             // legal home for a List is a context param slot.
@@ -435,6 +484,11 @@ impl Value {
             (Text(a), Text(b)) => a.as_bytes().cmp(b.as_bytes()),
             (Blob(a), Blob(b)) => a.cmp(b),
             (Timestamp(a), Timestamp(b)) => a.cmp(b),
+            (Date(a), Date(b)) => a.cmp(b),
+            (Time(a), Time(b)) => a.cmp(b),
+            // By VALUE, never by spelling: `1.0` and `1.00` are one number,
+            // which is PostgreSQL's own rule for the type.
+            (Numeric(a), Numeric(b)) => numeric_cmp(a, b),
             // Lists have no ordering and comparing one is always a bug in the
             // caller, not a NULL: say so rather than silently yielding NULL,
             // which in a policy predicate would read as "row not visible" and
@@ -713,7 +767,20 @@ fn class_rank(v: &Value) -> Option<u8> {
         Value::Int(_) | Value::Float(_) => 1,
         Value::Text(_) => 2,
         Value::Blob(_) => 3,
-        Value::Null | Value::Bool(_) | Value::Timestamp(_) | Value::List(_) => return None,
+        Value::Null
+        // A NUMERIC does NOT rank with the numbers, tempting as that is. This
+        // function is only ever reached for a pair `sql_cmp` refused, and a
+        // rank makes every such pair COMPARE — so ranking it 1 would make
+        // `Numeric("2")` and `Int(1)` equal, silently, because the rank is all
+        // that would be looked at. It is mpedb-native like Bool/Timestamp: no
+        // sqlite class to rank against, so a mixed pair stays peers until an
+        // exact decimal↔binary comparison exists to answer it properly.
+        | Value::Numeric(_)
+        | Value::Bool(_)
+        | Value::Timestamp(_)
+        | Value::Date(_)
+        | Value::Time(_)
+        | Value::List(_) => return None,
     })
 }
 
@@ -786,6 +853,539 @@ pub fn exact_float_as_int(f: f64) -> Option<i64> {
     (i >= i64::MIN as i128 && i <= i64::MAX as i128).then_some(i as i64)
 }
 
+/// The canonical text of a decimal: the spelling two EQUAL numerics share.
+///
+/// PostgreSQL's `numeric` compares by VALUE, so `1.0` and `1.00` are one
+/// value and must group as one and compare as equal. mpedb stores the text a
+/// client wrote, so equality needs a spelling that depends only on the value:
+/// no leading `+`, no insignificant zeros on either end, no `-0`, and `.`
+/// dropped when nothing follows it.
+///
+/// Deliberately textual and total: anything this cannot recognise as a decimal
+/// is returned trimmed and unchanged, so a value that arrived from somewhere
+/// unexpected keys as itself rather than as a silently different number.
+pub fn canonical_numeric(s: &str) -> String {
+    let t = s.trim();
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    // Exponent forms are left alone: normalising `1e3` to `1000` is a decision
+    // about how many digits a value HAS, and getting it wrong here would move
+    // rows between groups.
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return t.to_string();
+    }
+    let (int_part, frac_part) = match digits.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (digits, ""),
+    };
+    let int_trimmed = int_part.trim_start_matches('0');
+    let frac_trimmed = frac_part.trim_end_matches('0');
+    let int_final = if int_trimmed.is_empty() { "0" } else { int_trimmed };
+    let mut out = String::with_capacity(t.len());
+    // `-0` and `-0.000` are zero, and zero has no sign.
+    if neg && !(int_final == "0" && frac_trimmed.is_empty()) {
+        out.push('-');
+    }
+    out.push_str(int_final);
+    if !frac_trimmed.is_empty() {
+        out.push('.');
+        out.push_str(frac_trimmed);
+    }
+    out
+}
+
+/// The ELEMENTS of a value used as an array by a set-returning function.
+///
+/// Two shapes are accepted, and the second is the reason this function exists:
+///
+/// * a [`Value::List`] — an array that a query PRODUCED (`array_agg`), and
+/// * PostgreSQL's EXTERNAL TEXT form — `{1,2,3}` for an array literal and
+///   space-separated for an `int2vector`/`oidvector`. mpedb's catalog stores
+///   `pg_index.indkey` in that form because the catalog is materialized into a
+///   real table and a list has no row encoding, and `unnest(indkey)` is how
+///   every ORM reads a composite index's column list.
+///
+/// `None` means "not an array", which every caller turns into a NAMED refusal.
+/// A text that is not a vector literal is refused rather than treated as a
+/// one-element set: PostgreSQL cannot resolve `unnest('hello')` either, and
+/// silently answering one row would be a wrong answer, not a kindness.
+///
+/// NULL is the EMPTY set (`Some(vec![])`), matching `unnest(NULL)`.
+pub fn array_elements(v: &Value) -> Option<Vec<Value>> {
+    match v {
+        Value::List(items) => Some(items.clone()),
+        Value::Null => Some(Vec::new()),
+        Value::Text(s) => {
+            let t = s.trim();
+            // `{}` is the empty array; `{a,b}` is braced-and-comma-separated;
+            // anything else must be the space-separated vector form.
+            let (body, comma) = match t.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+                Some(inner) => (inner.trim(), true),
+                None => (t, false),
+            };
+            if body.is_empty() {
+                return Some(Vec::new());
+            }
+            let parts: Vec<&str> = if comma {
+                body.split(',').map(str::trim).collect()
+            } else {
+                body.split_whitespace().collect()
+            };
+            // Every element must be an integer. That is what the two vector
+            // types hold, and it is the check that keeps an ordinary sentence
+            // from parsing as a one-element array.
+            let mut out = Vec::with_capacity(parts.len());
+            for p in parts {
+                out.push(Value::Int(p.parse::<i64>().ok()?));
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// PostgreSQL's own limits on a `numeric`: at most this many digits before the
+/// decimal point, and this many after it. A literal outside them is refused by
+/// name rather than truncated — and they double as the bound that keeps
+/// [`parse_numeric`]'s exponent expansion from allocating without limit.
+pub const NUMERIC_MAX_WEIGHT: i64 = 131_072;
+pub const NUMERIC_MAX_SCALE: i64 = 16_383;
+
+/// Parse a decimal literal into the text a [`Value::Numeric`] stores, or `None`
+/// when it is not one.
+///
+/// Accepts what PostgreSQL's `numeric` input accepts: an optional sign, digits
+/// with an optional decimal point, an optional `e`-exponent, and the three
+/// special names (`NaN`, `Infinity`, `-Infinity`, case-insensitively, plus
+/// `inf`). An exponent is EXPANDED rather than kept — `1e3` stores as `1000`.
+///
+/// **The SCALE is kept.** `1.00` stores as `1.00`, not as `1`, because
+/// PostgreSQL's `numeric` carries its scale into its output and a client that
+/// wrote `Decimal("1.00")` gets `Decimal("1.00")` back. What is normalised is
+/// only what carries no information: a leading `+`, leading zeros on the
+/// integer part, and the sign of zero.
+///
+/// That makes this a DIFFERENT function from [`canonical_numeric`], and the
+/// split is the design: this one is the STORED form (scale preserved), that one
+/// is the KEY and COMPARISON form (scale erased, so `1.0` and `1.00` are one
+/// group and one UNIQUE key — PostgreSQL's own equality for the type). Storage
+/// is exact; ordering is by value.
+///
+/// It is also the strict counterpart to `canonical_numeric`, which is total by
+/// design and hands back anything it does not recognise unchanged. Use this one
+/// wherever a bad literal must become an ERROR (a `CAST`, a bound parameter, an
+/// import); use that one wherever a stored value is merely being re-keyed.
+pub fn parse_numeric(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    // The specials, by name. `NaN` has no sign in PostgreSQL (`-NaN` is `NaN`).
+    if body.eq_ignore_ascii_case("nan") {
+        return Some("NaN".to_string());
+    }
+    if body.eq_ignore_ascii_case("infinity") || body.eq_ignore_ascii_case("inf") {
+        return Some(if neg { "-Infinity".into() } else { "Infinity".into() });
+    }
+
+    let (mantissa, exp) = match body.find(['e', 'E']) {
+        Some(i) => {
+            let e = &body[i + 1..];
+            let e = if let Some(r) = e.strip_prefix('+') { r } else { e };
+            // A lone sign, an empty exponent or a non-numeric one is not a
+            // number; a HUGE one is caught by the weight check below.
+            let neg_e = e.starts_with('-');
+            let digits = if neg_e { &e[1..] } else { e };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // Saturating: an exponent that does not fit an i64 cannot fit the
+            // weight limit either, so it lands on the same refusal.
+            let mag: i64 = digits.parse().unwrap_or(i64::MAX);
+            (&body[..i], if neg_e { -mag } else { mag })
+        }
+        None => (body, 0),
+    };
+
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    // At least one digit, and nothing but digits — `.`, `1.2.3` and `1_000`
+    // are all not numbers.
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().chain(frac_part.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    // Shift the point by the exponent: the digits are `int_part ++ frac_part`
+    // and the point sits `int_part.len() + exp` places into them.
+    let digits: String = format!("{int_part}{frac_part}");
+    // Saturating: `1e9999999999999999999` parses its exponent as i64::MAX and
+    // must land on the weight refusal below, not on an arithmetic overflow.
+    let point = (int_part.len() as i64).saturating_add(exp);
+    if point > NUMERIC_MAX_WEIGHT || (digits.len() as i64).saturating_sub(point) > NUMERIC_MAX_SCALE
+    {
+        return None;
+    }
+    let plain = if point <= 0 {
+        format!("0.{}{}", "0".repeat((-point) as usize), digits)
+    } else if point as usize >= digits.len() {
+        format!("{}{}", digits, "0".repeat(point as usize - digits.len()))
+    } else {
+        let (a, b) = digits.split_at(point as usize);
+        format!("{a}.{b}")
+    };
+    // Leading zeros on the integer part carry nothing; trailing zeros on the
+    // fraction carry the SCALE, so they stay.
+    let (ip, fp) = plain.split_once('.').unwrap_or((plain.as_str(), ""));
+    let ip = ip.trim_start_matches('0');
+    let ip = if ip.is_empty() { "0" } else { ip };
+    let mut out = String::with_capacity(plain.len() + 1);
+    // Zero has no sign, whatever its scale: PostgreSQL prints `-0.00` as
+    // `0.00`.
+    if neg && !(ip == "0" && fp.bytes().all(|b| b == b'0')) {
+        out.push('-');
+    }
+    out.push_str(ip);
+    if !fp.is_empty() {
+        out.push('.');
+        out.push_str(fp);
+    }
+    Some(out)
+}
+
+/// An exact decimal as `(mantissa, scale)` — the value is `mantissa / 10^scale`.
+///
+/// `None` for a special (`NaN`, `±Infinity`), for anything that is not a plain
+/// decimal, and for a value needing more than an i128's 38 digits. Every
+/// caller turns that into a NAMED refusal: silently widening to f64 here would
+/// throw away exactly the digits this type exists to keep.
+pub(crate) fn decimal_parts(s: &str) -> Option<(i128, u32)> {
+    let t = s.trim();
+    if numeric_special_rank(t).is_some() {
+        return None;
+    }
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (ip, fp) = body.split_once('.').unwrap_or((body, ""));
+    if (ip.is_empty() && fp.is_empty())
+        || !ip.bytes().chain(fp.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let m: i128 = format!("{ip}{fp}").parse().ok()?;
+    Some((if neg { -m } else { m }, fp.len() as u32))
+}
+
+/// The inverse of [`decimal_parts`]: `mantissa / 10^scale` as canonical text.
+pub(crate) fn decimal_text(m: i128, scale: u32) -> String {
+    if scale == 0 {
+        return m.to_string();
+    }
+    let neg = m < 0;
+    // The magnitude as digits, padded so there is something before the point.
+    let digits = m.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let padded = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
+    } else {
+        digits
+    };
+    let (ip, fp) = padded.split_at(padded.len() - scale);
+    let out = format!("{ip}.{fp}");
+    // Zero has no sign, whatever its scale.
+    if neg && m != 0 {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// Rank of a special: `-Infinity` below every finite value, `Infinity` above,
+/// `NaN` above that — PostgreSQL's `numeric` ordering, where NaN is the
+/// largest value rather than incomparable.
+fn numeric_special_rank(s: &str) -> Option<u8> {
+    match s {
+        "-Infinity" => Some(0),
+        "Infinity" => Some(3),
+        "NaN" => Some(4),
+        _ => None,
+    }
+}
+
+/// Compare two decimals BY VALUE, in plain (non-exponent) form.
+///
+/// Total and allocation-free: insignificant zeros on either end are ignored
+/// rather than assumed absent, so `1.0` and `1.00` compare equal even though
+/// neither is the canonical spelling. Nothing here trusts its caller to have
+/// canonicalised, because a wrong comparison is a wrong answer and the check
+/// costs two `trim`s.
+pub fn numeric_cmp(a: &str, b: &str) -> Ordering {
+    match (numeric_special_rank(a), numeric_special_rank(b)) {
+        (Some(x), Some(y)) => return x.cmp(&y),
+        // A finite value ranks between -Infinity (0) and Infinity (3).
+        (Some(x), None) => return x.cmp(&2),
+        (None, Some(y)) => return 2.cmp(&y),
+        (None, None) => {}
+    }
+    // A leading `+` is a spelling, not a sign — `canonical_numeric` drops it,
+    // and this must agree or `+5` would compare above `5`.
+    let sign = |s: &str| -> (bool, usize) {
+        match s.as_bytes().first() {
+            Some(b'-') => (true, 1),
+            Some(b'+') => (false, 1),
+            _ => (false, 0),
+        }
+    };
+    let ((an, ao), (bn, bo)) = (sign(a), sign(b));
+    let (ab, bb) = (&a[ao..], &b[bo..]);
+    let (ai, af) = split_significant(ab);
+    let (bi, bf) = split_significant(bb);
+    // Zero has no sign, so `-0` and `0` must not take the sign branch below.
+    let (an, bn) = (an && !(ai.is_empty() && af.is_empty()), bn && !(bi.is_empty() && bf.is_empty()));
+    if an != bn {
+        return if an { Ordering::Less } else { Ordering::Greater };
+    }
+    // More integer digits IS a bigger number once the leading zeros are gone,
+    // and equal counts compare digit by digit. The fraction then compares
+    // lexicographically: with trailing zeros gone, the shorter side runs out
+    // where the longer still has a nonzero digit to come.
+    let mag = ai.len().cmp(&bi.len()).then_with(|| ai.cmp(bi)).then_with(|| af.cmp(bf));
+    if an {
+        mag.reverse()
+    } else {
+        mag
+    }
+}
+
+/// An unsigned decimal's significant digits: `(integer part, fraction)` with
+/// the insignificant zeros trimmed off each end.
+fn split_significant(s: &str) -> (&str, &str) {
+    let (i, f) = s.split_once('.').unwrap_or((s, ""));
+    (i.trim_start_matches('0'), f.trim_end_matches('0'))
+}
+
+// ---------------------------------------------------------------------------
+// Calendar: the ONE date/time text codec
+// ---------------------------------------------------------------------------
+//
+// It lives here, not in the wire crate, because three callers need it — the
+// PostgreSQL wire format, the store-time coercion, and `CAST` — and three
+// copies of a calendar is three chances to disagree about a leap year.
+
+/// Days from 1970-01-01 for a proleptic-Gregorian date, or `None` when
+/// `(y, m, d)` is not one. Howard Hinnant's `days_from_civil`, which is exact
+/// over the whole i64 range and needs no table.
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+        return None;
+    }
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+    let yoe = yy - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// The inverse: `(year, month, day)` for a day count since 1970-01-01.
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        // Proleptic Gregorian, so the rule holds for every year including the
+        // ones before the calendar existed — which is what `date` means.
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// `YYYY-MM-DD` → days since the Unix epoch, or `None`.
+///
+/// Strict on purpose, and this strictness IS the feature: sqlite's CAST rule
+/// takes the leading number, so `'2020-01-02'` became `2020`. Nothing here
+/// takes a prefix — either the whole string is a date or it is not one.
+pub fn parse_date_text(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let neg = t.starts_with('-');
+    let body = if neg { &t[1..] } else { t };
+    let mut p = body.split('-');
+    let y: i64 = int_field(p.next()?)?;
+    let m: i64 = int_field(p.next()?)?;
+    let d: i64 = int_field(p.next()?)?;
+    if p.next().is_some() {
+        return None;
+    }
+    days_from_civil(if neg { -y } else { y }, m, d)
+}
+
+/// `HH:MM[:SS[.ffffff]]` → microseconds since midnight, or `None`. A zone
+/// suffix means `timetz`, which mpedb has no type for, so it is refused rather
+/// than silently dropped.
+pub fn parse_time_text(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (hms, frac) = t.split_once('.').unwrap_or((t, ""));
+    let mut p = hms.split(':');
+    let h: i64 = int_field(p.next()?)?;
+    let mi: i64 = int_field(p.next()?)?;
+    let sec: i64 = match p.next() {
+        Some(x) => int_field(x)?,
+        None => 0,
+    };
+    if p.next().is_some() {
+        return None;
+    }
+    // 24:00:00 is PostgreSQL's end-of-day, and a leap second is 60.
+    if h > 24 || mi > 59 || sec > 60 || (h == 24 && (mi != 0 || sec != 0)) {
+        return None;
+    }
+    let mut us = 0i64;
+    if !frac.is_empty() {
+        if !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut f = frac.to_string();
+        f.truncate(6);
+        while f.len() < 6 {
+            f.push('0');
+        }
+        us = f.parse().ok()?;
+    }
+    Some((h * 3600 + mi * 60 + sec) * 1_000_000 + us)
+}
+
+/// One all-digits field. `parse::<i64>()` alone would accept `+3` and `-3`,
+/// which inside a date would make `2020-+1-02` a date.
+fn int_field(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// `YYYY-MM-DD[ HH:MM[:SS[.ffffff]]][zone]` → microseconds since the Unix
+/// epoch, or `None`. A missing zone reads as UTC, which is what mpedb's
+/// `Timestamp` means by construction.
+pub fn parse_timestamp_text(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let neg_year = t.starts_with('-');
+    let body = if neg_year { &t[1..] } else { t };
+    let (date, rest) = body.split_once(['T', ' ']).unwrap_or((body, ""));
+    let mut dp = date.split('-');
+    let y: i64 = int_field(dp.next()?)?;
+    let mo: i64 = int_field(dp.next()?)?;
+    let d: i64 = int_field(dp.next()?)?;
+    if dp.next().is_some() {
+        return None;
+    }
+    let days = days_from_civil(if neg_year { -y } else { y }, mo, d)?;
+
+    // Split the zone off before the time, or `+01` would be read as a field.
+    let (time, offset_secs) = split_zone(rest)?;
+    let us_of_day = if time.is_empty() { 0 } else { parse_time_text(time)? };
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(us_of_day.div_euclid(1_000_000))?
+        .checked_sub(offset_secs)?;
+    secs.checked_mul(1_000_000)?.checked_add(us_of_day.rem_euclid(1_000_000))
+}
+
+/// A trailing time zone, as `(time part, offset in seconds EAST of UTC)`.
+fn split_zone(rest: &str) -> Option<(&str, i64)> {
+    if rest.is_empty() {
+        return Some(("", 0));
+    }
+    if let Some(t) = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
+        return Some((t, 0));
+    }
+    // Look for a sign that is not the first character, so a negative year
+    // (already peeled off above) cannot be mistaken for a zone.
+    let bytes = rest.as_bytes();
+    for i in (1..bytes.len()).rev() {
+        if bytes[i] == b'+' || bytes[i] == b'-' {
+            let (t, z) = rest.split_at(i);
+            let sign = if z.starts_with('-') { -1 } else { 1 };
+            let z = &z[1..];
+            let (zh, zm) = match z.split_once(':') {
+                Some((a, b)) => (a, b),
+                None if z.len() == 4 => (&z[..2], &z[2..]),
+                None => (z, "0"),
+            };
+            return Some((t, sign * (int_field(zh)? * 3600 + int_field(zm)? * 60)));
+        }
+    }
+    Some((rest, 0))
+}
+
+/// A `Timestamp` as PostgreSQL's `timestamptz` text output: UTC, with the
+/// `+00` zone mpedb's timestamps always carry.
+pub fn timestamp_text(us: i64) -> String {
+    let (secs, frac) = (us.div_euclid(1_000_000), us.rem_euclid(1_000_000));
+    let (y, mo, d) = civil_from_days(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
+    let base = format!(
+        "{y:04}-{mo:02}-{d:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    );
+    if frac == 0 {
+        return format!("{base}+00");
+    }
+    let mut f = format!("{frac:06}");
+    while f.ends_with('0') {
+        f.pop();
+    }
+    format!("{base}.{f}+00")
+}
+
+/// A `Date` as PostgreSQL's `DateStyle = ISO` prints it.
+pub fn date_text(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// A `Time` as PostgreSQL prints it: `HH:MM:SS[.ffffff]`, trailing zeros of
+/// the fraction trimmed.
+pub fn time_text(us: i64) -> String {
+    let (secs, frac) = (us.div_euclid(1_000_000), us.rem_euclid(1_000_000));
+    let base = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
+    if frac == 0 {
+        return base;
+    }
+    let mut f = format!("{frac:06}");
+    while f.ends_with('0') {
+        f.pop();
+    }
+    format!("{base}.{f}")
+}
+
 /// Order-preserving u64 image of an f64: flips the sign bit for positives and
 /// all bits for negatives, after canonicalizing -0.0 and NaN.
 pub fn normalize_float_bits(v: f64) -> u64 {
@@ -824,6 +1424,11 @@ impl fmt::Display for Value {
                 f.write_str("'")
             }
             Value::Timestamp(v) => write!(f, "timestamp({v})"),
+            Value::Date(v) => write!(f, "date({v})"),
+            Value::Time(v) => write!(f, "time({v})"),
+            // Unquoted: a NUMERIC is a NUMBER whose exactness happens to be
+            // carried as text, and quoting it would render it as a string.
+            Value::Numeric(v) => f.write_str(v),
         }
     }
 }
@@ -858,6 +1463,22 @@ pub fn write_value(buf: &mut Vec<u8>, v: &Value) {
         Value::Timestamp(x) => {
             buf.push(6);
             buf.extend_from_slice(&x.to_le_bytes());
+        }
+        // 7 is the context list; the three below continue from 8, matching
+        // their `ColumnType` discriminants so the two tag spaces stay readable
+        // side by side.
+        Value::Date(x) => {
+            buf.push(8);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::Time(x) => {
+            buf.push(9);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::Numeric(x) => {
+            buf.push(10);
+            buf.extend_from_slice(&(x.len() as u32).to_le_bytes());
+            buf.extend_from_slice(x.as_bytes());
         }
         // A context list DOES have to serialize: the intent ring encodes params
         // with this function (ring_exec::encode_params) and context values are
@@ -930,6 +1551,17 @@ pub fn read_value(buf: &[u8], pos: &mut usize) -> Result<Value> {
                 items.push(v);
             }
             Value::List(items)
+        }
+        8 => Value::Date(i64::from_le_bytes(take(buf, pos, 8)?.try_into().unwrap())),
+        9 => Value::Time(i64::from_le_bytes(take(buf, pos, 8)?.try_into().unwrap())),
+        10 => {
+            let len = u32::from_le_bytes(take(buf, pos, 4)?.try_into().unwrap()) as usize;
+            let bytes = take(buf, pos, len)?;
+            Value::Numeric(
+                std::str::from_utf8(bytes)
+                    .map_err(|_| Error::Corrupt("invalid utf-8 in numeric value".into()))?
+                    .to_owned(),
+            )
         }
         _ => return Err(Error::Corrupt(format!("invalid value tag {tag}"))),
     })
@@ -1232,5 +1864,234 @@ mod affinity_tests {
         // A number against TEXT is still a clean REFUSAL: its answer depends on
         // comparison affinity, which is not implemented yet.
         assert!(Value::Int(1).sql_cmp(&Value::Text("1".into())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod numeric_tests {
+    use super::*;
+
+    #[test]
+    fn parses_what_postgresql_parses() {
+        for (input, want) in [
+            ("0", "0"),
+            ("-0", "0"),
+            ("+0.000", "0.000"),
+            ("1", "1"),
+            ("+1", "1"),
+            // The SCALE survives — this is what a `Decimal("1.00")` round trip
+            // rests on, and what `canonical_numeric` deliberately erases for
+            // the key.
+            ("1.0", "1.0"),
+            ("1.00", "1.00"),
+            ("0001.5000", "1.5000"),
+            ("-1.50", "-1.50"),
+            (" 42 ", "42"),
+            // Exponents are EXPANDED: one value, one spelling.
+            ("1e3", "1000"),
+            ("1E3", "1000"),
+            ("1e+3", "1000"),
+            ("1.5e-3", "0.0015"),
+            ("-2.5e2", "-250"),
+            ("1.50e2", "150"),
+            ("1e-5", "0.00001"),
+            (".5", "0.5"),
+            ("5.", "5"),
+            // The specials, by name.
+            ("nan", "NaN"),
+            ("NaN", "NaN"),
+            ("-nan", "NaN"),
+            ("infinity", "Infinity"),
+            ("-Infinity", "-Infinity"),
+            ("inf", "Infinity"),
+        ] {
+            assert_eq!(parse_numeric(input).as_deref(), Some(want), "{input}");
+        }
+    }
+
+    #[test]
+    fn refuses_what_is_not_a_number() {
+        for input in [
+            "", " ", "abc", "1.2.3", "1_000", "--1", "1e", "1e+", "1ee3", "0x10", "1 2", ".",
+            "1e999999999999999999999", "1e-99999999999999999999",
+        ] {
+            assert_eq!(parse_numeric(input), None, "{input} should not parse");
+        }
+    }
+
+    /// A `numeric` compares by VALUE — the property `1.0 = 1.00` rests on.
+    #[test]
+    fn compares_by_value_not_by_spelling() {
+        use Ordering::*;
+        for (a, b, want) in [
+            ("1.0", "1.00", Equal),
+            ("1", "1.000", Equal),
+            ("0", "-0", Equal),
+            ("+5", "5", Equal),
+            ("9", "10", Less),
+            ("0.5", "0.51", Less),
+            ("-0.5", "-0.51", Greater),
+            ("-1", "1", Less),
+            ("-100", "-9", Less),
+            ("0.00001", "0.0001", Less),
+            // PostgreSQL puts NaN above everything, unlike a float NaN.
+            ("NaN", "Infinity", Greater),
+            ("Infinity", "999999999999999999999", Greater),
+            ("-Infinity", "-999999999999999999999", Less),
+            ("NaN", "NaN", Equal),
+        ] {
+            assert_eq!(numeric_cmp(a, b), want, "{a} vs {b}");
+            assert_eq!(numeric_cmp(b, a), want.reverse(), "{b} vs {a}");
+        }
+    }
+
+    /// The stored form keeps the scale; the key form does not. Two functions,
+    /// two jobs — a single "canonical" would have to give up one of them.
+    #[test]
+    fn the_stored_form_and_the_key_form_differ_on_purpose() {
+        for (input, stored, key) in [
+            ("1.00", "1.00", "1"),
+            ("1.50", "1.50", "1.5"),
+            ("0.000", "0.000", "0"),
+            ("100", "100", "100"),
+        ] {
+            assert_eq!(parse_numeric(input).as_deref(), Some(stored), "stored {input}");
+            assert_eq!(canonical_numeric(stored), key, "key {input}");
+        }
+        // …and the two spellings still compare and group as ONE value.
+        assert_eq!(numeric_cmp("1.00", "1.0"), Ordering::Equal);
+    }
+
+    /// `sql_cmp` routes a numeric pair to the value comparison, so a `WHERE`
+    /// on a numeric column is not a spelling test.
+    #[test]
+    fn sql_cmp_answers_a_numeric_pair() {
+        let a = Value::Numeric("1.0".into());
+        let b = Value::Numeric("1.00".into());
+        assert_eq!(a.sql_cmp(&b).unwrap(), Some(Ordering::Equal));
+        let c = Value::Numeric("10".into());
+        let d = Value::Numeric("9".into());
+        assert_eq!(c.sql_cmp(&d).unwrap(), Some(Ordering::Greater));
+    }
+
+    /// A numeric against an INTEGER stays a refusal rather than a rank-only
+    /// "equal". Ranking it with the numbers made `Numeric("2")` and `Int(1)`
+    /// compare equal, which is the wrong answer this split exists to avoid.
+    #[test]
+    fn a_numeric_against_an_integer_is_not_silently_equal() {
+        let n = Value::Numeric("2".into());
+        let i = Value::Int(1);
+        assert!(n.sql_cmp(&i).is_err());
+        assert_eq!(n.sort_cmp(&i, Collation::Binary), None);
+    }
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+
+    #[test]
+    fn dates_round_trip_across_the_whole_range() {
+        for (text, days) in [
+            ("1970-01-01", 0),
+            ("1970-01-02", 1),
+            ("1969-12-31", -1),
+            ("2020-01-01", 18262),
+            ("2020-01-02", 18263),
+            ("2020-02-29", 18321), // a leap day
+            ("2000-02-29", 11016), // the 400-year rule
+            ("0001-01-01", -719162),
+            ("9999-12-31", 2932896),
+        ] {
+            assert_eq!(parse_date_text(text), Some(days), "parse {text}");
+            assert_eq!(date_text(days), text, "render {days}");
+        }
+    }
+
+    /// The bug this whole type surface exists to close: sqlite's CAST rule
+    /// takes the leading number, so `'2020-01-02'` became `2020`. Nothing here
+    /// may accept a prefix.
+    #[test]
+    fn a_date_is_all_or_nothing() {
+        for bad in [
+            "2020",
+            "2020-01",
+            "2020-01-02 03:04:05",
+            "2020-01-02T03:04",
+            "2020-13-01",
+            "2020-00-01",
+            "2020-01-00",
+            "2020-01-32",
+            "2021-02-29", // not a leap year
+            "1900-02-29", // the 100-year rule
+            "2020-+1-02",
+            "abc",
+            "",
+            "2020-01-02x",
+        ] {
+            assert_eq!(parse_date_text(bad), None, "{bad} should not parse");
+        }
+    }
+
+    #[test]
+    fn times_round_trip_and_refuse_a_zone() {
+        for (text, us) in [
+            ("00:00:00", 0),
+            ("03:04:05", 11_045_000_000),
+            ("23:59:59.999999", 86_399_999_999),
+            ("03:04:05.0015", 11_045_001_500),
+        ] {
+            assert_eq!(parse_time_text(text), Some(us), "parse {text}");
+            assert_eq!(time_text(us), text, "render {us}");
+        }
+        // Legal input that renders back with the seconds PostgreSQL prints.
+        assert_eq!(parse_time_text("03:04"), Some(11_040_000_000));
+        // 24:00:00 is PostgreSQL's end-of-day; 24:00:01 is not a time.
+        assert_eq!(parse_time_text("24:00:00"), Some(86_400_000_000));
+        for bad in ["3", "25:00:00", "24:00:01", "03:04:05+02", "03:04:05Z", "0a:00:00", ""] {
+            assert_eq!(parse_time_text(bad), None, "{bad} should not parse");
+        }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_text_tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_round_trip() {
+        for (text, us) in [
+            ("1970-01-01 00:00:00+00", 0i64),
+            ("2023-11-14 22:13:20+00", 1_700_000_000_000_000),
+            ("1969-12-31 23:59:59+00", -1_000_000),
+            ("2023-11-14 22:13:20.0015+00", 1_700_000_000_001_500),
+        ] {
+            assert_eq!(parse_timestamp_text(text), Some(us), "parse {text}");
+            assert_eq!(timestamp_text(us), text, "render {us}");
+        }
+    }
+
+    #[test]
+    fn zones_and_separators_are_understood() {
+        let base = parse_timestamp_text("2020-01-02 03:04:05").unwrap();
+        assert_eq!(parse_timestamp_text("2020-01-02T03:04:05"), Some(base));
+        assert_eq!(parse_timestamp_text("2020-01-02 03:04:05Z"), Some(base));
+        // +01 means the instant is an hour EARLIER in UTC.
+        assert_eq!(parse_timestamp_text("2020-01-02 04:04:05+01"), Some(base));
+        assert_eq!(parse_timestamp_text("2020-01-02 02:04:05-01"), Some(base));
+        assert_eq!(parse_timestamp_text("2020-01-02 04:34:05+01:30"), Some(base));
+        // A bare date is midnight.
+        assert_eq!(
+            parse_timestamp_text("2020-01-02"),
+            Some(days_from_civil(2020, 1, 2).unwrap() * 86_400 * 1_000_000)
+        );
+    }
+
+    /// Same rule as `parse_date_text`: all or nothing, never a prefix.
+    #[test]
+    fn a_timestamp_is_all_or_nothing() {
+        for bad in ["2020", "2020-01", "2020-13-01 00:00:00", "2021-02-29 00:00:00", "abc", ""] {
+            assert_eq!(parse_timestamp_text(bad), None, "{bad} should not parse");
+        }
     }
 }

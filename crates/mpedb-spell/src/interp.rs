@@ -202,7 +202,14 @@ fn truthy(v: &PValue) -> bool {
         PValue::Scalar(Value::Float(f)) => *f != 0.0,
         PValue::Scalar(Value::Text(s)) => !s.is_empty(),
         PValue::Scalar(Value::Blob(b)) => !b.is_empty(),
-        PValue::Scalar(Value::Timestamp(_)) => true,
+        PValue::Scalar(Value::Timestamp(_)) | PValue::Scalar(Value::Date(_)) => true,
+        // A `time` is micros since midnight, so midnight itself is 0 — and
+        // Python's `datetime.time(0, 0)` has been truthy since 3.5. The
+        // integer rule would make it falsey; the type rule is the right one.
+        PValue::Scalar(Value::Time(_)) => true,
+        // `Decimal("0")` is falsey in Python, and every spelling of zero
+        // canonicalises to `0`, so the string test IS the value test.
+        PValue::Scalar(Value::Numeric(n)) => n != "0",
         // A session-context list (§2.6) is param-only, but a proc can hold one
         // it was handed. Treat it like every other container here: empty is
         // falsey.

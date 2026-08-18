@@ -179,7 +179,12 @@ fn value_literal(v: &Value) -> String {
             if s.contains(['.', 'e', 'E']) { s } else { format!("{s}.0") }
         }
         Value::Float(_) => "NULL".to_string(), // NaN/inf: no SQL literal
-        Value::Timestamp(us) => us.to_string(), // stored as int microseconds
+        // Stored as integers: micros since the epoch, days since it, micros
+        // since midnight.
+        Value::Timestamp(us) | Value::Date(us) | Value::Time(us) => us.to_string(),
+        // Its canonical digits ARE a numeric literal, so it re-parses as
+        // itself rather than through a float.
+        Value::Numeric(n) => n.clone(),
         // A session-context list is not a value a C-API caller can bind, so it
         // never reaches here; render defensively rather than match-panic.
         Value::List(_) => "NULL".to_string(),

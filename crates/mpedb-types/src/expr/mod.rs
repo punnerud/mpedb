@@ -8,7 +8,7 @@
 //! the result is exactly TRUE.
 
 use crate::error::{Error, Result};
-use crate::value::{Affinity, Collation, Value};
+use crate::value::{Affinity, Collation, ColumnType, Value};
 use std::cmp::Ordering;
 
 mod codec;
@@ -89,6 +89,25 @@ pub enum Instr {
     /// (`'12ab'`→12); real→int truncates toward zero; `NUMERIC` yields an int
     /// when integral else a real. See `cast_value`.
     Cast(Affinity),
+    /// `CAST(x AS <type>)` under the **PostgreSQL dialect** — a TYPED
+    /// conversion that either produces the type or RAISES.
+    ///
+    /// A separate opcode from [`Instr::Cast`], not a flag on it, for the same
+    /// reason [`Instr::DivStrict`] is separate from [`Instr::Div`]: the plan
+    /// hash has to differ, or one compiled plan would serve two dialects that
+    /// disagree about the answer.
+    ///
+    /// The difference is not a nicety. sqlite's rule takes a leading numeric
+    /// PREFIX, so `'2020-01-02'` casts to the integer `2020` — and psycopg2
+    /// renders every Python `date` parameter as `'…'::date`, which made that
+    /// the ORDINARY write path rather than an edge case. `'6f8b…'::uuid` was
+    /// the integer `6` for the same reason. This one parses the whole string
+    /// or reports `invalid input syntax for type <t>`.
+    ///
+    /// The payload is the **PostgreSQL type OID**, not an mpedb `ColumnType`,
+    /// because the mpedb type cannot say which parse to run: `uuid` and
+    /// `bytea` are both `Blob` and read their text completely differently.
+    CastPg(u32),
     /// `a || b` — SQL concatenation. NULL propagates; ints and bools render
     /// as text first (sqlite's rule); floats are refused until someone needs
     /// their formatting pinned down.
@@ -677,6 +696,11 @@ impl ExprProgram {
                         Value::Null => Value::Null,
                         Value::Int(x) => Value::Float(x as f64),
                         Value::Float(x) => Value::Float(x),
+                        // PostgreSQL's own promotion: in `numeric op float8`
+                        // the float8 wins, so the exact side widens to it.
+                        // Lossy by definition, which is why it happens only
+                        // where a float is already in the expression.
+                        Value::Numeric(ref n) => Value::Float(float_prefix(n.as_bytes())),
                         v => {
                             return Err(Error::TypeMismatch(format!(
                                 "cannot cast {} to float",
@@ -688,6 +712,10 @@ impl ExprProgram {
                 Instr::Cast(t) => {
                     let a = stack.pop().expect("validated");
                     stack.push(cast_value(a, t)?);
+                }
+                Instr::CastPg(oid) => {
+                    let a = stack.pop().expect("validated");
+                    stack.push(cast_pg(&a, oid)?);
                 }
                 Instr::Concat => {
                     let b = stack.pop().expect("validated");
@@ -1150,12 +1178,86 @@ fn arith(op: Instr, a: Value, b: Value) -> Result<Value> {
             Instr::ModStrict => Float(x % y),
             _ => unreachable!(),
         }),
+        // Exact decimal arithmetic. An INT joins it as a scale-0 decimal
+        // rather than dragging the decimal down to a float: `numeric + 1` is
+        // numeric in PostgreSQL, and going through f64 is the precision loss
+        // the type exists to prevent. A float operand never reaches here —
+        // `unify_types` widened the decimal to f64 first, which is
+        // PostgreSQL's rule too.
+        (Numeric(x), Numeric(y)) => numeric_arith(op, &x, &y),
+        (Numeric(x), Int(y)) => numeric_arith(op, &x, &y.to_string()),
+        (Int(x), Numeric(y)) => numeric_arith(op, &x.to_string(), &y),
         (a, b) => Err(Error::TypeMismatch(format!(
             "arithmetic on {} and {} (binder should have coerced)",
             a.type_name(),
             b.type_name()
         ))),
     }
+}
+
+/// `+ - * / %` on two exact decimals.
+///
+/// Both sides are scaled to a common i128 mantissa, so the result is exact for
+/// `+ - *` and correctly rounded for `/`. A value needing more than 38
+/// significant digits, or a product that overflows, is a NAMED refusal rather
+/// than a silent fall back to f64 — this type exists so the digits survive,
+/// and quietly losing them here would be the wrong answer it was added to
+/// prevent.
+fn numeric_arith(op: Instr, a: &str, b: &str) -> Result<Value> {
+    let too_big = || {
+        Error::Unsupported(format!(
+            "exact decimal arithmetic on `{a}` and `{b}` needs more than 38 \
+             significant digits — CAST to double precision to compute it \
+             approximately"
+        ))
+    };
+    let (ma, sa) = crate::value::decimal_parts(a).ok_or_else(too_big)?;
+    let (mb, sb) = crate::value::decimal_parts(b).ok_or_else(too_big)?;
+    // Align to a common scale for everything except multiplication, whose
+    // scale is the SUM and needs no alignment.
+    let scale = sa.max(sb);
+    let lift = |m: i128, s: u32| -> Option<i128> { m.checked_mul(10i128.checked_pow(scale - s)?) };
+    let text = |m: i128, s: u32| Value::Numeric(crate::value::decimal_text(m, s));
+
+    Ok(match op {
+        Instr::Add => {
+            let (x, y) = (lift(ma, sa).ok_or_else(too_big)?, lift(mb, sb).ok_or_else(too_big)?);
+            text(x.checked_add(y).ok_or_else(too_big)?, scale)
+        }
+        Instr::Sub => {
+            let (x, y) = (lift(ma, sa).ok_or_else(too_big)?, lift(mb, sb).ok_or_else(too_big)?);
+            text(x.checked_sub(y).ok_or_else(too_big)?, scale)
+        }
+        Instr::Mul => text(ma.checked_mul(mb).ok_or_else(too_big)?, sa + sb),
+        // sqlite yields NULL on a zero divisor; the PostgreSQL dialect's
+        // strict pair raises, one arm below.
+        Instr::Div | Instr::Mod if mb == 0 => Value::Null,
+        Instr::DivStrict | Instr::ModStrict if mb == 0 => return Err(Error::DivisionByZero),
+        Instr::Div | Instr::DivStrict => {
+            // PostgreSQL computes a quotient to at least 16 significant
+            // digits; 16 past the common scale is at least that and is
+            // deterministic, which matters because two processes must agree.
+            let rs = scale + 16;
+            let num = lift(ma, sa)
+                .and_then(|x| x.checked_mul(10i128.checked_pow(rs)?))
+                .ok_or_else(too_big)?;
+            let den = lift(mb, sb).ok_or_else(too_big)?;
+            // Round half away from zero, as PostgreSQL's numeric division does.
+            let q = num / den;
+            let r = (num % den).abs();
+            let q = if r * 2 >= den.abs() {
+                q + if (num < 0) != (den < 0) { -1 } else { 1 }
+            } else {
+                q
+            };
+            text(q, rs)
+        }
+        Instr::Mod | Instr::ModStrict => {
+            let (x, y) = (lift(ma, sa).ok_or_else(too_big)?, lift(mb, sb).ok_or_else(too_big)?);
+            text(x % y, scale)
+        }
+        _ => unreachable!(),
+    })
 }
 
 
@@ -1203,6 +1305,168 @@ fn cast_value(v: Value, aff: Affinity) -> Result<Value> {
     })
 }
 
+/// PostgreSQL's `CAST`: produce the target type exactly, or raise.
+///
+/// The message is PostgreSQL's own (`invalid input syntax for type date:
+/// "2020"`), because that is what a client's error handling matches on and
+/// what a user reading a log expects to see.
+///
+/// Only the types where sqlite's affinity rule gives a WRONG answer are
+/// handled here; the binder sends everything else down [`cast_value`], so this
+/// changes nothing that was already right.
+/// A `CAST` to a PostgreSQL type by OID — the dispatcher behind
+/// [`Instr::CastPg`].
+///
+/// It exists because the mpedb type is not enough to choose a PARSE: `uuid`
+/// and `bytea` are both `Blob`, and reading a UUID's text as bytea (or the
+/// other way) is a wrong answer, not an error.
+///
+/// Only the types whose text form sqlite's affinity rule gets WRONG are
+/// handled strictly here; everything else falls back to that rule, which
+/// already agrees with PostgreSQL for it. Adding a type to this list is how a
+/// new strictness lands, and the list is short on purpose — each entry is a
+/// measured divergence, not a guess.
+pub(crate) fn cast_pg(v: &Value, oid: u32) -> Result<Value> {
+    let Some(ty) = crate::pgtype::by_oid(oid) else {
+        return Err(Error::Internal(format!("CAST to unknown PostgreSQL oid {oid}")));
+    };
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    let bad = || {
+        Error::TypeMismatch(format!(
+            "invalid input syntax for type {}: \"{}\"",
+            ty.name,
+            render_scalar_text(v)
+        ))
+    };
+    match ty.name {
+        // A UUID is 16 BYTES, and its text is hex with optional dashes —
+        // `'6f8b9c1e-…'::uuid` used to be the integer 6.
+        "uuid" => match v {
+            Value::Blob(b) if b.len() == 16 => Ok(v.clone()),
+            Value::Text(s) => parse_uuid(s).map(Value::Blob).ok_or_else(bad),
+            _ => Err(bad()),
+        },
+        "bytea" => match v {
+            Value::Blob(_) => Ok(v.clone()),
+            Value::Text(s) => parse_bytea(s).map(Value::Blob).ok_or_else(bad),
+            _ => Err(bad()),
+        },
+        _ => match ty.mpedb {
+            Some(m @ (ColumnType::Date
+            | ColumnType::Time
+            | ColumnType::Timestamp
+            | ColumnType::Numeric)) => cast_typed(v, m),
+            // Everything else keeps sqlite's affinity rule, which already
+            // gives PostgreSQL's answer for it.
+            _ => cast_value(v.clone(), Affinity::from_type_name(ty.name)),
+        },
+    }
+}
+
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (dashes optional, any case) as the
+/// 16 bytes PostgreSQL stores. Strict: a wrong length or a non-hex digit is
+/// `None`, never a prefix.
+fn parse_uuid(s: &str) -> Option<Vec<u8>> {
+    let hex: String = s.trim().chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..16)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+/// `\xDEADBEEF` (the modern default) or the legacy escape format.
+fn parse_bytea(s: &str) -> Option<Vec<u8>> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("\\x") {
+        if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        return (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+            .collect();
+    }
+    // Escape format: `\\` is a backslash, `\NNN` an octal byte, else itself.
+    let b = t.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            out.push(b[i]);
+            i += 1;
+        } else if i + 1 < b.len() && b[i + 1] == b'\\' {
+            out.push(b'\\');
+            i += 2;
+        } else if i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+            let oct = std::str::from_utf8(&b[i + 1..i + 4]).ok()?;
+            out.push(u8::from_str_radix(oct, 8).ok()?);
+            i += 4;
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+pub(crate) fn cast_typed(v: &Value, ty: ColumnType) -> Result<Value> {
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    let bad = |v: &Value| {
+        Error::TypeMismatch(format!(
+            "invalid input syntax for type {}: \"{}\"",
+            ty.name(),
+            render_scalar_text(v)
+        ))
+    };
+    Ok(match (ty, v) {
+        // Already the type: a cast to what you are is the identity, never a
+        // round trip through text that could lose a digit.
+        (ColumnType::Date, Value::Date(_))
+        | (ColumnType::Time, Value::Time(_))
+        | (ColumnType::Timestamp, Value::Timestamp(_))
+        | (ColumnType::Numeric, Value::Numeric(_)) => v.clone(),
+
+        (ColumnType::Date, Value::Text(s)) => {
+            Value::Date(crate::value::parse_date_text(s).ok_or_else(|| bad(v))?)
+        }
+        // PostgreSQL's `timestamp::date` truncates toward the past, which is
+        // what `div_euclid` does for negative instants too.
+        (ColumnType::Date, Value::Timestamp(us)) => Value::Date(us.div_euclid(86_400_000_000)),
+
+        (ColumnType::Time, Value::Text(s)) => {
+            Value::Time(crate::value::parse_time_text(s).ok_or_else(|| bad(v))?)
+        }
+        (ColumnType::Time, Value::Timestamp(us)) => Value::Time(us.rem_euclid(86_400_000_000)),
+
+        (ColumnType::Timestamp, Value::Text(s)) => {
+            Value::Timestamp(crate::value::parse_timestamp_text(s).ok_or_else(|| bad(v))?)
+        }
+        // Midnight UTC, which is what PostgreSQL's `date::timestamp` gives.
+        (ColumnType::Timestamp, Value::Date(d)) => {
+            Value::Timestamp(d.checked_mul(86_400_000_000).ok_or_else(|| bad(v))?)
+        }
+
+        (ColumnType::Numeric, Value::Text(s)) => {
+            Value::Numeric(crate::value::parse_numeric(s).ok_or_else(|| bad(v))?)
+        }
+        (ColumnType::Numeric, Value::Int(i)) => Value::Numeric(i.to_string()),
+        (ColumnType::Numeric, Value::Bool(b)) => Value::Numeric(i64::from(*b).to_string()),
+        // Through the shortest text that round-trips the float, which is every
+        // digit it actually held — going via an integer would truncate.
+        (ColumnType::Numeric, Value::Float(f)) => Value::Numeric(
+            crate::value::parse_numeric(&f.to_string()).ok_or_else(|| bad(v))?,
+        ),
+
+        // Everything else is a cast PostgreSQL does not define either
+        // (`bytea::date`, `date::time`); say so rather than invent one.
+        _ => return Err(bad(v)),
+    })
+}
+
 /// sqlite whitespace for numeric-prefix skipping: space, tab, LF, FF, CR.
 fn is_sql_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0c | b'\r')
@@ -1217,6 +1481,15 @@ fn render_scalar_text(v: &Value) -> String {
         Value::Float(f) => String::from_utf8(printf::float_to_text(*f))
             .expect("float_to_text is ASCII"),
         Value::Timestamp(t) => t.to_string(),
+        // A date/time renders as the integer it is: this is the sqlite CAST
+        // path, whose job is the affinity conversion, not a calendar. The
+        // PostgreSQL rendering (`2020-01-02`) belongs on the wire, where the
+        // type OID says how to read it.
+        Value::Date(d) => d.to_string(),
+        Value::Time(t) => t.to_string(),
+        // A NUMERIC is already canonical text — rendering it any other way
+        // would be the float round trip the type exists to avoid.
+        Value::Numeric(n) => n.clone(),
         Value::Text(s) => s.clone(),
         // Blob is handled by the caller (bytes are copied directly, not via
         // this text path); a List never reaches CAST.
@@ -1231,7 +1504,10 @@ fn to_integer(v: &Value) -> i64 {
         // `f as i64` saturates (NaN→0, ±inf→bounds) and truncates toward zero.
         Value::Float(f) => *f as i64,
         Value::Bool(b) => *b as i64,
-        Value::Timestamp(t) => *t,
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => *t,
+        // Its digits, by the same prefix rule text uses — a numeric IS a
+        // number, so this is a conversion and not a parse of something else.
+        Value::Numeric(n) => int_prefix(n.as_bytes()),
         Value::Text(s) => int_prefix(s.as_bytes()),
         Value::Blob(b) => int_prefix(b),
         Value::Null | Value::List(_) => 0,
@@ -1244,7 +1520,8 @@ fn to_real(v: &Value) -> f64 {
         Value::Int(i) => *i as f64,
         Value::Float(f) => *f,
         Value::Bool(b) => *b as u8 as f64,
-        Value::Timestamp(t) => *t as f64,
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => *t as f64,
+        Value::Numeric(n) => float_prefix(n.as_bytes()),
         Value::Text(s) => float_prefix(s.as_bytes()),
         Value::Blob(b) => float_prefix(b),
         Value::Null | Value::List(_) => 0.0,
@@ -1257,7 +1534,11 @@ fn to_numeric(v: Value) -> Value {
     match v {
         Value::Int(_) | Value::Float(_) => v,
         Value::Bool(b) => Value::Int(b as i64),
-        Value::Timestamp(t) => Value::Int(t),
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => Value::Int(t),
+        // Left ALONE. Numeric affinity turns text into a number and would
+        // turn this one into a float, which is exactly the exactness this
+        // type carries — it is already numeric, so there is nothing to apply.
+        Value::Numeric(_) => v,
         Value::Text(s) => bytes_to_numeric(s.as_bytes()),
         Value::Blob(b) => bytes_to_numeric(&b),
         Value::Null | Value::List(_) => v,
@@ -1600,4 +1881,259 @@ fn concat_value(a: Value, b: Value) -> Result<Value> {
     let mut s = as_text(a)?;
     s.push_str(&as_text(b)?);
     Ok(Value::Text(s))
+}
+
+#[cfg(test)]
+mod cast_type_tests {
+    use super::*;
+
+    fn cast(v: Value, ty: ColumnType) -> Result<Value> {
+        cast_typed(&v, ty)
+    }
+
+    fn cast_oid(v: Value, oid: u32) -> Result<Value> {
+        cast_pg(&v, oid)
+    }
+
+    /// `uuid` and `bytea` are BOTH `Blob`, so the mpedb type cannot say which
+    /// parse to run — that is why the opcode carries the PostgreSQL OID.
+    /// `'6f8b9c1e-…'::uuid` was the integer 6 before it did.
+    #[test]
+    fn uuid_and_bytea_are_told_apart_by_the_oid() {
+        let u = "6f8b9c1e-1234-5678-9abc-def012345678";
+        let want: Vec<u8> = vec![
+            0x6f, 0x8b, 0x9c, 0x1e, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34,
+            0x56, 0x78,
+        ];
+        assert_eq!(cast_oid(Value::Text(u.into()), 2950).unwrap(), Value::Blob(want.clone()));
+        // Dashes are optional, case is free.
+        assert_eq!(
+            cast_oid(Value::Text(u.replace('-', "").to_uppercase()), 2950).unwrap(),
+            Value::Blob(want)
+        );
+        // bytea reads the SAME text completely differently — as hex bytes.
+        assert_eq!(
+            cast_oid(Value::Text("\\x0102ff".into()), 17).unwrap(),
+            Value::Blob(vec![1, 2, 255])
+        );
+        assert_eq!(
+            cast_oid(Value::Text("ab\\\\c".into()), 17).unwrap(),
+            Value::Blob(b"ab\\c".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_bad_uuid_or_bytea_raises_and_never_takes_a_prefix() {
+        for (lit, oid, want) in [
+            ("6f8b9c1e", 2950u32, "uuid"),
+            ("6", 2950, "uuid"),
+            ("zzzzzzzz-1234-5678-9abc-def012345678", 2950, "uuid"),
+            ("\\xabc", 17, "bytea"),
+            ("\\xzz", 17, "bytea"),
+        ] {
+            let e = cast_oid(Value::Text(lit.into()), oid).unwrap_err().to_string();
+            assert!(
+                e.contains("invalid input syntax for type") && e.contains(want),
+                "{lit} as {want}: {e}"
+            );
+        }
+    }
+
+    /// The types NOT on the strict list keep sqlite's affinity answer, so this
+    /// change cannot have moved anything that was already right.
+    #[test]
+    fn a_non_strict_type_keeps_the_affinity_answer() {
+        // int8 (oid 20) still takes the leading-prefix rule.
+        assert_eq!(cast_oid(Value::Text("12ab".into()), 20).unwrap(), Value::Int(12));
+        // text (oid 25) renders.
+        assert_eq!(cast_oid(Value::Int(5), 25).unwrap(), Value::Text("5".into()));
+        // NULL casts to NULL for every type.
+        assert_eq!(cast_oid(Value::Null, 2950).unwrap(), Value::Null);
+    }
+
+    /// THE bug this opcode exists for. sqlite's rule takes the leading number,
+    /// so `'2020-01-02'` casts to 2020; psycopg2 renders every Python `date`
+    /// parameter as `'…'::date`, which made that the ordinary write path.
+    #[test]
+    fn a_date_literal_casts_to_the_date_and_not_to_its_year() {
+        let d = cast(Value::Text("2020-01-02".into()), ColumnType::Date).unwrap();
+        assert_eq!(d, Value::Date(18_263));
+        // …and the affinity cast still does the sqlite thing, untouched.
+        assert_eq!(
+            cast_value(Value::Text("2020-01-02".into()), Affinity::Integer).unwrap(),
+            Value::Int(2020)
+        );
+    }
+
+    #[test]
+    fn the_four_typed_casts_parse_their_whole_input() {
+        assert_eq!(
+            cast(Value::Text("03:04:05".into()), ColumnType::Time).unwrap(),
+            Value::Time(11_045_000_000)
+        );
+        assert_eq!(
+            cast(Value::Text("1970-01-01 00:00:01".into()), ColumnType::Timestamp).unwrap(),
+            Value::Timestamp(1_000_000)
+        );
+        assert_eq!(
+            cast(Value::Text("1.50".into()), ColumnType::Numeric).unwrap(),
+            Value::Numeric("1.50".into())
+        );
+        // An exponent literal expands, so one value has one stored spelling.
+        assert_eq!(
+            cast(Value::Text("1e3".into()), ColumnType::Numeric).unwrap(),
+            Value::Numeric("1000".into())
+        );
+    }
+
+    /// The message is PostgreSQL's own — that is what a client matches on.
+    #[test]
+    fn bad_input_raises_and_names_the_type() {
+        for (lit, ty, want) in [
+            ("2020", ColumnType::Date, "date"),
+            ("2020-13-01", ColumnType::Date, "date"),
+            ("3", ColumnType::Time, "time"),
+            ("25:00:00", ColumnType::Time, "time"),
+            ("2020", ColumnType::Timestamp, "timestamp"),
+            ("1.2.3", ColumnType::Numeric, "numeric"),
+            ("abc", ColumnType::Numeric, "numeric"),
+        ] {
+            let e = cast(Value::Text(lit.into()), ty).unwrap_err().to_string();
+            assert!(
+                e.contains("invalid input syntax for type") && e.contains(want) && e.contains(lit),
+                "{lit} as {want}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn null_casts_to_null_and_a_value_casts_to_itself() {
+        for ty in [ColumnType::Date, ColumnType::Time, ColumnType::Timestamp, ColumnType::Numeric] {
+            assert_eq!(cast(Value::Null, ty).unwrap(), Value::Null, "{ty:?}");
+        }
+        // Identity, not a round trip through text: `1.50` keeps its scale.
+        assert_eq!(
+            cast(Value::Numeric("1.50".into()), ColumnType::Numeric).unwrap(),
+            Value::Numeric("1.50".into())
+        );
+    }
+
+    /// The date/timestamp conversions PostgreSQL defines, in both directions.
+    #[test]
+    fn dates_and_timestamps_convert_the_way_postgresql_converts_them() {
+        // `timestamp::date` truncates toward the past, on both sides of zero.
+        assert_eq!(
+            cast(Value::Timestamp(18_263 * 86_400_000_000 + 3_600_000_000), ColumnType::Date)
+                .unwrap(),
+            Value::Date(18_263)
+        );
+        assert_eq!(cast(Value::Timestamp(-1), ColumnType::Date).unwrap(), Value::Date(-1));
+        // `timestamp::time` is the clock part, likewise.
+        assert_eq!(
+            cast(Value::Timestamp(18_263 * 86_400_000_000 + 3_600_000_000), ColumnType::Time)
+                .unwrap(),
+            Value::Time(3_600_000_000)
+        );
+        // `date::timestamp` is midnight UTC.
+        assert_eq!(
+            cast(Value::Date(18_263), ColumnType::Timestamp).unwrap(),
+            Value::Timestamp(18_263 * 86_400_000_000)
+        );
+        // Numbers into an exact decimal, without a float in the middle.
+        assert_eq!(
+            cast(Value::Int(42), ColumnType::Numeric).unwrap(),
+            Value::Numeric("42".into())
+        );
+        assert_eq!(
+            cast(Value::Float(1.5), ColumnType::Numeric).unwrap(),
+            Value::Numeric("1.5".into())
+        );
+        // A cast PostgreSQL does not define either.
+        assert!(cast(Value::Blob(vec![1]), ColumnType::Date).is_err());
+        assert!(cast(Value::Date(0), ColumnType::Time).is_err());
+    }
+}
+
+#[cfg(test)]
+mod numeric_arith_tests {
+    use super::*;
+
+    fn n(s: &str) -> Value {
+        Value::Numeric(s.to_string())
+    }
+    fn go(op: Instr, a: Value, b: Value) -> Result<Value> {
+        arith(op, a, b)
+    }
+
+    /// The whole point: no float in the middle. `0.1 + 0.2` is `0.3` exactly,
+    /// which the f64 path cannot say.
+    #[test]
+    fn addition_is_exact_where_a_float_would_not_be() {
+        assert_eq!(go(Instr::Add, n("0.1"), n("0.2")).unwrap(), n("0.3"));
+        assert_eq!(go(Instr::Sub, n("0.3"), n("0.1")).unwrap(), n("0.2"));
+        // Scales align rather than truncate.
+        assert_eq!(go(Instr::Add, n("1.5"), n("2.25")).unwrap(), n("3.75"));
+        assert_eq!(go(Instr::Sub, n("1"), n("0.001")).unwrap(), n("0.999"));
+        // Zero keeps its scale but never a sign.
+        assert_eq!(go(Instr::Sub, n("1.50"), n("1.50")).unwrap(), n("0.00"));
+    }
+
+    #[test]
+    fn multiplication_sums_the_scales_the_way_postgresql_does() {
+        assert_eq!(go(Instr::Mul, n("1.5"), n("2.5")).unwrap(), n("3.75"));
+        assert_eq!(go(Instr::Mul, n("0.01"), n("0.01")).unwrap(), n("0.0001"));
+        assert_eq!(go(Instr::Mul, n("-2.5"), n("4")).unwrap(), n("-10.0"));
+    }
+
+    /// An INTEGER joins as a scale-0 decimal — `numeric + 1` stays numeric in
+    /// PostgreSQL, and routing it through f64 would lose the digits.
+    #[test]
+    fn an_integer_operand_keeps_the_pair_exact() {
+        assert_eq!(go(Instr::Add, n("0.1"), Value::Int(1)).unwrap(), n("1.1"));
+        assert_eq!(go(Instr::Sub, Value::Int(1), n("0.1")).unwrap(), n("0.9"));
+        assert_eq!(go(Instr::Mul, n("1.25"), Value::Int(4)).unwrap(), n("5.00"));
+    }
+
+    #[test]
+    fn division_rounds_the_way_postgresql_rounds() {
+        // Exact quotients come out exact (trailing zeros are the scale).
+        let q = go(Instr::Div, n("1"), n("4")).unwrap();
+        assert_eq!(crate::value::canonical_numeric(&format!("{q}")), "0.25");
+        // A repeating quotient is carried to 16 places past the common scale.
+        let q = go(Instr::Div, n("1"), n("3")).unwrap();
+        let Value::Numeric(t) = q else { panic!() };
+        assert!(t.starts_with("0.3333333333333333"), "{t}");
+        // Rounding is away from zero on the half, on both signs.
+        let q = go(Instr::Div, n("-1"), n("3")).unwrap();
+        let Value::Numeric(t) = q else { panic!() };
+        assert!(t.starts_with("-0.3333333333333333"), "{t}");
+    }
+
+    #[test]
+    fn division_by_zero_follows_the_dialect() {
+        assert_eq!(go(Instr::Div, n("1"), n("0")).unwrap(), Value::Null);
+        assert!(matches!(
+            go(Instr::DivStrict, n("1"), n("0")),
+            Err(Error::DivisionByZero)
+        ));
+    }
+
+    /// Beyond an i128 it is a NAMED refusal, never a quiet fall back to f64 —
+    /// losing the digits is the wrong answer this type exists to prevent.
+    #[test]
+    fn too_many_digits_is_refused_by_name() {
+        let huge = "9".repeat(39);
+        let e = go(Instr::Add, n(&huge), n("1")).unwrap_err().to_string();
+        assert!(e.contains("38 significant digits"), "{e}");
+        assert!(e.contains("double precision"), "{e}");
+    }
+
+    /// A float in the expression widens the decimal, which is PostgreSQL's own
+    /// rule — checked here at the IR level, where `ToFloat` does the widening
+    /// the binder inserted.
+    #[test]
+    fn to_float_accepts_a_numeric() {
+        let p = ExprProgram::new(vec![Instr::PushParam(0), Instr::ToFloat], vec![]).unwrap();
+        assert_eq!(p.eval(&[], &[n("2.4")]).unwrap(), Value::Float(2.4));
+    }
 }

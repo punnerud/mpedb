@@ -25,6 +25,9 @@ fn type_name(t: ColumnType) -> &'static str {
         ColumnType::Text => "TEXT",
         ColumnType::Blob => "BLOB",
         ColumnType::Timestamp => "TIMESTAMP",
+        ColumnType::Date => "DATE",
+        ColumnType::Time => "TIME",
+        ColumnType::Numeric => "NUMERIC",
         ColumnType::Any => "",
     }
 }

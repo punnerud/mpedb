@@ -37,6 +37,9 @@ fn any_tag(v: &Value) -> u8 {
         Value::Text(_) => ColumnType::Text as u8,
         Value::Blob(_) => ColumnType::Blob as u8,
         Value::Timestamp(_) => ColumnType::Timestamp as u8,
+        Value::Date(_) => ColumnType::Date as u8,
+        Value::Time(_) => ColumnType::Time as u8,
+        Value::Numeric(_) => ColumnType::Numeric as u8,
         Value::List(_) => 0, // rejected by `fits` long before here
     }
 }
@@ -157,14 +160,16 @@ pub fn encode_row_parts<'a>(
         let off = slot; // shadow for the arms; the real cursor advances by `w` below
         match v {
             Value::Null => head[i / 8] |= 1 << (i % 8),
-            Value::Int(x) | Value::Timestamp(x) => {
+            Value::Int(x) | Value::Timestamp(x) | Value::Date(x) | Value::Time(x) => {
                 head[off..off + 8].copy_from_slice(&x.to_le_bytes())
             }
             Value::Float(x) => head[off..off + 8].copy_from_slice(&x.to_bits().to_le_bytes()),
             Value::Bool(x) => head[off] = *x as u8,
-            Value::Text(_) | Value::Blob(_) => {
+            // `Numeric` rides the varlen path: its exactness IS its canonical
+            // text, so it is stored as those bytes and never as a float.
+            Value::Text(_) | Value::Blob(_) | Value::Numeric(_) => {
                 let bytes: &'a [u8] = match v {
-                    Value::Text(s) => s.as_bytes(),
+                    Value::Text(s) | Value::Numeric(s) => s.as_bytes(),
                     Value::Blob(b) => b,
                     _ => unreachable!(),
                 };
@@ -290,13 +295,14 @@ pub fn decode_column(buf: &[u8], types: &[ColumnType], col: usize) -> Result<Val
             1 => Ok(Value::Bool(true)),
             _ => Err(Error::Corrupt("invalid bool in row".into())),
         },
-        ColumnType::Int64 | ColumnType::Timestamp => {
+        ColumnType::Int64 | ColumnType::Timestamp | ColumnType::Date | ColumnType::Time => {
             let raw = buf.get(off..off + 8).ok_or_else(err)?;
             let x = i64::from_le_bytes(raw.try_into().unwrap());
-            Ok(if ty == ColumnType::Int64 {
-                Value::Int(x)
-            } else {
-                Value::Timestamp(x)
+            Ok(match ty {
+                ColumnType::Timestamp => Value::Timestamp(x),
+                ColumnType::Date => Value::Date(x),
+                ColumnType::Time => Value::Time(x),
+                _ => Value::Int(x),
             })
         }
         ColumnType::Float64 => {
@@ -305,7 +311,7 @@ pub fn decode_column(buf: &[u8], types: &[ColumnType], col: usize) -> Result<Val
                 raw.try_into().unwrap(),
             ))))
         }
-        ColumnType::Text | ColumnType::Blob => {
+        ColumnType::Text | ColumnType::Blob | ColumnType::Numeric => {
             let raw = buf.get(off..off + 8).ok_or_else(err)?;
             let var_off = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
             let len = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
@@ -313,14 +319,17 @@ pub fn decode_column(buf: &[u8], types: &[ColumnType], col: usize) -> Result<Val
             let bytes = buf
                 .get(start..start.checked_add(len).ok_or_else(err)?)
                 .ok_or_else(err)?;
-            if ty == ColumnType::Text {
-                Ok(Value::Text(
-                    std::str::from_utf8(bytes)
-                        .map_err(|_| Error::Corrupt("invalid utf-8 in row".into()))?
-                        .to_owned(),
-                ))
-            } else {
+            if ty == ColumnType::Blob {
                 Ok(Value::Blob(bytes.to_vec()))
+            } else {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| Error::Corrupt("invalid utf-8 in row".into()))?
+                    .to_owned();
+                Ok(if ty == ColumnType::Numeric {
+                    Value::Numeric(text)
+                } else {
+                    Value::Text(text)
+                })
             }
         }
     }
@@ -391,20 +400,21 @@ pub fn decode_row_masked(
                 1 => Value::Bool(true),
                 _ => return Err(Error::Corrupt("invalid bool in row".into())),
             },
-            ColumnType::Int64 | ColumnType::Timestamp => {
+            ColumnType::Int64 | ColumnType::Timestamp | ColumnType::Date | ColumnType::Time => {
                 let raw = buf.get(voff..voff + 8).ok_or_else(err)?;
                 let x = i64::from_le_bytes(raw.try_into().unwrap());
-                if vty == ColumnType::Int64 {
-                    Value::Int(x)
-                } else {
-                    Value::Timestamp(x)
+                match vty {
+                    ColumnType::Timestamp => Value::Timestamp(x),
+                    ColumnType::Date => Value::Date(x),
+                    ColumnType::Time => Value::Time(x),
+                    _ => Value::Int(x),
                 }
             }
             ColumnType::Float64 => {
                 let raw = buf.get(voff..voff + 8).ok_or_else(err)?;
                 Value::Float(f64::from_bits(u64::from_le_bytes(raw.try_into().unwrap())))
             }
-            ColumnType::Text | ColumnType::Blob => {
+            ColumnType::Text | ColumnType::Blob | ColumnType::Numeric => {
                 let raw = buf.get(voff..voff + 8).ok_or_else(err)?;
                 let var_off = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
                 let len = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
@@ -412,14 +422,17 @@ pub fn decode_row_masked(
                 let bytes = buf
                     .get(start..start.checked_add(len).ok_or_else(err)?)
                     .ok_or_else(err)?;
-                if vty == ColumnType::Text {
-                    Value::Text(
-                        std::str::from_utf8(bytes)
-                            .map_err(|_| Error::Corrupt("invalid utf-8 in row".into()))?
-                            .to_owned(),
-                    )
-                } else {
+                if vty == ColumnType::Blob {
                     Value::Blob(bytes.to_vec())
+                } else {
+                    let text = std::str::from_utf8(bytes)
+                        .map_err(|_| Error::Corrupt("invalid utf-8 in row".into()))?
+                        .to_owned();
+                    if vty == ColumnType::Numeric {
+                        Value::Numeric(text)
+                    } else {
+                        Value::Text(text)
+                    }
                 }
             }
         });

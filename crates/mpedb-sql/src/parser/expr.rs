@@ -207,7 +207,22 @@ impl<'a> Parser<'a> {
         let mut seen_cmp = false;
         loop {
             if self.eat_kw(Kw::Is) {
-                let negated = self.eat_kw(Kw::Not);
+                let mut negated = self.eat_kw(Kw::Not);
+                // `x IS [NOT] DISTINCT FROM y` — the SQL-standard spelling of
+                // the same NULL-safe comparison mpedb writes as `x IS [NOT] y`,
+                // with the sense INVERTED: "IS NOT DISTINCT FROM" means EQUAL.
+                // So the two keywords flip `negated` rather than setting it.
+                //
+                // Without this the `FROM` fell out of the expression and was
+                // read as a second FROM clause, so the error named a TABLE
+                // (`no such table: t.col_b`) for what is a comparison.
+                if self.eat_kw(Kw::Distinct) {
+                    self.expect_kw(Kw::From, "FROM")?;
+                    negated = !negated;
+                    let rhs = self.bit_expr()?;
+                    e = Expr::IsDistinct(Box::new(e), Box::new(rhs), negated);
+                    continue;
+                }
                 if self.eat_kw(Kw::Null) {
                     e = Expr::IsNull(Box::new(e), negated);
                 } else {

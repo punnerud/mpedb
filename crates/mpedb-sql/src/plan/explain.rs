@@ -1056,6 +1056,17 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: true,
                 }
             }
+            // Spelled apart from the affinity cast on purpose: an EXPLAIN that
+            // rendered both as `CAST(x AS DATE)` would hide which of the two
+            // rules this plan actually runs.
+            Instr::CastPg(oid) => {
+                let a = pop(&mut st);
+                let name = mpedb_types::pgtype::by_oid(oid).map_or("?", |t| t.name);
+                Item {
+                    s: format!("CAST({} AS {name} STRICT)", a.s),
+                    atom: true,
+                }
+            }
             Instr::Like(i) => {
                 let a = pop(&mut st);
                 Item {

@@ -61,6 +61,9 @@ fn sqlite_type(ct: ColumnType) -> &'static str {
         ColumnType::Text => "TEXT",
         ColumnType::Blob => "BLOB",
         ColumnType::Timestamp => "DATETIME",
+        ColumnType::Date => "DATE",
+        ColumnType::Time => "TIME",
+        ColumnType::Numeric => "NUMERIC",
         // sqlite is the one target that HAS this concept: a column with no
         // declared type gets BLOB affinity, i.e. it stores whatever it is given.
         // That is exactly `any`, so the round-trip reconstructs it.
@@ -84,6 +87,14 @@ pub(crate) fn to_sql(v: &Value) -> SqlVal {
         Value::List(_) => SqlVal::Null,
         // import mapped INTEGER seconds → micros; go back to seconds
         Value::Timestamp(us) => SqlVal::Integer(us.div_euclid(1_000_000)),
+        // No conversion: sqlite has no date/time type, so the integer mpedb
+        // stores (days since the epoch; micros since midnight) is the only
+        // form that survives a round trip without a convention to get wrong.
+        Value::Date(d) => SqlVal::Integer(*d),
+        Value::Time(t) => SqlVal::Integer(*t),
+        // sqlite has no exact decimal either, and its NUMERIC affinity would
+        // turn one into a float. The canonical TEXT is what keeps the digits.
+        Value::Numeric(n) => SqlVal::Text(n.clone()),
     }
 }
 

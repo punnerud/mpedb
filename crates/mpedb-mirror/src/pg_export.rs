@@ -70,6 +70,9 @@ fn generic_pg_type(ct: ColumnType) -> &'static str {
         ColumnType::Text => "text",
         ColumnType::Blob => "bytea",
         ColumnType::Timestamp => "timestamptz",
+        ColumnType::Date => "date",
+        ColumnType::Time => "time",
+        ColumnType::Numeric => "numeric",
         // Unreachable via `mirror push`: preflight refuses an `any` column against
         // a PostgreSQL target (FindingKind::AnyColumn) before any DDL is
         // generated. If it ever gets here, the check was bypassed — emit
@@ -171,6 +174,12 @@ enum PgParam {
     Blob(Vec<u8>),
     /// micros since the unix epoch
     Micros(i64),
+    /// days since the unix epoch
+    Days(i64),
+    /// micros since midnight
+    TimeMicros(i64),
+    /// an exact decimal in canonical text form
+    Numeric(String),
 }
 
 fn to_param(v: &Value) -> PgParam {
@@ -182,6 +191,9 @@ fn to_param(v: &Value) -> PgParam {
         Value::Text(s) => PgParam::Text(s.clone()),
         Value::Blob(b) => PgParam::Blob(b.clone()),
         Value::Timestamp(us) => PgParam::Micros(*us),
+        Value::Date(d) => PgParam::Days(*d),
+        Value::Time(t) => PgParam::TimeMicros(*t),
+        Value::Numeric(n) => PgParam::Numeric(n.clone()),
         // A context list (§2.6) is param-only and cannot be stored, so nothing
         // read out of a column is one.
         Value::List(_) => PgParam::Null,
@@ -315,7 +327,8 @@ pub fn export_pg(
                         PgParam::Bool(b) => b,
                         PgParam::Text(s) => s,
                         PgParam::Blob(b) => b,
-                        PgParam::Micros(m) => m,
+                        PgParam::Micros(m) | PgParam::Days(m) | PgParam::TimeMicros(m) => m,
+                        PgParam::Numeric(n) => n,
                     }
                 })
                 .collect();

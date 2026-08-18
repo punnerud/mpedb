@@ -368,6 +368,25 @@ fn value_json(out: &mut String, v: &Value) {
             push_str(out, &us.to_string());
             out.push('}');
         }
+        // As strings, for the same reason `Int` is: these are i64s, and JS
+        // would round the large ones the engine did not round.
+        Value::Date(days) => {
+            out.push_str("{\"t\":\"date\",\"v\":");
+            push_str(out, &days.to_string());
+            out.push('}');
+        }
+        Value::Time(us) => {
+            out.push_str("{\"t\":\"time\",\"v\":");
+            push_str(out, &us.to_string());
+            out.push('}');
+        }
+        // A JSON number would be a float, which is the precision the type
+        // exists to keep — its canonical digits go across as a string.
+        Value::Numeric(n) => {
+            out.push_str("{\"t\":\"numeric\",\"v\":");
+            push_str(out, n);
+            out.push('}');
+        }
         Value::List(items) => {
             out.push_str("{\"t\":\"list\",\"v\":[");
             let mut sep = Sep::new();

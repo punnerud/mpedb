@@ -455,10 +455,23 @@ pub(crate) fn convert_value(vr: ValueRef, ct: ColumnType, table: &str, col: &str
             },
             // default timestamp convention: INTEGER seconds → micros
             ColumnType::Timestamp => Value::Timestamp(i.saturating_mul(1_000_000)),
+            // Import never DERIVES these three (they have no sqlite declared
+            // type that maps to one — see `ColumnType::declared`), so a column
+            // only has one when the mpedb side already did. Accept the
+            // integer as what the type says it counts.
+            ColumnType::Date => Value::Date(i),
+            ColumnType::Time => Value::Time(i),
+            ColumnType::Numeric => Value::Numeric(i.to_string()),
             ColumnType::Text | ColumnType::Blob => return violation("integer in text/blob column"),
         },
         ValueRef::Real(f) => match ct {
             ColumnType::Float64 => Value::Float(f),
+            // A float already lost the digits an exact decimal is for, so this
+            // records what arrived rather than pretending otherwise.
+            ColumnType::Numeric => match mpedb_types::value::parse_numeric(&f.to_string()) {
+                Some(n) => Value::Numeric(n),
+                None => return violation("non-finite real in a numeric column"),
+            },
             _ => return violation("real in a non-float column"),
         },
         ValueRef::Text(bytes) => match ct {
@@ -467,6 +480,14 @@ pub(crate) fn convert_value(vr: ValueRef, ct: ColumnType, table: &str, col: &str
                 Err(_) => return violation("invalid UTF-8 in TEXT column"),
             },
             ColumnType::Blob => Value::Blob(bytes.to_vec()),
+            // The form `export`'s `to_sql` writes, so the pair round-trips.
+            ColumnType::Numeric => match std::str::from_utf8(bytes)
+                .ok()
+                .and_then(mpedb_types::value::parse_numeric)
+            {
+                Some(n) => Value::Numeric(n),
+                None => return violation("text in a numeric column is not a decimal"),
+            },
             _ => return violation("text in a non-text column"),
         },
         ValueRef::Blob(bytes) => match ct {

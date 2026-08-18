@@ -131,6 +131,12 @@ pub use mpedb_types::{
     HostAggState, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema,
     TableDef, TableKind, TableSet, Value, INDEX_EXPR_COL, MAX_DB_SIZE_MB,
 };
+/// The strict decimal parser: what turns a client's literal into the canonical
+/// text a [`Value::Numeric`] stores, and refuses what is not a number.
+pub use mpedb_types::value::{canonical_numeric, numeric_cmp, parse_numeric};
+/// The schema plus the generation it was read at — one value that answers both
+/// "what is the schema" and "is my copy stale", CONSISTENTLY.
+pub use mpedb_core::engine::SchemaBundle;
 
 use exec::{exec_stmt, ChargeMode, ReadCtx};
 pub use exec::take_last_insert_rowid;

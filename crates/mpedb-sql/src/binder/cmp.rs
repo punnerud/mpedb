@@ -2,6 +2,10 @@
 //! sqlite-vs-postgres dialect gates, and row-value desugaring (split from
 //! binder.rs; see mod.rs).
 
+/// `pg_type.oid` for `numeric` — the strict cast the integer side takes so
+/// a mixed NUMERIC/INTEGER pair meets as two decimals at runtime.
+const NUMERIC_OID: u32 = 1700;
+
 use super::*;
 
 impl<'a> Binder<'a> {
@@ -268,8 +272,14 @@ impl<'a> Binder<'a> {
                     // Without this, `doc ->> '$.n' + 1` — and every arithmetic
                     // over a host UDF result — would be a COMPILE error even
                     // though the values are numbers.
+                    // `Numeric` is a number too, and its arithmetic is EXACT
+                    // (`expr::numeric_arith`) rather than a float's. Leaving
+                    // it out here made `-15 / CAST(10 AS NUMERIC)` a compile
+                    // error after the type existed — the operand had a home
+                    // at runtime and none at bind time.
                     if t != ColumnType::Int64
                         && t != ColumnType::Float64
+                        && t != ColumnType::Numeric
                         && t != ColumnType::Any
                     {
                         return Err(bind_err(format!(
@@ -630,6 +640,40 @@ impl<'a> Binder<'a> {
             (Some(ColumnType::Float64), Some(ColumnType::Int64)) => {
                 let r = fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(r)), self.suppress_fold)?;
                 Ok((l, r, Some(ColumnType::Float64)))
+            }
+            // PostgreSQL's own promotion rule for a mixed numeric pair:
+            // `numeric op float8` is float8 (the inexact side wins, because
+            // the float already lost the digits), while `numeric op int` stays
+            // NUMERIC and is computed exactly. Widening a decimal to f64 just
+            // because an integer stood next to it would throw away the
+            // exactness the type exists for.
+            (Some(ColumnType::Numeric), Some(ColumnType::Float64)) => {
+                let l = fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(l)), self.suppress_fold)?;
+                Ok((l, r, Some(ColumnType::Float64)))
+            }
+            (Some(ColumnType::Float64), Some(ColumnType::Numeric)) => {
+                let r = fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(r)), self.suppress_fold)?;
+                Ok((l, r, Some(ColumnType::Float64)))
+            }
+            // …and the integer is CONVERTED, not left to meet the decimal at
+            // runtime. A mixed pair reaching the evaluator would have to be
+            // ordered by `sort_cmp`, whose cross-class answer is "peers" — and
+            // the grouping key, which ranks NUMERIC in a class of its own,
+            // would then disagree with it. One conversion here keeps the two
+            // in step (`group_key_matches_sort_cmp` is the pin).
+            (Some(ColumnType::Numeric), Some(ColumnType::Int64)) => {
+                let r = fold_maybe(
+                    BExpr::CastPg(Box::new(r), NUMERIC_OID),
+                    self.suppress_fold,
+                )?;
+                Ok((l, r, Some(ColumnType::Numeric)))
+            }
+            (Some(ColumnType::Int64), Some(ColumnType::Numeric)) => {
+                let l = fold_maybe(
+                    BExpr::CastPg(Box::new(l), NUMERIC_OID),
+                    self.suppress_fold,
+                )?;
+                Ok((l, r, Some(ColumnType::Numeric)))
             }
             // A dynamically-typed operand (`ColumnType::Any` — a host UDF result
             // (design/DESIGN-UDF.md) or a typeless column) unifies with ANY

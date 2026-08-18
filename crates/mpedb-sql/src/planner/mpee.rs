@@ -1146,6 +1146,7 @@ fn cols_of(e: &BExpr) -> Vec<u16> {
             | BExpr::Glob(a, _)
             | BExpr::Regexp(a, _)
             | BExpr::Cast(a, _)
+            | BExpr::CastPg(a, _)
             | BExpr::InParam(a, _)
             | BExpr::InParamColl(a, _, _) => stack.push(a),
             BExpr::Binary(_, a, b)

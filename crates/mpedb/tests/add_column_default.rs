@@ -65,7 +65,10 @@ fn from_mpedb(v: &Value) -> Cell {
         Value::Null => Cell::Null,
         Value::Int(i) => Cell::Int(*i),
         Value::Bool(b) => Cell::Int(*b as i64),
-        Value::Timestamp(t) => Cell::Int(*t),
+        Value::Timestamp(t) | Value::Date(t) | Value::Time(t) => Cell::Int(*t),
+        // This differential is against sqlite, which has no exact decimal;
+        // the canonical text is what the two sides can agree on.
+        Value::Numeric(n) => Cell::Text(n.clone()),
         Value::Float(f) => Cell::Real(f.to_bits()),
         Value::Text(s) => Cell::Text(s.clone()),
         Value::Blob(b) => Cell::Blob(b.clone()),
