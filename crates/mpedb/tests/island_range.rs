@@ -178,3 +178,56 @@ fn an_unsatisfiable_predicate_returns_nothing() {
     assert_eq!(ours(&db, sql), oracle(sql));
     assert!(ours(&db, sql).is_empty());
 }
+
+/// An INTEGER indexed column, which every test above happens not to have.
+///
+/// The island's endpoints are f64 because the analysis is arithmetic, but the
+/// bound is ENCODED, and `keycode` gives an `Int` the sign-flipped i64 image
+/// and a `Float` the IEEE total-order image — eight bytes each, same tag,
+/// mutually unordered. An upper bound of `Float(-18.0)` against a column
+/// keyed on `Int(-47)` therefore sorted the row ABOVE the bound and the scan
+/// walked straight past it.
+///
+/// The differential found it as `UPDATE t SET b = a WHERE a + 3 < -15`
+/// leaving `a = -47` untouched; this is that program, minimized, with the
+/// UPDATE kept because a write that misses rows is how the bug shows up as
+/// corrupt data rather than a short answer.
+#[test]
+fn an_integer_column_gets_an_integer_bound() {
+    let dir = mpedb_testkit::scratch_base();
+    let path = dir
+        .join(format!("mpedb-island-int-{}.mpedb", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+    let _ = std::fs::remove_file(&path);
+    let cfg =
+        Config::from_toml_str(&format!("[database]\npath = \"{path}\"\nsize_mb = 16\n")).unwrap();
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query("CREATE TABLE t (pk INTEGER PRIMARY KEY, a INTEGER, b REAL)", &[])
+        .unwrap();
+    db.query("CREATE INDEX t_a ON t (a)", &[]).unwrap();
+    for (pk, a, b) in [(14i64, None, -11.75f64), (43, Some(-4i64), 17.75), (22, Some(-47), -14.25)]
+    {
+        db.query(
+            "INSERT INTO t VALUES ($1, $2, $3)",
+            &[Value::Int(pk), a.map_or(Value::Null, Value::Int), Value::Float(b)],
+        )
+        .unwrap();
+    }
+
+    // `a + 3 < -15` implies `a <= -18`: a bound the query never wrote, over a
+    // column whose keys are integers.
+    let sql = "SELECT pk FROM t WHERE a + 3 < -15";
+    match access(&db, sql) {
+        AccessPath::IndexRange { hi: Some(_), .. } => {}
+        other => panic!("expected a bounded IndexRange from the island, got {other:?}"),
+    }
+    assert_eq!(ours(&db, sql), vec!["22".to_string()], "the range must not skip a matching row");
+
+    // The write path, which is where a missed row becomes wrong data.
+    db.query("UPDATE t SET b = a WHERE a + 3 < -15", &[]).unwrap();
+    assert_eq!(
+        ours(&db, "SELECT pk, a, b FROM t ORDER BY pk"),
+        vec!["14||-11.75".to_string(), "22|-47|-47".to_string(), "43|-4|17.75".to_string()],
+    );
+}
