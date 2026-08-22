@@ -370,8 +370,16 @@ pub(crate) fn checkpoint_to_sqlite(c: &mut Sqlite3) -> Result<u64, String> {
         // from the import: the sidecar is writable, so the schema now is the
         // truth, and a remembered string would go stale the first time someone
         // ran DDL against it.
-        let cols: Vec<String> = t
-            .columns
+        // The VISIBLE columns only. A table imported without a primary key
+        // gets one synthesized — a trailing hidden `rowid` — and it must not
+        // reach the sqlite schema: sqlite maintains its own rowid, and the
+        // rows here come from `SELECT *`, which already expands over the
+        // visible columns alone. Writing it produced a phantom third column
+        // whose every value was NULL. That was wrong before NOT NULL was
+        // carried across as well; the flag only made it audible, as four
+        // `NULL value in p.rowid` lines from `PRAGMA integrity_check`.
+        let visible = t.visible_columns();
+        let cols: Vec<String> = visible
             .iter()
             .map(|col| {
                 // NOT NULL goes back out too, for the same reason the import
@@ -407,14 +415,22 @@ pub(crate) fn checkpoint_to_sqlite(c: &mut Sqlite3) -> Result<u64, String> {
                     t.name
                 ));
             }
+            // Resolved against the VISIBLE columns for the same reason: an
+            // index keyed on the hidden rowid would name a column the written
+            // schema does not have, and its ordinals would not address the
+            // rows either.
             let cols: Vec<String> = ix
                 .columns
                 .iter()
-                .filter_map(|c| t.columns.get(*c as usize))
+                .filter_map(|c| visible.get(*c as usize))
                 .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
                 .collect();
             if cols.len() != ix.columns.len() {
-                return Err(format!("index `{name}` on `{}`: unresolved key column", t.name));
+                return Err(format!(
+                    "index `{name}` on `{}`: a key column is not in the written schema \
+                     (the synthesized rowid is not carried across)",
+                    t.name
+                ));
             }
             let unique = if ix.unique { "UNIQUE " } else { "" };
             indexes.push(mpedb_sqlitefmt::ImageIndex {
