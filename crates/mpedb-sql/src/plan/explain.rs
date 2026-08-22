@@ -875,32 +875,43 @@ impl CompiledPlan {
                 format!("{label}({}) via index {index_no}", items.join(", "))
             }
             AccessPath::IndexRange { index_no, lo, hi } => {
-                let col = (*index_no as usize)
-                    .checked_sub(1)
-                    .and_then(|i| {
-                        schema
-                            .table(table)
-                            .map(crate::planner::secondary_indexes)
-                            .unwrap_or_default()
-                            .get(i)
-                            .copied()
-                            .flatten() // composite (#55): falls back below
-                    })
-                    .unwrap_or(0);
+                // The range is always over the index's FIRST key column
+                // (the Phase-1 rule in `planner::access`), so read it from
+                // `TableDef.indexes` directly — the same way the IndexPoint
+                // arm above does.
+                //
+                // This used to go through `secondary_indexes`, which answers
+                // `None` for a COMPOSITE index — a leftover from before #55,
+                // when a composite was never an access path. Since it is one,
+                // `None` fell to `unwrap_or(0)`, and column 0 is not "unknown"
+                // but a real column: an `IndexRange` over `(lat, lon)` printed
+                // `IndexRange(hex >= 59.82, hex <= 59.85)`. The plan and the
+                // answer were right; only the label lied, which is the worst
+                // way for an EXPLAIN to be wrong.
+                let col = (*index_no as usize).checked_sub(1).and_then(|i| {
+                    schema
+                        .table(table)
+                        .and_then(|t| t.indexes.get(i))
+                        .and_then(|ix| ix.columns.first().copied())
+                });
                 let mut items = Vec::new();
+                // An index we cannot resolve says so, rather than naming
+                // whichever column happens to sit at ordinal 0.
+                let name = match col {
+                    Some(c) => col_name(c),
+                    None => "<column?>".to_string(),
+                };
                 if let Some(b) = lo {
                     let op = if b.inclusive { ">=" } else { ">" };
                     items.push(format!(
-                        "{} {op} {}",
-                        col_name(col),
+                        "{name} {op} {}",
                         self.render_part_outer(&b.parts[0], outer)
                     ));
                 }
                 if let Some(b) = hi {
                     let op = if b.inclusive { "<=" } else { "<" };
                     items.push(format!(
-                        "{} {op} {}",
-                        col_name(col),
+                        "{name} {op} {}",
                         self.render_part_outer(&b.parts[0], outer)
                     ));
                 }
