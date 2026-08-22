@@ -17,7 +17,7 @@ members = []
 
 [package]
 name = "mpedb-pg"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "LicenseRef-mpedb-1.0"
 description = "PostgreSQL v3 wire protocol for mpedb — serverless, one process per connection"

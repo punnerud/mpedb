@@ -11,7 +11,7 @@ build-backend = "maturin"
 
 [project]
 name = "mpedb"
-version = "0.3.0"
+version = "0.3.1"
 description = "Drop-in sqlite3 replacement: multi-process embedded database with MVCC snapshots, content-hashed plans, and a sqlite-backed sync mode for .db files"
 readme = "README.md"
 requires-python = ">=3.10"
