@@ -1,10 +1,10 @@
 //! Islands: the interval a predicate confines a column to.
 //!
-//! A predicate can bound a column without ever naming a bound. `(lat-A)*(lat-A)
-//! + (lon-B)*(lon-B) < R*R` is a circle, and a circle is a box in every axis —
-//! but the planner sees `f(col) > 0`, classifies it UNKNOWN
-//! ([`super::mpee`]), and takes a full scan over a tree that could have
-//! answered it.
+//! A predicate can bound a column without ever naming a bound.
+//! `(lat-A)*(lat-A) + (lon-B)*(lon-B) < R*R` is a circle, and a circle is a
+//! box in every axis — but the planner sees `f(col) > 0`, classifies it
+//! UNKNOWN ([`super::mpee`]), and takes a full scan over a tree that could
+//! have answered it.
 //!
 //! This module computes the box. Not by recognizing the expression — nothing
 //! here knows Pythagoras, circles or geography — but by ARITHMETIC in the
@@ -34,7 +34,6 @@
 //! 3VL-NULL on a NULL operand, so a row with a NULL column cannot satisfy a
 //! comparison, and excluding it from the interval is sound.
 
-use super::atoms::split_and;
 use crate::ast::BinOp;
 use crate::binder::{BExpr, BUnOp};
 use mpedb_types::Value;
@@ -110,7 +109,7 @@ impl Iv {
 /// The interval `col` is confined to by `conjuncts`, or `None` when unbounded.
 ///
 /// `conjuncts` are the top-level AND terms of a WHERE clause (see
-/// [`split_and`]). Each is analyzed on its own and the results intersected,
+/// [`super::atoms::split_and`]). Each is analyzed on its own and the results intersected,
 /// which is exactly what AND means for a superset.
 pub(super) fn island(conjuncts: &[BExpr], col: u16) -> Option<Iv> {
     let mut acc = Iv::ALL;
@@ -349,13 +348,6 @@ fn num_of(v: &Value) -> Option<f64> {
         Value::Float(f) if f.is_finite() => Some(*f),
         _ => None,
     }
-}
-
-/// Split a WHERE clause and ask for one column's island in one step.
-pub(super) fn island_of(where_clause: &BExpr, col: u16) -> Option<Iv> {
-    let mut parts = Vec::new();
-    split_and(where_clause.clone(), &mut parts);
-    island(&parts, col)
 }
 
 #[cfg(test)]

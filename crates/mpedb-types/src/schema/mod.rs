@@ -340,11 +340,6 @@ impl ColumnDef {
     }
 }
 
-/// One secondary index (canonical-bytes v2, DESIGN-SCHEMA-V2). `index_no` in
-/// the catalog/plans is `1 + position` in `TableDef::indexes` (0 = PK tree).
-/// Column order is significant. This list is the SINGLE source of truth for
-/// index numbering — the per-column `unique`/`indexed` flags are input sugar
-
 /// Whether an index is filled and may answer queries — see
 /// [`IndexDef::state`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -360,6 +355,10 @@ pub enum IndexState {
     Building,
 }
 
+/// One secondary index (canonical-bytes v2, DESIGN-SCHEMA-V2). `index_no` in
+/// the catalog/plans is `1 + position` in `TableDef::indexes` (0 = PK tree).
+/// Column order is significant. This list is the SINGLE source of truth for
+/// index numbering — the per-column `unique`/`indexed` flags are input sugar
 /// and in-memory convenience, reconstructed from here on decode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexDef {
