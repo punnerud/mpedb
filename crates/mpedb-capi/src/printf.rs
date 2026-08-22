@@ -24,13 +24,29 @@ extern "C" {
     fn mpedb_capi_vsnprintf();
 }
 
+// The tail branch is spelled differently per architecture — x86-64 `jmp`,
+// AArch64 `b` — and an aarch64 assembler answers "unrecognized instruction
+// mnemonic, did you mean: cmp?" to the x86 one. Both instructions do the same
+// thing that matters here: transfer control WITHOUT touching a register or the
+// stack, so the callee sees precisely what the caller set up. On x86-64 that
+// includes `al`; on AArch64 it includes the variadic area the caller has
+// already laid out.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!(
+    "the printf thunks need a tail-branch mnemonic for this architecture; \
+     add an arm to `thunk!` rather than letting the naked body come out empty"
+);
+
 macro_rules! thunk {
     ($name:ident => $imp:ident, $doc:literal) => {
         #[doc = $doc]
         #[unsafe(naked)]
         #[no_mangle]
         pub unsafe extern "C" fn $name() {
-            naked_asm!("jmp {}", sym $imp)
+            #[cfg(target_arch = "x86_64")]
+            naked_asm!("jmp {}", sym $imp);
+            #[cfg(target_arch = "aarch64")]
+            naked_asm!("b {}", sym $imp);
         }
     };
 }
