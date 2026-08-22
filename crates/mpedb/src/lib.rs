@@ -1679,6 +1679,18 @@ impl Database {
         Ok(plan.output_decltypes(&self.schema()))
     }
 
+    /// Per output column, the base TABLE to report through the C-API shim
+    /// (`sqlite3_column_table_name`). Compiles `sql` — surfacing any bind/plan
+    /// error exactly as prepare would — and derives each column's source table
+    /// from the plan's projection (see [`CompiledPlan::output_table_names`]):
+    /// a bare base-table column reports its table, everything computed reports
+    /// `None`. A non-SELECT yields an empty vec (all NULL). This does not
+    /// execute or publish a plan.
+    pub fn output_table_names(&self, sql: &str) -> Result<Vec<Option<String>>> {
+        let (plan, _explain) = self.compile_maybe_explain(sql)?;
+        Ok(plan.output_table_names(&self.schema()))
+    }
+
     /// What `sql` would TOUCH, at column granularity, without running it: the
     /// report an authorization layer, an audit log or a policy gate consults
     /// before a statement is allowed through (see [`plan_access`]).
