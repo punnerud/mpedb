@@ -4856,12 +4856,17 @@ mod tests {
         // so the second commit's page is never flushed — and the caller must
         // not be told the range is durable.
         {
-            use std::os::unix::fs::FileExt as _;
-            let wal = std::fs::OpenOptions::new()
+            // Seek + write rather than `FileExt::write_all_at`: the positional
+            // form is `std::os::unix` on unix and `seek_write` on Windows, and
+            // this test does not need either. It broke the Windows lib-test
+            // build — the library compiled, so only `cargo test` saw it.
+            use std::io::{Seek, SeekFrom, Write};
+            let mut wal = std::fs::OpenOptions::new()
                 .write(true)
                 .open(wal_path(&p))
                 .unwrap();
-            wal.write_all_at(b"XXXX", 0).unwrap();
+            wal.seek(SeekFrom::Start(0)).unwrap();
+            wal.write_all(b"XXXX").unwrap();
         }
         assert!(
             !shm.wal_msync_logged_pages(0, end).unwrap(),
