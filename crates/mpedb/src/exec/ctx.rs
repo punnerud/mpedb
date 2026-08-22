@@ -49,6 +49,22 @@ pub(super) fn output_collations(
 /// kinds. Write operations on a read transaction are unreachable by
 /// construction (routing is by the recomputed `footprint.read_only`) and
 /// return `Error::Internal` if ever hit.
+/// Which shape of index walk [`TxnCtx::scan_by_index_capped`] performs.
+///
+/// An equality probe and a bounded range are mutually exclusive. As three
+/// separate parameters they were not: `prefix` alongside `lo`/`hi` was
+/// expressible and meant nothing, and it pushed the signature past what any
+/// reader can hold at once.
+pub(crate) enum IndexProbe<'a> {
+    /// Every entry whose key starts with `encode_key_spec(values, …)` — the
+    /// `WHERE col = v` probe. A NULL among the values matches nothing: a row
+    /// with a NULL in an indexed column has no entry at all.
+    Prefix(&'a [Value]),
+    /// Raw-encoded bounds, the same prefix construction composite-PK ranges
+    /// use.
+    Range { lo: Option<(&'a [u8], bool)>, hi: Option<(&'a [u8], bool)> },
+}
+
 pub(crate) trait TxnCtx {
     /// Host-registered scalar UDFs in scope for this execution (design/DESIGN-UDF.md),
     /// or `None` where none are (the default). Both native contexts carry them —
@@ -171,6 +187,52 @@ pub(crate) trait TxnCtx {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
     ) -> Result<Vec<Vec<Value>>>;
+    /// The index paths' [`scan_rows_capped`](Self::scan_rows_capped): the
+    /// residual filter per row and a cap on KEPT rows, both applied INSIDE the
+    /// walk.
+    ///
+    /// The materializing forms above build the whole matching range first, so
+    /// a probe that matches a third of the table paid for a third of the table
+    /// to return one row (measured: 528 MB peak for `WHERE hex = 'x' LIMIT 1`
+    /// on 945 234 rows, against 7,5 MB for the same one row by table scan).
+    /// The filter has to come down WITH the cap, not after it — capping at `n`
+    /// rows the filter has not seen yet would stop early and return fewer rows
+    /// than exist.
+    ///
+    /// `prefix` selects the shape: `Some(values)` is the equality probe,
+    /// `None` the `lo`/`hi` range. The default collects and then filters,
+    /// which is right for the WriteTxn contexts (collect-then-mutate is their
+    /// rule anyway); `ReadCtx` overrides it with the real cursor.
+    fn scan_by_index_capped(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        probe: IndexProbe<'_>,
+        filter: Option<(&ExprProgram, &[Value])>,
+        cap: Option<usize>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let rows = match probe {
+            IndexProbe::Prefix(v) => self.scan_by_index(table, index_no, v)?,
+            IndexProbe::Range { lo, hi } => self.scan_by_index_range(table, index_no, lo, hi)?,
+        };
+        let host = self.host_fns();
+        let mut kept = Vec::new();
+        let mut stack = Vec::new();
+        for row in rows {
+            let keep = match filter {
+                Some((f, params)) => f.eval_filter_host(&mut stack, &row, params, host)?,
+                None => true,
+            };
+            if keep {
+                kept.push(row);
+                if cap.is_some_and(|c| kept.len() >= c) {
+                    break;
+                }
+            }
+        }
+        Ok(kept)
+    }
+
     /// Scan with the residual filter applied per row and an optional cap on
     /// KEPT rows — the LIMIT/OFFSET pushdown (MPEE "stream under a memory
     /// budget" transfer: never materialize what the query will not return).
@@ -769,6 +831,44 @@ impl TxnCtx for ReadCtx<'_, '_> {
         // cap is reached — `SELECT ... LIMIT k` does O(offset+k) work
         let host = self.1;
         let mut cursor = self.0.scan_raw(table, lo, hi)?;
+        let mut kept = Vec::new();
+        let mut stack = Vec::new();
+        while let Some(row) = cursor.next()? {
+            let keep = match filter {
+                Some((f, params)) => f.eval_filter_host(&mut stack, &row, params, host)?,
+                None => true,
+            };
+            if keep {
+                kept.push(row);
+                if cap.is_some_and(|c| kept.len() >= c) {
+                    break;
+                }
+            }
+        }
+        Ok(kept)
+    }
+    fn scan_by_index_capped(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        probe: IndexProbe<'_>,
+        filter: Option<(&ExprProgram, &[Value])>,
+        cap: Option<usize>,
+    ) -> Result<Vec<Vec<Value>>> {
+        // The index twin of `scan_rows_capped`: stop walking the index the
+        // moment the cap is met, and never build a row the filter rejects.
+        let host = self.1;
+        let mut cursor = match probe {
+            IndexProbe::Prefix(vals) => {
+                if vals.iter().any(|v| v.is_null()) {
+                    return Ok(Vec::new()); // any-NULL rows are never indexed
+                }
+                self.0.scan_by_index_prefix_raw(table, index_no, vals)?
+            }
+            IndexProbe::Range { lo, hi } => {
+                self.0.scan_by_index_range_raw(table, index_no, lo, hi)?
+            }
+        };
         let mut kept = Vec::new();
         let mut stack = Vec::new();
         while let Some(row) = cursor.next()? {

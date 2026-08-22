@@ -1298,8 +1298,17 @@ pub(super) fn gather_rows(
             } else {
                 // N rows equal on the covered prefix; the engine takes the
                 // exact-get fast path when a UNIQUE index is covered full
-                // width.
-                ctx.scan_by_index(table, *index_no, &vals)?
+                // width. Filter and cap go DOWN into the walk — a probe on a
+                // low-cardinality column matches a large slice of the table,
+                // and building all of it to return one row cost 528 MB on a
+                // 945 234-row table.
+                return ctx.scan_by_index_capped(
+                    table,
+                    *index_no,
+                    super::ctx::IndexProbe::Prefix(&vals),
+                    filter.map(|f| (f, params)),
+                    cap,
+                );
             }
         }
         AccessPath::IndexRange { index_no, lo, hi } => {
@@ -1327,13 +1336,26 @@ pub(super) fn gather_rows(
                     // access path under a LIMIT would also change WHICH rows a
                     // LIMIT with no ORDER BY returns. Both belong to the
                     // pushdown fix, not to this one.
-                    match cap.is_none().then(|| {
-                        ctx.scan_by_index_range_adaptive(table, *index_no, lo_b, hi_b)
-                    }) {
-                        Some(r) => match r? {
-                            Some(rows) => rows,
-                            None => ctx.scan_by_index_range(table, *index_no, lo_b, hi_b)?,
-                        },
+                    // Going to keep every row anyway? Then materializing
+                    // costs nothing extra, and the adaptive pricing above is
+                    // worth having. Going to THROW rows away — a cap, a
+                    // residual filter, or both — then walk the index and drop
+                    // them as they come, so the range never exists in memory.
+                    //
+                    // The adaptive switch stays out of the second case on
+                    // purpose: it changes the access path, and under a LIMIT
+                    // with no ORDER BY that changes WHICH rows come back.
+                    if cap.is_some() || filter.is_some() {
+                        return ctx.scan_by_index_capped(
+                            table,
+                            *index_no,
+                            super::ctx::IndexProbe::Range { lo: lo_b, hi: hi_b },
+                            filter.map(|f| (f, params)),
+                            cap,
+                        );
+                    }
+                    match ctx.scan_by_index_range_adaptive(table, *index_no, lo_b, hi_b)? {
+                        Some(rows) => rows,
                         None => ctx.scan_by_index_range(table, *index_no, lo_b, hi_b)?,
                     }
                 }

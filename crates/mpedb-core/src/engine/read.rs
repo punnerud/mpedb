@@ -416,30 +416,12 @@ impl ReadTxn<'_> {
         if full_unique {
             return Ok(self.get_by_index(table_id, index_no, values)?.into_iter().collect());
         }
-        let prefix = keycode::encode_key_spec(values, self.bundle.index_coll(table_id, index_no));
-        let iroot = self.tree_root(table_id, index_no)?;
-        let root = self.tree_root(table_id, 0)?;
-        let types = &self.bundle.col_types[table_id as usize];
-        // COVERING read: when the entry already carries every column, rebuild
-        // the row from it and skip the per-row PK-tree descent entirely.
-        let cov = self.bundle.covering(table_id, index_no);
+        // COVERING read, the key encoding and the prefix stop all live in
+        // the cursor now.
         let mut out = Vec::new();
-        let mut c = btree::cursor(self, iroot, Some((&prefix[..], true)), None)?;
-        while let Some((k, pk_bytes)) = c.next(self)? {
-            if !k.starts_with(&prefix) {
-                break; // past every (value, *) entry
-            }
-            self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
-            if let Some(cov) = &cov {
-                out.push(cov.row(&k, &pk_bytes)?);
-                continue;
-            }
-            match btree::get(self, root, &pk_bytes)? {
-                Some(bytes) => out.push(row::decode_row(&bytes, types)?),
-                None => {
-                    return Err(Error::Corrupt("index entry points at a missing row".into()))
-                }
-            }
+        let mut c = self.scan_by_index_prefix_raw(table_id, index_no, values)?;
+        while let Some(r) = c.next()? {
+            out.push(r);
         }
         Ok(out)
     }
@@ -588,27 +570,56 @@ impl ReadTxn<'_> {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
     ) -> Result<Vec<Vec<Value>>> {
-        let iroot = self.tree_root(table_id, index_no)?;
-        let root = self.tree_root(table_id, 0)?;
-        let types = &self.bundle.col_types[table_id as usize];
-        // COVERING read — see `scan_by_index`.
-        let cov = self.bundle.covering(table_id, index_no);
+        // Drains the cursor: one place decides what an index entry becomes,
+        // so the streaming and materializing forms cannot drift apart.
         let mut out = Vec::new();
-        let mut c = btree::cursor(self, iroot, lo, hi)?;
-        while let Some((_k, pk_bytes)) = c.next(self)? {
-            self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
-            if let Some(cov) = &cov {
-                out.push(cov.row(&_k, &pk_bytes)?);
-                continue;
-            }
-            match btree::get(self, root, &pk_bytes)? {
-                Some(bytes) => out.push(row::decode_row(&bytes, types)?),
-                None => {
-                    return Err(Error::Corrupt("index entry points at a missing row".into()))
-                }
-            }
+        let mut c = self.scan_by_index_range_raw(table_id, index_no, lo, hi)?;
+        while let Some(r) = c.next()? {
+            out.push(r);
         }
         Ok(out)
+    }
+
+    /// The streaming form of [`scan_by_index_range`](Self::scan_by_index_range):
+    /// a cursor over the index tree that yields one row at a time.
+    ///
+    /// The materializing forms build a `Vec` of the WHOLE matching range
+    /// before the caller sees a row, so `WHERE hex = 'x' LIMIT 1` paid for
+    /// every row equal on `hex`. Measured on a 945 234-row table: 528 MB peak
+    /// to return one row, against 7,5 MB for the same single row via a table
+    /// scan, which has had this cursor (`scan_raw`) all along.
+    pub fn scan_by_index_range_raw(
+        &self,
+        table_id: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<IndexRowCursor<'_, '_>> {
+        let iroot = self.tree_root(table_id, index_no)?;
+        let root = self.tree_root(table_id, 0)?;
+        let cov = self.bundle.covering(table_id, index_no);
+        let cursor = btree::cursor(self, iroot, lo, hi)?;
+        Ok(IndexRowCursor { txn: self, cursor, table_id, root, cov, prefix: Vec::new() })
+    }
+
+    /// The same cursor over an equality probe: every entry whose key starts
+    /// with `prefix`, which is `encode_key_spec(values, …)` — the `(value ‖ pk)`
+    /// layout of a non-unique index and the bare `value` of a unique one both
+    /// begin with it.
+    pub fn scan_by_index_prefix_raw(
+        &self,
+        table_id: u32,
+        index_no: u32,
+        values: &[Value],
+    ) -> Result<IndexRowCursor<'_, '_>> {
+        // Encoded here, not by the caller: the collation spec belongs to the
+        // bundle, and one encoding site is one rule.
+        let prefix = keycode::encode_key_spec(values, self.bundle.index_coll(table_id, index_no));
+        let iroot = self.tree_root(table_id, index_no)?;
+        let root = self.tree_root(table_id, 0)?;
+        let cov = self.bundle.covering(table_id, index_no);
+        let cursor = btree::cursor(self, iroot, Some((&prefix[..], true)), None)?;
+        Ok(IndexRowCursor { txn: self, cursor, table_id, root, cov, prefix })
     }
 
     pub fn scan(
@@ -1147,6 +1158,49 @@ pub struct RowCursor<'t, 'e> {
     charge_batch: u32,
     /// Rows folded since the last meter update (`charge_batch > 1` only).
     pending: u32,
+}
+
+/// A cursor over an INDEX tree that yields whole rows.
+///
+/// Mirrors [`RowCursor`] for the index access paths. Each step reads one
+/// index entry and either rebuilds the row from it (a covering index) or
+/// descends the PK tree once — the same per-entry work the materializing
+/// `scan_by_index*` do, just handed back one row at a time so a caller with a
+/// LIMIT or a residual filter can stop.
+pub struct IndexRowCursor<'t, 'e> {
+    txn: &'t ReadTxn<'e>,
+    cursor: btree::Cursor,
+    table_id: u32,
+    /// The PK tree, for the non-covering fetch.
+    root: u64,
+    cov: Option<crate::engine::Covering>,
+    /// Equality probes stop when the key stops starting with this. Empty for
+    /// a range, where the cursor's own `hi` bound ends the walk.
+    prefix: Vec<u8>,
+}
+
+impl IndexRowCursor<'_, '_> {
+    /// The next row, or `None` at the end of the range.
+    pub fn next(&mut self) -> Result<Option<Vec<Value>>> {
+        let txn = self.txn;
+        let Some((k, pk_bytes)) = self.cursor.next(txn)? else {
+            return Ok(None);
+        };
+        if !self.prefix.is_empty() && !k.starts_with(&self.prefix) {
+            return Ok(None); // past every (value, *) entry
+        }
+        txn.charge_work(1, || scan_label(&txn.bundle.schema, self.table_id))?;
+        if let Some(cov) = &self.cov {
+            return Ok(Some(cov.row(&k, &pk_bytes)?));
+        }
+        match btree::get(txn, self.root, &pk_bytes)? {
+            Some(bytes) => Ok(Some(row::decode_row(
+                &bytes,
+                &txn.bundle.col_types[self.table_id as usize],
+            )?)),
+            None => Err(Error::Corrupt("index entry points at a missing row".into())),
+        }
+    }
 }
 
 impl RowCursor<'_, '_> {
