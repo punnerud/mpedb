@@ -374,10 +374,16 @@ pub(crate) fn checkpoint_to_sqlite(c: &mut Sqlite3) -> Result<u64, String> {
             .columns
             .iter()
             .map(|col| {
+                // NOT NULL goes back out too, for the same reason the import
+                // brings it in: it is what lets a planner — sqlite's or the
+                // next mpedb to open the file — use a composite index. A round
+                // trip that silently widened every column to nullable would
+                // leave the file correct and slower on every subsequent read.
                 let q = col.name.replace('"', "\"\"");
+                let nn = if col.nullable { "" } else { " NOT NULL" };
                 match col.decltype() {
-                    Some(d) if !d.is_empty() => format!("\"{q}\" {d}"),
-                    _ => format!("\"{q}\""),
+                    Some(d) if !d.is_empty() => format!("\"{q}\" {d}{nn}"),
+                    _ => format!("\"{q}\"{nn}"),
                 }
             })
             .collect();
@@ -564,16 +570,32 @@ pub(crate) fn import_sqlite_file(src: &Path, dest: &Database) -> Result<u64, Str
     let tables = f.tables().map_err(|e| format!("{e}"))?;
     let mut rows = 0u64;
     for t in &tables {
+        // NOT NULL is carried across, and it is not cosmetic. mpedb's planner
+        // reads declared nullability: a composite index whose trailing column
+        // is nullable cannot serve a range over the leading one — a row with a
+        // NULL in that column has no index entry at all, so the probe would
+        // miss rows the range covers (`planner/access.rs`, `suffix_not_null`).
+        //
+        // Dropping the flag here therefore turned an indexed lookup into a
+        // full scan, silently. Measured on a 945 234-row track table:
+        // `(lat, lon)` declared NOT NULL in the source, discarded on import,
+        // and the area query fell to FullScan.
+        //
+        // The reader already parses it (`sqlitefmt::Table::not_null`), for the
+        // same reason in reverse: dropping it let the overlay accept a row
+        // sqlite refuses.
         let cols: Vec<String> = t
             .columns
             .iter()
+            .enumerate()
             .zip(&t.decl_types)
-            .map(|(n, d)| {
+            .map(|((i, n), d)| {
                 let q = n.replace('"', "\"\"");
+                let nn = if t.not_null.get(i).copied().unwrap_or(false) { " NOT NULL" } else { "" };
                 if d.is_empty() {
-                    format!("\"{q}\"")
+                    format!("\"{q}\"{nn}")
                 } else {
-                    format!("\"{q}\" {d}")
+                    format!("\"{q}\" {d}{nn}")
                 }
             })
             .collect();

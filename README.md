@@ -110,6 +110,27 @@ migrations included):
 LD_PRELOAD=$PWD/libmpedb_sqlite3.so python3 manage.py test
 ```
 
+**PHP, with nothing installed.** No PECL, no extension to compile, no rebuild
+of PHP — the distro's own `pdo_sqlite` and `sqlite3` are dynamically linked
+against `libsqlite3.so.0`, so substituting the shim under that soname is the
+whole procedure:
+
+```sh
+mkdir shim && ln -s $PWD/libmpedb_sqlite3.so shim/libsqlite3.so.0
+LD_LIBRARY_PATH=$PWD/shim php app.php     # both extensions, unchanged
+```
+
+Note the difference from the Python line above: **`LD_PRELOAD` does not work
+for PHP**, and the reason is worth knowing before debugging it. PHP loads its
+extensions with `dlopen`, and their own `DT_NEEDED` on `libsqlite3.so.0` wins
+over the preload scope — so the shim loads, binds nothing, and the program
+quietly keeps using stock sqlite. Substituting under the soname is what makes
+the extensions resolve into it.
+
+An existing `.db` opens directly: reads see the sqlite data, writes land in a
+`<file>.mpedb` sidecar, and `PRAGMA wal_checkpoint` writes the whole database
+back out as a sqlite file that stock sqlite accepts, indexes included.
+
 This is the binary CPython's `test_sqlite3` (466/466) and the Django and
 SQLAlchemy suites run through. Building it yourself is one command when you
 want HEAD instead of a release:
