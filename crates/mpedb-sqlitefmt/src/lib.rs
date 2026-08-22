@@ -20,7 +20,7 @@ pub mod lock;
 pub mod stamp;
 mod write;
 
-pub use write::{write_image, ImageTable};
+pub use write::{write_image, ImageIndex, ImageTable};
 
 use std::fs::File;
 use std::io::Read as _;
@@ -314,6 +314,34 @@ impl SqliteFile {
                 return Ok(());
             };
             if ty == "table" && is_create_virtual(sql) {
+                out.push((name.clone(), sql.clone()));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Every explicitly declared INDEX, as `(name, CREATE INDEX …)`.
+    ///
+    /// Only the declared ones. sqlite also writes catalog rows for the indexes
+    /// it creates itself to enforce UNIQUE and PRIMARY KEY — those carry a
+    /// NULL `sql` and are named `sqlite_autoindex_*`; they belong to the
+    /// constraint, are re-created by whoever re-creates it, and re-issuing
+    /// them as DDL would be an error.
+    ///
+    /// The SQL is returned verbatim rather than parsed: an importer replays it
+    /// against the destination, which is the only reading that cannot drift
+    /// from what the source actually declared.
+    pub fn indexes(&self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        self.scan_rowid_tree(1, &mut |_rowid, vals| {
+            let [Value::Text(ty), Value::Text(name), ..] = &vals[..] else {
+                return Ok(());
+            };
+            let Some(Value::Text(sql)) = vals.get(4) else {
+                return Ok(()); // auto-index: NULL sql, nothing to replay
+            };
+            if ty == "index" && !name.starts_with("sqlite_") {
                 out.push((name.clone(), sql.clone()));
             }
             Ok(())

@@ -110,6 +110,7 @@ fn foo_facit_through_stock() {
             vec![Value::Int(1), Value::Text("x".into())],
             vec![Value::Int(2), Value::Text("y".into())],
         ],
+        indexes: Vec::new(),
     };
     let path = verify("wfoo", &[foo]);
     if !have_cli() {
@@ -133,6 +134,7 @@ fn shapes_through_stock() {
             name: "empty".into(),
             sql: "CREATE TABLE empty (a, b, c)".into(),
             rows: vec![],
+            indexes: Vec::new(),
         },
         ImageTable {
             name: "vals".into(),
@@ -150,12 +152,14 @@ fn shapes_through_stock() {
                 vec![Value::Int(i64::MIN)],
                 vec![Value::Int(i64::MAX)],
             ],
+            indexes: Vec::new(),
         },
         ImageTable {
             // Alone in its tree: the near-X cell fills the whole leaf.
             name: "big".into(),
             sql: "CREATE TABLE big (t)".into(),
             rows: vec![vec![Value::Text("x".repeat(4058))]],
+            indexes: Vec::new(),
         },
         ImageTable {
             name: "wide".into(),
@@ -164,6 +168,7 @@ fn shapes_through_stock() {
                 vec![Value::Int(7), Value::Text("a".into())],
                 vec![Value::Int(0), Value::Null],
             ],
+            indexes: Vec::new(),
         },
     ];
     let path = verify("wshapes", &tables);
