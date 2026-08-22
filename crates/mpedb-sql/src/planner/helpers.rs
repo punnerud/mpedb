@@ -56,7 +56,13 @@ pub(crate) fn conflict_probe_opt(table: &TableDef, target: &[u16]) -> Option<Con
     let ino = table.indexes.iter().position(|ix| {
         // …and an expression index cannot serve a conflict target either: the
         // target names COLUMNS, and this index does not key by them.
+        // A BUILDING unique index cannot witness a conflict: the row it would
+        // have collided with may be ahead of the backfill and have no entry
+        // yet. The probe would find nothing, ON CONFLICT would take the
+        // insert branch, and a DUPLICATE row would land — the constraint
+        // violated by the statement meant to respect it.
         if !ix.unique
+            || !ix.usable_for_access()
             || ix.columns.len() != want.len()
             || ix.predicate.is_some()
             || !ix.exprs.is_empty()

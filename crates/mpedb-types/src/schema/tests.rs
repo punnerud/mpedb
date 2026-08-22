@@ -182,7 +182,7 @@ fn indexes_derive_normalize_and_roundtrip() {
                 unique: false, indexed: true, default: None, check: None, collation: Collation::Binary },
         ],
         primary_key: vec![0],
-        indexes: vec![IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false }],
+        indexes: vec![IndexDef { state: IndexState::Ready, columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false }],
         dead: false, pk_name: None, kind: TableKind::Standard, implicit_rowid: false, autoincrement: false,
         foreign_keys: Vec::new(),
     };
@@ -196,9 +196,9 @@ fn indexes_derive_normalize_and_roundtrip() {
         t.indexes,
         vec![
             // Derived from `a`'s `unique` column flag, which IS a constraint.
-            IndexDef { columns: vec![1], unique: true, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: true },
-            IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false },
-            IndexDef { columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false },
+            IndexDef { state: IndexState::Ready, columns: vec![1], unique: true, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: true },
+            IndexDef { state: IndexState::Ready, columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false },
+            IndexDef { state: IndexState::Ready, columns: vec![1, 2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false },
         ]
     );
     assert!(!t.columns[0].unique && !t.columns[0].indexed);
@@ -226,7 +226,7 @@ fn hostile_bytes_refuse_cleanly() {
             col("w", ColumnType::Int64),
         ],
         primary_key: vec![0],
-        indexes: vec![IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false }],
+        indexes: vec![IndexDef { state: IndexState::Ready, columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false }],
         dead: false, pk_name: None, kind: TableKind::Standard, implicit_rowid: false, autoincrement: false,
         foreign_keys: Vec::new(),
     }])
@@ -237,14 +237,14 @@ fn hostile_bytes_refuse_cleanly() {
     // sqlite's, and the planner — not the schema — is what keeps it from
     // ever being probed.
     let mut ok = base.clone();
-    ok.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false }];
+    ok.tables[0].indexes = vec![IndexDef { state: IndexState::Ready, columns: vec![1], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false }];
     Schema::from_canonical_bytes(&ok.canonical_bytes()).unwrap();
 
     // Duplicate index shapes refuse.
     let mut evil = base.clone();
     evil.tables[0]
         .indexes
-        .push(IndexDef { columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false });
+        .push(IndexDef { state: IndexState::Ready, columns: vec![2], unique: false, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false });
     assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
 
     // An index equal to the whole single-column PK is REDUNDANT, not
@@ -252,7 +252,7 @@ fn hostile_bytes_refuse_cleanly() {
     // it and Django's `remove_unique_together` on a pk field emits exactly
     // this. Refusing it blocked a migration with nothing wrong in it.
     let mut redundant = base.clone();
-    redundant.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false }];
+    redundant.tables[0].indexes = vec![IndexDef { state: IndexState::Ready, columns: vec![0], unique: true, predicate: None, name: None, exprs: Vec::new(), collations: Vec::new(), from_constraint: false }];
     Schema::from_canonical_bytes(&redundant.canonical_bytes()).unwrap();
 
     // v1 bytes (version byte 1) refuse by name — no migration exists.
@@ -370,7 +370,7 @@ fn tombstoned_schema_round_trips_through_v3_bytes() {
     assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
     assert_eq!(s.hash(), r.hash());
     // The version byte is 9.
-    assert_eq!(s.canonical_bytes()[0], 20);
+    assert_eq!(s.canonical_bytes()[0], 21);
     // A v8 file refuses cleanly (no misread of the new generated bytes).
     let mut v8 = s.canonical_bytes();
     v8[0] = 8;
@@ -529,7 +529,7 @@ fn implicit_rowid_round_trips_and_helpers() {
     let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
     assert_eq!(s, r);
     assert_eq!(s.hash(), r.hash());
-    assert_eq!(s.canonical_bytes()[0], 20);
+    assert_eq!(s.canonical_bytes()[0], 21);
 
     // Truncation at every offset is Corrupt, never a panic.
     let bytes = s.canonical_bytes();
@@ -588,7 +588,7 @@ fn column_decl_text_round_trips_and_is_hostile_safe() {
     let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
     assert_eq!(s, r);
     assert_eq!(s.hash(), r.hash());
-    assert_eq!(s.canonical_bytes()[0], 20);
+    assert_eq!(s.canonical_bytes()[0], 21);
     // The text is part of the schema identity: `f float` and `f REAL` are
     // the same storage and DIFFERENT schemas, because a consumer keying
     // converters off the decltype sees two different columns.
@@ -648,7 +648,7 @@ fn column_collation_round_trips_and_is_hostile_safe() {
     let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
     assert_eq!(s, r);
     assert_eq!(s.hash(), r.hash());
-    assert_eq!(s.canonical_bytes()[0], 20);
+    assert_eq!(s.canonical_bytes()[0], 21);
 
     // The collation changes the hash: a BINARY `name` is a different schema.
     let mut plain = s.clone();
@@ -805,7 +805,7 @@ fn generated_column_round_trips_and_is_hostile_safe() {
     let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
     assert_eq!(s, r, "the compiled program survives byte-for-byte");
     assert_eq!(s.hash(), r.hash());
-    assert_eq!(s.canonical_bytes()[0], 20);
+    assert_eq!(s.canonical_bytes()[0], 21);
 
     // It computes, in declaration order, through the decoded schema.
     let mut row = vec![Value::Int(21), Value::Null];

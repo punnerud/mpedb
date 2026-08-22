@@ -393,6 +393,7 @@ mod tests {
         for t in schema.tables.iter_mut() {
             t.indexes = (0..6)
                 .map(|_| mpedb_types::IndexDef {
+                    state: mpedb_types::IndexState::Ready,
                     columns: vec![0],
                     unique: false,
                     predicate: None,

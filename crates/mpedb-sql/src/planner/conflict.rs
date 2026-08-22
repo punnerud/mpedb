@@ -56,7 +56,7 @@ pub(super) fn plan_on_conflict(
         for ix in table
             .indexes
             .iter()
-            .filter(|ix| ix.unique && !ix.has_expression_part())
+            .filter(|ix| ix.unique && ix.usable_for_access())
         {
             // An expression index cannot be an ON CONFLICT target — there are no
             // column NAMES to write in the conflict clause — and its ordinals

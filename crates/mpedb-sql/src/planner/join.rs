@@ -1055,7 +1055,7 @@ fn extract_join_access(
             // …and an EXPRESSION index for the same class of reason: its key is
             // a computed value the join has no way to pin, and `pins[col]` with
             // the `INDEX_EXPR_COL` sentinel is an out-of-bounds panic.
-            if ix.predicate.is_some() || ix.has_expression_part() {
+            if ix.predicate.is_some() || !ix.usable_for_access() {
                 continue;
             }
             let mut cis = Vec::new();

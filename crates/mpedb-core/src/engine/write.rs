@@ -338,6 +338,16 @@ impl<'e> WriteTxn<'e> {
     /// rule in here is what makes insert, delete, update and the initial build
     /// agree by construction. Three copies of this test would drift, and the
     /// one that drifted would leave an index entry the table does not justify.
+    ///
+    /// **`IndexState` is deliberately NOT consulted here.** A `Building` index
+    /// is maintained exactly like a `Ready` one — that is the whole point of
+    /// publishing it before it is filled: rows written during the build get
+    /// their entries from the ordinary write paths, and the background fill
+    /// only has to cover the rows that already existed. Skipping maintenance
+    /// for a `Building` index would leave it missing precisely the rows
+    /// written while it was being built, and nothing afterwards would notice.
+    /// The state is read by the PLANNER (`IndexDef::usable_for_access`), which
+    /// is a question about answering queries, not about staying correct.
     fn index_entry_key(
         &self,
         tid: usize,
@@ -1448,9 +1458,23 @@ impl<'e> WriteTxn<'e> {
             let (iroot, icount) = self.tree_root(table_id, ino)?;
             let out = btree::delete(self, iroot, &ikey)?;
             if !out.existed {
-                return Err(Error::Corrupt("missing index entry on delete".into()));
+                // A BUILDING index legitimately has holes: this row sits ahead
+                // of the backfill cursor, so its entry was never written and
+                // there is nothing to remove. For a READY index a hole is
+                // engine corruption and stays one.
+                //
+                // The count guard is the load-bearing half. `icount` is u64,
+                // so decrementing it for an entry that was not there wraps to
+                // u64::MAX — and that count is persisted, read back by
+                // `count_index_entries`, and consumed by the `count(*)`-from-
+                // entry-count path. It would SURVIVE the flip to Ready and
+                // answer wrongly, with no error, long after the build.
+                if self.bundle.sec_state[tid][i] == mpedb_types::IndexState::Ready {
+                    return Err(Error::Corrupt("missing index entry on delete".into()));
+                }
+            } else {
+                self.set_tree_root(table_id, ino, out.new_root, icount - 1);
             }
-            self.set_tree_root(table_id, ino, out.new_root, icount - 1);
         }
         // Remove the deleted row's postings (FTS tables only).
         self.fts_maybe_index(table_id, &old, false)?;
@@ -1601,10 +1625,15 @@ impl<'e> WriteTxn<'e> {
             if let Some(okey) = okey {
                 let out = btree::delete(self, iroot, &okey)?;
                 if !out.existed {
-                    return Err(Error::Corrupt("missing index entry on update".into()));
+                    // The delete path's rule, for the same reason and with the
+                    // same u64 wrap waiting behind it — see `delete_by_pk`.
+                    if self.bundle.sec_state[tid][i] == mpedb_types::IndexState::Ready {
+                        return Err(Error::Corrupt("missing index entry on update".into()));
+                    }
+                } else {
+                    iroot = out.new_root;
+                    icount -= 1;
                 }
-                iroot = out.new_root;
-                icount -= 1;
             }
             if let Some(nkey) = nkey {
                 let out = btree::insert(self, iroot, &nkey, &mut btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
@@ -2318,6 +2347,7 @@ impl<'e> WriteTxn<'e> {
         let new_schema = bundle.schema.with_added_index(
             table_id,
             mpedb_types::IndexDef {
+                state: mpedb_types::IndexState::Ready,
                 columns: columns.clone(),
                 unique,
                 predicate,

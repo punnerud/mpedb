@@ -229,6 +229,7 @@ mod tests {
 
     fn ix(pred: Option<&str>) -> IndexDef {
         IndexDef {
+            state: mpedb_types::IndexState::Ready,
             collations: Vec::new(),
             columns: vec![1],
             unique: false,
