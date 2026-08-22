@@ -1177,7 +1177,7 @@ fn agg_index_choice(
         // An expression index is never an access path
         // (`IndexDef::has_expression_part`), and its ordinals carry a
         // sentinel that panics if used to index `columns`.
-        if ix.has_expression_part() {
+        if !ix.usable_for_access() {
             continue;
         }
         if pos >= 63 {

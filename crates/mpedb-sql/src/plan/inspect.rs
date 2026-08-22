@@ -41,6 +41,41 @@ impl CompiledPlan {
             .collect()
     }
 
+    /// Per output column: the base TABLE the column comes from
+    /// (libsqlite3 `sqlite3_column_table_name`), or `None` where sqlite also
+    /// reports NULL. Same rule as [`Self::output_decltypes`] and derived from
+    /// the same plan-level source mapping, not from names: only an output
+    /// column that is a bare reference to a real base-table column has a
+    /// source table. Anything computed — an expression, an aggregate, a
+    /// window — has none, and a join reshapes the tuple so `Projection::Column`
+    /// no longer indexes one table's row. A non-SELECT yields an empty vec,
+    /// which the caller reads as "all NULL".
+    pub fn output_table_names(&self, schema: &Schema) -> Vec<Option<String>> {
+        let PlanStmt::Select(sp) = &self.stmt else {
+            return Vec::new();
+        };
+        let out_n = sp.projection.len().saturating_sub(sp.order_junk as usize);
+        if !sp.joins.is_empty() || sp.aggregate.is_some() || !sp.windows.is_empty() {
+            return vec![None; out_n];
+        }
+        let Some(table) = schema.table(sp.table) else {
+            return vec![None; out_n];
+        };
+        sp.projection
+            .iter()
+            .take(out_n)
+            .map(|p| match p {
+                // The column must really exist on the table: an out-of-range
+                // index is not a source, and must not borrow the table's name.
+                Projection::Column(n) => table
+                    .columns
+                    .get(*n as usize)
+                    .map(|_| table.name.to_string()),
+                Projection::Expr { .. } | Projection::SetReturning { .. } => None,
+            })
+            .collect()
+    }
+
     /// The table this plan targets (for RLS policy-epoch validation), if any.
     pub fn target_table(&self) -> Option<u32> {
         match &self.stmt {

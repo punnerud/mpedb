@@ -1159,58 +1159,8 @@ pub unsafe extern "C" fn sqlite3_deserialize(
         let staged = ephemeral_path();
         let rc = (|| -> Result<(), c_int> {
             std::fs::write(&staged, bytes).map_err(|_| SQLITE_IOERR)?;
-            let f = mpedb_sqlitefmt::SqliteFile::open(&staged).map_err(|_| SQLITE_NOTADB)?;
-            let tables = f.tables().map_err(|_| SQLITE_NOTADB)?;
             let (newdb, newpath) = open_blank_database().map_err(|_| SQLITE_IOERR)?;
-            for t in &tables {
-                let cols: Vec<String> = t
-                    .columns
-                    .iter()
-                    .zip(&t.decl_types)
-                    .map(|(n, d)| {
-                        let q = n.replace('"', "\"\"");
-                        if d.is_empty() {
-                            format!("\"{q}\"")
-                        } else {
-                            format!("\"{q}\" {d}")
-                        }
-                    })
-                    .collect();
-                let create = format!(
-                    "CREATE TABLE \"{}\" ({})",
-                    t.name.replace('"', "\"\""),
-                    cols.join(", ")
-                );
-                newdb.query(&create, &[]).map_err(|_| SQLITE_NOTADB)?;
-                let placeholders: Vec<String> =
-                    (1..=t.columns.len()).map(|i| format!("${i}")).collect();
-                let ins = format!(
-                    "INSERT INTO \"{}\" VALUES ({})",
-                    t.name.replace('"', "\"\""),
-                    placeholders.join(", ")
-                );
-                let mut err = false;
-                f.scan_table(t, &mut |_rowid, vals| {
-                    let params: Vec<Value> = vals
-                        .into_iter()
-                        .map(|v| match v {
-                            mpedb_sqlitefmt::Value::Null => Value::Null,
-                            mpedb_sqlitefmt::Value::Int(i) => Value::Int(i),
-                            mpedb_sqlitefmt::Value::Float(x) => Value::Float(x),
-                            mpedb_sqlitefmt::Value::Text(s) => Value::Text(s),
-                            mpedb_sqlitefmt::Value::Blob(b) => Value::Blob(b),
-                        })
-                        .collect();
-                    if newdb.query(&ins, &params).is_err() {
-                        err = true;
-                    }
-                    Ok(())
-                })
-                .map_err(|_| SQLITE_NOTADB)?;
-                if err {
-                    return Err(SQLITE_NOTADB);
-                }
-            }
+            crate::open::import_sqlite_file(&staged, &newdb).map_err(|_| SQLITE_NOTADB)?;
             adopt_reopened(c, newdb);
             let old_path = std::mem::replace(&mut c.path, newpath);
             match std::mem::replace(&mut c.backing, Backing::Ephemeral) {

@@ -169,7 +169,15 @@ pub(crate) fn resolve(schema: &Schema, child: &TableDef, fk: &ForeignKeyDef) -> 
         let ix = parent
             .indexes
             .iter()
-            .position(|ix| ix.unique && ix.predicate.is_none() && ix.columns == parent_cols)
+            // A BUILDING index is not filled yet: probing it would answer "no such
+            // parent" for a parent that exists, refusing a legal write. Its state
+            // is the only thing separating that from a real FK violation.
+            .position(|ix| {
+                ix.unique
+                    && ix.usable_for_access()
+                    && ix.predicate.is_none()
+                    && ix.columns == parent_cols
+            })
             .ok_or_else(mismatch)?;
         ParentProbe::Index(ix as u32 + 1)
     };
@@ -464,7 +472,12 @@ fn children_with_key(
     if let Some(pos) = child
         .indexes
         .iter()
-        .position(|ix| ix.predicate.is_none() && ix.columns == cols)
+        // A BUILDING index has holes, and this is the sharpest place that
+        // matters: a child row whose entry is not written yet would not be
+        // found, so ON DELETE CASCADE would leave it orphaned and RESTRICT
+        // would permit a delete it must refuse. Falling through to the scan
+        // is slower and correct.
+        .position(|ix| ix.usable_for_access() && ix.predicate.is_none() && ix.columns == cols)
     {
         return ctx.scan_by_index(child.id, pos as u32 + 1, key);
     }

@@ -211,6 +211,8 @@ unsafe fn prepare_common(
         columns: Vec::new(),
         col_name_c: Vec::new(),
         decltype_c: None,
+        table_name_c: None,
+        sql_c: None,
         rows: Vec::new(),
         pos: 0,
         have_row: false,
@@ -366,6 +368,8 @@ pub unsafe extern "C" fn sqlite3_exec(
                     columns: Vec::new(),
                     col_name_c: Vec::new(),
                     decltype_c: None,
+                    table_name_c: None,
+                    sql_c: None,
                     rows: Vec::new(),
                     pos: 0,
                     have_row: false,
@@ -739,6 +743,57 @@ pub unsafe extern "C" fn sqlite3_column_decltype(p: *mut Stmt, col: c_int) -> *c
         Some(Some(bytes)) => bytes.as_ptr() as *const c_char,
         _ => ptr::null(),
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_column_table_name(p: *mut Stmt, col: c_int) -> *const c_char {
+    let Some(s) = stmt(p) else { return ptr::null() };
+    if col < 0 {
+        return ptr::null();
+    }
+    // Same lazy shape and the same plan-derived source mapping as
+    // `sqlite3_column_decltype`: an output column that is a bare base-table
+    // column reports that table, anything computed reports NULL. Real sqlite
+    // only exports this call when built with SQLITE_ENABLE_COLUMN_METADATA;
+    // consumers that link it (PHP's pdo_sqlite) treat NULL as "no table",
+    // which is also what sqlite answers for an expression.
+    if s.table_name_c.is_none() {
+        let names = conn(s.db)
+            .and_then(|c| c.db.output_table_names(&s.exec_sql).ok())
+            .unwrap_or_default();
+        s.table_name_c = Some(
+            names
+                .into_iter()
+                .map(|o| {
+                    o.map(|name| {
+                        let mut v = name.into_bytes();
+                        v.push(0); // NUL-terminate
+                        v
+                    })
+                })
+                .collect(),
+        );
+    }
+    match s.table_name_c.as_ref().unwrap().get(col as usize) {
+        Some(Some(bytes)) => bytes.as_ptr() as *const c_char,
+        _ => ptr::null(),
+    }
+}
+
+/// `sqlite3_sql`: the statement text as it was handed to prepare — the
+/// ORIGINAL spelling, parameters unsubstituted (that is `expanded_sql`). The
+/// pointer belongs to the statement and stays valid until it is finalized, so
+/// the NUL-terminated copy is kept on the statement rather than allocated per
+/// call. sqlite answers NULL for a null handle.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_sql(p: *mut Stmt) -> *const c_char {
+    let Some(s) = stmt(p) else { return ptr::null() };
+    if s.sql_c.is_none() {
+        let mut v = s.sql.clone().into_bytes();
+        v.push(0);
+        s.sql_c = Some(v);
+    }
+    s.sql_c.as_ref().unwrap().as_ptr() as *const c_char
 }
 
 // ===========================================================================

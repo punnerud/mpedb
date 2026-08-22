@@ -336,7 +336,7 @@ impl<'a> Problem<'a> {
                 // Same rule as the planner's: an expression index is never an
                 // access path, so the cost model must not treat it as one — the
                 // model has to describe the access the planner actually emits.
-                && !ix.has_expression_part()
+                && ix.usable_for_access()
                 && !ix.columns.is_empty()
                 && ix.columns.iter().all(|&c| pinned(c))
         })

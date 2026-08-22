@@ -171,7 +171,7 @@ impl Database {
                 }
                 rows.push(out);
             }
-            tables.push(fmtx::ImageTable { name: t.name.clone(), sql, rows });
+            tables.push(fmtx::ImageTable { name: t.name.clone(), sql, rows, indexes: Vec::new() });
         }
         r.finish()?;
         match fmtx::write_image(&tables, 4096) {

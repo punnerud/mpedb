@@ -680,6 +680,16 @@ pub struct SchemaBundle {
     /// Parallel to `sec_indexes`: is index `k` UNIQUE (values→pk, enforced)
     /// or plain non-unique (`(values ‖ pk)` key, duplicates allowed)?
     pub sec_unique: Vec<Vec<bool>>,
+    /// Parallel to `sec_indexes`: index `k`'s build state.
+    ///
+    /// Positional like everything else about index numbering — a `Building`
+    /// index KEEPS its slot, because `index_no = position + 1` is what every
+    /// B-tree key and every persisted plan rests on. Shortening these arrays
+    /// to "only the ready ones" would repoint all of them.
+    ///
+    /// Read on the write path to tell a legitimate hole (a row ahead of a
+    /// build's backfill cursor) from engine corruption.
+    pub sec_state: Vec<Vec<mpedb_types::IndexState>>,
     pub col_types: Vec<Vec<ColumnType>>,
     /// Per table: the [`KeySpec`] of each PRIMARY KEY column, in key order —
     /// parallel to `TableDef.primary_key`. Empty-folding when every entry is
@@ -737,6 +747,11 @@ impl SchemaBundle {
             .tables
             .iter()
             .map(|t| t.indexes.iter().map(|ix| ix.unique).collect())
+            .collect();
+        let sec_state = schema
+            .tables
+            .iter()
+            .map(|t| t.indexes.iter().map(|ix| ix.state).collect())
             .collect();
         let col_types = schema
             .tables
@@ -800,6 +815,7 @@ impl SchemaBundle {
             index_exprs,
             sec_indexes,
             sec_unique,
+            sec_state,
             col_types,
             pk_specs,
             sec_specs,

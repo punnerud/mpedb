@@ -163,7 +163,7 @@ pub(super) fn extract_access(
             // An expression index is never an access path (see
             // `IndexDef::has_expression_part`): its key is a computed value, and
             // its ordinals carry a sentinel that would panic below.
-            if ix.has_expression_part() {
+            if !ix.usable_for_access() {
                 continue;
             }
 
@@ -318,7 +318,7 @@ pub(super) fn extract_access(
         // An expression index is never an access path (see
         // `IndexDef::has_expression_part`): its key is a computed value, and
         // its ordinals carry a sentinel that would panic below.
-        if ix.has_expression_part() {
+        if !ix.usable_for_access() {
             continue;
         }
 
@@ -368,9 +368,122 @@ pub(super) fn extract_access(
         }
     }
 
+    // 3.6 An ISLAND: a range no conjunct states, derived by arithmetic from
+    // one that does. `(lat-A)*(lat-A) + (lon-B)*(lon-B) < R*R` confines `lat`
+    // to `[A-R, A+R]` without ever writing a bound on `lat` — see
+    // `super::interval`, which computes it without recognizing the shape.
+    //
+    // Last of the index paths on purpose. Every rule above consumes its
+    // conjuncts and answers a predicate the query WROTE; this one answers a
+    // predicate it only IMPLIES, so it may not pre-empt an exact match. And
+    // nothing is consumed: the island is a superset, so the whole predicate
+    // stays as the residual filter and decides each row on its own.
+    for (pos, ix) in table.indexes.iter().enumerate() {
+        if pos >= 63 {
+            break; // beyond the footprint bitmap — never chosen
+        }
+        if !ix.usable_for_access() {
+            continue;
+        }
+        if ix.predicate.is_some() && !super::partial::index_usable(table, ix, &conjuncts) {
+            continue;
+        }
+        // Same prefix rule as the range path above: only the leading column,
+        // and only when the uncovered suffix cannot hide rows (membership).
+        let col = ix.columns[0];
+        if unbounded(col) || !suffix_not_null(ix, 1) {
+            continue;
+        }
+        // The island is arithmetic, so its endpoints are f64 — but the bound
+        // is ENCODED, and `keycode` encodes each type differently. Only the
+        // two numeric domains it can land in exactly are allowed through;
+        // anything else would compare a float image against keys that are not
+        // float images. Same principle as `typeless` above, one type wider.
+        // `Timestamp`/`Date`/`Time` share the i64 key image and could join
+        // Int64, but they are left out until something needs them: the cost
+        // is the full scan they already took before islands existed.
+        let ty = table.columns[col as usize].ty;
+        if !matches!(ty, ColumnType::Int64 | ColumnType::Float64) {
+            continue;
+        }
+        let Some(iv) = super::interval::island(&conjuncts, col) else {
+            continue;
+        };
+        if iv.is_empty() {
+            // The predicate is unsatisfiable. Say so as an empty range rather
+            // than inventing a separate "no rows" path.
+            let residual = rebuild_residual(conjuncts, &consumed);
+            return Ok((
+                AccessPath::IndexRange {
+                    index_no: (pos + 1) as u32,
+                    lo: bound_from(1.0, ty, false, consts)?,
+                    hi: bound_from(-1.0, ty, true, consts)?,
+                },
+                residual,
+            ));
+        }
+        let lo = if iv.lo.is_finite() { bound_from(iv.lo, ty, false, consts)? } else { None };
+        let hi = if iv.hi.is_finite() { bound_from(iv.hi, ty, true, consts)? } else { None };
+        if lo.is_none() && hi.is_none() {
+            continue;
+        }
+        let residual = rebuild_residual(conjuncts, &consumed);
+        return Ok((
+            AccessPath::IndexRange { index_no: (pos + 1) as u32, lo, hi },
+            residual,
+        ));
+    }
+
     // 4. Full scan; the whole predicate stays as the filter.
     let residual = rebuild_residual(conjuncts, &consumed);
     Ok((AccessPath::FullScan, residual))
+}
+
+/// An island endpoint as an inclusive key bound, in the COLUMN's own domain.
+///
+/// The interval is closed by construction (`interval::Iv`), which is why
+/// `inclusive` is always true: a strict predicate was already widened to a
+/// closed interval, and the residual filter rejects the boundary row if it
+/// does not belong.
+///
+/// The TYPE is not cosmetic, and getting it wrong loses rows rather than
+/// costing time. `keycode` gives an `Int` the sign-flipped i64 image and a
+/// `Float` the IEEE total-order image; both are eight bytes behind the same
+/// tag, and neither orders against the other. An upper bound of
+/// `Float(-18.0)` (`0x3FCD_FFFF_FFFF_FFFF`) against a column keyed on
+/// `Int(-47)` (`0x7FFF_FFFF_FFFF_FFD1`) puts the row ABOVE the bound, and the
+/// scan walks past a row that satisfies the predicate. That is the failure
+/// the differential caught: `UPDATE t SET b = a WHERE a + 3 < -15` left
+/// `a = -47` untouched.
+///
+/// So an integer column gets an integer bound, rounded OUTWARD — and exactly,
+/// not merely safely: the integers `<= v` are precisely those `<= floor(v)`,
+/// and the integers `>= v` precisely those `>= ceil(v)`. An endpoint outside
+/// i64 yields `None`, dropping that side of the range instead of wrapping;
+/// the residual filter still decides every row.
+fn bound_from(
+    v: f64,
+    ty: ColumnType,
+    upper: bool,
+    consts: &mut Vec<Value>,
+) -> Result<Option<KeyBound>> {
+    let val = match ty {
+        ColumnType::Float64 => Value::Float(v),
+        ColumnType::Int64 => {
+            let r = if upper { v.floor() } else { v.ceil() };
+            if !(i64::MIN as f64..=i64::MAX as f64).contains(&r) {
+                return Ok(None);
+            }
+            Value::Int(r as i64)
+        }
+        // Guarded at the call site; an unreachable arm is still cheaper than
+        // a wrong key.
+        _ => return Ok(None),
+    };
+    Ok(Some(KeyBound {
+        parts: vec![KeyPart::Const(push_plan_const(consts, val)?)],
+        inclusive: true,
+    }))
 }
 
 /// Does this index's ENTRY carry the whole row — its own key columns plus the

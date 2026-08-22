@@ -724,6 +724,7 @@ pub(crate) fn table_def_from_spec(
         .iter()
         .map(|group| {
             Ok(mpedb_types::IndexDef {
+                state: mpedb_types::IndexState::Ready,
                 collations: Vec::new(),
                 columns: group
                     .columns

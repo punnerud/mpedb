@@ -1,0 +1,215 @@
+# PHP — the ABI drop-in, exercised through a consumer that was never told.
+#
+# `mpedb-capi` builds `libmpedb_sqlite3.so`, which exports sqlite3's C-API. The
+# crate's own tests prove the symbols behave; they cannot prove that a real
+# libsqlite3 CONSUMER binds them, because the consumer is what supplies the
+# expectations. PHP is the sharpest available one: `pdo_sqlite` and `sqlite3`
+# are separate extensions, dynamically linked against `libsqlite3.so.0`, and
+# between them they call 72 of the exported symbols.
+#
+# What this catches that nothing else does:
+#
+#  * a MISSING export. The shim once shipped without `sqlite3_sql`,
+#    `sqlite3_column_table_name`, `sqlite3_mprintf` and `sqlite3_snprintf`;
+#    every Rust test passed and PHP refused to load the extension at all.
+#  * a LOCAL export. Symbols can be linked in and still bind nowhere — rustc
+#    gives a cdylib an export list, and `--exclude-libs,ALL` makes anything
+#    arriving from a static archive local. `nm` says `t` instead of `T`, the
+#    Rust tests never notice, and the consumer fails at dlopen.
+#  * a DIVERGENT format. sqlite's printf is not C's: `%q`, `%Q`, `%w`, `%z`,
+#    and a NULL `%s` renders empty rather than `(null)`. Those are checked
+#    differentially against the runner's real sqlite3, because agreeing with
+#    ourselves proves nothing.
+#
+# Linux only, deliberately: this is about ELF symbol binding and `LD_LIBRARY_PATH`,
+# which macOS (two-level namespaces, `DYLD_*`) and Windows (no such mechanism)
+# do not share. A macOS equivalent would be a different test, not this one.
+name: PHP
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  php:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: php + sqlite3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y php-cli php-sqlite3 sqlite3
+          php -v
+          # The two extensions under test, and the library they are linked
+          # against. If either is absent the rest of this job proves nothing,
+          # so fail here rather than silently skipping.
+          php -m | grep -qx 'pdo_sqlite'
+          php -m | grep -qx 'sqlite3'
+          sqlite3 --version
+
+      # mpedb-capi is its OWN workspace — it exports sqlite3_* and cannot
+      # co-link the bundled sqlite the parent pulls in. Same reason linux.yml
+      # builds it by manifest path.
+      - name: build the shim
+        run: cargo build --release --manifest-path crates/mpedb-capi/Cargo.toml
+
+      - name: exports are GLOBAL, not merely present
+        run: |
+          SO=$(find target crates/mpedb-capi/target -name libmpedb_sqlite3.so | head -1)
+          test -n "$SO" || { echo "no libmpedb_sqlite3.so was built"; exit 1; }
+          echo "shim: $SO"
+          # Every symbol PHP's two extensions reference must be exported and
+          # DEFINED (nm 'T'). A symbol that is present but local is the failure
+          # this step exists for, so grep the dynamic table specifically.
+          nm -D --defined-only "$SO" | grep -oE 'sqlite3_[A-Za-z0-9_]+' | sort -u > exported.txt
+          for ext in pdo_sqlite sqlite3; do
+            nm -D --undefined-only "/usr/lib/php/$(php -r 'echo PHP_ZEND_EXTENSION_API_NO ?: "";' 2>/dev/null || true)"/$ext.so 2>/dev/null \
+              || nm -D --undefined-only $(php -r 'echo ini_get("extension_dir");')/$ext.so
+          done | grep -oE 'sqlite3_[A-Za-z0-9_]+' | sort -u > needed.txt
+          echo "needed $(wc -l < needed.txt), exported $(wc -l < exported.txt)"
+          if ! comm -23 needed.txt exported.txt | grep -q .; then
+            echo "every symbol PHP needs is exported"
+          else
+            echo "MISSING from the shim:"; comm -23 needed.txt exported.txt; exit 1
+          fi
+
+      - name: PHP loads both extensions against the shim
+        run: |
+          SO=$(find target crates/mpedb-capi/target -name libmpedb_sqlite3.so | head -1)
+          mkdir -p shimlib && ln -sf "$(realpath "$SO")" shimlib/libsqlite3.so.0
+          # Substituting under the soname is the real drop-in path. LD_PRELOAD
+          # does NOT work here and the difference is worth stating: PHP loads
+          # extensions with dlopen, and their own DT_NEEDED wins over the
+          # preload scope, so the shim would load and never be called.
+          out=$(LD_LIBRARY_PATH=$PWD/shimlib php -r '
+            echo extension_loaded("pdo_sqlite") ? "pdo_sqlite ok\n" : "pdo_sqlite FAILED\n";
+            echo extension_loaded("sqlite3")    ? "sqlite3 ok\n"    : "sqlite3 FAILED\n";
+          ' 2>&1)
+          echo "$out"
+          echo "$out" | grep -q FAILED && exit 1
+          echo "$out" | grep -q 'Unable to load' && exit 1
+          true
+
+      - name: PDO round-trip through the shim
+        run: |
+          SO=$(find target crates/mpedb-capi/target -name libmpedb_sqlite3.so | head -1)
+          mkdir -p shimlib && ln -sf "$(realpath "$SO")" shimlib/libsqlite3.so.0
+          cat > rt.php <<'EOF'
+          <?php
+          $db = new PDO('sqlite:ci.mpedb');
+          $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+          $db->exec('CREATE TABLE t (a INTEGER, b TEXT)');
+          $i = $db->prepare('INSERT INTO t VALUES (?, ?)');
+          foreach ([[1,'x'],[2,'y'],[3,'z']] as $r) { $i->execute($r); }
+          $n = $db->query('SELECT COUNT(*) FROM t WHERE a > 1')->fetchColumn();
+          if ((int)$n !== 2) { fwrite(STDERR, "count $n, want 2\n"); exit(1); }
+          // getColumnMeta['table'] is sqlite3_column_table_name — one of the
+          // four symbols whose absence used to stop the extension loading.
+          $m = $db->query('SELECT a FROM t')->getColumnMeta(0);
+          if (($m['table'] ?? '') !== 't') { fwrite(STDERR, "table name: ".json_encode($m)."\n"); exit(1); }
+          // …and NULL for a computed column, which is what sqlite answers.
+          $m = $db->query('SELECT a*2 FROM t')->getColumnMeta(0);
+          if (($m['table'] ?? null) !== null && $m['table'] !== '') {
+              fwrite(STDERR, "computed column claimed a table\n"); exit(1);
+          }
+          echo "pdo round-trip ok\n";
+          EOF
+          rm -f ci.mpedb
+          LD_LIBRARY_PATH=$PWD/shimlib php rt.php
+
+      - name: printf matches real sqlite, format for format
+        run: |
+          SO=$(find target crates/mpedb-capi/target -name libmpedb_sqlite3.so | head -1)
+          cat > pf.c <<'EOF'
+          #include <stdio.h>
+          extern char *sqlite3_mprintf(const char*, ...);
+          extern char *sqlite3_snprintf(int, char*, const char*, ...);
+          extern void  sqlite3_free(void*);
+          #define P(...) do { char *r = sqlite3_mprintf(__VA_ARGS__); \
+              printf("[%s]\n", r ? r : "(NULL)"); sqlite3_free(r); } while (0)
+          int main(void) {
+            P("%s", "hei"); P("%s", (char*)0); P("%q", "d'Arcy"); P("%Q", "d'Arcy");
+            P("%Q", (char*)0); P("%q", (char*)0); P("%w", "tab\"le"); P("%w", (char*)0);
+            P("%d/%d", 7, -3); P("%5d|%-5d|", 42, 42); P("%08.3f", 3.14159);
+            P("%lld", 9223372036854775807LL); P("%x %X %o", 255, 255, 8);
+            P("%*d", 6, 42); P("%.2s", "abcdef"); P("%.*s", 3, "abcdef");
+            P("100%%"); P(""); P("%c%c", 'h', 'i'); P("%e", 1234.5678);
+            P("%400d", 5); P("%+d %+d", 5, -5);
+            { char *i = sqlite3_mprintf("%s", "eid"); P("[%z]", i); }
+            { char b[8]; printf("[%s]\n", sqlite3_snprintf(sizeof b, b, "%s", "avkortes-her")); }
+            return 0;
+          }
+          EOF
+          # Same program, two libraries. Ours must agree with the distro's
+          # sqlite on every DEFINED format; `%zu` is excluded because sqlite
+          # reads the `z` as its own conversion and segfaults on it.
+          gcc -o pf_mpedb pf.c -L"$(dirname "$SO")" -l:libmpedb_sqlite3.so -Wl,-rpath,"$(dirname "$(realpath "$SO")")"
+          gcc -o pf_sqlite pf.c /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 -Wl,-rpath,/usr/lib/x86_64-linux-gnu
+          ./pf_mpedb > m.txt
+          ./pf_sqlite > s.txt
+          if diff -u s.txt m.txt; then
+            echo "identical on all $(wc -l < s.txt) formats"
+          else
+            echo "printf diverged from sqlite"; exit 1
+          fi
+
+      - name: shim reads a real sqlite file
+        run: |
+          SO=$(find target crates/mpedb-capi/target -name libmpedb_sqlite3.so | head -1)
+          mkdir -p shimlib && ln -sf "$(realpath "$SO")" shimlib/libsqlite3.so.0
+          rm -f src.db src.db.mpedb
+          sqlite3 src.db "CREATE TABLE p (id INTEGER, name TEXT);
+                          INSERT INTO p VALUES (1,'a'),(2,'b'),(3,'c');
+                          CREATE INDEX p_id ON p (id);"
+          cat > rd.php <<'EOF'
+          <?php
+          $db = new PDO('sqlite:src.db');
+          $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+          $n = (int)$db->query('SELECT COUNT(*) FROM p')->fetchColumn();
+          if ($n !== 3) { fwrite(STDERR, "read $n rows, want 3\n"); exit(1); }
+          $db->exec("INSERT INTO p VALUES (4,'d')");
+          $r = $db->query('PRAGMA wal_checkpoint')->fetch(PDO::FETCH_NUM);
+          if ((int)$r[2] < 4) { fwrite(STDERR, "checkpoint wrote {$r[2]}\n"); exit(1); }
+          echo "sidecar + checkpoint ok\n";
+          EOF
+          LD_LIBRARY_PATH=$PWD/shimlib php rd.php
+          # The checkpoint wrote a sqlite file: REAL sqlite has to accept it,
+          # indexes and all. This is the half our own reader cannot vouch for.
+          #
+          # Each check REPORTS rather than just exiting. A bare `test` under
+          # `bash -e` fails silently, and the one time this step went red the
+          # log said only "exit code 1" — the actual complaint (four
+          # `NULL value in p.rowid` lines, from a synthesized rowid written as
+          # a real column) had to be reproduced locally to be seen at all.
+          fail=0
+          check() {  # check <what> <got> <want>
+            if [ "$2" = "$3" ]; then echo "ok: $1 = $3"; else
+              echo "FAIL: $1 — got [$2], want [$3]"; fail=1
+            fi
+          }
+          check "integrity_check" "$(sqlite3 src.db 'PRAGMA integrity_check;')" "ok"
+          check "row count"       "$(sqlite3 src.db 'SELECT COUNT(*) FROM p;')" "4"
+          check "index count"     "$(sqlite3 src.db "SELECT COUNT(*) FROM sqlite_master WHERE type='index';")" "1"
+          # The schema must be the one that went in — no phantom columns.
+          check "schema" "$(sqlite3 src.db "SELECT COUNT(*) FROM pragma_table_info('p');")" "2"
+          if [ "$fail" != 0 ]; then
+            echo "--- what the file actually holds ---"
+            sqlite3 src.db '.schema' 'SELECT * FROM p;'
+            exit 1
+          fi
+          echo "stock sqlite accepts the checkpointed file"

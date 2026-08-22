@@ -177,7 +177,7 @@ pub use fts::{Doclist, FtsModule, Tokenizer};
 pub use policy::{PolicyCmd, PolicyDef};
 pub use schema::{
     store_into, ColumnDef, DefaultExpr, DefaultProgram, FkAction, ForeignKeyDef, GeneratedCol, GeneratedKind,
-    IndexDef, Schema, TableDef, TableKind,
+    IndexDef, IndexState, Schema, TableDef, TableKind,
     INDEX_EXPR_COL, MAX_IDENTIFIER_LEN, MAX_INDEXES,
 };
 pub use value::{

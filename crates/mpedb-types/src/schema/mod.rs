@@ -340,6 +340,21 @@ impl ColumnDef {
     }
 }
 
+/// Whether an index is filled and may answer queries — see
+/// [`IndexDef::state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexState {
+    /// Filled and usable. Every index created synchronously is born this way,
+    /// and so is every index decoded from a pre-v21 schema.
+    #[default]
+    Ready,
+    /// Published but not yet filled: maintained by writers, never chosen by
+    /// the planner. A crash leaves it in this state, which is resumable — the
+    /// alternative, a `Ready` index missing rows, is unrecoverable because
+    /// nothing downstream can tell it apart from a complete one.
+    Building,
+}
+
 /// One secondary index (canonical-bytes v2, DESIGN-SCHEMA-V2). `index_no` in
 /// the catalog/plans is `1 + position` in `TableDef::indexes` (0 = PK tree).
 /// Column order is significant. This list is the SINGLE source of truth for
@@ -349,6 +364,24 @@ impl ColumnDef {
 pub struct IndexDef {
     /// Ordinals into `TableDef::columns`, in key order.
     pub columns: Vec<u16>,
+    /// Whether this index may ANSWER a query yet (P2,
+    /// design/DESIGN-WORKLOAD-INDEXES.md §7).
+    ///
+    /// A background build has to publish the index BEFORE it is filled, so
+    /// that concurrent writers maintain it from that moment on — otherwise
+    /// every row written during the build is missing from it. But an index
+    /// the planner can see is an index the planner will USE, the instant it
+    /// appears in `TableDef::indexes`. Using a half-filled one is not a
+    /// slower answer, it is a WRONG one: fewer rows than exist.
+    ///
+    /// The state separates the two. `Building` participates in maintenance
+    /// (`WriteTxn::index_entry_key`) and is invisible to access selection;
+    /// `Ready` is an ordinary index. Nothing else in the engine distinguishes
+    /// them.
+    ///
+    /// On the wire since canonical-bytes **v21**. An index decoded from an
+    /// older schema is `Ready`, which is what every index in such a file is.
+    pub state: IndexState,
     pub unique: bool,
     /// Partial-index predicate source (`CREATE INDEX … WHERE <pred>`, P1 /
     /// design/DESIGN-WORKLOAD-INDEXES.md §5). `None` is a whole-table index.
@@ -443,6 +476,34 @@ impl IndexDef {
     pub fn has_expression_part(&self) -> bool {
         !self.exprs.iter().all(Option::is_none)
             || self.columns.contains(&INDEX_EXPR_COL)
+    }
+
+    /// May this index ANSWER a query — that is, may the planner choose it as
+    /// an access path?
+    ///
+    /// Two independent reasons say no, and both are wrong-ANSWER bugs rather
+    /// than missed optimizations, which is why they are gathered here instead
+    /// of being spelled out at each of the six places that enumerate
+    /// `TableDef::indexes`:
+    ///
+    /// * an [expression part](Self::has_expression_part) keys a computed
+    ///   value, and matching a query's expression against a stored one is a
+    ///   problem this planner does not solve;
+    /// * a [`Building`](IndexState::Building) index is not filled yet, so it
+    ///   holds fewer rows than the table.
+    ///
+    /// The history is the argument for one function: when `exprs` landed, the
+    /// six sites each had to learn the rule separately, one was missed, and it
+    /// PANICKED — found by the PostgreSQL differential, not by review. A
+    /// second per-index reason would have the same shape, so it gets the same
+    /// test.
+    ///
+    /// Maintenance is a different question with a different answer: a
+    /// `Building` index IS maintained by every writer (see
+    /// `WriteTxn::index_entry_key`), because rows written during the build
+    /// must not be missing from it afterwards.
+    pub fn usable_for_access(&self) -> bool {
+        self.state == IndexState::Ready && !self.has_expression_part()
     }
 }
 
@@ -1055,6 +1116,7 @@ fn normalize_and_derive(t: &mut TableDef) {
                 && !(t.primary_key.len() == 1 && t.primary_key[0] == *i as u16)
         })
         .map(|(i, c)| IndexDef {
+            state: IndexState::Ready,
             collations: Vec::new(),
             columns: vec![i as u16],
             unique: c.unique,

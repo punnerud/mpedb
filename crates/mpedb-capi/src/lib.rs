@@ -23,6 +23,7 @@ mod exec;
 mod ext;
 mod introspect;
 mod open;
+mod printf;
 mod sql;
 mod stmt;
 mod udf;
@@ -64,6 +65,33 @@ static EPHEMERAL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// (open transaction, busy timeout, last error, change counters).
 /// A pragma's answer: `(column names, rows)`.
 type PragmaAnswer = (Vec<String>, Vec<Vec<Value>>);
+
+/// `PRAGMA wal_checkpoint[(<mode>)]` — for a database opened FROM a sqlite
+/// file, re-serialize the sidecar back over that file. `Ok(None)` = not this
+/// pragma, carry on.
+///
+/// Here rather than in `introspect::pragma` for the same reason `fk_pragma`
+/// is: it needs the connection, both to read the rows out and to know which
+/// sqlite file they came from.
+///
+/// The answer is sqlite's `(busy, log, checkpointed)`. sqlite reports
+/// `(0, -1, -1)` for a database not in WAL mode, and a native mpedb database
+/// never is, so that is what it gets. A sqlite-backed one reports the row
+/// count in both slots — not a WAL frame count, since nothing here is a WAL
+/// frame, but the honest measure of what was written.
+fn checkpoint_pragma(c: &mut Sqlite3, sqltext: &str) -> Result<Option<PragmaAnswer>, String> {
+    let (name, _arg) = introspect::parse_pragma(sqltext);
+    if !name.eq_ignore_ascii_case("wal_checkpoint") {
+        return Ok(None);
+    }
+    let cols =
+        vec!["busy".to_string(), "log".to_string(), "checkpointed".to_string()];
+    if c.sqlite_source.is_none() {
+        return Ok(Some((cols, vec![vec![Value::Int(0), Value::Int(-1), Value::Int(-1)]])));
+    }
+    let n = open::checkpoint_to_sqlite(c)? as i64;
+    Ok(Some((cols, vec![vec![Value::Int(0), Value::Int(n), Value::Int(n)]])))
+}
 
 /// `PRAGMA foreign_keys [= …]` and `PRAGMA foreign_key_check [(t)]` (#194).
 /// `Ok(None)` = not one of these, carry on with the ordinary pragma handler.
@@ -139,6 +167,10 @@ pub struct Sqlite3 {
     txn: Option<WriteSession<'static>>,
     db: Database,
     path: PathBuf,
+    /// The sqlite file this handle was opened from, when it was one. `path`
+    /// then points at the sidecar that actually backs the connection, and this
+    /// is where `checkpoint` writes back to. `None` for a native mpedb file.
+    sqlite_source: Option<PathBuf>,
     /// What `path` is: a real file the caller named, or the tmpfs file standing
     /// in for an in-memory database (which is removed again on close).
     backing: Backing,
@@ -271,6 +303,15 @@ pub struct Stmt {
     /// `None` = not yet computed; inner `None` = this column has no decltype
     /// (NULL). NUL-terminated bytes, aligned to `columns`.
     decltype_c: Option<Vec<Option<Vec<u8>>>>,
+    /// Per-column source table (`sqlite3_column_table_name`), computed LAZILY
+    /// on the same terms as `decltype_c`: `None` = not yet computed; inner
+    /// `None` = this column has no base table (NULL). NUL-terminated bytes,
+    /// aligned to `columns`.
+    table_name_c: Option<Vec<Option<Vec<u8>>>>,
+    /// `sql` NUL-terminated, for `sqlite3_sql`. That call hands out a pointer
+    /// the statement owns for its whole life, so it cannot be a temporary.
+    /// Built once on first ask.
+    sql_c: Option<Vec<u8>>,
     rows: Vec<Vec<Value>>,
     /// Index of the NEXT row to yield; the current row is `pos - 1`.
     pos: usize,

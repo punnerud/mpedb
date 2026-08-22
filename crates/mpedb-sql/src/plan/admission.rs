@@ -46,7 +46,7 @@ pub fn agg_servable_by_index(
             && !ix.columns.is_empty()
             // An expression key part has no column whose NOT NULL could make the
             // count exact, and its ordinal panics `not_null`.
-            && !ix.has_expression_part()
+            && ix.usable_for_access()
             && ix.columns.iter().all(|&c| not_null(c));
     };
     // The argument must be the bare leading index column…

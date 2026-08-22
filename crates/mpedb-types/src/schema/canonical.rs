@@ -13,7 +13,9 @@ impl Schema {
         // the bump exists to make an old reader refuse by VERSION rather than
         // by an unknown tag three fields deeper in.
         // v20: IndexDef.from_constraint and TableDef.pk_name.
-        buf.push(20u8); // schema encoding version
+        // v21: IndexDef.state — a background build must publish an index before
+        // it is filled, and the planner must not choose it until it is.
+        buf.push(21u8); // schema encoding version
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -154,6 +156,12 @@ impl Schema {
                 // Constraint provenance (v20): whether this unique index exists
                 // because a UNIQUE constraint was declared. One byte per index.
                 buf.push(ix.from_constraint as u8);
+                // Build state (v21). One byte per index, and `Ready` is 0 so a
+                // schema of ordinary indexes grows by a zero byte each.
+                buf.push(match ix.state {
+                    IndexState::Ready => 0u8,
+                    IndexState::Building => 1u8,
+                });
             }
             // FOREIGN KEYs (v12). Almost every table has none, so the common
             // case is a single zero u16 — the same "one length word" price the
@@ -210,7 +218,7 @@ impl Schema {
         // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name;
         // v12 = TableDef.foreign_keys; v13 = IndexDef.exprs.
         // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if !(9..=20).contains(&version) {
+        if !(9..=21).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
@@ -225,6 +233,7 @@ impl Schema {
         // v20 added TWO fields, and one flag gates both: they went in
         // together, so a file has both or neither.
         let has_index_from_constraint = version >= 20;
+        let has_index_state = version >= 21;
         let ntables = read_u32(buf, &mut pos)? as usize;
         // The CEILING, not the configured cap: this bounds what a FILE can
         // make this decoder believe, and a hostile file must not be able to
@@ -526,9 +535,25 @@ impl Schema {
                 } else {
                     unique
                 };
+                // Build state (v21). A file older than that has no half-built
+                // index in it — the synchronous CREATE INDEX that wrote it
+                // either completed or committed nothing — so `Ready` is not a
+                // default, it is what those indexes ARE.
+                let state = if has_index_state {
+                    let tag = *buf.get(pos).ok_or_else(err)?;
+                    pos += 1;
+                    match tag {
+                        0 => IndexState::Ready,
+                        1 => IndexState::Building,
+                        _ => return Err(Error::Corrupt("bad index state tag".into())),
+                    }
+                } else {
+                    IndexState::Ready
+                };
                 indexes.push(IndexDef {
                     collations,
                     columns: cols,
+                    state,
                     unique,
                     predicate,
                     exprs,
