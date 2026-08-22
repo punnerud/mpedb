@@ -198,10 +198,20 @@ fn seed_toml(path: &std::path::Path, size_mb: u64) -> String {
     // and a LOSSY rewrite in the Python binding — four sites, three behaviours,
     // two of them wrong on Windows. #159 found it by running on Windows.
     let p = mpedb::toml_escape(&path.to_string_lossy());
-    // Modest max_readers keeps the reader-table pages (and thus high_water for
-    // a nearly empty :memory: DB) small — backup progress paces over that.
+    // 32 was chosen when this only ever backed a scratch `:memory:` database,
+    // where a small reader table keeps `high_water` (and so backup progress)
+    // tight. It is the wrong number for a FILE: the geometry is frozen into
+    // it at creation, and a PHP-FPM pool with more than 32 concurrent read
+    // transactions gets `ReadersFull` — a refusal with no way out but
+    // rebuilding the file. `MPEDB_MAX_READERS` overrides it; the default
+    // follows the engine's own (1024) for anything on disk.
+    let max_readers = std::env::var("MPEDB_MAX_READERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| (1..=65536).contains(n))
+        .unwrap_or(1024);
     format!(
-        "[database]\npath = \"{p}\"\nsize_mb = {size_mb}\nmax_readers = 32\n\n\
+        "[database]\npath = \"{p}\"\nsize_mb = {size_mb}\nmax_readers = {max_readers}\n\n\
          [[table]]\nname = \"{SEED_TABLE}\"\nprimary_key = [\"id\"]\n\n  \
          [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n"
     )
@@ -484,6 +494,10 @@ pub(crate) fn checkpoint_to_sqlite(c: &mut Sqlite3) -> Result<u64, String> {
     if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&c.path) {
         let _ = f.set_modified(now);
     }
+    // The checkpoint just REWROTE the source, so its length is almost
+    // certainly not the one the sidecar was stamped with. Restamp, or the very
+    // next open re-imports the file this sidecar just produced.
+    stamp_source(&src, &c.path);
     Ok(total)
 }
 
@@ -495,6 +509,111 @@ pub(crate) fn checkpoint_to_sqlite(c: &mut Sqlite3) -> Result<u64, String> {
 /// full re-import, so an edit to the source costs one import on the next open,
 /// not on every statement.
 ///
+/// Is the sidecar usable as-is for this source?
+///
+/// mtime ALONE is not enough, and the failure is silent. `cp -p`, `rsync -t`
+/// and every restore-from-backup preserve the source's timestamp, so a
+/// database put back in place looks OLDER than a sidecar built from the
+/// database it replaced — and the stale sidecar keeps being served, with no
+/// error and no hint.
+///
+/// So the stamp is the source's LENGTH plus its 100-byte sqlite HEADER, which
+/// carries the page size, the page count, the change counter and the schema
+/// cookie. A rebuilt database differs in at least one of those essentially
+/// always, and reading 100 bytes costs nothing against the import it guards.
+///
+/// It remains a heuristic, and the residual gap is stated rather than papered
+/// over: a replacement with the same length AND the same header differs only
+/// in page CONTENT, and finding that needs a full hash of 142 MB on every
+/// open — more expensive than the import. `a_same_size_replacement_is_not_seen`
+/// pins that limit so nobody assumes more than is here.
+///
+/// `MPEDB_SIDECAR_STAMP=off` skips the check for a caller that manages the
+/// sidecar itself — the nightly-build case, where it is produced deliberately
+/// and nothing should re-import it.
+fn sidecar_is_fresh(src: &Path, side: &Path) -> bool {
+    if !side.exists() {
+        return false;
+    }
+    if std::env::var("MPEDB_SIDECAR_STAMP").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+        return true;
+    }
+    let (Ok(sm), Ok(dm)) = (std::fs::metadata(src), std::fs::metadata(side)) else {
+        return false;
+    };
+    let (Ok(st), Ok(dt)) = (sm.modified(), dm.modified()) else {
+        return false; // a clock that will not answer: import
+    };
+    if dt < st {
+        return false;
+    }
+    // The source's length as it was at import, stamped beside the sidecar.
+    // Absent (a sidecar from before this existed) means unknown, and unknown
+    // means fresh-by-mtime, exactly as before — no forced re-import of every
+    // sidecar in existence.
+    let stamp = stamp_path(side);
+    match std::fs::read_to_string(&stamp) {
+        Ok(t) => t.trim() == source_stamp(src, sm.len()),
+        // No stamp: a sidecar from before this existed. Unknown means
+        // fresh-by-mtime, exactly as before — no forced re-import of every
+        // sidecar already on disk.
+        Err(_) => true,
+    }
+}
+
+/// `<length>:<hex of the 100-byte header>` — the source's identity, cheaply.
+fn source_stamp(src: &Path, len: u64) -> String {
+    use std::io::Read;
+    let mut head = [0u8; 100];
+    let n = std::fs::File::open(src).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+    let mut out = format!("{len}:");
+    for b in &head[..n] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn stamp_path(side: &Path) -> PathBuf {
+    let mut p = side.as_os_str().to_os_string();
+    p.push(".src");
+    PathBuf::from(p)
+}
+
+/// An advisory `flock` held for the length of one import.
+///
+/// Best-effort by design: a filesystem that cannot lock (NFS without a lock
+/// daemon — which is what `/home` is on the deployment this was written for)
+/// returns an error, and the import proceeds unserialized rather than
+/// refusing to open the database. That is the pre-existing behaviour, so the
+/// lock can only make things better, never worse.
+struct ImportLock(Option<std::fs::File>);
+
+impl ImportLock {
+    fn acquire(path: &Path) -> Self {
+        let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)
+        else {
+            return Self(None);
+        };
+        // Blocking: the point is that the waiter finds the finished sidecar,
+        // not that it races the winner.
+        let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) };
+        if rc != 0 {
+            return Self(None);
+        }
+        Self(Some(f))
+    }
+}
+
+impl Drop for ImportLock {
+    fn drop(&mut self) {
+        if let Some(f) = &self.0 {
+            unsafe {
+                libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(f), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 /// The import goes to a temporary name and is renamed into place at the end,
 /// so an interrupted one leaves no half-filled sidecar for the next open to
 /// mistake for a complete one.
@@ -503,29 +622,50 @@ fn sqlite_sidecar(src: &Path) -> Result<PathBuf, String> {
     side.push(".mpedb");
     let side = PathBuf::from(side);
 
-    let src_time = std::fs::metadata(src).and_then(|m| m.modified()).ok();
-    let side_time = std::fs::metadata(&side).and_then(|m| m.modified()).ok();
-    let fresh = match (src_time, side_time) {
-        (Some(a), Some(b)) => b >= a,
-        // No sidecar yet, or a clock that will not answer: import.
-        _ => false,
-    };
-    if side.exists() && fresh {
+    if sidecar_is_fresh(src, &side) {
         return Ok(side);
     }
 
+    // SERIALIZE the import. Without this every concurrent open that finds the
+    // sidecar stale starts its own — N full imports of the same file, all
+    // writing the SAME staging path, and the losers hand a real user
+    // `SQLITE_CANTOPEN`. After a nightly rebuild that is every request at once.
+    //
+    // The lock is a separate file, taken for the whole check-and-build: a
+    // waiter that gets the lock re-checks freshness and finds the winner's
+    // sidecar already in place, so it pays the wait and not the import.
+    let lock_path = {
+        let mut p = side.as_os_str().to_os_string();
+        p.push(".lock");
+        PathBuf::from(p)
+    };
+    let _guard = ImportLock::acquire(&lock_path);
+    if sidecar_is_fresh(src, &side) {
+        return Ok(side);
+    }
+
+    // Per-process staging name. Two processes that somehow reach here at once
+    // (an unlockable filesystem — NFS without a lock daemon) must not write
+    // the same bytes: better two imports than one corrupt file.
     let staging = {
         let mut p = side.as_os_str().to_os_string();
-        p.push(".importing");
+        p.push(format!(".importing.{}", std::process::id()));
         PathBuf::from(p)
     };
     let _ = std::fs::remove_file(&staging);
     // Size the sidecar from the source. mpedb preallocates, so this has to be
     // decided up front: 4x the sqlite file plus 32 MiB of slack, since mpedb's
     // per-row layout is not sqlite's and an import that runs out of space
-    // fails the open rather than growing. Generous on purpose — the file is
-    // sparse until written, so the cost of overshooting is address space, not
-    // disk.
+    // fails the open rather than growing.
+    //
+    // The 4x is not slack that costs nothing. This comment used to say the
+    // file is sparse until written and that overshooting costs address space
+    // rather than disk; that is FALSE below 2 GiB, where the reservation is
+    // zero-filled outright. Measured on the 142 MB track database: a 597 MB
+    // sidecar, 597 MB actually allocated, of which 96 % holds real data — so
+    // the multiplier is roughly right for the data and the file genuinely
+    // costs what it says. Overshooting costs disk, and on a tmpfs staging
+    // directory it costs RAM.
     let src_mb = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0) / (1024 * 1024);
     let size_mb = (src_mb * 4 + 32).max(16);
     let (db, tmp) = open_blank_database_sized(size_mb).map_err(|e| {
@@ -557,7 +697,20 @@ fn sqlite_sidecar(src: &Path) -> Result<PathBuf, String> {
         let _ = std::fs::remove_file(&staging);
         format!("unable to open database file: cannot place `{}`: {e}", side.display())
     })?;
+    // Stamp the source length this sidecar was built from — the second opinion
+    // `sidecar_is_fresh` needs when a restore preserves mtime. Written AFTER
+    // the rename, so a stamp never claims a sidecar that is not there; a
+    // failure to write it only costs the next open its mtime-only reading,
+    // which is where this started.
+    stamp_source(src, &side);
     Ok(side)
+}
+
+/// Record the source's length beside the sidecar. Best effort.
+fn stamp_source(src: &Path, side: &Path) {
+    if let Ok(m) = std::fs::metadata(src) {
+        let _ = std::fs::write(stamp_path(side), source_stamp(src, m.len()));
+    }
 }
 
 pub(crate) const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -572,6 +725,24 @@ pub(crate) fn is_sqlite_file(path: &Path) -> bool {
     };
     let mut m = [0u8; 16];
     f.read_exact(&mut m).is_ok() && &m == SQLITE_MAGIC
+}
+
+/// Rows per import transaction. `mpedb-mirror`'s number, and for its reason:
+/// big enough that the per-commit cost disappears, small enough that the COW
+/// pages one transaction holds do not.
+const IMPORT_BATCH: usize = 4096;
+
+/// One transaction's worth of rows, committed and cleared.
+fn flush_batch(dest: &Database, ins: &str, rows: &mut Vec<Vec<Value>>) -> Result<u64, String> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let n = rows.len() as u64;
+    let mut s = dest.begin().map_err(|e| format!("{e}"))?;
+    s.query_many(ins, rows).map_err(|e| format!("{e}"))?;
+    s.commit().map_err(|e| format!("{e}"))?;
+    rows.clear();
+    Ok(n)
 }
 
 /// Read a sqlite database with the native reader and re-create it inside an
@@ -624,28 +795,49 @@ pub(crate) fn import_sqlite_file(src: &Path, dest: &Database) -> Result<u64, Str
             t.name.replace('"', "\"\""),
             placeholders.join(", ")
         );
+        // BATCHED, not a row at a time. `dest.query()` is autocommit: it takes
+        // the writer lock, applies one row and flips the meta page — 945 234
+        // times for the track table, which is where the 15 seconds went. One
+        // transaction per BATCH rows amortises all three, and `query_many`
+        // ("executemany's engine half") compiles the INSERT once for the whole
+        // batch instead of once per row.
+        //
+        // Per batch rather than one transaction for the table: a single
+        // transaction over a million rows holds every COW page it touches
+        // until commit, which is a hard `DbFull` on a sidecar sized for the
+        // DATA. 4096 is `mpedb-mirror`'s number, for the same reason.
         let mut failed = None;
+        let mut pending: Vec<Vec<Value>> = Vec::with_capacity(IMPORT_BATCH);
         f.scan_table(t, &mut |_rowid, vals| {
-            let params: Vec<Value> = vals
-                .into_iter()
-                .map(|v| match v {
-                    mpedb_sqlitefmt::Value::Null => Value::Null,
-                    mpedb_sqlitefmt::Value::Int(i) => Value::Int(i),
-                    mpedb_sqlitefmt::Value::Float(x) => Value::Float(x),
-                    mpedb_sqlitefmt::Value::Text(s) => Value::Text(s),
-                    mpedb_sqlitefmt::Value::Blob(b) => Value::Blob(b),
-                })
-                .collect();
-            if let Err(e) = dest.query(&ins, &params) {
-                if failed.is_none() {
-                    failed = Some(format!("{e}"));
+            if failed.is_some() {
+                return Ok(()); // drain the scan; the first error is the one to report
+            }
+            pending.push(
+                vals.into_iter()
+                    .map(|v| match v {
+                        mpedb_sqlitefmt::Value::Null => Value::Null,
+                        mpedb_sqlitefmt::Value::Int(i) => Value::Int(i),
+                        mpedb_sqlitefmt::Value::Float(x) => Value::Float(x),
+                        mpedb_sqlitefmt::Value::Text(s) => Value::Text(s),
+                        mpedb_sqlitefmt::Value::Blob(b) => Value::Blob(b),
+                    })
+                    .collect(),
+            );
+            if pending.len() >= IMPORT_BATCH {
+                match flush_batch(dest, &ins, &mut pending) {
+                    Ok(n) => rows += n,
+                    Err(e) => failed = Some(e),
                 }
-            } else {
-                rows += 1;
             }
             Ok(())
         })
         .map_err(|e| format!("{e}"))?;
+        if failed.is_none() {
+            match flush_batch(dest, &ins, &mut pending) {
+                Ok(n) => rows += n,
+                Err(e) => failed = Some(e),
+            }
+        }
         if let Some(e) = failed {
             return Err(e);
         }
