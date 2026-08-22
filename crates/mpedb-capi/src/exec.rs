@@ -309,6 +309,14 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             if let Some((columns, rows)) = fk_pragma(c, sqltext)? {
                 return Ok(Outcome::Rows { columns, rows });
             }
+            // `PRAGMA wal_checkpoint` on a sqlite-backed database writes the
+            // sidecar back over its source file. A whole-image write, so it is
+            // asked for explicitly and never implied.
+            match checkpoint_pragma(c, sqltext) {
+                Ok(Some((columns, rows))) => return Ok(Outcome::Rows { columns, rows }),
+                Ok(None) => {}
+                Err(msg) => return Err(DbError::Unsupported(msg)),
+            }
             // A VIEW answers `table_info` too — with its RESULT columns, which
             // is how SQLAlchemy's `get_multi_*` reflection discovers that a
             // view has columns at all. Returning nothing for one silently

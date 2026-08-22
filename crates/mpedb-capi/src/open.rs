@@ -1,5 +1,7 @@
 use super::*;
 
+use std::path::Path;
+
 // ===========================================================================
 // open / close
 // ===========================================================================
@@ -285,11 +287,363 @@ pub(super) fn is_callable_name(lower: &str) -> bool {
 /// (`CREATE TEMP TABLE`/`VIEW`/`TRIGGER` all fail to parse), so mpedb's temp
 /// schema is provably EMPTY — an empty image is the exact answer, not an
 /// approximation of one.
+/// The 16 bytes every sqlite file starts with.
+/// One mpedb value as the sqlite value it should become on the way out.
+///
+/// mpedb's type set is wider than sqlite's five storage classes, so a few
+/// variants have to CHOOSE a representation. Each choice below is the one that
+/// survives a round trip back through the importer:
+///
+/// * `Bool` → integer 0/1, which is how sqlite itself stores booleans.
+/// * `Timestamp`/`Date`/`Time` → their integer counts (microseconds, days,
+///   microseconds), the same numbers mpedb holds. Rendering them as text would
+///   pick a format sqlite has no opinion about and mpedb would not read back.
+/// * `Numeric` → its canonical text. An exact decimal has no lossless sqlite
+///   number: REAL would round it, and INTEGER cannot hold the fraction.
+///
+/// A `List` is refused by name. It is a parameter-only value that never
+/// belongs to a stored row, so meeting one here means something upstream is
+/// wrong and quietly writing anything would hide it.
+fn to_sqlite_value(v: mpedb::Value) -> Result<mpedb_sqlitefmt::Value, String> {
+    use mpedb_sqlitefmt::Value as S;
+    Ok(match v {
+        mpedb::Value::Null => S::Null,
+        mpedb::Value::Int(i) => S::Int(i),
+        mpedb::Value::Float(f) => S::Float(f),
+        mpedb::Value::Bool(b) => S::Int(b as i64),
+        mpedb::Value::Text(t) => S::Text(t),
+        mpedb::Value::Blob(b) => S::Blob(b),
+        mpedb::Value::Timestamp(i) | mpedb::Value::Date(i) | mpedb::Value::Time(i) => S::Int(i),
+        mpedb::Value::Numeric(n) => S::Text(n),
+        other => {
+            return Err(format!(
+                "a {other:?} cannot be stored in a sqlite file (it is a parameter-only value)"
+            ))
+        }
+    })
+}
+
+/// Write the sidecar's current contents back over the sqlite file it came
+/// from — the C-API's `mpedb checkpoint`.
+///
+/// The whole database is re-serialized, not a delta. Without mpedb-mirror
+/// (which a library exporting `sqlite3_*` can never link, since it pulls in a
+/// real sqlite through rusqlite) there is no change log to apply, so there is
+/// nothing finer to push than the full picture. That is honest but expensive:
+/// cost scales with the database, not with what changed.
+///
+/// The image goes to a temporary file in the SAME directory and is renamed
+/// over the original, so a reader either sees the whole old file or the whole
+/// new one. A failure part-way leaves the original untouched.
+///
+/// # What a checkpoint does NOT carry back
+///
+/// **Indexes.** The writer emits table b-trees only, so a source that had
+/// indexes comes back without them. Measured on the 944 457-row track
+/// database: three indexes in, none out, and the file fell from 148 MB to
+/// 87 MB. The data is complete and every query still answers correctly — it
+/// answers by scanning. Re-create them with `CREATE INDEX` against the
+/// checkpointed file, or keep the sidecar as the working copy.
+///
+/// This is the one place the shim knowingly returns less than it was given,
+/// so it is stated here rather than discovered from a file that got faster to
+/// write and slower to read. Writing index trees needs the index b-tree cell
+/// forms (0x0a / 0x02) AND a key ordering that matches sqlite's collation
+/// exactly — an index sqlite believes is sorted but is not would be a silent
+/// wrong answer, which is worse than an absent one.
+///
+/// Returns the number of rows written.
+pub(crate) fn checkpoint_to_sqlite(c: &mut Sqlite3) -> Result<u64, String> {
+    let Some(src) = c.sqlite_source.clone() else {
+        return Err("this database was not opened from a sqlite file — nothing to check point \
+                    back into"
+            .into());
+    };
+
+    let _ = c.db.refresh_schema_if_stale();
+    let bundle = c.db.schema();
+    let mut tables: Vec<mpedb_sqlitefmt::ImageTable> = Vec::new();
+    let mut total = 0u64;
+
+    for t in bundle.tables.iter().filter(|t| !t.dead && t.name != crate::SEED_TABLE) {
+        // The CREATE text is rebuilt from the live schema rather than kept
+        // from the import: the sidecar is writable, so the schema now is the
+        // truth, and a remembered string would go stale the first time someone
+        // ran DDL against it.
+        let cols: Vec<String> = t
+            .columns
+            .iter()
+            .map(|col| {
+                let q = col.name.replace('"', "\"\"");
+                match col.decltype() {
+                    Some(d) if !d.is_empty() => format!("\"{q}\" {d}"),
+                    _ => format!("\"{q}\""),
+                }
+            })
+            .collect();
+        let sql =
+            format!("CREATE TABLE \"{}\" ({})", t.name.replace('"', "\"\""), cols.join(", "));
+
+        // Indexes come from the live schema too. A partial index is refused
+        // by name rather than written whole: an index sqlite believes covers
+        // the table but only holds part of it would answer with missing rows.
+        let mut indexes = Vec::new();
+        for ix in &t.indexes {
+            let Some(name) = ix.name.clone() else {
+                // Derived from a column flag; it never had a name to write a
+                // CREATE INDEX with, and sqlite would name its own differently.
+                continue;
+            };
+            if ix.predicate.is_some() {
+                return Err(format!(
+                    "index `{name}` on `{}` is a partial index — this writer cannot carry \
+                     the WHERE clause, and writing it whole would claim rows it does not hold",
+                    t.name
+                ));
+            }
+            let cols: Vec<String> = ix
+                .columns
+                .iter()
+                .filter_map(|c| t.columns.get(*c as usize))
+                .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
+                .collect();
+            if cols.len() != ix.columns.len() {
+                return Err(format!("index `{name}` on `{}`: unresolved key column", t.name));
+            }
+            let unique = if ix.unique { "UNIQUE " } else { "" };
+            indexes.push(mpedb_sqlitefmt::ImageIndex {
+                sql: format!(
+                    "CREATE {unique}INDEX \"{}\" ON \"{}\" ({})",
+                    name.replace('"', "\"\""),
+                    t.name.replace('"', "\"\""),
+                    cols.join(", ")
+                ),
+                name,
+                columns: ix.columns.iter().map(|c| *c as usize).collect(),
+            });
+        }
+
+        let quoted = t.name.replace('"', "\"\"");
+        let rows = match c.db.query(&format!("SELECT * FROM \"{quoted}\""), &[]) {
+            Ok(mpedb::ExecResult::Rows { rows, .. }) => rows,
+            Ok(_) => Vec::new(),
+            Err(e) => return Err(format!("reading `{}`: {e}", t.name)),
+        };
+        total += rows.len() as u64;
+        let rows = rows
+            .into_iter()
+            .map(|r| r.into_iter().map(to_sqlite_value).collect::<Result<Vec<_>, _>>())
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|e| format!("table `{}`: {e}", t.name))?;
+        tables.push(mpedb_sqlitefmt::ImageTable { name: t.name.clone(), sql, rows, indexes });
+    }
+
+    let img = mpedb_sqlitefmt::write_image(&tables, 4096)
+        .map_err(|e| format!("building the sqlite image: {e}"))?;
+
+    let staging = {
+        let mut p = src.as_os_str().to_os_string();
+        p.push(".checkpointing");
+        PathBuf::from(p)
+    };
+    std::fs::write(&staging, &img).map_err(|e| {
+        let _ = std::fs::remove_file(&staging);
+        format!("writing `{}`: {e}", staging.display())
+    })?;
+    std::fs::rename(&staging, &src).map_err(|e| {
+        let _ = std::fs::remove_file(&staging);
+        format!("replacing `{}`: {e}", src.display())
+    })?;
+
+    // The sidecar is now OLDER than the source it just produced, which is
+    // exactly the condition that triggers a re-import on the next open. Touch
+    // it forward so a checkpoint does not cost a full re-import afterwards.
+    let now = std::time::SystemTime::now();
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&c.path) {
+        let _ = f.set_modified(now);
+    }
+    Ok(total)
+}
+
+/// The `.mpedb` that mirrors a sqlite file, and the import that fills it.
+///
+/// Returns the sidecar path, ready to open. It is rebuilt when the sqlite file
+/// is newer than it — the coarse check, since without mirror's triggers there
+/// is nothing finer to go on — and reused untouched otherwise. A rebuild is a
+/// full re-import, so an edit to the source costs one import on the next open,
+/// not on every statement.
+///
+/// The import goes to a temporary name and is renamed into place at the end,
+/// so an interrupted one leaves no half-filled sidecar for the next open to
+/// mistake for a complete one.
+fn sqlite_sidecar(src: &Path) -> Result<PathBuf, String> {
+    let mut side = src.as_os_str().to_os_string();
+    side.push(".mpedb");
+    let side = PathBuf::from(side);
+
+    let src_time = std::fs::metadata(src).and_then(|m| m.modified()).ok();
+    let side_time = std::fs::metadata(&side).and_then(|m| m.modified()).ok();
+    let fresh = match (src_time, side_time) {
+        (Some(a), Some(b)) => b >= a,
+        // No sidecar yet, or a clock that will not answer: import.
+        _ => false,
+    };
+    if side.exists() && fresh {
+        return Ok(side);
+    }
+
+    let staging = {
+        let mut p = side.as_os_str().to_os_string();
+        p.push(".importing");
+        PathBuf::from(p)
+    };
+    let _ = std::fs::remove_file(&staging);
+    // Size the sidecar from the source. mpedb preallocates, so this has to be
+    // decided up front: 4x the sqlite file plus 32 MiB of slack, since mpedb's
+    // per-row layout is not sqlite's and an import that runs out of space
+    // fails the open rather than growing. Generous on purpose — the file is
+    // sparse until written, so the cost of overshooting is address space, not
+    // disk.
+    let src_mb = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0) / (1024 * 1024);
+    let size_mb = (src_mb * 4 + 32).max(16);
+    let (db, tmp) = open_blank_database_sized(size_mb).map_err(|e| {
+        format!("unable to open database file: cannot stage `{}`: {e}", side.display())
+    })?;
+    let out = import_sqlite_file(src, &db).map_err(|e| {
+        format!("unable to open database file: cannot import `{}`: {e}", src.display())
+    });
+    drop(db);
+    if let Err(e) = out {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // The staged database was created wherever ephemeral files live, which is
+    // routinely a different filesystem from the sqlite file (/tmp or /dev/shm
+    // vs the data directory). rename cannot cross that boundary — EXDEV — so
+    // fall back to a copy, still landing on the final name through a rename
+    // within the destination directory so no partial sidecar is ever visible.
+    let placed = std::fs::rename(&tmp, &staging).or_else(|e| {
+        if e.raw_os_error() == Some(libc::EXDEV) {
+            std::fs::copy(&tmp, &staging).map(|_| ())
+        } else {
+            Err(e)
+        }
+    });
+    let placed = placed.and_then(|()| std::fs::rename(&staging, &side));
+    let _ = std::fs::remove_file(&tmp);
+    placed.map_err(|e| {
+        let _ = std::fs::remove_file(&staging);
+        format!("unable to open database file: cannot place `{}`: {e}", side.display())
+    })?;
+    Ok(side)
+}
+
+pub(crate) const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// Does `path` hold a sqlite database? Decided by the magic, never by the
+/// extension — a sqlite file is routinely called `.db`, `.sqlite` or nothing
+/// at all, and an mpedb file is just as often called `.db`.
+pub(crate) fn is_sqlite_file(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut m = [0u8; 16];
+    f.read_exact(&mut m).is_ok() && &m == SQLITE_MAGIC
+}
+
+/// Read a sqlite database with the native reader and re-create it inside an
+/// already-open mpedb database: each table declared, then its rows inserted.
+///
+/// The reader is `mpedb-sqlitefmt`, pure Rust. That is not a preference — this
+/// crate EXPORTS the `sqlite3_*` symbols, so it can never link a real sqlite
+/// (nor `mpedb-mirror`, which pulls one in through rusqlite). Whatever this
+/// shim knows about the sqlite file format, it knows on its own.
+pub(crate) fn import_sqlite_file(src: &Path, dest: &Database) -> Result<u64, String> {
+    let f = mpedb_sqlitefmt::SqliteFile::open(src).map_err(|e| format!("{e}"))?;
+    let tables = f.tables().map_err(|e| format!("{e}"))?;
+    let mut rows = 0u64;
+    for t in &tables {
+        let cols: Vec<String> = t
+            .columns
+            .iter()
+            .zip(&t.decl_types)
+            .map(|(n, d)| {
+                let q = n.replace('"', "\"\"");
+                if d.is_empty() {
+                    format!("\"{q}\"")
+                } else {
+                    format!("\"{q}\" {d}")
+                }
+            })
+            .collect();
+        let create =
+            format!("CREATE TABLE \"{}\" ({})", t.name.replace('"', "\"\""), cols.join(", "));
+        dest.query(&create, &[]).map_err(|e| format!("{e}"))?;
+        let placeholders: Vec<String> = (1..=t.columns.len()).map(|i| format!("${i}")).collect();
+        let ins = format!(
+            "INSERT INTO \"{}\" VALUES ({})",
+            t.name.replace('"', "\"\""),
+            placeholders.join(", ")
+        );
+        let mut failed = None;
+        f.scan_table(t, &mut |_rowid, vals| {
+            let params: Vec<Value> = vals
+                .into_iter()
+                .map(|v| match v {
+                    mpedb_sqlitefmt::Value::Null => Value::Null,
+                    mpedb_sqlitefmt::Value::Int(i) => Value::Int(i),
+                    mpedb_sqlitefmt::Value::Float(x) => Value::Float(x),
+                    mpedb_sqlitefmt::Value::Text(s) => Value::Text(s),
+                    mpedb_sqlitefmt::Value::Blob(b) => Value::Blob(b),
+                })
+                .collect();
+            if let Err(e) = dest.query(&ins, &params) {
+                if failed.is_none() {
+                    failed = Some(format!("{e}"));
+                }
+            } else {
+                rows += 1;
+            }
+            Ok(())
+        })
+        .map_err(|e| format!("{e}"))?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+    }
+
+    // Indexes LAST, after the rows: building one index over a filled table is
+    // one sort, where maintaining it across every insert is a b-tree update
+    // per row. Skipping them entirely was measured on the 944 457-row track
+    // database — the query fell back to a full scan and took 469 ms against
+    // sqlite's 122 ms, and the import is pointless if what comes out cannot be
+    // queried at the same speed.
+    //
+    // A failed index is NOT fatal. The data is already correct and queryable;
+    // an index sqlite accepts but mpedb's parser does not (a partial index, an
+    // expression index) should cost speed, not the whole open.
+    for (_name, sql) in f.indexes().map_err(|e| format!("{e}"))? {
+        let _ = dest.query(&sql, &[]);
+    }
+    Ok(rows)
+}
+
 pub(crate) fn open_blank_database() -> Result<(Database, PathBuf), String> {
+    open_blank_database_sized(16)
+}
+
+/// A blank database of a chosen size in MiB.
+///
+/// mpedb files are preallocated, so the size has to be decided before the
+/// first row goes in — too small and the import stops with "database is out of
+/// space" partway through, which is what a fixed 16 MiB did to a 148 MB sqlite
+/// file.
+pub(crate) fn open_blank_database_sized(size_mb: u64) -> Result<(Database, PathBuf), String> {
     let path = ephemeral_path();
     let _ = std::fs::remove_file(&path);
-    let mut cfg =
-        Config::from_toml_str(&seed_toml(&path, 16)).map_err(|e| format!("config error: {e}"))?;
+    let mut cfg = Config::from_toml_str(&seed_toml(&path, size_mb))
+        .map_err(|e| format!("config error: {e}"))?;
     cfg.options.path = path.clone();
     match Database::open_with_config(cfg) {
         Ok(db) => Ok((db, path)),
@@ -314,7 +668,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
     // it — reserve, don't grow); otherwise a small default. Only meaningful for a
     // NEW file; an existing one keeps the geometry it was created with.
     let req = requested_size_mb(filename);
-    let (path, kind, size_mb) = match target {
+    let (mut path, kind, size_mb) = match target {
         // Ephemeral / named-memory used to default to 1 MiB, to make CPython's
         // `test_backup.test_progress` report a small step count. That was a
         // global default tuned to flatter ONE test, and it was measured to cost
@@ -339,7 +693,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
     // A named in-memory database starts empty on its FIRST open in this
     // process and is attached (not recreated) by every later one.
     let fresh_memory = matches!(kind, Backing::NamedMemory) && named_memory_acquire(&path);
-    let exists = match kind {
+    let mut exists = match kind {
         Backing::Ephemeral => false,
         Backing::NamedMemory => {
             if fresh_memory {
@@ -352,6 +706,35 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
     if matches!(kind, Backing::Ephemeral) {
         let _ = std::fs::remove_file(&path);
     }
+    // A SQLITE file opened by path. mpedb's own reader cannot make sense of
+    // one — it would report "database file is not initialized (READY marker
+    // absent)", which is true and useless — so the file is imported into a
+    // SIDECAR `<path>.mpedb` and that is what gets opened. Same shape the CLI
+    // uses for `mpedb data.db`, with one difference forced by this crate: the
+    // CLI keeps the sidecar in step through mpedb-mirror's change tracking,
+    // and mirror links a real sqlite through rusqlite, which a library that
+    // EXPORTS sqlite3_* can never do. So the sidecar here is refreshed by
+    // re-import whenever the source is newer, and never pushed back.
+    //
+    // What that means for a caller, stated plainly because it is the sharp
+    // edge: reads see the sqlite data, writes land in the sidecar, and the
+    // sqlite file itself is left exactly as it was found.
+    let mut sqlite_source = None;
+    if matches!(kind, Backing::File) && exists && is_sqlite_file(&path) {
+        match sqlite_sidecar(&path) {
+            Ok(side) => {
+                sqlite_source = Some(std::mem::replace(&mut path, side));
+                exists = true;
+            }
+            Err(msg) => {
+                if matches!(kind, Backing::NamedMemory) {
+                    named_memory_release(&path);
+                }
+                return Err((SQLITE_CANTOPEN, msg));
+            }
+        }
+    }
+
     let attach = || -> Result<Database, (c_int, String)> {
         if exists {
             // Attach an existing mpedb file config-free (reads its stored schema).
@@ -411,6 +794,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         txn: None,
         db,
         path,
+        sqlite_source,
         backing: kind,
         busy_timeout_ms: 0,
         echo_pragmas: introspect::EchoPragmas::default(),
