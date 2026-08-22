@@ -939,7 +939,8 @@ fn try_count_only(
     let (lo, hi) = match access {
         AccessPath::FullScan => (None, None),
         AccessPath::PkRange { lo, hi } => {
-            match gather::range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+            match gather::range_bounds(lo.as_ref(), hi.as_ref(), plan, params,
+                ctx.key_col_types(table, 0).as_deref())? {
                 // A NULL bound makes the range predicate UNKNOWN for every
                 // row: zero rows, counted here exactly as the born-exhausted
                 // scan would have.
@@ -1171,7 +1172,8 @@ fn try_fused_fold(
     let (lo, hi) = match access {
         AccessPath::FullScan => (None, None),
         AccessPath::PkRange { lo, hi } => {
-            match gather::range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+            match gather::range_bounds(lo.as_ref(), hi.as_ref(), plan, params,
+                ctx.key_col_types(table, 0).as_deref())? {
                 // A NULL bound: UNKNOWN for every row, zero rows — the
                 // never-pushed accumulators below finish to the empty-fold
                 // answers (count 0, everything else NULL), no scan, no charge,

@@ -874,6 +874,25 @@ impl SchemaBundle {
         })
     }
 
+    /// The declared types of the key columns of `index_no` on `table_id`, in
+    /// key order — `index_no = 0` is the primary key.
+    ///
+    /// A caller that ENCODES a key bound needs these: the tree is keyed by the
+    /// column's own domain, and a bound in some other domain does not order
+    /// against it. `Text("59.05")` and `Float(59.05)` are eight different
+    /// bytes behind the same tag in `keycode`, so a text bound over a REAL
+    /// index sorts above every row and the scan matches nothing.
+    pub fn key_col_types(&self, table_id: u32, index_no: u32) -> Option<Vec<ColumnType>> {
+        let t = table_id as usize;
+        let types = self.col_types.get(t)?;
+        let cols: &[u16] = if index_no == 0 {
+            &self.schema.table(table_id)?.primary_key
+        } else {
+            self.sec_indexes.get(t)?.get(index_no as usize - 1)?
+        };
+        cols.iter().map(|c| types.get(*c as usize).copied()).collect()
+    }
+
     pub fn pk_coll(&self, table_id: u32) -> &[KeySpec] {
         let t = table_id as usize;
         if self.any_key_special.get(t).copied().unwrap_or(false) {

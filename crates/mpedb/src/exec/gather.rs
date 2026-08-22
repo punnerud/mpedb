@@ -1,5 +1,6 @@
 use super::*;
 use mpedb_types::Instr;
+use mpedb_types::ColumnType;
 use std::collections::HashMap;
 
 /// Live-cell accounting for a nested-loop join's materialized intermediate
@@ -1268,7 +1269,7 @@ pub(super) fn gather_rows(
             ctx.get_by_pk(table, &pk)?.into_iter().collect()
         }
         AccessPath::PkRange { lo, hi } => {
-            return match range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+            return match range_bounds(lo.as_ref(), hi.as_ref(), plan, params, ctx.key_col_types(table, 0).as_deref())? {
                 // A NULL bound makes the range predicate UNKNOWN for every
                 // row: no matches.
                 None => Ok(Vec::new()),
@@ -1312,7 +1313,8 @@ pub(super) fn gather_rows(
             }
         }
         AccessPath::IndexRange { index_no, lo, hi } => {
-            match range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+            let kt = ctx.key_col_types(table, *index_no);
+            match range_bounds(lo.as_ref(), hi.as_ref(), plan, params, kt.as_deref())? {
                 // A NULL bound makes the range predicate UNKNOWN: no matches.
                 None => Vec::new(),
                 // The same prefix-bound construction as a composite-PK range
@@ -1515,7 +1517,7 @@ impl BatchScan {
         let (lo, hi, empty) = match access {
             AccessPath::FullScan => (None, None, false),
             AccessPath::PkRange { lo, hi } => {
-                match range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+                match range_bounds(lo.as_ref(), hi.as_ref(), plan, params, ctx.key_col_types(table, 0).as_deref())? {
                     // A NULL bound makes the range predicate UNKNOWN for every
                     // row: a valid scan that is born exhausted, NOT a refusal
                     // to stream (which would re-materialize for nothing).
@@ -1631,22 +1633,53 @@ pub(crate) type RawBound = (Vec<u8>, bool);
 /// (v, x) — including ones extending it with further PK columns.
 ///
 /// Returns `Ok(None)` when any bound part resolves to NULL (empty result).
+/// Raw-encoded key bounds for a range access path, with the key columns'
+/// declared types so a bound lands in the column's OWN domain.
+///
+/// A bound is not a comparison: it is a KEY, and `keycode` gives every type its
+/// own image. `Text("59.05")` and `Float(59.05)` are eight different bytes
+/// behind the same tag, and text orders above every number — so a text bound
+/// over a REAL index sorts past the whole tree and the scan matches nothing.
+///
+/// That is not hypothetical. PDO binds every `execute([...])` parameter as
+/// TEXT, and the binder deliberately leaves an ORDERED comparison's parameter
+/// unpinned (`cmp.rs`: equality pins so `WHERE id = ?` stays a point probe;
+/// inequality stays free so `year >= 1942.1` compares exactly). The residual
+/// filter handles that correctly — it applies affinity, as sqlite does — but
+/// the bound built from the same predicate kept the raw text, and
+/// `lat BETWEEN ? AND ?` answered ZERO ROWS where 45 915 exist.
+///
+/// The rule is the one an index bound always follows: **convert exactly, or
+/// widen.** A value that reaches its column's domain losslessly is used; one
+/// that cannot is DROPPED, leaving that side unbounded, because the residual
+/// filter still decides every row. Narrowing on a guess would lose rows;
+/// widening only costs a scan.
 pub(crate) fn range_bounds(
     lo: Option<&KeyBound>,
     hi: Option<&KeyBound>,
     plan: &CompiledPlan,
     params: &[Value],
+    key_types: Option<&[ColumnType]>,
 ) -> Result<Option<(Option<RawBound>, Option<RawBound>)>> {
+    // `None` = this part could not be put in the column's domain, so the whole
+    // bound is dropped rather than encoded wrong.
     let resolve = |b: &KeyBound| -> Result<Option<Vec<Value>>> {
         if b.parts.is_empty() {
             return Err(internal("range bound"));
         }
         let mut vs = Vec::with_capacity(b.parts.len());
-        for part in &b.parts {
+        for (i, part) in b.parts.iter().enumerate() {
             let v = resolve_part(part, plan, params)?;
             if v.is_null() {
                 return Ok(None);
             }
+            let v = match key_types.and_then(|t| t.get(i)) {
+                Some(&t) => match to_key_domain(v, t) {
+                    Some(v) => v,
+                    None => return Ok(None),
+                },
+                None => v,
+            };
             vs.push(v);
         }
         Ok(Some(vs))
@@ -1676,6 +1709,32 @@ pub(crate) fn range_bounds(
     Ok(Some((lo_k, hi_k)))
 }
 
+/// `v` in `t`'s domain, or `None` when it cannot get there losslessly.
+///
+/// This is sqlite's comparison affinity, not a cast: `'12'` against an int
+/// column is 12, but `'abc'` is NOT 0. A cast would make `lat >= 'abc'` mean
+/// `lat >= 0` and match most of the table; affinity leaves the text alone, and
+/// here that means we have no key bound to offer and say so.
+fn to_key_domain(v: Value, t: ColumnType) -> Option<Value> {
+    if v.fits(t) {
+        return Some(v);
+    }
+    match (v, t) {
+        (Value::Text(s), ColumnType::Int64) => s.trim().parse::<i64>().ok().map(Value::Int),
+        (Value::Text(s), ColumnType::Float64) => s.trim().parse::<f64>().ok().and_then(|f| {
+            f.is_finite().then_some(Value::Float(f))
+        }),
+        // An exact int/float bridge, the same one `coerce_params` makes.
+        (Value::Int(n), ColumnType::Float64) => {
+            mpedb_types::exact_int_as_float(n).map(Value::Float)
+        }
+        (Value::Float(f), ColumnType::Int64) => {
+            mpedb_types::exact_float_as_int(f).map(Value::Int)
+        }
+        _ => None,
+    }
+}
+
 fn prefix_hi(vs: &[Value]) -> Vec<u8> {
     let mut k = keycode::encode_key(vs);
     k.push(0xFF);
@@ -1702,7 +1761,7 @@ pub(super) fn gather_topk(
     check_order_colls(order_by, ctx.host_colls())?;
     match access {
         AccessPath::PkRange { lo, hi } => {
-            match range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+            match range_bounds(lo.as_ref(), hi.as_ref(), plan, params, ctx.key_col_types(table, 0).as_deref())? {
                 None => Ok(Vec::new()),
                 Some((lo_k, hi_k)) => ctx.scan_rows_topk(
                     table,

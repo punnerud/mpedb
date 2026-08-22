@@ -649,6 +649,13 @@ impl ReadTxn<'_> {
         })
     }
 
+    /// The key columns' declared types for `index_no` — see
+    /// [`SchemaBundle::key_col_types`]. What a caller building a key bound
+    /// needs in order to put the bound in the column's own domain.
+    pub fn key_col_types(&self, table_id: u32, index_no: u32) -> Option<Vec<ColumnType>> {
+        self.bundle.key_col_types(table_id, index_no)
+    }
+
     /// Range scan with raw encoded-key bounds (the SQL executor needs prefix
     /// semantics on composite PKs that value-level bounds cannot express).
     pub fn scan_raw(

@@ -102,6 +102,17 @@ pub(crate) trait TxnCtx {
     fn snapshot_txn(&self) -> Option<&ReadTxn<'_>> {
         None
     }
+
+    /// The declared types of `index_no`'s key columns (`0` = the primary key),
+    /// for a caller that is about to ENCODE a key bound.
+    ///
+    /// `None` means "cannot say", and the caller must then encode the value as
+    /// it stands — the behaviour before this existed. It is not a safe answer,
+    /// only an honest one: a context that wraps another should delegate rather
+    /// than accept the default.
+    fn key_col_types(&self, _table: u32, _index_no: u32) -> Option<Vec<mpedb_types::ColumnType>> {
+        self.snapshot_txn().and_then(|t| t.key_col_types(_table, _index_no))
+    }
     /// The PKs of existing rows the proposed `row` collides with on a
     /// SECONDARY UNIQUE constraint — `INSERT OR REPLACE`'s victims beyond the
     /// PK's own (#169).

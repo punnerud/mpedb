@@ -1730,6 +1730,18 @@ impl<'e> WriteTxn<'e> {
         Ok(out)
     }
 
+    /// The key columns' declared types for `index_no` — see
+    /// [`crate::SchemaBundle::key_col_types`]. Writers need it for the same
+    /// reason readers do: an UPDATE or DELETE with a range predicate builds
+    /// the same key bounds a SELECT does.
+    pub fn key_col_types(
+        &self,
+        table_id: u32,
+        index_no: u32,
+    ) -> Option<Vec<mpedb_types::ColumnType>> {
+        self.bundle.key_col_types(table_id, index_no)
+    }
+
     pub fn row_count(&mut self, table_id: u32) -> Result<u64> {
         self.tree_root(table_id, 0).map(|(_, c)| c)
     }

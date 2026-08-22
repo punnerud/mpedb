@@ -203,7 +203,8 @@ impl<'db> RowStream<'db> {
         match access {
             AccessPath::FullScan => {}
             AccessPath::PkRange { lo, hi } => {
-                match range_bounds(lo.as_ref(), hi.as_ref(), &plan, params)? {
+                match range_bounds(lo.as_ref(), hi.as_ref(), &plan, params,
+                    schema.key_col_types(table, 0).as_deref())? {
                     // A NULL bound: the range predicate is UNKNOWN for every
                     // row — the stream is born exhausted.
                     None => return Ok(stream),
