@@ -178,11 +178,13 @@ fn which_range_spelling_pins_its_parameter() {
     );
     assert_eq!((between, spelled), (11, 11), "both spellings of the same range");
 
-    // The one-sided form answers 20 — every row — where the numeric reading is
-    // 16. Not asserted here because it is a THIRD number, neither the correct
-    // 16 nor the all-text-sorts-high 0, and a test should not pin behaviour
-    // nobody has explained. Whoever fixes the pinning should find out what this
-    // path does and give it its own case.
+    // The one-sided form was the loose end when this test was written: it
+    // answered 20 — every row — where the numeric reading is 16 and the
+    // all-text-sorts-high reading is 0, a third number nobody could explain,
+    // so it was left unasserted rather than pinned on a guess. The domain fix
+    // settled it: an unbounded-below range with a text `lo` had been dropping
+    // its bound and keeping none, which is every row. It is 16 now, and
+    // asserted.
     let one_sided = n_of(d.query("SELECT COUNT(*) FROM t WHERE lat >= $1", &p[..1]).unwrap());
-    assert!(one_sided > 0, "for the record, it currently answers {one_sided}");
+    assert_eq!(one_sided, 16, "lat >= 59.05 over 59.01..59.20");
 }

@@ -1,10 +1,37 @@
 # DESIGN-COLUMNAR — model-driven column segments, priced by MPEE (design)
 
-**Status: design only. No code written.** This is the design document the
-"columnar storage" task requires before implementation + review, in the
-discipline of DESIGN-TRIGGERS and DESIGN-MPEE-GENERAL. It settles the ONE hard
-question — coherence — before any storage code, because a stale column segment
-returns a **wrong answer**, not a mis-price.
+**Status: PARTLY IMPLEMENTED.** This began as the design document the
+"columnar storage" task required before implementation + review, in the
+discipline of DESIGN-TRIGGERS and DESIGN-MPEE-GENERAL, and it settles the ONE
+hard question — coherence — before any storage code, because a stale column
+segment returns a **wrong answer**, not a mis-price. That part still stands.
+
+What has since been built, in `crates/mpedb/src/colseg/` (~2 000 lines):
+
+* the block **encoder and decoder** with the `mod_gen` coherence stamp
+  (`encode_block` / `decode_block`), and the zone map (`zone.rs`);
+* the **read path, on the AGGREGATE side only** — `feed_from_segments`,
+  `feed_filtered_from_segments`, `feed_group_from_segments`,
+  `sum_f64_whole_table`, wired from `exec/aggregate.rs`. A fold over a
+  segmentable column uses segments when they cover the table at the current
+  generation, and falls back to the row path when they do not;
+* the **maintenance passes** as explicit API — `Database::compact_columns`,
+  `sync_columnar`, `columnar_maintenance_plan`, `maintain_columnar`,
+  `drop_column_segments`.
+
+What is NOT built, and matters to anyone planning from this document:
+
+* **row-returning scans never consult segments.** `SELECT a, b FROM t WHERE …`
+  reads whole records from the PK tree whatever segments exist, so §1's
+  "touched bytes" argument is only cashed in for aggregates;
+* **nothing builds segments automatically.** The passes are a Rust API; no
+  command, no trigger and no background task calls them, and they are not
+  reachable through the C-API shim. A database that nobody explicitly compacts
+  has no segments, and every read silently takes the row path.
+
+Measured consequence, on politihelikopter.com's 945 234-row track table:
+mpedb touches 225 MB of file pages to answer an area query that sqlite answers
+touching 37 MB, and the two gaps above are why.
 
 ## 1. Why — the gap is the storage model, measured
 
