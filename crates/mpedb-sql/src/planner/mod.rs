@@ -91,6 +91,7 @@ mod access;
 mod aggregate;
 mod derived;
 mod footprint;
+mod interval;
 mod fts;
 mod join;
 mod mpee;

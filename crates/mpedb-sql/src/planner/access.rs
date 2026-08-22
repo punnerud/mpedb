@@ -163,7 +163,7 @@ pub(super) fn extract_access(
             // An expression index is never an access path (see
             // `IndexDef::has_expression_part`): its key is a computed value, and
             // its ordinals carry a sentinel that would panic below.
-            if ix.has_expression_part() {
+            if !ix.usable_for_access() {
                 continue;
             }
 
@@ -318,7 +318,7 @@ pub(super) fn extract_access(
         // An expression index is never an access path (see
         // `IndexDef::has_expression_part`): its key is a computed value, and
         // its ordinals carry a sentinel that would panic below.
-        if ix.has_expression_part() {
+        if !ix.usable_for_access() {
             continue;
         }
 
@@ -368,9 +368,74 @@ pub(super) fn extract_access(
         }
     }
 
+    // 3.6 An ISLAND: a range no conjunct states, derived by arithmetic from
+    // one that does. `(lat-A)*(lat-A) + (lon-B)*(lon-B) < R*R` confines `lat`
+    // to `[A-R, A+R]` without ever writing a bound on `lat` — see
+    // `super::interval`, which computes it without recognizing the shape.
+    //
+    // Last of the index paths on purpose. Every rule above consumes its
+    // conjuncts and answers a predicate the query WROTE; this one answers a
+    // predicate it only IMPLIES, so it may not pre-empt an exact match. And
+    // nothing is consumed: the island is a superset, so the whole predicate
+    // stays as the residual filter and decides each row on its own.
+    for (pos, ix) in table.indexes.iter().enumerate() {
+        if pos >= 63 {
+            break; // beyond the footprint bitmap — never chosen
+        }
+        if !ix.usable_for_access() {
+            continue;
+        }
+        if ix.predicate.is_some() && !super::partial::index_usable(table, ix, &conjuncts) {
+            continue;
+        }
+        // Same prefix rule as the range path above: only the leading column,
+        // and only when the uncovered suffix cannot hide rows (membership).
+        let col = ix.columns[0];
+        if unbounded(col) || !suffix_not_null(ix, 1) {
+            continue;
+        }
+        let Some(iv) = super::interval::island(&conjuncts, col) else {
+            continue;
+        };
+        if iv.is_empty() {
+            // The predicate is unsatisfiable. Say so as an empty range rather
+            // than inventing a separate "no rows" path.
+            let residual = rebuild_residual(conjuncts, &consumed);
+            return Ok((
+                AccessPath::IndexRange {
+                    index_no: (pos + 1) as u32,
+                    lo: Some(bound_from(1.0, consts)?),
+                    hi: Some(bound_from(-1.0, consts)?),
+                },
+                residual,
+            ));
+        }
+        let lo = if iv.lo.is_finite() { Some(bound_from(iv.lo, consts)?) } else { None };
+        let hi = if iv.hi.is_finite() { Some(bound_from(iv.hi, consts)?) } else { None };
+        if lo.is_none() && hi.is_none() {
+            continue;
+        }
+        let residual = rebuild_residual(conjuncts, &consumed);
+        return Ok((
+            AccessPath::IndexRange { index_no: (pos + 1) as u32, lo, hi },
+            residual,
+        ));
+    }
+
     // 4. Full scan; the whole predicate stays as the filter.
     let residual = rebuild_residual(conjuncts, &consumed);
     Ok((AccessPath::FullScan, residual))
+}
+
+/// An island endpoint as an inclusive key bound. The interval is closed by
+/// construction (`interval::Iv`), which is why `inclusive` is always true:
+/// a strict predicate was already widened to a closed interval, and the
+/// residual filter rejects the boundary row if it does not belong.
+fn bound_from(v: f64, consts: &mut Vec<Value>) -> Result<KeyBound> {
+    Ok(KeyBound {
+        parts: vec![KeyPart::Const(push_plan_const(consts, Value::Float(v))?)],
+        inclusive: true,
+    })
 }
 
 /// Does this index's ENTRY carry the whole row — its own key columns plus the
