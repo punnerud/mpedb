@@ -122,7 +122,7 @@ pub(crate) fn record_flush(off: u64, bytes: &[u8]) -> Result<()> {
     let mut shadow = l.shadow.lock().unwrap_or_else(|e| e.into_inner());
     let mut rec = vec![EV_FLUSH, 0, 0, 0, 0];
     let mut count = 0u32;
-    for (i, page) in bytes.chunks_exact(PAGE_SIZE).enumerate() {
+    for (i, page) in bytes.as_chunks::<PAGE_SIZE>().0.iter().enumerate() {
         let id = off / PAGE_SIZE as u64 + i as u64;
         let h = xxhash_rust::xxh3::xxh3_64(page);
         if shadow.insert(id, h) == Some(h) {

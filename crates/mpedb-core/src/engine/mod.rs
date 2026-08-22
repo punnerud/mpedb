@@ -1473,8 +1473,8 @@ impl Engine {
                         )?);
                         continue;
                     }
-                    for ch in v.chunks_exact(8) {
-                        let id = u64::from_le_bytes(ch.try_into().unwrap());
+                    for ch in v.as_chunks::<8>().0 {
+                        let id = u64::from_le_bytes(*ch);
                         if !freelisted.insert(id) {
                             return Err(Error::Corrupt(format!(
                                 "page {id} listed twice in freelist"

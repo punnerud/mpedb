@@ -106,7 +106,7 @@ fn md5_hex(data: &[u8]) -> String {
     msg.extend_from_slice(&bitlen.to_le_bytes());
     let (mut a0, mut b0, mut c0, mut d0) =
         (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (j, w) in m.iter_mut().enumerate() {
             *w = u32::from_le_bytes(chunk[4 * j..4 * j + 4].try_into().unwrap());

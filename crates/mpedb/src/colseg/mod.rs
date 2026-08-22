@@ -249,8 +249,8 @@ impl Block<'_> {
             // Raw f64s: one contiguous scan.
             Codec::Raw64(p) => {
                 let bytes = p.get(..n * 8)?;
-                for chunk in bytes.chunks_exact(8) {
-                    *acc += f64::from_le_bytes(chunk.try_into().unwrap());
+                for chunk in bytes.as_chunks::<8>().0 {
+                    *acc += f64::from_le_bytes(*chunk);
                 }
             }
             // Low-cardinality (the common price/measure column): decode the

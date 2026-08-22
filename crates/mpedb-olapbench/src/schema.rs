@@ -62,7 +62,7 @@ pub fn fact_row(id: i64, rng: &mut Rng) -> Fact {
         store_id: rng.below(DIM_STORE as u64) as i64,
         qty: 1 + rng.below(20) as i64,
         // Two decimals, so float equality across engines is not luck.
-        amount: (rng.below(1_000_00) as f64) / 100.0,
+        amount: (rng.below(1_000 * 100) as f64) / 100.0,
     }
 }
 

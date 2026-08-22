@@ -797,8 +797,10 @@ fn try_exec_knn(
         return Ok(None);
     }
     let q: Vec<f64> = qb
-        .chunks_exact(4)
-        .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f64::from(f32::from_le_bytes(*c)))
         .collect();
 
     let keep = {
@@ -883,7 +885,7 @@ fn try_exec_knn(
         };
         let mut d2 = 0.0f64;
         let mut abandoned = false;
-        for (chunk, qv) in eb.chunks_exact(4).zip(&q) {
+        for (chunk, qv) in eb.as_chunks::<4>().0.iter().zip(&q) {
             let x = f64::from(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             let d = x - qv;
             d2 += d * d;

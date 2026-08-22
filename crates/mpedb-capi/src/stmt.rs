@@ -605,9 +605,7 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_index(p: *mut Stmt, name: *const
 pub unsafe extern "C" fn sqlite3_clear_bindings(p: *mut Stmt) -> c_int {
     match stmt(p) {
         Some(s) => {
-            for b in &mut s.binds {
-                *b = Value::Null;
-            }
+            s.binds.fill(Value::Null);
             SQLITE_OK
         }
         None => SQLITE_MISUSE,

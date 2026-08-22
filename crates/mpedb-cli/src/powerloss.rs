@@ -300,7 +300,9 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         // faithful model.)
         let preserved: Vec<(u64, u64)> = match std::fs::read(&sync_log) {
             Ok(bytes) => bytes
-                .chunks_exact(12)
+                .as_chunks::<12>()
+                .0
+                .iter()
                 .map(|ch| {
                     (
                         u64::from_le_bytes(ch[0..8].try_into().unwrap()),

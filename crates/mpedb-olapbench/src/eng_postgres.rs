@@ -126,7 +126,7 @@ impl Postgres {
             .args(["-w", "-t", "60", "-o", &opts, "start"]);
         run_cmd(start, "pg_ctl start")?;
 
-        let mut me = Postgres {
+        let me = Postgres {
             client: RefCell::new(Self::connect(&sockdir)?),
             datadir,
             sockdir,

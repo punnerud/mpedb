@@ -58,7 +58,7 @@ pub(super) fn decode_run_entry(
     }
     let mut runs = Vec::with_capacity(val.len() / 12);
     let mut prev_end = 0u64;
-    for ch in val.chunks_exact(12) {
+    for ch in val.as_chunks::<12>().0 {
         let start = u64::from_le_bytes(ch[0..8].try_into().unwrap());
         let npages = u32::from_le_bytes(ch[8..12].try_into().unwrap());
         if npages == 0 {

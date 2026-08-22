@@ -541,9 +541,7 @@ fn vec_arg(f: ScalarFn, pos: u8, v: &Value) -> Result<Vec<f32>> {
             b.len()
         )));
     }
-    Ok(b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    Ok(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
 }
 
 pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {

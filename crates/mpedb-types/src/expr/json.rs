@@ -1160,7 +1160,7 @@ pub(super) fn json_object(args: &[Value]) -> Result<Value> {
         ));
     }
     let mut out = String::from("{");
-    for (k, pair) in rest.chunks_exact(2).enumerate() {
+    for (k, pair) in rest.as_chunks::<2>().0.iter().enumerate() {
         if k > 0 {
             out.push(',');
         }
@@ -1279,7 +1279,7 @@ fn json_edit(mode: Edit, args: &[Value], name: &str) -> Result<Value> {
         )));
     }
     let mut doc = own(parse(s)?);
-    for (k, pair) in rest.chunks_exact(2).enumerate() {
+    for (k, pair) in rest.as_chunks::<2>().0.iter().enumerate() {
         if pair[0].is_null() {
             continue;
         }

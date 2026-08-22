@@ -434,8 +434,8 @@ impl<'e> WriteTxn<'e> {
         // zero-fill meta/lock/reader pages (page_mut_unchecked only
         // bounds-checks the upper end).
         let mut ids = Vec::with_capacity(val.len() / 8);
-        for chunk in val.chunks_exact(8) {
-            let id = u64::from_le_bytes(chunk.try_into().unwrap());
+        for chunk in val.as_chunks::<8>().0 {
+            let id = u64::from_le_bytes(*chunk);
             if id < self.eng.shm.data_start || id >= self.eng.shm.page_count {
                 return Err(Error::Corrupt(format!(
                     "freelist lists page {id} outside the data region"
