@@ -909,6 +909,56 @@ pub(super) fn plan_select<'s>(
         order_by.clear();
     }
 
+    // The same reasoning one tree over. An index access delivers INDEX order —
+    // the key columns in order, then the pk within one key — which is why the
+    // guard above excludes it wholesale. But an equality-pinned PREFIX makes
+    // every row the scan yields agree on those columns, so what is left IS the
+    // index's next key columns, in order. `WHERE hex = ? ORDER BY ts` over
+    // `(hex, ts)` is scan order exactly as `run_id = $1 … ORDER BY pk_enc` is.
+    //
+    // Measured on politihelikopter.com before this: that query sorted 338 887
+    // rows to return twenty — 403 ms and 483 MB peak, against sqlite's 1,5 ms,
+    // because sqlite reads twenty index entries and stops. Eliding the sort is
+    // also what lets the LIMIT reach the scan at all (`gather.rs`: a cap cannot
+    // pass through a sort), so the two costs are one fix.
+    //
+    // Every condition below is a way the key can fail to BE the value's order:
+    // a folded collation, a class-encoded `any`, an expression key, DESC, a
+    // non-default NULL placement. Any of them and the sort stays.
+    let index_pinned = match &access {
+        AccessPath::IndexPoint { index_no, parts } if order_over == OrderOver::BaseRow => {
+            (*index_no as usize)
+                .checked_sub(1)
+                .and_then(|i| table.indexes.get(i))
+                .filter(|ix| ix.exprs.is_empty())
+                .map(|ix| (ix, parts.len()))
+        }
+        _ => None,
+    };
+    if let Some((ix, pinned)) = index_pinned {
+        if !order_by.is_empty()
+            && order_by.len() <= ix.columns.len().saturating_sub(pinned)
+            && order_by.iter().enumerate().all(|(k, (c, dir, coll))| {
+                ix.columns.get(pinned + k) == Some(c)
+                    && !dir.desc
+                    && dir.default_nulls()
+                    && coll.native() == Some(Collation::Binary)
+                    && table.columns.get(*c as usize).is_some_and(|cd| {
+                        cd.collation == Collation::Binary
+                            && cd.ty != ColumnType::Any
+                            // NOT NULL keeps the NULL placement moot. A row
+                            // with a NULL in an indexed column has no entry at
+                            // all, so it could be argued the question never
+                            // arises — but resting an elision on that is the
+                            // reasoning the PK arm above declines to make.
+                            && !cd.nullable
+                    })
+            })
+        {
+            order_by.clear();
+        }
+    }
+
     // A bare `Projection::Column(i)` takes its output name from the def the
     // EXECUTOR resolves, and for the series sentinel that is the STATIC one.
     // So whenever the column was renamed by an alias, the name has to travel in
