@@ -735,3 +735,63 @@ fn an_authorizer_does_not_rewrite_the_error_of_a_statement_that_cannot_compile()
         sqlite3_close(db);
     }
 }
+
+/// The authorizer must SEE an `ATTACH`, with the filename, and be able to
+/// refuse it.
+///
+/// This is not a message-shape nicety. PHP's sqlite3 extension registers an
+/// authorizer on every connection for one purpose: `SQLITE_ATTACH` carries the
+/// path as arg1, and `open_basedir` is enforced by denying the ones that
+/// escape it. The shim described no action for ATTACH at all, so the gate that
+/// exists to make that decision was never asked — safe only by accident,
+/// because the surrounding refusal happened to reject every ATTACH while an
+/// authorizer was registered. A consumer that would have ALLOWED the attach
+/// could not, and one that relies on denying it was relying on a check that
+/// was not running.
+#[test]
+fn an_authorizer_sees_attach_with_its_filename_and_can_deny_it() {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Mutex;
+
+    static SEEN: AtomicI32 = AtomicI32::new(-1);
+    static ARG1: Mutex<String> = Mutex::new(String::new());
+
+    unsafe extern "C" fn deny_attach(
+        _ctx: *mut c_void,
+        action: c_int,
+        a1: *const c_char,
+        _a2: *const c_char,
+        _a3: *const c_char,
+        _a4: *const c_char,
+    ) -> c_int {
+        if action == 24 {
+            SEEN.store(action, Ordering::SeqCst);
+            if !a1.is_null() {
+                *ARG1.lock().unwrap() = CStr::from_ptr(a1).to_string_lossy().into_owned();
+            }
+            return SQLITE_DENY;
+        }
+        SQLITE_OK
+    }
+
+    unsafe {
+        let db = open_memory();
+        assert_eq!(sqlite3_set_authorizer(db, deny_attach as *mut c_void, ptr::null_mut()), SQLITE_OK);
+
+        let sql = cs("ATTACH 'file:..%2ffoo.php' as db2");
+        let mut st: *mut Stmt = ptr::null_mut();
+        let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut());
+
+        assert_eq!(SEEN.load(Ordering::SeqCst), 24, "SQLITE_ATTACH was never raised");
+        assert_eq!(
+            *ARG1.lock().unwrap(),
+            "file:..%2ffoo.php",
+            "the authorizer must be given the PATH — it is what open_basedir is checked against"
+        );
+        assert_eq!(rc, SQLITE_AUTH);
+        let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy().into_owned();
+        assert_eq!(msg, "not authorized", "sqlite's wording for a denial that is not a column read");
+
+        sqlite3_close(db);
+    }
+}

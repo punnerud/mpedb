@@ -36,7 +36,6 @@ ext/sqlite3/tests/sqlite3_trampoline_create_collation.phpt
 #   rigid typing: mpedb REFUSES a comparison sqlite coerces. Loud, not silent.
 ext/sqlite3/tests/bug73068.phpt
 ext/sqlite3/tests/bug73333.phpt
-ext/sqlite3/tests/bug81742.phpt
 ext/sqlite3/tests/gh20699.phpt
 ext/pdo_sqlite/tests/bug_71885.phpt
 ext/pdo_sqlite/tests/bug_72368.phpt

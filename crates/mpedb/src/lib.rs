@@ -147,7 +147,7 @@ pub use exec::take_last_insert_rowid;
 pub use fk::FkCheckRow;
 /// Re-exported for the C-API shim, which has to know whether a DDL statement
 /// targets the TEMP schema before it can file the statement's text there.
-pub use mpedb_sql::{rename_table_in_ddl, rewrite_temp_ddl};
+pub use mpedb_sql::{rename_table_in_ddl, rewrite_temp_ddl, AttachStmt};
 use mpedb_core::{CheckPrograms, Engine, SchemaPrograms, WriteTxn};
 use mpedb_sql::{CompiledPlan, HostUdfSet, PlanStmt};
 use registry::{decode_registry_plan, patched_last_used, plan_subkey};
@@ -1704,6 +1704,14 @@ impl Database {
     /// executed statement can never be two different plans. Any bind/plan error
     /// surfaces here just as it would at prepare. Nothing is executed and no
     /// plan is published.
+    /// What an `ATTACH`/`DETACH` names, parsed with this database's dialect and
+    /// nothing applied — the shim needs it to raise `SQLITE_ATTACH` /
+    /// `SQLITE_DETACH` for an authorizer, which is the gate PHP's `open_basedir`
+    /// enforcement runs through. `None` for any other statement.
+    pub fn attach_target(&self, sql: &str) -> Result<Option<AttachStmt>> {
+        mpedb_sql::parse_attach_dialect(sql, self.dialect)
+    }
+
     pub fn access_report(&self, sql: &str) -> Result<AccessReport> {
         // DDL compiles to no plan — the facade applies it against the catalog
         // directly — so it is described by its parse, not by a footprint.

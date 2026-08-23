@@ -59,6 +59,8 @@ pub const SQLITE_READ: c_int = 20;
 pub const SQLITE_SELECT: c_int = 21;
 pub const SQLITE_TRANSACTION: c_int = 22;
 pub const SQLITE_UPDATE: c_int = 23;
+pub const SQLITE_ATTACH: c_int = 24;
+pub const SQLITE_DETACH: c_int = 25;
 pub const SQLITE_ALTER_TABLE: c_int = 26;
 pub const SQLITE_DROP_VTABLE: c_int = 30;
 pub const SQLITE_CREATE_VTABLE: c_int = 29;
@@ -190,6 +192,28 @@ unsafe fn describe(c: &mut Sqlite3, stmt_sql: &str) -> Result<Vec<Call>, Refusal
         }
         Kind::RollbackTo => {
             return Ok(vec![one(SQLITE_SAVEPOINT, Some("ROLLBACK"), Some(&savepoint_name(text)))])
+        }
+        // ATTACH and DETACH are the reason several consumers register an
+        // authorizer at all. PHP's sqlite3 extension installs one on every
+        // connection for exactly this action: SQLITE_ATTACH carries the
+        // FILENAME as arg1, and `open_basedir` is enforced by denying paths
+        // that escape it (bug81742 is that test). The shim used to refuse
+        // ATTACH outright whenever an authorizer was registered, which is safe
+        // but silent — the gate that exists to make this decision was never
+        // asked, and a caller who would have ALLOWED the attach could not.
+        //
+        // sqlite passes the filename for ATTACH and the schema name for
+        // DETACH. An ATTACH we cannot parse gets no action and falls through
+        // to the compile path, where it fails as it always has.
+        Kind::Ddl => {
+            if let Ok(Some(st)) = c.db.attach_target(text) {
+                return Ok(vec![match st {
+                    mpedb::AttachStmt::Attach { path, .. } => {
+                        one(SQLITE_ATTACH, Some(&path), None)
+                    }
+                    mpedb::AttachStmt::Detach { name } => one(SQLITE_DETACH, Some(&name), None),
+                }]);
+            }
         }
         // VACUUM / ANALYZE are accepted no-ops: nothing is touched, so there
         // is nothing to authorize.
