@@ -23,7 +23,11 @@ find ext/pdo_sqlite/tests ext/sqlite3/tests ext/pdo/tests -name '*.diff' -delete
 
 # run-tests exits non-zero whenever any test fails, which is the expected case
 # under the shim. Its exit code carries nothing we do not read from the log.
-TEST_PHP_EXECUTABLE="$(which php)" php run-tests.php -q --offline \
+# --no-color: show_result() wraps every verdict in an ANSI escape, so a result
+# line does not begin with PASS/FAIL/SKIP but with \e[1;33m. Every grep below
+# depends on this flag; if a future run-tests drops it the run dies outright,
+# and dying is the correct outcome — the alternative is empty lists again.
+TEST_PHP_EXECUTABLE="$(which php)" php run-tests.php -q --offline --no-color \
   -p "$(which php)" ext/pdo_sqlite/tests ext/sqlite3/tests > "$LOG" 2>&1
 RC=$?
 STARTED=$(grep -c '^TEST ' "$LOG")
@@ -58,6 +62,19 @@ sed -n '/^FAILED TEST SUMMARY/,/^====/p' "$LOG" \
 # see whether the two runs judged the same set of tests.
 grep '^SKIP ' "$LOG" \
   | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_.-]+\.phpt' | sort -u > "${FAILS%.txt}-skipped.txt" || true
+
+# Check every list we derived against the count run-tests printed itself. A
+# pattern that matches nothing yields an empty file, and an empty file is
+# indistinguishable from good news — that mistake has now been made three
+# times in this one step, twice by the code written to prevent it. Parsing
+# MORE than reported is fine (a redirect parent is named alongside its
+# children); parsing fewer means the pattern missed, and the count is a lie.
+check() { # name reported parsed
+  echo "  $1: run-tests reported $2, parsed $3"
+  [ "$3" -ge "$2" ] || { echo "parsed fewer $1 than run-tests reported — the pattern missed"; exit 1; }
+}
+check failures "$(grep -m1 '^Tests failed' "$LOG" | awk '{print $4}')" "$(wc -l < "$FAILS")"
+check skips    "$(grep -m1 '^Tests skipped' "$LOG" | awk '{print $4}')" "$(wc -l < "${FAILS%.txt}-skipped.txt")"
 
 # grep exits 1 on no match, and under `pipefail` that becomes the script's
 # status: a perfectly clean run would report itself as a failure. The count
