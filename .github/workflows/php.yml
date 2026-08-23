@@ -293,6 +293,16 @@ jobs:
           echo "shim-only failures: $(wc -l < only.txt), known: $(wc -l < known.txt)"
           echo "known entries absent from this PHP's corpus (not judged): $ABSENT"
 
+          # Executed counts that differ between the two runs mean a test left
+          # the experiment rather than answering it. A skip prints as silence;
+          # say which one, so it cannot pass for agreement.
+          comm -13 base-skipped.txt shim-skipped.txt > skip-only.txt
+          if [ -s skip-only.txt ]; then
+            echo "--- skipped under the shim, executed under stock sqlite ---"
+            cat skip-only.txt
+            echo "(not judged either way — a skip is not a pass)"
+          fi
+
           NEW=$(comm -13 known.txt only.txt)
           FIXED=$(comm -23 known.txt only.txt)
           if [ -n "$FIXED" ]; then
