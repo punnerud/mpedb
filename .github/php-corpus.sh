@@ -30,6 +30,14 @@ find ext/pdo_sqlite/tests ext/sqlite3/tests ext/pdo/tests -name '*.diff' -delete
 TEST_PHP_EXECUTABLE="$(which php)" php run-tests.php -q --offline --no-color \
   -p "$(which php)" ext/pdo_sqlite/tests ext/sqlite3/tests > "$LOG" 2>&1
 RC=$?
+
+# run-tests draws its progress with a CARRIAGE RETURN, so "TEST 22/133 [...]"
+# and the verdict that overwrites it are one physical line: SKIP and FAIL never
+# start a line, they follow a \r. GitHub's log viewer renders that as a break,
+# which is why the log looked line-per-result while '^SKIP ' matched nothing.
+# Normalise once, here, so every pattern below reads what the file contains.
+tr '\r' '\n' < "$LOG" > "$LOG.lines" && mv "$LOG.lines" "$LOG"
+
 STARTED=$(grep -c '^TEST ' "$LOG")
 echo "run-tests exit $RC after starting $STARTED tests"
 
