@@ -266,8 +266,21 @@ jobs:
       - name: …and the same corpus against the shim
         run: |
           set -e
-          SO=$(find target crates/mpedb-capi/target -name libmpedb_sqlite3.so | head -1)
+          SO=$(find target crates/mpedb-capi/target -name libmpedb_sqlite3.so 2>/dev/null | head -1)
+          test -n "$SO" || { echo "no libmpedb_sqlite3.so was built"; exit 1; }
           mkdir -p shimlib && ln -sf "$(realpath "$SO")" shimlib/libsqlite3.so.0
+          # PROVE the substitution took before trusting a single number from
+          # it. A broken symlink, a missing build, a soname that did not
+          # resolve — every one of those makes PHP quietly load the SYSTEM
+          # sqlite, and then the corpus run is identical to the baseline and
+          # reports zero shim-only failures. That is not a pass, it is the
+          # measurement not happening, and it read as a pass the first time
+          # this step ran.
+          MAPPED=$(LD_LIBRARY_PATH="$PWD/shimlib" php -r '
+            $m = @file_get_contents("/proc/self/maps") ?: "";
+            echo str_contains($m, "libmpedb_sqlite3") ? "mpedb" : "system";')
+          echo "PHP has mapped: $MAPPED"
+          test "$MAPPED" = "mpedb" || { echo "the shim did not load — refusing to report on it"; exit 1; }
           cd corpus
           find ext/pdo_sqlite/tests ext/sqlite3/tests -name '*.diff' -delete 2>/dev/null || true
           LD_LIBRARY_PATH="$PWD/../shimlib" TEST_PHP_EXECUTABLE="$(which php)" \
