@@ -51,4 +51,10 @@ fi
 # baseline reporting "Tests failed: 0" produced two failing test names, both of
 # them tests that are SUPPOSED to fail.
 sed -n '/^FAILED TEST SUMMARY/,/^====/p' "$LOG" \
-  | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_.-]+\.phpt' | sort -u > "$FAILS"
+  | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_.-]+\.phpt' | sort -u > "$FAILS" || true
+
+# grep exits 1 on no match, and under `pipefail` that becomes the script's
+# status: a perfectly clean run would report itself as a failure. The count
+# above is what says whether the run happened; an empty list here means zero
+# failures and nothing else.
+exit 0
