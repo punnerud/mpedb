@@ -282,7 +282,16 @@ fn expand_sql(exec_sql: &str, binds: &[Value]) -> String {
 pub unsafe extern "C" fn sqlite3_expanded_sql(p: *mut Stmt) -> *mut c_char {
     match stmt(p) {
         Some(s) => {
-            let out = expand_sql(&s.exec_sql, &s.binds);
+            // Expanded from `exec_sql`, the REWRITTEN form, because that is
+            // what the placeholder substitution is written against — named
+            // parameters have already been renumbered there. But sqlite
+            // expands the span it CONSUMED, terminator included, so the `;`
+            // that `sql` kept is put back afterwards rather than by expanding
+            // a string the substitution would not recognise.
+            let mut out = expand_sql(&s.exec_sql, &s.binds);
+            if s.sql.ends_with(';') && !out.ends_with(';') {
+                out.push(';');
+            }
             // sqlite subjects the expanded string to SQLITE_LIMIT_LENGTH and
             // answers NULL past it (CPython's trace path then falls back to
             // the unexpanded text).

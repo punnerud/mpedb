@@ -213,3 +213,78 @@ jobs:
             exit 1
           fi
           echo "stock sqlite accepts the checkpointed file"
+
+      # PHP's OWN sqlite corpus — 232 tests from php-src, the consumer's own
+      # expectations rather than ours.
+      #
+      # Why it earns its minute: every external suite mpedb had run (Django's
+      # 18 214, SQLAlchemy's 1 544, CPython's `test_sqlite3` 466/466) is a
+      # PYTHON consumer, and Python's sqlite3 binds each parameter with its own
+      # type. PHP's PDO binds them as TEXT. That difference hid a wrong answer
+      # for a week — `lat BETWEEN ? AND ?` returned zero rows where sqlite
+      # returned 6 207 — and no Python suite could have found it.
+      #
+      # Judged as a DIFFERENTIAL: the same corpus runs under stock sqlite
+      # first, and only tests that fail under the shim while PASSING under
+      # sqlite count. That is the same standard the Django number is quoted at,
+      # and it means a php-src release that breaks its own tests cannot be
+      # mistaken for a regression here.
+      - name: PHP's own sqlite corpus, against stock sqlite
+        run: |
+          set -e
+          V=$(php -r 'echo PHP_VERSION;')
+          echo "runner PHP: $V"
+          # The tests must match the interpreter: a corpus from another minor
+          # asserts behaviour this PHP does not have. Exact tag first, the
+          # minor's branch as the fallback.
+          for REF in "refs/tags/php-$V" "refs/heads/PHP-${V%.*}"; do
+            if curl -sfL -o src.tgz "https://codeload.github.com/php/php-src/tar.gz/$REF"; then
+              echo "corpus: $REF"; break
+            fi
+          done
+          test -s src.tgz || { echo "no php-src for $V"; exit 1; }
+          mkdir -p corpus && tar xzf src.tgz -C corpus --strip-components=1 \
+            "*/run-tests.php" "*/ext/pdo_sqlite" "*/ext/sqlite3" 2>/dev/null
+          cd corpus
+          run() {
+            find ext/pdo_sqlite/tests ext/sqlite3/tests -name '*.diff' -delete 2>/dev/null || true
+            env $1 TEST_PHP_EXECUTABLE="$(which php)" php run-tests.php -q --offline \
+              -p "$(which php)" ext/pdo_sqlite/tests ext/sqlite3/tests 2>&1 \
+              | sed -n '/FAILED TEST SUMMARY/,/^====/p' \
+              | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_]+\.phpt' | sort -u
+          }
+          run "IGNORE=1" > ../base.txt || true
+          echo "stock sqlite fails: $(wc -l < ../base.txt)"
+          cat ../base.txt
+
+      - name: …and the same corpus against the shim
+        run: |
+          set -e
+          SO=$(find target crates/mpedb-capi/target -name libmpedb_sqlite3.so | head -1)
+          mkdir -p shimlib && ln -sf "$(realpath "$SO")" shimlib/libsqlite3.so.0
+          cd corpus
+          find ext/pdo_sqlite/tests ext/sqlite3/tests -name '*.diff' -delete 2>/dev/null || true
+          LD_LIBRARY_PATH="$PWD/../shimlib" TEST_PHP_EXECUTABLE="$(which php)" \
+            php run-tests.php -q --offline -p "$(which php)" \
+            ext/pdo_sqlite/tests ext/sqlite3/tests 2>&1 \
+            | sed -n '/FAILED TEST SUMMARY/,/^====/p' \
+            | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_]+\.phpt' | sort -u > ../shim.txt || true
+          cd ..
+          # Shim-only: fails here, passes under stock sqlite.
+          comm -13 base.txt shim.txt > only.txt
+          grep -vE '^#|^$' .github/php-corpus-known.txt | sort > known.txt
+          echo "shim-only failures: $(wc -l < only.txt), known: $(wc -l < known.txt)"
+
+          NEW=$(comm -13 known.txt only.txt)
+          FIXED=$(comm -23 known.txt only.txt)
+          if [ -n "$FIXED" ]; then
+            echo "--- these now PASS; delete them from php-corpus-known.txt ---"
+            echo "$FIXED"
+          fi
+          if [ -n "$NEW" ]; then
+            echo "--- NEW shim-only failures ---"
+            echo "$NEW"
+            for t in $NEW; do echo "=== $t ==="; head -25 "corpus/${t%.phpt}.diff" 2>/dev/null; done
+            exit 1
+          fi
+          echo "no new shim-only failures"

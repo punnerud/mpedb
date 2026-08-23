@@ -1,0 +1,49 @@
+# PHP's own sqlite corpus: the tests that fail under the shim and PASS under
+# stock sqlite. Measured 2026-08-23 against php-8.3.33, 232 tests, of which
+# stock sqlite fails zero.
+#
+# This list exists so a NEW failure is visible. It is not a target to keep at
+# zero by deletion — a line removed without the test passing is a lie the next
+# person inherits.
+#
+# Classified by inspection. None of these returns wrong DATA silently: every
+# one is a refusal, a message difference, a missing feature or metadata. That
+# is the property worth defending, and the reason this list is tolerable.
+#
+#   feature not implemented — real work, tracked separately
+ext/pdo_sqlite/tests/gh9032.phpt
+ext/sqlite3/tests/gh9032.phpt
+ext/sqlite3/tests/sqlite3_25_create_aggregate.phpt
+ext/sqlite3/tests/sqlite3_38_backup.phpt
+ext/sqlite3/tests/sqlite3_40_setauthorizer.phpt
+ext/sqlite3/tests/sqlite3_defensive.phpt
+ext/sqlite3/tests/sqlite3_trampoline_create_aggregate.phpt
+ext/sqlite3/tests/sqlite3_trampoline_create_collation.phpt
+#
+#   rigid typing: mpedb REFUSES a comparison sqlite coerces. Loud, not silent.
+ext/sqlite3/tests/bug69972.phpt
+ext/sqlite3/tests/bug73068.phpt
+ext/sqlite3/tests/bug73333.phpt
+ext/sqlite3/tests/bug81742.phpt
+ext/sqlite3/tests/gh20699.phpt
+ext/pdo_sqlite/tests/bug_71885.phpt
+ext/pdo_sqlite/tests/bug_72368.phpt
+#
+#   error text differs, both engines refuse
+ext/pdo_sqlite/tests/bug38334.phpt
+ext/pdo_sqlite/tests/bug_34630.phpt
+ext/pdo_sqlite/tests/bug_36798.phpt
+ext/pdo_sqlite/tests/common.phpt
+ext/pdo_sqlite/tests/pdo_fetch_func_001.phpt
+ext/pdo_sqlite/tests/pdo_sqlite_filename_uri.phpt
+ext/pdo_sqlite/tests/pdo_sqlite_transaction.phpt
+ext/sqlite3/tests/sqlite3_02_create.phpt
+ext/sqlite3/tests/sqlite3_20_error.phpt
+ext/sqlite3/tests/sqlite3_enable_exceptions.phpt
+ext/sqlite3/tests/sqlite3_prepare_faultystmt.phpt
+#
+#   extended result codes: the base code is returned where sqlite gives the
+#   extended one (19 vs 1555). A consumer that branches on it gets the coarser
+#   answer, never a wrong one.
+ext/pdo_sqlite/tests/pdo_sqlite_extendederror_attr.phpt
+ext/sqlite3/tests/sqlite3_39_toggleExtended.phpt

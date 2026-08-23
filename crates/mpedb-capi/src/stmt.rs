@@ -58,6 +58,16 @@ unsafe fn prepare_common(
     };
 
     let (first, tail) = sql::split_first(full);
+    // What `sqlite3_sql` must hand back is the span sqlite CONSUMED, and that
+    // includes the terminating `;` — `split_first` drops it because the engine
+    // parses what comes before. Two different questions, so two strings:
+    // `sql` is what the caller asked for, `exec_sql` is what runs.
+    // `SQLite3Stmt::getSQL` answered "SELECT :a, :b, ?" where sqlite answers
+    // "SELECT :a, :b, ?;" until this existed.
+    let asked = match full.as_bytes().get(first.len()) {
+        Some(b';') => &full[..first.len() + 1],
+        _ => first,
+    };
     // pz_tail points at the first byte past this statement (into z_sql).
     if !pz_tail.is_null() {
         let off = full.len() - tail.len();
@@ -202,7 +212,7 @@ unsafe fn prepare_common(
     let n_params = scan.count;
     let boxed = Box::new(Stmt {
         db,
-        sql: first.to_string(),
+        sql: asked.to_string(),
         exec_sql: scan.rewritten,
         n_params,
         param_names: scan.names,
@@ -359,6 +369,9 @@ pub unsafe extern "C" fn sqlite3_exec(
             if !c.trace_cb.is_null() && c.trace_mask & SQLITE_TRACE_STMT != 0 {
                 let tmp = Box::new(Stmt {
                     db,
+                    // `sqlite3_exec`'s throwaway statement is never handed
+                    // to a caller, so no one can ask it for its SQL — the
+                    // consumed-span distinction above does not arise here.
                     sql: first.to_string(),
                     exec_sql: first.to_string(),
                     n_params: 0,
