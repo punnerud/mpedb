@@ -845,6 +845,29 @@ fn writing_the_catalog_is_refused_by_name_while_reading_it_still_works() {
         exec(db, "CREATE TABLE sqlite_masterly (a)");
         assert_eq!(exec(db, "DELETE FROM sqlite_masterly"), SQLITE_OK);
 
+        // WITH AN AUTHORIZER REGISTERED, which is the case that actually
+        // shipped broken. The gate describes a statement by compiling it, and
+        // compiling this one fails with the "no such table" message being
+        // replaced here — so an authorizer, which PHP installs on every
+        // connection, got there first and reported the wrong thing anyway.
+        // This assertion is the difference between the two orderings.
+        unsafe extern "C" fn allow(
+            _c: *mut c_void,
+            _a: c_int,
+            _1: *const c_char,
+            _2: *const c_char,
+            _3: *const c_char,
+            _4: *const c_char,
+        ) -> c_int {
+            SQLITE_OK
+        }
+        assert_eq!(sqlite3_set_authorizer(db, allow as *mut c_void, ptr::null_mut()), SQLITE_OK);
+        let s = cs("DELETE FROM sqlite_master");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_ERROR);
+        let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy().into_owned();
+        assert_eq!(msg, "table sqlite_master may not be modified", "with an authorizer registered");
+
         sqlite3_close(db);
     }
 }

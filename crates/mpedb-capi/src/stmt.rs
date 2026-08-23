@@ -172,6 +172,22 @@ unsafe fn prepare_common(
         }
     }
 
+    // Writing the catalog is refused BY NAME, and BEFORE the authorizer,
+    // because the engine's answer would be "no such table: sqlite_master" —
+    // untrue, since reads of it are answered by introspection on the next
+    // line. sqlite refuses this with "table sqlite_master may not be modified"
+    // unless writable_schema is on AND defensive mode is off; mpedb has no
+    // rows behind the catalog to write, so the refusal is unconditional.
+    //
+    // Ahead of the authorizer because it is a structural refusal, not an
+    // authorization question — and because the gate would get there first: it
+    // describes a statement by compiling it, and compiling this one fails with
+    // the very message being replaced here.
+    if let Some(name) = introspect::sqlite_master_write_target(first) {
+        c.set_error(SQLITE_ERROR, SQLITE_ERROR, &format!("table {name} may not be modified"));
+        return SQLITE_ERROR;
+    }
+
     // The authorizer sees every action this statement performs, BEFORE it is
     // accepted — sqlite consults it during prepare, and a DENY fails the
     // prepare with SQLITE_AUTH. A no-op (and no extra compile) when none is
@@ -187,18 +203,6 @@ unsafe fn prepare_common(
             // Report exactly what the validation below would have.
             auth::Refusal::NotCompilable(e) => c.set_db_error(&e),
         };
-    }
-
-    // Writing the catalog is refused BY NAME, before validation, because the
-    // engine's answer would be "no such table: sqlite_master" — untrue, since
-    // reads of it are answered by introspection. sqlite refuses the same
-    // statement with "table sqlite_master may not be modified" unless
-    // writable_schema is on AND defensive mode is off; mpedb has no rows
-    // behind the catalog to write, so the refusal is unconditional and this is
-    // simply the honest wording for it.
-    if let Some(name) = introspect::sqlite_master_write_target(first) {
-        c.set_error(SQLITE_ERROR, SQLITE_ERROR, &format!("table {name} may not be modified"));
-        return SQLITE_ERROR;
     }
 
     // Validate compilable statements now (surface syntax/bind errors at
