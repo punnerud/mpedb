@@ -243,8 +243,14 @@ jobs:
             fi
           done
           test -s src.tgz || { echo "no php-src for $V"; exit 1; }
-          mkdir -p corpus && tar xzf src.tgz -C corpus --strip-components=1 \
-            "*/run-tests.php" "*/ext/pdo_sqlite" "*/ext/sqlite3" 2>/dev/null
+          # `--wildcards` explicitly: GNU tar does not glob extraction patterns
+          # by default here, and warns rather than errors — with `2>/dev/null`
+          # and `set -e` that surfaced as a bare "exit 2" with no cause. Let it
+          # speak instead of silencing it.
+          mkdir -p corpus && tar xzf src.tgz -C corpus --strip-components=1 --wildcards \
+            "*/run-tests.php" "*/ext/pdo_sqlite" "*/ext/sqlite3"
+          test -f corpus/run-tests.php || { echo "corpus did not extract"; exit 1; }
+          echo "extracted: $(ls corpus/ext/pdo_sqlite/tests/*.phpt corpus/ext/sqlite3/tests/*.phpt | wc -l) tests"
           cd corpus
           run() {
             find ext/pdo_sqlite/tests ext/sqlite3/tests -name '*.diff' -delete 2>/dev/null || true
