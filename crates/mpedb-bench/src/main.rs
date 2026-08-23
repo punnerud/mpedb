@@ -17,6 +17,7 @@ mod notify_load;
 mod sync_load;
 mod dur_compare;
 mod eng_mpedb;
+mod expr;
 mod extents;
 mod h2h;
 mod eng_pg;
@@ -356,7 +357,14 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--extents")
         .and_then(|w| w[1].parse().ok());
-    const VALUED: [&str; 7] = [
+    // `--expr <rader>`: where a residual filter's time goes. No database and
+    // no disk — it measures `ExprProgram` alone, against the same opcodes over
+    // an f64 stack and against the predicate written by hand.
+    let expr_arg: Option<usize> = args
+        .windows(2)
+        .find(|w| w[0] == "--expr")
+        .and_then(|w| w[1].parse().ok());
+    const VALUED: [&str; 8] = [
         "--only",
         "--tmpfs",
         "--out",
@@ -364,6 +372,7 @@ fn main() {
         "--disk",
         "--h2h",
         "--extents",
+        "--expr",
     ];
     for (i, a) in args.iter().enumerate() {
         let known = a == "--quick"
@@ -456,6 +465,10 @@ fn main() {
             eprintln!("doc load cell failed: {e}");
             std::process::exit(1);
         }
+        return;
+    }
+    if let Some(n) = expr_arg {
+        expr::run(n, 7);
         return;
     }
     if let Some(iters) = extents_arg {
