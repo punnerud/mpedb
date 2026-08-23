@@ -55,8 +55,7 @@ ext/sqlite3/tests/sqlite3_20_error.phpt
 ext/sqlite3/tests/sqlite3_enable_exceptions.phpt
 ext/sqlite3/tests/sqlite3_prepare_faultystmt.phpt
 #
-#   extended result codes: the base code is returned where sqlite gives the
-#   extended one (19 vs 1555). A consumer that branches on it gets the coarser
-#   answer, never a wrong one.
-ext/pdo_sqlite/tests/pdo_sqlite_extendederror_attr.phpt
-ext/sqlite3/tests/sqlite3_39_toggleExtended.phpt
+#   (extended result codes used to sit here — sqlite3_extended_result_codes()
+#   was a no-op, so sqlite3_errcode() gave 19 where sqlite gives 1555. Fixed;
+#   both tests pass. Left as a note because "coarser, never wrong" is the kind
+#   of gap that stays put until someone writes down what it costs.)

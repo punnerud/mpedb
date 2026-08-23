@@ -227,6 +227,12 @@ pub struct Sqlite3 {
     interrupted: AtomicBool,
     err_code: c_int,
     err_ext: c_int,
+    /// `sqlite3_extended_result_codes()`. OFF by default, as in sqlite, and it
+    /// governs `sqlite3_errcode()` only: `sqlite3_extended_errcode()` answers
+    /// with the extended code either way. Both PHP's `lastErrorCode()` and
+    /// PDO's `errorInfo()[1]` read the former, which is why the toggle is
+    /// visible at all rather than being the no-op it was.
+    extended_codes: bool,
     err_msg: Vec<u8>, // NUL-terminated
     changes: c_int,
     total_changes: c_int,

@@ -597,3 +597,60 @@ fn uri_path_percent_decodes() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+/// `sqlite3_extended_result_codes()` decides what `sqlite3_errcode()` answers.
+///
+/// The extended code has always been tracked — `sqlite3_extended_errcode()`
+/// returned 1555 for a primary-key collision long before this test existed —
+/// but the toggle was a no-op, so `sqlite3_errcode()` handed out the coarse 19
+/// no matter what the caller had asked for. That is never a WRONG answer, only
+/// a less precise one, which is exactly why nothing caught it: a consumer that
+/// enables extended codes and receives base codes cannot tell the difference
+/// from a database that simply has nothing finer to say.
+///
+/// Two of PHP's own tests read this door and no other: SQLite3::lastErrorCode()
+/// and PDO's errorInfo()[1] both call `sqlite3_errcode()`. The expectations
+/// below are theirs — 19 with the toggle off, 1555 with it on, for a collision
+/// on INTEGER PRIMARY KEY (SQLITE_CONSTRAINT_PRIMARYKEY, not _UNIQUE).
+#[test]
+fn extended_result_codes_toggle_governs_errcode_and_not_extended_errcode() {
+    unsafe {
+        let db = open_memory();
+        exec(db, "CREATE TABLE dog (id INTEGER PRIMARY KEY, name TEXT)");
+        exec(db, "INSERT INTO dog VALUES (1, 'Annoying Dog')");
+
+        let collide = || {
+            let s = cs("INSERT INTO dog VALUES (1, 'Annoying Dog')");
+            let mut st: *mut Stmt = ptr::null_mut();
+            assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+            let rc = sqlite3_step(st);
+            sqlite3_finalize(st);
+            rc
+        };
+
+        // Off by default, as in sqlite — a caller that never asks keeps the
+        // coarse code, and PHP's first two lastErrorCode() reads expect 19.
+        collide();
+        assert_eq!(sqlite3_errcode(db), SQLITE_CONSTRAINT, "base code with the toggle off");
+        assert_eq!(
+            sqlite3_extended_errcode(db),
+            SQLITE_CONSTRAINT_PRIMARYKEY,
+            "the extended code is tracked either way — the toggle governs who is TOLD"
+        );
+
+        assert_eq!(sqlite3_extended_result_codes(db, 1), SQLITE_OK);
+        collide();
+        assert_eq!(sqlite3_errcode(db), SQLITE_CONSTRAINT_PRIMARYKEY, "1555 once asked for");
+        assert_eq!(sqlite3_extended_errcode(db), SQLITE_CONSTRAINT_PRIMARYKEY);
+
+        // And back: the switch is a switch, not a latch.
+        assert_eq!(sqlite3_extended_result_codes(db, 0), SQLITE_OK);
+        collide();
+        assert_eq!(sqlite3_errcode(db), SQLITE_CONSTRAINT);
+
+        // A NULL handle is misuse, not a silent success.
+        assert_eq!(sqlite3_extended_result_codes(ptr::null_mut(), 1), SQLITE_MISUSE);
+
+        sqlite3_close(db);
+    }
+}

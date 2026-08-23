@@ -833,6 +833,7 @@ pub unsafe extern "C" fn sqlite3_errmsg(db: *mut Sqlite3) -> *const c_char {
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_errcode(db: *mut Sqlite3) -> c_int {
     match conn(db) {
+        Some(c) if c.extended_codes => c.err_ext,
         Some(c) => c.err_code,
         None => last_open_error().map(|(c, _)| c).unwrap_or(SQLITE_MISUSE),
     }

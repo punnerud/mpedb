@@ -1057,6 +1057,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         interrupted: AtomicBool::new(false),
         err_code: SQLITE_OK,
         err_ext: SQLITE_OK,
+        extended_codes: false,
         err_msg: Vec::new(),
         changes: 0,
         total_changes: 0,
@@ -1313,12 +1314,18 @@ pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut Sqlite3, ms: c_int) -> c_
 
 /// Non-standard-but-common helpers some consumers (incl. Python's sqlite3) call.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_extended_result_codes(db: *mut Sqlite3, _onoff: c_int) -> c_int {
-    // The shim always tracks an extended code; the toggle is a no-op.
-    if db.is_null() {
-        SQLITE_MISUSE
-    } else {
-        SQLITE_OK
+pub unsafe extern "C" fn sqlite3_extended_result_codes(db: *mut Sqlite3, onoff: c_int) -> c_int {
+    // The extended code is always TRACKED; what this switches is whether
+    // `sqlite3_errcode` hands it out. Answering 19 where sqlite answers 1555 is
+    // never wrong, only coarser — but a consumer that asked for the finer
+    // answer and silently got the coarse one cannot tell the difference, and
+    // both PHP extensions ask through this exact door.
+    match conn(db) {
+        Some(c) => {
+            c.extended_codes = onoff != 0;
+            SQLITE_OK
+        }
+        None => SQLITE_MISUSE,
     }
 }
 
