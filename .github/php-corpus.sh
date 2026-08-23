@@ -15,7 +15,11 @@ FAILS=$(realpath -m "${3:?fails path}")
 MIN=${MIN_TESTS:-100}
 
 cd "$CORPUS"
-find ext/pdo_sqlite/tests ext/sqlite3/tests -name '*.diff' -delete 2>/dev/null
+# pdo_sqlite's common.phpt is a REDIRECTTEST into ext/pdo/tests, the shared PDO
+# suite every driver is run through. Without that directory run-tests does not
+# skip the test, it dies — which is exactly how 133 tests became 13.
+test -d ext/pdo/tests || { echo "ext/pdo/tests missing; common.phpt will kill the run"; exit 1; }
+find ext/pdo_sqlite/tests ext/sqlite3/tests ext/pdo/tests -name '*.diff' -delete 2>/dev/null
 
 # run-tests exits non-zero whenever any test fails, which is the expected case
 # under the shim. Its exit code carries nothing we do not read from the log.
@@ -30,7 +34,9 @@ echo "run-tests exit $RC after starting $STARTED tests"
 # all) retire a test without ever loading a database.
 EXEC=$(grep -m1 'Number of tests' "$LOG" | awk '{print $NF}')
 COLLECTED=$(ls ext/pdo_sqlite/tests/*.phpt ext/sqlite3/tests/*.phpt | wc -l)
-echo "executed ${EXEC:-none} of $COLLECTED collected"
+# Executed can exceed collected: common.phpt redirects into the shared PDO
+# suite, and every one of those counts as a test run against sqlite.
+echo "executed ${EXEC:-none}; $COLLECTED sqlite tests collected, plus the PDO suite via redirect"
 grep -E '^(Tests skipped|Tests failed|Tests passed)' "$LOG" || true
 
 if [ -z "$EXEC" ] || [ "$EXEC" -lt "$MIN" ]; then
@@ -41,4 +47,4 @@ if [ -z "$EXEC" ] || [ "$EXEC" -lt "$MIN" ]; then
 fi
 
 sed -n '/FAILED TEST SUMMARY/,/^====/p' "$LOG" \
-  | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_]+\.phpt' | sort -u > "$FAILS"
+  | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_.-]+\.phpt' | sort -u > "$FAILS"

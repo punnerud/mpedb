@@ -248,9 +248,9 @@ jobs:
           # and `set -e` that surfaced as a bare "exit 2" with no cause. Let it
           # speak instead of silencing it.
           mkdir -p corpus && tar xzf src.tgz -C corpus --strip-components=1 --wildcards \
-            "*/run-tests.php" "*/ext/pdo_sqlite" "*/ext/sqlite3"
+            "*/run-tests.php" "*/ext/pdo_sqlite" "*/ext/sqlite3" "*/ext/pdo"
           test -f corpus/run-tests.php || { echo "corpus did not extract"; exit 1; }
-          echo "extracted: $(ls corpus/ext/pdo_sqlite/tests/*.phpt corpus/ext/sqlite3/tests/*.phpt | wc -l) tests"
+          echo "extracted: $(ls corpus/ext/pdo_sqlite/tests/*.phpt corpus/ext/sqlite3/tests/*.phpt | wc -l) sqlite tests"
           .github/php-corpus.sh corpus base.log base.txt
           echo "stock sqlite fails: $(wc -l < base.txt)"
           cat base.txt
@@ -282,7 +282,7 @@ jobs:
           # calling it fixed would delete a real entry on the strength of a
           # version difference. Compare only against what exists here.
           grep -vE '^#|^$' .github/php-corpus-known.txt | sort > known-all.txt
-          (cd corpus && ls ext/pdo_sqlite/tests/*.phpt ext/sqlite3/tests/*.phpt) | sort > present.txt
+          (cd corpus && ls ext/pdo_sqlite/tests/*.phpt ext/sqlite3/tests/*.phpt ext/pdo/tests/*.phpt) | sort > present.txt
           comm -12 known-all.txt present.txt > known.txt
           ABSENT=$(comm -23 known-all.txt present.txt | wc -l)
           echo "shim-only failures: $(wc -l < only.txt), known: $(wc -l < known.txt)"
