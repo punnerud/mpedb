@@ -312,7 +312,29 @@ jobs:
           if [ -n "$NEW" ]; then
             echo "--- NEW shim-only failures ---"
             echo "$NEW"
-            for t in $NEW; do echo "=== $t ==="; head -25 "corpus/${t%.phpt}.diff" 2>/dev/null; done
+            # A redirected test is NAMED under ext/pdo_sqlite/tests but its
+            # .diff lands beside the file, in ext/pdo/tests. Look in both.
+            for t in $NEW; do
+              echo "=== $t ==="
+              b=${t%.phpt}.diff
+              head -25 "corpus/$b" 2>/dev/null || head -25 "corpus/${b/pdo_sqlite/pdo}" 2>/dev/null
+            done
             exit 1
           fi
           echo "no new shim-only failures"
+
+      - name: keep every diff, not only the new ones
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # A known failure still has to be read before it can be fixed, and
+          # reading it should not cost a workflow edit and a six-minute round
+          # trip. run-tests writes <test>.diff beside each failing test; they
+          # are small, and they are the whole record of what we answered.
+          name: php-corpus-diffs
+          path: |
+            corpus/ext/*/tests/*.diff
+            shim.log
+            base.log
+          if-no-files-found: warn
+          retention-days: 14
