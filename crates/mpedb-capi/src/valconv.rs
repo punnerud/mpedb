@@ -247,6 +247,15 @@ pub fn sqlite_shaped_message(e: &DbError) -> Option<String> {
         DbError::Bind(m) if m.starts_with("unknown table `") && m.ends_with('`') => {
             Some(format!("no such table: {}", &m["unknown table `".len()..m.len() - 1]))
         }
+        // sqlite: `table T already exists`, and PHP's sqlite3_02_create asserts
+        // on it verbatim. mpedb's schema check says `duplicate table name: T` —
+        // the same fact, named the same way round, so this is a renaming and
+        // not a reinterpretation. Guarded on the colon form: a bare
+        // `duplicate table name` (no subject) keeps the native wording rather
+        // than being rendered as a sentence with a hole in it.
+        DbError::Schema(m) if m.starts_with("duplicate table name: ") => {
+            Some(format!("table {} already exists", &m["duplicate table name: ".len()..]))
+        }
         e if is_writer_lock_reentry(e) => Some("database is locked".to_string()),
         _ => None,
     }

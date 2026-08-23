@@ -19,9 +19,16 @@
 //!   callback asked to hide. It fails the prepare with a message that says so —
 //!   fail-closed, never a silent leak.
 //! * Any other return value is sqlite's "authorizer malfunction".
-//! * A statement the shim cannot describe in action codes (`ATTACH`/`DETACH`,
-//!   and anything that fails to compile) is refused while an authorizer is
-//!   registered, rather than being let through unexamined.
+//! * A statement the shim cannot describe in action codes (`ATTACH`/`DETACH`)
+//!   is refused while an authorizer is registered, rather than being let
+//!   through unexamined.
+//! * A statement that does not COMPILE is a different case and is not refused
+//!   as an authorization failure: it reports the compile error prepare would
+//!   have reported. Nothing is let through — the statement still fails — but
+//!   the reason given is the true one. Treating the two alike meant that under
+//!   PHP, whose sqlite3 extension registers an authorizer on every connection,
+//!   a mistyped table name produced "not authorized" instead of "no such
+//!   table", with SQLITE_AUTH instead of SQLITE_ERROR.
 //!
 //! Column attribution inherits `access_report`'s one approximation: exact for
 //! single-table statements, widened to "every column of every table read" for
@@ -30,7 +37,7 @@
 
 use crate::consts::*;
 use crate::{introspect, sql, Sqlite3};
-use mpedb::{Access, ObjectKind, TxnOp};
+use mpedb::{Access, Error as DbError, ObjectKind, TxnOp};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
@@ -80,7 +87,27 @@ struct Call {
 
 /// The outcome of the whole authorization pass: `Ok(())` or the exact
 /// `(code, message)` the prepare must fail with.
-pub type AuthResult = Result<(), (c_int, String)>;
+/// Why a statement did not get through the gate.
+///
+/// The two are not the same thing and must not produce the same error. A
+/// DENIAL is the authorizer's answer and belongs to the caller who registered
+/// it. A statement that does not COMPILE was never a candidate for
+/// authorization: it cannot run, so nothing can be granted or withheld, and
+/// the honest report is the compile error itself.
+///
+/// Collapsing the second into the first is what made `SELECT * FROM nosuch`
+/// answer "not authorized: this statement cannot be described in authorizer
+/// actions" instead of "no such table: nosuch". PHP's sqlite3 extension
+/// registers an authorizer on every connection it opens, so under it that was
+/// the error EVERY mistyped table name produced.
+pub enum Refusal {
+    /// The authorizer said no, or the shim refused on its behalf.
+    Denied(c_int, String),
+    /// The statement does not compile. Report it as prepare would have.
+    NotCompilable(Box<DbError>),
+}
+
+pub type AuthResult = Result<(), Refusal>;
 
 /// Run every action this statement performs past the connection's authorizer.
 /// A no-op (and no compile) when none is registered.
@@ -107,13 +134,13 @@ pub unsafe fn authorize(c: &mut Sqlite3, stmt_sql: &str) -> AuthResult {
                     // sqlite's column-read message names the object; every
                     // other denial is the generic one.
                     (SQLITE_READ, Some(t), Some(col)) => {
-                        (SQLITE_AUTH, format!("access to {t}.{col} is prohibited"))
+                        Refusal::Denied(SQLITE_AUTH, format!("access to {t}.{col} is prohibited"))
                     }
-                    _ => (SQLITE_AUTH, "not authorized".to_string()),
+                    _ => Refusal::Denied(SQLITE_AUTH, "not authorized".to_string()),
                 });
             }
             SQLITE_IGNORE => {
-                return Err((
+                return Err(Refusal::Denied(
                     SQLITE_ERROR,
                     "authorizer returned SQLITE_IGNORE, which mpedb cannot honour: it \
                      means \"read this column as NULL\", and mpedb has no plan rewrite \
@@ -123,7 +150,7 @@ pub unsafe fn authorize(c: &mut Sqlite3, stmt_sql: &str) -> AuthResult {
                         .to_string(),
                 ));
             }
-            _ => return Err((SQLITE_ERROR, "authorizer malfunction".to_string())),
+            _ => return Err(Refusal::Denied(SQLITE_ERROR, "authorizer malfunction".to_string())),
         }
     }
     Ok(())
@@ -135,7 +162,7 @@ fn cstr(s: &str) -> CString {
 
 /// The action list for one statement, in the order sqlite raises them:
 /// the statement's own action first, then the object touches.
-unsafe fn describe(c: &mut Sqlite3, stmt_sql: &str) -> Result<Vec<Call>, (c_int, String)> {
+unsafe fn describe(c: &mut Sqlite3, stmt_sql: &str) -> Result<Vec<Call>, Refusal> {
     use sql::Kind;
     let text = sql::strip_leading_trivia(stmt_sql);
     let one = |action, arg1: Option<&str>, arg2: Option<&str>| Call {
@@ -186,15 +213,13 @@ unsafe fn describe(c: &mut Sqlite3, stmt_sql: &str) -> Result<Vec<Call>, (c_int,
         Some(s) => s.access_report(text),
         None => c.db.access_report(text),
     };
-    let report = report.map_err(|e| {
-        (
-            SQLITE_AUTH,
-            format!(
-                "not authorized: this statement cannot be described in authorizer \
-                 actions, so it is refused while an authorizer is registered ({e})"
-            ),
-        )
-    })?;
+    // A statement that will not compile is not an authorization question. It
+    // is about to fail at prepare with a real message — "no such table: foo" —
+    // and answering SQLITE_AUTH here would replace that message for every
+    // caller who happens to have an authorizer registered, which under PHP is
+    // every caller. Hand back the compile error and let it be reported as it
+    // would have been. Nothing is waved through: this path still fails.
+    let report = report.map_err(|e| Refusal::NotCompilable(Box::new(e)))?;
 
     let mut calls = Vec::new();
     for a in &report.actions {
@@ -213,11 +238,11 @@ unsafe fn describe(c: &mut Sqlite3, stmt_sql: &str) -> Result<Vec<Call>, (c_int,
                 Some((create, _)) => one(create, Some(name), table.as_deref()),
                 // An RLS policy is an mpedb concept with no sqlite action
                 // code. Refusing beats inventing one or waving it through.
-                None => return Err((SQLITE_AUTH, unmappable("CREATE POLICY"))),
+                None => return Err(Refusal::Denied(SQLITE_AUTH, unmappable("CREATE POLICY"))),
             },
             Access::Drop { kind, name, table } => match object_codes(*kind) {
                 Some((_, drop)) => one(drop, Some(name), table.as_deref()),
-                None => return Err((SQLITE_AUTH, unmappable("DROP POLICY"))),
+                None => return Err(Refusal::Denied(SQLITE_AUTH, unmappable("DROP POLICY"))),
             },
         });
     }

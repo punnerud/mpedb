@@ -654,3 +654,84 @@ fn extended_result_codes_toggle_governs_errcode_and_not_extended_errcode() {
         sqlite3_close(db);
     }
 }
+
+/// Registering an authorizer must not change the error a BROKEN statement
+/// gets.
+///
+/// The gate is asked to describe a statement in action codes before it runs,
+/// and describing it means compiling it. When that compile fails the statement
+/// is not an authorization question at all — it cannot run, so nothing is
+/// being granted or withheld — but the shim reported the failure as
+/// SQLITE_AUTH "not authorized: this statement cannot be described…", burying
+/// the real message inside a parenthesis.
+///
+/// PHP's sqlite3 extension registers an authorizer on every connection it
+/// opens. So under PHP, that was the error EVERY mistyped table name produced:
+/// three of PHP's own tests expect "no such table: X" and got a sentence about
+/// authorization instead. The same query without an authorizer answered
+/// correctly, which is the tell — the gate was editing errors it had no
+/// business touching.
+#[test]
+fn an_authorizer_does_not_rewrite_the_error_of_a_statement_that_cannot_compile() {
+    unsafe extern "C" fn allow_everything(
+        _ctx: *mut c_void,
+        _action: c_int,
+        _a1: *const c_char,
+        _a2: *const c_char,
+        _a3: *const c_char,
+        _a4: *const c_char,
+    ) -> c_int {
+        SQLITE_OK
+    }
+
+    unsafe {
+        let db = open_memory();
+
+        // What the error looks like with no authorizer in the picture.
+        let bad = cs("SELECT * FROM non_existent_table");
+        let mut st: *mut Stmt = ptr::null_mut();
+        let rc_plain = sqlite3_prepare_v2(db, bad.as_ptr(), -1, &mut st, ptr::null_mut());
+        let msg_plain = CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy().into_owned();
+        assert_eq!(rc_plain, SQLITE_ERROR);
+        assert!(msg_plain.contains("no such table"), "plain message was {msg_plain:?}");
+
+        // Now with one registered that allows everything. The authorizer has
+        // no opinion on this statement — it never gets asked, because there is
+        // nothing to ask about — so the answer must be identical.
+        assert_eq!(
+            sqlite3_set_authorizer(db, allow_everything as *mut c_void, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let rc_auth = sqlite3_prepare_v2(db, bad.as_ptr(), -1, &mut st, ptr::null_mut());
+        let msg_auth = CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy().into_owned();
+        assert_eq!(rc_auth, rc_plain, "an authorizer changed the RESULT CODE of a broken statement");
+        assert_eq!(msg_auth, msg_plain, "an authorizer changed the MESSAGE of a broken statement");
+        assert!(!msg_auth.contains("not authorized"), "still an authorization story: {msg_auth:?}");
+
+        // And the gate still gates: a valid statement the callback denies is
+        // refused, so none of the above weakened it.
+        unsafe extern "C" fn deny_everything(
+            _ctx: *mut c_void,
+            _action: c_int,
+            _a1: *const c_char,
+            _a2: *const c_char,
+            _a3: *const c_char,
+            _a4: *const c_char,
+        ) -> c_int {
+            SQLITE_DENY
+        }
+        exec(db, "CREATE TABLE t (a INTEGER)");
+        assert_eq!(
+            sqlite3_set_authorizer(db, deny_everything as *mut c_void, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let good = cs("SELECT a FROM t");
+        assert_eq!(
+            sqlite3_prepare_v2(db, good.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_AUTH,
+            "a denial must still refuse a statement that DOES compile"
+        );
+
+        sqlite3_close(db);
+    }
+}

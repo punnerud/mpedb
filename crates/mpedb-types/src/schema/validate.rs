@@ -32,8 +32,17 @@ impl Schema {
         let mut names: Vec<String> =
             self.tables.iter().filter(|t| !t.dead).map(|t| fold_ident(&t.name)).collect();
         names.sort_unstable();
-        if names.windows(2).any(|w| w[0] == w[1]) {
-            return Err(Error::Schema("duplicate table name".into()));
+        if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
+            // NAME the collision. An error that reports a name is duplicated
+            // without saying which one is the hardest kind to act on, and
+            // sqlite's own wording is built from it — the shim renders this as
+            // `table T already exists`, which is what its consumers grep for.
+            let dup = self
+                .tables
+                .iter()
+                .find(|t| !t.dead && fold_ident(&t.name) == w[0])
+                .map_or_else(|| w[0].clone(), |t| t.name.clone());
+            return Err(Error::Schema(format!("duplicate table name: {dup}")));
         }
         // DENSE ids: position == id is ENFORCED so every positional engine
         // site stays correct. A DROP tombstones IN PLACE (keeps the slot), so

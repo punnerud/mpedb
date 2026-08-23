@@ -43,6 +43,8 @@ ext/pdo_sqlite/tests/bug_71885.phpt
 ext/pdo_sqlite/tests/bug_72368.phpt
 #
 #   error text differs, both engines refuse
+#   (four left here when the authorizer stopped rewriting compile errors and
+#   the duplicate-table refusal learned to name its table)
 ext/pdo_sqlite/tests/bug38334.phpt
 ext/pdo_sqlite/tests/bug_34630.phpt
 ext/pdo_sqlite/tests/bug_36798.phpt
@@ -50,10 +52,6 @@ ext/pdo_sqlite/tests/common.phpt
 ext/pdo_sqlite/tests/pdo_fetch_func_001.phpt
 ext/pdo_sqlite/tests/pdo_sqlite_filename_uri.phpt
 ext/pdo_sqlite/tests/pdo_sqlite_transaction.phpt
-ext/sqlite3/tests/sqlite3_02_create.phpt
-ext/sqlite3/tests/sqlite3_20_error.phpt
-ext/sqlite3/tests/sqlite3_enable_exceptions.phpt
-ext/sqlite3/tests/sqlite3_prepare_faultystmt.phpt
 #
 #   (extended result codes used to sit here — sqlite3_extended_result_codes()
 #   was a no-op, so sqlite3_errcode() gave 19 where sqlite gives 1555. Fixed;

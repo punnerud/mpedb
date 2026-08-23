@@ -177,9 +177,16 @@ unsafe fn prepare_common(
     // prepare with SQLITE_AUTH. A no-op (and no extra compile) when none is
     // registered. It runs on the parameter-rewritten text, which is what the
     // engine compiles. See `auth.rs`.
-    if let Err((code, msg)) = auth::authorize(c, &scan.rewritten) {
-        c.set_error(code, code, &msg);
-        return code;
+    if let Err(r) = auth::authorize(c, &scan.rewritten) {
+        return match r {
+            auth::Refusal::Denied(code, msg) => {
+                c.set_error(code, code, &msg);
+                code
+            }
+            // Not an authorization outcome: the statement does not compile.
+            // Report exactly what the validation below would have.
+            auth::Refusal::NotCompilable(e) => c.set_db_error(&e),
+        };
     }
 
     // Validate compilable statements now (surface syntax/bind errors at
@@ -394,8 +401,14 @@ pub unsafe extern "C" fn sqlite3_exec(
             }
             // sqlite's exec PREPARES each statement, so the authorizer gates
             // exec'd statements exactly as it gates the step path.
-            if let Err((code, msg)) = auth::authorize(c, first) {
-                c.set_error(code, code, &msg);
+            if let Err(r) = auth::authorize(c, first) {
+                let code = match r {
+                    auth::Refusal::Denied(code, msg) => {
+                        c.set_error(code, code, &msg);
+                        code
+                    }
+                    auth::Refusal::NotCompilable(e) => c.set_db_error(&e),
+                };
                 set_exec_errmsg(c, errmsg);
                 return code;
             }
