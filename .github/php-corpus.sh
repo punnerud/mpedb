@@ -21,6 +21,9 @@ find ext/pdo_sqlite/tests ext/sqlite3/tests -name '*.diff' -delete 2>/dev/null
 # under the shim. Its exit code carries nothing we do not read from the log.
 TEST_PHP_EXECUTABLE="$(which php)" php run-tests.php -q --offline \
   -p "$(which php)" ext/pdo_sqlite/tests ext/sqlite3/tests > "$LOG" 2>&1
+RC=$?
+STARTED=$(grep -c '^TEST ' "$LOG")
+echo "run-tests exit $RC after starting $STARTED tests"
 
 # "Number of tests : 133 130" — collected, then actually executed. The second
 # number is the one that matters: SKIPIF blocks (a missing extension, most of
@@ -31,7 +34,8 @@ echo "executed ${EXEC:-none} of $COLLECTED collected"
 grep -E '^(Tests skipped|Tests failed|Tests passed)' "$LOG" || true
 
 if [ -z "$EXEC" ] || [ "$EXEC" -lt "$MIN" ]; then
-  echo "the corpus did not run — refusing to report a failure count from it"
+  echo "the corpus did not run to completion — refusing to report a failure count"
+  echo "exit $RC; a bare 139 is the runner itself dying, not a test failing"
   tail -40 "$LOG"
   exit 1
 fi
