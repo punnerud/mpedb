@@ -189,6 +189,18 @@ unsafe fn prepare_common(
         };
     }
 
+    // Writing the catalog is refused BY NAME, before validation, because the
+    // engine's answer would be "no such table: sqlite_master" — untrue, since
+    // reads of it are answered by introspection. sqlite refuses the same
+    // statement with "table sqlite_master may not be modified" unless
+    // writable_schema is on AND defensive mode is off; mpedb has no rows
+    // behind the catalog to write, so the refusal is unconditional and this is
+    // simply the honest wording for it.
+    if let Some(name) = introspect::sqlite_master_write_target(first) {
+        c.set_error(SQLITE_ERROR, SQLITE_ERROR, &format!("table {name} may not be modified"));
+        return SQLITE_ERROR;
+    }
+
     // Validate compilable statements now (surface syntax/bind errors at
     // prepare, as sqlite does), WITHOUT executing or publishing a plan. Validate
     // the REWRITTEN text — mpedb's parser rejects a bare `:` — not the original.

@@ -795,3 +795,56 @@ fn an_authorizer_sees_attach_with_its_filename_and_can_deny_it() {
         sqlite3_close(db);
     }
 }
+
+/// Writing the catalog is refused by name, and reading it still works.
+///
+/// The engine has no `sqlite_master` table — the catalog is not rows — so a
+/// `DELETE FROM sqlite_master` came back as "no such table: sqlite_master".
+/// That is not true and it is not useful: `SELECT * FROM sqlite_master` is
+/// answered by introspection on the very next line. sqlite's own wording says
+/// the real thing, and for mpedb it is unconditional rather than a mode:
+/// there is nothing behind the catalog to write.
+#[test]
+fn writing_the_catalog_is_refused_by_name_while_reading_it_still_works() {
+    unsafe {
+        let db = open_memory();
+        exec(db, "CREATE TABLE test (a, b)");
+
+        let count = |db: *mut Sqlite3| -> i64 {
+            let s = cs("SELECT COUNT(*) FROM sqlite_master");
+            let mut st: *mut Stmt = ptr::null_mut();
+            assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+            assert_eq!(sqlite3_step(st), SQLITE_ROW);
+            let n = sqlite3_column_int64(st, 0);
+            sqlite3_finalize(st);
+            n
+        };
+        assert_eq!(count(db), 1, "the catalog is readable");
+
+        for sql in [
+            "DELETE FROM sqlite_master",
+            "INSERT INTO sqlite_master VALUES ('table','x','x',2,'')",
+            "UPDATE sqlite_master SET name = 'x'",
+            "DELETE FROM sqlite_schema",
+            "DELETE FROM sqlite_temp_master",
+        ] {
+            let s = cs(sql);
+            let mut st: *mut Stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut());
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy().into_owned();
+            assert_eq!(rc, SQLITE_ERROR, "{sql}");
+            assert!(msg.ends_with(" may not be modified"), "{sql} said {msg:?}");
+            assert!(!msg.contains("no such table"), "{sql} said {msg:?}");
+        }
+
+        // Refused, not silently ignored: nothing changed.
+        assert_eq!(count(db), 1);
+
+        // A table whose name merely STARTS with the catalog's is not the
+        // catalog, and must still be writable.
+        exec(db, "CREATE TABLE sqlite_masterly (a)");
+        assert_eq!(exec(db, "DELETE FROM sqlite_masterly"), SQLITE_OK);
+
+        sqlite3_close(db);
+    }
+}

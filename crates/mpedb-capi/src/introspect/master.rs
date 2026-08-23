@@ -155,12 +155,31 @@ pub fn sqlite_sequence_query(
 /// already. Statement-start anchored; sqlite's `OR <conflict>` spellings are
 /// carried through.
 pub fn sqlite_sequence_write_target(sql: &str) -> bool {
-    parse_seq_target(sql).is_some()
+    parse_write_target(sql, &["sqlite_sequence"]).is_some()
+}
+
+/// The catalog table a statement WRITES, if it writes one.
+///
+/// sqlite refuses these with `table sqlite_master may not be modified` unless
+/// `PRAGMA writable_schema` is on and defensive mode is off. mpedb has no
+/// writable schema table to offer at all — the catalog is not rows — so the
+/// refusal is permanent, and saying so is better than the engine's `no such
+/// table: sqlite_master`, which is untrue: reads of it work.
+pub fn sqlite_master_write_target(sql: &str) -> Option<&'static str> {
+    const NAMES: [&str; 4] =
+        ["sqlite_master", "sqlite_schema", "sqlite_temp_master", "sqlite_temp_schema"];
+    parse_write_target(sql, &NAMES).map(|(_, _, n)| n)
 }
 
 /// (verb, byte offset just past the table name) when the statement writes
 /// `sqlite_sequence`.
 fn parse_seq_target(sql: &str) -> Option<(SeqVerb, usize)> {
+    parse_write_target(sql, &["sqlite_sequence"]).map(|(v, at, _)| (v, at))
+}
+
+/// (verb, byte offset just past the table name, the name matched) when the
+/// statement writes one of `names`.
+fn parse_write_target(sql: &str, names: &[&'static str]) -> Option<(SeqVerb, usize, &'static str)> {
     let lower = sql.to_ascii_lowercase();
     let s = lower.trim_start();
     let base = lower.len() - s.len();
@@ -206,13 +225,21 @@ fn parse_seq_target(sql: &str) -> Option<(SeqVerb, usize)> {
         Some(r) => (r, 1),
         None => (rest, 0),
     };
-    let tail = rest.strip_prefix("sqlite_sequence")?;
+    // Longest first, so `sqlite_temp_master` is not shadowed by a prefix.
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    if quoted == 0 && tail.chars().next().is_some_and(ident) {
-        return None;
+    let mut found: Option<&'static str> = None;
+    for n in names {
+        let Some(tail) = rest.strip_prefix(*n) else { continue };
+        if quoted == 0 && tail.chars().next().is_some_and(ident) {
+            continue;
+        }
+        if found.is_none_or(|f| f.len() < n.len()) {
+            found = Some(n);
+        }
     }
-    let name_end = at + quoted + "sqlite_sequence".len() + quoted;
-    Some((verb, base + name_end))
+    let name = found?;
+    let name_end = at + quoted + name.len() + quoted;
+    Some((verb, base + name_end, name))
 }
 
 #[derive(Clone, Copy, PartialEq)]

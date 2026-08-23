@@ -29,7 +29,6 @@ ext/sqlite3/tests/gh9032.phpt
 ext/sqlite3/tests/sqlite3_25_create_aggregate.phpt
 ext/sqlite3/tests/sqlite3_38_backup.phpt
 ext/sqlite3/tests/sqlite3_40_setauthorizer.phpt
-ext/sqlite3/tests/sqlite3_defensive.phpt
 ext/sqlite3/tests/sqlite3_trampoline_create_aggregate.phpt
 ext/sqlite3/tests/sqlite3_trampoline_create_collation.phpt
 #
