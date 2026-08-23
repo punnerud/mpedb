@@ -1,6 +1,19 @@
 # PHP's own sqlite corpus: the tests that fail under the shim and PASS under
-# stock sqlite. Measured 2026-08-23 against php-8.3.33, 232 tests, of which
-# stock sqlite fails zero.
+# stock sqlite. CI measures this on every run against the php-src tag matching
+# the runner's interpreter — php-8.3.6 as of writing: 133 tests from
+# ext/pdo_sqlite and ext/sqlite3, plus the shared PDO suite that
+# pdo_sqlite/tests/common.phpt redirects into, 217 executed in all. Stock
+# sqlite fails zero of them.
+#
+# A test reached through that redirect is reported under the directory that
+# redirected to it, so the four bug_* entries below name ext/pdo_sqlite/tests
+# while the files live in ext/pdo/tests. That is run-tests' naming, not a typo.
+#
+# One test SKIPS under the shim and runs under stock sqlite:
+# ext/pdo_sqlite/tests/bug_42589.phpt, whose SKIPIF greps PRAGMA
+# compile_options for ENABLE_COLUMN_METADATA. We do not advertise it, so the
+# test declines to run. CI prints it every time rather than letting a skip
+# pass for agreement.
 #
 # This list exists so a NEW failure is visible. It is not a target to keep at
 # zero by deletion — a line removed without the test passing is a lie the next
