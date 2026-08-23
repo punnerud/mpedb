@@ -53,13 +53,42 @@ unsafe fn count(path: &str) -> i64 {
     n
 }
 
-fn scratch(tag: &str) -> String {
-    let dir = common::scratch_base_str();
-    let p = format!("{}/mpedb-side-{tag}-{}.db", dir.trim_end_matches('/'), std::process::id());
-    for suffix in ["", ".mpedb", ".mpedb.src", ".mpedb.lock"] {
-        let _ = std::fs::remove_file(format!("{p}{suffix}"));
+/// A scratch path that cleans up AFTER itself, not only before.
+///
+/// Cleaning at the start only is what leaked: each run left a source, a
+/// sidecar (~4x the source), a stamp and a lock behind, and on a tmpfs a few
+/// runs of this file fill the disk. The guard removes all four when the test
+/// ends, including on a panic — unwinding runs `Drop`.
+///
+/// It cannot help a process that is KILLED, which is why
+/// `mpedb_testkit::scratch_base` also sweeps files whose PID is gone. Two
+/// lines of defence for two different failures: this one is exact, that one
+/// covers what no destructor can.
+struct Scratch(String);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let dir = common::scratch_base_str();
+        let p =
+            format!("{}/mpedb-side-{tag}-{}.db", dir.trim_end_matches('/'), std::process::id());
+        let s = Scratch(p);
+        s.wipe();
+        s
     }
-    p
+    fn wipe(&self) {
+        for suffix in ["", ".mpedb", ".mpedb.src", ".mpedb.lock"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
+        }
+    }
+    fn path(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        self.wipe();
+    }
 }
 
 /// A restore that PRESERVES the source's timestamp — `cp -p`, `rsync -t`, any
@@ -68,7 +97,8 @@ fn scratch(tag: &str) -> String {
 /// error: the failure this test exists for.
 #[test]
 fn a_restore_that_keeps_the_mtime_is_still_seen() {
-    let p = scratch("restore");
+    let _g = Scratch::new("restore");
+    let p = _g.path().to_string();
     write_source(&p, 300, "a");
     unsafe {
         assert_eq!(count(&p), 300);
@@ -103,7 +133,8 @@ fn a_restore_that_keeps_the_mtime_is_still_seen() {
 /// a more expensive check on every reader.
 #[test]
 fn a_same_size_replacement_is_not_seen() {
-    let p = scratch("samesize");
+    let _g = Scratch::new("samesize");
+    let p = _g.path().to_string();
     write_source(&p, 3, "a");
     unsafe {
         assert_eq!(count(&p), 3);
@@ -128,7 +159,8 @@ fn a_same_size_replacement_is_not_seen() {
 /// rebuild.
 #[test]
 fn an_untouched_source_reuses_its_sidecar() {
-    let p = scratch("reuse");
+    let _g = Scratch::new("reuse");
+    let p = _g.path().to_string();
     write_source(&p, 5, "a");
     unsafe {
         assert_eq!(count(&p), 5);
@@ -156,7 +188,8 @@ fn an_untouched_source_reuses_its_sidecar() {
 /// not the mechanism. The lock's argument is in the code, not here.
 #[test]
 fn concurrent_opens_import_once_and_all_succeed() {
-    let p = scratch("race");
+    let _g = Scratch::new("race");
+    let p = _g.path().to_string();
     write_source(&p, 11, "a");
     let n = 6;
     let got: Vec<i64> = std::thread::scope(|s| {
@@ -185,7 +218,8 @@ fn concurrent_opens_import_once_and_all_succeed() {
 /// must still come across exactly — the boundary the batching introduced.
 #[test]
 fn a_source_larger_than_one_batch_imports_whole() {
-    let p = scratch("batch");
+    let _g = Scratch::new("batch");
+    let p = _g.path().to_string();
     write_source(&p, 10_000, "r");
     unsafe {
         assert_eq!(count(&p), 10_000, "4096 + 4096 + 1808, all of them");

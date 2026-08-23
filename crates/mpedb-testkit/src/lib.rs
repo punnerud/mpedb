@@ -125,6 +125,96 @@ static UNIQ: AtomicU64 = AtomicU64::new(0);
 /// A named directory that does not exist is created. One that cannot be used
 /// PANICS by name rather than silently falling back: a run that quietly
 /// ignores where you told it to write is worse than one that stops.
+/// Remove scratch files left by test processes that are no longer running.
+///
+/// Called once per process from [`scratch_base`], because `Drop` cannot be the
+/// whole answer: a test binary killed by the OOM killer, by SIGKILL, or by a
+/// harness timeout never runs one. On this project that is not hypothetical —
+/// `/dev/shm` reached 96 % three times in one day, 312 files and 3.8 GB, and
+/// the first time it did the OOM killer took the session that was writing
+/// them. A sidecar is ~4x its source, so a handful of abandoned imports fills
+/// a tmpfs.
+///
+/// **Only provably dead files.** A name must both look like ours — an
+/// `.mpedb` family suffix, or an `mpedb-` prefix — and carry a PID that no
+/// longer exists. Anything else is left alone, including another engine's
+/// files (`/dev/shm` is shared: PostgreSQL keeps its own there) and any test
+/// that names its files without a PID, where staleness cannot be proven.
+///
+/// Parallel test binaries are the reason the check is `kill(pid, 0)` and not a
+/// timestamp: two suites running at once must not collect each other's live
+/// databases, and an mtime says nothing about whether a writer is still there.
+///
+/// And it runs ONCE, at the first `scratch_base` of the process — so a file
+/// created later in the run is never a candidate. That is what makes this safe
+/// rather than merely careful: there is no window in which a test's own
+/// scratch can be swept out from under it.
+#[cfg(unix)]
+fn sweep_dead_scratch(dir: &Path) {
+    fn looks_like_ours(name: &str) -> bool {
+        name.starts_with("mpedb-")
+            || name.ends_with(".mpedb")
+            || name.ends_with(".mpedb.src")
+            || name.ends_with(".mpedb.lock")
+            || name.ends_with(".overlay.mpedb")
+            || (name.ends_with("-wal") && name.contains(".mpedb"))
+    }
+    fn owner_is_gone(name: &str) -> bool {
+        // Every PID-looking run of digits must be dead; a name with none is
+        // not attributable and so is never swept.
+        let mut saw = false;
+        let bytes = name.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !bytes[i].is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i - start >= 4 {
+                let Ok(pid) = name[start..i].parse::<i32>() else { continue };
+                saw = true;
+                // ESRCH means no such process. EPERM means it exists and is
+                // someone else's — alive either way, so keep the file.
+                if unsafe { libc::kill(pid, 0) } == 0
+                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                {
+                    return false;
+                }
+            }
+        }
+        saw
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !looks_like_ours(&name) || !owner_is_gone(&name) {
+            continue;
+        }
+        // Directories too: several suites give a killed run a whole scratch
+        // directory, and one held 16 MB. Same standard as a file — the name
+        // is ours and the PID in it is gone — because a recursive delete
+        // deserves no weaker a test, not a stronger one. A directory with no
+        // PID (the fixed-name ones several suites share) fails `owner_is_gone`
+        // above and is never reached.
+        let removed = if e.file_type().is_ok_and(|t| t.is_dir()) {
+            std::fs::remove_dir_all(e.path())
+        } else {
+            std::fs::remove_file(e.path())
+        };
+        // Best effort throughout: something another process is racing us to
+        // delete is not a problem worth reporting from a test helper.
+        let _ = removed;
+    }
+}
+
+#[cfg(not(unix))]
+fn sweep_dead_scratch(_dir: &Path) {}
+
 pub fn scratch_base() -> PathBuf {
     let base = match std::env::var_os("MPEDB_TEST_DIR") {
         Some(dir) if !dir.is_empty() => {
@@ -137,6 +227,10 @@ pub fn scratch_base() -> PathBuf {
         _ if Path::new("/dev/shm").is_dir() => PathBuf::from("/dev/shm"),
         _ => std::env::temp_dir(),
     };
+    // Once per process, not per call: `scratch_base` is used from ~200 test
+    // files and often several times in one test.
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| sweep_dead_scratch(&base));
     PathBuf::from(windows_safe(&base, true))
 }
 

@@ -15,3 +15,7 @@ mpedb-types = { workspace = true }
 # The differential oracle: the SAME pinned sqlite on every machine, compiled
 # in. Bumping this version is the deliberate, reviewable way the oracle moves.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# `kill(pid, 0)` for the scratch sweep: the only way to tell a file abandoned
+# by a killed test process from one a running one still needs.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
