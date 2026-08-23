@@ -282,7 +282,12 @@ jobs:
           # calling it fixed would delete a real entry on the strength of a
           # version difference. Compare only against what exists here.
           grep -vE '^#|^$' .github/php-corpus-known.txt | sort > known-all.txt
-          (cd corpus && ls ext/pdo_sqlite/tests/*.phpt ext/sqlite3/tests/*.phpt ext/pdo/tests/*.phpt) | sort > present.txt
+          # A test reached through common.phpt's redirect is reported under the
+          # directory that redirected — ext/pdo_sqlite/tests/bug_34630.phpt —
+          # while the file itself lives in ext/pdo/tests. List it under the name
+          # it is reported by, or four real known failures read as brand new.
+          (cd corpus && ls ext/pdo_sqlite/tests/*.phpt ext/sqlite3/tests/*.phpt \
+             && ls ext/pdo/tests/*.phpt | sed 's|^ext/pdo/|ext/pdo_sqlite/|') | sort > present.txt
           comm -12 known-all.txt present.txt > known.txt
           ABSENT=$(comm -23 known-all.txt present.txt | wc -l)
           echo "shim-only failures: $(wc -l < only.txt), known: $(wc -l < known.txt)"

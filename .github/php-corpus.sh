@@ -46,5 +46,9 @@ if [ -z "$EXEC" ] || [ "$EXEC" -lt "$MIN" ]; then
   exit 1
 fi
 
-sed -n '/FAILED TEST SUMMARY/,/^====/p' "$LOG" \
+# ANCHORED: run-tests prints "EXPECTED FAILED TEST SUMMARY" 25 lines above the
+# real one, and an unanchored match takes the earlier section — which is how a
+# baseline reporting "Tests failed: 0" produced two failing test names, both of
+# them tests that are SUPPOSED to fail.
+sed -n '/^FAILED TEST SUMMARY/,/^====/p' "$LOG" \
   | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_.-]+\.phpt' | sort -u > "$FAILS"
