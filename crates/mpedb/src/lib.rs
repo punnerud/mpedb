@@ -137,6 +137,10 @@ pub use mpedb_types::value::{canonical_numeric, numeric_cmp, parse_numeric};
 /// The schema plus the generation it was read at — one value that answers both
 /// "what is the schema" and "is my copy stale", CONSISTENTLY.
 pub use mpedb_core::engine::SchemaBundle;
+/// What kind of storage a database file sits on. Re-exported because the
+/// design's "local filesystem" assumption is a fact CALLERS need — the C-API
+/// shim answers `PRAGMA mpedb_filesystem` from it.
+pub use mpedb_core::{fs_kind, FsKind};
 
 use exec::{exec_stmt, ChargeMode, ReadCtx};
 pub use exec::take_last_insert_rowid;

@@ -312,6 +312,9 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // `PRAGMA wal_checkpoint` on a sqlite-backed database writes the
             // sidecar back over its source file. A whole-image write, so it is
             // asked for explicitly and never implied.
+            if let Some((columns, rows)) = crate::filesystem_pragma(c, sqltext) {
+                return Ok(Outcome::Rows { columns, rows });
+            }
             match checkpoint_pragma(c, sqltext) {
                 Ok(Some((columns, rows))) => return Ok(Outcome::Rows { columns, rows }),
                 Ok(None) => {}

@@ -79,6 +79,46 @@ type PragmaAnswer = (Vec<String>, Vec<Vec<Value>>);
 /// never is, so that is what it gets. A sqlite-backed one reports the row
 /// count in both slots — not a WAL frame count, since nothing here is a WAL
 /// frame, but the honest measure of what was written.
+/// `PRAGMA mpedb_filesystem` — what kind of storage this database sits on.
+///
+/// mpedb's design assumes a local filesystem, and says so
+/// (`design/DESIGN.md`): the robust `PROCESS_SHARED` mutex, the meta pages and
+/// the reader table live INSIDE the memory-mapped file, which needs
+/// `MAP_SHARED` coherence and OFD lock semantics that a network filesystem
+/// does not promise.
+///
+/// It is a report, not a refusal, and the reason is the failure mode rather
+/// than politeness: on a network filesystem mpedb usually WORKS from one host,
+/// because a Linux client keeps one page cache per file. Refusing would break
+/// deployments that are fine today; staying silent would let one grow into a
+/// second host with no error anywhere. So it answers when asked.
+///
+/// Answers `(path, kind, ok)` — `ok = 1` for a local filesystem, `0` for a
+/// network one, and `1` when nothing could be determined, since an unknown
+/// answer must not read as an accusation.
+fn filesystem_pragma(c: &Sqlite3, sqltext: &str) -> Option<PragmaAnswer> {
+    let (name, _arg) = introspect::parse_pragma(sqltext);
+    if !name.eq_ignore_ascii_case("mpedb_filesystem") {
+        return None;
+    }
+    // The sqlite source when there is one: that is the file a caller thinks of
+    // as "the database", and the sidecar lives beside it anyway.
+    let path = c.sqlite_source.clone().unwrap_or_else(|| c.path.clone());
+    let (kind, ok) = match mpedb::fs_kind(&path) {
+        mpedb::FsKind::Local => ("local".to_string(), 1),
+        mpedb::FsKind::Network(n) => (n.to_string(), 0),
+        mpedb::FsKind::Unknown => ("unknown".to_string(), 1),
+    };
+    Some((
+        vec!["path".to_string(), "kind".to_string(), "ok".to_string()],
+        vec![vec![
+            Value::Text(path.to_string_lossy().into_owned()),
+            Value::Text(kind),
+            Value::Int(ok),
+        ]],
+    ))
+}
+
 fn checkpoint_pragma(c: &mut Sqlite3, sqltext: &str) -> Result<Option<PragmaAnswer>, String> {
     let (name, _arg) = introspect::parse_pragma(sqltext);
     if !name.eq_ignore_ascii_case("wal_checkpoint") {

@@ -553,7 +553,7 @@ fn sidecar_is_fresh(src: &Path, side: &Path) -> bool {
     // sidecar in existence.
     let stamp = stamp_path(side);
     match std::fs::read_to_string(&stamp) {
-        Ok(t) => t.trim() == source_stamp(src, sm.len()),
+        Ok(t) => source_stamp(src).is_some_and(|now| t.trim() == now),
         // No stamp: a sidecar from before this existed. Unknown means
         // fresh-by-mtime, exactly as before — no forced re-import of every
         // sidecar already on disk.
@@ -561,16 +561,42 @@ fn sidecar_is_fresh(src: &Path, side: &Path) -> bool {
     }
 }
 
-/// `<length>:<hex of the 100-byte header>` — the source's identity, cheaply.
-fn source_stamp(src: &Path, len: u64) -> String {
-    use std::io::Read;
-    let mut head = [0u8; 100];
-    let n = std::fs::File::open(src).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
-    let mut out = format!("{len}:");
-    for b in &head[..n] {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
+/// The source's identity, as a line that can be compared.
+///
+/// `mpedb_sqlitefmt::stamp::BaseStamp` already answers exactly this question,
+/// and answers it better than the hand-rolled length-and-header pair that
+/// stood here first: it carries the change counter, the schema cookie, the
+/// format-version bytes AND the `-wal` salt pair — the last of which no amount
+/// of reading the main file can substitute for, because a WAL checkpoint
+/// reuses the log from offset 0 with new salts and unchanged size.
+///
+/// `read` rather than `settle_and_read`: settling exists to make mtime
+/// trustworthy against same-tick writes, and it needs a write-excluding lock
+/// on the base plus a scratch file. Here the base is not ours to lock, and the
+/// tuple's header fields already cover what mtime cannot.
+///
+/// Rendered rather than encoded because it is only ever compared with itself:
+/// the check formats the CURRENT stamp and compares strings, so no parser
+/// exists to disagree with the writer. The `v1` prefix means a future field
+/// invalidates old stamps instead of silently comparing unequal things.
+fn source_stamp(src: &Path) -> Option<String> {
+    let s = mpedb_sqlitefmt::stamp::BaseStamp::read(src).ok()?;
+    let t = s
+        .mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+        .unwrap_or_else(|_| "pre-epoch".into());
+    let wal = match s.wal {
+        Some((salt, len)) => {
+            let hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+            format!(" wal={hex}:{len}")
+        }
+        None => String::new(),
+    };
+    Some(format!(
+        "v1 {t} {} {} {} {:02x}{:02x}{wal}",
+        s.size, s.change_counter, s.schema_cookie, s.format_versions[0], s.format_versions[1]
+    ))
 }
 
 fn stamp_path(side: &Path) -> PathBuf {
@@ -708,8 +734,8 @@ fn sqlite_sidecar(src: &Path) -> Result<PathBuf, String> {
 
 /// Record the source's length beside the sidecar. Best effort.
 fn stamp_source(src: &Path, side: &Path) {
-    if let Ok(m) = std::fs::metadata(src) {
-        let _ = std::fs::write(stamp_path(side), source_stamp(src, m.len()));
+    if let Some(t) = source_stamp(src) {
+        let _ = std::fs::write(stamp_path(side), t);
     }
 }
 

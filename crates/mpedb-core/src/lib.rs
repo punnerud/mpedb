@@ -51,6 +51,11 @@ pub mod engine;
 // `not_unsafe_ptr_arg_deref` (rightly) only tolerates that behind a private
 // module. The facade needs exactly one of them, re-exported below.
 mod os;
+/// Which kind of storage a path sits on. Just these two out of `os` — the
+/// module is otherwise internal (hole punching, madvise hints), but the
+/// design's "local filesystem" precondition is something CALLERS have to be
+/// able to check, so the check is part of the surface.
+pub use os::{fs_kind, FsKind};
 pub use os::Instant;
 
 /// Wall-clock microseconds since the Unix epoch — see [`os::wall_clock_micros`].

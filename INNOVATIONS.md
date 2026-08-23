@@ -848,8 +848,14 @@ get wrong.
 The stamp itself is a tuple: timestamp, size, change counter, schema cookie, two
 header bytes, and — if a write-ahead log exists — **its salt pair**, which is the
 monotone witness the counter cannot be, because a log reset reuses the file from
-offset 0 with new salts and unchanged size. Network filesystems are refused by
-default: attribute caching defeats every part of this.
+offset 0 with new salts and unchanged size. Network filesystems **defeat every
+part of this** — attribute caching means the tuple can be stale in ways no
+field catches. They are DETECTED and reported (`fs_kind`, and
+`PRAGMA mpedb_filesystem` through the C-API shim), not refused: refusing would
+break deployments that work today because a Linux client keeps one page cache
+per file, so a single host does see its own writes. What is unsafe is a second
+host, and what was unacceptable was saying nothing. (This paragraph previously
+claimed they were refused by default. No such check existed.)
 
 ### 5.7 ABI-level drop-in, with the interposition itself under test [T]
 

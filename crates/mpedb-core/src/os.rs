@@ -286,6 +286,67 @@ pub fn punch_hole(fd: RawFd, offset: i64, len: i64) {
     }
 }
 
+/// The kind of filesystem a database file sits on, as far as it matters here.
+///
+/// Only one distinction is drawn, and only because mpedb's design rests on it:
+/// the engine puts its robust `PROCESS_SHARED` mutex, the meta pages and the
+/// reader table INSIDE the memory-mapped file (`shm.rs`). That construction
+/// needs `MAP_SHARED` coherence and OFD lock semantics, and a network
+/// filesystem promises neither.
+///
+/// It usually WORKS on one host anyway, which is the dangerous part: a Linux
+/// client keeps one page cache per file, so two processes on the same machine
+/// do see each other's writes. Nothing guarantees it, and a second host
+/// mounting the same export sees a different cache with no error anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsKind {
+    /// A local filesystem — what the design assumes.
+    Local,
+    /// A network filesystem, named. `MAP_SHARED` coherence is the client's
+    /// behaviour rather than a guarantee.
+    Network(&'static str),
+    /// `statfs` did not answer, or this platform has no cheap way to ask.
+    /// Deliberately NOT reported as network: a detector that cries wolf when
+    /// it cannot see is worse than one that stays quiet.
+    Unknown,
+}
+
+/// Which filesystem holds `path`.
+///
+/// One `statfs`, no allocation, no error path — an answer we cannot get is
+/// `Unknown`, never a failure to open. The magic numbers are Linux's, from
+/// `<linux/magic.h>`; they are stable ABI and there is no portable API for
+/// this.
+#[cfg(target_os = "linux")]
+pub fn fs_kind(path: &std::path::Path) -> FsKind {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return FsKind::Unknown;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return FsKind::Unknown;
+    }
+    match st.f_type as i64 {
+        0x6969 => FsKind::Network("NFS"),
+        0xff53_4d42 | 0xfe53_4d42 => FsKind::Network("SMB/CIFS"),
+        0x0187 => FsKind::Network("AFS"),
+        0x0127_2d76 => FsKind::Network("Ceph"),
+        0x6b41_6653 => FsKind::Network("9P"),
+        // FUSE is not itself remote, but it may be anything — sshfs and every
+        // cloud mount live here. Named separately so the message can say so.
+        0x6573_5546 => FsKind::Network("FUSE (may be remote)"),
+        _ => FsKind::Local,
+    }
+}
+
+/// macOS/Windows/wasm: no cheap portable probe, so no claim is made.
+#[cfg(not(target_os = "linux"))]
+pub fn fs_kind(path: &std::path::Path) -> FsKind {
+    let _ = path;
+    FsKind::Unknown
+}
+
 /// Advise transparent huge pages over the mapping. Opportunistic; macOS: no-op.
 /// Windows: large pages need SE_LOCK_MEMORY_NAME and a non-pageable
 /// allocation, which does not fit a file-backed shared mapping. This is a

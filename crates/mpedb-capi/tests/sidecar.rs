@@ -93,7 +93,9 @@ fn a_restore_that_keeps_the_mtime_is_still_seen() {
 /// The limit of the stamp, pinned rather than left to be discovered.
 ///
 /// 3 rows and 7 rows both fit one page, so the two files have the SAME length
-/// and a byte-identical 100-byte header — they differ only in page content.
+/// and a byte-identical header — same change counter, same schema cookie, same
+/// format bytes, no `-wal` either side, so `BaseStamp` sees one file. They
+/// differ only in page content.
 /// Nothing short of hashing the whole source can tell them apart, and hashing
 /// 142 MB on every open costs more than the import being avoided. So this case
 /// is NOT caught, and that is a decision, not an oversight: if it ever has to

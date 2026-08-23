@@ -62,7 +62,19 @@ documents rather than solves in Phase 1.
   creator's PID-namespace inode (`/proc/self/ns/pid`) and boot id; attach from a
   different namespace or after reboot-with-live-file inconsistencies is refused with a
   clear error. NFS and other network filesystems are unsupported (mmap coherence and OFD
-  lock semantics do not hold).
+  lock semantics do not hold) — the robust `PROCESS_SHARED` mutex, the meta pages and the
+  reader table all live INSIDE the mapping, so this is not a formality.
+
+  They are **detected and reported, not refused**: `mpedb_core::fs_kind`, and
+  `PRAGMA mpedb_filesystem` (`path`, `kind`, `ok`) through the C-API shim. The reason is
+  the failure mode. On one Linux host it usually WORKS — the client keeps one page cache
+  per file, so processes there do see each other's writes — and a hard refusal would stop
+  deployments that are fine. What no cache saves is a SECOND host mounting the same
+  export: it sees its own cache, and nothing anywhere reports an error. So the distinction
+  worth holding is not local-vs-network but **who writes**: reading from one host a file
+  that is replaced atomically is a different risk from concurrent writers over NFS. The
+  first is what politihelikopter.com does; the second is what the design refuses to
+  reason about.
 - Online schema migration: attach fails on schema mismatch with a diff (the full canonical
   schema is stored **in the file**, §6); `mpedb-cli dump`/`migrate` provide the offline
   escape hatch.
