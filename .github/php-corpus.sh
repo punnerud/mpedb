@@ -69,12 +69,17 @@ grep '^SKIP ' "$LOG" \
 # times in this one step, twice by the code written to prevent it. Parsing
 # MORE than reported is fine (a redirect parent is named alongside its
 # children); parsing fewer means the pattern missed, and the count is a lie.
-check() { # name reported parsed
+check() { # name reported parsed sample-pattern
   echo "  $1: run-tests reported $2, parsed $3"
-  [ "$3" -ge "$2" ] || { echo "parsed fewer $1 than run-tests reported — the pattern missed"; exit 1; }
+  [ "$3" -ge "$2" ] || {
+    echo "parsed fewer $1 than run-tests reported — the pattern missed"
+    echo "  how those lines actually look in the log:"
+    grep -inE "$4" "$LOG" | head -5 | cut -c1-140
+    exit 1
+  }
 }
-check failures "$(grep -m1 '^Tests failed' "$LOG" | awk '{print $4}')" "$(wc -l < "$FAILS")"
-check skips    "$(grep -m1 '^Tests skipped' "$LOG" | awk '{print $4}')" "$(wc -l < "${FAILS%.txt}-skipped.txt")"
+check failures "$(grep -m1 '^Tests failed' "$LOG" | awk '{print $4}')" "$(wc -l < "$FAILS")" 'FAIL'
+check skips    "$(grep -m1 '^Tests skipped' "$LOG" | awk '{print $4}')" "$(wc -l < "${FAILS%.txt}-skipped.txt")" 'SKIP'
 
 # grep exits 1 on no match, and under `pipefail` that becomes the script's
 # status: a perfectly clean run would report itself as a failure. The count
