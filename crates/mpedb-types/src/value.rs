@@ -799,7 +799,10 @@ fn class_rank(v: &Value) -> Option<u8> {
 /// a NaN at all — it turns into NULL on the way in — so no differential can
 /// observe the difference, while an order that is not total would break every
 /// sort that meets one.
-fn int_float_cmp(i: i64, r: f64) -> Ordering {
+/// `pub(crate)` for the filter fast path (`expr::numeric_filter`), which must
+/// answer EXACTLY as `sql_cmp` does or it is not a fast path but a second
+/// opinion. One implementation, two callers.
+pub(crate) fn int_float_cmp(i: i64, r: f64) -> Ordering {
     if r.is_nan() {
         return Ordering::Less;
     }

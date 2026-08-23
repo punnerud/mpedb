@@ -459,6 +459,10 @@ pub struct ExprProgram {
     /// Maximum stack depth, proven at construction/decode time so `eval`
     /// needs no per-instruction underflow checks to be panic-free.
     max_stack: usize,
+    /// Every opcode is one [`numeric_filter`] handles, and the frame fits.
+    /// Derived, never encoded — a decoded program recomputes it in
+    /// [`Self::new`], so the plan format is unchanged.
+    fast_ok: bool,
 }
 
 impl ExprProgram {
@@ -496,10 +500,35 @@ impl ExprProgram {
     /// Build a program, verifying stack discipline and const/index bounds.
     pub fn new(instrs: Vec<Instr>, consts: Vec<Value>) -> Result<ExprProgram> {
         let max_stack = codec::validate(&instrs, &consts)?;
+        // Whether the numeric filter fast path COULD take this program is a
+        // property of the opcodes, so it is settled once here rather than
+        // rediscovered per row. Measured why: without this, a program the fast
+        // path cannot take paid for the attempt on every row — an interleaved
+        // A/B over an affinity-carrying filter showed the attempt costing
+        // ~14 ns/row, which turned a win into a 1.3 % loss.
+        let fast_ok = max_stack <= NUM_DEPTH
+            && instrs.iter().all(|i| {
+                matches!(
+                    i,
+                    Instr::PushCol(_)
+                        | Instr::PushParam(_)
+                        | Instr::PushConst(_)
+                        | Instr::Eq
+                        | Instr::Ne
+                        | Instr::Lt
+                        | Instr::Le
+                        | Instr::Gt
+                        | Instr::Ge
+                        | Instr::And
+                        | Instr::Or
+                        | Instr::Not
+                )
+            });
         Ok(ExprProgram {
             instrs,
             consts,
             max_stack,
+            fast_ok,
         })
     }
 
@@ -1088,8 +1117,184 @@ impl ExprProgram {
         // non-boolean is truthy-tested the way sqlite does (`truthy3`); the
         // binder has already desugared every statically-typed boolean context,
         // so this only catches expressions whose type could not be pinned.
+        // The numeric fast path first. It declines — cheaply, and without
+        // touching `stack` — on anything it does not handle, so the general
+        // evaluator below remains the only path that can error, call a host
+        // function or see text. Declining is free of side effects, which is
+        // what makes falling through safe rather than merely convenient.
+        if self.fast_ok && !fastpath_off() {
+            if let Some(hit) = numeric_filter(self, cols, params) {
+                return Ok(hit);
+            }
+        }
         Ok(truthy3(&self.eval_with_stack_host(stack, cols, params, host)?) == Some(true))
     }
+}
+
+/// `MPEDB_NO_FASTPATH=1` takes the numeric filter out of the picture.
+///
+/// Kept, not scaffolding. An A/B that needs two builds cannot rule out the
+/// build, and this one had to: a two-build comparison of the OLAP suite showed
+/// the fast path doing NOTHING, while the same binary under this variable
+/// showed 14.5 %. The two-build answer was wrong, and without a runtime switch
+/// there was no way to find that out.
+///
+/// Read once through a `OnceLock` — a `getenv` per row would be the thing
+/// being measured — and only reached when `fast_ok` already said yes.
+/// The fast path's frame depth. A deeper program declines at construction.
+const NUM_DEPTH: usize = 32;
+
+fn fastpath_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("MPEDB_NO_FASTPATH").is_ok_and(|v| v == "1"))
+}
+
+/// One slot of the numeric filter fast path: `Copy`, no heap, no drop glue.
+///
+/// The general evaluator's slot is `Value` — 32 bytes with four heap-owning
+/// variants and a recursive one, so every push is an eleven-way `clone` call
+/// and every pop runs drop glue. Measured (`mpedb-bench --expr`): cloning a
+/// `Value::Null` costs 10.7 ns where copying the same 32 bytes as a plain
+/// struct costs 0.58. The payload is irrelevant; the enum machinery is the
+/// cost, and this type exists to not have it.
+#[derive(Clone, Copy)]
+enum Num {
+    Null,
+    I(i64),
+    F(f64),
+    B(bool),
+}
+
+impl Num {
+    /// The one conversion in, and the gate: anything not numeric declines the
+    /// whole fast path rather than guessing at its semantics.
+    fn of(v: &Value) -> Option<Num> {
+        match v {
+            Value::Null => Some(Num::Null),
+            Value::Int(i) => Some(Num::I(*i)),
+            Value::Float(f) => Some(Num::F(*f)),
+            Value::Bool(b) => Some(Num::B(*b)),
+            _ => None,
+        }
+    }
+
+    /// [`truthy3`] for this slot, arm for arm.
+    fn truthy(self) -> Option<bool> {
+        match self {
+            Num::Null => None,
+            Num::B(b) => Some(b),
+            Num::I(i) => Some(i != 0),
+            Num::F(f) => Some(f != 0.0),
+        }
+    }
+
+    /// [`Value::sql_cmp`] for this slot, arm for arm — including the arms it
+    /// REFUSES. `Bool` against a number is not a comparison mpedb answers, and
+    /// answering it here would be a divergence, so it declines instead.
+    fn cmp3(self, other: Num) -> Option<Option<Ordering>> {
+        use Num::*;
+        Some(Some(match (self, other) {
+            (Null, _) | (_, Null) => return Some(None),
+            (I(a), I(b)) => a.cmp(&b),
+            (F(a), F(b)) => crate::value::float_total_cmp(a, b),
+            (I(a), F(b)) => crate::value::int_float_cmp(a, b),
+            (F(a), I(b)) => crate::value::int_float_cmp(b, a).reverse(),
+            (B(a), B(b)) => a.cmp(&b),
+            // Mixed bool/number: `sql_cmp` refuses it. Decline, so the general
+            // path produces the error and its exact text.
+            _ => return None,
+        }))
+    }
+}
+
+/// A filter over numeric columns, evaluated without boxing.
+///
+/// Returns `None` when the program or the data is outside what this handles —
+/// any opcode not in the subset below, any value that is not NULL, an integer,
+/// a real or a boolean, any comparison `sql_cmp` refuses. The caller then runs
+/// the general evaluator, which is the only path that produces errors, calls
+/// host functions, or touches text.
+///
+/// **Every arm here mirrors one in `eval_with_stack_host`, deliberately.** A
+/// fast path that computes something subtly different is not an optimisation,
+/// it is a second engine — so `prop_fast_path_matches_general` runs both over
+/// random programs and rows and demands the same answer.
+fn numeric_filter(prog: &ExprProgram, cols: &[Value], params: &[Value]) -> Option<bool> {
+    // A fixed frame, not a `Vec`: this runs once per ROW, and one heap
+    // allocation per row would cost more than the boxing it exists to avoid.
+    // `max_stack` is proven at construction, so the depth is known before the
+    // first instruction and a deeper program simply declines.
+    let mut stack = [Num::Null; NUM_DEPTH];
+    let mut sp = 0usize;
+    macro_rules! push {
+        ($v:expr) => {{
+            if sp >= NUM_DEPTH {
+                return None;
+            }
+            stack[sp] = $v;
+            sp += 1;
+        }};
+    }
+    macro_rules! pop {
+        () => {{
+            sp = sp.checked_sub(1)?;
+            stack[sp]
+        }};
+    }
+    for &instr in &prog.instrs {
+        match instr {
+            Instr::PushCol(i) => push!(Num::of(cols.get(i as usize)?)?),
+            Instr::PushParam(i) => push!(Num::of(params.get(i as usize)?)?),
+            Instr::PushConst(i) => push!(Num::of(prog.consts.get(i as usize)?)?),
+            Instr::Eq | Instr::Ne | Instr::Lt | Instr::Le | Instr::Gt | Instr::Ge => {
+                let b = pop!();
+                let a = pop!();
+                push!(match a.cmp3(b)? {
+                    None => Num::Null,
+                    Some(ord) => Num::B(match instr {
+                        Instr::Eq => ord == Ordering::Equal,
+                        Instr::Ne => ord != Ordering::Equal,
+                        Instr::Lt => ord == Ordering::Less,
+                        Instr::Le => ord != Ordering::Greater,
+                        Instr::Gt => ord == Ordering::Greater,
+                        _ => ord != Ordering::Less,
+                    }),
+                });
+            }
+            Instr::And | Instr::Or => {
+                let b = pop!().truthy();
+                let a = pop!().truthy();
+                push!(if matches!(instr, Instr::And) {
+                    match (a, b) {
+                        (Some(false), _) | (_, Some(false)) => Num::B(false),
+                        (Some(true), Some(true)) => Num::B(true),
+                        _ => Num::Null,
+                    }
+                } else {
+                    match (a, b) {
+                        (Some(true), _) | (_, Some(true)) => Num::B(true),
+                        (Some(false), Some(false)) => Num::B(false),
+                        _ => Num::Null,
+                    }
+                });
+            }
+            Instr::Not => {
+                let a = pop!().truthy();
+                push!(match a {
+                    None => Num::Null,
+                    Some(x) => Num::B(!x),
+                });
+            }
+            // Everything else — arithmetic, CASE jumps, scalar and host calls,
+            // IN, LIKE, collated compares — stays with the general evaluator.
+            _ => return None,
+        }
+    }
+    // A program that leaves anything but one value is not one this may judge.
+    if sp != 1 {
+        return None;
+    }
+    Some(stack[0].truthy() == Some(true))
 }
 
 /// sqlite's `sqlite3VdbeBooleanValue`, as SQL 3VL: `None` for NULL, otherwise

@@ -1488,3 +1488,106 @@ fn scalar_min_max_semantics_and_codec() {
         let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
     }
 }
+
+/// The filter fast path must answer EXACTLY as the general evaluator does.
+///
+/// `numeric_filter` is a second implementation of the same semantics, and a
+/// second implementation that disagrees anywhere is not an optimisation — it
+/// is a wrong answer that only appears for some shapes of data. So: random
+/// programs over random rows, both evaluators, every result compared.
+///
+/// The generator deliberately produces rows the fast path must DECLINE (text,
+/// blobs) alongside ones it takes, and programs it cannot handle (arithmetic,
+/// scalar calls) alongside ones it can — a test that only ever exercises the
+/// fast path would not notice it swallowing a case it should have passed on.
+#[cfg(test)]
+mod fast_path_parity {
+    use crate::expr::{ExprProgram, Instr};
+    use crate::Value;
+
+    /// A tiny deterministic PRNG: reproducible failures beat a good
+    /// distribution, and any seed that fails must fail again.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        fn upto(&mut self, n: u64) -> usize {
+            (self.next() % n) as usize
+        }
+    }
+
+    fn a_value(r: &mut Rng) -> Value {
+        match r.upto(8) {
+            0 => Value::Null,
+            1 => Value::Int(r.next() as i64 % 7 - 3),
+            2 => Value::Int(0),
+            3 => Value::Float((r.next() % 700) as f64 / 100.0 - 3.5),
+            4 => Value::Float(0.0),
+            5 => Value::Float(-0.0),
+            6 => Value::Bool(r.upto(2) == 1),
+            // Not numeric: the fast path must decline the whole program.
+            _ => Value::Text(format!("t{}", r.upto(3))),
+        }
+    }
+
+    #[test]
+    fn the_fast_path_never_disagrees_with_the_general_one() {
+        let mut r = Rng(0x5eed);
+        let cmp = [Instr::Eq, Instr::Ne, Instr::Lt, Instr::Le, Instr::Gt, Instr::Ge];
+        let mut taken = 0usize;
+        let mut declined = 0usize;
+
+        for _ in 0..20_000 {
+            // A program: two or three comparisons over columns and consts,
+            // folded with AND/OR/NOT.
+            let terms = 1 + r.upto(3);
+            let consts: Vec<Value> = (0..4).map(|_| a_value(&mut r)).collect();
+            let mut instrs = Vec::new();
+            for t in 0..terms {
+                instrs.push(Instr::PushCol(r.upto(3) as u16));
+                instrs.push(Instr::PushConst(r.upto(4) as u16));
+                instrs.push(cmp[r.upto(6)]);
+                if r.upto(4) == 0 {
+                    instrs.push(Instr::Not);
+                }
+                if t > 0 {
+                    instrs.push(if r.upto(2) == 0 { Instr::And } else { Instr::Or });
+                }
+            }
+            // Sometimes an opcode the fast path must refuse.
+            if r.upto(5) == 0 {
+                instrs.push(Instr::PushConst(0));
+                instrs.push(Instr::Add);
+            }
+            let Ok(prog) = ExprProgram::new(instrs, consts) else {
+                continue; // not stack-disciplined; the generator's problem, not the engine's
+            };
+            let cols: Vec<Value> = (0..3).map(|_| a_value(&mut r)).collect();
+
+            let fast = super::super::numeric_filter(&prog, &cols, &[]);
+            let mut stack = Vec::new();
+            let slow = prog
+                .eval_with_stack_host(&mut stack, &cols, &[], None)
+                .map(|v| super::super::truthy3(&v) == Some(true));
+
+            match (fast, &slow) {
+                (Some(f), Ok(s)) => {
+                    assert_eq!(f, *s, "fast {f} vs general {s}\nprog {:?}\ncols {cols:?}", prog.instrs);
+                    taken += 1;
+                }
+                // Declining is always allowed; the general path then answers.
+                (None, _) => declined += 1,
+                // The fast path must never answer where the general one errors.
+                (Some(f), Err(e)) => {
+                    panic!("fast path answered {f} where the general one errored: {e}\nprog {:?}\ncols {cols:?}", prog.instrs)
+                }
+            }
+        }
+        // A parity test that never takes the fast path proves nothing, and one
+        // that always takes it never exercised the decline.
+        assert!(taken > 2_000, "fast path almost never fired: {taken}");
+        assert!(declined > 2_000, "fast path never declined: {declined}");
+    }
+}

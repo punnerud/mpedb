@@ -66,6 +66,38 @@ Linear, with a ~15 ns fixed cost per call. This also reconciles the bench with
 `olap.md`: the filter there costs ~44.5 ns/row, which is a three-opcode
 program at 49 ns — not a different result, a shorter predicate.
 
+## What it bought, end to end
+
+The decomposition above says what expression evaluation costs. It does not say
+what a QUERY costs, and the two are not the same thing — so the fast path was
+measured through the C API on a 945 234-row table, one binary, with
+`MPEDB_NO_FASTPATH=1` as the only difference:
+
+| workload | fast path off | on | |
+|---|---:|---:|---|
+| full scan + one predicate | 198.7 ms | **170.0 ms** | −14.5 % |
+| index range + residual filter | 233.9 | 233.7 | unchanged |
+| the microbench above, 15 opcodes | 187 ns/row | 48.6 | −74 % |
+
+Both results are the expected ones. A full scan spends its time deciding rows,
+so a cheaper decision shows. An index range spends it fetching rows the index
+pointed at, and its filter is a rounding error — which is what an earlier
+measurement had already found, when adding four comparisons per row to that
+query cost nothing at all.
+
+**A methodological note worth more than the numbers.** The first attempt
+compared two BUILDS of the OLAP suite, with and without the change, and showed
+exactly nothing: `scan-filter-sum` 21.6 ms against 21.8. The same change under
+a runtime switch, one binary, shows 14.5 %. A two-build comparison cannot rule
+out the build, and here it was wrong. `MPEDB_NO_FASTPATH` stays in the tree for
+that reason — not as scaffolding, but because without it the wrong answer was
+unfalsifiable.
+
+An earlier version of this document also read the `value − f64` gap as pure
+boxing. It is boxing plus whatever else differs between the two arms, and only
+a fraction of it reaches a real query: 74 % off the interpreter is 14.5 % off
+the scan that contains it.
+
 ## What follows
 
 **Copy-and-patch is cancelled by this measurement, not by opinion.** It removes
@@ -75,7 +107,11 @@ executable memory at all, so the interpreter would have to stay anyway) plus
 W^X handling on macOS and Windows. A large permanent surface for a fraction of
 a tenth.
 
-**Type specialisation is where the win is**, and it is ordinary Rust. mpedb's
+**Type specialisation is where the win is**, and it is now in the tree
+(`expr::numeric_filter`): a 16-byte `Copy` slot with no drop glue, on a fixed
+frame with no per-row allocation, tried only for programs whose opcodes qualify
+— settled once at construction, because deciding it per row cost ~14 ns/row on
+programs that do not. It is ordinary Rust. mpedb's
 plans are already statically typed — the binder enforces rigid typing,
 `CompiledPlan.param_types` pins parameters, `SchemaBundle.col_types` knows
 every column — so the types exist at compile time and the evaluator throws

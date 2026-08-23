@@ -181,6 +181,99 @@ fn scaling_control(vrows: &[Vec<Value>], reps: usize) {
     }
 }
 
+/// The 11.3 ns per opcode, taken apart.
+///
+/// Knowing that boxing costs ten nanoseconds an opcode does not say WHICH part
+/// of boxing: the 32-byte move, the `clone` call, the drop glue, or `sql_cmp`'s
+/// walk over the type cross-product. Each is a different fix, so each is timed
+/// on its own here rather than argued about.
+fn opcode_parts(reps: usize, n: usize) {
+    let a = Value::Float(10.83);
+    let b = Value::Float(10.90);
+    let text = Value::Text("4a9f01".to_string());
+
+    let mut best = [f64::MAX; 7];
+    for _ in 0..reps {
+        // 1. clone a numeric Value — what PushCol/PushConst do
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(a.clone());
+        }
+        best[0] = best[0].min(t.elapsed().as_secs_f64());
+
+        // 2. clone a TEXT Value — the same opcode when the column is text
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(text.clone());
+        }
+        best[1] = best[1].min(t.elapsed().as_secs_f64());
+
+        // 3. sql_cmp on two numerics
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(a.sql_cmp(&b).unwrap());
+        }
+        best[2] = best[2].min(t.elapsed().as_secs_f64());
+
+        // 4. a Vec<Value> push+pop round trip — the move and the drop glue
+        let mut v: Vec<Value> = Vec::with_capacity(4);
+        let t = Instant::now();
+        for _ in 0..n {
+            v.push(a.clone());
+            std::hint::black_box(v.pop());
+        }
+        best[3] = best[3].min(t.elapsed().as_secs_f64());
+
+        // 5b. is the cost the VARIANT or the enum machinery? If Null clones
+        // as slowly as Float, nothing about the payload explains it.
+        let nul = Value::Null;
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(nul.clone());
+        }
+        best[5] = best[5].min(t.elapsed().as_secs_f64());
+
+        // 5c. a plain 32-byte struct with no drop and no enum — the floor for
+        // moving the same number of bytes.
+        // The field is never read on purpose — the point is the MOVE, and
+        // reading it would measure a load as well.
+        #[derive(Clone, Copy)]
+        struct Bytes32(#[allow(dead_code)] [u64; 4]);
+        let raw = Bytes32([1, 2, 3, 4]);
+        let t = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(raw);
+        }
+        best[6] = best[6].min(t.elapsed().as_secs_f64());
+
+        // 5. the same round trip with f64 — the floor for a stack operation
+        let mut f: Vec<f64> = Vec::with_capacity(4);
+        let t = Instant::now();
+        for _ in 0..n {
+            f.push(10.83);
+            std::hint::black_box(f.pop());
+        }
+        best[4] = best[4].min(t.elapsed().as_secs_f64());
+    }
+    let ns = |i: usize| best[i] / n as f64 * 1e9;
+    println!("\n  Hvor gaar de ~11 ns per opkode?");
+    println!("  {:<34} {:>8}", "del", "ns");
+    for (i, name) in [
+        "clone Value::Float",
+        "clone Value::Text (heap)",
+        "sql_cmp(Float, Float)",
+        "Vec<Value> push+pop",
+        "Vec<f64> push+pop",
+        "clone Value::Null",
+        "kopier 32 byte (ingen enum)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        println!("  {:<34} {:>8.2}", name, ns(i));
+    }
+}
+
 pub fn run(rows_n: usize, reps: usize) {
     let prog = predicate_program();
     let (fops, fconsts) = f64_program();
@@ -250,6 +343,7 @@ pub fn run(rows_n: usize, reps: usize) {
              interp, 100.0 * interp / total);
     println!();
     scaling_control(&vrows, reps);
+    opcode_parts(reps, 2_000_000);
     println!();
     println!("  Den andre linja er alt en JIT eller en vektoriserer kan angripe.");
     println!("  Er den liten, er copy-and-patch avlyst uansett hva den koster.");
