@@ -251,17 +251,9 @@ jobs:
             "*/run-tests.php" "*/ext/pdo_sqlite" "*/ext/sqlite3"
           test -f corpus/run-tests.php || { echo "corpus did not extract"; exit 1; }
           echo "extracted: $(ls corpus/ext/pdo_sqlite/tests/*.phpt corpus/ext/sqlite3/tests/*.phpt | wc -l) tests"
-          cd corpus
-          run() {
-            find ext/pdo_sqlite/tests ext/sqlite3/tests -name '*.diff' -delete 2>/dev/null || true
-            env $1 TEST_PHP_EXECUTABLE="$(which php)" php run-tests.php -q --offline \
-              -p "$(which php)" ext/pdo_sqlite/tests ext/sqlite3/tests 2>&1 \
-              | sed -n '/FAILED TEST SUMMARY/,/^====/p' \
-              | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_]+\.phpt' | sort -u
-          }
-          run "IGNORE=1" > ../base.txt || true
-          echo "stock sqlite fails: $(wc -l < ../base.txt)"
-          cat ../base.txt
+          .github/php-corpus.sh corpus base.log base.txt
+          echo "stock sqlite fails: $(wc -l < base.txt)"
+          cat base.txt
 
       - name: …and the same corpus against the shim
         run: |
@@ -281,18 +273,20 @@ jobs:
             echo str_contains($m, "libmpedb_sqlite3") ? "mpedb" : "system";')
           echo "PHP has mapped: $MAPPED"
           test "$MAPPED" = "mpedb" || { echo "the shim did not load — refusing to report on it"; exit 1; }
-          cd corpus
-          find ext/pdo_sqlite/tests ext/sqlite3/tests -name '*.diff' -delete 2>/dev/null || true
-          LD_LIBRARY_PATH="$PWD/../shimlib" TEST_PHP_EXECUTABLE="$(which php)" \
-            php run-tests.php -q --offline -p "$(which php)" \
-            ext/pdo_sqlite/tests ext/sqlite3/tests 2>&1 \
-            | sed -n '/FAILED TEST SUMMARY/,/^====/p' \
-            | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_]+\.phpt' | sort -u > ../shim.txt || true
-          cd ..
+          LD_LIBRARY_PATH="$PWD/shimlib" .github/php-corpus.sh corpus shim.log shim.txt
           # Shim-only: fails here, passes under stock sqlite.
           comm -13 base.txt shim.txt > only.txt
-          grep -vE '^#|^$' .github/php-corpus-known.txt | sort > known.txt
+          # The known list was measured against one PHP; the runner has another,
+          # and php-src adds and removes .phpt files between patch releases. A
+          # test that is not IN this corpus did not pass — it did not run, and
+          # calling it fixed would delete a real entry on the strength of a
+          # version difference. Compare only against what exists here.
+          grep -vE '^#|^$' .github/php-corpus-known.txt | sort > known-all.txt
+          (cd corpus && ls ext/pdo_sqlite/tests/*.phpt ext/sqlite3/tests/*.phpt) | sort > present.txt
+          comm -12 known-all.txt present.txt > known.txt
+          ABSENT=$(comm -23 known-all.txt present.txt | wc -l)
           echo "shim-only failures: $(wc -l < only.txt), known: $(wc -l < known.txt)"
+          echo "known entries absent from this PHP's corpus (not judged): $ABSENT"
 
           NEW=$(comm -13 known.txt only.txt)
           FIXED=$(comm -23 known.txt only.txt)
