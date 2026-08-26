@@ -28,6 +28,7 @@
 //!
 //! Leaf cell:   u16 key_len ‖ u8 vkind ‖ key ‖ (vkind=0: u16 val_len ‖ val)
 //!                                          ‖ (vkind=1: u32 total_len ‖ u64 first_overflow_page)
+//!                                          ‖ (vkind=4: u128 content_hash ‖ u64 total_len)
 //! Branch cell: u16 key_len ‖ key ‖ u64 child   (separator: child holds keys ≥ separator)
 
 use crate::pagestore::{cow, PageStore};
@@ -143,6 +144,20 @@ fn leaf_cell(p: &[u8], i: usize) -> Result<(&[u8], LeafVal<'_>)> {
                 first_page: u64::from_le_bytes(rest[4..12].try_into().unwrap()),
             }
         }
+        4 => {
+            if rest.len() < EXTERNAL_REF_LEN {
+                return Err(corrupt("truncated external ref"));
+            }
+            let hash = u128::from_le_bytes(rest[0..16].try_into().unwrap());
+            let total_len = u64::from_le_bytes(rest[16..24].try_into().unwrap());
+            // A zero length would name the empty payload, which never leaves
+            // the tree — anything that small is inline. Refusing it here keeps
+            // a zeroed cell from decoding as a legitimate reference.
+            if total_len == 0 {
+                return Err(corrupt("external ref of zero length"));
+            }
+            LeafVal::External { hash, total_len }
+        }
         2 => {
             if rest.len() < EXTENT_REF_LEN {
                 return Err(corrupt("truncated extent ref"));
@@ -178,11 +193,51 @@ fn leaf_cell(p: &[u8], i: usize) -> Result<(&[u8], LeafVal<'_>)> {
 /// Encoded size of a `vkind=2` reference: start_page ‖ total_len ‖ npages.
 pub const EXTENT_REF_LEN: usize = 8 + 8 + 4;
 
+/// Encoded size of a `vkind=4` reference: content hash ‖ total_len.
+///
+/// ## Why there is a fourth kind
+///
+/// `vkind=2` names a run of pages inside this file's own arena, so the value
+/// it points at can only be reached by a process that has this file mapped.
+/// `vkind=4` names the payload by its **contents** instead, which makes the
+/// payload a thing that can live outside the arena entirely — as its own file,
+/// carried by whatever moves files between machines.
+///
+/// Content addressing is what removes the conflict rather than resolving it.
+/// Two writers that produce the same bytes compute the same name and are
+/// already in agreement without having spoken; two that produce different bytes
+/// compute different names and never contend for one. Whatever carries the
+/// objects is handed only immutable things, and immutable things have no
+/// merge.
+///
+/// ## `xxh3_128` names; it does not authorise
+///
+/// The hash answers "which payload is this", and 128 bits puts accidental
+/// collision far past the birthday bound for any corpus a database like this
+/// holds. It is deliberately not asked to answer "may this writer put bytes
+/// here" — that is the store's question, and every store that shares payloads
+/// between people already has an answer to it, the way Core Data and CloudKit
+/// do. A writer who could plant a colliding object would need write access
+/// first, and a writer with write access does not need a collision.
+///
+/// So a cryptographic digest would buy nothing here and cost something real:
+/// this engine is reached through a shim that is a drop-in for libsqlite3, and
+/// a dependency surface that drifts from sqlite's is a compatibility bill paid
+/// for a guarantee that belongs one layer up.
+pub const EXTERNAL_REF_LEN: usize = 16 + 8;
+
+/// The name a payload is stored under, computed from the payload alone.
+pub fn content_hash(bytes: &[u8]) -> u128 {
+    xxhash_rust::xxh3::xxh3_128(bytes)
+}
+
 #[derive(Clone, Copy)]
 enum LeafVal<'a> {
     Inline(&'a [u8]),
     Overflow { total_len: u32, first_page: u64 },
     Extent { start_page: u64, total_len: u64, npages: u32 },
+    /// A payload held outside this file, named by its contents.
+    External { hash: u128, total_len: u64 },
 }
 
 fn leaf_cell_len(p: &[u8], i: usize) -> Result<usize> {
@@ -191,6 +246,7 @@ fn leaf_cell_len(p: &[u8], i: usize) -> Result<usize> {
         LeafVal::Inline(v) => 3 + key.len() + 2 + v.len(),
         LeafVal::Overflow { .. } => 3 + key.len() + 12,
         LeafVal::Extent { .. } => 3 + key.len() + EXTENT_REF_LEN,
+        LeafVal::External { .. } => 3 + key.len() + EXTERNAL_REF_LEN,
     })
 }
 
@@ -529,6 +585,8 @@ enum OldVal {
     None,
     Overflow(u64),
     Extent(u64, u32),
+    /// Named by contents, held outside the arena.
+    External(u128),
 }
 
 /// Free it — the ONE place replace and delete route through, so overflow
@@ -538,6 +596,11 @@ fn free_old_val<S: PageStore + ?Sized>(store: &mut S, old: OldVal) -> Result<()>
         OldVal::None => Ok(()),
         OldVal::Overflow(first) => free_overflow(store, first),
         OldVal::Extent(start, npages) => store.free_extent(start, npages),
+        // Letting go of a NAME, not of a place. Several rows — and several
+        // devices — may hold the same one, because identical contents produce
+        // it, so this can never be an unconditional delete. The store decides;
+        // the default does nothing, which leaks a file rather than losing one.
+        OldVal::External(hash) => store.release_external(hash),
     }
 }
 
@@ -556,6 +619,21 @@ fn read_leaf_val<S: PageStore + ?Sized>(store: &S, val: LeafVal<'_>) -> Result<V
             }
             Ok(out)
         }
+        LeafVal::External { hash, total_len } => {
+            let mut out = Vec::with_capacity(total_len.min(1 << 20) as usize);
+            store.read_external(hash, total_len, &mut out)?;
+            if out.len() as u64 != total_len {
+                return Err(corrupt("external read returned wrong length"));
+            }
+            // The name IS the contents, so a name that does not describe what
+            // came back is the one failure this kind can have that the others
+            // cannot: the bytes arrived from outside the arena, across
+            // whatever carried them, and nothing else has checked them.
+            if content_hash(&out) != hash {
+                return Err(corrupt("external payload does not match its content hash"));
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -569,6 +647,7 @@ pub enum ValueLoc {
     Inline(Vec<u8>),
     Overflow { total_len: u32, first_page: u64 },
     Extent { start_page: u64, total_len: u64 },
+    External { hash: u128, total_len: u64 },
 }
 
 impl ValueLoc {
@@ -577,6 +656,7 @@ impl ValueLoc {
             ValueLoc::Inline(v) => v.len() as u64,
             ValueLoc::Overflow { total_len, .. } => *total_len as u64,
             ValueLoc::Extent { total_len, .. } => *total_len,
+            ValueLoc::External { total_len, .. } => *total_len,
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -609,6 +689,9 @@ pub fn value_loc<S: PageStore + ?Sized>(
                         }
                         LeafVal::Extent { start_page, total_len, .. } => {
                             ValueLoc::Extent { start_page, total_len }
+                        }
+                        LeafVal::External { hash, total_len } => {
+                            ValueLoc::External { hash, total_len }
                         }
                     })),
                     Err(_) => Ok(None),
@@ -691,6 +774,23 @@ pub fn read_value_range<S: PageStore + ?Sized>(
                 return Err(corrupt("extent read returned wrong length"));
             }
             out.copy_from_slice(&scratch[skip..]);
+            Ok(())
+        }
+        ValueLoc::External { hash, total_len } => {
+            // The whole payload, even for a few bytes of it, and that is not
+            // laziness: the name IS a hash of the whole, so a fragment cannot
+            // be checked against it. Serving an unverified fragment would make
+            // the one guarantee this kind has — that the bytes are the bytes
+            // the writer wrote — quietly conditional on how much was asked for.
+            let mut whole = Vec::with_capacity((*total_len).min(1 << 20) as usize);
+            store.read_external(*hash, *total_len, &mut whole)?;
+            if whole.len() as u64 != *total_len {
+                return Err(corrupt("external read returned wrong length"));
+            }
+            if content_hash(&whole) != *hash {
+                return Err(corrupt("external payload does not match its content hash"));
+            }
+            out.copy_from_slice(&whole[off as usize..off as usize + out.len()]);
             Ok(())
         }
     }
@@ -842,6 +942,12 @@ pub enum Payload<'a> {
         total_len: u64,
         npages: u32,
     },
+    /// A payload ALREADY written outside this file and named by its contents:
+    /// the leaf carries only the `vkind=4` reference. Payload-before-reference
+    /// is the same contract as `ExtentRef`, and it matters more here — the
+    /// payload's file may be carried to another machine, and a reference that
+    /// arrives before its bytes names something that is not there yet.
+    ExternalRef { hash: u128, total_len: u64 },
 }
 
 impl<'a> Payload<'a> {
@@ -854,6 +960,7 @@ impl<'a> Payload<'a> {
             // payload's own size lives behind it and never counts against
             // inline/split thresholds.
             Payload::ExtentRef { .. } => EXTENT_REF_LEN,
+            Payload::ExternalRef { .. } => EXTERNAL_REF_LEN,
         }
     }
 
@@ -871,7 +978,9 @@ impl<'a> Payload<'a> {
             // big to be inline — `insert_rec` checks the length first.
             // An ExtentRef is encoded by the leaf writer itself (vkind=2),
             // never through the byte-copy path.
-            Payload::Stream { .. } | Payload::ExtentRef { .. } => &[],
+            Payload::Stream { .. }
+            | Payload::ExtentRef { .. }
+            | Payload::ExternalRef { .. } => &[],
         }
     }
 }
@@ -944,6 +1053,13 @@ fn make_leaf_cell(key: &[u8], val: &Payload<'_>, overflow_page: u64) -> Vec<u8> 
         c.extend_from_slice(&start_page.to_le_bytes());
         c.extend_from_slice(&total_len.to_le_bytes());
         c.extend_from_slice(&npages.to_le_bytes());
+        return c;
+    }
+    if let Payload::ExternalRef { hash, total_len } = val {
+        c.push(4);
+        c.extend_from_slice(key);
+        c.extend_from_slice(&hash.to_le_bytes());
+        c.extend_from_slice(&total_len.to_le_bytes());
         return c;
     }
     if overflow_page == 0 {
@@ -1095,6 +1211,7 @@ fn insert_rec<S: PageStore + ?Sized>(
                         LeafVal::Extent { start_page, npages, .. } => {
                             OldVal::Extent(start_page, npages)
                         }
+                        LeafVal::External { hash, .. } => OldVal::External(hash),
                         LeafVal::Inline(_) => OldVal::None,
                     }
                 };
@@ -1125,7 +1242,11 @@ fn insert_rec<S: PageStore + ?Sized>(
                 // The extent payload was written (and, in durable modes,
                 // synced) BEFORE this insert — the cell is only the 20-byte
                 // reference and never spills.
-                None if matches!(val, Payload::ExtentRef { .. }) => {
+                None if matches!(
+                    val,
+                    Payload::ExtentRef { .. } | Payload::ExternalRef { .. }
+                ) =>
+                {
                     (0u64, make_leaf_cell(key, val, 0))
                 }
                 None => {
@@ -1295,6 +1416,7 @@ fn delete_rec<S: PageStore + ?Sized>(store: &mut S, page_id: u64, key: &[u8]) ->
                     LeafVal::Extent { start_page, npages, .. } => {
                         OldVal::Extent(start_page, npages)
                     }
+                    LeafVal::External { hash, .. } => OldVal::External(hash),
                     LeafVal::Inline(_) => OldVal::None,
                 }
             };
@@ -2091,6 +2213,145 @@ mod tests {
         dirty[at + 8..at + 12].copy_from_slice(&(npages + 1).to_le_bytes());
         let err = get(&store, root, b"k").unwrap_err();
         assert!(format!("{err}").contains("mismatch"), "{err}");
+    }
+
+    /// A payload held outside the arena comes back exactly as it went in.
+    #[test]
+    fn external_payload_round_trips() {
+        let mut store = TestStore::new();
+        let bytes: Vec<u8> = (0..9000u32).map(|i| (i * 31) as u8).collect();
+        let (hash, total_len) = store.put_external(&bytes);
+        let root = insert(
+            &mut store,
+            0,
+            b"k",
+            &mut Payload::ExternalRef { hash, total_len },
+            InsertMode::Upsert,
+        )
+        .unwrap()
+        .new_root;
+        assert_eq!(get(&store, root, b"k").unwrap().as_deref(), Some(bytes.as_slice()));
+
+        // And a slice of it, which has to fetch and verify the whole thing.
+        let loc = value_loc(&store, root, b"k").unwrap().unwrap();
+        let mut window = vec![0u8; 300];
+        read_value_range(&store, &loc, 4096 - 7, &mut window).unwrap();
+        assert_eq!(window, &bytes[4096 - 7..4096 - 7 + 300]);
+    }
+
+    /// The `vkind=4` decode is strict: truncation at every offset must be
+    /// Corrupt, never a panic and never a read past the cell.
+    #[test]
+    fn external_cell_decode_is_strict() {
+        let mut store = TestStore::new();
+        let (hash, total_len) = store.put_external(&[3u8; 7000]);
+        let root = insert(
+            &mut store,
+            0,
+            b"kk",
+            &mut Payload::ExternalRef { hash, total_len },
+            InsertMode::Upsert,
+        )
+        .unwrap()
+        .new_root;
+        let page: Vec<u8> = store.page(root).unwrap().to_vec();
+
+        for cut in 0..page.len() {
+            let mut broken = page.clone();
+            broken.truncate(cut);
+            broken.resize(PAGE_SIZE, 0);
+            // Whatever it decides, it must decide it — a panic here is the bug
+            // this test exists for.
+            std::panic::catch_unwind(|| {
+                let _ = leaf_cell(&broken, 0);
+            })
+            .expect("decoding a truncated page must not panic");
+        }
+    }
+
+    /// The name is the contents, so contents that do not match the name are
+    /// refused rather than served.
+    ///
+    /// This is the one failure this kind has that the others cannot: an extent
+    /// is bytes this file wrote into itself, while an external payload arrived
+    /// from outside and nothing else has checked it.
+    #[test]
+    fn external_payload_that_does_not_match_its_name_is_refused() {
+        struct Liar {
+            inner: TestStore,
+            serve: Vec<u8>,
+        }
+        impl PageStore for Liar {
+            fn page(&self, id: u64) -> Result<&[u8]> { self.inner.page(id) }
+            fn page_mut(&mut self, id: u64) -> Result<&mut [u8]> { self.inner.page_mut(id) }
+            fn alloc(&mut self) -> Result<u64> { self.inner.alloc() }
+            fn free(&mut self, id: u64) -> Result<()> { self.inner.free(id) }
+            fn is_dirty(&self, id: u64) -> bool { self.inner.is_dirty(id) }
+            fn read_external(&self, _h: u128, total_len: u64, out: &mut Vec<u8>) -> Result<()> {
+                // Right length, wrong bytes — the case a length check misses.
+                assert_eq!(self.serve.len() as u64, total_len);
+                out.extend_from_slice(&self.serve);
+                Ok(())
+            }
+        }
+
+        let honest: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        let mut store = TestStore::new();
+        let (hash, total_len) = store.put_external(&honest);
+        let root = insert(
+            &mut store,
+            0,
+            b"k",
+            &mut Payload::ExternalRef { hash, total_len },
+            InsertMode::Upsert,
+        )
+        .unwrap()
+        .new_root;
+
+        let mut swapped = honest.clone();
+        swapped[2500] ^= 0xFF;
+        let liar = Liar { inner: store, serve: swapped };
+        let err = get(&liar, root, b"k").unwrap_err();
+        assert!(format!("{err}").contains("content hash"), "{err}");
+    }
+
+    /// Identical contents are one object, not two — and letting go of a row
+    /// does not take the object away, because another row may still name it.
+    #[test]
+    fn identical_contents_share_one_object_and_outlive_a_row() {
+        let mut store = TestStore::new();
+        let bytes = vec![9u8; 6000];
+        let (h1, len1) = store.put_external(&bytes);
+        let (h2, len2) = store.put_external(&bytes);
+        assert_eq!(h1, h2, "the same bytes must produce the same name");
+        assert_eq!(len1, len2);
+        assert_eq!(store.stored_external(), 1, "one object, written twice");
+
+        let mut root = 0;
+        for key in [b"a".as_slice(), b"b".as_slice()] {
+            root = insert(
+                &mut store,
+                root,
+                key,
+                &mut Payload::ExternalRef { hash: h1, total_len: len1 },
+                InsertMode::Upsert,
+            )
+            .unwrap()
+            .new_root;
+        }
+
+        root = delete(&mut store, root, b"a").unwrap().new_root;
+        store.commit();
+        assert_eq!(store.live_external(), vec![h1], "still named by the other row");
+        assert_eq!(get(&store, root, b"b").unwrap().as_deref(), Some(bytes.as_slice()));
+
+        root = delete(&mut store, root, b"b").unwrap().new_root;
+        store.commit();
+        assert!(store.live_external().is_empty(), "nothing names it now");
+        // And it is STILL on disk. That is deliberate: a sweep that can see
+        // every reference reclaims it, not the row that happened to be deleted.
+        assert_eq!(store.stored_external(), 1);
+        let _ = root;
     }
 
     /// A streamed value must be byte-for-byte the same as one handed over whole.

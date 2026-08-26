@@ -71,6 +71,38 @@ pub trait PageStore {
     fn free_extent(&mut self, _start_page: u64, _npages: u32) -> Result<()> {
         Err(Error::Unsupported("this store has no extents".into()))
     }
+
+    // ---- external payloads (`vkind=4`) ----
+    //
+    // Like extents, but named by their CONTENTS rather than by a place in this
+    // file, so the bytes can live outside the arena — as their own file, which
+    // is a thing something else can carry to another machine. Allocation and
+    // the payload write are again not trait methods: the store places the bytes
+    // on its own terms before the tiny reference ever reaches the btree.
+
+    /// Read `total_len` bytes of the payload named `hash` into `out`
+    /// (appended). Refusing is right for a store that has none: a read cannot
+    /// invent the bytes, and a `vkind=4` cell reached here is either a database
+    /// from a build with the feature on, or corruption.
+    fn read_external(&self, _hash: u128, _total_len: u64, _out: &mut Vec<u8>) -> Result<()> {
+        Err(Error::Unsupported("this store has no external payloads".into()))
+    }
+
+    /// Say that one reference to `hash` has gone.
+    ///
+    /// **Not** the mirror of `free_extent`, and the difference is the whole
+    /// point of content addressing. A run of pages has exactly one owner, so
+    /// freeing it is safe the moment that owner lets go. A name has as many
+    /// owners as there are rows — and devices — holding identical contents, and
+    /// this store can only see the rows in front of it. So the default does
+    /// nothing at all: a file nobody references any more is wasted space, which
+    /// is recoverable at leisure by something that can see every reference,
+    /// while a file deleted out from under a reference is data loss, which is
+    /// not recoverable by anything. Reclamation belongs to a sweep that knows
+    /// the whole set, not to the row that happened to be edited.
+    fn release_external(&mut self, _hash: u128) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Copy-on-write: dirty pages are modified in place; committed pages are
@@ -114,6 +146,14 @@ pub mod test_store {
         extents: std::collections::BTreeMap<u64, Vec<u8>>,
         extents_pending_free: BTreeSet<u64>,
         next_extent: u64,
+        /// External payloads (`vkind=4`): content hash → bytes. A map keyed by
+        /// the hash is the model of a directory of content-named files, which
+        /// is what the real store keeps — including that writing the same
+        /// bytes twice is one object, not two.
+        external: std::collections::BTreeMap<u128, Vec<u8>>,
+        /// How many rows in the tree name each payload, so a test can say what
+        /// the real reclaimer will one day have to work out for itself.
+        external_refs: std::collections::BTreeMap<u128, usize>,
     }
 
     impl TestStore {
@@ -144,6 +184,29 @@ pub mod test_store {
             let npages = bytes.len().div_ceil(PAGE_SIZE).max(1) as u32;
             self.extents.insert(start, bytes.to_vec());
             (start, bytes.len() as u64, npages)
+        }
+
+        /// Place `bytes` outside the arena and hand back the name the leaf
+        /// cell will carry. Same payload-before-reference order as extents.
+        pub fn put_external(&mut self, bytes: &[u8]) -> (u128, u64) {
+            let hash = crate::btree::content_hash(bytes);
+            self.external.insert(hash, bytes.to_vec());
+            *self.external_refs.entry(hash).or_insert(0) += 1;
+            (hash, bytes.len() as u64)
+        }
+
+        /// Payloads still named by at least one row.
+        pub fn live_external(&self) -> Vec<u128> {
+            self.external_refs
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(h, _)| *h)
+                .collect()
+        }
+
+        /// Everything held, referenced or not — what a directory listing sees.
+        pub fn stored_external(&self) -> usize {
+            self.external.len()
         }
 
         /// Live (not pending-free) extents, for the model's leak check.
@@ -226,6 +289,28 @@ pub mod test_store {
                 return Err(Error::Corrupt("extent length mismatch".into()));
             }
             out.extend_from_slice(b);
+            Ok(())
+        }
+
+        fn read_external(&self, hash: u128, total_len: u64, out: &mut Vec<u8>) -> Result<()> {
+            let b = self
+                .external
+                .get(&hash)
+                .ok_or_else(|| Error::Corrupt(format!("external payload {hash:#x} not here")))?;
+            if b.len() as u64 != total_len {
+                return Err(Error::Corrupt("external length mismatch".into()));
+            }
+            out.extend_from_slice(b);
+            Ok(())
+        }
+
+        fn release_external(&mut self, hash: u128) -> Result<()> {
+            // The model counts references and deletes NOTHING, which is what
+            // the real store does too. What it makes visible is the gap: a
+            // payload can reach zero references and still be a file on disk.
+            if let Some(n) = self.external_refs.get_mut(&hash) {
+                *n = n.saturating_sub(1);
+            }
             Ok(())
         }
 
