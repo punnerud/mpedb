@@ -851,13 +851,18 @@ fn writing_the_catalog_is_refused_by_name_while_reading_it_still_works() {
         // replaced here — so an authorizer, which PHP installs on every
         // connection, got there first and reported the wrong thing anyway.
         // This assertion is the difference between the two orderings.
+        // The six-argument authorizer signature, named after what sqlite puts
+        // in each slot — `auth.rs` already calls the first two `arg1`/`arg2`.
+        // They were `_1`..`_4`, which clippy's `just_underscores_and_digits`
+        // rejects; a leading underscore on a real name silences the unused
+        // warning just as well and says what the slot holds.
         unsafe extern "C" fn allow(
-            _c: *mut c_void,
-            _a: c_int,
-            _1: *const c_char,
-            _2: *const c_char,
-            _3: *const c_char,
-            _4: *const c_char,
+            _ctx: *mut c_void,
+            _action: c_int,
+            _arg1: *const c_char,
+            _arg2: *const c_char,
+            _db_name: *const c_char,
+            _trigger_or_view: *const c_char,
         ) -> c_int {
             SQLITE_OK
         }

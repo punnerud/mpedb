@@ -27,6 +27,13 @@ log-based engine), and the hardware published when the hardware is the answer.
   `cargo test --manifest-path crates/mpedb-capi/Cargo.toml`)
 - One crate: `cargo test -p mpedb-core` (also: mpedb-types, mpedb-sql, mpedb, mpedb-cli)
 - Lint (keep clean): `cargo clippy --workspace --all-targets -- -D warnings`
+  **plus the satellite workspace CI also lints**, which `--workspace` cannot
+  reach: `cargo clippy --manifest-path crates/mpedb-capi/Cargo.toml
+  --all-targets -- -D warnings`. Leaving it out is how a lint reached main red:
+  a separate workspace is invisible to the parent's `--workspace`, so the
+  documented command passed locally and the same command failed in CI, which
+  runs both. `mpedb-pg` and `mpedb-fs` are separate workspaces too and are in
+  NO CI job at all — lint and test those by hand while that is true.
 - Slow/instrumented tests are `#[ignore]`d: `cargo test -p mpedb-core -- --ignored`
 - **Point every test's scratch at a real volume**: `MPEDB_TEST_DIR=/path cargo test …`.
   `mpedb_testkit::scratch_base` (and `mpedb_core::scratch_dir`, which spells the
