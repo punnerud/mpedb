@@ -324,7 +324,38 @@ pub(super) struct SpLayer {
     pub(super) images: HashMap<u64, Box<[u8; PAGE_SIZE]>>,
 }
 
+/// Where a payload too big for the tree ended up.
+///
+/// Three insert paths make this same choice — a streaming insert, a flat one,
+/// and an upsert — and having each spell it out as an `Option` of a tuple is
+/// how the three would come to disagree about a fourth case. One name, one
+/// mapping to a `Payload`, three callers.
+enum BigRef {
+    None,
+    Extent { start_page: u64, total_len: u64, npages: u32 },
+    External { hash: u128, total_len: u64 },
+}
+
 impl<'e> WriteTxn<'e> {
+    /// Put a payload outside the file as its own content-named object.
+    ///
+    /// Nothing is allocated and no map edit is recorded: the arena never learns
+    /// this payload existed, which is the point — the page accounting has
+    /// nothing to answer for and the freelist has nothing to reclaim.
+    fn write_external_payload(&mut self, pieces: &[&[u8]], total_len: u64) -> Result<BigRef> {
+        let mut writer = self.eng.shm.external_begin()?;
+        for piece in pieces {
+            writer.write(piece)?;
+        }
+        let (hash, written) = writer.finish()?;
+        if written != total_len {
+            return Err(Error::Internal(
+                "external payload length disagrees with the encoded row".into(),
+            ));
+        }
+        Ok(BigRef::External { hash, total_len })
+    }
+
     /// The key `row` occupies in secondary index `i` of table position `tid`, or
     /// `None` when the row is not a MEMBER of that index.
     ///
@@ -927,7 +958,45 @@ impl<'e> WriteTxn<'e> {
             .eng
             .extent_threshold
             .is_some_and(|t| total_len as usize > t);
-        let mut payload = if as_extent {
+        let external = if as_extent && self.eng.external_extents {
+            // Same expected-failure rule as below: probe the PK before a single
+            // payload byte exists, so a duplicate leaves the txn clean enough
+            // to continue.
+            if btree::get(self, root, &key)?.is_some() {
+                return Err(Error::PrimaryKeyViolation { table: tname.clone(), pk: pk_constraint_name(self.eng, table_id) });
+            }
+            // Streamed straight through the hash into the object, so a payload
+            // of any size costs one pass and never a second resident copy. No
+            // kernel-copy fast path here yet: `copy_file_range` would want the
+            // bytes to land in the temp file, and the hash still has to see
+            // every one of them, so the copy would buy nothing it does not
+            // immediately give back.
+            let mut writer = self.eng.shm.external_begin()?;
+            writer.write(&head)?;
+            let mut remaining = src.len();
+            let mut buf = vec![0u8; PAGE_SIZE.min(64 * 1024)];
+            while remaining > 0 {
+                let take = remaining.min(buf.len());
+                // A short source surfaces here exactly as it does on the extent
+                // path, and hard-aborts the txn: a reference over a partially
+                // written payload is how a dead writer's bytes become readable.
+                src.next_into(&mut buf[..take])?;
+                writer.write(&buf[..take])?;
+                remaining -= take;
+            }
+            let (hash, written) = writer.finish()?;
+            if written != total_len {
+                return Err(Error::Internal(
+                    "external payload length disagrees with the streamed row".into(),
+                ));
+            }
+            Some((hash, total_len))
+        } else {
+            None
+        };
+        let mut payload = if let Some((hash, total_len)) = external {
+            btree::Payload::ExternalRef { hash, total_len }
+        } else if as_extent {
             // Same expected-failure rule as insert_row: probe the PK before
             // any payload byte or bookkeeping exists, so a duplicate leaves
             // the txn clean enough to continue.
@@ -1174,7 +1243,7 @@ impl<'e> WriteTxn<'e> {
         // edit would then commit an extent nothing references. So the PK is
         // probed here (UNIQUE was pre-checked above for extent), before any
         // payload byte or bookkeeping exists.
-        let extent_ref = if as_extent {
+        let extent_ref: BigRef = if as_extent {
             let (root_probe, _) = self.tree_root(table_id, 0)?;
             if btree::get(self, root_probe, &key)?.is_some() {
                 let tname = self
@@ -1186,30 +1255,46 @@ impl<'e> WriteTxn<'e> {
                 return Err(Error::PrimaryKeyViolation { table: tname, pk: pk_constraint_name(self.eng, table_id) });
             }
             let total_len = encoded_len as u64;
-            let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
-                .map_err(|_| Error::Unsupported("value too large for one extent".into()))?;
-            let start_page = self.alloc_run(npages)?;
-            leakstat::add(&leakstat::EXTENT_ALLOC_PAGES, u64::from(npages));
-            match (&flat, &parts) {
-                (Some(b), _) => {
-                    self.write_extent_payload(start_page, npages, &[b.as_slice()], total_len)?
+            if self.eng.external_extents {
+                match (&flat, &parts) {
+                    (Some(b), _) => self.write_external_payload(&[b.as_slice()], total_len)?,
+                    (None, Some(_)) => self.write_external_payload(&pieces, total_len)?,
+                    (None, None) => unreachable!("payload has exactly one form"),
                 }
-                (None, Some(_)) => {
-                    self.write_extent_payload(start_page, npages, &pieces, total_len)?
+            } else {
+                let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
+                    .map_err(|_| Error::Unsupported("value too large for one extent".into()))?;
+                let start_page = self.alloc_run(npages)?;
+                leakstat::add(&leakstat::EXTENT_ALLOC_PAGES, u64::from(npages));
+                match (&flat, &parts) {
+                    (Some(b), _) => {
+                        self.write_extent_payload(start_page, npages, &[b.as_slice()], total_len)?
+                    }
+                    (None, Some(_)) => {
+                        self.write_extent_payload(start_page, npages, &pieces, total_len)?
+                    }
+                    (None, None) => unreachable!("payload has exactly one form"),
                 }
-                (None, None) => unreachable!("payload has exactly one form"),
+                self.pending_map_edits.push(extent::MapEdit::Insert(start_page, npages));
+                BigRef::Extent { start_page, total_len, npages }
             }
-            self.pending_map_edits.push(extent::MapEdit::Insert(start_page, npages));
-            Some((start_page, total_len, npages))
         } else {
-            None
+            BigRef::None
         };
-        let mut payload = match (extent_ref, &flat) {
-            (Some((start_page, total_len, npages)), _) => {
-                btree::Payload::ExtentRef { start_page, total_len, npages }
+        let mut payload = match (&extent_ref, &flat) {
+            (BigRef::Extent { start_page, total_len, npages }, _) => {
+                btree::Payload::ExtentRef {
+                    start_page: *start_page,
+                    total_len: *total_len,
+                    npages: *npages,
+                }
             }
-            (None, Some(b)) => btree::Payload::Flat(b),
-            (None, None) => btree::Payload::Parts(&pieces),
+            (BigRef::External { hash, total_len }, _) => btree::Payload::ExternalRef {
+                hash: *hash,
+                total_len: *total_len,
+            },
+            (BigRef::None, Some(b)) => btree::Payload::Flat(b),
+            (BigRef::None, None) => btree::Payload::Parts(&pieces),
         };
 
         let (root, count) = self.tree_root(table_id, 0)?;
@@ -1571,21 +1656,28 @@ impl<'e> WriteTxn<'e> {
         // frees the OLD value's chain/run through `free_old_val` either way.
         let extent_ref = if self.eng.extent_threshold.is_some_and(|t| payload.len() > t) {
             let total_len = payload.len() as u64;
-            let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
-                .map_err(|_| Error::Unsupported("value too large for one extent".into()))?;
-            let start_page = self.alloc_run(npages)?;
-            leakstat::add(&leakstat::EXTENT_ALLOC_PAGES, u64::from(npages));
-            self.write_extent_payload(start_page, npages, &[payload.as_slice()], total_len)?;
-            self.pending_map_edits.push(extent::MapEdit::Insert(start_page, npages));
-            Some((start_page, total_len, npages))
+            if self.eng.external_extents {
+                self.write_external_payload(&[payload.as_slice()], total_len)?
+            } else {
+                let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
+                    .map_err(|_| Error::Unsupported("value too large for one extent".into()))?;
+                let start_page = self.alloc_run(npages)?;
+                leakstat::add(&leakstat::EXTENT_ALLOC_PAGES, u64::from(npages));
+                self.write_extent_payload(start_page, npages, &[payload.as_slice()], total_len)?;
+                self.pending_map_edits.push(extent::MapEdit::Insert(start_page, npages));
+                BigRef::Extent { start_page, total_len, npages }
+            }
         } else {
-            None
+            BigRef::None
         };
         let mut up = match extent_ref {
-            Some((start_page, total_len, npages)) => {
+            BigRef::Extent { start_page, total_len, npages } => {
                 btree::Payload::ExtentRef { start_page, total_len, npages }
             }
-            None => btree::Payload::Flat(&payload),
+            BigRef::External { hash, total_len } => {
+                btree::Payload::ExternalRef { hash, total_len }
+            }
+            BigRef::None => btree::Payload::Flat(&payload),
         };
         let out = btree::insert(self, root, &key, &mut up, InsertMode::Upsert)?;
         self.set_tree_root(table_id, 0, out.new_root, count);

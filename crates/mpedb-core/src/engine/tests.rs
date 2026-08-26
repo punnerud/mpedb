@@ -1698,3 +1698,167 @@ primary_key = ["id"]
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(&path);
 }
+
+/// A source that hands its bytes over a few at a time, so the streamed insert
+/// really streams rather than being handed a slice.
+struct SliceSource {
+    bytes: Vec<u8>,
+    at: usize,
+}
+
+impl crate::btree::BlobSource for SliceSource {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    fn next_into(&mut self, out: &mut [u8]) -> mpedb_types::Result<()> {
+        let end = self.at + out.len();
+        if end > self.bytes.len() {
+            return Err(mpedb_types::Error::Corrupt("source ran short".into()));
+        }
+        out.copy_from_slice(&self.bytes[self.at..end]);
+        self.at = end;
+        Ok(())
+    }
+}
+
+/// With `external_extents` on, an extent-sized row goes outside the file and
+/// still reads back through a fresh attach — and the arena never grew for it.
+///
+/// The two halves matter together. Coming back through a NEW attach is what
+/// proves the reference survived the meta, and the page count is what proves
+/// the payload really left: an object that quietly took pages as well would
+/// pass every read test there is.
+#[test]
+fn external_extents_put_the_row_outside_the_file() {
+    let path = crate::scratch_dir()
+        .join("mpedb-engine-tests")
+        .join(format!("ext-rows-{}.mpedb", std::process::id()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let mut dir = path.clone().into_os_string();
+    dir.push(".extents");
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 16
+max_readers = 8
+external_extents = true
+
+[[table]]
+name = "blobs"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "data"
+  type = "blob"
+"#,
+        crate::toml_escape_path(&path)
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    assert!(cfg.options.external_extents, "the knob must survive the TOML");
+
+    let blob = |seed: u8, len: usize| -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add((i * 7) as u8)).collect()
+    };
+    let big_a = blob(1, 30_000);
+    let big_b = blob(2, 45_000);
+    let small = blob(3, 100);
+
+    let file_size = |p: &std::path::Path| -> u64 {
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    };
+    {
+        let mut eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+        eng.set_extent_threshold(Some(4096));
+        eng.set_external_extents(true);
+        {
+            let mut w = eng.begin_write().unwrap();
+            for (id, b) in [(1i64, &big_a), (2, &big_b), (3, &small)] {
+                w.insert_row(0, &[Value::Int(id), Value::Blob(b.clone())]).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        // The arena's own bookkeeping still adds up: an external payload takes
+        // no pages, so there is nothing new for the verifier to place.
+        eng.verify_page_accounting().unwrap();
+    }
+
+    // Two objects, not three: the small row stayed inline.
+    let objects: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(objects.len(), 2, "one object per big row, none for the small one: {objects:?}");
+    assert!(objects.iter().all(|n| n.ends_with(".ext")), "{objects:?}");
+
+    // A fresh attach: the reference went through the meta, and the payload
+    // comes back from beside the file.
+    {
+        let eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+        let r = eng.begin_read().unwrap();
+        for (id, want) in [(1i64, &big_a), (2, &big_b), (3, &small)] {
+            let got = r.get_by_pk(0, &[Value::Int(id)]).unwrap().expect("row is there");
+            assert_eq!(got[1], Value::Blob(want.clone()), "row {id}");
+        }
+    }
+
+    // The other two write paths take the same turn. An UPDATE replaces the
+    // payload — a new object, and the old one still on disk because nothing
+    // reclaims yet — and a STREAMED insert never has the whole payload
+    // resident, so it hashes as it goes.
+    let replaced = blob(9, 33_000);
+    let streamed = blob(10, 52_000);
+    {
+        let mut eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+        eng.set_extent_threshold(Some(4096));
+        eng.set_external_extents(true);
+        {
+            let mut w = eng.begin_write().unwrap();
+            assert!(w
+                .update_by_pk(0, &[Value::Int(1), Value::Blob(replaced.clone())])
+                .unwrap());
+            let mut src = SliceSource { bytes: streamed.clone(), at: 0 };
+            w.insert_row_streaming(0, &[Value::Int(4), Value::Blob(Vec::new())], 1, &mut src)
+                .unwrap();
+            w.commit().unwrap();
+        }
+        eng.verify_page_accounting().unwrap();
+    }
+    {
+        let eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+        let r = eng.begin_read().unwrap();
+        assert_eq!(
+            r.get_by_pk(0, &[Value::Int(1)]).unwrap().unwrap()[1],
+            Value::Blob(replaced.clone()),
+            "the update's payload"
+        );
+        assert_eq!(
+            r.get_by_pk(0, &[Value::Int(4)]).unwrap().unwrap()[1],
+            Value::Blob(streamed.clone()),
+            "the streamed payload"
+        );
+    }
+
+    // And the payloads really left: the objects beside the file hold them, and
+    // the file itself is the reservation it was created with, no more.
+    let outside: u64 = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().len())
+        .sum();
+    assert!(
+        outside >= (big_a.len() + big_b.len()) as u64,
+        "the objects hold {outside} bytes, less than the rows that went into them"
+    );
+    assert_eq!(file_size(&path), 16 * 1024 * 1024, "the arena is its reservation");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&path);
+}

@@ -1056,6 +1056,7 @@ impl Database {
         // DESIGN-BLOBEXTENT §8: per-process knob, like durability. The format
         // self-describes, so this only decides what NEW writes do.
         engine.set_extent_threshold(config.options.extent_threshold);
+        engine.set_external_extents(config.options.external_extents);
         // From here on the ENGINE recompiles CHECK programs itself whenever it
         // rebuilds a bundle from the catalog. The config-derived vector above
         // only covers the SEED schema; a table created by `CREATE TABLE …

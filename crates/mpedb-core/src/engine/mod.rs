@@ -945,6 +945,11 @@ pub struct Engine {
     /// overflow chain (DESIGN-BLOBEXTENT §8). `None` = disabled — today's
     /// behavior byte for byte, and the A/B's control arm.
     extent_threshold: Option<usize>,
+    /// Send extent-sized payloads outside the file as content-named objects
+    /// (`vkind=4`) rather than into a run of pages inside it (`vkind=2`).
+    /// Per-process, exactly like `extent_threshold`: it decides what NEW
+    /// writes do and nothing about what can be read.
+    external_extents: bool,
     /// Per-statement-execution work-row budget (#74), copied into each txn's
     /// [`WorkMeter`] at begin. `0` = unlimited.
     work_budget: u64,
@@ -1024,6 +1029,7 @@ impl Engine {
             concurrency: config.options.concurrency,
             flusher,
             extent_threshold: None,
+            external_extents: false,
             work_budget: config.options.max_work_rows,
             max_tables: config.options.max_tables,
             join_cells_budget: config.options.max_join_cells,
@@ -1233,6 +1239,7 @@ impl Engine {
             concurrency: Concurrency::Serial,
             flusher: None, // read-only tooling handle; async needs a config
             extent_threshold: None,
+            external_extents: false,
             // Tooling handle (no config): the WORK-ROW budget is unlimited, a
             // `dump`/verify pass legitimately scans whole tables and a row count
             // is exactly what it would refuse.
@@ -1361,6 +1368,10 @@ impl Engine {
     /// Enable/disable the extent path (DESIGN-BLOBEXTENT §8). Values whose
     /// encoded payload exceeds the threshold take an extent run; `None`
     /// keeps every value on the inline/overflow path.
+    pub fn set_external_extents(&mut self, external: bool) {
+        self.external_extents = external;
+    }
+
     pub fn set_extent_threshold(&mut self, threshold: Option<usize>) {
         self.extent_threshold = threshold;
     }
