@@ -388,6 +388,17 @@ pub(super) const FK_RUNS: u8 = 1;
 /// Read an extent's bytes out of the mapping, bounds-checked against the
 /// MAPPING (page_count), not just high_water — checked u64 math throughout
 /// (DESIGN-BLOBEXTENT §3.1).
+/// One external payload, fetched by name. The btree checks the name against
+/// what came back; this only goes and gets it.
+pub(super) fn read_external_from_shm(
+    shm: &Shm,
+    hash: u128,
+    total_len: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    shm.read_external_payload(hash, total_len, out)
+}
+
 pub(super) fn read_extent_from_shm(
     shm: &Shm,
     start_page: u64,

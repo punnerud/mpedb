@@ -1005,10 +1005,87 @@ std::thread_local! {
     static EXCLUSIVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Distinguishes concurrent writers' half-written files within one process.
+/// Only ever part of a temporary name, so it never reaches anything durable.
+static EXTERNAL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One payload on its way to becoming an object.
+///
+/// ## Why a rename is the whole crash argument
+///
+/// The bytes go to a temporary name and are hashed as they pass. Only once
+/// they are all written and durable does the file get the name that says what
+/// it is. So there is no instant at which an object exists under its own name
+/// holding anything other than the bytes that name describes: a crash before
+/// the rename leaves a `.writing-*` file that belongs to nobody and can be
+/// swept, and a crash after it leaves a complete object.
+///
+/// That is a stronger guarantee than the in-file extent gets, and it comes for
+/// free rather than by effort — an extent has to reach its final place as it is
+/// written, because its place is what names it, so its integrity rests on the
+/// ordering of an msync against a meta flip. An object is named by its
+/// contents, so it can be assembled somewhere anonymous first.
+///
+/// The hash is computed on the way through rather than by reading the file
+/// back, so a payload of any size costs one pass and no second resident copy.
+pub struct ExternalWriter {
+    file: File,
+    temp: PathBuf,
+    dir: PathBuf,
+    hasher: xxhash_rust::xxh3::Xxh3,
+    len: u64,
+}
+
+impl ExternalWriter {
+    pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        self.file
+            .write_all(bytes)
+            .map_err(|_| io_err("write(external payload)"))?;
+        self.hasher.update(bytes);
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Publish it, and hand back the reference the leaf cell will carry.
+    pub fn finish(self) -> Result<(u128, u64)> {
+        self.file
+            .sync_all()
+            .map_err(|_| io_err("fsync(external payload)"))?;
+        let hash = self.hasher.digest128();
+        let final_path = self.dir.join(format!("{hash:032x}.ext"));
+        // Renaming over an object that is already there is not a conflict, it
+        // is the same bytes arriving twice — which is exactly what content
+        // addressing is for, and what makes writing the same page on two
+        // devices cost one object instead of two.
+        std::fs::rename(&self.temp, &final_path).map_err(|_| io_err("rename(external payload)"))?;
+        // The rename itself has to survive, not just the bytes: a directory
+        // entry lives in the directory, and an unsynced one can be lost while
+        // the file it names is perfectly durable.
+        if let Ok(dir) = File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
+        Ok((hash, self.len))
+    }
+}
+
+impl Drop for ExternalWriter {
+    fn drop(&mut self) {
+        // An abandoned payload leaves nothing behind. `finish` renamed the file
+        // away, so this only ever removes one nobody claimed.
+        let _ = std::fs::remove_file(&self.temp);
+    }
+}
+
 pub struct Shm {
     map: *mut u8,
     len: usize,
     file: File,
+    /// Where the database file is, which is the only thing that says where its
+    /// external payloads are (`<path>.extents/`). The mapping cannot answer
+    /// this — it is bytes, not a name — and an fd cannot portably be turned
+    /// back into a path.
+    path: PathBuf,
     pub page_count: u64,
     pub max_readers: u32,
     pub durability: Durability,
@@ -1313,6 +1390,65 @@ impl Drop for FlockGuard<'_> {
 }
 
 impl Shm {
+    // ---------- external payloads (`vkind=4`) ----------
+
+    /// Where this database's external payloads live.
+    ///
+    /// Beside the file rather than inside it, and named after it, so a
+    /// database and its payloads travel together and two databases in one
+    /// directory cannot claim each other's objects.
+    pub fn external_dir(&self) -> PathBuf {
+        let mut p = self.path.clone().into_os_string();
+        p.push(".extents");
+        PathBuf::from(p)
+    }
+
+    /// The object's own name. Lower-case hex of the content hash, fixed width,
+    /// so a directory listing sorts and a name never needs escaping.
+    pub fn external_path(&self, hash: u128) -> PathBuf {
+        self.external_dir().join(format!("{hash:032x}.ext"))
+    }
+
+    /// Begin writing one payload. See [`ExternalWriter`] for the crash argument.
+    pub fn external_begin(&self) -> Result<ExternalWriter> {
+        let dir = self.external_dir();
+        std::fs::create_dir_all(&dir).map_err(|_| io_err("mkdir(external payloads)"))?;
+        let seq = EXTERNAL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let temp = dir.join(format!(".writing-{}-{}", crate::os::process_id(), seq));
+        let file = std::fs::File::create(&temp).map_err(|_| io_err("create(external payload)"))?;
+        Ok(ExternalWriter {
+            file,
+            temp,
+            dir,
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
+            len: 0,
+        })
+    }
+
+    /// Read one back. The caller checks the hash — this only fetches bytes.
+    pub fn read_external_payload(
+        &self,
+        hash: u128,
+        total_len: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let path = self.external_path(hash);
+        let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
+            // Not corruption and not a bug: on a device that syncs these
+            // objects, a reference can arrive before the bytes it names. The
+            // caller can wait and ask again; a Corrupt would tell it to give up.
+            std::io::ErrorKind::NotFound => {
+                Error::Unsupported(format!("external payload {hash:032x} is not here yet"))
+            }
+            _ => io_err("read(external payload)"),
+        })?;
+        if bytes.len() as u64 != total_len {
+            return Err(Error::Corrupt("external payload length mismatch".into()));
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+
     // ---------- raw access helpers ----------
 
     #[inline]
@@ -3890,6 +4026,7 @@ impl Shm {
             map: ptr as *mut u8,
             len: size as usize,
             file: file.try_clone()?,
+            path: db_path.to_path_buf(),
             page_count: size / PAGE_SIZE as u64,
             max_readers,
             durability,

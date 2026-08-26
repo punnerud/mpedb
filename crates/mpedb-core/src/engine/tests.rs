@@ -1607,3 +1607,94 @@ fn a_failed_insert_that_allocated_is_not_exactly_undoable() {
     w.commit().unwrap();
     eng.verify_page_accounting().unwrap();
 }
+
+/// An external payload becomes an object beside the database, named by its
+/// contents, and comes back byte-for-byte through a fresh attach.
+///
+/// Also holds the crash argument: the bytes reach a temporary name and only
+/// take their own name once they are durable, so there is never a moment when
+/// an object exists under its own name holding anything but what that name
+/// describes.
+#[test]
+fn external_payload_becomes_a_content_named_object() {
+    let path = crate::scratch_dir()
+        .join("mpedb-engine-tests")
+        .join(format!("external-{}.mpedb", std::process::id()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(path.with_extension("mpedb.extents"));
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 16
+max_readers = 8
+
+[[table]]
+name = "t"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+"#,
+        crate::toml_escape_path(&path)
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    let eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(2_654_435_761)) as u8).collect();
+
+    // Written in pieces, the way a streaming insert hands it over.
+    let mut writer = eng.shm.external_begin().unwrap();
+    let dir = eng.shm.external_dir();
+    for chunk in payload.chunks(7_000) {
+        writer.write(chunk).unwrap();
+    }
+    // Mid-write: something anonymous, and nothing claiming to be an object.
+    let during: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        during.iter().all(|n| n.starts_with(".writing-")),
+        "a half-written payload must not sit under a name that describes it: {during:?}"
+    );
+
+    let (hash, len) = writer.finish().unwrap();
+    assert_eq!(len, payload.len() as u64);
+    assert_eq!(hash, crate::btree::content_hash(&payload));
+
+    let after: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(after, vec![format!("{hash:032x}.ext")], "one object, no leftovers");
+
+    let mut back = Vec::new();
+    eng.shm.read_external_payload(hash, len, &mut back).unwrap();
+    assert_eq!(back, payload);
+
+    // The same bytes again are the same object, not a second one.
+    let mut again = eng.shm.external_begin().unwrap();
+    again.write(&payload).unwrap();
+    let (hash2, _) = again.finish().unwrap();
+    assert_eq!(hash2, hash);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+    // Abandoned mid-write, it leaves nothing behind.
+    {
+        let mut dropped = eng.shm.external_begin().unwrap();
+        dropped.write(b"never finished").unwrap();
+    }
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "an abandoned write left a file");
+
+    // A name nobody has written is not corruption — on a device that syncs
+    // these, a reference can simply arrive before its bytes do.
+    let mut nothing = Vec::new();
+    let err = eng.shm.read_external_payload(hash ^ 1, len, &mut nothing).unwrap_err();
+    assert!(format!("{err}").contains("not here yet"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&path);
+}

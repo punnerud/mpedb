@@ -67,6 +67,10 @@ impl PageStore for ReadTxn<'_> {
         super::read_extent_from_shm(&self.eng.shm, start_page, total_len, out)
     }
 
+    fn read_external(&self, hash: u128, total_len: u64, out: &mut Vec<u8>) -> Result<()> {
+        super::read_external_from_shm(&self.eng.shm, hash, total_len, out)
+    }
+
     fn page(&self, id: u64) -> Result<&[u8]> {
         self.eng.shm.page(id)
     }

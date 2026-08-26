@@ -239,6 +239,22 @@ pub struct DbOptions {
     /// format self-describes (`vkind=2` cells), so processes with different
     /// thresholds only differ in what NEW writes do.
     pub extent_threshold: Option<usize>,
+    /// Send extent-sized payloads OUTSIDE the database file, as their own
+    /// content-named objects in `<path>.extents/`, instead of into a run of
+    /// pages inside it (`vkind=4` rather than `vkind=2`).
+    ///
+    /// Per-process, like `extent_threshold` and for the same reason: the
+    /// on-disk format self-describes, so a process with this off still reads
+    /// every object a process with it on has written. It only decides what NEW
+    /// writes do.
+    ///
+    /// Off unless asked for. It is the right shape for a payload that has to
+    /// reach another machine — an immutable object with a name that does not
+    /// depend on where it sits — and the wrong shape for one that does not,
+    /// because it trades a run inside a file that is already reserved for a
+    /// file the filesystem has to track, and gives up the arena's page
+    /// accounting for a reference count nothing keeps yet.
+    pub external_extents: bool,
     /// Per-statement-execution runtime budget in "work rows" (#74,
     /// design/DESIGN-RUNTIME-BUDGET.md): rows yielded by scans, nested-loop join
     /// candidates, and correlated-subquery re-evaluations. `0` = unlimited. A
@@ -518,6 +534,10 @@ struct RawDatabase {
     /// coalescing levers land).
     #[serde(default)]
     extent_threshold_kb: Option<u64>,
+    /// Put extent-sized payloads in `<path>.extents/` as content-named objects
+    /// rather than in this file's page space. Off unless asked for.
+    #[serde(default)]
+    external_extents: Option<bool>,
 }
 
 /// The measured per-platform default (DESIGN-BLOBEXTENT §8; blob_bulk_ab,
@@ -894,6 +914,7 @@ fn raw_to_config(
                     Some(kb) => Some(kb as usize * 1024),
                     None => default_extent_threshold(),
                 },
+                external_extents: db.external_extents.unwrap_or(false),
                 max_work_rows: runtime.max_work_rows,
                 max_join_cells: runtime.max_join_cells,
                 max_query_threads: runtime.max_query_threads,
@@ -968,6 +989,7 @@ impl RawMember {
                 owner: self.owner,
                 group: self.group,
                 extent_threshold_kb: None,
+                external_extents: None,
             },
             self.tables,
         )

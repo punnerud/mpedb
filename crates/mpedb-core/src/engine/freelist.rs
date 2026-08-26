@@ -18,6 +18,14 @@ impl PageStore for WriteTxn<'_> {
         read_extent_from_shm(&self.eng.shm, start_page, total_len, out)
     }
 
+    fn read_external(&self, hash: u128, total_len: u64, out: &mut Vec<u8>) -> Result<()> {
+        // No coalescing buffer to consult, unlike `read_extent` above: an
+        // external payload is written and made durable under a name of its
+        // own before the reference to it exists, so there is never a window
+        // where the tree names one that the filesystem cannot yet serve.
+        super::read_external_from_shm(&self.eng.shm, hash, total_len, out)
+    }
+
     fn free_extent(&mut self, start_page: u64, npages: u32) -> Result<()> {
         // Called by the btree exactly where it frees an overflow chain. It
         // only RECORDS: map edits apply in one place at commit, and the

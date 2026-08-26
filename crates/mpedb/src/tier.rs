@@ -125,6 +125,10 @@ impl Database {
                 durability,
                 concurrency: Concurrency::Serial,
                 extent_threshold: default_extent_threshold(),
+                // A cold tier is a file the drainer made and the drainer reads.
+                // Objects beside it would be one more thing to carry for a
+                // tier whose whole point is to sit still.
+                external_extents: false,
                 max_work_rows: DEFAULT_MAX_WORK_ROWS,
                 max_join_cells: DEFAULT_MAX_JOIN_CELLS,
                 // A cold tier holds ONE drained table; a foreign key would have
