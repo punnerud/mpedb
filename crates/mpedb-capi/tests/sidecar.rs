@@ -165,14 +165,27 @@ fn an_untouched_source_reuses_its_sidecar() {
     unsafe {
         assert_eq!(count(&p), 5);
     }
-    let side = format!("{p}.mpedb");
-    let first = std::fs::metadata(&side).unwrap().modified().unwrap();
+    // The STAMP is the signal, not the sidecar's own mtime. `stamp_source` runs
+    // exactly twice in `open.rs` — after an import places the sidecar, and after
+    // a checkpoint rewrites the source — so this file moves if and only if a
+    // re-import happened, which is what the test is named after.
+    //
+    // The sidecar's mtime is NOT that signal, and using it passed only by
+    // accident of the filesystem. Every open writes the reader table (page 3,
+    // process state per CLAUDE.md's page map) through the mmap, and on a real
+    // filesystem that bumps the file's mtime; on the tmpfs that CI's default
+    // temp dir happens to be, it does not. Measured on ext4: the sidecar's
+    // bytes differ at offset 13952 — page 3 exactly — with the data pages
+    // untouched and no import performed. So the old assertion failed under the
+    // `MPEDB_TEST_DIR` that CLAUDE.md mandates, and passed in CI.
+    let stamp = format!("{p}.mpedb.src");
+    let first = std::fs::metadata(&stamp).unwrap().modified().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
     unsafe {
         assert_eq!(count(&p), 5);
     }
     assert_eq!(
-        std::fs::metadata(&side).unwrap().modified().unwrap(),
+        std::fs::metadata(&stamp).unwrap().modified().unwrap(),
         first,
         "the sidecar was rebuilt for a source nobody touched"
     );
