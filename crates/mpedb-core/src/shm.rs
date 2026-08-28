@@ -1029,7 +1029,14 @@ static EXTERNAL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// The hash is computed on the way through rather than by reading the file
 /// back, so a payload of any size costs one pass and no second resident copy.
 pub struct ExternalWriter {
-    file: File,
+    // `std::fs::File` SPELLED OUT, not the ambient `File`. On wasm32 that alias
+    // is `wasmcompat::File` — the anonymous memfd stand-in, which deliberately
+    // has no path constructor because a tab has no filesystem — so the ambient
+    // name did not compile for that target at all. An external payload is a
+    // real object beside the database, so the real type is the right one, and
+    // on wasm32 `std::fs` then refuses at RUNTIME: the same "return failure
+    // rather than pretend success" the compat layer promises for `fchmod`.
+    file: std::fs::File,
     temp: PathBuf,
     dir: PathBuf,
     hasher: xxhash_rust::xxh3::Xxh3,
@@ -1062,7 +1069,7 @@ impl ExternalWriter {
         // The rename itself has to survive, not just the bytes: a directory
         // entry lives in the directory, and an unsynced one can be lost while
         // the file it names is perfectly durable.
-        if let Ok(dir) = File::open(&self.dir) {
+        if let Ok(dir) = std::fs::File::open(&self.dir) {
             let _ = dir.sync_all();
         }
         Ok((hash, self.len))
