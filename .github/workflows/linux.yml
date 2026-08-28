@@ -157,6 +157,29 @@ jobs:
         run: |
           cargo test --manifest-path crates/mpedb-capi/Cargo.toml
           cargo clippy --manifest-path crates/mpedb-capi/Cargo.toml --all-targets -- -D warnings
+      # mpedb-pg and mpedb-fs are separate workspaces for their own reasons, and
+      # until this step NO workflow named either: the PostgreSQL wire protocol
+      # and the FUSE view were neither built nor tested anywhere in CI, so a
+      # green tick said nothing about them.
+      #
+      # Both are Linux-only, and both were checked rather than assumed:
+      #   * mpedb-pg uses `std::os::fd` and `std::os::unix` — `cargo check
+      #     --target x86_64-pc-windows-gnu` fails on the imports, so it is here
+      #     and on macOS, never on Windows. Same reach as capi.
+      #   * mpedb-fs is THIS JOB ONLY. `fuser`'s build script wants macFUSE via
+      #     pkg-config on Apple and fails outright (measured on an M3), which is
+      #     the whole reason the crate is its own workspace.
+      #
+      # `cargo test` on mpedb-fs runs ZERO tests today — it has none. The step is
+      # still worth its minute: it compiles the binary and lints it, which is
+      # more than the nothing that ran before, and it fails loudly the day the
+      # FUSE view stops building.
+      - name: pg and fs (their own workspaces)
+        run: |
+          cargo test --manifest-path crates/mpedb-pg/Cargo.toml
+          cargo clippy --manifest-path crates/mpedb-pg/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path crates/mpedb-fs/Cargo.toml
+          cargo clippy --manifest-path crates/mpedb-fs/Cargo.toml --all-targets -- -D warnings
 
   # The RELEASE profile is its own test target, not an optimization detail:
   # debug builds run `verify_plan_memo` (recompile-and-compare on every memo

@@ -70,6 +70,18 @@ jobs:
         run: |
           cargo test --manifest-path crates/mpedb-capi/Cargo.toml
           cargo clippy --manifest-path crates/mpedb-capi/Cargo.toml --all-targets -- -D warnings
+      # mpedb-pg is a separate workspace and was in no workflow at all until
+      # now. It belongs on macOS as much as on Linux — the wire protocol is
+      # portable Unix code, and this is the second Unix.
+      #
+      # mpedb-fs is deliberately NOT here: `fuser`'s build script looks for
+      # macFUSE through pkg-config and fails on a stock runner (measured on an
+      # M3, `failed to run custom build command for fuser`). Adding it would buy
+      # a red tick for a dependency's packaging, not for anything mpedb does.
+      - name: pg (its own workspace)
+        run: |
+          cargo test --manifest-path crates/mpedb-pg/Cargo.toml
+          cargo clippy --manifest-path crates/mpedb-pg/Cargo.toml --all-targets -- -D warnings
       # The crash harnesses, the same six Windows runs. They were run here by
       # HAND and reported in the README's platform table, which is not the same
       # as running: crash-safety is the product, macOS's writer lock is a
