@@ -69,9 +69,22 @@ NUMBER values remain exact decimals; integers are normalized to decimals at
 parameter boundaries. Values beyond 38 significant digits or the supported
 Oracle exponent range currently raise instead of simulating Oracle rounding
 or underflow. Floating-point/text-to-NUMBER conversions and NLS settings are
-not implemented. **Arithmetic, defaults, constrained types, SQL
+not implemented. **Defaults, constrained types, SQL
 statements, calls to other routines, packages, exceptions, cursors, and dynamic
 SQL remain unimplemented**, so this is not full PL/SQL compatibility.
+
+Arithmetic `+`, `-`, `*`, `/` and unary signs now use bounded arbitrary-width
+integer decimal intermediates, with SQL NULL propagation and proper operator
+precedence. Exact terminating division works (e.g. `5 / 2 = 2.5`); zero division
+raises. The implementation handles valid exponents such as `1e100` without a
+floating-point fallback or i128 overflow. Nonterminating division (`1 / 3`),
+results requiring more than the currently supported 38 significant digits,
+overflow, and underflow are still refused. Oracle guarantees up to 20 base-100
+digits (39 or 40 decimal digits depending on position); this is why copying
+PostgreSQL's 16-place division or guessing a 38-digit rounding rule would be
+incorrect. Rounded arithmetic and full Oracle NUMBER behavior require a real
+reference measurement and remain part of the unfinished scope. See
+[Oracle NUMBER precision](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Data-Types.html).
 
 The native `ProcEngine` calling convention supplies one argument slot for every
 formal parameter, including OUT placeholders. OUT values start NULL; IN OUT

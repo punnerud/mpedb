@@ -474,7 +474,7 @@ impl Parser<'_> {
         Ok(if count > 0 { Some(Type::Boolean) } else { ty })
     }
     fn comparison(&mut self) -> Result<Option<Type>> {
-        let ty = self.atom()?;
+        let ty = self.additive()?;
         if self.word("IS") {
             let not = self.word("NOT");
             self.want_word("NULL")?;
@@ -493,7 +493,7 @@ impl Parser<'_> {
             };
             if let Some(op) = op {
                 self.at += 1;
-                let right = self.atom()?;
+                let right = self.additive()?;
                 if let Some(ty) = ty {
                     self.compatible(ty, right)?;
                 }
@@ -503,6 +503,64 @@ impl Parser<'_> {
                 Ok(ty)
             }
         }
+    }
+    fn additive(&mut self) -> Result<Option<Type>> {
+        let mut ty = self.multiplicative()?;
+        loop {
+            let op = if self.symbol("+") {
+                Op::SqlAdd
+            } else if self.symbol("-") {
+                Op::SqlSub
+            } else {
+                break;
+            };
+            self.compatible(Type::Number, ty)?;
+            let right = self.multiplicative()?;
+            self.compatible(Type::Number, right)?;
+            self.builder.emit(op)?;
+            ty = Some(Type::Number);
+        }
+        Ok(ty)
+    }
+    fn multiplicative(&mut self) -> Result<Option<Type>> {
+        let mut ty = self.unary()?;
+        loop {
+            let op = if self.symbol("*") {
+                Op::SqlMul
+            } else if self.symbol("/") {
+                Op::SqlDiv
+            } else {
+                break;
+            };
+            self.compatible(Type::Number, ty)?;
+            let right = self.unary()?;
+            self.compatible(Type::Number, right)?;
+            self.builder.emit(op)?;
+            ty = Some(Type::Number);
+        }
+        Ok(ty)
+    }
+    fn unary(&mut self) -> Result<Option<Type>> {
+        let mut negate = false;
+        let mut signed = false;
+        loop {
+            if self.symbol("-") {
+                negate = !negate;
+                signed = true;
+            } else if self.symbol("+") {
+                signed = true;
+            } else {
+                break;
+            }
+        }
+        let ty = self.atom()?;
+        if signed {
+            self.compatible(Type::Number, ty)?;
+        }
+        if negate {
+            self.builder.emit(Op::SqlNeg)?;
+        }
+        Ok(if signed { Some(Type::Number) } else { ty })
     }
     fn atom(&mut self) -> Result<Option<Type>> {
         if self.word("NULL") {
@@ -522,23 +580,13 @@ impl Parser<'_> {
             self.want_symbol(")")?;
             return Ok(ty);
         }
-        let minus = self.symbol("-");
-        let plus = if minus { false } else { self.symbol("+") };
         if let Some(Token::Number(text)) = self.peek() {
-            let text = if minus {
-                format!("-{text}")
-            } else {
-                text.clone()
-            };
-            let value = mpedb_types::value::parse_numeric(&text)
+            let value = mpedb_types::value::parse_numeric(text)
                 .ok_or_else(|| self.error("unsupported NUMBER literal"))?;
             self.at += 1;
             self.constant(Value::Numeric(value))?;
             self.builder.emit(Op::SqlNumber)?;
             return Ok(Some(Type::Number));
-        }
-        if minus || plus {
-            return Err(self.error("unary arithmetic on expressions is not implemented"));
         }
         let name = self.identifier()?;
         let local = *self.locals.get(&name).ok_or_else(|| {

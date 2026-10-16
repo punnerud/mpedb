@@ -18,3 +18,8 @@ blake3 = { workspace = true }
 rustpython-parser = { version = "0.4", default-features = false, features = ["num-bigint"] }
 syn = { version = "2", features = ["full"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
+# Exact Oracle NUMBER intermediates must span its full decimal exponent range;
+# a fixed i128 mantissa cannot represent even the valid value 1e100.
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"

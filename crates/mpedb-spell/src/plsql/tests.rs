@@ -10,6 +10,90 @@ fn tuple(values: Vec<Value>) -> ProcValue {
 }
 
 #[test]
+fn exact_arithmetic_obeys_precedence_and_preserves_full_exponent_range() {
+    for (expression, expected) in [
+        ("0.1 + 0.2", "0.3"),
+        ("10 - 3 * 2", "4"),
+        ("(10 - 3) * 2", "14"),
+        ("-(7.5 + 2.5) / 4", "-2.5"),
+        ("1 / 8", "0.125"),
+        ("5 / 2", "2.5"),
+        ("1e100 + 1e100", "2e100"),
+        ("1e-100 * 1e-20", "1e-120"),
+        ("1 / 1e100", "1e-100"),
+        ("9007199254740992.125 + 0.125", "9007199254740992.25"),
+        ("-5 / -2", "2.5"),
+        ("---2", "-2"),
+    ] {
+        // Separate minus tokens because Oracle's -- begins a line comment.
+        let expression = expression.replace("---", "- - - ");
+        let expected = mpedb_types::value::canonical_numeric(
+            &mpedb_types::value::parse_numeric(expected).unwrap(),
+        );
+        let source = function("", "NUMBER", &format!("BEGIN RETURN {expression}; END;"));
+        assert_eq!(
+            call(&source, &[]).unwrap(),
+            Value::Numeric(expected),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn arithmetic_nulls_zero_division_and_short_circuit_match_sql_rules() {
+    for expression in ["NULL + 1", "NULL * 2", "-NULL", "NULL / 0"] {
+        assert_eq!(
+            call(
+                &function("", "NUMBER", &format!("BEGIN RETURN {expression}; END;")),
+                &[]
+            )
+            .unwrap(),
+            Value::Null
+        );
+    }
+    assert!(matches!(
+        call(&function("", "NUMBER", "BEGIN RETURN 1 / 0; END;"), &[]),
+        Err(mpedb_types::Error::DivisionByZero)
+    ));
+    assert_eq!(
+        call(
+            &function("", "BOOLEAN", "BEGIN RETURN FALSE AND (1 / 0 > 1); END;"),
+            &[]
+        )
+        .unwrap(),
+        Value::Bool(false)
+    );
+    assert!(call(
+        &function("", "BOOLEAN", "BEGIN RETURN NULL AND (1 / 0 > 1); END;"),
+        &[]
+    )
+    .is_err());
+    assert!(compile(&function("", "BOOLEAN", "BEGIN RETURN TRUE OR 1 + 2; END;")).is_err());
+}
+
+#[test]
+fn rounding_dependent_arithmetic_is_not_silently_postgresql_or_float() {
+    let error = call(&function("", "NUMBER", "BEGIN RETURN 1 / 3; END;"), &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("rounded recurring decimal"));
+    for expression in [
+        "1e125 * 100",
+        "1e-100 * 1e-100",
+        "99999999999999999999999999999999999999 * 3",
+    ] {
+        assert!(
+            call(
+                &function("", "NUMBER", &format!("BEGIN RETURN {expression}; END;")),
+                &[]
+            )
+            .is_err(),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
 fn out_parameters_start_null_and_copy_out_in_declaration_order() {
     let source = "CREATE PROCEDURE copy_values(a NUMBER, b OUT NUMBER, c IN OUT BOOLEAN, d OUT BOOLEAN) IS BEGIN IF b IS NOT NULL THEN RETURN; END IF; b := a; c := NOT c; END;";
     assert_eq!(

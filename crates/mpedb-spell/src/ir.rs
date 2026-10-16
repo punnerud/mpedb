@@ -136,6 +136,13 @@ pub enum Op {
     SqlBool,
     /// Normalize a finite NUMBER value; integer inputs become exact decimals.
     SqlNumber,
+    /// Exact decimal arithmetic; rounding-dependent results currently refuse.
+    SqlAdd,
+    SqlSub,
+    SqlMul,
+    SqlDiv,
+    SqlNeg,
+
     /// A function reached END without returning; always raises.
     MissingReturn,
     /// Pop n scalars in source order and construct a scalar-only tuple.
@@ -225,6 +232,12 @@ const OP_JUMP_IF_SQL_TRUE: u8 = 44;
 const OP_SQL_NUMBER: u8 = 45;
 const OP_MISSING_RETURN: u8 = 46;
 const OP_TUPLE: u8 = 47;
+const OP_SQL_ADD: u8 = 48;
+const OP_SQL_SUB: u8 = 49;
+const OP_SQL_MUL: u8 = 50;
+const OP_SQL_DIV: u8 = 51;
+const OP_SQL_NEG: u8 = 52;
+
 
 /// A validated procedure: everything the runtime needs, nothing it has to
 /// trust. Constructible only through [`Proc::new`] / [`Proc::decode`], both
@@ -464,6 +477,12 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::SqlGe => b.push(OP_SQL_GE),
         Op::SqlBool => b.push(OP_SQL_BOOL),
         Op::SqlNumber => b.push(OP_SQL_NUMBER),
+        Op::SqlAdd => b.push(OP_SQL_ADD),
+        Op::SqlSub => b.push(OP_SQL_SUB),
+        Op::SqlMul => b.push(OP_SQL_MUL),
+        Op::SqlDiv => b.push(OP_SQL_DIV),
+        Op::SqlNeg => b.push(OP_SQL_NEG),
+
         Op::MissingReturn => b.push(OP_MISSING_RETURN),
 
         Op::Add => b.push(OP_ADD),
@@ -532,6 +551,12 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_SQL_GE => Op::SqlGe,
         OP_SQL_BOOL => Op::SqlBool,
         OP_SQL_NUMBER => Op::SqlNumber,
+        OP_SQL_ADD => Op::SqlAdd,
+        OP_SQL_SUB => Op::SqlSub,
+        OP_SQL_MUL => Op::SqlMul,
+        OP_SQL_DIV => Op::SqlDiv,
+        OP_SQL_NEG => Op::SqlNeg,
+
         OP_MISSING_RETURN => Op::MissingReturn,
 
         OP_ADD => Op::Add,
@@ -565,7 +590,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber => (1, 1),
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg => (1, 1),
         Op::Add
         | Op::Sub
         | Op::Mul
@@ -580,6 +605,10 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         | Op::Le
         | Op::Gt
         | Op::Ge
+        | Op::SqlAdd
+        | Op::SqlSub
+        | Op::SqlMul
+        | Op::SqlDiv
         | Op::SqlAnd
         | Op::SqlOr
         | Op::SqlEq

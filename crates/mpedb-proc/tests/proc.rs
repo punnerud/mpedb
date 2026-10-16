@@ -698,3 +698,16 @@ fn plsql_out_parameters_survive_storage_and_copy_out_only_on_success() {
     assert!(engine.call(&hash.to_string(), &args).is_err());
     assert_eq!(args, [Value::Int(42), Value::Null, Value::Int(1)]);
 }
+
+#[test]
+fn plsql_arithmetic_updates_in_out_values_without_binary_float_rounding() {
+    let (cfg, _guard) = test_config("plsql-arithmetic");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    let source = "CREATE PROCEDURE adjust(amount IN OUT NUMBER, result OUT NUMBER) IS BEGIN amount := amount + 0.1 + 0.2; result := amount / 2; END;";
+    let hash = engine.define(source, Lang::PlSql).unwrap();
+    assert_eq!(engine.call(&hash.to_string(), &[Value::Numeric("9007199254740992.1".into()), Value::Null]).unwrap(), ProcValue::Tuple(vec![
+        ProcValue::Scalar(Value::Numeric("9007199254740992.4".into())),
+        ProcValue::Scalar(Value::Numeric("4503599627370496.2".into())),
+    ]));
+}
