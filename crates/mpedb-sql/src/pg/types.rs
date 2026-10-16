@@ -49,18 +49,7 @@ fn is_array(decl: &str) -> bool {
 /// binder refuses it by name rather than silently creating a column that never
 /// fills itself in.
 pub(crate) fn is_serial(decl: &str) -> bool {
-    matches!(
-        normalize(decl).as_str(),
-        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
-    )
-}
-
-fn normalize(decl: &str) -> String {
-    decl.split('(')
-        .next()
-        .unwrap_or(decl)
-        .trim()
-        .to_ascii_lowercase()
+    pgtype::is_serial(decl)
 }
 
 #[cfg(test)]

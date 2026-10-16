@@ -335,6 +335,8 @@ pub(crate) enum SubqueryBody {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Expr {
     Lit(Value),
+    /// PostgreSQL INSERT VALUES cell: use the target column's default.
+    Default,
     /// 0-based parameter index.
     Param(u16),
     /// `t.*` — per-table star expansion (a SELECT-ITEM form, not a value).

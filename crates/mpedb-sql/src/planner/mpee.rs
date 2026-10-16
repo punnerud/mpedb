@@ -1146,6 +1146,7 @@ fn cols_of(e: &BExpr) -> Vec<u16> {
             | BExpr::Glob(a, _)
             | BExpr::Regexp(a, _)
             | BExpr::Cast(a, _)
+            | BExpr::EnumRank(a, _)
             | BExpr::CastPg(a, _)
             | BExpr::InParam(a, _)
             | BExpr::InParamColl(a, _, _) => stack.push(a),
@@ -1310,7 +1311,7 @@ mod tests {
     /// `n` tables `tK(a int64 PRIMARY KEY, b int64)` — the `select5` chain
     /// shape, small enough to build without an engine.
     fn chain_schema(n: usize) -> Schema {
-        let c = |name: &str, nullable: bool| mpedb_types::ColumnDef {
+        let c = |name: &str, nullable: bool| mpedb_types::ColumnDef { pg_enum: None,
             default_text: None,
             generated: None,
             decl: None,
@@ -1399,7 +1400,7 @@ mod tests {
     /// whole claim of the CostSource seam.
     #[test]
     fn ndv_flips_a_star_to_dimension_first() {
-        let c = |name: &str, ty: ColumnType, indexed: bool| mpedb_types::ColumnDef {
+        let c = |name: &str, ty: ColumnType, indexed: bool| mpedb_types::ColumnDef { pg_enum: None,
             default_text: None,
             generated: None,
             decl: None,

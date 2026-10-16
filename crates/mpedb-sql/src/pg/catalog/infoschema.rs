@@ -121,9 +121,29 @@ pub(crate) fn columns(schema: &Schema) -> Vec<Vec<Value>> {
     let mut out = Vec::new();
     for t in live_tables(schema) {
         for (i, c) in super::visible_columns(t).iter().enumerate() {
-            let (prec, radix, scale) = match c.ty {
-                C::Int64 => (Some(64), Some(2), Some(0)),
-                C::Float64 => (Some(53), Some(2), None),
+            let declared = c.decl.as_deref().and_then(mpedb_types::pgtype::by_name);
+            let type_name = c.pg_enum.as_ref().map(|e| e.name.as_str()).unwrap_or_else(|| declared.map(|t| t.name).unwrap_or_else(|| udt_name(c.ty)));
+            let modifier = c
+                .decl
+                .as_deref()
+                .and_then(mpedb_types::pgtype::type_modifier);
+            let char_length = match type_name {
+                "varchar" | "bpchar" => modifier.map(|m| i64::from(m - 4)),
+                _ => None,
+            };
+            let (prec, radix, scale) = match type_name {
+                "int2" => (Some(16), Some(2), Some(0)),
+                "int4" => (Some(32), Some(2), Some(0)),
+                "int8" => (Some(64), Some(2), Some(0)),
+                "float4" => (Some(24), Some(2), None),
+                "float8" => (Some(53), Some(2), None),
+                // PG 16's information_schema exposes the stored scale bits,
+                // including 2046 for a declared scale of -2 (oracle-checked).
+                "numeric" => (
+                    modifier.map(|m| i64::from((m - 4) >> 16)),
+                    Some(10),
+                    modifier.map(|m| i64::from((m - 4) & 0x7ff)),
+                ),
                 _ => (None, None, None),
             };
             out.push(vec![
@@ -137,12 +157,17 @@ pub(crate) fn columns(schema: &Schema) -> Vec<Vec<Value>> {
                     None => Value::Null,
                 },
                 yes_no(c.nullable),
-                text(sql_type_name(c.ty)),
-                // mpedb's Text has no declared length — it is not varchar(n) —
-                // so the standard's answer is NULL, meaning "no limit". A
-                // number here would promise an enforcement that does not exist.
-                Value::Null,
-                Value::Null,
+                text(
+                    if c.pg_enum.is_some() { "USER-DEFINED" } else { declared
+                        .map(|t| mpedb_types::pgtype::sql_spelling(t.name))
+                        .unwrap_or_else(|| sql_type_name(c.ty)) },
+                ),
+                // Report the declaration, just as pg_attribute.atttypmod does.
+                // Storage still has the documented widened-type semantics.
+                char_length.map(Value::Int).unwrap_or(Value::Null),
+                char_length
+                    .map(|n| Value::Int(n * 4))
+                    .unwrap_or(Value::Null),
                 prec.map(Value::Int).unwrap_or(Value::Null),
                 radix.map(Value::Int).unwrap_or(Value::Null),
                 scale.map(Value::Int).unwrap_or(Value::Null),
@@ -151,12 +176,12 @@ pub(crate) fn columns(schema: &Schema) -> Vec<Vec<Value>> {
                     _ => Value::Null,
                 },
                 match c.ty {
-                    C::Text => text("C"),
+                    C::Text if c.pg_enum.is_none() => text("C"),
                     _ => Value::Null,
                 },
                 text(CATALOG),
-                text("pg_catalog"),
-                text(udt_name(c.ty)),
+                text(if c.pg_enum.is_some() { "public" } else { "pg_catalog" }),
+                text(type_name),
                 yes_no(false),
                 Value::Null,
                 if c.generated.is_some() {

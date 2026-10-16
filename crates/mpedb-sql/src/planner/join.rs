@@ -210,6 +210,10 @@ pub(super) fn plan_join_select<'s>(
     slot_types: Vec<Ty>,
     cte: Option<CteRef<'s>>,
 ) -> Result<PlannedStmt> {
+    if enum_source(s, schema) {
+        return Err(Error::Unsupported("joins over enum tables need enum-aware tuple metadata".into()));
+    }
+
     // A CORRELATED subplan is lifted BEFORE the join dispatch, and its
     // `outer_args` are slots of the joined tuple in the TEXTUAL order — v1
     // refused to reorder at all whenever one existed, because leaving them
@@ -926,7 +930,7 @@ fn join_order_by(
             }
         }
         let (b, _) = binder.bind_expr(e)?;
-        if matches!(b, BExpr::Const(_)) {
+        if matches!(b, BExpr::Const(_)) && !binder.allows_constant_order_key(e) {
             return Err(bind_err(format!(
                 "{} is a constant — it names no column, so it orders nothing.",
                 describe_key(e, i)

@@ -139,13 +139,11 @@ pub(super) fn push_junk(
         )));
     };
     let (b, _) = binder.bind_expr(key)?;
-    // A CONSTANT sort key names no column, so it cannot order anything: every
-    // row gets the same key and the sort is a no-op. sqlite accepts it and
-    // hands back scan order — an arbitrary answer to a query that asked for an
-    // order. PostgreSQL refuses, and it is right to, because the reason people
-    // write this is that they meant an ordinal: `ORDER BY 2` IS an output
-    // position, and `1 + 1` looks like one until it silently is not.
-    if matches!(b, BExpr::Const(_)) {
+    // Keep the existing refusal for untyped constants. PostgreSQL accepts an
+    // explicitly cast constant as an expression (Django emits this shape for
+    // annotated constants); it contributes an equal key to each row, leaving
+    // subsequent ORDER BY keys to decide the order.
+    if matches!(b, BExpr::Const(_)) && !binder.allows_constant_order_key(key) {
         return Err(bind_err(format!(
             "{} is a constant — it names no column, so it orders nothing. A bare integer \
              like `ORDER BY 2` is an output position; an expression is not.",
@@ -526,6 +524,16 @@ pub(super) fn plan_select<'s>(
             (crate::plan::DUAL_TABLE, crate::plan::dual_def())
         }
     };
+    let enum_order;
+    let s = if table.columns.iter().any(|c| c.pg_enum.is_some()) {
+        if !s.joins.is_empty() || !s.group_by.is_empty() || s.having.is_some()
+            || s.items.as_ref().is_some_and(|xs| xs.iter().any(|(e,_)| super::aggregate::contains_agg(e) || super::window::contains_window(e)))
+            || s.order_by.iter().any(|(e,_)| super::aggregate::contains_agg(e) || super::window::contains_window(e)) {
+            return Err(Error::Unsupported("joins, aggregation and windows on native enum tables need enum-aware output metadata".into()));
+        }
+        enum_order = rewrite_enum_order(s, table)?;
+        &enum_order
+    } else { s };
     if !s.joins.is_empty() {
         return plan_join_select(
             s, schema, n_params, catalog, mode, host_udfs, row_count, consts, subplans, slot_types, cte,
@@ -1106,7 +1114,7 @@ fn rewrite_where_aliases_rec(
         ast::Expr::Col(..)
         | ast::Expr::Qualified(..)
         | ast::Expr::TableStar(_)
-        | ast::Expr::Lit(_)
+        | ast::Expr::Default | ast::Expr::Lit(_)
         | ast::Expr::Param(_)
         | ast::Expr::ContextRef(_)
         | ast::Expr::Excluded(_)
@@ -1174,4 +1182,34 @@ pub(super) fn set_returning_arg(item: &ast::Expr) -> Result<Option<(ast::Expr, S
         }
         _ => Ok(None),
     }
+}
+
+fn rewrite_enum_order(s: &ast::SelectStmt, table: &TableDef) -> Result<ast::SelectStmt> {
+    let mut out = s.clone();
+    for (key, _) in &mut out.order_by {
+        let mut source = key.clone();
+        if let ast::Expr::Lit(Value::Int(n)) = &source {
+            if *n > 0 {
+                if let Some(items) = &s.items {
+                    if let Some((e,_)) = items.get(*n as usize - 1) { source = e.clone(); }
+                } else if let Some(c) = table.visible_columns().get(*n as usize - 1) {
+                    source = ast::Expr::Col(c.name.clone(), false);
+                }
+            }
+        }
+        if let ast::Expr::Col(name, _) = &source {
+            if let Some(items) = &s.items {
+                if let Some((e,_)) = items.iter().find(|(_,alias)| alias.as_ref() == Some(name)) { source = e.clone(); }
+            }
+        }
+        let col = match &source {
+            ast::Expr::Col(n, _) | ast::Expr::Qualified(_,n) => table.column_index(n),
+            _ => None,
+        };
+        if col.is_some_and(|c| table.columns[c as usize].pg_enum.is_some()) {
+            if s.distinct { return Err(Error::Unsupported("DISTINCT with enum ordering needs enum-aware projection keys".into())); }
+            *key = ast::Expr::Func("__mpedb_enum_rank".into(), vec![source]);
+        }
+    }
+    Ok(out)
 }

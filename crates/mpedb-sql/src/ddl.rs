@@ -29,6 +29,7 @@ pub struct CreateColumnSpec {
     /// no type at all. Neither `ty` nor `affinity` can reconstruct it, and it
     /// is what `sqlite3_column_decltype` is defined to return.
     pub decl: Option<String>,
+    pub pg_enum: Option<mpedb_types::pgtype::PgEnum>,
     pub not_null: bool,
     pub unique: bool,
     pub pk: bool,
@@ -255,6 +256,8 @@ pub enum CommentTarget {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlStmt {
+    CreateEnum { name: String, labels: Vec<String> },
+    DropEnum { name: String, if_exists: bool },
     CreateTable(CreateTableSpec),
     /// `CREATE [OR REPLACE] FUNCTION … AS $$ … $$ LANGUAGE plpgsql` — carried
     /// as its WHOLE SOURCE TEXT rather than as a parsed shape, and that is the
@@ -316,6 +319,9 @@ pub enum DdlStmt {
     /// INSERTs. The facade refuses UNIQUE / PRIMARY KEY on ADD and NOT NULL
     /// without a non-NULL default — matching sqlite.
     AlterAddColumn { table: String, column: CreateColumnSpec },
+    /// PostgreSQL: validate existing rows and attach a foreign key to the schema.
+    AlterAddForeignKey { table: String, foreign_key: ForeignKeySpec },
+    AlterAddUnique { table: String, columns: Vec<String>, name: Option<String> },
     /// `ALTER TABLE <t> DROP [COLUMN] <name>` (#47 stage 5) — removes a column
     /// and rewrites existing rows without it. The facade/schema refuse dropping
     /// a PK column, an indexed column, or the last column (no online index

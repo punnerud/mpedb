@@ -19,6 +19,9 @@ pub(super) fn plan_compound(
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
+    if c.arms.iter().any(|s| enum_source(s, schema)) {
+        return Err(Error::Unsupported("set operations over enum tables need enum-aware tuple metadata".into()));
+    }
     let mut arms: Vec<crate::plan::CompoundArm> = Vec::with_capacity(c.arms.len());
     let mut param_types: Vec<Option<ColumnType>> = Vec::new();
     let mut context_keys: Vec<String> = Vec::new();

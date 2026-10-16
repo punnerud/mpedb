@@ -27,6 +27,13 @@ use mpedb_types::Value;
 /// hexadecimal UUID string" — it was promised a UUID and handed bytea.
 pub fn to_text_as(v: &Value, oid: u32) -> Option<Vec<u8>> {
     match (oid, v) {
+        // A timestamp without time zone must not carry an offset in its text.
+        // psycopg2 honours an explicit +00 even when the OID is 1114.
+        (1114, Value::Timestamp(us)) => {
+            let mut text = timestamp_text(*us);
+            text.truncate(text.len() - 3); // timestamp_text always appends +00
+            Some(text.into_bytes())
+        }
         // int2vector (22) and oidvector (30) are ARRAYS that PostgreSQL prints
         // SPACE-separated and unbraced, not in the `{…}` array form — and
         // clients parse exactly that. `pg_index.indkey` is the one every ORM

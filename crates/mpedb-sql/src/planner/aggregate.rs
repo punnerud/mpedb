@@ -31,7 +31,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
         // what keeps `sum(x) OVER (…)` from being read as a plain aggregate.
         E::Window { .. } => false,
         E::TableStar(_)
-        | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
+        | E::Default | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) | E::Raise(..) => false,
     }
 }
@@ -260,7 +260,7 @@ fn lift_aggs(
         // (windows + aggregate is rejected at routing); if one reaches here it
         // passes through to the binder's clear refusal rather than being lifted.
         other @ E::Window { .. } => other.clone(),
-        other @ (E::TableStar(_) | E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_) | E::Raise(..)) => {
+        other @ (E::TableStar(_) | E::Default | E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_) | E::Raise(..)) => {
             other.clone()
         }
     })
@@ -333,7 +333,7 @@ fn synthetic_grouped_table(
     let mut out: Vec<mpedb_types::ColumnDef> =
         Vec::with_capacity(key_types.len() + aggs.len() + bare.len());
     for (k, &ty) in key_types.iter().enumerate() {
-        out.push(mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
+        out.push(mpedb_types::ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
             name: format!("__g{k}"),
             ty,
             nullable: true, // a group key can be NULL; NULLs group together
@@ -365,7 +365,7 @@ fn synthetic_grouped_table(
             // to the argument's type would reject `stddev_pop(int_col) / 2.0`.
             None => ColumnType::Any,
         };
-        out.push(mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
+        out.push(mpedb_types::ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
             name: format!("__g{}", key_types.len() + i),
             ty,
             // COUNT and TOTAL are never NULL (0 / 0.0 over an empty group);
@@ -389,7 +389,7 @@ fn synthetic_grouped_table(
     // the base column. Always nullable — a bare column is carried from a witness
     // row that may hold NULL, and an empty group yields NULL.
     for (j, (_, ty, aff)) in bare.iter().enumerate() {
-        out.push(mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
+        out.push(mpedb_types::ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
             name: format!("__b{j}"),
             ty: *ty,
             nullable: true,

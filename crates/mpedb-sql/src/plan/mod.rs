@@ -565,7 +565,9 @@ const MAX_JOINS: usize = 63;
 //     a plain select ([`SelectSource`]). The presence byte was already a tag
 //     (0 = no source, 1 = select), so tag 2 carries a `DerivedPlan` in the
 //     layout `encode_derived_plan` already writes for a compound arm.
-const PLAN_FORMAT: u8 = 78;
+// 79: EnumRank / EnumValidate opcodes carry enum labels in constant pools.
+// 80: PostgreSQL calendar EXTRACT and temporal text scalar functions.
+const PLAN_FORMAT: u8 = 80;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -624,7 +626,7 @@ pub fn series_def_named(table: &str, column: &str) -> mpedb_types::TableDef {
     mpedb_types::TableDef {
         id: 0,
         name: table.into(),
-        columns: vec![mpedb_types::ColumnDef {
+        columns: vec![mpedb_types::ColumnDef { pg_enum: None,
             name: column.into(),
             ty: ColumnType::Int64,
             nullable: false,
@@ -989,6 +991,14 @@ pub struct CompiledPlan {
     /// stays LAST, so the session-fill formula is untouched.
     pub subplans: Vec<SubPlan>,
     pub footprint: Footprint,
+}
+
+/// PostgreSQL result metadata obtained without executing a statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgOutputColumn {
+    pub name: String,
+    pub type_oid: Option<u32>,
+    pub type_mod: i32,
 }
 
 impl CompiledPlan {

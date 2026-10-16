@@ -214,6 +214,39 @@ impl Database {
         }
     }
 
+    /// PostgreSQL result OIDs from the member that actually owns the query.
+    /// No statement is executed to describe it.
+    pub fn routed_output_pg_oids(&self, sql: &str) -> Vec<Option<u32>> {
+        match self.resolve_db_refs_hook(sql) {
+            Ok(DbRoute::AttachedOnly { db, sql }) => {
+                let guard = self.attached.read().expect(POISON);
+                guard.find(&db).and_then(|i| guard.members[i].db.output_pg_oids(&sql).ok()).unwrap_or_default()
+            }
+            Ok(DbRoute::Main(s)) => self.output_pg_oids(&s).unwrap_or_default(),
+            Ok(DbRoute::Passthrough) => self.output_pg_oids(sql).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Describe PostgreSQL columns using the schema selected by name resolution.
+    /// This compiles the query without executing it.
+    pub fn routed_output_pg_columns(&self, sql: &str) -> Result<Vec<mpedb_sql::PgOutputColumn>> {
+        match self.resolve_db_refs_hook(sql)? {
+            DbRoute::AttachedOnly { db, sql } => {
+                let guard = self.attached.read().expect(POISON);
+                let i = guard
+                    .find(&db)
+                    .ok_or_else(|| Error::Bind(format!("unknown database {db}")))?;
+                guard.members[i].db.output_pg_columns(&sql)
+            }
+            DbRoute::Main(sql) => self.output_pg_columns(&sql),
+            DbRoute::Passthrough => self.output_pg_columns(sql),
+            DbRoute::Cross { .. } => Err(Error::Unsupported(
+                "PostgreSQL column metadata for a cross-file query".into(),
+            )),
+        }
+    }
+
     /// Run `sql` on one attached member and report its output columns and
     /// their declared types — what `PRAGMA <schema>.table_info(<view>)` needs.
     ///
@@ -250,7 +283,11 @@ impl Database {
         // for `temp` that is user-visible — it showed up in
         // `sqlite_temp_master` as a table nobody created. A zero-table schema
         // is legal (#47) and is what an untouched temp schema actually is.
-        let db = open_ephemeral_temp()?;
+        let mut db = open_ephemeral_temp()?;
+        // TEMP belongs to the connection's SQL dialect. A sqlite-default
+        // member parsed SERIAL as an untyped affinity column and DATE casts
+        // with sqlite's prefix rule even on a PostgreSQL connection.
+        db.set_dialect(self.dialect);
         let mut guard = self.attached.write().expect(POISON);
         // Another thread on this connection may have won the race.
         if guard.find("temp").is_some() {

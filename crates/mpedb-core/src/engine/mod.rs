@@ -2084,6 +2084,11 @@ impl Engine {
             )));
         }
         for (v, c) in values.iter().zip(&table.columns) {
+            if let (Some(e), Value::Text(label)) = (&c.pg_enum, v) {
+                if !e.labels.contains(label) {
+                    return Err(Error::Bind(format!("invalid input value for enum {}: {:?}", e.name, label)));
+                }
+            }
             if !v.fits(c.ty) {
                 // The row has already been through the column's store-time
                 // affinity, so on a converting column (task #113) this value is

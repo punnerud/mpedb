@@ -31,6 +31,7 @@ pub use datetime::{sqlite_now_parts, sqlite_now_string};
 pub use scalar::ScalarFn;
 
 use ops::{
+    pg_like_match,
     bit_i64, bitwise, escape_char, glob_match, in_items_3vl, in_list_3vl,
     like_match, like_match_cs, regexp_match, CrossClass,
 };
@@ -108,6 +109,10 @@ pub enum Instr {
     /// because the mpedb type cannot say which parse to run: `uuid` and
     /// `bytea` are both `Blob` and read their text completely differently.
     CastPg(u32),
+    /// Validate an enum label and replace it with its declaration-order rank.
+    EnumRank(u16),
+    /// Validate a label without changing its text value.
+    EnumValidate(u16),
     /// `a || b` — SQL concatenation. NULL propagates; ints and bools render
     /// as text first (sqlite's rule); floats are refused until someone needs
     /// their formatting pinned down.
@@ -463,9 +468,42 @@ pub struct ExprProgram {
     /// Derived, never encoded — a decoded program recomputes it in
     /// [`Self::new`], so the plan format is unchanged.
     fast_ok: bool,
+    has_enum_inputs: bool,
 }
 
 impl ExprProgram {
+    pub fn with_enum_validation(&self, e: &crate::pgtype::PgEnum) -> Result<Self> {
+        let mut constants = self.consts.clone();
+        let slot = u16::try_from(constants.len()).map_err(|_| Error::Unsupported("too many enum constants".into()))?;
+        let mut labels = vec![Value::Text(e.name.clone())];
+        labels.extend(e.labels.iter().cloned().map(Value::Text));
+        constants.push(Value::List(labels));
+        let mut instrs = self.instrs.clone();
+        instrs.push(Instr::EnumValidate(slot));
+        Self::new(instrs, constants)
+    }
+
+    /// Bound enum coercions are checked even when a scan produces no rows.
+    pub fn validate_enum_inputs(&self, params: &[Value]) -> Result<()> {
+        if !self.has_enum_inputs { return Ok(()); }
+        for pair in self.instrs.windows(2) {
+            let slot = match pair[1] { Instr::EnumRank(s) | Instr::EnumValidate(s) => s, _ => continue };
+            let value = match pair[0] {
+                Instr::PushParam(p) => params.get(p as usize),
+                Instr::PushConst(c) => self.consts.get(c as usize),
+                _ => None,
+            };
+            if let Some(Value::Text(label)) = value {
+                let Value::List(def) = &self.consts[slot as usize] else { unreachable!("validated") };
+                if !def[1..].iter().any(|v| matches!(v, Value::Text(s) if s == label)) {
+                    let Value::Text(name) = &def[0] else { unreachable!("validated") };
+                    return Err(Error::Bind(format!("invalid input value for enum {}: {:?}", name, label)));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Every column this expression reads, folded into a `& 63` bitmask
     /// (#146 K1).
     ///
@@ -524,7 +562,9 @@ impl ExprProgram {
                         | Instr::Not
                 )
             });
+        let has_enum_inputs = instrs.iter().any(|i| matches!(i, Instr::EnumRank(_) | Instr::EnumValidate(_)));
         Ok(ExprProgram {
+            has_enum_inputs,
             instrs,
             consts,
             max_stack,
@@ -742,6 +782,20 @@ impl ExprProgram {
                     let a = stack.pop().expect("validated");
                     stack.push(cast_value(a, t)?);
                 }
+                Instr::EnumRank(slot) | Instr::EnumValidate(slot) => {
+                    let Value::List(def) = &self.consts[slot as usize] else { unreachable!("validated") };
+                    let Value::Text(name) = &def[0] else { unreachable!("validated") };
+                    let a = stack.pop().expect("validated");
+                    stack.push(match a {
+                        Value::Null => Value::Null,
+                        Value::Text(label) => {
+                            let rank = def[1..].iter().position(|s| matches!(s, Value::Text(s) if s == &label))
+                                .ok_or_else(|| Error::Bind(format!("invalid input value for enum {}: {:?}", name, label)))?;
+                            if matches!(instr, Instr::EnumRank(_)) { Value::Int(rank as i64) } else { Value::Text(label) }
+                        }
+                        _ => return Err(Error::TypeMismatch("enum label must be text".into())),
+                    });
+                }
                 Instr::CastPg(oid) => {
                     let a = stack.pop().expect("validated");
                     stack.push(cast_pg(&a, oid)?);
@@ -795,7 +849,7 @@ impl ExprProgram {
                         (Value::Text(s), Value::Text(p)) => Value::Bool(if ci {
                             like_match(p, s, Some(esc))
                         } else {
-                            like_match_cs(p, s, Some(esc))
+                            pg_like_match(p, s, esc)?
                         }),
                         _ => {
                             return Err(Error::TypeMismatch(
@@ -854,7 +908,7 @@ impl ExprProgram {
                         (Value::Text(s), Value::Text(p)) => Value::Bool(if ci {
                             like_match(p, s, Some(esc))
                         } else {
-                            like_match_cs(p, s, Some(esc))
+                            pg_like_match(p, s, esc)?
                         }),
                         _ => {
                             return Err(Error::TypeMismatch(
@@ -1408,7 +1462,7 @@ fn arith(op: Instr, a: Value, b: Value) -> Result<Value> {
 /// than a silent fall back to f64 — this type exists so the digits survive,
 /// and quietly losing them here would be the wrong answer it was added to
 /// prevent.
-fn numeric_arith(op: Instr, a: &str, b: &str) -> Result<Value> {
+pub(crate) fn numeric_arith(op: Instr, a: &str, b: &str) -> Result<Value> {
     let too_big = || {
         Error::Unsupported(format!(
             "exact decimal arithmetic on `{a}` and `{b}` needs more than 38 \

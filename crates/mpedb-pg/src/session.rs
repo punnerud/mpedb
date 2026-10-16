@@ -99,6 +99,9 @@ pub struct Session<S: Read + Write> {
     /// PRE-transaction state. A property asserted in prose is a property
     /// nobody checks — `wire.rs` now checks this one.
     txn_log: Vec<(String, Vec<Value>)>,
+    /// Savepoints address positions in the replay log. Duplicate names shadow
+    /// earlier entries until the newer savepoint is released.
+    savepoints: Vec<(String, usize)>,
     pid: i32,
     secret: i32,
     /// Reported as `server_version` and by `SHOW server_version`.
@@ -148,6 +151,7 @@ impl<S: Read + Write> Session<S> {
             portals: HashMap::new(),
             in_explicit_txn: false,
             txn_log: Vec::new(),
+            savepoints: Vec::new(),
             pid,
             // Derived from the pid rather than random: mpedb has no RNG
             // dependency by policy, and the secret's job here is to make a
@@ -371,6 +375,11 @@ impl<S: Read + Write> Session<S> {
     // ---------------------------------------------------------- extended query
 
     fn parse(&mut self, name: String, sql: String, param_oids: Vec<u32>) {
+        if param_oids.iter().any(|oid| *oid >= (1 << 31) && *oid & 4095 == 0) {
+            self.fail_str(errmap::FEATURE_NOT_SUPPORTED,
+                "native enum parameter OID hints need enum-aware parameter identity; use unspecified text parameters");
+            return;
+        }
         // An unnamed statement is replaced silently; a NAMED one that already
         // exists is a protocol error in PostgreSQL, and clients rely on that to
         // catch their own bugs.
@@ -576,6 +585,60 @@ impl<S: Read + Write> Session<S> {
             return Ok(Answer::Empty);
         }
 
+        if let Some((args, name)) = mpedb_sql::pg::api::session_config_call(trimmed, params) {
+            // Timestamp rendering currently uses UTC. Accept exactly the
+            // setting we can honor, rather than pretending to change zones.
+            match args.as_slice() {
+                [Value::Text(setting), Value::Text(zone), Value::Bool(false)]
+                    if setting.eq_ignore_ascii_case("timezone") && zone == "UTC" => {
+                        return Ok(Answer::Rows {
+                            columns: vec![name], rows: vec![vec![Value::Text("UTC".into())]],
+                        });
+                    }
+                _ => return Err(Error::Unsupported(
+                    "set_config currently supports only TimeZone = UTC with is_local = false".into(),
+                )),
+            }
+        }
+
+        if let Some((sequence, name)) = mpedb_sql::pg::api::serial_nextval_call(trimmed, params) {
+            let (namespace, sequence) = mpedb_sql::pg::api::serial_regclass_name(&sequence)
+                .ok_or_else(|| Error::Bind("invalid SERIAL sequence name".into()))?;
+            let next = self.db.next_serial_value(&sequence, namespace.as_deref())?;
+            return Ok(Answer::Rows { columns: vec![name], rows: vec![vec![Value::Int(next)]] });
+        }
+
+        if let Some(control) = mpedb_sql::parse_txn_control_dialect(trimmed, Dialect::Postgres) {
+            use mpedb_sql::TxnControl;
+            let rollback = matches!(&control, TxnControl::RollbackTo(_));
+            match control {
+                TxnControl::Savepoint(name) => {
+                    self.require_transaction("SAVEPOINT")?;
+                    self.savepoints.push((name, self.txn_log.len()));
+                    return Ok(Answer::Affected("SAVEPOINT".into()));
+                }
+                TxnControl::Release(name) | TxnControl::RollbackTo(name) => {
+                    self.require_transaction(if rollback {
+                        "ROLLBACK TO SAVEPOINT"
+                    } else {
+                        "RELEASE SAVEPOINT"
+                    })?;
+                    let index = self.savepoints.iter().rposition(|(n, _)| *n == name)
+                        .ok_or_else(|| Error::Bind(format!("savepoint \"{name}\" does not exist")))?;
+                    if rollback {
+                        self.txn_log.truncate(self.savepoints[index].1);
+                        self.savepoints.truncate(index + 1);
+                        self.status = TxnStatus::InTransaction;
+                    } else {
+                        self.savepoints.truncate(index);
+                    }
+                    let tag = if rollback { "ROLLBACK" } else { "RELEASE" };
+                    return Ok(Answer::Affected(tag.into()));
+                }
+                _ => {}
+            }
+        }
+
         // Transaction control is handled HERE rather than handed to the engine,
         // because mpedb's write session cannot span round trips without holding
         // the writer lock across them (see the module header).
@@ -592,6 +655,7 @@ impl<S: Read + Write> Session<S> {
                 }
                 self.in_explicit_txn = true;
                 self.txn_log.clear();
+                self.savepoints.clear();
                 self.status = TxnStatus::InTransaction;
                 return Ok(Answer::Affected("BEGIN".into()));
             }
@@ -599,12 +663,14 @@ impl<S: Read + Write> Session<S> {
                 let r = self.commit_block();
                 self.in_explicit_txn = false;
                 self.txn_log.clear();
+                self.savepoints.clear();
                 self.status = TxnStatus::Idle;
                 return r.map(|()| Answer::Affected("COMMIT".into()));
             }
             Some(TxnVerb::Rollback) => {
                 self.in_explicit_txn = false;
                 self.txn_log.clear();
+                self.savepoints.clear();
                 self.status = TxnStatus::Idle;
                 return Ok(Answer::Affected("ROLLBACK".into()));
             }
@@ -679,9 +745,34 @@ impl<S: Read + Write> Session<S> {
                 // The stored comments ride along: `pg_description` is built
                 // from them and they are not part of the schema.
                 let comments = self.db.list_comments().unwrap_or_default();
+                let describe_view = |(name, definition): (String, String), temporary| {
+                    let columns = if temporary {
+                        self.db.routed_output_pg_columns(&definition)
+                    } else {
+                        self.db.output_pg_columns(&definition)
+                    }
+                    .ok()
+                    .filter(|columns| !columns.is_empty());
+                    mpedb_sql::pg::api::CatalogView {
+                        name,
+                        definition,
+                        columns,
+                    }
+                };
+                let views: Vec<_> = self.db.list_views()?.into_iter()
+                    .map(|v| describe_view(v, false)).collect();
+                let mut temp_views: Vec<_> = self.db.temp_views_all().into_iter()
+                    .map(|(name, definition, _)| describe_view((name, definition), true))
+                    .collect();
+                temp_views.sort_by(|a, b| a.name.cmp(&b.name));
+                let temp = self.db.attached_schema("temp").or_else(|| {
+                    (!temp_views.is_empty()).then(|| self.db.temp_schema_or_empty())
+                });
+                let enums = self.db.list_pg_enums()?;
                 let cat = self
                     .cat
-                    .ensure(&bundle.schema, bundle.schema_gen, &comments)
+                    .ensure_with_objects(&bundle.schema, bundle.schema_gen, &comments,
+                        temp.as_ref().map(|t| (&t.schema, t.schema_gen)), &views, &temp_views, &enums)
                     .map_err(Error::Internal)?;
                 cat.query(&rewritten, params)
             }
@@ -697,6 +788,14 @@ impl<S: Read + Write> Session<S> {
                     .collect(),
             }),
             Err(e) => Err(e),
+        }
+    }
+
+    fn require_transaction(&self, command: &str) -> Result<(), Error> {
+        if self.in_explicit_txn {
+            Ok(())
+        } else {
+            Err(Error::Bind(format!("{command} can only be used in transaction blocks")))
         }
     }
 
@@ -843,8 +942,8 @@ impl<S: Read + Write> Session<S> {
     /// Two sources, in this order:
     ///
     /// 1. **The DECLARED type**, where the plan can name one — an output column
-    ///    that is a bare reference to a base-table column
-    ///    (`CompiledPlan::output_decltypes`). This is the authority, because
+    ///    that is a bare reference to a base-table column, including RETURNING,
+    ///    or an explicit strict PG cast (`CompiledPlan::output_pg_oids`). This is the authority, because
     ///    mpedb's STORAGE type is coarser than PostgreSQL's: `uuid` and `bytea`
     ///    are both `Blob`, so a value alone reports `bytea` for a `uuid`
     ///    column and the client hands back bytes where it was promised a UUID.
@@ -861,17 +960,7 @@ impl<S: Read + Write> Session<S> {
         // the value — never an error, since this is only a description.
         let declared: Vec<Option<u32>> = self
             .db
-            .output_decltypes(sql)
-            .map(|v| {
-                v.into_iter()
-                    .map(|d| {
-                        d.as_deref()
-                            .and_then(mpedb_types::pgtype::by_name)
-                            .map(|t| t.oid)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+            .routed_output_pg_oids(sql);
         columns
             .iter()
             .enumerate()
@@ -900,7 +989,9 @@ impl<S: Read + Write> Session<S> {
                     .unwrap_or(25);
                 let type_len = mpedb_types::pgtype::by_oid(oid)
                     .map(|t| t.typlen)
-                    .unwrap_or(-1);
+                    // The compiler reserves aligned OIDs above 2^31 for
+                    // persisted native enums, whose PostgreSQL width is 4.
+                    .unwrap_or(if oid >= (1 << 31) && oid & 4095 == 0 { 4 } else { -1 });
                 FieldDesc {
                     name: name.clone(),
                     table_oid: 0,
@@ -923,7 +1014,7 @@ impl<S: Read + Write> Session<S> {
         self.out.error(errmap::SEVERITY_ERROR, code, msg);
         if self.in_explicit_txn {
             // PostgreSQL puts the whole block in the failed state: everything
-            // but ROLLBACK is refused until the block ends. Not reproducing
+            // but transaction-end commands and ROLLBACK TO are refused. Not reproducing
             // that lets a client commit a block whose middle failed.
             self.status = TxnStatus::Failed;
         }
@@ -946,13 +1037,27 @@ enum TxnVerb {
 }
 
 fn txn_verb(sql: &str) -> Option<TxnVerb> {
-    let head = sql
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .find(|s| !s.is_empty())
-        .unwrap_or_default()
-        .to_ascii_uppercase();
-    match head.as_str() {
-        "BEGIN" | "START" => Some(TxnVerb::Begin),
+    let sql = sql.trim();
+    let end = sql
+        .find(|c: char| c.is_whitespace() || c == ';')
+        .unwrap_or(sql.len());
+    let head = &sql[..end];
+    // Match the whole control statement. ROLLBACK TO and malformed SQL
+    // must never become a full rollback just because of the first word.
+    let tail = sql[end..]
+        .trim()
+        .strip_suffix(';')
+        .unwrap_or(sql[end..].trim())
+        .trim();
+    if !tail.is_empty()
+        && !tail.eq_ignore_ascii_case("TRANSACTION")
+        && !tail.eq_ignore_ascii_case("WORK")
+    {
+        return None;
+    }
+    match head.to_ascii_uppercase().as_str() {
+        "BEGIN" => Some(TxnVerb::Begin),
+        "START" if tail.eq_ignore_ascii_case("TRANSACTION") => Some(TxnVerb::Begin),
         "COMMIT" | "END" => Some(TxnVerb::Commit),
         "ROLLBACK" | "ABORT" => Some(TxnVerb::Rollback),
         _ => None,
@@ -960,7 +1065,13 @@ fn txn_verb(sql: &str) -> Option<TxnVerb> {
 }
 
 fn is_txn_end(sql: &str) -> bool {
-    matches!(txn_verb(sql), Some(TxnVerb::Commit) | Some(TxnVerb::Rollback))
+    matches!(
+        txn_verb(sql),
+        Some(TxnVerb::Commit) | Some(TxnVerb::Rollback)
+    ) || matches!(
+        mpedb_sql::parse_txn_control_dialect(sql, Dialect::Postgres),
+        Some(mpedb_sql::TxnControl::RollbackTo(_))
+    )
 }
 
 /// A write that may be BUFFERED into a transaction block.
@@ -1222,6 +1333,9 @@ mod tests {
         // called `beginning` into a transaction start.
         assert!(txn_verb("BEGINNING").is_none());
         assert!(txn_verb("COMMITTED").is_none());
+        assert!(txn_verb("ROLLBACK TO SAVEPOINT sp").is_none());
+        assert!(txn_verb("ROLLBACK nonsense").is_none());
+        assert!(txn_verb("COMMIT nonsense").is_none());
     }
 
     #[test]

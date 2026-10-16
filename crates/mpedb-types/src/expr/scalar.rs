@@ -263,6 +263,10 @@ pub enum ScalarFn {
     /// (mpedb has no nested arrays), and the planner checks it and drops it
     /// rather than carrying a value that can only have one legal setting.
     Subscripts = 76,
+    /// PostgreSQL EXTRACT calendar fields, producing exact numeric values.
+    PgExtract = 77,
+    /// Calendar text with a compile-time UTC-zone suffix decision.
+    PgTemporalText = 78,
     SqrtStrict = 70,
     LnStrict = 71,
     Log10Strict = 72,
@@ -343,6 +347,8 @@ impl ScalarFn {
             69 => ScalarFn::JsonQuoteExtract,
             70 => ScalarFn::SqrtStrict,
             75 => ScalarFn::FormatType,
+            77 => ScalarFn::PgExtract,
+            78 => ScalarFn::PgTemporalText,
             76 => ScalarFn::Subscripts,
             71 => ScalarFn::LnStrict,
             72 => ScalarFn::Log10Strict,
@@ -382,6 +388,8 @@ impl ScalarFn {
             // PostgreSQL allows the one-argument form too (`format_type(oid)`
             // is `format_type(oid, NULL)`), and reflection uses both.
             ScalarFn::FormatType => argc == 1 || argc == 2,
+            ScalarFn::PgExtract => argc == 2,
+            ScalarFn::PgTemporalText => argc == 2,
             ScalarFn::Subscripts => argc == 1,
             ScalarFn::Substr => argc == 2 || argc == 3,
             ScalarFn::Instr | ScalarFn::Pow | ScalarFn::VecL2 | ScalarFn::VecCosine => argc == 2,
@@ -454,6 +462,8 @@ impl ScalarFn {
             ScalarFn::Log2Strict => "log2",
             ScalarFn::LogBaseStrict => "log",
             ScalarFn::FormatType => "format_type",
+            ScalarFn::PgExtract => "extract",
+            ScalarFn::PgTemporalText => "temporal_text",
             ScalarFn::Subscripts => "generate_subscripts",
             ScalarFn::Pow => "pow",
             ScalarFn::Sign => "sign",
@@ -578,6 +588,9 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
             // A NULL oid IS a NULL answer: there is no type to name.
             return Ok(Value::Null);
         };
+        if (1i64 << 31..=u32::MAX as i64).contains(oid) && *oid & 4095 == 0 {
+            return Err(Error::Unsupported("format_type for a native enum OID requires pg_attribute catalog context".into()));
+        }
         let typmod = match args.get(1) {
             Some(Value::Int(m)) => Some(*m as i32),
             _ => None,
@@ -936,6 +949,16 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
         }
         // Handled above the null gate — a NULL modifier is not a NULL answer.
         ScalarFn::FormatType => unreachable!("format_type runs before the null gate"),
+        ScalarFn::PgExtract => super::datetime::pg_extract(args)?,
+        ScalarFn::PgTemporalText => match (&args[0], &args[1]) {
+            (Value::Timestamp(us), Value::Bool(zoned)) => {
+                let text = crate::value::timestamp_text(*us);
+                Value::Text(if *zoned { text } else { text.trim_end_matches("+00").into() })
+            }
+            (Value::Date(days), Value::Bool(_)) => Value::Text(crate::value::date_text(*days)),
+            (Value::Time(us), Value::Bool(_)) => Value::Text(crate::value::time_text(*us)),
+            _ => return Err(Error::TypeMismatch("temporal_text requires a typed date/time and zone flag".into())),
+        },
         ScalarFn::LogBaseStrict => {
             let b = num(&args[0])?;
             let x = num(&args[1])?;

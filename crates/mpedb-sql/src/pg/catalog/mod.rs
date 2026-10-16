@@ -144,6 +144,172 @@ const OFF_INDEX: i64 = 16;
 const OFF_CONSTRAINT: i64 = 256;
 const OFF_ATTRDEF: i64 = 512;
 
+pub(crate) fn view_rows(
+    name: &str,
+    views: &[super::api::CatalogView],
+    temporary: bool,
+) -> mpedb_types::Result<Vec<Vec<Value>>> {
+    let Some(rel) = lookup(name) else {
+        return Ok(Vec::new());
+    };
+    if !matches!(rel.name, "pg_class" | "pg_views" | "pg_attribute") {
+        return Ok(Vec::new());
+    }
+    let namespace = if temporary {
+        8000
+    } else {
+        i64::from(PUBLIC_NS_OID)
+    };
+    let ns_name = if temporary { "pg_temp_1" } else { "public" };
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for view in views {
+        // Views are persisted by name, without table ids. Reserve independent
+        // 16-wide blocks above both table-OID ranges. Name-derived OIDs survive
+        // unrelated view drops; fail rather than alias on a hash collision.
+        let hash = blake3::hash(view.name.as_bytes());
+        let slot = u32::from_le_bytes(hash.as_bytes()[..4].try_into().expect("four hash bytes"))
+            & 0x01ff_ffff;
+        let oid = (1i64 << 30) + if temporary { 1i64 << 29 } else { 0 } + i64::from(slot) * 16;
+        if !seen.insert(oid) {
+            return Err(mpedb_types::Error::Unsupported(
+                "view catalog OID hash collision".into(),
+            ));
+        }
+        if rel.name == "pg_attribute" {
+            for (i, column) in view.columns.iter().flatten().enumerate() {
+                rows.push(
+                    rel.columns
+                        .iter()
+                        .map(|(name, ty)| match *name {
+                            "attrelid" => int(oid),
+                            "attname" => text(&column.name),
+                            "atttypid" => column
+                                .type_oid
+                                .map(|n| int(i64::from(n)))
+                                .unwrap_or(Value::Null),
+                            "attlen" => int(column
+                                .type_oid
+                                .and_then(mpedb_types::pgtype::by_oid)
+                                .map(|t| i64::from(t.typlen))
+                                .unwrap_or(-1)),
+                            "attnum" => int(i as i64 + 1),
+                            "attcacheoff" | "attstattarget" => int(-1),
+                            "atttypmod" => int(column.type_mod),
+                            "attislocal" => Value::Bool(true),
+                            "attstorage" => text("p"),
+                            "attalign" => text("i"),
+                            _ => match ty {
+                                ColumnType::Int64 => int(0),
+                                ColumnType::Bool => Value::Bool(false),
+                                ColumnType::Text => text(""),
+                                _ => Value::Null,
+                            },
+                        })
+                        .collect(),
+                );
+            }
+            continue;
+        }
+        let row = if rel.name == "pg_views" {
+            vec![
+                text(ns_name),
+                text(&view.name),
+                text(pgcat::OWNER_NAME),
+                text(&view.definition),
+            ]
+        } else {
+            rel.columns
+                .iter()
+                .map(|(column, ty)| match *column {
+                    "oid" => int(oid),
+                    "relname" => text(&view.name),
+                    "relnamespace" => int(namespace),
+                    "reltype" => int(oid + 1),
+                    "relowner" => int(pgcat::OWNER_OID),
+                    "reltuples" => Value::Float(-1.0),
+                    "relpersistence" => text(if temporary { "t" } else { "p" }),
+                    "relkind" => text("v"),
+                    "relnatts" => view
+                        .columns
+                        .as_ref()
+                        .map(|c| int(c.len() as i64))
+                        .unwrap_or(Value::Null),
+                    "relhasrules" | "relispopulated" | "mpedb_visible" => Value::Bool(true),
+                    "relreplident" => text("n"),
+                    "relacl" | "reloptions" => Value::Null,
+                    "mpedb_viewdef" => text(&view.definition),
+                    _ => match ty {
+                        ColumnType::Int64 => int(0),
+                        ColumnType::Bool => Value::Bool(false),
+                        ColumnType::Text => text(""),
+                        _ => Value::Null,
+                    },
+                })
+                .collect()
+        };
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Rows for the connection-private temp namespace. The underlying schema
+/// keeps its dense native ids; only catalog object OIDs move into a disjoint
+/// range, leaving schema.table(id) and foreign-key resolution intact.
+pub(crate) fn temporary_rows(name: &str, schema: &Schema) -> Option<Vec<Vec<Value>>> {
+    let rel = lookup(name)?;
+    let mut rows = match rel.name {
+        "pg_namespace" | "schemata" => (rel.rows)(schema)
+            .into_iter()
+            .filter(|r| r.get(1) == Some(&text("public")))
+            .collect(),
+        "pg_class"
+        | "pg_attribute"
+        | "pg_index"
+        | "pg_constraint"
+        | "pg_attrdef"
+        | "pg_tables"
+        | "pg_indexes"
+        | "tables"
+        | "columns"
+        | "table_constraints"
+        | "key_column_usage"
+        | "referential_constraints" => (rel.rows)(schema),
+        _ => return Some(Vec::new()),
+    };
+    let offset = (mpedb_types::MAX_TABLES_CEILING as i64 + 1) * OID_BLOCK;
+    for row in &mut rows {
+        for (value, (column, _)) in row.iter_mut().zip(rel.columns) {
+            match (rel.name, *column) {
+                ("pg_namespace", "oid") | (_, "relnamespace" | "connamespace") => {
+                    *value = int(8000)
+                }
+                ("pg_namespace", "nspname") => *value = text("pg_temp_1"),
+                (_, "relpersistence") => *value = text("t"),
+                ("pg_class", "oid" | "reltype" | "relfilenode")
+                | ("pg_attribute", "attrelid")
+                | ("pg_index", "indexrelid" | "indrelid")
+                | ("pg_constraint", "oid" | "conrelid" | "confrelid" | "conindid")
+                | ("pg_attrdef", "oid" | "adrelid") => {
+                    if let Value::Int(oid) = value {
+                        if *oid >= FIRST_NORMAL_OID {
+                            *oid += offset;
+                        }
+                    }
+                }
+                (_, n)
+                    if (n.ends_with("_schema") || n == "schemaname")
+                        && *value == text("public") =>
+                {
+                    *value = text("pg_temp_1")
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(rows)
+}
+
 /// The OID mpedb gives a user table.
 pub(crate) fn table_oid(table_id: u32) -> i64 {
     FIRST_NORMAL_OID + i64::from(table_id) * OID_BLOCK
@@ -245,7 +411,7 @@ mod tests {
     /// One column. `ColumnDef` has no constructor and twelve fields; spelling
     /// them out at every call site is what makes schema tests unreadable.
     fn c(name: &str, ty: ColumnType, nullable: bool, unique: bool, indexed: bool) -> ColumnDef {
-        ColumnDef {
+        ColumnDef { pg_enum: None,
             name: name.into(),
             ty,
             nullable,

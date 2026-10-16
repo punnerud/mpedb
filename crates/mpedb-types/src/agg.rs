@@ -268,6 +268,21 @@ impl Accum {
                                 Error::ArithmeticOverflow,
                             )?),
                             Some(Value::Float(a)) => Value::Float(a + *i as f64),
+                            Some(Value::Numeric(a)) if self.func == AggFn::Sum => {
+                                crate::expr::numeric_arith(crate::Instr::Add, &a, &i.to_string())?
+                            }
+                            Some(other) => return Err(mixed(self.func, &other, v)),
+                        });
+                    }
+                    Value::Numeric(n) if self.func == AggFn::Sum => {
+                        self.acc = Some(match self.acc.take() {
+                            None => crate::expr::numeric_arith(crate::Instr::Add, "0", n)?,
+                            Some(Value::Numeric(a)) => {
+                                crate::expr::numeric_arith(crate::Instr::Add, &a, n)?
+                            }
+                            Some(Value::Int(a)) => {
+                                crate::expr::numeric_arith(crate::Instr::Add, &a.to_string(), n)?
+                            }
                             Some(other) => return Err(mixed(self.func, &other, v)),
                         });
                     }
@@ -442,6 +457,22 @@ fn mixed(f: AggFn, a: &Value, b: &Value) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_sum_keeps_decimal_precision_and_distinct_value_identity() {
+        let values = [
+            Some(Value::Numeric("9007199254740993.01".into())),
+            None,
+            Some(Value::Numeric("0.02".into())),
+        ];
+        assert_eq!(run(AggFn::Sum, &values), Value::Numeric("9007199254740993.03".into()));
+        let mut distinct = Accum::new_distinct(AggFn::Sum);
+        distinct.push(Some(&Value::Numeric("1.0".into()))).unwrap();
+        distinct.push(Some(&Value::Numeric("1.00".into()))).unwrap();
+        assert_eq!(distinct.finish(), Value::Numeric("1.0".into()));
+        let mut too_wide = Accum::new(AggFn::Sum);
+        assert!(matches!(too_wide.push(Some(&Value::Numeric("99999999999999999999999999999999999999999".into()))), Err(Error::Unsupported(_))));
+    }
 
     fn run(f: AggFn, vals: &[Option<Value>]) -> Value {
         let mut a = Accum::new(f);

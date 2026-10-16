@@ -785,6 +785,194 @@ documented unlimited opt-out that skips the clamp. Worth writing down because
 the failure reads exactly like a real regression in the one arm whose whole job
 is to be stable.
 
+### Continued compliance measurement (2026-10-16)
+
+The workbench now has a pinned Python environment and a runner that creates a
+fresh database for every run. See
+[`run_suite.py`](crates/mpedb-pg/workbench/run_suite.py) and the
+[workbench instructions](crates/mpedb-pg/workbench/README.md). These numbers use
+SQLAlchemy **2.0.44**, psycopg2 **2.9.13**, pytest **9.1.1** and pytest-timeout
+**2.4.0**. They are a new paired measurement, not a comparison with the older
+661 result whose environment was not pinned here.
+
+| | passed | failed | errors | skipped |
+|---|---:|---:|---:|---:|
+| before this change | 645 | 29 | 7 | 681 |
+| result type metadata and timestamp text | **652** | **22** | 7 | 681 |
+| declared type modifiers + `VALUES (DEFAULT)` | **657** | **17** | 7 | 681 |
+| scalar-subquery result types | **658** | **16** | 7 | 681 |
+| temporary catalogs, view reflection and grouped set arms | **677** | **7** | 7 | 671 |
+| owned SERIAL key preallocation | **682** | **2** | 7 | 671 |
+| routed temporary-view column reflection | **685** | **2** | 7 | 668 |
+
+Compared by test name: **7 fixed, 0 regressed**. No requirement exclusions
+were added. The fixes preserve the target OID of strict PostgreSQL casts,
+describe base columns in `INSERT`/`UPDATE`/`DELETE … RETURNING`, and omit the
+UTC suffix when rendering `timestamp without time zone`. Storage alone cannot
+distinguish `timestamp` from `timestamptz`, or `uuid` from `bytea`; the compiled
+projection supplies that information. SQLite's declared-column metadata keeps
+its existing separate API.
+
+The next paired run fixes **6 more tests, 0 regressions** against 652. Declared
+`VARCHAR`, `CHAR` and `NUMERIC` names and modifiers now reach `pg_attribute` and
+`information_schema.columns`; lengths and decimal precision/scale no longer
+disappear during reflection. Modifier encodings were checked against a local
+PostgreSQL 16 oracle, including negative numeric scales. These describe the
+declaration: the documented widened storage semantics (no character-length or
+numeric-scale enforcement) still apply.
+
+An explicit `DEFAULT` in an INSERT VALUES cell uses the existing
+`InsertSource::Default` mechanism, including per-row generated keys and mixed
+default/literal/NULL cells. It is a PostgreSQL-only AST marker; SQLite still
+rejects that syntax and keeps its double-quoted-string behaviour. A failed
+NOT NULL default aborts the entire multi-row insert. Scalar subqueries now
+derive their output OIDs from the inner projection, including nested and empty
+results, rather than guessing from a shared storage type.
+
+Build artifacts and test databases for these runs use the extra volume. The
+broader regression run passed **1,323 MPEdb tests in 171 suites**, as well as
+the SQL, type and PostgreSQL crate tests and the PostgreSQL Clippy checks.
+
+Savepoints are also handled by the wire session's replay log. `ROLLBACK TO`
+previously discarded the entire transaction. It now discards only statements
+after the named savepoint, retains that savepoint for reuse, and recovers a
+failed transaction. `RELEASE` discards the target and its nested savepoints;
+duplicate names shadow older savepoints. Wire tests cover both query protocols,
+quoted names, case folding, duplicate names, error recovery and SQLSTATEs
+`3B001` / `25P01`. The existing immediate-DDL limitation still applies.
+
+Temporary databases now inherit the PostgreSQL dialect. Their catalog objects
+have disjoint OIDs and participate in session-local visibility and cache
+invalidation. Stored views expose names, definitions and simple projection
+column metadata. The `views`, `temp_table_names` and `has_temp_table`
+requirements are opened, adding ten attempted tests. Grouped set-operation
+arms preserve their own ORDER/LIMIT clauses and grouping. These changes fix
+nine previously failing tests with no regressions.
+
+Standalone `SELECT nextval(...)` calls can reserve keys for newly created
+single-column SERIAL primary keys, including parameterized calls, regclass
+casts and public/temp qualification. Reservations commit independently and
+share the persistent AUTOINCREMENT high-water with direct inserts. Five more
+SQLAlchemy tests pass, with no regressions. This is a limited owned-generator
+adapter: explicit inserted IDs also advance its counter, unlike PostgreSQL
+sequences. Legacy SERIAL tables without the monotonic flag require recreation
+or migration and are explicitly refused. General sequence DDL, currval/setval,
+and nextval embedded in arbitrary expressions remain unsupported. The
+existing buffered transaction replay limitations still apply.
+
+Temporary-view column reflection now compiles against the owning database,
+preserving names, PostgreSQL type OIDs and declared modifiers for temp-table
+sources. Permanent-view metadata continues to use the main schema even when a
+temp table shadows a source name. Wire coverage includes dropping and recreating
+a view under the same name. Opening `temporary_views` adds three passing
+SQLAlchemy tests with no regressions. View column reflection currently describes
+simple projections; complex view projections remain incomplete.
+`pg_table_is_visible` and `pg_get_viewdef` resolve catalog-column calls; arbitrary
+OID expressions are not a general lookup API.
+
+At this measurement, all seven setup errors were native ENUM
+creation. The two failed tests are the temporary-index `include_columns`
+expectation and a DISTINCT ON compiler-warning expectation. Both also fail
+against PostgreSQL **16.15** using the same stock dialect and requirements;
+opening their requirements would additionally claim unsupported engine features,
+so they remain visible. The 668 skipped cases are not evidence of implemented
+features. The retained reports are `satest-2dojqkdm/results.xml` (677) and
+`satest-2x2cfub5/results.xml` (682) and `satest-rxe22e4_/results.xml` (685) under
+the extra-volume test directory.
+
+### PostgreSQL-specific test expectations (2026-10-16)
+
+The workbench now offers two explicit modes. `--stock-suite` retains the generic
+upstream assertions and the **685 passed / 2 failed / 7 errors / 668 skipped**
+result. The default adapts exactly two assertions to the stock PostgreSQL
+dialect: DISTINCT ON compilation must produce PostgreSQL syntax, and ordinary
+index reflection includes `include_columns: []`. These are harness corrections,
+not newly implemented engine capabilities. Neither `supports_distinct_on` nor
+`index_reflects_included_columns` is opened. The two adapted tests and eight
+additional emulated-ENUM tests also pass against PostgreSQL **16.15**; the
+original two assertions still fail there with `MPEDB_STOCK_SUITE=1`.
+
+The adapted run reports **695 passed / 0 failed / 7 errors / 668 skipped**.
+Eight additional tests exercise SQLAlchemy's
+`Enum(..., native_enum=False, create_constraint=True)`: all seven upstream
+round-trip cases plus a database-side invalid-label CHECK rejection (`23514`).
+At this stage, native `EnumTest` was unchanged and all seven CREATE TYPE setup
+errors remained visible. Emulated ENUM uses VARCHAR/CHECK and text sorting; it does not provide
+native enum declaration-order comparison. Native ENUM needs persisted type
+definitions, label validation and order-aware operators, plus type/catalog
+reflection. Accepting CREATE TYPE as a VARCHAR alias would be incorrect.
+
+Wire tests verify that CREATE TYPE remains refused and that DISTINCT ON and
+CREATE INDEX INCLUDE now return explicit unsupported-feature errors (`0A000`)
+instead of incidental syntax errors. Ordinary DISTINCT and CREATE INDEX retain
+their existing paths. The runner records mode and adaptations in `run.json` and
+still returns pytest's exit status. These modes
+must be distinguished when comparing compatibility numbers.
+
+### Native ENUM implementation (2026-10-16)
+
+The seven native `EnumTest` setup errors are now fixed without changing those
+tests or their requirements. Definitions persist in the database's system
+keyspace, and each enum column carries its immutable type name, OID and ordered
+labels in schema format **22**. Schemas without enum columns keep format **21**
+and its canonical hash, including existing files' immutable bootstrap hashes.
+Existing schema formats **9–21** still decode;
+a specific version-21 fixture verifies that pre-enum columns remain readable.
+Row storage stays text, with enum label validation enforced by the core writer.
+Enum columns do not apply SQLite text affinity: an integer does not silently
+become a numeric-looking label.
+
+CREATE TYPE AS ENUM, DROP TYPE, ordinary INSERT/UPDATE/DELETE and RETURNING,
+single-table comparisons and ORDER BY, NULL values, and basic catalog reflection
+are covered. Comparisons and sorting use declaration-order ranks, not lexical
+label order. Invalid labels report `22P02`, including bound comparisons and
+updates whose scans produce no rows. Different enum types cannot be compared
+as interchangeable text. DROP TYPE refuses dependent columns (`2BP01`), and a
+recreated type gets a new OID from a durable allocator. The writer checks the
+type definition again when creating or adding a column, preventing a concurrent
+drop/recreation from publishing a stale column descriptor.
+
+`pg_type`, `pg_enum`, `pg_attribute`, `information_schema.columns` and the
+catalog-column form of `format_type` expose the enum's identity and ordered
+labels. Text wire results carry the enum OID and PostgreSQL's four-byte type
+length. Quoted type names, Unicode and percent-sign labels, reopening, separate
+database handles, and unchanged invalid-update rows have regression coverage.
+Declaration ordering, NULL placement and information-schema fields were checked
+against PostgreSQL **16.15**. The NULL test also exposed and fixed PostgreSQL
+mode's default ORDER BY placement: ascending uses NULLS LAST, descending NULLS
+FIRST; explicit placement and SQLite mode retain their own rules.
+
+| Suite mode | passed | failed | errors | skipped |
+|---|---:|---:|---:|---:|
+| PostgreSQL expectations, including eight emulated-ENUM tests | **702** | **0** | **0** | 668 |
+| Original stock assertions (`--stock-suite`) | **692** | **2** | **0** | 668 |
+
+Both modes fix the same seven native enum cases with **zero regressions**. The
+stock mode retains the two generic PostgreSQL expectation mismatches described
+above. A green attempted suite still does not implement the 668 skipped cases.
+
+This initial native surface explicitly refuses contexts that need further enum
+type propagation: joins, aggregation, windows, materialized derived sources, set
+operations, recursive queries and subqueries over enum tables; DISTINCT with
+enum ordering; computed enum UPDATE, INSERT SELECT and ON CONFLICT UPDATE;
+and general scalar/cast/collation, IN, LIKE and regex expressions on enum tables. Plain DISTINCT,
+literal/parameter updates and ON CONFLICT DO NOTHING remain available. ALTER
+TYPE, enum arrays, qualified enum type declarations, public enums in temp tables,
+and general enum casts are not implemented. Explicit native-enum parameter OID
+hints are refused until parameter type identity can be preserved; ordinary
+unspecified text parameters are supported. Enum DDL inherits the existing wire
+session limitation of immediately applied DDL, rather than transactional DDL.
+Each definition is bounded to 4,093 labels of at most 63 bytes
+and a 1 MiB metadata encoding. These are declared limits, not equivalent
+implementations of every PostgreSQL enum operation.
+
+The broader regression run passed **1,903 tests across 185 suites**. Additional
+checks cover schema backward decoding, native enum persistence and unsupported
+query boundaries; workspace, PostgreSQL and C-API Clippy checks are run with
+warnings denied. Test databases and build artifacts remain on the extra volume.
+Retained paired reports include `satest-mo8x96sb/results.xml` (adapted mode) and
+`satest-51xh0fqd/results.xml` (stock mode).
+
 ### Gate 0: one connection at a time
 
 Before any of that: `mpedb-pg serve --unix` accepts SERIALLY, by design (the
@@ -794,6 +982,62 @@ forkserve.py` runs the server the way it is meant to run. This is not a bug and
 not a limitation — but it is a deployment fact any benchmark has to reproduce,
 and nothing in the corpus could have surfaced it, because `psql` opens one
 connection.
+
+### Django execution and SQL fixes (2026-10-16)
+
+The PostgreSQL workbench now runs Django 5.2's own unmodified tests. Its
+explicit MPEdb backend mode provisions separate files for `default` and `other`
+and adapts SQL generation to supported operations; stock backend mode remains
+available and still refuses CREATE DATABASE. See the
+[runner instructions](crates/mpedb-pg/workbench/README.md) for every adaptation
+and feature declaration. A green subset does not establish full Django support.
+
+Native fixes found through this workbench:
+
+* Standalone `SELECT set_config('TimeZone', 'UTC', false)` works with literals
+  or text parameters. Other settings, zones and local-setting semantics are
+  explicitly refused; no timezone conversion is simulated.
+* `obj_description(c.oid, 'pg_class')` reads stored table comments from the
+  session catalog, including invalidation after COMMENT changes. Other
+  object classes and arbitrary OID expressions remain unsupported.
+* PostgreSQL ALTER TABLE can ADD FOREIGN KEY and ADD UNIQUE. Foreign keys
+  resolve parents and validate existing rows under the writer lock; unique
+  constraints build and validate a real backing index. Names survive
+  reflection. Invalid existing data aborts the change. Other ALTER constraint
+  forms (CHECK, PRIMARY KEY, DROP, deferred UNIQUE) remain refused.
+* WriteSession rule evaluation uses its uncommitted schema after DDL, including
+  foreign keys and triggers, rather than the committed rule cache.
+* EXTRACT supports year/month/day/dow/isodow/doy on date and timestamp, and
+  hour/minute/second on timestamp and time. Seconds preserve microseconds as
+  exact numeric values. The exact nested shape
+  `EXTRACT(SECOND FROM DATE_TRUNC('second', typed_value))` is supported for
+  Django's integer-second lookups; this does not implement general DATE_TRUNC
+  or interval storage. Unsupported field/type combinations are refused.
+* Temporal `::text` casts render calendar text. Declared timestamp columns and explicit
+  casts preserve timestamp/timestamptz zone identity; computed timestamp
+  expressions whose source identity is unavailable are refused.
+* SUM of finite typed numeric values reuses exact decimal arithmetic, including NULL
+  and DISTINCT semantics. The existing 38-digit arithmetic bound still applies;
+  AVG(numeric) remains unsupported. For lossless large fractional inputs, use
+  typed numeric parameters or quoted text casts: ordinary fractional SQL
+  literals still pass through the existing floating-point lexer.
+* PostgreSQL E-strings decode simple, octal, hexadecimal and Unicode escapes,
+  including surrogate pairs. NUL and invalid UTF-8/Unicode are rejected.
+* LIKE defaults to PostgreSQL's backslash escape and permits explicit ESCAPE ''.
+  A dangling escape raises SQLSTATE 22025 when matching reaches it, while an
+  earlier mismatch can return false. The boundary follows PostgreSQL's
+  [LIKE matcher](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/utils/adt/like_match.c)
+  and matches **2,800 differential cases** against PostgreSQL 16.15, including
+  custom Unicode escape characters. SQLite LIKE is unchanged.
+* Explicitly cast constant ORDER BY expressions are accepted; later sort keys
+  still determine ordering. Bare ordinal validation and expression errors remain.
+
+The new calendar scalars use plan format **80**; persisted schema formats are
+unchanged by this Django batch. PostgreSQL 16.15 controls verify decimal sums,
+calendar extraction, temporal rendering, and escape decoding. Current adapted
+ORM results are **229 passed, 2 errors, 15 skipped** over 246 tests. Remaining
+errors are `~*` and `random()`; full-suite setup still lacks `inet` and the
+PostgreSQL extension system. Test adaptations and skips are reported explicitly.
 
 ## What is measured
 

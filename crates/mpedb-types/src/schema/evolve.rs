@@ -1,6 +1,51 @@
 use super::*;
 
 impl Schema {
+    /// Attach a foreign key without changing row layout or tree identities.
+    /// Parent resolution and existing-row validation belong to the facade.
+    pub fn with_added_foreign_key(&self, table_id: u32, fk: ForeignKeyDef) -> Result<Schema> {
+        let mut schema = self.clone();
+        let table = schema
+            .tables
+            .get_mut(table_id as usize)
+            .filter(|t| !t.dead)
+            .ok_or_else(|| Error::Schema("foreign key table does not exist".into()))?;
+        if fk.columns.is_empty()
+            || fk
+                .columns
+                .iter()
+                .any(|&c| c as usize >= table.columns.len())
+            || (!fk.parent_columns.is_empty() && fk.parent_columns.len() != fk.columns.len())
+            || !valid_identifier(&fk.parent)
+            || fk.parent_columns.iter().any(|c| !valid_identifier(c))
+            || fk.name.as_ref().is_some_and(|n| !valid_identifier(n))
+        {
+            return Err(Error::Schema("invalid foreign key definition".into()));
+        }
+        if table.foreign_keys.len() >= u16::MAX as usize {
+            return Err(Error::Schema(
+                "foreign key count exceeds schema format limit".into(),
+            ));
+        }
+        if let Some(name) = &fk.name {
+            if table.pk_name.as_ref() == Some(name)
+                || table
+                    .foreign_keys
+                    .iter()
+                    .any(|f| f.name.as_ref() == Some(name))
+                || table
+                    .indexes
+                    .iter()
+                    .any(|ix| ix.from_constraint && ix.name.as_ref() == Some(name))
+            {
+                return Err(Error::Bind(format!("constraint \"{name}\" already exists")));
+            }
+        }
+        table.foreign_keys.push(fk);
+        schema.validate()?;
+        Ok(schema)
+    }
+
     /// Evolve this schema by APPENDING one table — `CREATE TABLE` (#47).
     /// Nothing renumbers: existing ids and positions are untouched, the new
     /// table takes the lowest free id (= the current count while ids are

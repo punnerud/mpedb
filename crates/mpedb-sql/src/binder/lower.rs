@@ -212,6 +212,16 @@ pub(super) fn cmp_kind(op: BinOp) -> CmpKind {
 }
 
 pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
+    // Keep the PG target OID in the executable projection. Timestamp and
+    // timestamptz (and uuid/bytea) share storage, so replacing a cast by its
+    // value loses the type the wire client needs. Still validate literal
+    // casts here so invalid input retains its compile-time error behaviour.
+    if let BExpr::CastPg(a, _) = &e {
+        if matches!(a.as_ref(), BExpr::Const(_)) {
+            compile_program(&e)?.eval(&[], &[])?;
+            return Ok(e);
+        }
+    }
     let foldable = match &e {
         BExpr::Unary(_, a) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Binary(_, a, b) => {
@@ -321,6 +331,15 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
         BExpr::Cast(a, t) => {
             emit(a, instrs, consts)?;
             instrs.push(Instr::Cast(*t));
+        }
+        BExpr::EnumRank(a, e) => {
+            emit(a, instrs, consts)?;
+            let mut def = vec![Value::Text(e.name.clone())];
+            def.extend(e.labels.iter().cloned().map(Value::Text));
+            let slot = consts.len();
+            if slot > u16::MAX as usize { return Err(Error::Unsupported("too many expression constants".into())); }
+            consts.push(Value::List(def));
+            instrs.push(Instr::EnumRank(slot as u16));
         }
         BExpr::CastPg(a, oid) => {
             emit(a, instrs, consts)?;

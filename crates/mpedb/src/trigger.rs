@@ -34,7 +34,7 @@ use mpedb_types::ExprProgram;
 pub(crate) const TRIGGER_PREFIX: &[u8] = b"trigger/";
 /// One byte past `/` (0x2F → 0x30) — the exclusive upper bound for a prefix
 /// scan of `trigger/…`, so the scan never walks the whole sys-keyspace.
-const TRIGGER_PREFIX_END: &[u8] = b"trigger0";
+pub(crate) const TRIGGER_PREFIX_END: &[u8] = b"trigger0";
 
 const TRG_MAGIC: &[u8; 4] = b"MTRG";
 /// Versioned from day one (DESIGN-TRIGGERS §3.3). A later layout change is a new
@@ -472,9 +472,17 @@ impl Database {
         let r = self.engine.begin_read()?;
         let scan = r.sys_scan_range(TRIGGER_PREFIX, TRIGGER_PREFIX_END);
         r.finish()?;
+        self.build_write_rules_from_rows(schema, scan?)
+    }
+
+    pub(crate) fn build_write_rules_from_rows(
+        &self,
+        schema: &mpedb_types::Schema,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<WriteRules> {
         let mut set = WriteRules::empty();
         set.recursive = self.tunables()?.recursive_triggers;
-        for (subkey, value) in scan? {
+        for (subkey, value) in rows {
             if !subkey.starts_with(TRIGGER_PREFIX) {
                 continue;
             }

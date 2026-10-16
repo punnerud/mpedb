@@ -24,6 +24,11 @@ fn values_as_select(
         return None;
     }
     let row = &s.rows[0];
+    // DEFAULT is a target-column instruction, never a SELECT expression.
+    // Other cells can still use the ordinary InsertSource::Expr path.
+    if row.iter().any(|e| matches!(e, ast::Expr::Default)) {
+        return None;
+    }
     let mut probe = Binder::new(table, n_params, true);
     probe.set_dialect(mode);
     probe.set_host_udfs(host_udfs);
@@ -76,6 +81,9 @@ pub(super) fn plan_insert(
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
+    if table.columns.iter().any(|c| c.pg_enum.is_some()) && (s.select.is_some() || !matches!(s.on_conflict, ast::OnConflict::Error | ast::OnConflict::DoNothing)) {
+        return Err(Error::Unsupported("INSERT SELECT / ON CONFLICT on native enum tables needs enum-aware type propagation".into()));
+    }
 
     // `VALUES (<expression>)` — a function call, a scalar subquery, arithmetic
     // over one — is the same statement as `SELECT <expression>` with no FROM:
@@ -234,6 +242,7 @@ pub(super) fn plan_insert(
         for (ci, col) in table.columns.iter().enumerate() {
             let src = match slot_of_col[ci] {
                 None => InsertSource::Default,
+                Some(slot) if matches!(row[slot], ast::Expr::Default) => InsertSource::Default,
                 Some(slot) => {
                     let (b, _) = binder.bind_expr(&row[slot])?;
                     match b {
@@ -452,6 +461,13 @@ pub(super) fn plan_update(
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
+    for (name, value) in &s.set {
+        if table.column_index(name).is_some_and(|i| table.columns[i as usize].pg_enum.is_some())
+            && !matches!(value, ast::Expr::Lit(_) | ast::Expr::Param(_)) {
+            return Err(Error::Unsupported("computed UPDATE of a native enum needs enum-aware type propagation".into()));
+        }
+    }
+
     // Subqueries in the WHERE lift out FIRST (#97), exactly as they do for a
     // SELECT: each becomes a `SubPlan` + reserved slot and is replaced by
     // `Param(slot)`, so everything below sees only a parameter.
@@ -500,7 +516,9 @@ pub(super) fn plan_update(
         let col = &table.columns[idx as usize];
         let expr = last_expr[idx as usize].expect("recorded in order");
         let b = binder.bind_assign(expr, col)?;
-        set.push((idx, compile_program(&b)?));
+        let program = compile_program(&b)?;
+        let program = if let Some(e) = &col.pg_enum { program.with_enum_validation(e)? } else { program };
+        set.push((idx, program));
     }
 
     let bound_where = where_ast

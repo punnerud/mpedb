@@ -94,6 +94,7 @@ pub(crate) mod funcs {
     #[derive(Debug)]
     #[allow(dead_code)]
     pub(crate) enum PgFunc {
+        Extract,
         Const(Value),
         ConstOfAny(Value),
         FirstArg,

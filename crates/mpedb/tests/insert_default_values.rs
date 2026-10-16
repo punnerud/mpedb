@@ -29,6 +29,46 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 }
 
 #[test]
+#[cfg(feature = "pg-dialect")]
+fn owned_serial_reservations_survive_reopen_and_share_insert_counter() {
+    let (mut db, path) = db();
+    db.set_dialect(mpedb_types::Dialect::Postgres);
+    db.query("CREATE TABLE serial_keys (id serial PRIMARY KEY)", &[])
+        .unwrap();
+    assert_eq!(db.next_serial_value("serial_keys_id_seq", None).unwrap(), 1);
+    let mut peer = Database::open_from_file(std::path::Path::new(&path)).unwrap();
+    peer.set_dialect(mpedb_types::Dialect::Postgres);
+    assert_eq!(
+        peer.next_serial_value("serial_keys_id_seq", None).unwrap(),
+        2
+    );
+    db.query("INSERT INTO serial_keys DEFAULT VALUES", &[])
+        .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id FROM serial_keys"),
+        vec![vec![Value::Int(3)]]
+    );
+    drop(peer);
+    drop(db);
+    let mut reopened = Database::open_from_file(std::path::Path::new(&path)).unwrap();
+    reopened.set_dialect(mpedb_types::Dialect::Postgres);
+    assert_eq!(
+        reopened
+            .next_serial_value("serial_keys_id_seq", None)
+            .unwrap(),
+        4
+    );
+    reopened
+        .query("INSERT INTO serial_keys VALUES (9223372036854775807)", &[])
+        .unwrap();
+    assert!(reopened
+        .next_serial_value("serial_keys_id_seq", None)
+        .is_err());
+    drop(reopened);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn default_values_rowid_and_null_and_defaults() {
     let (db, path) = db();
     struct G(String);
@@ -50,6 +90,12 @@ fn default_values_rowid_and_null_and_defaults() {
     db.query("INSERT INTO t DEFAULT VALUES", &[]).unwrap();
     let r = rows(&db, "SELECT id, v, n FROM t WHERE id = 3");
     assert_eq!(r, vec![vec![Value::Int(3), Value::Null, Value::Int(7)]]);
+
+    // PostgreSQL's per-cell DEFAULT is dialect-specific. SQLite still rejects
+    // it, and its double-quoted-string fallback remains a literal value.
+    assert!(db.query("INSERT INTO t (id) VALUES (DEFAULT)", &[]).is_err());
+    db.query("INSERT INTO t (id,v) VALUES (4,\"DEFAULT\")", &[]).unwrap();
+    assert_eq!(rows(&db, "SELECT v FROM t WHERE id=4"), vec![vec![Value::Text("DEFAULT".into())]]);
 }
 
 #[test]

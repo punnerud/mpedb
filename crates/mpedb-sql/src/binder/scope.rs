@@ -231,6 +231,33 @@ impl<'a> Scope<'a> {
     /// comparison/ORDER-BY precedence rung "if the operand is a column, use the
     /// column's collation". [`Collation::Binary`] for an out-of-range slot (a
     /// synthetic tuple with no such column), which degrades to the default.
+    pub fn column_enum(&self, c: u16) -> Option<&mpedb_types::pgtype::PgEnum> {
+        let mut base = 0usize;
+        for t in &self.tables {
+            if (c as usize) < base + t.columns.len() {
+                return t.columns[c as usize - base].pg_enum.as_ref();
+            }
+            base += t.columns.len();
+        }
+        None
+    }
+
+    pub fn column_pg_oid(&self, c: u16) -> Option<u32> {
+        let mut base = 0usize;
+        for t in &self.tables {
+            if (c as usize) < base + t.columns.len() {
+                let column = &t.columns[c as usize - base];
+                // Synthetic tuples can retain Timestamp storage while losing
+                // timestamp/timestamptz identity. Only an explicit declaration
+                // can choose the text representation without guessing.
+                return column.decl.as_deref().and_then(mpedb_types::pgtype::by_name)
+                    .map(|t| t.oid);
+            }
+            base += t.columns.len();
+        }
+        None
+    }
+
     pub fn column_collation(&self, c: u16) -> Collation {
         let mut base = 0usize;
         for t in &self.tables {

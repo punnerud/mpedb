@@ -100,6 +100,14 @@ fn from_less_select(items: Vec<(Expr, Option<String>)>) -> SelectStmt {
 }
 
 impl<'a> Parser<'a> {
+    fn parenthesized_query_ahead(&self) -> bool {
+        let mut offset = 0;
+        while self.peek_at(offset) == Some(&Tok::LParen) {
+            offset += 1;
+        }
+        matches!(self.peek_at(offset), Some(Tok::Kw(Kw::Select)) | Some(Tok::Kw(Kw::Values)))
+    }
+
     /// The named refusal for a table function in `FROM`.
     ///
     /// `generate_series` gets the exact rewrite that works, because it is the
@@ -323,11 +331,30 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// A parenthesized PG query is an identity SELECT over a derived body.
+    /// Keeping it as a body preserves its local ORDER BY/LIMIT and set grouping;
+    /// the existing materializer executes it without a new plan representation.
+    fn select_arm(&mut self) -> Result<SelectStmt> {
+        if self.dialect != mpedb_types::Dialect::Postgres || !self.eat(&Tok::LParen) {
+            return self.select_core();
+        }
+        self.enter_expr()?;
+        let body = self.subquery_body();
+        self.exit_expr();
+        let body = body?;
+        self.expect(&Tok::RParen, "`)` after a parenthesized query")?;
+        let mut select = from_less_select(Vec::new());
+        select.items = None;
+        select.from_derived = Some(Box::new(body));
+        self.select_tail(&mut select)?;
+        Ok(select)
+    }
+
     /// `SELECT …`, or a compound chain `SELECT … UNION [ALL]/EXCEPT/INTERSECT
     /// SELECT …`. Ops apply left-associatively with equal precedence (sqlite's
     /// rule; PostgreSQL binds INTERSECT tighter — documented deviation).
     pub(super) fn select_stmt(&mut self) -> Result<Stmt> {
-        let first = self.select_core()?;
+        let first = self.select_arm()?;
         if self.peek_compound_op().is_none() {
             return Ok(Stmt::Select(first));
         }
@@ -342,7 +369,7 @@ impl<'a> Parser<'a> {
     /// belongs to the compound, exactly as in a top-level compound.
     pub(super) fn subquery_body(&mut self) -> Result<crate::ast::SubqueryBody> {
         use crate::ast::SubqueryBody;
-        let first = self.select_core()?;
+        let first = self.select_arm()?;
         if self.peek_compound_op().is_none() {
             return Ok(SubqueryBody::Select(first));
         }
@@ -388,7 +415,7 @@ impl<'a> Parser<'a> {
                 )));
             }
             ops.push(op);
-            arms.push(self.select_core()?);
+            arms.push(self.select_arm()?);
         }
         // The trailing clauses parsed into the last arm; they belong to the
         // compound. Ordinals / names in them resolve against the OUTPUT.
@@ -433,6 +460,11 @@ impl<'a> Parser<'a> {
     pub(super) fn select_core(&mut self) -> Result<SelectStmt> {
         self.expect_kw(Kw::Select, "SELECT")?;
         let distinct = self.eat_kw(Kw::Distinct);
+        if distinct && self.dialect == mpedb_types::Dialect::Postgres && self.peek_kw(Kw::On) {
+            return Err(Error::Unsupported(
+                "DISTINCT ON requires ordered per-group row selection; use row_number() over (partition by ... order by ...) in a derived query".into(),
+            ));
+        }
         if !distinct {
             self.eat_all_quantifier();
         }
@@ -460,10 +492,11 @@ impl<'a> Parser<'a> {
             // flattens a simple derived body before planning; the rest refuse.
             let (table, from_derived, from_series, from_alias, mut from_parens) = if self.peek()
                 == Some(&Tok::LParen)
-                && matches!(
+                && (matches!(
                     self.peek_at(1),
                     Some(Tok::Kw(Kw::Select)) | Some(Tok::Kw(Kw::Values))
-                )
+                ) || (self.dialect == mpedb_types::Dialect::Postgres
+                    && self.parenthesized_query_ahead()))
             {
                 self.expect(&Tok::LParen, "(")?;
                 // A plain SELECT body, or a whole compound `SELECT … UNION …`
@@ -672,6 +705,28 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let mut select = SelectStmt {
+            table,
+            from_derived,
+            from_series,
+            alias: from_alias,
+            joins,
+            distinct,
+            items,
+            where_clause,
+            group_by,
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        drop_trailing: 0,
+        };
+        self.select_tail(&mut select)?;
+        Ok(select)
+    }
+
+    /// Trailing clauses shared by a plain SELECT and a parenthesized query arm.
+    fn select_tail(&mut self, select: &mut SelectStmt) -> Result<()> {
         let mut order_by = Vec::new();
         if self.eat_kw(Kw::Order) {
             self.expect_kw(Kw::By, "BY after ORDER")?;
@@ -688,7 +743,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        align_order_by_alias_case(&items, &mut order_by);
+        align_order_by_alias_case(&select.items, &mut order_by);
         self.neg_limit_in_core = false;
         let limit = if self.eat_kw(Kw::Limit) {
             self.limit_int("LIMIT")?
@@ -702,22 +757,10 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(SelectStmt {
-            table,
-            from_derived,
-            from_series,
-            alias: from_alias,
-            joins,
-            distinct,
-            items,
-            where_clause,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-        drop_trailing: 0,
-        })
+        select.order_by = order_by;
+        select.limit = limit;
+        select.offset = offset;
+        Ok(())
     }
 
     /// One SELECT-list item: `expr [[AS] alias]`. A bare identifier right

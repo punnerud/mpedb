@@ -67,6 +67,9 @@ pub(super) fn plan_derived_select(
         (None, Some(k)) => s.joins[k].derived.as_deref().expect("position found it"),
         (None, None) => return Err(Error::Internal("no derived source to materialize".into())),
     };
+    if enum_body(body_ast, schema) {
+        return Err(Error::Unsupported("materialized enum sources need enum-aware tuple metadata".into()));
+    }
     // The alias is how the outer addresses the body's columns. An alias-less
     // derived table (sqlite allows `FROM (SELECT …)`) gets a synthetic name no
     // identifier can spell, so it can never collide with a real table name nor

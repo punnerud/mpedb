@@ -17,6 +17,35 @@ from sqlalchemy.testing.requirements import SuiteRequirements
 
 class Requirements(SuiteRequirements):
     @property
+    def temporary_views(self):
+        """Session-local views expose names and routed column metadata."""
+        return exclusions.open()
+
+    @property
+    def views(self):
+        """Stored views now expose names, definitions and simple column metadata.
+
+        This opens the suite's view coverage rather than leaving implemented
+        view reflection hidden behind SuiteRequirements' closed default.
+        """
+        return exclusions.open()
+
+    @property
+    def temp_table_names(self):
+        """The session catalog now lists its private temporary tables.
+
+        The stock default is closed. It also controls whether multi-reflection
+        expects temp objects for ANY/TEMPORARY scope, so leaving it closed
+        incorrectly treats real temp rows as unexpected extra results.
+        """
+        return exclusions.open()
+
+    @property
+    def has_temp_table(self):
+        """has_table sees temp pg_class rows on the owning connection."""
+        return exclusions.open()
+
+    @property
     def schemas(self):
         """mpedb has no named schemas at all.
 
@@ -35,7 +64,8 @@ class Requirements(SuiteRequirements):
     def sequences(self):
         """No sequence objects.
 
-        `CREATE SEQUENCE` and `nextval()` are both refused by name. mpedb's
+        `CREATE SEQUENCE` is refused by name. Standalone `nextval()` supports
+        only the owned generator of a SERIAL primary key. mpedb's
         answer to a generated key is an INTEGER PRIMARY KEY, whose rowid the
         engine allocates — which serves SERIAL but is not a first-class
         sequence a second table could share.

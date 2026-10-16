@@ -193,7 +193,7 @@ mod tests {
     use mpedb_types::{ColumnDef, IndexDef};
 
     fn col(name: &str, ty: ColumnType, nullable: bool) -> ColumnDef {
-        ColumnDef {
+        ColumnDef { pg_enum: None,
             default_text: None,
             generated: None,
             decl: None,

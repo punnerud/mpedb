@@ -93,6 +93,18 @@ impl Schema {
                 return Err(Error::Schema(format!("duplicate column in `{}`", t.name)));
             }
             for c in &t.columns {
+                if let Some(e) = &c.pg_enum {
+                    e.validate()?;
+                    if !c.decl.as_deref().is_some_and(|d| e.matches_decl(d)) {
+                        return Err(Error::Schema("enum descriptor disagrees with declared type".into()));
+                    }
+                    if c.ty != ColumnType::Text || c.collation != Collation::Binary {
+                        return Err(Error::Schema("enum columns require text storage and binary label equality".into()));
+                    }
+                    if let Some(DefaultExpr::Const(Value::Text(label))) = &c.default {
+                        if !e.labels.contains(label) { return Err(Error::Schema("invalid enum default".into())); }
+                    }
+                }
                 if !valid_identifier(&c.name) {
                     return Err(Error::Schema(format!(
                         "invalid column name `{}.{}`",

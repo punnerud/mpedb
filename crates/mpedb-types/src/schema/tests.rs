@@ -5,7 +5,7 @@ fn sample() -> Schema {
         id: 0,
         name: "users".into(),
         columns: vec![
-            ColumnDef { generated: None, default_text: None, decl: None,
+            ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,
@@ -15,7 +15,7 @@ fn sample() -> Schema {
                 check: None, collation: Collation::Binary,
                 affinity: Affinity::implied_by(ColumnType::Int64),
             },
-            ColumnDef { generated: None, default_text: None, decl: None,
+            ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                 name: "email".into(),
                 ty: ColumnType::Text,
                 nullable: false,
@@ -25,7 +25,7 @@ fn sample() -> Schema {
                 check: None, collation: Collation::Binary,
                 affinity: Affinity::implied_by(ColumnType::Text),
             },
-            ColumnDef { generated: None, default_text: None, decl: None,
+            ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                 name: "age".into(),
                 ty: ColumnType::Int64,
                 nullable: true,
@@ -62,7 +62,7 @@ fn table_order_is_name_sorted_regardless_of_input_order() {
                 .map(|n| TableDef {
                     id: 0,
                     name: n.to_string(),
-                    columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
+                    columns: vec![ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                         name: "id".into(),
                         ty: ColumnType::Int64,
                         nullable: false,
@@ -91,7 +91,7 @@ fn rejects_bad_schemas() {
     let bad = Schema::new(vec![TableDef {
         id: 0,
         name: "t".into(),
-        columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
+        columns: vec![ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
             name: "id".into(),
             ty: ColumnType::Int64,
             nullable: true,
@@ -111,7 +111,7 @@ fn rejects_bad_schemas() {
     let bad = Schema::new(vec![TableDef {
         id: 0,
         name: "__mpedb_plans".into(),
-        columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
+        columns: vec![ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
             name: "id".into(),
             ty: ColumnType::Int64,
             nullable: false,
@@ -139,7 +139,7 @@ fn rejects_bad_schemas() {
 /// what keeps every positional engine cache correct until DROP's audit).
 #[test]
 fn ids_are_dense_explicit_and_survive_the_wire() {
-    let col = |n: &str| ColumnDef { generated: None, default_text: None, decl: None, name: n.into(), ty: ColumnType::Int64,
+    let col = |n: &str| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: n.into(), ty: ColumnType::Int64,
             affinity: Affinity::implied_by(ColumnType::Int64),
         nullable: false, unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
     let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
@@ -171,13 +171,13 @@ fn indexes_derive_normalize_and_roundtrip() {
         id: 0,
         name: "t".into(),
         columns: vec![
-            ColumnDef { generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
+            ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                     affinity: Affinity::implied_by(ColumnType::Int64),
                 unique: true, indexed: true, default: None, check: None, collation: Collation::Binary },
-            ColumnDef { generated: None, default_text: None, decl: None, name: "a".into(), ty: ColumnType::Int64, nullable: true,
+            ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: "a".into(), ty: ColumnType::Int64, nullable: true,
                     affinity: Affinity::implied_by(ColumnType::Int64),
                 unique: true, indexed: true, default: None, check: None, collation: Collation::Binary },
-            ColumnDef { generated: None, default_text: None, decl: None, name: "b".into(), ty: ColumnType::Text, nullable: true,
+            ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: "b".into(), ty: ColumnType::Text, nullable: true,
                     affinity: Affinity::implied_by(ColumnType::Text),
                 unique: false, indexed: true, default: None, check: None, collation: Collation::Binary },
         ],
@@ -212,14 +212,14 @@ fn indexes_derive_normalize_and_roundtrip() {
 
 #[test]
 fn hostile_bytes_refuse_cleanly() {
-    let col = |n: &str, ty| ColumnDef { generated: None, default_text: None, decl: None, name: n.into(), ty, nullable: true,
+    let col = |n: &str, ty| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: n.into(), ty, nullable: true,
             affinity: Affinity::implied_by(ty),
         unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
     let base = Schema::new(vec![TableDef {
         id: 0,
         name: "t".into(),
         columns: vec![
-            ColumnDef { generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
+            ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                     affinity: Affinity::implied_by(ColumnType::Int64),
                 unique: false, indexed: false, default: None, check: None, collation: Collation::Binary },
             col("v", ColumnType::Any),
@@ -269,7 +269,7 @@ fn hostile_bytes_refuse_cleanly() {
 }
 
 fn tbl(n: &str) -> TableDef {
-    let col = |n: &str| ColumnDef { generated: None, default_text: None, decl: None,
+    let col = |n: &str| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: n.into(), ty: ColumnType::Int64, nullable: false,
         unique: false, indexed: false, default: None, check: None, collation: Collation::Binary,
         affinity: Affinity::implied_by(ColumnType::Int64),
@@ -453,12 +453,12 @@ fn configured_cap_bounds_the_mint() {
 /// survives, and the helpers report the right visible set.
 #[test]
 fn implicit_rowid_round_trips_and_helpers() {
-    let col = |n: &str, ty| ColumnDef { generated: None, default_text: None, decl: None,
+    let col = |n: &str, ty| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: n.into(), ty, nullable: true, unique: false, indexed: false,
         default: None, check: None, collation: Collation::Binary,
         affinity: Affinity::implied_by(ty),
     };
-    let rowid = ColumnDef { generated: None, default_text: None, decl: None,
+    let rowid = ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: "rowid".into(), ty: ColumnType::Int64, nullable: false,
         unique: false, indexed: false, default: None, check: None, collation: Collation::Binary,
         affinity: Affinity::implied_by(ColumnType::Int64),
@@ -543,7 +543,7 @@ fn implicit_rowid_round_trips_and_helpers() {
 /// contributes to the hash, and truncation at every offset is Corrupt.
 #[test]
 fn column_decl_text_round_trips_and_is_hostile_safe() {
-    let col = |n: &str, ty, decl: Option<&str>| ColumnDef { generated: None, default_text: None,
+    let col = |n: &str, ty, decl: Option<&str>| ColumnDef { pg_enum: None, generated: None, default_text: None,
         name: n.into(),
         ty,
         nullable: true,
@@ -614,12 +614,12 @@ fn column_decl_text_round_trips_and_is_hostile_safe() {
 /// Corrupt — the roundtrip/truncation contract extended to the new field.
 #[test]
 fn column_collation_round_trips_and_is_hostile_safe() {
-    let col = |n: &str, ty, coll| ColumnDef { generated: None, default_text: None, decl: None,
+    let col = |n: &str, ty, coll| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: n.into(), ty, nullable: true, unique: false, indexed: false,
         default: None, check: None, collation: coll,
         affinity: Affinity::implied_by(ty),
     };
-    let id = ColumnDef { generated: None, default_text: None, decl: None,
+    let id = ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: "id".into(), ty: ColumnType::Int64, nullable: false, unique: false,
         indexed: false, default: None, check: None, collation: Collation::Binary,
         affinity: Affinity::implied_by(ColumnType::Int64),
@@ -683,11 +683,11 @@ fn collated_key_column_accepted_but_non_text_refused() {
             id: 0,
             name: "t".into(),
             columns: vec![
-                ColumnDef { generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                     unique: false, indexed: false, default: None, check: None,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     collation: Collation::Binary },
-                ColumnDef { generated: None, default_text: None, decl: None, name: "name".into(), ty: ColumnType::Text, nullable: true,
+                ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: "name".into(), ty: ColumnType::Text, nullable: true,
                     unique, indexed: !unique, default: None, check: None,
                         affinity: Affinity::implied_by(ColumnType::Text),
                     collation: Collation::NoCase },
@@ -709,7 +709,7 @@ fn collated_key_column_accepted_but_non_text_refused() {
     assert!(Schema::new(vec![TableDef {
         id: 0,
         name: "t".into(),
-        columns: vec![ColumnDef { generated: None, default_text: None, decl: None, name: "k".into(), ty: ColumnType::Text, nullable: false,
+        columns: vec![ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: "k".into(), ty: ColumnType::Text, nullable: false,
             unique: false, indexed: false, default: None, check: None,
                 affinity: Affinity::implied_by(ColumnType::Text),
             collation: Collation::NoCase }],
@@ -727,11 +727,11 @@ fn collated_key_column_accepted_but_non_text_refused() {
         id: 0,
         name: "t".into(),
         columns: vec![
-            ColumnDef { generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
+            ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                 unique: false, indexed: false, default: None, check: None,
                     affinity: Affinity::implied_by(ColumnType::Int64),
                 collation: Collation::Binary },
-            ColumnDef { generated: None, default_text: None, decl: None, name: "n".into(), ty: ColumnType::Int64, nullable: true,
+            ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None, name: "n".into(), ty: ColumnType::Int64, nullable: true,
                 unique: false, indexed: false, default: None, check: None,
                     affinity: Affinity::implied_by(ColumnType::Int64),
                 collation: Collation::NoCase },
@@ -769,7 +769,7 @@ fn hostile_implicit_rowid_bytes_refuse() {
 #[test]
 fn generated_column_round_trips_and_is_hostile_safe() {
     use crate::expr::Instr;
-    let plain = |n: &str, ty| ColumnDef { generated: None, default_text: None, decl: None,
+    let plain = |n: &str, ty| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: n.into(), ty, nullable: true, unique: false, indexed: false,
         default: None, check: None, collation: Collation::Binary,
         affinity: Affinity::implied_by(ty),
@@ -824,7 +824,7 @@ fn generated_column_round_trips_and_is_hostile_safe() {
 #[test]
 fn generated_column_validation_rules() {
     use crate::expr::Instr;
-    let plain = |n: &str, ty| ColumnDef { generated: None, default_text: None, decl: None,
+    let plain = |n: &str, ty| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: n.into(), ty, nullable: true, unique: false, indexed: false,
         default: None, check: None, collation: Collation::Binary,
         affinity: Affinity::implied_by(ty),
@@ -906,7 +906,7 @@ fn generated_column_validation_rules() {
 #[test]
 fn drop_renumbers_a_generated_program_and_rename_needs_a_rewritten_source() {
     use crate::expr::Instr;
-    let plain = |n: &str, ty, nullable| ColumnDef { generated: None, default_text: None, decl: None,
+    let plain = |n: &str, ty, nullable| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: n.into(), ty, nullable, unique: false, indexed: false,
         default: None, check: None, collation: Collation::Binary,
         affinity: Affinity::implied_by(ty),
@@ -988,4 +988,24 @@ fn drop_renumbers_a_generated_program_and_rename_needs_a_rewritten_source() {
         .with_renamed_column(0, "b", "z", &[(3, "z".into()), (1, "z".into())], &[])
         .unwrap_err();
     assert!(format!("{err}").contains("not generated"), "{err}");
+}
+
+#[test]
+fn version_21_columns_decode_without_enum_metadata() {
+    let mut table = sample().tables.remove(0);
+    table.columns.truncate(1);
+    table.indexes.clear();
+    let schema = Schema::new(vec![table]).unwrap();
+    let old = schema.canonical_bytes();
+    assert_eq!(old[0], 21);
+    assert_eq!(Schema::from_canonical_bytes(&old).unwrap(), schema);
+    // v22 inserts an enum-presence byte after each declared type. A v22
+    // schema whose last enum was dropped still decodes into this old shape.
+    let table = &schema.tables[0];
+    let enum_tag = 1 + 4 + 4 + 4 + 4 + table.name.len() + 2
+        + 4 + table.columns[0].name.len() + 5;
+    let mut newer = old;
+    newer.insert(enum_tag, 0);
+    newer[0] = 22;
+    assert_eq!(Schema::from_canonical_bytes(&newer).unwrap(), schema);
 }

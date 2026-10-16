@@ -55,6 +55,7 @@ pub(crate) fn coerce_params<'a>(
             got: params.len(),
         });
     }
+    plan.validate_enum_inputs(params)?;
     let mut out: Option<Vec<Value>> = None;
     for (i, pt) in plan.param_types.iter().enumerate() {
         let (Some(t), Some(v)) = (pt, params.get(i)) else {

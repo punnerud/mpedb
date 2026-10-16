@@ -21,7 +21,7 @@ mod ddl;
 mod dml;
 mod expr;
 mod select;
-pub(crate) use ddl::parse_ddl_dialect;
+pub(crate) use ddl::{parse_ddl_dialect, parse_ddl_with_enums};
 
 #[cfg(test)]
 mod tests;
@@ -475,6 +475,7 @@ struct Parser<'a> {
     /// cast where sqlite has no such operator at all. Defaults to
     /// [`Dialect::Sqlite`], so every existing caller parses exactly as before.
     dialect: Dialect,
+    pg_enums: Vec<mpedb_types::pgtype::PgEnum>,
 }
 
 impl<'a> Parser<'a> {
@@ -484,6 +485,7 @@ impl<'a> Parser<'a> {
             toks,
             pos: 0,
             dialect: Dialect::Sqlite,
+            pg_enums: Vec::new(),
             style: ParamStyle::Unset,
             next_question: 0,
             max_params: 0,
@@ -708,7 +710,9 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(crate::plan::SortDir::new(desc, nulls_first))
+        Ok(crate::plan::SortDir::new(desc, nulls_first.or_else(|| {
+            (self.dialect == Dialect::Postgres).then_some(desc)
+        })))
     }
 
     /// The argument of `LIKE … ESCAPE <c>`, already past the `ESCAPE` word.
@@ -983,6 +987,7 @@ impl<'a> Parser<'a> {
     fn statement(&mut self) -> Result<Stmt> {
         match self.peek() {
             Some(Tok::Kw(Kw::Select)) => self.select_stmt(),
+            Some(Tok::LParen) if self.dialect == Dialect::Postgres => self.select_stmt(),
             Some(Tok::Kw(Kw::Values)) => self.values_stmt(),
             Some(Tok::Kw(Kw::Insert)) => self.insert_stmt(),
             Some(Tok::Kw(Kw::Update)) => self.update_stmt(),
@@ -1056,6 +1061,13 @@ impl<'a> Parser<'a> {
     /// accepts all three). Comparison for RELEASE/ROLLBACK TO is
     /// case-insensitive (see the write session), matching sqlite.
     fn savepoint_name(&mut self, what: &str) -> Result<String> {
+        if self.dialect == Dialect::Postgres {
+            return match self.advance() {
+                Some(Tok::Ident(s)) => Ok(s.to_ascii_lowercase()),
+                Some(Tok::QuotedIdent(s, true)) => Ok(s),
+                _ => Err(self.err_here(format!("expected {what}"))),
+            };
+        }
         match self.peek() {
             Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(..)) => self.ident(what),
             Some(Tok::Str(_)) => match self.advance() {
@@ -1092,6 +1104,10 @@ pub enum TxnControl {
 /// here; a comment-prefixed control statement conservatively misses the gate
 /// and takes the compile road — correct, merely not fast.
 pub(crate) fn parse_txn_control(sql: &str) -> Option<TxnControl> {
+    parse_txn_control_dialect(sql, Dialect::Sqlite)
+}
+
+pub(crate) fn parse_txn_control_dialect(sql: &str, dialect: Dialect) -> Option<TxnControl> {
     let t = sql.trim_start();
     let end = t
         .bytes()
@@ -1102,8 +1118,9 @@ pub(crate) fn parse_txn_control(sql: &str) -> Option<TxnControl> {
     if !VERBS.iter().any(|w| word.eq_ignore_ascii_case(w)) {
         return None;
     }
-    let toks = tokenize(sql).ok()?;
+    let toks = crate::token::tokenize_dialect(sql, dialect).ok()?;
     let mut p = Parser::new(sql, toks);
+    p.dialect = dialect;
     let stmt = p.statement().ok()?;
     p.eat(&Tok::Semicolon);
     p.expect_eof().ok()?;

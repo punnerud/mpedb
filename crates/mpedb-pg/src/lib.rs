@@ -62,7 +62,7 @@ pub(crate) mod testutil {
     use mpedb_types::{ColumnDef, ColumnType, TableDef};
 
     fn c(name: &str, ty: ColumnType, nullable: bool, unique: bool) -> ColumnDef {
-        ColumnDef {
+        ColumnDef { pg_enum: None,
             name: name.into(),
             ty,
             nullable,

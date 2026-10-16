@@ -42,7 +42,7 @@ pub use dbref::{
 };
 pub use ddl::{
     CommentTarget, CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, CreateVirtualTableSpec,
-    DdlStmt, RlsAction, TriggerBodySpec, TriggerEvent, TriggerTiming,
+    DdlStmt, ForeignKeySpec, RlsAction, TriggerBodySpec, TriggerEvent, TriggerTiming,
 };
 pub use trigger::{
     compile_trigger_arg, compile_trigger_body, compile_trigger_when, RowMap, RowSide,
@@ -51,7 +51,7 @@ pub use trigger::{
 pub use plan::{
     AccessPath, AggCall, Aggregation, CompiledPlan, CompoundArm, CompoundPlan, ConflictProbe, Frame,
     FrameBound, FrameExclude, FrameMode, FtsQuery, FtsTerm, GroupKey, InsertSource, Join,
-    JoinKind, OrderOver,
+    JoinKind, OrderOver, PgOutputColumn,
     parallel_fold_shape, LimitVal, PlanOnConflict, PlanStmt, PolicyStamp, Projection, DerivedPlan, dual_def,
     RecursiveCtePlan, SelectPlan, SelectSource, SetOp, SortDir, SubBody, SubPlan, SubPlanKind, WinInt,
     WindowFunc, WindowSpec, CTE_TABLE, DUAL_TABLE, SERIES_TABLE, series_def,
@@ -105,6 +105,11 @@ pub use parser::TxnControl;
 /// without bound.
 pub fn parse_txn_control(sql: &str) -> Option<TxnControl> {
     parser::parse_txn_control(sql)
+}
+
+/// Transaction control parsed under the connection's SQL dialect.
+pub fn parse_txn_control_dialect(sql: &str, dialect: Dialect) -> Option<TxnControl> {
+    parser::parse_txn_control_dialect(sql, dialect)
 }
 
 // Re-export the shared types a plan consumer needs.
@@ -490,6 +495,12 @@ pub fn compile_generated(expr_src: &str, table: &TableDef, col: usize) -> Result
     let mut binder = binder::Binder::new(table, 0, false);
     let bound = binder.bind_assign(&expr, target)?;
     binder::compile_program(&bound)
+}
+
+/// DDL parser with the database's persisted native PostgreSQL enum definitions.
+pub fn parse_ddl_with_enums(sql: &str, dialect: Dialect,
+    enums: &[mpedb_types::pgtype::PgEnum]) -> Result<Option<DdlStmt>> {
+    parser::parse_ddl_with_enums(sql, dialect, enums)
 }
 
 #[cfg(test)]

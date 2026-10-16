@@ -87,6 +87,80 @@ use super::printf::sqlite_printf;
 use crate::error::{Error, Result};
 use crate::value::Value;
 
+/// UTC calendar extraction for typed date/time values, with exact microseconds.
+pub(super) fn pg_extract(args: &[Value]) -> Result<Value> {
+    let Value::Text(field) = &args[0] else {
+        return Err(Error::TypeMismatch("EXTRACT field must be text".into()));
+    };
+    let (days, micros, time_only) = match args[1] {
+        Value::Timestamp(us) => (
+            us.div_euclid(86_400_000_000),
+            us.rem_euclid(86_400_000_000),
+            false,
+        ),
+        Value::Date(days) => (days, 0, false),
+        Value::Time(us) => (0, us, true),
+        _ => {
+            return Err(Error::TypeMismatch(
+                "EXTRACT requires a typed date/time value".into(),
+            ))
+        }
+    };
+    if i32::try_from(days).is_err() {
+        return Err(Error::Unsupported(
+            "EXTRACT date exceeds PostgreSQL's day-count range".into(),
+        ));
+    }
+    let (year, month, day) = crate::value::civil_from_days(days);
+    let date_only = matches!(args[1], Value::Date(_));
+    if date_only
+        && matches!(
+            field.as_str(),
+            "hour" | "minute" | "second" | "second_truncated"
+        )
+    {
+        return Err(Error::Unsupported(format!(
+            "EXTRACT({field}) is not supported for date"
+        )));
+    }
+    if matches!(field.as_str(), "second" | "second_truncated") {
+        let us = micros.rem_euclid(60_000_000);
+        let fraction = if field == "second_truncated" {
+            0
+        } else {
+            us % 1_000_000
+        };
+        return Ok(Value::Numeric(format!("{}.{fraction:06}", us / 1_000_000)));
+    }
+    let value = match field.as_str() {
+        "hour" => micros / 3_600_000_000,
+        "minute" => (micros / 60_000_000) % 60,
+        _ if time_only => {
+            return Err(Error::Unsupported(format!(
+                "EXTRACT({field}) is not supported for time"
+            )))
+        }
+        "year" => {
+            if year <= 0 {
+                year - 1
+            } else {
+                year
+            }
+        }
+        "month" => i64::from(month),
+        "day" => i64::from(day),
+        "dow" => (days + 4).rem_euclid(7),
+        "isodow" => (days + 3).rem_euclid(7) + 1,
+        "doy" => days - crate::value::days_from_civil(year, 1, 1).expect("valid calendar year") + 1,
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "EXTRACT({field}) is not supported"
+            )))
+        }
+    };
+    Ok(Value::Numeric(value.to_string()))
+}
+
 /// sqlite's `validJulianDay`: the millisecond Julian day must be non-negative
 /// and no larger than `INT_464269060799999` — Julian day 5373484.5, i.e. the
 /// end of the year 9999.

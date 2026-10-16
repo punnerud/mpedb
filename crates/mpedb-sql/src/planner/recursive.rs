@@ -28,6 +28,9 @@ pub(super) fn plan_recursive_cte(
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
+    if enum_source(&rc.anchor, schema) || enum_source(&rc.recursive, schema) {
+        return Err(Error::Unsupported("recursive enum queries need enum-aware working tuples".into()));
+    }
     let name = rc.name.as_str();
 
     // 1. Anchor — planned against the REAL schema, so it cannot reference the

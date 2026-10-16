@@ -110,6 +110,30 @@ mod dml;
 mod helpers;
 mod rls;
 
+/// Materialized tuples currently carry storage types, not enum identities.
+/// Refuse enum sources at those boundaries until they can preserve the latter.
+fn enum_source(s: &ast::SelectStmt, schema: &Schema) -> bool {
+    let table_has = |name: &str| {
+        schema
+            .table_id(name)
+            .and_then(|id| schema.table(id))
+            .is_some_and(|t| t.columns.iter().any(|c| c.pg_enum.is_some()))
+    };
+    s.table.as_deref().is_some_and(table_has)
+        || s.joins.iter().any(|j| {
+            table_has(&j.table) || j.derived.as_deref().is_some_and(|b| enum_body(b, schema))
+        })
+        || s.from_derived
+            .as_deref()
+            .is_some_and(|b| enum_body(b, schema))
+}
+fn enum_body(b: &ast::SubqueryBody, schema: &Schema) -> bool {
+    match b {
+        ast::SubqueryBody::Select(s) => enum_source(s, schema),
+        ast::SubqueryBody::Compound(c) => c.arms.iter().any(|s| enum_source(s, schema)),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
 

@@ -1684,6 +1684,19 @@ impl Database {
         Ok(plan.output_decltypes(&self.schema()))
     }
 
+    /// PostgreSQL result types derived from the compiled projection, including
+    /// explicit casts and write statements with RETURNING. No SQL is executed.
+    pub fn output_pg_oids(&self, sql: &str) -> Result<Vec<Option<u32>>> {
+        let (plan, _explain) = self.compile_maybe_explain(sql)?;
+        Ok(plan.output_pg_oids(&self.schema()))
+    }
+
+    /// PostgreSQL view/query column metadata, without executing the query.
+    pub fn output_pg_columns(&self, sql: &str) -> Result<Vec<mpedb_sql::PgOutputColumn>> {
+        let (plan, _explain) = self.compile_maybe_explain(sql)?;
+        Ok(plan.output_pg_columns(&self.schema()))
+    }
+
     /// Per output column, the base TABLE to report through the C-API shim
     /// (`sqlite3_column_table_name`). Compiles `sql` — surfacing any bind/plan
     /// error exactly as prepare would — and derives each column's source table
@@ -1716,7 +1729,7 @@ impl Database {
     pub fn access_report(&self, sql: &str) -> Result<AccessReport> {
         // DDL compiles to no plan — the facade applies it against the catalog
         // directly — so it is described by its parse, not by a footprint.
-        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.dialect)? {
+        if let Some(ddl) = self.parse_ddl(sql)? {
             return Ok(access::ddl_access(&ddl));
         }
         let (plan, _explain) = self.compile_maybe_explain(sql)?;
@@ -1975,7 +1988,7 @@ impl Database {
     }
 
     pub fn plan_footprint(&self, sql: &str) -> Result<(PlanHash, Footprint)> {
-        if mpedb_sql::parse_ddl_dialect(sql, self.dialect)?.is_some() {
+        if self.parse_ddl(sql)?.is_some() {
             return Err(Error::Unsupported(
                 "DDL compiles to no plan and has no footprint".into(),
             ));
@@ -2350,7 +2363,7 @@ impl Database {
         };
         // RLS DDL (CREATE/DROP POLICY, ALTER TABLE … ROW LEVEL SECURITY) mutates
         // the catalog rather than compiling to a plan — apply it directly.
-        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.dialect)? {
+        if let Some(ddl) = self.parse_ddl(sql)? {
             return self.apply_ddl(ddl);
         }
         let (plan, is_explain) = self.compile_maybe_explain(sql)?;
@@ -2548,7 +2561,7 @@ impl Database {
                 return self.query_attached_only(&db, &sql, params);
             }
         };
-        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.dialect)? {
+        if let Some(ddl) = self.parse_ddl(sql)? {
             return self.apply_ddl(ddl);
         }
         let (plan, is_explain) = self.compile_maybe_explain(sql)?;
@@ -3496,6 +3509,23 @@ fn session_txn_verb_err() -> Error {
 }
 
 impl WriteSession<'_> {
+    /// DDL in this transaction can change both triggers and foreign keys
+    /// before schema_gen advances. Do not reuse the committed rules cache.
+    fn write_rules(&mut self) -> Result<Arc<trigger::WriteRules>> {
+        if !self.ddl_applied {
+            return self.db.write_rules();
+        }
+        let bundle = self.txn.schema_bundle();
+        let rows = self
+            .txn
+            .sys_scan_range(trigger::TRIGGER_PREFIX, trigger::TRIGGER_PREFIX_END)?;
+        let mut rules = self.db.build_write_rules_from_rows(&bundle.schema, rows)?;
+        if self.db.fk_enforced() {
+            rules.fks = Some(Arc::new(fk::FkGraph::build(&bundle.schema)));
+        }
+        Ok(Arc::new(rules))
+    }
+
     /// Schema as seen by this open write txn (includes uncommitted DDL).
     pub fn schema(&self) -> std::sync::Arc<mpedb_core::engine::SchemaBundle> {
         self.txn.schema_bundle()
@@ -3561,7 +3591,7 @@ impl WriteSession<'_> {
     /// transaction can still be described (#95). An authorization gate must be
     /// able to describe every statement it lets through, including those.
     pub fn access_report(&self, sql: &str) -> Result<AccessReport> {
-        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.db.dialect)? {
+        if let Some(ddl) = self.db.parse_ddl(sql)? {
             return Ok(access::ddl_access(&ddl));
         }
         let schema = self.txn.schema_bundle();
@@ -3732,7 +3762,7 @@ impl WriteSession<'_> {
         // session's transaction so the schema change lives in the txn's COW
         // catalog pages and commits/rolls back atomically with the session's
         // DML — never a mid-transaction commit.
-        if let Some(ddl) = mpedb_sql::parse_ddl_dialect(sql, self.db.dialect)? {
+        if let Some(ddl) = self.db.parse_ddl(sql)? {
             return self.apply_ddl(ddl);
         }
         // Compile against THIS session's schema view — which includes any DDL
@@ -3886,7 +3916,7 @@ impl WriteSession<'_> {
                 self.db.resolve_db_refs_hook(sql)?,
                 multifile::DbRoute::Passthrough
             )
-            || mpedb_sql::parse_ddl_dialect(sql, self.db.dialect)?.is_some()
+            || self.db.parse_ddl(sql)?.is_some()
         {
             return Ok(None);
         }
@@ -3914,7 +3944,7 @@ impl WriteSession<'_> {
         self.db.warn_if_risky(&plan);
         let schema = self.txn.schema_bundle();
         self.db.validate_policy_write(None, &plan, &mut self.txn)?;
-        let triggers = self.db.write_rules()?;
+        let triggers = self.write_rules()?;
         let tables = self.db.host_tables(&plan);
         // The whole batch runs inside an anonymous engine savepoint: on ANY
         // row error the batch is rolled back WHOLE and the error returned —
@@ -4349,7 +4379,7 @@ impl WriteSession<'_> {
         // lock, so no policy edit can race it). Local-cache plans only, so no
         // shared-registry eviction is needed here.
         self.db.validate_policy_write(None, plan, &mut self.txn)?;
-        let triggers = self.db.write_rules()?;
+        let triggers = self.write_rules()?;
         // Execute against the session's OWN schema view (== the txn's captured
         // bundle), so a statement touching a table this session created/altered
         // earlier resolves against the shape it will commit with (#95). For a
@@ -4689,6 +4719,7 @@ impl WriteSession<'_> {
                 .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{name}`")))
         };
         match ddl {
+            DdlStmt::CreateEnum { .. } | DdlStmt::DropEnum { .. } => return Err(Error::Unsupported("enum DDL inside a native WriteSession".into())),
             DdlStmt::CreateTable(spec) => {
                 let def = crate::ddl_apply::table_def_from_spec(spec, &self.db.host_udf_set())?;
                 self.txn.create_table(def)?;
@@ -4795,6 +4826,14 @@ impl WriteSession<'_> {
                     crate::ddl_apply::refuse_check_violating_rows(&mut self.txn, id, c, &fill)?;
                 }
                 self.txn.alter_add_column(id, col, fill)?;
+            }
+            DdlStmt::AlterAddForeignKey { table, foreign_key } => {
+                let id = resolve(&table)?;
+                crate::ddl_apply::add_foreign_key_on_txn(&mut self.txn, id, foreign_key)?;
+            }
+            DdlStmt::AlterAddUnique { table, columns, name } => {
+                let id = resolve(&table)?;
+                crate::ddl_apply::add_unique_on_txn(&mut self.txn, id, &columns, name)?;
             }
             DdlStmt::AlterDropColumn { table, column } => {
                 let id = resolve(&table)?;
@@ -5654,7 +5693,7 @@ primary_key = ["id"]
         let other_schema = Schema::new(vec![TableDef {
             id: 0,
             name: "users".into(),
-            columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
+            columns: vec![ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,
@@ -6062,7 +6101,7 @@ primary_key = ["id"]
         let foreign_schema = Schema::new(vec![TableDef {
             id: 0,
             name: "users".into(),
-            columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
+            columns: vec![ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,

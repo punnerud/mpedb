@@ -204,6 +204,8 @@ pub struct ColumnDef {
     /// the answer. Read it through [`ColumnDef::decltype`], never directly.
     /// Participates in the schema hash (canonical bytes v8).
     pub decl: Option<String>,
+    /// Native PostgreSQL enum descriptor; storage is the validated label text.
+    pub pg_enum: Option<crate::pgtype::PgEnum>,
     /// `GENERATED ALWAYS AS (<expr>) [STORED|VIRTUAL]` — the column's value is
     /// COMPUTED from the rest of the row, never supplied by the writer, and
     /// `INSERT`/`UPDATE` refuse to name it. `None` for an ordinary column.
@@ -320,13 +322,13 @@ impl ColumnDef {
     /// free function [`converts_on_store`] for the rule and why `decl` is the
     /// provenance bit that decides it.
     pub fn converts_on_store(&self) -> bool {
-        converts_on_store(self.ty, self.affinity, self.decl.is_some())
+        self.pg_enum.is_none() && converts_on_store(self.ty, self.affinity, self.decl.is_some())
     }
 
     /// The value as this column stores it: its store-time affinity applied
     /// where [`ColumnDef::converts_on_store`] says it applies.
     pub fn store(&self, v: Value) -> Value {
-        store_into(self.ty, self.affinity, self.decl.is_some(), v)
+        if self.pg_enum.is_some() { v } else { store_into(self.ty, self.affinity, self.decl.is_some(), v) }
     }
 
     /// What `sqlite3_column_decltype` reports for this column: the VERBATIM

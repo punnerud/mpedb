@@ -286,9 +286,42 @@ pub(super) fn like_match(pattern: &str, s: &str, esc: Option<char>) -> bool {
     like_impl(pattern, s, true, esc)
 }
 
-/// Case-SENSITIVE LIKE (PostgreSQL dialect): identical to [`like_match`] except
-/// literal characters compare exactly (`'a' LIKE 'A'` is FALSE). The `%`/`_`
-/// wildcards — and the ESCAPE rules — behave the same.
+/// Case-sensitive LIKE with PostgreSQL's conditional invalid-escape errors.
+pub(super) fn pg_like_match(pattern: &str, s: &str, esc: char) -> Result<bool> {
+    if pattern.chars().rev().take_while(|&c| c == esc).count() % 2 != 0 {
+        // PostgreSQL checks an invalid tail only when matching reaches it.
+        let prefix = &pattern[..pattern.len() - esc.len_utf8()];
+        let mut compiled = compile_pattern(prefix, Some(esc))
+            .ok_or_else(|| Error::Internal("invalid LIKE prefix before final escape".into()))?;
+        let tail = compiled
+            .iter()
+            .rposition(|p| matches!(p, Pat::Lit(_)))
+            .map_or(0, |i| i + 1);
+        let mut star = false;
+        let empty_remainder_errors = compiled[tail..].iter().any(|p| match p {
+            Pat::Any => {
+                star = true;
+                false
+            }
+            Pat::One => star,
+            Pat::Lit(_) => false,
+        });
+        // Its % optimization consumes following _ wildcards before checking
+        // the escape, including when those _ exhaust the subject.
+        if !empty_remainder_errors {
+            compiled.push(Pat::One);
+        }
+        compiled.push(Pat::Any);
+        if like_match_compiled(&compiled, s, false) {
+            return Err(Error::Bind(
+                "LIKE pattern must not end with escape character".into(),
+            ));
+        }
+        return Ok(false);
+    }
+    Ok(like_match_cs(pattern, s, Some(esc)))
+}
+
 pub(super) fn like_match_cs(pattern: &str, s: &str, esc: Option<char>) -> bool {
     like_impl(pattern, s, false, esc)
 }

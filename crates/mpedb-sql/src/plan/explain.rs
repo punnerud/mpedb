@@ -1085,6 +1085,10 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
             // Spelled apart from the affinity cast on purpose: an EXPLAIN that
             // rendered both as `CAST(x AS DATE)` would hide which of the two
             // rules this plan actually runs.
+            Instr::EnumRank(_) | Instr::EnumValidate(_) => {
+                let a = pop(&mut st);
+                Item { s: format!("{}({})", if matches!(instr, Instr::EnumRank(_)) { "ENUM_RANK" } else { "ENUM_VALIDATE" }, a.s), atom: true }
+            }
             Instr::CastPg(oid) => {
                 let a = pop(&mut st);
                 let name = mpedb_types::pgtype::by_oid(oid).map_or("?", |t| t.name);

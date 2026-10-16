@@ -20,6 +20,69 @@ impl<'a> Binder<'a> {
             if let Some(hit) = crate::pg::funcs::resolve(name, args.len()) {
                 use crate::pg::funcs::PgFunc;
                 match hit? {
+                    PgFunc::Extract => {
+                        let [ast::Expr::Lit(Value::Text(field)), source] = args else {
+                            return Err(bind_err(
+                                "EXTRACT requires a literal field and a date/time value",
+                            ));
+                        };
+                        let field = field.to_ascii_lowercase();
+                        match field.as_str() {
+                            "year" | "month" | "day" | "hour" | "minute" | "second" | "dow" | "isodow"
+                            | "doy" => {}
+                            _ => {
+                                return Err(Error::Unsupported(format!(
+                                    "EXTRACT({field}) is not supported"
+                                )))
+                            }
+                        }
+                        // Lower Django's exact seconds lookup shape without
+                        // claiming general DATE_TRUNC or an interval type.
+                        let (source, truncate_second) = match source {
+                            ast::Expr::Func(name, args)
+                                if field == "second" && name.eq_ignore_ascii_case("date_trunc") =>
+                            {
+                                let [ast::Expr::Lit(Value::Text(unit)), source] = args.as_slice() else {
+                                    return Err(Error::Unsupported(
+                                        "EXTRACT over DATE_TRUNC requires literal 'second'".into(),
+                                    ));
+                                };
+                                if unit != "second" {
+                                    return Err(Error::Unsupported(
+                                        "EXTRACT over DATE_TRUNC supports only literal 'second'".into(),
+                                    ));
+                                }
+                                (source, true)
+                            }
+                            _ => (source, false),
+                        };
+                        let (value, ty) = self.bind_expr(source)?;
+                        let time_field = matches!(field.as_str(), "hour" | "minute" | "second");
+                        if ty == Some(ColumnType::Date) && time_field {
+                            return Err(Error::Unsupported(format!(
+                                "EXTRACT({field}) is not supported for date"
+                            )));
+                        }
+                        if !matches!(ty, None | Some(ColumnType::Timestamp | ColumnType::Date))
+                            && !(ty == Some(ColumnType::Time) && time_field)
+                        {
+                            return Err(bind_err(
+                                "EXTRACT requires a date, timestamp, or supported time field",
+                            ));
+                        }
+                        let field = if truncate_second {
+                            "second_truncated".into()
+                        } else {
+                            field
+                        };
+                        return Ok((
+                            BExpr::Call(
+                                ScalarFn::PgExtract,
+                                vec![BExpr::Const(Value::Text(field)), value],
+                            ),
+                            Some(ColumnType::Numeric),
+                        ));
+                    }
                     PgFunc::Const(v) => {
                         // `Ty` is `Option<ColumnType>` — None is the untyped
                         // NULL, which none of these constants is.
@@ -77,6 +140,18 @@ impl<'a> Binder<'a> {
                         return self.bind_expr(first);
                     }
                     PgFunc::SiblingColumn(col) => {
+                        if name.eq_ignore_ascii_case("obj_description") {
+                            let supported_class = matches!(args.get(1),
+                                Some(ast::Expr::Lit(Value::Text(class))) if class == "pg_class");
+                            let oid_arg = matches!(args.first(),
+                                Some(ast::Expr::Qualified(_, field)) | Some(ast::Expr::Col(field, _))
+                                    if field == "oid");
+                            if !supported_class || !oid_arg {
+                                return Err(Error::Unsupported(
+                                    "obj_description currently requires a pg_class oid column and literal 'pg_class'".into(),
+                                ));
+                            }
+                        }
                         // The rendered answer lives on the relation the OID came
                         // from, so the qualifier has to be carried over: `c.oid`
                         // becomes `c.condef`, and an unqualified `oid` becomes an
@@ -514,6 +589,8 @@ impl<'a> Binder<'a> {
             // table stays the one place a scalar's shape is declared, even
             // though only `pg::funcs` can reach it.
             ScalarFn::FormatType => (&[], Some(ColumnType::Text)),
+            ScalarFn::PgExtract => (&[], Some(ColumnType::Numeric)),
+            ScalarFn::PgTemporalText => (&[], Some(ColumnType::Text)),
             // Returns an ARRAY, which has no `ColumnType` — `Any`, like every
             // other value typed per row. Its argument is unconstrained: the
             // check that it IS an array happens where the array is read.

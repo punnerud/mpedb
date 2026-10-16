@@ -569,7 +569,7 @@ pub(crate) fn ensure_lineage_tables(
 /// turns every per-row residual lookup into a PkPoint and the chunk resume
 /// into a composite PkRange.
 pub(crate) fn spec_col(name: &str, ty: ColumnType) -> mpedb_sql::CreateColumnSpec {
-    mpedb_sql::CreateColumnSpec {
+    mpedb_sql::CreateColumnSpec { pg_enum: None,
         default_src: None,
         default_text: None, autoincrement: false,
         name: name.into(),

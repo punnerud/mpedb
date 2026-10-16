@@ -187,7 +187,7 @@ pub(crate) fn cte_working_table_def(
             .iter()
             .zip(col_types)
             .enumerate()
-            .map(|(i, (name, &ty))| mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
+            .map(|(i, (name, &ty))| mpedb_types::ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                 name: name.clone(),
                 ty,
                 nullable: true,

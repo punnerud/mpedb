@@ -210,11 +210,33 @@ pub fn format_type(oid: u32, typmod: Option<i32>) -> String {
         "varchar" | "bpchar" => format!("{name}({})", m - 4),
         "numeric" => {
             let packed = m - 4;
-            format!("{name}({},{})", packed >> 16, packed & 0xffff)
+            let scale = ((packed & 0x7ff) ^ 1024) - 1024;
+            format!("{name}({},{scale})", packed >> 16)
         }
         // Every other type either takes no modifier or takes one mpedb never
         // stores; printing the bare name is what PostgreSQL does there too.
         _ => name.into(),
+    }
+}
+
+/// PostgreSQL's packed modifier for a declared character or numeric type.
+/// This describes the declaration; it does not add length/scale enforcement
+/// to mpedb's widened storage types. Unknown or malformed modifiers have none.
+pub fn type_modifier(decl: &str) -> Option<i32> {
+    let ty = by_name(decl)?;
+    let (_, rest) = decl.split_once('(')?;
+    let (args, _) = rest.split_once(')')?;
+    let numbers: Option<Vec<i32>> = args.split(',').map(|s| s.trim().parse().ok()).collect();
+    let numbers = numbers?;
+    match (ty.name, numbers.as_slice()) {
+        ("varchar" | "bpchar", [length]) if *length > 0 => length.checked_add(4),
+        ("numeric", [precision]) if (1..=1000).contains(precision) => Some((precision << 16) + 4),
+        ("numeric", [precision, scale])
+            if (1..=1000).contains(precision) && (-1000..=1000).contains(scale) =>
+        {
+            Some((precision << 16) + (scale & 0x7ff) + 4)
+        }
+        _ => None,
     }
 }
 
@@ -263,6 +285,11 @@ pub fn by_name(decl: &str) -> Option<PgType> {
     TYPES.iter().find(|ty| ty.name == canon).copied()
 }
 
+/// PostgreSQL's SERIAL spelling family (owned integer key generators).
+pub fn is_serial(decl: &str) -> bool {
+    matches!(normalize(decl).as_str(), "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial")
+}
+
 /// Look a type up by its OID — the direction the wire protocol reads.
 pub fn by_oid(oid: u32) -> Option<PgType> {
     TYPES.iter().find(|ty| ty.oid == oid).copied()
@@ -293,6 +320,33 @@ pub fn default_oid(ty: ColumnType) -> u32 {
 #[cfg(test)]
 mod format_type_tests {
     use super::*;
+
+    #[test]
+    fn declared_modifiers_round_trip_through_postgresql_encoding() {
+        for (decl, expected) in [
+            ("VARCHAR(52)", "character varying(52)"),
+            ("char(3)", "character(3)"),
+            ("NUMERIC(18, 5)", "numeric(18,5)"),
+            ("decimal(4,-2)", "numeric(4,-2)"),
+            ("numeric(10)", "numeric(10,0)"),
+        ] {
+            let ty = by_name(decl).unwrap();
+            assert_eq!(format_type(ty.oid, type_modifier(decl)), expected);
+        }
+        for invalid in [
+            "text",
+            "varchar",
+            "varchar(0)",
+            "varchar(2147483647)",
+            "numeric(0,2)",
+            "numeric(1001,2)",
+            "numeric(2,1001)",
+            "numeric(2,x)",
+            "numeric(1,2,3)",
+        ] {
+            assert_eq!(type_modifier(invalid), None, "{invalid}");
+        }
+    }
 
     /// `format_type` is what reflection reads a column's type through, so a
     /// wrong answer here is a wrong SCHEMA, not a wrong value.
@@ -442,5 +496,65 @@ mod tests {
         for ty in TYPES {
             assert_eq!(by_oid(ty.oid).map(|t| t.name), Some(ty.name));
         }
+    }
+}
+
+/// A native PostgreSQL enumeration. Labels retain declaration order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PgEnum {
+    pub name: String,
+    pub oid: u32,
+    pub labels: Vec<String>,
+}
+
+impl PgEnum {
+    pub fn matches_decl(&self, decl: &str) -> bool {
+        let decl = decl.trim();
+        if decl.starts_with('"') && decl.ends_with('"') && decl.len() >= 2 {
+            self.name == decl[1..decl.len() - 1].replace("\"\"", "\"")
+        } else {
+            self.name == decl.to_ascii_lowercase()
+        }
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        toml::to_string(self)
+            .expect("serializable enum")
+            .into_bytes()
+    }
+    pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| crate::Error::Corrupt("invalid enum UTF-8".into()))?;
+        let e: Self = toml::from_str(text)
+            .map_err(|_| crate::Error::Corrupt("invalid enum definition".into()))?;
+        e.validate()
+            .map_err(|_| crate::Error::Corrupt("invalid enum definition".into()))?;
+        Ok(e)
+    }
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.name.is_empty()
+            || self.name.len() > crate::schema::MAX_IDENTIFIER_LEN
+            || self.name.contains('\0')
+            || self.labels.len() > 4093
+            || self.oid < (1 << 31)
+            || self.oid & 4095 != 0
+        {
+            return Err(crate::Error::Schema(
+                "invalid PostgreSQL enum definition".into(),
+            ));
+        }
+        if self.encode().len() > (1 << 20) {
+            return Err(crate::Error::Schema(
+                "enum definition exceeds metadata size limit".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for label in &self.labels {
+            if label.len() > 63 || label.contains('\0') || !seen.insert(label) {
+                return Err(crate::Error::Schema(
+                    "enum labels must be distinct, NUL-free and at most 63 bytes".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }

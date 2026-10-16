@@ -125,6 +125,7 @@ pub(crate) enum BExpr {
     /// a numeric prefix. Semantics live in
     /// [`Instr::CastPg`](mpedb_types::expr).
     CastPg(Box<BExpr>, u32),
+    EnumRank(Box<BExpr>, mpedb_types::pgtype::PgEnum),
     /// A comparison under an explicit collating sequence (task: COLLATE). The
     /// `BinOp` is one of the six comparison operators; TEXT operands compare
     /// under `Collation`. A distinct node from [`BExpr::Binary`] on purpose: the
@@ -422,6 +423,10 @@ impl<'a> Binder<'a> {
     /// binders inherit it. Mirrors [`set_allow_excluded`](Self::set_allow_excluded).
     pub fn set_dialect(&mut self, mode: Dialect) {
         self.dialect = mode;
+    }
+
+    pub fn allows_constant_order_key(&self, key: &ast::Expr) -> bool {
+        self.dialect == Dialect::Postgres && matches!(key, ast::Expr::Cast(..))
     }
 
     /// Install the HOST-registered scalar UDFs in scope for this binder
@@ -778,6 +783,46 @@ impl<'a> Binder<'a> {
 
     /// Bind an expression bottom-up; returns the folded expression + type.
     pub fn bind_expr(&mut self, e: &ast::Expr) -> Result<(BExpr, Ty)> {
+        if self.dialect == Dialect::Postgres {
+            if let ast::Expr::Func(name, args) = e {
+                if name.trim_start_matches("pg_catalog.").eq_ignore_ascii_case("format_type") && args.len() == 2 {
+                    let sibling = match &args[0] {
+                        ast::Expr::Qualified(q, n) if n == "atttypid" => Some(ast::Expr::Qualified(q.clone(), "mpedb_formatted_type".into())),
+                        ast::Expr::Col(n, _) if n == "atttypid" => Some(ast::Expr::Col("mpedb_formatted_type".into(), false)),
+                        _ => None,
+                    };
+                    if let Some(sibling) = sibling {
+                        let stored_modifier = match (&args[0], &args[1]) {
+                            (ast::Expr::Qualified(a, _), ast::Expr::Qualified(b, n)) => a == b && n == "atttypmod",
+                            (ast::Expr::Col(_, _), ast::Expr::Col(n, _)) => n == "atttypmod",
+                            _ => false,
+                        };
+                        let available = match &sibling {
+                            ast::Expr::Qualified(q, n) => self.scope.resolve_qualified(q, n).is_ok(),
+                            ast::Expr::Col(n, _) => self.scope.resolve(n).is_ok(),
+                            _ => false,
+                        };
+                        if stored_modifier && available { return self.bind_expr(&sibling); }
+                    }
+                }
+            }
+        }
+        if let ast::Expr::Func(name, args) = e {
+            if name == "__mpedb_enum_rank" && args.len() == 1 {
+                let (b, _) = self.bind_expr(&args[0])?;
+                let BExpr::Col(c) = &b else { return Err(bind_err("enum rank requires an enum column")); };
+                let def = self.scope.column_enum(*c).cloned().ok_or_else(|| bind_err("enum rank requires an enum column"))?;
+                return Ok((BExpr::EnumRank(Box::new(b), def), Some(ColumnType::Int64)));
+            }
+        }
+        // The initial native enum surface deliberately excludes expressions
+        // that would erase type identity and accidentally use text semantics.
+        if self.scope.tables.iter().any(|t| t.columns.iter().any(|c| c.pg_enum.is_some()))
+            && !matches!(e, ast::Expr::Lit(_) | ast::Expr::Param(_) | ast::Expr::Col(..)
+                | ast::Expr::Qualified(..) | ast::Expr::Binary(..) | ast::Expr::Unary(..)
+                | ast::Expr::IsNull(..)) {
+            return Err(Error::Unsupported("this expression on a native enum table needs enum-aware type propagation".into()));
+        }
         match e {
             // RAISE never binds: inside a trigger body the trigger compiler
             // intercepts it before binding, so reaching here means any other
@@ -811,6 +856,7 @@ impl<'a> Binder<'a> {
             // `t.*` reaching the binder means it stood somewhere other than a
             // top-level select item (the planner expands those before binding)
             // — `count(t.*)`, a WHERE, an ORDER BY. sqlite refuses these too.
+            ast::Expr::Default => Err(bind_err("DEFAULT is only valid as an INSERT VALUES cell")),
             ast::Expr::TableStar(q) => Err(bind_err(format!(
                 "`{q}.*` is only valid as a top-level select item"
             ))),
@@ -1417,6 +1463,43 @@ impl<'a> Binder<'a> {
                 // cast it already had, so nothing that was right changes.
                 if self.dialect == mpedb_types::Dialect::Postgres {
                     if let Some(pg) = mpedb_types::pgtype::by_name(tyname) {
+                        if pg.name == "text" {
+                            let (value, source_type) = self.bind_expr(a)?;
+                            if matches!(
+                                source_type,
+                                Some(ColumnType::Timestamp | ColumnType::Date | ColumnType::Time)
+                            ) {
+                                let source_oid = match a.as_ref() {
+                                    ast::Expr::Cast(_, ty) => mpedb_types::pgtype::by_name(ty).map(|t| t.oid),
+                                    _ => match &value {
+                                        BExpr::Col(c) => self.scope.column_pg_oid(*c),
+                                        BExpr::CastPg(_, oid) => Some(*oid),
+                                        _ => None,
+                                    },
+                                };
+                                let zoned = if source_type == Some(ColumnType::Timestamp) {
+                                    match source_oid {
+                                    Some(1114) => false,
+                                    Some(1184) => true,
+                                    _ => return Err(Error::Unsupported(
+                                        "timestamp text casts require a column or explicit timestamp/timestamptz source type".into(),
+                                    )),
+                                }
+                                } else {
+                                    false
+                                };
+                                return Ok((
+                                    fold_maybe(
+                                        BExpr::Call(
+                                            ScalarFn::PgTemporalText,
+                                            vec![value, BExpr::Const(Value::Bool(zoned))],
+                                        ),
+                                        self.suppress_fold,
+                                    )?,
+                                    Some(ColumnType::Text),
+                                ));
+                            }
+                        }
                         if strict_pg_cast(pg.name) {
                             let ty = pg.mpedb;
                             let (a, _) = self.bind_expr(a)?;

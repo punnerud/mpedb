@@ -357,11 +357,9 @@ fn like_escape_is_case_sensitive_under_the_postgres_dialect() {
     // `A\B` = literal "AB": only the upper-case row under postgres.
     assert_eq!(ids(&pg, r"s LIKE 'A\B' ESCAPE '\'"), vec!["5".to_string()]);
 
-    // Case-agnostic subjects: both dialects must agree, character for
-    // character, on every escape rule.
+    // Valid escape patterns agree apart from case sensitivity.
     for p in [
         r"s LIKE '100\%' ESCAPE '\'",
-        r"s LIKE 'ab\' ESCAPE '\'",
         r"s LIKE '\_' ESCAPE '\'",
         "s LIKE 'a%%b' ESCAPE '%'",
         "s LIKE '__' ESCAPE '_'",
@@ -369,6 +367,11 @@ fn like_escape_is_case_sensitive_under_the_postgres_dialect() {
     ] {
         assert_eq!(ids(&pg, p), ids(&lite, p), "dialects disagree on `{p}`");
     }
+    // PostgreSQL raises when a row reaches a dangling escape. SQLite treats
+    // it as a non-match. Checked against PostgreSQL 16, not inferred from
+    // sqlite's behavior (the earlier shared expectation was incorrect).
+    assert!(pg.query(r"SELECT id FROM t WHERE s LIKE 'ab\' ESCAPE '\'", &[]).is_err());
+    assert!(ids(&lite, r"s LIKE 'ab\' ESCAPE '\'").is_empty());
 
     drop(pg);
     drop(lite);

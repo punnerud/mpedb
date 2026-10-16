@@ -15,7 +15,11 @@ impl Schema {
         // v20: IndexDef.from_constraint and TableDef.pk_name.
         // v21: IndexDef.state — a background build must publish an index before
         // it is filled, and the planner must not choose it until it is.
-        buf.push(21u8); // schema encoding version
+        // v22: per-column native PostgreSQL enum descriptor.
+        // Preserve the canonical preimage of ordinary SQLite/PG schemas,
+        // including the immutable bootstrap hash stored in existing files.
+        let has_enums = self.tables.iter().any(|t| t.columns.iter().any(|c| c.pg_enum.is_some()));
+        buf.push(if has_enums { 22u8 } else { 21u8 });
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -57,6 +61,15 @@ impl Schema {
                     Some(d) => {
                         buf.push(1);
                         write_str(&mut buf, d);
+                    }
+                }
+                if has_enums {
+                    match &c.pg_enum {
+                        None => buf.push(0),
+                        Some(e) => {
+                            buf.push(1);
+                            write_str(&mut buf, &toml::to_string(e).expect("serializable enum"));
+                        }
                     }
                 }
                 match &c.default {
@@ -208,8 +221,8 @@ impl Schema {
 
     /// Parse [`canonical_bytes`] output (bounds-checked; used when attaching
     /// to an existing database to recover its schema from the catalog). Only
-    /// version 5 is accepted — older files refuse loudly and are regenerated
-    /// (DESIGN-SCHEMA-V2 §5; the project carries no migration burden).
+    /// versions 9 through 22 are accepted. Earlier formats refuse loudly;
+    /// pre-enum columns decode with no enum descriptor.
     pub fn from_canonical_bytes(buf: &[u8]) -> Result<Schema> {
         let err = || Error::Corrupt("truncated schema".into());
         let mut pos = 0usize;
@@ -218,7 +231,7 @@ impl Schema {
         // v9 = generated columns; v10 = IndexDef.predicate; v11 = IndexDef.name;
         // v12 = TableDef.foreign_keys; v13 = IndexDef.exprs.
         // Older versions refuse loudly (no migration burden — DESIGN-SCHEMA-V2 §5).
-        if !(9..=21).contains(&version) {
+        if !(9..=22).contains(&version) {
             return Err(Error::Corrupt(format!(
                 "unknown schema version {version} (v1..v8 predate canonical-bytes v9 — \
                  regenerate or re-import)"
@@ -322,6 +335,15 @@ impl Schema {
                     }
                     _ => return Err(Error::Corrupt("bad column decl tag".into())),
                 };
+                let pg_enum = if version >= 22 {
+                    match *buf.get(pos).ok_or_else(err)? {
+                        0 => { pos += 1; None }
+                        1 => { pos += 1; let raw = read_str(buf, &mut pos)?;
+                            Some(toml::from_str::<crate::pgtype::PgEnum>(&raw)
+                                .map_err(|e| Error::Corrupt(format!("invalid enum metadata: {e}")))?) }
+                        _ => return Err(Error::Corrupt("bad enum metadata tag".into())),
+                    }
+                } else { None };
                 let default = match *buf.get(pos).ok_or_else(err)? {
                     0 => {
                         pos += 1;
@@ -394,7 +416,7 @@ impl Schema {
                     }
                     _ => return Err(Error::Corrupt("bad generated tag".into())),
                 };
-                columns.push(ColumnDef {
+                columns.push(ColumnDef { pg_enum,
                     name: cname,
                     ty,
                     nullable: flags & 1 != 0,

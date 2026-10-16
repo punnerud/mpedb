@@ -13,6 +13,120 @@
 use super::*;
 use mpedb_sql::CommentTarget;
 
+pub(crate) fn add_unique_on_txn(
+    txn: &mut mpedb_core::engine::WriteTxn,
+    table_id: u32,
+    columns: &[String],
+    name: Option<String>,
+) -> Result<()> {
+    let bundle = txn.schema_bundle();
+    let table = bundle
+        .schema
+        .table(table_id)
+        .ok_or_else(|| Error::Bind("ALTER TABLE: table no longer exists".into()))?;
+    if let Some(name) = &name {
+        if table.pk_name.as_ref() == Some(name)
+            || table
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.name.as_ref() == Some(name))
+            || bundle
+                .schema
+                .tables
+                .iter()
+                .any(|t| !t.dead && t.indexes.iter().any(|ix| ix.name.as_ref() == Some(name)))
+        {
+            return Err(Error::Bind(format!(
+                "constraint or index \"{name}\" already exists"
+            )));
+        }
+    }
+    let cols = resolve_index_columns(table, &table.name, columns)?;
+    let schema = bundle.schema.with_added_index(
+        table_id,
+        mpedb_types::IndexDef {
+            state: mpedb_types::IndexState::Ready,
+            columns: cols.clone(),
+            unique: true,
+            predicate: None,
+            name: name.clone(),
+            exprs: Vec::new(),
+            collations: Vec::new(),
+            from_constraint: true,
+        },
+    )?;
+    txn.create_index(table_id, cols, Vec::new(), Vec::new(), true, None, name)?;
+    txn.publish_schema(&schema)
+}
+
+/// Resolve and validate under the writer lock before publishing any metadata.
+/// Existing rows are checked even when ordinary FK enforcement is disabled.
+pub(crate) fn add_foreign_key_on_txn(
+    txn: &mut mpedb_core::engine::WriteTxn,
+    table_id: u32,
+    spec: mpedb_sql::ForeignKeySpec,
+) -> Result<()> {
+    let bundle = txn.schema_bundle();
+    let table = bundle
+        .schema
+        .table(table_id)
+        .ok_or_else(|| Error::Bind("ALTER TABLE: table no longer exists".into()))?;
+    let columns = spec
+        .columns
+        .iter()
+        .map(|name| {
+            table
+                .columns
+                .iter()
+                .position(|c| mpedb_types::ident_eq(&c.name, name))
+                .map(|at| at as u16)
+                .ok_or_else(|| {
+                    Error::Bind(format!(
+                        "unknown column \"{name}\" in foreign key definition"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let foreign_key = mpedb_types::ForeignKeyDef {
+        columns,
+        parent: spec.parent,
+        parent_columns: spec.parent_columns,
+        on_delete: spec.on_delete,
+        on_update: spec.on_update,
+        deferred: spec.deferred,
+        name: spec.name,
+    };
+    let schema = bundle
+        .schema
+        .with_added_foreign_key(table_id, foreign_key)?;
+    let table = schema.table(table_id).expect("validated table");
+    let foreign_key = table.foreign_keys.last().expect("added foreign key");
+    let resolved = crate::fk::resolve(&schema, table, foreign_key)?;
+    let parent = schema.table(resolved.parent_id).expect("resolved parent");
+    if foreign_key
+        .columns
+        .iter()
+        .zip(&resolved.parent_cols)
+        .any(|(&child, &parent_col)| {
+            table.columns[child as usize].ty != parent.columns[parent_col as usize].ty
+        })
+    {
+        return Err(Error::Unsupported(
+            "foreign keys between different storage types are not supported".into(),
+        ));
+    }
+    let mut validation_schema = schema.clone();
+    validation_schema.tables[table_id as usize].foreign_keys = vec![foreign_key.clone()];
+    let violations = {
+        let mut ctx = crate::exec::WriteCtx::new(txn, None, None, None);
+        crate::fk::check_all(&mut ctx, &validation_schema, Some(table_id))?
+    };
+    if !violations.is_empty() {
+        return Err(crate::fk::violation(&table.name, foreign_key));
+    }
+    txn.publish_schema(&schema)
+}
+
 /// Sys-keyspace prefix for a stored COMMENT.
 ///
 /// The subkey spells the target so the three kinds cannot collide:
@@ -33,6 +147,159 @@ pub(crate) const VIEW_PREFIX: &[u8] = b"view/";
 pub(crate) const VIEW_PREFIX_END: &[u8] = b"view0";
 
 impl Database {
+    /// Persisted PostgreSQL enum definitions, including types with no columns.
+    pub fn list_pg_enums(&self) -> Result<Vec<mpedb_types::pgtype::PgEnum>> {
+        let r = self.engine.begin_read()?;
+        r.sys_scan_range(b"pg_enum/", b"pg_enum0")?
+            .into_iter()
+            .map(|(_, bytes)| mpedb_types::pgtype::PgEnum::decode(&bytes))
+            .collect()
+    }
+
+    pub(crate) fn parse_ddl(&self, sql: &str) -> Result<Option<mpedb_sql::DdlStmt>> {
+        // Ordinary statements and built-in DDL need no enum registry scan.
+        // Only a DDL parse that could name a custom type retries with the
+        // persisted definitions (unknown names remain explicit errors).
+        match mpedb_sql::parse_ddl_dialect(sql, self.dialect) {
+            Err(original) if self.dialect == mpedb_types::Dialect::Postgres => {
+                let enums = self.list_pg_enums()?;
+                if enums.is_empty() { return Err(original); }
+                mpedb_sql::parse_ddl_with_enums(sql, self.dialect, &enums)
+            }
+            result => result,
+        }
+    }
+
+    fn apply_enum(
+        &self,
+        name: &str,
+        labels: Option<Vec<String>>,
+        if_exists: bool,
+    ) -> Result<ExecResult> {
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
+        let key = format!("pg_enum/{name}");
+        let old = w.sys_get(key.as_bytes())?;
+        if let Some(labels) = labels {
+            if old.is_some() {
+                return Err(Error::Bind(format!("type \"{name}\" already exists")));
+            }
+            if mpedb_types::pgtype::by_name(name).is_some()
+                || w.schema_bundle().schema.table_id(name).is_some()
+            {
+                return Err(Error::Bind(format!("type \"{name}\" already exists")));
+            }
+            let next = match w.sys_get(b"pg_enum_oid_next")? {
+                Some(bytes) => u64::from_le_bytes(
+                    bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::Corrupt("invalid enum OID counter".into()))?,
+                ),
+                None => {
+                    let mut next = 1u64 << 31;
+                    for (_, bytes) in w.sys_scan_range(b"pg_enum/", b"pg_enum0")? {
+                        let existing = mpedb_types::pgtype::PgEnum::decode(&bytes)?;
+                        next = next.max(u64::from(existing.oid) + 4096);
+                    }
+                    next
+                }
+            };
+            if !((1u64 << 31)..=(1u64 << 32)).contains(&next) || next & 4095 != 0 {
+                return Err(Error::Corrupt("invalid enum OID counter".into()));
+            }
+            if next == (1u64 << 32) {
+                return Err(Error::Unsupported("enum OID space exhausted".into()));
+            }
+            let e = mpedb_types::pgtype::PgEnum {
+                name: name.into(),
+                oid: next as u32,
+                labels,
+            };
+            e.validate()?;
+            w.sys_put(key.as_bytes(), &e.encode())?;
+            w.sys_put(b"pg_enum_oid_next", &(next + 4096).to_le_bytes())?;
+        } else {
+            if old.is_none() {
+                if if_exists {
+                    w.abort();
+                    return Ok(ExecResult::Affected(0));
+                }
+                return Err(Error::Bind(format!("type \"{name}\" does not exist")));
+            }
+            if w.schema_bundle().schema.live_tables().any(|t| {
+                t.columns
+                    .iter()
+                    .any(|c| c.pg_enum.as_ref().is_some_and(|e| e.name == name))
+            }) {
+                return Err(Error::Bind(format!(
+                    "cannot drop type \"{name}\" because columns depend on it"
+                )));
+            }
+            w.sys_delete(key.as_bytes())?;
+        }
+        w.bump_schema_gen();
+        w.commit()?;
+        self.cache.write().expect(POISON).clear();
+        self.engine.reload_schema_from_catalog()?;
+        Ok(ExecResult::Affected(0))
+    }
+
+    /// Reserve a key from the owned SERIAL generator. This is a short,
+    /// independently committed allocation: the caller's later rollback does
+    /// not return the key. It shares the AUTOINCREMENT high-water with direct
+    /// inserts, preventing a reserved id from being assigned a second time.
+    ///
+    /// This is the rowid-alias model, not a standalone PostgreSQL sequence:
+    /// explicit ids also advance the high-water. Never call while holding a
+    /// WriteSession on this database.
+    pub fn next_serial_value(&self, sequence: &str, namespace: Option<&str>) -> Result<i64> {
+        if !matches!(
+            namespace,
+            None | Some("public") | Some("pg_temp") | Some("pg_temp_1")
+        ) {
+            return Err(Error::Bind(format!(
+                "sequence \"{sequence}\" does not exist"
+            )));
+        }
+        if namespace != Some("public") {
+            let guard = self.attached.read().expect(POISON);
+            if let Some(i) = guard.find("temp") {
+                let db = &guard.members[i].db;
+                db.engine.refresh_schema_if_stale()?;
+                if owned_serial_table(&db.schema().schema, sequence).is_some() {
+                    return db.next_serial_value(sequence, Some("public"));
+                }
+            }
+            if namespace.is_some() {
+                return Err(Error::Bind(format!(
+                    "sequence \"{sequence}\" does not exist"
+                )));
+            }
+        }
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
+        let bundle = w.schema_bundle();
+        let id = owned_serial_table(&bundle.schema, sequence)
+            .ok_or_else(|| Error::Bind(format!("sequence \"{sequence}\" does not exist")))?;
+        if !bundle.schema.table(id).is_some_and(|t| t.autoincrement) {
+            return Err(Error::Unsupported("nextval on a legacy SERIAL table needs a monotonic owned generator; recreate/migrate the table".into()));
+        }
+        let key = mpedb_core::engine::rowid_seq_key(id);
+        if let Some(bytes) = w.sys_get(&key)? {
+            let stored = i64::from_le_bytes(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Corrupt("invalid SERIAL high-water".into()))?,
+            );
+            if stored == i64::MAX {
+                return Err(Error::ArithmeticOverflow);
+            }
+        }
+        let next = w.next_rowid(id)?;
+        w.commit()?;
+        Ok(next)
+    }
+
     /// Load every stored view (`view/<name>` → SELECT source) into a catalog.
     /// Cheap when there are none. Cached by the facade behind the schema-gen
     /// gate — views change only on a DDL commit, which bumps `schema_gen`.
@@ -327,6 +594,15 @@ impl Database {
         let _ = self.engine.reload_schema_from_catalog();
         Ok(ExecResult::Affected(0))
     }
+}
+
+fn owned_serial_table(schema: &mpedb_types::Schema, sequence: &str) -> Option<u32> {
+    schema.tables.iter().filter(|t| !t.dead).find_map(|t| {
+        let col = t.rowid_alias_col()?;
+        let column = t.columns.get(col as usize)?;
+        if !column.decl.as_deref().is_some_and(mpedb_types::pgtype::is_serial) { return None; }
+        (format!("{}_{}_seq", t.name, column.name) == sequence).then_some(t.id)
+    })
 }
 
 fn view_key(name: &str) -> Vec<u8> {
@@ -665,7 +941,7 @@ pub(crate) fn table_def_from_spec(
                     // takes the column's store-time affinity FIRST — sqlite
                     // stores `DEFAULT '1.50'` on a NUMERIC column as the real
                     // 1.5, and reports `typeof()` accordingly.
-                    let v = mpedb_types::store_into(c.ty, c.affinity, c.decl.is_some(), v.clone());
+                    let v = mpedb_types::store_into(c.ty, c.affinity, c.decl.is_some() && c.pg_enum.is_none(), v.clone());
                     let v = coerce_default(v, c.ty, &spec.name, &c.name)?;
                     if v.is_null() {
                         None
@@ -676,7 +952,7 @@ pub(crate) fn table_def_from_spec(
                 // The column-default parser emits a Const literal or `Now`.
                 other => other.cloned(),
             };
-            Ok(mpedb_types::ColumnDef { generated: None,
+            Ok(mpedb_types::ColumnDef { pg_enum: c.pg_enum.clone(), generated: None,
                 // The DEFAULT's DDL text verbatim, for `dflt_value` — sqlite
                 // reports what was WRITTEN, which the folded value cannot say.
                 default_text: c.default_text.clone(),
@@ -749,7 +1025,7 @@ pub(crate) fn table_def_from_spec(
         // Append the hidden rowid as the trailing column and make it the sole PK.
         // It IS a single-Int64-PK rowid alias, so the existing NULL→max(rowid)+1
         // auto-assign machinery (#85) drives it with no engine change.
-        columns.push(mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
+        columns.push(mpedb_types::ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
             name: "rowid".into(),
             ty: mpedb_types::ColumnType::Int64,
             nullable: false,
@@ -872,7 +1148,7 @@ pub(crate) fn table_def_from_spec(
 pub(crate) fn virtual_table_def_from_spec(
     spec: mpedb_sql::CreateVirtualTableSpec,
 ) -> Result<mpedb_types::TableDef> {
-    let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef { generated: None, default_text: None, decl: None,
+    let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: name.to_string(),
         ty,
         nullable,
@@ -956,7 +1232,7 @@ pub(crate) fn add_column_from_spec(
         // lands in every existing row, so it must be the value the column would
         // have held had the rows been inserted with it.
         Some(DefaultExpr::Const(v)) => coerce_default(
-            mpedb_types::store_into(spec.ty, spec.affinity, spec.decl.is_some(), v),
+            mpedb_types::store_into(spec.ty, spec.affinity, spec.decl.is_some() && spec.pg_enum.is_none(), v),
             spec.ty,
             table,
             &spec.name,
@@ -996,7 +1272,7 @@ pub(crate) fn add_column_from_spec(
     } else {
         Some(DefaultExpr::Const(fill.clone()))
     };
-    let mut col = mpedb_types::ColumnDef { generated: None,
+    let mut col = mpedb_types::ColumnDef { pg_enum: spec.pg_enum.clone(), generated: None,
         // ADD COLUMN's default is a CONSTANT (a non-constant one is refused
         // above), so its DDL text is what the column keeps.
         default_text: spec.default_text.clone(),
@@ -1195,7 +1471,7 @@ pub(crate) fn fts4_shadow_defs(
     vtab: &str,
     content_cols: &[String],
 ) -> Vec<mpedb_types::TableDef> {
-    let col = |name: &str, ty, nullable| mpedb_types::ColumnDef {
+    let col = |name: &str, ty, nullable| mpedb_types::ColumnDef { pg_enum: None,
         generated: None,
         default_text: None,
         decl: None,
@@ -1742,6 +2018,8 @@ impl Database {
     pub(crate) fn apply_ddl(&self, ddl: mpedb_sql::DdlStmt) -> Result<ExecResult> {
         use mpedb_sql::{DdlStmt, RlsAction};
         match ddl {
+            DdlStmt::CreateEnum { name, labels } => return self.apply_enum(&name, Some(labels), false),
+            DdlStmt::DropEnum { name, if_exists } => return self.apply_enum(&name, None, if_exists),
             DdlStmt::CreateTable(spec) => {
                 return self.apply_create_table(spec);
             }
@@ -1792,6 +2070,16 @@ impl Database {
             }
             DdlStmt::AlterAddColumn { table, column } => {
                 return self.apply_alter_add_column(&table, column);
+            }
+            DdlStmt::AlterAddForeignKey { table, foreign_key } => {
+                return self.apply_alter_rename(&table, |txn, id| {
+                    add_foreign_key_on_txn(txn, id, foreign_key)
+                });
+            }
+            DdlStmt::AlterAddUnique { table, columns, name } => {
+                return self.apply_alter_rename(&table, |txn, id| {
+                    add_unique_on_txn(txn, id, &columns, name)
+                });
             }
             DdlStmt::AlterDropColumn { table, column } => {
                 return self.apply_alter_drop_column(&table, &column);

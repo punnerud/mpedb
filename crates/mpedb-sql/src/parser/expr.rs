@@ -175,7 +175,7 @@ impl<'a> Parser<'a> {
         Ok(words.join(" "))
     }
 
-    fn enter_expr(&mut self) -> Result<()> {
+    pub(super) fn enter_expr(&mut self) -> Result<()> {
         let probe = 0u8;
         let here = &probe as *const u8 as usize;
         if self.stack_base.saturating_sub(here) > MAX_PARSER_STACK {
@@ -188,7 +188,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn exit_expr(&mut self) {
+    pub(super) fn exit_expr(&mut self) {
         debug_assert!(self.depth > 0);
         self.depth -= 1;
     }
@@ -294,9 +294,12 @@ impl<'a> Parser<'a> {
                 let escape = if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("ESCAPE"))
                 {
                     self.pos += 1;
-                    Some(self.escape_char()?)
+                    if self.dialect == Dialect::Postgres && matches!(self.peek(), Some(Tok::Str(s)) if s.is_empty()) {
+                        self.pos += 1;
+                        None
+                    } else { Some(self.escape_char()?) }
                 } else {
-                    None
+                    (self.dialect == Dialect::Postgres).then_some('\\')
                 };
                 let like = Expr::Like(Box::new(e), Box::new(pat), escape);
                 e = if negated {
@@ -1829,6 +1832,16 @@ impl<'a> Parser<'a> {
         }
         // `CAST ( expr AS <typename> )` — CAST is a positional word, not a
         // keyword, so a table may still be named `cast`.
+        if self.dialect == mpedb_types::Dialect::Postgres
+            && matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("EXTRACT"))
+            && matches!(self.peek_at(1), Some(Tok::LParen)) {
+            self.pos += 2;
+            let field = self.ident("date/time field in EXTRACT")?;
+            self.expect_kw(Kw::From, "FROM in EXTRACT")?;
+            let source = self.expr()?;
+            self.expect(&Tok::RParen, ") after EXTRACT")?;
+            return Ok(Expr::Func("__mpedb_extract".into(), vec![Expr::Lit(Value::Text(field)), source]));
+        }
         if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("CAST"))
             && matches!(self.peek_at(1), Some(Tok::LParen))
         {

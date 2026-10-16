@@ -798,7 +798,7 @@ fn raw_to_config(
                         Error::Config(format!("bad default for {}.{}: {m}", t.name, c.name))
                     })?),
                 };
-                columns.push(ColumnDef { generated: None, default_text: None, decl: None,
+                columns.push(ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                     name: c.name.clone(),
                     ty,
                     nullable: c.nullable,

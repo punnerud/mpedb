@@ -79,13 +79,35 @@ pub(crate) fn parse_ddl_dialect(
     sql: &str,
     dialect: mpedb_types::Dialect,
 ) -> Result<Option<DdlStmt>> {
+    parse_ddl_with_enums(sql, dialect, &[])
+}
+
+pub(crate) fn parse_ddl_with_enums(sql: &str, dialect: mpedb_types::Dialect,
+    enums: &[mpedb_types::pgtype::PgEnum]) -> Result<Option<DdlStmt>> {
     let toks = crate::token::tokenize_dialect(sql, dialect)?;
     let mut p = Parser::new(sql, toks);
     p.dialect = dialect;
+    p.pg_enums = enums.to_vec();
     let ddl = match p.peek_ident_ci().as_deref() {
         Some("create") => {
             p.advance();
-            if p.eat_word("TABLE") {
+            if dialect == mpedb_types::Dialect::Postgres && p.eat_word("TYPE") {
+                let name = p.ident("enum type name")?;
+                p.expect_kw(Kw::As, "AS")?;
+                p.expect_word("ENUM")?;
+                p.expect(&Tok::LParen, "(")?;
+                let mut labels = Vec::new();
+                if !p.eat(&Tok::RParen) {
+                    loop {
+                        let crate::ast::Expr::Lit(Value::Text(label)) = p.expr()? else {
+                            return Err(p.err_here("enum labels must be string literals"));
+                        };
+                        labels.push(label);
+                        if !p.eat(&Tok::Comma) { p.expect(&Tok::RParen, ")")?; break; }
+                    }
+                }
+                DdlStmt::CreateEnum { name, labels }
+            } else if p.eat_word("TABLE") {
                 p.parse_create_table()?
             } else if p.eat_word("VIRTUAL") {
                 p.expect_word("TABLE")?;
@@ -149,7 +171,12 @@ pub(crate) fn parse_ddl_dialect(
         }
         Some("drop") => {
             p.advance();
-            if p.eat_word("TABLE") {
+            if dialect == mpedb_types::Dialect::Postgres && p.eat_word("TYPE") {
+                let if_exists = p.eat_word("IF");
+                if if_exists { p.expect_word("EXISTS")?; }
+                let name = p.ident("enum type name")?;
+                DdlStmt::DropEnum { name, if_exists }
+            } else if p.eat_word("TABLE") {
                 p.parse_drop_table()?
             } else if p.eat_word("VIEW") {
                 p.parse_drop_view()?
@@ -430,7 +457,8 @@ impl<'a> Parser<'a> {
                 // A QUOTED word can never be a constraint keyword, so it is
                 // always part of the type name (sqlite's `ids ::= ID|STRING`).
                 Some(Tok::QuotedIdent(..)) => {
-                    words.push(self.ident("a type name")?.to_ascii_lowercase())
+                    let name = self.ident("a type name")?;
+                    words.push(if self.dialect == mpedb_types::Dialect::Postgres { name } else { name.to_ascii_lowercase() });
                 }
                 _ => break,
             }
@@ -516,7 +544,9 @@ impl<'a> Parser<'a> {
         let (sqlite_ty, sqlite_aff) = mpedb_types::ColumnType::declared(&joined);
         let (ty, aff) = if self.dialect == mpedb_types::Dialect::Postgres {
             let ty =
-                crate::pg::types::column_type(&joined).map_err(|e| self.err_here(e.to_string()))?;
+                if self.pg_enums.iter().any(|e| e.matches_decl(text)) {
+                    mpedb_types::ColumnType::Text
+                } else { crate::pg::types::column_type(&joined).map_err(|e| self.err_here(e.to_string()))? };
             (ty, mpedb_types::Affinity::implied_by(ty))
         } else {
             (sqlite_ty, sqlite_aff)
@@ -784,6 +814,7 @@ impl<'a> Parser<'a> {
         // `double precision`, an unknown name, or none at all).
         let (ty, affinity, decl) = self.declared_type()?;
         let mut col = crate::ddl::CreateColumnSpec {
+            pg_enum: decl.as_ref().and_then(|d| self.pg_enums.iter().find(|e| e.matches_decl(d))).cloned(),
             name: cname,
             ty,
             affinity,
@@ -1065,7 +1096,17 @@ impl<'a> Parser<'a> {
                         )));
                     }
                 }
-                columns.iter().any(|c| c.autoincrement)
+                let inline_pk: Vec<_> = columns.iter().filter(|c| c.pk).collect();
+                let serial_pk = self.dialect == mpedb_types::Dialect::Postgres
+                    && columns.iter().any(|c| {
+                        let sole_pk = if table_pk.is_empty() {
+                            inline_pk.len() == 1 && c.pk
+                        } else {
+                            table_pk.len() == 1 && mpedb_types::ident_eq(&table_pk[0], &c.name)
+                        };
+                        sole_pk && c.decl.as_deref().is_some_and(crate::pg::types::is_serial)
+                    });
+                columns.iter().any(|c| c.autoincrement) || serial_pk
             },
             columns,
             table_pk,
@@ -1562,6 +1603,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen, ")")?;
+        if self.dialect == mpedb_types::Dialect::Postgres && self.peek_word_at(0, "INCLUDE") {
+            return Err(mpedb_types::Error::Unsupported(
+                "CREATE INDEX INCLUDE requires stored non-key index columns".into(),
+            ));
+        }
         // Nothing downstream should have to ask twice whether this is an
         // expression index: the vector is empty unless a part actually is one.
         if exprs.iter().all(Option::is_none) {
@@ -1744,6 +1790,22 @@ impl<'a> Parser<'a> {
             return Ok(DdlStmt::AlterRenameColumn { table, column, new_name });
         }
         if self.eat_word("ADD") {
+            if self.dialect == mpedb_types::Dialect::Postgres
+                && matches!(self.word_at_cursor().as_str(), "CONSTRAINT" | "FOREIGN" | "UNIQUE") {
+                let name = if self.eat_word("CONSTRAINT") {
+                    Some(self.ident("constraint name")?)
+                } else { None };
+                if self.eat_word("UNIQUE") {
+                    let columns = self.paren_ident_list()?;
+                    return Ok(DdlStmt::AlterAddUnique { table, columns, name });
+                }
+                self.expect_word("FOREIGN")?;
+                self.expect_word("KEY")?;
+                let columns = self.paren_ident_list()?;
+                self.expect_word("REFERENCES")?;
+                let foreign_key = self.references_clause(columns, name)?;
+                return Ok(DdlStmt::AlterAddForeignKey { table, foreign_key });
+            }
             // A TABLE CONSTRAINT is not a column, and reading it as one was a
             // WRONG ANSWER — the worst kind, because it succeeded.
             //
@@ -1775,6 +1837,7 @@ impl<'a> Parser<'a> {
             // → Any, matching sqlite's no-affinity column.
             let (ty, affinity, decl) = self.declared_type()?;
             let mut col = crate::ddl::CreateColumnSpec {
+            pg_enum: decl.as_ref().and_then(|d| self.pg_enums.iter().find(|e| e.matches_decl(d))).cloned(),
                 name: cname,
                 ty,
                 affinity,

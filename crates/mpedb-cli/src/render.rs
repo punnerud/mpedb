@@ -148,7 +148,7 @@ mod tests {
             "  padded  ",
             "back\\slash",
         ];
-        let col = |n: &str| ColumnDef { generated: None, default_text: None, decl: None,
+        let col = |n: &str| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
             name: n.into(),
             ty: ColumnType::Int64,
             nullable: false,

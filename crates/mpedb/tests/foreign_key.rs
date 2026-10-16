@@ -16,6 +16,72 @@ mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+#[cfg(feature = "pg-dialect")]
+fn postgres_alter_foreign_key_validates_existing_rows_and_enforces_future_writes() {
+    let mut db = open();
+    db.db.set_dialect(mpedb_types::Dialect::Postgres);
+    db.query("CREATE TABLE p (id integer PRIMARY KEY)", &[])
+        .unwrap();
+    db.query("CREATE TABLE c (id integer PRIMARY KEY, pid integer)", &[])
+        .unwrap();
+    db.query("INSERT INTO c VALUES (1, 99)", &[]).unwrap();
+    let sql = "ALTER TABLE c ADD CONSTRAINT c_parent FOREIGN KEY (pid) REFERENCES p(id)";
+    assert!(matches!(
+        db.query(sql, &[]),
+        Err(mpedb::Error::ForeignKeyViolation { .. })
+    ));
+    assert!(db.schema().schema.table(2).unwrap().foreign_keys.is_empty());
+    db.query("INSERT INTO p VALUES (99)", &[]).unwrap();
+    db.query(sql, &[]).unwrap();
+    assert!(db.query(sql, &[]).is_err(), "duplicate name must fail");
+    assert!(db.query("INSERT INTO c VALUES (2, 100)", &[]).is_err());
+    db.query("INSERT INTO c VALUES (2, NULL)", &[]).unwrap();
+    assert!(db.query("DELETE FROM p WHERE id = 99", &[]).is_err());
+    let schema = db.schema();
+    let fk = &schema.schema.table(2).unwrap().foreign_keys[0];
+    assert_eq!(fk.name.as_deref(), Some("c_parent"));
+}
+
+#[test]
+#[cfg(feature = "pg-dialect")]
+fn postgres_alter_constraints_in_write_session_rollback_and_unique_build_is_atomic() {
+    let mut db = open();
+    db.db.set_dialect(mpedb_types::Dialect::Postgres);
+    db.query("CREATE TABLE p (id integer PRIMARY KEY)", &[])
+        .unwrap();
+    db.query("CREATE TABLE c (id integer PRIMARY KEY, pid integer)", &[])
+        .unwrap();
+    {
+        let mut txn = db.begin().unwrap();
+        txn.query("ALTER TABLE c ADD FOREIGN KEY (pid) REFERENCES p(id)", &[])
+            .unwrap();
+        assert!(txn.query("INSERT INTO c VALUES (1, 999)", &[]).is_err());
+        txn.rollback();
+    }
+    db.query("INSERT INTO c VALUES (1, 999), (2, 999)", &[])
+        .unwrap();
+    let unique = "ALTER TABLE c ADD CONSTRAINT uq_pid UNIQUE (pid)";
+    assert!(db.query(unique, &[]).is_err());
+    assert!(db.schema().schema.table(2).unwrap().indexes.is_empty());
+    db.query("DELETE FROM c WHERE id = 2", &[]).unwrap();
+    {
+        let mut txn = db.begin().unwrap();
+        txn.query(unique, &[]).unwrap();
+        assert!(txn.query("INSERT INTO c VALUES (2, 999)", &[]).is_err());
+        txn.rollback();
+    }
+    assert!(db.schema().schema.table(2).unwrap().indexes.is_empty());
+    db.query(unique, &[]).unwrap();
+    assert!(db.query("INSERT INTO c VALUES (2, 999)", &[]).is_err());
+    db.query("INSERT INTO c VALUES (2, NULL), (3, NULL)", &[])
+        .unwrap();
+    let schema = db.schema();
+    let ix = &schema.schema.table(2).unwrap().indexes[0];
+    assert!(ix.from_constraint);
+    assert_eq!(ix.name.as_deref(), Some("uq_pid"));
+}
+
 struct Tmp {
     db: Database,
     path: String,

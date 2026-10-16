@@ -4,7 +4,7 @@
     use mpedb_types::ColumnDef;
 
     fn table() -> TableDef {
-        let col = |name: &str, ty: ColumnType, nullable: bool| ColumnDef { generated: None, default_text: None, decl: None,
+        let col = |name: &str, ty: ColumnType, nullable: bool| ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
             name: name.into(),
             ty,
             nullable,
@@ -528,7 +528,7 @@
         let b = TableDef {
             id: 0,
             name: "other".into(),
-            columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
+            columns: vec![ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                 name: "tag".into(),
                 ty: ColumnType::Text,
                 nullable: true,
@@ -572,7 +572,7 @@
         let b = TableDef {
             id: 0,
             name: "other".into(),
-            columns: vec![ColumnDef { generated: None, default_text: None, decl: None,
+            columns: vec![ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
                 name: "id".into(), // collides with a.id
                 ty: ColumnType::Int64,
                 nullable: false,

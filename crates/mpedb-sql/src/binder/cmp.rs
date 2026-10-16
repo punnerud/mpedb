@@ -57,6 +57,28 @@ impl<'a> Binder<'a> {
         };
         let (l, lt) = self.bind_expr(l_ast)?;
         let (r, rt) = self.bind_expr(r_ast)?;
+        let le = if let BExpr::Col(c) = &l { self.scope.column_enum(*c).cloned() } else { None };
+        let re = if let BExpr::Col(c) = &r { self.scope.column_enum(*c).cloned() } else { None };
+        if le.is_some() || re.is_some() {
+            if !is_cmp || l_coll.is_some() || r_coll.is_some() {
+                return Err(Error::Unsupported("enum operators other than uncollated comparisons".into()));
+            }
+            if let (Some(a), Some(b)) = (&le, &re) {
+                if a.oid != b.oid { return Err(bind_err("cannot compare different enum types")); }
+            }
+            if (le.is_none() && matches!(l, BExpr::Col(_))) || (re.is_none() && matches!(r, BExpr::Col(_))) {
+                return Err(bind_err("cannot compare an enum column with a non-enum column"));
+            }
+            let e = le.or(re).expect("one enum");
+            let permitted = |b: &BExpr| matches!(b, BExpr::Col(_) | BExpr::Const(Value::Text(_) | Value::Null) | BExpr::Param(_));
+            if !permitted(&l) || !permitted(&r) {
+                return Err(Error::Unsupported("enum comparison with a computed operand".into()));
+            }
+            let l = self.unify_param(l, lt, ColumnType::Text).0;
+            let r = self.unify_param(r, rt, ColumnType::Text).0;
+            return Ok((BExpr::Binary(op, Box::new(BExpr::EnumRank(Box::new(l), e.clone())),
+                Box::new(BExpr::EnumRank(Box::new(r), e))), Some(ColumnType::Bool)));
+        }
         match op {
             // The two JSON accessors are OPERATORS in the grammar but scalar
             // CALLS in the IR, so they never reach `BExpr::Binary` — one less

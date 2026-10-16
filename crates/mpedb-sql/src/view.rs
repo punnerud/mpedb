@@ -767,6 +767,7 @@ fn rewrite_cte_cols(
             Ok(())
         }
         Expr::TableStar(_)
+        | Expr::Default
         | Expr::Lit(_)
         | Expr::Param(_)
         | Expr::ContextRef(_)
@@ -1411,6 +1412,7 @@ fn expr_mentions(e: &Expr, hidden: &[String]) -> bool {
         Expr::Subquery(b) | Expr::Exists(b, _) => body(b),
         Expr::InSubquery(a, b, _) => sub(a) || body(b),
         Expr::TableStar(_)
+        | Expr::Default
         | Expr::Lit(_)
         | Expr::Param(_)
         | Expr::ContextRef(_)
@@ -1550,6 +1552,7 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
         // subquery does not see the derived alias, so it is left as-is.
         Expr::Subquery(_) | Expr::Exists(_, _) | Expr::InSubquery(_, _, _) => {}
         Expr::TableStar(_)
+        | Expr::Default
         | Expr::Lit(_)
         | Expr::Param(_)
         | Expr::Col(..)
@@ -1956,6 +1959,7 @@ pub(crate) fn expr_aggregates(e: &Expr) -> bool {
         | Expr::Exists(..)
         | Expr::InSubquery(..)
         | Expr::TableStar(_)
+        | Expr::Default
         | Expr::Lit(_)
         | Expr::Param(_)
         | Expr::Col(..)

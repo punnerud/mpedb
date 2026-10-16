@@ -287,7 +287,7 @@ fn object_codes(k: ObjectKind) -> Option<(c_int, c_int)> {
         ObjectKind::Index => (SQLITE_CREATE_INDEX, SQLITE_DROP_INDEX),
         ObjectKind::View => (SQLITE_CREATE_VIEW, SQLITE_DROP_VIEW),
         ObjectKind::Trigger => (SQLITE_CREATE_TRIGGER, SQLITE_DROP_TRIGGER),
-        ObjectKind::Policy => return None,
+        ObjectKind::Policy | ObjectKind::EnumType => return None,
     })
 }
 

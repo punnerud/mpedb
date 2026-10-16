@@ -124,7 +124,18 @@ pub fn sqlstate(e: &Error) -> (&'static str, String) {
 /// misdiagnosis — it is the probe every migration tool runs.
 fn bind_code(m: &str) -> &'static str {
     let l = m.to_ascii_lowercase();
-    if l.contains("no such table") || l.contains("unknown table") || l.contains("does not exist: table")
+    if l.starts_with("like pattern must not end with escape character") { return "22025"; }
+    if l.starts_with("invalid input value for enum ") { return INVALID_TEXT_REPRESENTATION; }
+    if l.starts_with("type ") && l.ends_with("already exists") { return "42710"; }
+    if l.starts_with("type ") && l.ends_with("does not exist") { return "42704"; }
+    if l.starts_with("cannot drop type ") { return "2BP01"; }
+    if l.starts_with("savepoint \"") && l.ends_with("does not exist") {
+        "3B001"
+    } else if l.starts_with("sequence \"") && l.ends_with("does not exist") {
+        UNDEFINED_TABLE
+    } else if l.ends_with("can only be used in transaction blocks") {
+        "25P01"
+    } else if l.contains("no such table") || l.contains("unknown table") || l.contains("does not exist: table")
     {
         UNDEFINED_TABLE
     } else if l.contains("unknown function") || l.contains("no such function") {

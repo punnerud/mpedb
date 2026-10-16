@@ -78,7 +78,7 @@ pub(super) fn expr_has_subquery(e: &ast::Expr) -> bool {
         // that appears there is refused by the binder, not lifted here.
         E::Window { .. } => false,
         E::TableStar(_)
-        | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
+        | E::Default | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) | E::Raise(..) => false,
     }
 }
@@ -538,7 +538,7 @@ impl Lift<'_> {
             // Windows are not descended into for subquery lifting (stage 1); a
             // subquery inside one reaches the binder's refusal unchanged.
             other @ E::Window { .. } => other.clone(),
-            other @ (E::TableStar(_) | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_)
+            other @ (E::TableStar(_) | E::Default | E::Lit(_) | E::Param(_) | E::Col(..) | E::ContextRef(_)
             | E::Excluded(_) | E::Qualified(..) | E::Raise(..)) => other.clone(),
         })
     }
@@ -683,6 +683,9 @@ impl Lift<'_> {
     /// against the outer scope, plan the rewritten inner select, and hand back
     /// the reserved slot its result will occupy.
     fn plan_one_select(&mut self, inner: &ast::SelectStmt, kind: SubPlanKind) -> Result<u16> {
+        if enum_source(inner, self.schema) || self.outer_scope.named().iter().any(|(_,t)| t.columns.iter().any(|c| c.pg_enum.is_some())) {
+            return Err(Error::Unsupported("enum subqueries need enum-aware parameter metadata".into()));
+        }
         // #73 §3: a subquery MAY now contain subqueries, and (stage 3) a nested
         // one may correlate to a MIDDLE or the outermost scope, not only its
         // immediate parent. `Correlate` below resolves this subquery's OWN
@@ -1166,7 +1169,7 @@ impl<'a> Correlate<'a, '_> {
             // a window inside a subquery that references an enclosing row reaches
             // the binder's "unknown column" / window refusal unchanged.
             other @ E::Window { .. } => other.clone(),
-            other @ (E::TableStar(_) | E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_)
+            other @ (E::TableStar(_) | E::Default | E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_)
             | E::Raise(..)) => other.clone(),
         })
     }
@@ -1224,7 +1227,8 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
         | BExpr::Glob(a, _)
         | BExpr::Regexp(a, _)
         | BExpr::Cast(a, _)
-        | BExpr::CastPg(a, _) => refs_correlated(a, sub_base, correlated),
+        | BExpr::EnumRank(a, _)
+            | BExpr::CastPg(a, _) => refs_correlated(a, sub_base, correlated),
         BExpr::Binary(_, a, bx)
         | BExpr::IsDistinct(a, bx, _)
         | BExpr::CollateCmp(_, a, bx, _)
@@ -1306,7 +1310,7 @@ fn qualify_probe(
             E::Qualified(q.clone(), n.clone())
         }
         // Column-free by construction: nothing to qualify, nothing to shadow.
-        E::Lit(_) | E::Param(_) => e.clone(),
+        E::Default | E::Lit(_) | E::Param(_) => e.clone(),
         E::Binary(op, a, b) => {
             E::Binary(*op, Box::new(sub(a, quals)?), Box::new(sub(b, quals)?))
         }

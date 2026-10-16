@@ -1993,7 +1993,22 @@ impl<'e> WriteTxn<'e> {
     /// The txn's CAPTURED bundle still holds the old schema — a DDL txn
     /// does nothing else; the caller swaps the engine bundle after commit
     /// (`Engine::reload_schema_from_catalog`).
+    fn validate_enum_definition(&mut self, column: &mpedb_types::ColumnDef) -> Result<()> {
+        if let Some(e) = &column.pg_enum {
+            let key = format!("pg_enum/{}", e.name);
+            let bytes = self.sys_get(key.as_bytes())?.ok_or_else(|| Error::Bind(format!("type \"{}\" does not exist", e.name)))?;
+            if mpedb_types::pgtype::PgEnum::decode(&bytes)? != *e {
+                return Err(Error::Bind("enum definition changed while preparing DDL; retry".into()));
+            }
+        }
+        Ok(())
+    }
+
     pub fn create_table(&mut self, def: mpedb_types::TableDef) -> Result<u32> {
+        if self.sys_get(format!("pg_enum/{}", def.name).as_bytes())?.is_some() {
+            return Err(Error::Bind(format!("type \"{}\" already exists", def.name)));
+        }
+        for c in &def.columns { self.validate_enum_definition(c)?; }
         let new_schema = self
             .bundle
             .schema
@@ -2224,6 +2239,10 @@ impl<'e> WriteTxn<'e> {
         col: mpedb_types::ColumnDef,
         fill: Value,
     ) -> Result<()> {
+        self.validate_enum_definition(&col)?;
+        if let (Some(e), Value::Text(label)) = (&col.pg_enum, &fill) {
+            if !e.labels.contains(label) { return Err(Error::Bind(format!("invalid input value for enum {}: {:?}", e.name, label))); }
+        }
         let bundle = Arc::clone(&self.bundle);
         let new_schema = bundle.schema.with_added_column(table_id, col.clone())?;
         let old_types = bundle.col_types[table_id as usize].clone();

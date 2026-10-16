@@ -39,6 +39,7 @@ fn perr(pos: usize, msg: impl Into<String>) -> Error {
 /// Returns `(token, index just past it)`.
 pub(crate) fn special(b: &[u8], i: usize) -> Result<Option<(Tok, usize)>> {
     Ok(Some(match b[i] {
+        b'e' | b'E' if b.get(i + 1) == Some(&b'\'') => escape_string(b, i)?,
         b':' => {
             if b.get(i + 1) == Some(&b':') {
                 (Tok::DoubleColon, i + 2)
@@ -84,6 +85,104 @@ pub(crate) fn special(b: &[u8], i: usize) -> Result<Option<(Tok, usize)>> {
         },
         _ => return Ok(None),
     }))
+}
+
+/// PostgreSQL E'...' strings, including byte escapes and Unicode surrogate
+/// pairs. Decode bytes first, then enforce PostgreSQL's UTF-8/no-NUL boundary.
+fn escape_string(b: &[u8], start: usize) -> Result<(Tok, usize)> {
+    let mut pos = start + 2;
+    let mut out = Vec::new();
+    while let Some(&byte) = b.get(pos) {
+        pos += 1;
+        if byte == b'\'' {
+            if b.get(pos) == Some(&b'\'') {
+                out.push(b'\'');
+                pos += 1;
+                continue;
+            }
+            if out.contains(&0) {
+                return Err(perr(start, "NUL is not allowed in PostgreSQL strings"));
+            }
+            let text = String::from_utf8(out)
+                .map_err(|_| perr(start, "escape string is not valid UTF-8"))?;
+            return Ok((Tok::Str(text), pos));
+        }
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+        let escaped = *b
+            .get(pos)
+            .ok_or_else(|| perr(start, "unterminated escape string"))?;
+        pos += 1;
+        match escaped {
+            b'b' => out.push(8),
+            b'f' => out.push(12),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'0'..=b'7' => {
+                let mut value = u16::from(escaped - b'0');
+                for _ in 0..2 {
+                    match b.get(pos) {
+                        Some(digit @ b'0'..=b'7') => {
+                            value = value * 8 + u16::from(digit - b'0');
+                            pos += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(value as u8);
+            }
+            b'x' => {
+                let mut value = 0u8;
+                let mut digits = 0;
+                for _ in 0..2 {
+                    let Some(digit) = b.get(pos).and_then(|c| (*c as char).to_digit(16)) else {
+                        break;
+                    };
+                    value = value * 16 + digit as u8;
+                    digits += 1;
+                    pos += 1;
+                }
+                out.push(if digits == 0 { b'x' } else { value });
+            }
+            b'u' | b'U' => {
+                let mut code = escape_hex(b, &mut pos, if escaped == b'u' { 4 } else { 8 }, start)?;
+                if (0xd800..=0xdbff).contains(&code) {
+                    if b.get(pos..pos + 2) != Some(b"\\u") {
+                        return Err(perr(start, "Unicode high surrogate needs a low surrogate"));
+                    }
+                    pos += 2;
+                    let low = escape_hex(b, &mut pos, 4, start)?;
+                    if !(0xdc00..=0xdfff).contains(&low) {
+                        return Err(perr(start, "invalid Unicode low surrogate"));
+                    }
+                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                }
+                let ch =
+                    char::from_u32(code).ok_or_else(|| perr(start, "invalid Unicode escape"))?;
+                let mut encoded = [0; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+            }
+            // PostgreSQL drops the slash for unrecognized escapes (\z → z).
+            other => out.push(other),
+        }
+    }
+    Err(perr(start, "unterminated escape string"))
+}
+
+fn escape_hex(b: &[u8], pos: &mut usize, width: usize, start: usize) -> Result<u32> {
+    let mut value = 0u32;
+    for _ in 0..width {
+        let digit = b
+            .get(*pos)
+            .and_then(|c| (*c as char).to_digit(16))
+            .ok_or_else(|| perr(start, "invalid Unicode escape"))?;
+        value = (value << 4) | digit;
+        *pos += 1;
+    }
+    Ok(value)
 }
 
 /// `$$body$$` / `$tag$body$tag$`, or `Ok(None)` when this `$` opens a `$n`
@@ -148,6 +247,35 @@ mod tests {
             .into_iter()
             .map(|t| t.tok)
             .collect())
+    }
+
+    #[test]
+    fn escape_strings_decode_like_postgresql_and_leave_sqlite_unchanged() {
+        assert_eq!(
+            pg(r"E'line\nquote\' slash\\'"),
+            vec![Tok::Str("line\nquote' slash\\".into())]
+        );
+        assert_eq!(
+            pg(r"e'\141\x62\u0063\U0001F600\uD834\uDD1E'"),
+            vec![Tok::Str("abc😀𝄞".into())]
+        );
+        assert_eq!(pg(r"E'\xc3\xa9\z\v\x'"), vec![Tok::Str("ézvx".into())]);
+        assert_eq!(pg(r"E'it''s \\1'"), vec![Tok::Str("it's \\1".into())]);
+        for sql in [
+            r"E'\000'",
+            r"E'\400'",
+            r"E'\xff'",
+            r"E'\uD800'",
+            r"E'\uDD1E'",
+            r"E'\u123'",
+            "E'unclosed",
+        ] {
+            assert!(tokenize_dialect(sql, Dialect::Postgres).is_err(), "{sql}");
+        }
+        assert_eq!(
+            lite(r"E'\n'").unwrap(),
+            vec![Tok::Ident("E".into()), Tok::Str(r"\n".into())]
+        );
     }
 
     #[test]
@@ -271,14 +399,22 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             lite,
-            vec![Tok::Ident("ARRAY".into()), Tok::QuotedIdent("1,2".into(), false)]
+            vec![
+                Tok::Ident("ARRAY".into()),
+                Tok::QuotedIdent("1,2".into(), false)
+            ]
         );
         // A bracketed NAME under PG is now three tokens, which is correct for
         // that dialect — `t[1]` is a subscript there, never a table called
         // `1`.
         assert_eq!(
             pg("t[1]"),
-            vec![Tok::Ident("t".into()), Tok::LBracket, Tok::Int(1), Tok::RBracket]
+            vec![
+                Tok::Ident("t".into()),
+                Tok::LBracket,
+                Tok::Int(1),
+                Tok::RBracket
+            ]
         );
     }
 

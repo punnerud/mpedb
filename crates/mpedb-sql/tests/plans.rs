@@ -7,7 +7,7 @@ use mpedb_sql::{
 };
 
 fn col(name: &str, ty: ColumnType) -> ColumnDef {
-    ColumnDef { generated: None, default_text: None, decl: None,
+    ColumnDef { pg_enum: None, generated: None, default_text: None, decl: None,
         name: name.into(),
         ty,
         nullable: true,

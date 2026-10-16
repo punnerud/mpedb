@@ -39,6 +39,8 @@ pub(crate) const COMPAT_PG_VERSION: &str = "16.14";
 /// What a PG function name resolves to.
 #[derive(Debug)]
 pub(crate) enum PgFunc {
+    /// Calendar fields evaluated on typed UTC dates/timestamps as numeric values.
+    Extract,
     /// Fold to this constant; the arguments (there are none) are discarded.
     Const(Value),
     /// Fold to this constant REGARDLESS of the arguments, which are discarded.
@@ -117,10 +119,10 @@ pub(crate) fn resolve(name: &str, argc: usize) -> Option<Result<PgFunc>> {
         // asked about. psql's `\d` calls this for every row.
         "pg_get_userbyid" => PgFunc::ConstOfAny(Value::Text("mpedb".into())),
         // `pg_table_is_visible(oid)` asks whether an object is reachable on the
-        // current search_path. mpedb has one namespace and no search_path, so
-        // everything that exists is visible. Answering `false` (or refusing)
-        // makes `\d` list nothing at all, with no error to explain it.
-        "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible" => {
+        // current search_path. The session catalog accounts for temp objects
+        // shadowing public ones; the answer is carried on the pg_class row.
+        "pg_table_is_visible" => PgFunc::SiblingColumn("mpedb_visible"),
+        "pg_type_is_visible" | "pg_function_is_visible" => {
             PgFunc::ConstOfAny(Value::Bool(true))
         }
         // Used by psql to render a DEFAULT or an index predicate. mpedb stores
@@ -139,6 +141,8 @@ pub(crate) fn resolve(name: &str, argc: usize) -> Option<Result<PgFunc>> {
         // 'int'` and every foreign key on the database reflects as none.
         // `pg_constraint.condef` holds the rendered text (pg/catalog/pgcat.rs).
         "pg_get_constraintdef" => PgFunc::SiblingColumn("condef"),
+        "pg_get_viewdef" => PgFunc::SiblingColumn("mpedb_viewdef"),
+        "obj_description" if argc == 2 => PgFunc::SiblingColumn("mpedb_obj_description"),
         // `pg_get_indexdef(oid, k, pretty)` renders the k-th KEY EXPRESSION of
         // an index, and its first argument is an OID — so returning that made a
         // `CASE` whose other arm is the column NAME mix `int` with `text` and
@@ -155,6 +159,7 @@ pub(crate) fn resolve(name: &str, argc: usize) -> Option<Result<PgFunc>> {
         // and treats NULL as "not serial", which is correct.
         "pg_get_serial_sequence" => PgFunc::ConstOfAny(Value::Null),
         "pg_typeof" => PgFunc::TypeOf,
+        "__mpedb_extract" => PgFunc::Extract,
         // The privilege family: one role, and the OS is the fence.
         "has_table_privilege" | "has_column_privilege" | "has_database_privilege"
         | "has_function_privilege" | "has_schema_privilege" | "has_sequence_privilege"
@@ -251,6 +256,7 @@ fn check_arity(name: &str, f: &PgFunc, argc: usize) -> Result<()> {
         PgFunc::AliasSwap2(_) => Some(2),
         PgFunc::FirstArg => None,
         PgFunc::TypeOf => Some(1),
+        PgFunc::Extract => Some(2),
         PgFunc::Alias(_) | PgFunc::ConstOfAny(_) | PgFunc::AlwaysTrue => None,
         // `pg_get_constraintdef(oid)` and `pg_get_constraintdef(oid, pretty)`
         // are both spelled by clients; only the first argument is read.
@@ -322,7 +328,7 @@ mod tests {
         ));
         assert!(matches!(
             ok("pg_table_is_visible", 1),
-            PgFunc::ConstOfAny(Value::Bool(true))
+            PgFunc::SiblingColumn("mpedb_visible")
         ));
         // …and they take their argument without complaining about arity.
         assert!(resolve("pg_get_userbyid", 1).unwrap().is_ok());

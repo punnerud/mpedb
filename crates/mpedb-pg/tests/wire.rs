@@ -352,6 +352,555 @@ fn a_rolled_back_block_leaves_nothing_behind() {
     assert_eq!(rows(&out).last().unwrap(), &vec![Some("0".into())]);
 }
 
+#[test]
+fn rollback_to_savepoint_preserves_the_outer_transaction_and_can_be_repeated() {
+    let out = run(vec![
+        query("BEGIN"),
+        query("INSERT INTO users VALUES (9,'outer',NULL)"),
+        query("SAVEPOINT \"inner point\""),
+        query("INSERT INTO users VALUES (10,'inner',NULL)"),
+        query("ROLLBACK TO SAVEPOINT \"inner point\""),
+        query("INSERT INTO users VALUES (11,'again',NULL)"),
+        query("ROLLBACK TO \"inner point\""),
+        query("COMMIT"),
+        query("SELECT id FROM users WHERE id >= 9 ORDER BY id"),
+    ]);
+    assert!(!frames(&out).iter().any(|(t, _)| *t == b'E'));
+    assert_eq!(rows(&out), vec![vec![Some("9".into())]]);
+}
+
+#[test]
+fn rollback_to_savepoint_recovers_a_failed_transaction_over_extended_protocol() {
+    let out = run(vec![
+        query("BEGIN; INSERT INTO users VALUES (9,'outer',NULL); SAVEPOINT sp"),
+        query("INSERT INTO users VALUES (9,'duplicate',NULL)"),
+        msg(b'P', b"\0ROLLBACK TO SAVEPOINT sp\0\0\0"),
+        msg(b'B', &[0; 8]),
+        msg(b'E', &[0; 5]),
+        msg(b'S', &[]),
+        query("INSERT INTO users VALUES (10,'recovered',NULL); COMMIT"),
+        query("SELECT id FROM users WHERE id >= 9 ORDER BY id"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert_eq!(errors.len(), 1);
+    assert!(String::from_utf8_lossy(&errors[0].1).contains("23505"));
+    assert_eq!(
+        rows(&out),
+        vec![vec![Some("9".into())], vec![Some("10".into())]]
+    );
+}
+
+#[test]
+fn release_restores_shadowed_savepoint_and_discards_nested_savepoints() {
+    let out = run(vec![
+        query("BEGIN; SAVEPOINT SP; INSERT INTO users VALUES (9,'one',NULL)"),
+        query("SAVEPOINT sp; INSERT INTO users VALUES (10,'two',NULL); SAVEPOINT child"),
+        query("RELEASE SAVEPOINT sp; ROLLBACK TO sp; COMMIT"),
+        query("SELECT count(*) FROM users WHERE id >= 9"),
+        query("BEGIN; ROLLBACK TO sp"),
+        query("ROLLBACK"),
+        query("SAVEPOINT outside"),
+    ]);
+    assert_eq!(rows(&out), vec![vec![Some("0".into())]]);
+    let codes: Vec<_> = frames(&out)
+        .iter()
+        .filter(|(t, _)| *t == b'E')
+        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+        .collect();
+    assert_eq!(codes.len(), 2);
+    assert!(codes[0].contains("3B001"));
+    assert!(codes[1].contains("25P01"));
+}
+
+#[test]
+fn timestamp_and_uuid_types_survive_casts_and_returning() {
+    let out = run(vec![
+        query("CREATE TABLE typed (id int PRIMARY KEY, ts timestamp, tz timestamptz, u uuid)"),
+        query("INSERT INTO typed VALUES (1, '2020-01-02 03:04:05.0015'::timestamp, '2020-01-02 03:04:05.0015+00'::timestamptz, '3bf17fd4-4bc6-45cc-bef3-56288f675a46'::uuid) RETURNING ts,tz,u"),
+        query("SELECT ts,tz,u FROM typed"),
+        query("SELECT '2020-01-02 03:04:05.0015'::timestamp, '2020-01-02 03:04:05.0015+00'::timestamptz, NULL::uuid"),
+        query("UPDATE typed SET ts=ts RETURNING ts,tz,u"),
+        query("DELETE FROM typed RETURNING ts,tz,u"),
+    ]);
+    assert!(
+        !frames(&out).iter().any(|(t, _)| *t == b'E'),
+        "{:?}",
+        frames(&out)
+            .iter()
+            .filter(|(t, _)| *t == b'E')
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+            .collect::<Vec<_>>()
+    );
+    let expected = vec![
+        Some("2020-01-02 03:04:05.0015".into()),
+        Some("2020-01-02 03:04:05.0015+00".into()),
+        Some("3bf17fd4-4bc6-45cc-bef3-56288f675a46".into()),
+    ];
+    let data = rows(&out);
+    for i in [0, 1, 3, 4] {
+        assert_eq!(data[i], expected);
+    }
+    let descriptions: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'T')
+        .collect();
+    assert_eq!(descriptions.len(), 5);
+    for (_, body) in descriptions {
+        let mut at = 2;
+        for oid in [1114u32, 1184, 2950] {
+            at += body[at..].iter().position(|b| *b == 0).unwrap() + 1;
+            assert_eq!(
+                u32::from_be_bytes(body[at + 6..at + 10].try_into().unwrap()),
+                oid
+            );
+            at += 18;
+        }
+    }
+}
+
+#[test]
+fn default_values_cells_use_column_defaults_and_allocate_each_generated_key() {
+    let out = run(vec![
+        query("CREATE TABLE default_cells (id serial PRIMARY KEY, v int DEFAULT 7, label text DEFAULT 'default')"),
+        query("INSERT INTO default_cells (id,v,label) VALUES (DEFAULT,DEFAULT,DEFAULT), (DEFAULT,12,DEFAULT), (DEFAULT,DEFAULT,NULL) RETURNING id,v,label"),
+        query("INSERT INTO default_cells (id,v) VALUES (DEFAULT,2+3) RETURNING id,v"),
+        query("SELECT count(*) FROM default_cells"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![Some("1".into()), Some("7".into()), Some("default".into())],
+            vec![Some("2".into()), Some("12".into()), Some("default".into())],
+            vec![Some("3".into()), Some("7".into()), None],
+            vec![Some("4".into()), Some("5".into())],
+            vec![Some("4".into())],
+        ]
+    );
+}
+
+#[test]
+fn catalog_preserves_declared_character_and_numeric_modifiers() {
+    let out = run(vec![
+        query("CREATE TABLE declared_types (v varchar(52), c char(3), n numeric(18,5), neg numeric(4,-2), u uuid, ts timestamp)"),
+        query("SELECT a.attname,a.atttypid,a.atttypmod,format_type(a.atttypid,a.atttypmod) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname='declared_types' ORDER BY a.attnum"),
+    ]);
+    assert!(!frames(&out).iter().any(|(t, _)| *t == b'E'));
+    let expected = [
+        ["v", "1043", "56", "character varying(52)"],
+        ["c", "1042", "7", "character(3)"],
+        ["n", "1700", "1179657", "numeric(18,5)"],
+        ["neg", "1700", "264194", "numeric(4,-2)"],
+        ["u", "2950", "-1", "uuid"],
+        ["ts", "1114", "-1", "timestamp without time zone"],
+    ];
+    assert_eq!(
+        rows(&out),
+        expected
+            .into_iter()
+            .map(|r| r.into_iter().map(|s| Some(s.into())).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_missing_required_default_aborts_the_entire_multi_row_insert() {
+    let out = run(vec![
+        query("CREATE TABLE required_default (id serial PRIMARY KEY, v int NOT NULL)"),
+        query("INSERT INTO required_default VALUES (DEFAULT,1),(DEFAULT,DEFAULT)"),
+        query("SELECT count(*) FROM required_default"),
+    ]);
+    let errors: Vec<_> = frames(&out).into_iter().filter(|(t, _)| *t == b'E').collect();
+    assert_eq!(errors.len(), 1);
+    assert!(String::from_utf8_lossy(&errors[0].1).contains("23502"));
+    assert_eq!(rows(&out), vec![vec![Some("0".into())]]);
+}
+
+#[test]
+fn parenthesized_set_arms_keep_local_limits_and_outer_clauses() {
+    let out = run(vec![
+        query("(SELECT id FROM users ORDER BY id DESC LIMIT 1) UNION ALL (SELECT id FROM users ORDER BY id LIMIT 1) ORDER BY id LIMIT 1"),
+        query("SELECT d.id FROM ((SELECT id FROM users ORDER BY id DESC LIMIT 1) UNION ALL (SELECT id FROM users ORDER BY id LIMIT 1)) AS d ORDER BY d.id DESC LIMIT 1"),
+        query("(SELECT 1 AS id UNION SELECT 2) EXCEPT (SELECT 2 AS id EXCEPT SELECT 1) ORDER BY id"),
+        query("SELECT a.id FROM ((users a JOIN users b ON a.id=b.id)) ORDER BY a.id LIMIT 1"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{:?}",
+        errors
+            .iter()
+            .map(|(_, b)| String::from_utf8_lossy(b))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![Some("1".into())],
+            vec![Some("2".into())],
+            vec![Some("1".into())],
+            vec![Some("1".into())]
+        ]
+    );
+}
+
+#[test]
+fn temp_catalog_has_disjoint_oids_and_refreshes_without_main_ddl() {
+    let out = run(vec![
+        query("SELECT count(*) FROM pg_class WHERE relname='users'"),
+        query("CREATE TEMP TABLE users (id int PRIMARY KEY, label text UNIQUE)"),
+        query("SELECT n.nspname,c.relpersistence,pg_table_is_visible(c.oid),a.attname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid WHERE c.relname='users' ORDER BY n.nspname,a.attnum"),
+        query("SELECT count(DISTINCT oid) FROM pg_class WHERE relname='users'"),
+        query("DROP TABLE users"),
+        query("SELECT count(*) FROM pg_class c WHERE c.relname='users' AND pg_table_is_visible(c.oid)"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{:?}",
+        errors
+            .iter()
+            .map(|(_, b)| String::from_utf8_lossy(b))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![Some("1".into())],
+            vec![
+                Some("pg_temp_1".into()),
+                Some("t".into()),
+                Some("t".into()),
+                Some("id".into())
+            ],
+            vec![
+                Some("pg_temp_1".into()),
+                Some("t".into()),
+                Some("t".into()),
+                Some("label".into())
+            ],
+            vec![
+                Some("public".into()),
+                Some("p".into()),
+                Some("f".into()),
+                Some("id".into())
+            ],
+            vec![
+                Some("public".into()),
+                Some("p".into()),
+                Some("f".into()),
+                Some("nick".into())
+            ],
+            vec![
+                Some("public".into()),
+                Some("p".into()),
+                Some("f".into()),
+                Some("score".into())
+            ],
+            vec![Some("2".into())],
+            vec![Some("1".into())],
+        ]
+    );
+}
+
+#[test]
+fn view_names_definitions_and_temp_shadowing_refresh_in_the_catalog() {
+    let out = run(vec![
+        query("CREATE VIEW names_v AS SELECT id,nick FROM users"),
+        query("SELECT c.relname,c.relkind,c.relnatts,pg_get_viewdef(c.oid) FROM pg_class c WHERE c.relname='names_v'"),
+        query("CREATE TEMP VIEW names_v AS SELECT id FROM users"),
+        query("SELECT n.nspname,c.relpersistence,pg_table_is_visible(c.oid),pg_get_viewdef(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='names_v' ORDER BY n.nspname"),
+        query("SELECT schemaname,viewname FROM pg_views ORDER BY schemaname"),
+        query("DROP VIEW names_v"),
+        query("SELECT c.relname FROM pg_class c WHERE c.relkind='v' AND pg_table_is_visible(c.oid)"),
+        query("DROP VIEW names_v"),
+        query("SELECT count(*) FROM pg_class WHERE relname='names_v'"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{:?}",
+        errors
+            .iter()
+            .map(|(_, b)| String::from_utf8_lossy(b))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![
+                Some("names_v".into()),
+                Some("v".into()),
+                Some("2".into()),
+                Some("SELECT id,nick FROM users".into())
+            ],
+            vec![
+                Some("pg_temp_1".into()),
+                Some("t".into()),
+                Some("t".into()),
+                Some("SELECT id FROM users".into())
+            ],
+            vec![
+                Some("public".into()),
+                Some("p".into()),
+                Some("f".into()),
+                Some("SELECT id,nick FROM users".into())
+            ],
+            vec![Some("pg_temp_1".into()), Some("names_v".into())],
+            vec![Some("public".into()), Some("names_v".into())],
+            vec![Some("names_v".into())],
+            vec![Some("0".into())],
+        ]
+    );
+}
+
+#[test]
+fn distinct_on_and_include_are_named_refusals() {
+    let out = run(vec![
+        query("SELECT DISTINCT ON (id) id,nick FROM users ORDER BY id"),
+        query("CREATE INDEX users_cover ON users(id) INCLUDE (nick)"),
+        query("SELECT count(*) FROM users"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert_eq!(errors.len(), 2);
+    for (_, error) in errors {
+        assert!(String::from_utf8_lossy(&error).contains("0A000"));
+    }
+    assert_eq!(rows(&out), vec![vec![Some("2".into())]]);
+}
+
+#[test]
+fn temporary_view_columns_use_the_owning_schema_and_refresh_after_recreation() {
+    let out = run(vec![
+        query("CREATE TABLE view_source (id int PRIMARY KEY, label varchar(9))"),
+        query("CREATE VIEW permanent_view AS SELECT label FROM view_source"),
+        query("CREATE TEMP TABLE view_source (id int PRIMARY KEY, label varchar(23), ts timestamp)"),
+        query("CREATE TEMP VIEW typed_view AS SELECT id,label,ts FROM view_source"),
+        query("SELECT a.attname,a.atttypid,a.atttypmod FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname='typed_view' ORDER BY a.attnum"),
+        query("SELECT a.attname,a.atttypid,a.atttypmod FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname='permanent_view'"),
+        query("DROP VIEW typed_view"),
+        query("CREATE TEMP VIEW typed_view AS SELECT label AS renamed FROM view_source"),
+        query("SELECT a.attname,a.atttypid,a.atttypmod FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname='typed_view' ORDER BY a.attnum"),
+    ]);
+    assert!(!frames(&out).iter().any(|(t, _)| *t == b'E'));
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![Some("id".into()), Some("23".into()), Some("-1".into())],
+            vec![Some("label".into()), Some("1043".into()), Some("27".into())],
+            vec![Some("ts".into()), Some("1114".into()), Some("-1".into())],
+            vec![Some("label".into()), Some("1043".into()), Some("13".into())],
+            vec![
+                Some("renamed".into()),
+                Some("1043".into()),
+                Some("27".into())
+            ],
+        ]
+    );
+}
+
+#[test]
+fn temp_tables_use_pg_types_generated_keys_and_result_metadata() {
+    let out = run(vec![
+        query("CREATE TEMP TABLE typed_tmp (id serial PRIMARY KEY, d date, u uuid, ts timestamp)"),
+        query("INSERT INTO typed_tmp (d,u,ts) VALUES ('2020-01-02'::date,'3bf17fd4-4bc6-45cc-bef3-56288f675a46'::uuid,'2020-01-02 03:04:05'::timestamp) RETURNING id,d,u,ts"),
+        query("SELECT a.attname,ad.adbin FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid LEFT JOIN pg_attrdef ad ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum WHERE c.relname='typed_tmp' ORDER BY a.attnum"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{:?}",
+        errors
+            .iter()
+            .map(|(_, b)| String::from_utf8_lossy(b))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows(&out)[0],
+        vec![
+            Some("1".into()),
+            Some("2020-01-02".into()),
+            Some("3bf17fd4-4bc6-45cc-bef3-56288f675a46".into()),
+            Some("2020-01-02 03:04:05".into())
+        ]
+    );
+    assert_eq!(
+        rows(&out)[1],
+        vec![
+            Some("id".into()),
+            Some("nextval('typed_tmp_id_seq'::regclass)".into())
+        ]
+    );
+}
+
+#[test]
+fn serial_nextval_shares_a_durable_high_water_with_direct_inserts() {
+    let out = run(vec![
+        query("CREATE TABLE keys (id serial PRIMARY KEY, value text)"),
+        query("SELECT nextval('keys_id_seq') AS allocated"),
+        query("INSERT INTO keys (value) VALUES ('direct') RETURNING id"),
+        query("INSERT INTO keys VALUES (1,'reserved')"),
+        query("BEGIN; SELECT pg_catalog.nextval('public.keys_id_seq'::regclass); ROLLBACK"),
+        query("SELECT nextval('keys_id_seq')"),
+        query("SELECT id FROM keys ORDER BY id"),
+        query("CREATE TEMP TABLE keys (id serial PRIMARY KEY)"),
+        query("SELECT nextval('keys_id_seq')"),
+        query("SELECT nextval('public.keys_id_seq')"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{:?}",
+        errors
+            .iter()
+            .map(|(_, b)| String::from_utf8_lossy(b))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows(&out),
+        ["1", "2", "3", "4", "1", "2", "1", "5"].map(|v| vec![Some(v.into())])
+    );
+}
+
+#[test]
+fn serial_nextval_rejects_missing_and_nonstandalone_calls_without_consuming_keys() {
+    let out = run(vec![
+        query("CREATE TABLE keys (id serial PRIMARY KEY)"),
+        query("SELECT nextval('missing')"),
+        query("SELECT nextval('keys_id_seq') WHERE false"),
+        query("SELECT nextval('keys_id_seq')"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert_eq!(errors.len(), 2);
+    assert!(String::from_utf8_lossy(&errors[0].1).contains("42P01"));
+    assert!(String::from_utf8_lossy(&errors[1].1).contains("0A000"));
+    assert_eq!(rows(&out), vec![vec![Some("1".into())]]);
+}
+
+#[test]
+fn scalar_subqueries_preserve_result_types_including_empty_and_nested_results() {
+    let out = run(vec![
+        query("CREATE TABLE scalar_types (id int PRIMARY KEY, ts timestamp, u uuid)"),
+        query("INSERT INTO scalar_types VALUES (1,'2020-01-02 03:04:05'::timestamp,'3bf17fd4-4bc6-45cc-bef3-56288f675a46'::uuid)"),
+        query("SELECT (SELECT ts FROM scalar_types WHERE id=1) AS ts, (SELECT (SELECT u FROM scalar_types WHERE id=1)) AS u, (SELECT ts FROM scalar_types WHERE id=99) AS empty, EXISTS(SELECT id FROM scalar_types WHERE id=1) AS present"),
+    ]);
+    assert!(!frames(&out).iter().any(|(t, _)| *t == b'E'));
+    assert_eq!(
+        rows(&out),
+        vec![vec![
+            Some("2020-01-02 03:04:05".into()),
+            Some("3bf17fd4-4bc6-45cc-bef3-56288f675a46".into()),
+            None,
+            Some("t".into())
+        ]]
+    );
+    let body = frames(&out)
+        .into_iter()
+        .find(|(t, _)| *t == b'T')
+        .unwrap()
+        .1;
+    let mut at = 2;
+    for oid in [1114u32, 2950, 1114, 16] {
+        at += body[at..].iter().position(|b| *b == 0).unwrap() + 1;
+        assert_eq!(
+            u32::from_be_bytes(body[at + 6..at + 10].try_into().unwrap()),
+            oid
+        );
+        at += 18;
+    }
+}
+
+#[test]
+fn information_schema_agrees_with_declared_type_metadata() {
+    let out = run(vec![
+        query("CREATE TABLE info_types (v varchar(52), c char(3), n numeric(18,5), neg numeric(4,-2))"),
+        query("SELECT column_name,data_type,character_maximum_length,character_octet_length,numeric_precision,numeric_precision_radix,numeric_scale,udt_name FROM information_schema.columns WHERE table_name='info_types' ORDER BY ordinal_position"),
+    ]);
+    assert!(!frames(&out).iter().any(|(t, _)| *t == b'E'));
+    // These are PostgreSQL 16's actual rows, including its unsigned display of
+    // a negative numeric scale in information_schema (format_type uses -2).
+    let expected = [
+        [
+            Some("v"),
+            Some("character varying"),
+            Some("52"),
+            Some("208"),
+            None,
+            None,
+            None,
+            Some("varchar"),
+        ],
+        [
+            Some("c"),
+            Some("character"),
+            Some("3"),
+            Some("12"),
+            None,
+            None,
+            None,
+            Some("bpchar"),
+        ],
+        [
+            Some("n"),
+            Some("numeric"),
+            None,
+            None,
+            Some("18"),
+            Some("10"),
+            Some("5"),
+            Some("numeric"),
+        ],
+        [
+            Some("neg"),
+            Some("numeric"),
+            None,
+            None,
+            Some("4"),
+            Some("10"),
+            Some("2046"),
+            Some("numeric"),
+        ],
+    ];
+    assert_eq!(
+        rows(&out),
+        expected
+            .into_iter()
+            .map(|r| r
+                .into_iter()
+                .map(|s| s.map(str::to_string))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// **Pins a KNOWN DIVERGENCE**, so it is a fact on the record rather than a
 /// surprise: DDL is transactional in PostgreSQL, and is not here.
 ///
@@ -530,6 +1079,193 @@ fn show_answers_the_settings_a_driver_asks_for_at_connect() {
         .map(|(_, b)| String::from_utf8_lossy(&b).trim_end_matches('\0').to_string())
         .collect();
     assert!(completions.contains(&"SET".to_string()), "{completions:?}");
+}
+
+#[test]
+fn django_can_configure_utc_without_claiming_other_timezones() {
+    let out = run(vec![
+        query("SELECT set_config('TimeZone', 'UTC', false) AS configured"),
+        query("SHOW timezone"),
+        query("SELECT set_config('TimeZone', 'Europe/Oslo', false)"),
+        query("SELECT set_config('TimeZone', 'UTC', true)"),
+        query("SELECT set_config('search_path', 'other', false)"),
+        query("SELECT set_config('TimeZone', 'UTC', false) WHERE false"),
+    ]);
+    assert_eq!(
+        rows(&out),
+        vec![vec![Some("UTC".into())], vec![Some("UTC".into())]]
+    );
+    assert_eq!(frames(&out).iter().filter(|(t, _)| *t == b'E').count(), 4);
+}
+
+#[test]
+fn django_table_introspection_reads_stored_comments() {
+    let out = run(vec![
+        query("COMMENT ON TABLE users IS 'Django table comment'"),
+        query("SELECT c.relname, obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c WHERE c.relname = 'users'"),
+        query("COMMENT ON TABLE users IS NULL"),
+        query("SELECT obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c WHERE c.relname = 'users'"),
+        query("SELECT obj_description(c.oid, 'pg_constraint') FROM pg_catalog.pg_class c"),
+    ]);
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![Some("users".into()), Some("Django table comment".into())],
+            vec![None],
+        ]
+    );
+    assert_eq!(frames(&out).iter().filter(|(t, _)| *t == b'E').count(), 1);
+}
+
+#[test]
+fn postgres_extract_uses_typed_calendar_fields_and_exact_numeric_results() {
+    let out = run(vec![
+        query("SELECT EXTRACT(MONTH FROM '2024-02-29 12:34:56.123456'::timestamp), EXTRACT(DOY FROM '2024-02-29'::date)"),
+        query("SELECT EXTRACT(YEAR FROM '2024-02-29'::date) / 2, EXTRACT(MONTH FROM '2024-02-29'::date) = 2"),
+        query("SELECT EXTRACT(DOW FROM '1969-12-28'::date), EXTRACT(ISODOW FROM '1969-12-28'::date), EXTRACT(HOUR FROM '12:34:56'::time)"),
+        query("SELECT EXTRACT(DAY FROM NULL::timestamp)"),
+        query("SELECT EXTRACT(SECOND FROM '2024-02-29 12:34:56.123456'::timestamp)"),
+        query("SELECT EXTRACT(SECOND FROM DATE_TRUNC('second', '12:34:56.123456'::time))"),
+        query("SELECT EXTRACT(YEAR FROM '12:34:56'::time)"),
+        query("SELECT EXTRACT(EPOCH FROM '2024-02-29'::timestamp)"),
+        query("SELECT EXTRACT(HOUR FROM '2024-02-29'::date)"),
+    ]);
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![Some("2".into()), Some("60".into())],
+            vec![Some("1012.0000000000000000".into()), Some("t".into())],
+            vec![Some("0".into()), Some("7".into()), Some("12".into())],
+            vec![None],
+            vec![Some("56.123456".into())],
+            vec![Some("56.000000".into())],
+        ]
+    );
+    assert_eq!(frames(&out).iter().filter(|(t, _)| *t == b'E').count(), 3);
+}
+
+#[test]
+fn numeric_sum_preserves_large_decimal_totals_and_having_arithmetic() {
+    let out = run(vec![
+        query("CREATE TABLE decimal_totals (id integer PRIMARY KEY, amount numeric)"),
+        query("INSERT INTO decimal_totals VALUES (1, '9007199254740993.01'::numeric), (2, '0.02'::numeric), (3, NULL)"),
+        query("SELECT SUM(amount) FROM decimal_totals HAVING SUM(amount) - 9007199254740993::numeric > 0"),
+        query("SELECT SUM(amount) FROM decimal_totals WHERE id = 3"),
+    ]);
+    assert!(!tags(&out).contains('E'), "{out:?}");
+    assert_eq!(
+        rows(&out),
+        vec![vec![Some("9007199254740993.03".into())], vec![None]]
+    );
+}
+
+#[test]
+fn postgres_temporal_text_casts_render_calendar_values_and_preserve_zone_identity() {
+    let out = run(vec![
+        query("SELECT ('2005-01-02 03:04:05.123456'::timestamp)::text, ('2005-01-02 03:04:05.123456+00'::timestamptz)::text"),
+        query("CREATE TABLE temporal_casts (id integer PRIMARY KEY, naive timestamp, zoned timestamptz)"),
+        query("INSERT INTO temporal_casts VALUES (1, '2005-01-02'::timestamp, '2005-01-02'::timestamptz)"),
+        query("SELECT naive::text, zoned::text FROM temporal_casts WHERE zoned::text LIKE '2005%'"),
+        query("SELECT ('2024-02-29'::date)::text, ('12:34:56.123456'::time)::text, (NULL::timestamp)::text"),
+    ]);
+    assert!(!tags(&out).contains('E'), "{out:?}");
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![
+                Some("2005-01-02 03:04:05.123456".into()),
+                Some("2005-01-02 03:04:05.123456+00".into())
+            ],
+            vec![
+                Some("2005-01-02 00:00:00".into()),
+                Some("2005-01-02 00:00:00+00".into())
+            ],
+            vec![
+                Some("2024-02-29".into()),
+                Some("12:34:56.123456".into()),
+                None
+            ],
+        ]
+    );
+}
+
+#[test]
+fn set_config_utc_accepts_extended_protocol_text_parameters() {
+    let mut parse = b"st\0SELECT set_config($1, $2, false)\0".to_vec();
+    parse.extend_from_slice(&2i16.to_be_bytes());
+    parse.extend_from_slice(&25i32.to_be_bytes());
+    parse.extend_from_slice(&25i32.to_be_bytes());
+    let mut bind = b"\0st\0".to_vec();
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&2i16.to_be_bytes());
+    for value in ["TimeZone", "UTC"] {
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value.as_bytes());
+    }
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    let mut execute = b"\0".to_vec();
+    execute.extend_from_slice(&0i32.to_be_bytes());
+    let out = run(vec![
+        msg(b'P', &parse),
+        msg(b'B', &bind),
+        msg(b'E', &execute),
+        msg(b'S', &[]),
+    ]);
+    assert!(!tags(&out).contains('E'), "{out:?}");
+    assert_eq!(rows(&out), vec![vec![Some("UTC".into())]]);
+}
+
+#[test]
+fn timestamp_text_cast_refuses_lost_source_identity_in_materialized_tuples() {
+    let out = run(vec![
+        query("CREATE TABLE tz_identity (id integer PRIMARY KEY, ts timestamptz)"),
+        query("INSERT INTO tz_identity VALUES (1, '2005-01-02'::timestamptz)"),
+        query("SELECT q.ts::text FROM (SELECT ts FROM tz_identity LIMIT 1) q"),
+        query("SELECT (q.ts::timestamptz)::text FROM (SELECT ts FROM tz_identity LIMIT 1) q"),
+    ]);
+    let errors: Vec<_> = frames(&out).into_iter().filter(|(t, _)| *t == b'E').collect();
+    assert_eq!(errors.len(), 1);
+    assert!(String::from_utf8_lossy(&errors[0].1).contains("0A000"));
+    assert_eq!(rows(&out), vec![vec![Some("2005-01-02 00:00:00+00".into())]]);
+}
+
+#[test]
+fn postgres_escape_strings_and_default_like_escape_follow_postgresql() {
+    let out = run(vec![
+        query(r"SELECT 'a_b' LIKE E'a\\_b', 'axb' LIKE E'a\\_b', 'a\b' LIKE E'a\\\\b'"),
+        query(r"SELECT 'a_b' LIKE 'a\_b' ESCAPE ''"),
+        query(r"SELECT 'x' LIKE E'x\\'"),
+        query(r"SELECT 'xy' LIKE E'x\\'"),
+        query(r"SELECT 'x' LIKE E'%_\\'"),
+    ]);
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![Some("t".into()), Some("f".into()), Some("t".into())],
+            vec![Some("f".into())],
+            vec![Some("f".into())]
+        ]
+    );
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert_eq!(errors.len(), 2);
+    assert!(String::from_utf8_lossy(&errors[0].1).contains("22025"));
+}
+
+#[test]
+fn postgres_cast_constant_order_key_preserves_secondary_sort_keys_and_errors() {
+    let out = run(vec![
+        query("SELECT id FROM users ORDER BY '1'::varchar, id DESC"),
+        query("SELECT id FROM users ORDER BY (1 / 0)::integer, id DESC"),
+        query("SELECT id FROM users ORDER BY 2"),
+    ]);
+    assert_eq!(
+        rows(&out),
+        vec![vec![Some("2".into())], vec![Some("1".into())]]
+    );
+    assert_eq!(frames(&out).iter().filter(|(t, _)| *t == b'E').count(), 2);
 }
 
 /// Two writes to an ATTACHED member inside one `BEGIN`/`COMMIT` block must
@@ -769,4 +1505,122 @@ fn a_transaction_block_sees_its_own_writes_and_counts_its_own_rows() {
             vec![Some("church".into())],
         ]
     );
+}
+
+#[test]
+fn native_enums_validate_order_reflect_and_drop_with_dependencies() {
+    let out = run(vec![
+        query("CREATE TYPE status AS ENUM ('z','a','m%','réveillé')"),
+        query("CREATE TABLE enum_items (id int PRIMARY KEY, state status)"),
+        query("INSERT INTO enum_items VALUES (1,'a'),(2,'réveillé'),(3,'z'),(4,'m%') RETURNING state"),
+        query("SELECT state FROM enum_items ORDER BY state"),
+        query("SELECT state AS value FROM enum_items ORDER BY 1 DESC LIMIT 2"),
+        query("SELECT state FROM enum_items WHERE state > 'a' ORDER BY state"),
+        query("SELECT state FROM enum_items WHERE state < 'a'"),
+        query("SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON t.oid=e.enumtypid WHERE t.typname='status' ORDER BY e.enumsortorder"),
+        query("INSERT INTO enum_items VALUES (5,'invalid')"),
+        query("SELECT state FROM enum_items WHERE state='invalid'"),
+        query("DROP TYPE status"),
+        query("DROP TABLE enum_items"),
+        query("DROP TYPE status"),
+        query("SELECT count(*) FROM pg_type WHERE typname='status'"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    for error in &errors[..2] {
+        assert!(
+            String::from_utf8_lossy(&error.1).contains("22P02"),
+            "{error:?}"
+        );
+    }
+    assert!(String::from_utf8_lossy(&errors[2].1).contains("2BP01"));
+    let expected = [
+        "a",
+        "réveillé",
+        "z",
+        "m%",
+        "z",
+        "a",
+        "m%",
+        "réveillé",
+        "réveillé",
+        "m%",
+        "m%",
+        "réveillé",
+        "z",
+        "z",
+        "a",
+        "m%",
+        "réveillé",
+        "0",
+    ];
+    assert_eq!(rows(&out), expected.map(|s| vec![Some(s.into())]));
+    let (_, description) = frames(&out).into_iter().find(|(t, _)| *t == b'T').unwrap();
+    let at = 2 + description[2..].iter().position(|b| *b == 0).unwrap() + 1;
+    assert!(u32::from_be_bytes(description[at + 6..at + 10].try_into().unwrap()) >= (1 << 31));
+    assert_eq!(i16::from_be_bytes(description[at + 10..at + 12].try_into().unwrap()), 4);
+}
+
+#[test]
+fn enum_reflection_preserves_type_names_and_complex_queries_are_refused() {
+    let out = run(vec![
+        query("CREATE TYPE first_enum AS ENUM ('z','a')"),
+        query("CREATE TYPE second_enum AS ENUM ('z','a')"),
+        query("CREATE TABLE typed_enums (id int PRIMARY KEY, a first_enum, b second_enum, txt text)"),
+        query("INSERT INTO typed_enums VALUES (1,'z','z','z')"),
+        query("SELECT format_type(a.atttypid,a.atttypmod) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname='typed_enums' AND a.attname='a'"),
+        query("SELECT data_type,udt_schema,udt_name FROM information_schema.columns WHERE table_name='typed_enums' AND column_name='a'"),
+        query("SELECT a=b FROM typed_enums"),
+        query("SELECT a=txt FROM typed_enums"),
+        query("SELECT min(a) FROM typed_enums"),
+        query("SELECT a FROM typed_enums UNION ALL SELECT a FROM typed_enums"),
+        query("SELECT a FROM (SELECT a FROM typed_enums ORDER BY a LIMIT 1) v"),
+        query("SELECT t.a FROM users u JOIN typed_enums t ON t.id=u.id"),
+        query("CREATE VIEW enum_view AS SELECT a FROM typed_enums"),
+        query("SELECT a.attlen,a.attbyval,format_type(a.atttypid,a.atttypmod) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname='enum_view'"),
+        query("SELECT format_type(t.oid,-1) FROM pg_type t WHERE t.typname='first_enum'"),
+        query("SELECT a FROM typed_enums WHERE a LIKE '%'"),
+        query("SELECT row_number() OVER (ORDER BY a) FROM typed_enums"),
+    ]);
+    let errors: Vec<_> = frames(&out)
+        .into_iter()
+        .filter(|(t, _)| *t == b'E')
+        .collect();
+    assert_eq!(errors.len(), 9, "{errors:?}");
+    for (_, error) in &errors[2..] {
+        assert!(
+            String::from_utf8_lossy(error).contains("0A000"),
+            "{error:?}"
+        );
+    }
+    assert_eq!(
+        rows(&out),
+        vec![
+            vec![Some("first_enum".into())],
+            vec![
+                Some("USER-DEFINED".into()),
+                Some("public".into()),
+                Some("first_enum".into())
+            ],
+            vec![Some("4".into()), Some("t".into()), Some("first_enum".into())],
+        ]
+    );
+}
+
+#[test]
+fn native_enum_parameter_hints_refuse_erasing_type_identity() {
+    let mut parse = b"\0SELECT $1\0".to_vec();
+    parse.extend_from_slice(&1i16.to_be_bytes());
+    parse.extend_from_slice(&(1u32 << 31).to_be_bytes());
+    let out = run(vec![
+        query("CREATE TYPE hinted_enum AS ENUM ('x')"),
+        msg(b'P', &parse), msg(b'S', &[]), query("SELECT 1"),
+    ]);
+    let errors: Vec<_> = frames(&out).into_iter().filter(|(t,_)| *t == b'E').collect();
+    assert_eq!(errors.len(), 1);
+    assert!(String::from_utf8_lossy(&errors[0].1).contains("0A000"));
+    assert_eq!(rows(&out), vec![vec![Some("1".into())]]);
 }

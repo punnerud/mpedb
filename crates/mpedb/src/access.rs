@@ -66,6 +66,7 @@ pub enum ObjectKind {
     View,
     Trigger,
     Policy,
+    EnumType,
 }
 
 /// Which end of a transaction or savepoint a control statement is.
@@ -188,6 +189,8 @@ pub fn ddl_access(ddl: &DdlStmt) -> AccessReport {
         table: table.map(str::to_string),
     };
     let actions = match ddl {
+        DdlStmt::CreateEnum { name, .. } => vec![create(K::EnumType, name, None)],
+        DdlStmt::DropEnum { name, .. } => vec![drop(K::EnumType, name, None)],
         DdlStmt::CreateTable(s) => vec![create(K::Table, &s.name, None)],
         DdlStmt::CreateVirtualTable(s) => vec![create(K::VirtualTable, &s.name, None)],
         // A stored function is not a table-shaped object: it has no schema
@@ -221,6 +224,8 @@ pub fn ddl_access(ddl: &DdlStmt) -> AccessReport {
         DdlStmt::AlterRenameTable { table, .. }
         | DdlStmt::AlterRenameColumn { table, .. }
         | DdlStmt::AlterAddColumn { table, .. }
+        | DdlStmt::AlterAddForeignKey { table, .. }
+        | DdlStmt::AlterAddUnique { table, .. }
         | DdlStmt::AlterDropColumn { table, .. }
         | DdlStmt::AlterRls { table, .. } => vec![Access::Alter { table: table.clone() }],
         // Maintenance statements mpedb accepts as no-ops: nothing is touched.

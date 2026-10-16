@@ -19,6 +19,28 @@ pub struct CatalogRelation {
     pub columns: &'static [(&'static str, ColumnType)],
 }
 
+/// Render a user enum type as an SQL identifier, preserving quoted names.
+pub fn enum_type_name(e: &mpedb_types::pgtype::PgEnum) -> String {
+    let plain = crate::token::tokenize_dialect(&e.name, Dialect::Postgres).ok()
+        .is_some_and(|tokens| tokens.len() == 1 && matches!(&tokens[0].tok, crate::token::Tok::Ident(n) if n == &e.name))
+        && e.name == e.name.to_ascii_lowercase();
+    if plain { e.name.clone() } else { format!("\"{}\"", e.name.replace('"', "\"\"")) }
+}
+
+/// Stored view metadata supplied by the database owning its definition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogView {
+    pub name: String,
+    pub definition: String,
+    /// None when the current compiler cannot describe the definition.
+    pub columns: Option<Vec<crate::PgOutputColumn>>,
+}
+
+/// Catalog rows for stored views; no view is executed to construct these.
+pub fn view_catalog_rows(name: &str, views: &[CatalogView], temporary: bool) -> Result<Vec<Vec<Value>>> {
+    catalog::view_rows(name, views, temporary)
+}
+
 /// Every relation mpedb synthesises, in a stable order.
 pub fn catalog_relations() -> Vec<CatalogRelation> {
     catalog::relations()
@@ -35,6 +57,116 @@ pub fn catalog_relations() -> Vec<CatalogRelation> {
 /// catalog relation.
 pub fn catalog_rows(qualified_or_bare: &str, schema: &Schema) -> Option<Vec<Vec<Value>>> {
     catalog::lookup(qualified_or_bare).map(|r| (r.rows)(schema))
+}
+
+/// Catalog rows belonging to the connection-private temporary schema.
+pub fn temporary_catalog_rows(name: &str, schema: &Schema) -> Option<Vec<Vec<Value>>> {
+    catalog::temporary_rows(name, schema)
+}
+
+/// Recognize only a standalone SELECT nextval(literal-or-parameter), never a
+/// larger expression whose filtering or evaluation count would be discarded.
+pub fn serial_nextval_call(sql: &str, params: &[Value]) -> Option<(String, String)> {
+    use crate::ast::{Expr, Stmt};
+    if !sql.as_bytes().windows(7).any(|s| s.eq_ignore_ascii_case(b"nextval")) { return None; }
+    let (stmt, _, _, ctes) = crate::parser::parse_statement_ctes_dialect(
+        sql, &[], &[], &crate::binder::OpSet::default(), Dialect::Postgres,
+    ).ok()?;
+    if !ctes.is_empty() { return None; }
+    let Stmt::Select(s) = stmt else { return None; };
+    if s.table.is_some() || s.from_derived.is_some() || s.from_series.is_some() || !s.joins.is_empty()
+        || s.where_clause.is_some() || !s.group_by.is_empty() || s.having.is_some()
+        || !s.order_by.is_empty() || s.limit.is_some() || s.offset.is_some() || s.distinct {
+        return None;
+    }
+    let items = s.items?;
+    let [(Expr::Func(name, args), alias)] = items.as_slice() else { return None; };
+    if !name.eq_ignore_ascii_case("nextval") || args.len() != 1 { return None; }
+    let mut argument = &args[0];
+    if let Expr::Cast(inner, ty) = argument {
+        if !ty.eq_ignore_ascii_case("regclass") { return None; }
+        argument = inner;
+    }
+    let value = match argument {
+        Expr::Lit(v) => v,
+        Expr::Param(n) => params.get(*n as usize)?,
+        _ => return None,
+    };
+    let Value::Text(sequence) = value else { return None; };
+    Some((sequence.clone(), alias.clone().unwrap_or_else(|| "nextval".into())))
+}
+
+/// Session functions must not discard a FROM, filter, or surrounding expression.
+/// Only literal and bound arguments can be evaluated outside the SQL engine.
+pub fn session_config_call(sql: &str, params: &[Value]) -> Option<(Vec<Value>, String)> {
+    use crate::ast::{Expr, Stmt};
+    if !sql
+        .as_bytes()
+        .windows(10)
+        .any(|s| s.eq_ignore_ascii_case(b"set_config"))
+    {
+        return None;
+    }
+    let (stmt, _, _, ctes) = crate::parser::parse_statement_ctes_dialect(
+        sql,
+        &[],
+        &[],
+        &crate::binder::OpSet::default(),
+        Dialect::Postgres,
+    )
+    .ok()?;
+    if !ctes.is_empty() {
+        return None;
+    }
+    let Stmt::Select(s) = stmt else {
+        return None;
+    };
+    if s.table.is_some()
+        || s.from_derived.is_some()
+        || s.from_series.is_some()
+        || !s.joins.is_empty()
+        || s.where_clause.is_some()
+        || !s.group_by.is_empty()
+        || s.having.is_some()
+        || !s.order_by.is_empty()
+        || s.limit.is_some()
+        || s.offset.is_some()
+        || s.distinct
+    {
+        return None;
+    }
+    let items = s.items?;
+    let [(Expr::Func(name, args), alias)] = items.as_slice() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("set_config") {
+        return None;
+    }
+    let values = args
+        .iter()
+        .map(|arg| match arg {
+            Expr::Lit(v) => Some(v.clone()),
+            Expr::Param(n) => params.get(*n as usize).cloned(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((values, alias.clone().unwrap_or_else(|| "set_config".into())))
+}
+
+/// A regclass-style name, respecting quoted identifiers and schema qualification.
+pub fn serial_regclass_name(name: &str) -> Option<(Option<String>, String)> {
+    use crate::token::{tokenize_dialect, Tok};
+    let tokens = tokenize_dialect(name, Dialect::Postgres).ok()?;
+    let ident = |t: &Tok| match t {
+        Tok::Ident(n) => Some(n.to_ascii_lowercase()),
+        Tok::QuotedIdent(n, true) => Some(n.clone()),
+        _ => None,
+    };
+    match tokens.as_slice() {
+        [name] => Some((None, ident(&name.tok)?)),
+        [schema, dot, name] if dot.tok == Tok::Dot => Some((Some(ident(&schema.tok)?), ident(&name.tok)?)),
+        _ => None,
+    }
 }
 
 /// Which catalog relations a statement NAMES, as `(schema, name)` pairs.

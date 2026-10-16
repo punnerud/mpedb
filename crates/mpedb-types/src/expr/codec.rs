@@ -87,6 +87,8 @@ const OP_MOD_STRICT: u8 = 66;
 /// The PostgreSQL dialect's typed `CAST` — see [`Instr::CastPg`]. Payload is a
 /// 4-byte little-endian PostgreSQL type OID.
 const OP_CAST_PG: u8 = 67;
+const OP_ENUM_RANK: u8 = 68;
+const OP_ENUM_VALIDATE: u8 = 69;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -193,6 +195,10 @@ impl ExprProgram {
                 Instr::Cast(aff) => {
                     buf.push(OP_CAST);
                     buf.push(aff as u8);
+                }
+                Instr::EnumRank(slot) | Instr::EnumValidate(slot) => {
+                    buf.push(if matches!(i, Instr::EnumRank(_)) { OP_ENUM_RANK } else { OP_ENUM_VALIDATE });
+                    buf.extend_from_slice(&slot.to_le_bytes());
                 }
                 Instr::CastPg(oid) => {
                     buf.push(OP_CAST_PG);
@@ -357,6 +363,8 @@ impl ExprProgram {
                             .ok_or_else(|| Error::Corrupt("bad CAST affinity tag".into()))?,
                     )
                 }
+                OP_ENUM_RANK => Instr::EnumRank(read_u16_arg()?),
+                OP_ENUM_VALIDATE => Instr::EnumValidate(read_u16_arg()?),
                 OP_CAST_PG => {
                     let raw = buf.get(*pos..*pos + 4).ok_or_else(err)?;
                     *pos += 4;
@@ -579,6 +587,13 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     // Pops the probe scalar, pushes the 3VL result; the list comes
                     // from a param slot, not the stack, so the arity is not here.
                     Instr::InParam(_) | Instr::InParamColl(..) => (1, 1),
+                    Instr::EnumRank(slot) | Instr::EnumValidate(slot) => {
+                        let Some(crate::Value::List(def)) = consts.get(slot as usize) else { return Err(Error::Corrupt("bad enum rank constant".into())); };
+                        if def.is_empty() || !def.iter().all(|v| matches!(v, crate::Value::Text(_))) {
+                            return Err(Error::Corrupt("bad enum rank labels".into()));
+                        }
+                        (1, 1)
+                    }
                     Instr::Cast(_) | Instr::CastPg(_) | Instr::Affinity(_) => (1, 1),
                     Instr::Concat => (2, 1),
                     Instr::ConcatN(n) => (n as usize, 1),

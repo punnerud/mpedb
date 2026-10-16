@@ -3,6 +3,120 @@
 use super::*;
 
 impl CompiledPlan {
+    pub fn validate_enum_inputs(&self, params: &[Value]) -> mpedb_types::Result<()> {
+        let projection = |xs: &[Projection]| -> mpedb_types::Result<()> {
+            for p in xs {
+                if let Projection::Expr { program, .. } | Projection::SetReturning { program, .. } = p {
+                    program.validate_enum_inputs(params)?;
+                }
+            }
+            Ok(())
+        };
+        match &self.stmt {
+            PlanStmt::Select(s) => {
+                if let Some(p) = &s.filter { p.validate_enum_inputs(params)?; }
+                projection(&s.projection)?;
+            }
+            PlanStmt::Update { filter, set, returning, .. } => {
+                if let Some(p) = filter { p.validate_enum_inputs(params)?; }
+                for (_,p) in set { p.validate_enum_inputs(params)?; }
+                if let Some(xs) = returning { projection(xs)?; }
+            }
+            PlanStmt::Delete { filter, returning, .. } => {
+                if let Some(p) = filter { p.validate_enum_inputs(params)?; }
+                if let Some(xs) = returning { projection(xs)?; }
+            }
+            PlanStmt::Insert { returning: Some(xs), .. } => projection(xs)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Describe the columns of an ordinary view/query without reading rows.
+    /// Reshaped aggregate/window/derived outputs are left undescribed here.
+    pub fn output_pg_columns(&self, schema: &Schema) -> Vec<PgOutputColumn> {
+        let PlanStmt::Select(sp) = &self.stmt else {
+            return Vec::new();
+        };
+        if !sp.joins.is_empty() || sp.aggregate.is_some() || !sp.windows.is_empty() {
+            return Vec::new();
+        }
+        sp.projection
+            .iter()
+            .take(sp.projection.len().saturating_sub(sp.order_junk as usize))
+            .map(|p| {
+                let source = match p {
+                    Projection::Column(n) => schema
+                        .table(sp.table)
+                        .and_then(|t| t.columns.get(*n as usize)),
+                    Projection::Expr { program, .. } => match program.instrs.as_slice() {
+                        [Instr::PushCol(n)] => schema
+                            .table(sp.table)
+                            .and_then(|t| t.columns.get(*n as usize)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let name = match p {
+                    Projection::Column(_) => source.map(|c| c.name.clone()).unwrap_or_default(),
+                    Projection::Expr { name, .. } | Projection::SetReturning { name, .. } => {
+                        name.clone()
+                    }
+                };
+                PgOutputColumn {
+                    name,
+                    type_oid: projection_pg_oid(
+                        p,
+                        sp.table,
+                        schema,
+                        &self.subplans,
+                        self.subplan_base(),
+                    ),
+                    type_mod: source
+                        .and_then(|c| c.decltype())
+                        .and_then(mpedb_types::pgtype::type_modifier)
+                        .unwrap_or(-1),
+                }
+            })
+            .collect()
+    }
+
+    /// PostgreSQL output OIDs, including RETURNING and explicit strict casts.
+    /// This is separate from sqlite decltypes: a computed cast has a PG type
+    /// even though sqlite correctly reports no declared column type for it.
+    pub fn output_pg_oids(&self, schema: &Schema) -> Vec<Option<u32>> {
+        let (table, projection) = match &self.stmt {
+            PlanStmt::Select(sp)
+                if sp.joins.is_empty() && sp.aggregate.is_none() && sp.windows.is_empty() =>
+            {
+                (
+                    sp.table,
+                    &sp.projection[..sp.projection.len().saturating_sub(sp.order_junk as usize)],
+                )
+            }
+            PlanStmt::Insert {
+                table,
+                returning: Some(p),
+                ..
+            }
+            | PlanStmt::Update {
+                table,
+                returning: Some(p),
+                ..
+            }
+            | PlanStmt::Delete {
+                table,
+                returning: Some(p),
+                ..
+            } => (*table, p.as_slice()),
+            _ => return Vec::new(),
+        };
+        projection
+            .iter()
+            .map(|p| projection_pg_oid(p, table, schema, &self.subplans, self.subplan_base()))
+            .collect()
+    }
+
     /// Per output column: the declared type name to report as its `decltype`
     /// (libsqlite3 `sqlite3_column_decltype`), or `None` where sqlite also
     /// reports NULL. A `decltype` exists ONLY for an output column that is a
@@ -150,6 +264,54 @@ impl CompiledPlan {
                 | PlanStmt::Update { returning: Some(_), .. }
                 | PlanStmt::Delete { returning: Some(_), .. }
         )
+    }
+}
+
+/// Follow a scalar subquery's result slot back to its actual output. The slot's
+/// storage type cannot distinguish timestamp/timestamptz or uuid/bytea.
+fn projection_pg_oid(
+    projection: &Projection,
+    table: u32,
+    schema: &Schema,
+    subplans: &[SubPlan],
+    sub_base: u16,
+) -> Option<u32> {
+    match projection {
+        Projection::Column(n) => schema
+            .table(table)
+            .and_then(|t| t.columns.get(*n as usize))
+            .and_then(|c| c.pg_enum.as_ref().map(|e| e.oid)
+                .or_else(|| c.decltype().and_then(mpedb_types::pgtype::by_name).map(|t| t.oid))),
+        Projection::Expr { program, .. } => {
+            if let Some(Instr::CastPg(oid)) = program.instrs.last() {
+                return Some(*oid);
+            }
+            let [Instr::PushParam(slot)] = program.instrs.as_slice() else {
+                return match program.instrs.as_slice() {
+                    [Instr::PushCol(n)] => projection_pg_oid(&Projection::Column(*n), table, schema, subplans, sub_base),
+                    [Instr::PushConst(n)] => program.consts.get(*n as usize).and_then(Value::column_type).map(mpedb_types::pgtype::default_oid),
+                    _ => None,
+                };
+            };
+            let sub = subplans.get(slot.checked_sub(sub_base)? as usize)?;
+            if sub.kind != SubPlanKind::Scalar {
+                return None;
+            }
+            let SubBody::Select(sp) = &sub.body else {
+                return None;
+            };
+            if !sp.joins.is_empty() || sp.aggregate.is_some() || !sp.windows.is_empty() {
+                return None;
+            }
+            projection_pg_oid(
+                sp.projection.first()?,
+                sp.table,
+                schema,
+                &sub.subplans,
+                sub.sub_base,
+            )
+        }
+        Projection::SetReturning { .. } => None,
     }
 }
 

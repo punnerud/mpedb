@@ -160,6 +160,12 @@ pub(crate) fn resolve(schema: &Schema, child: &TableDef, fk: &ForeignKeyDef) -> 
     if parent_cols.len() != fk.columns.len() || parent_cols.is_empty() {
         return Err(mismatch());
     }
+    for (&cc, &pc) in fk.columns.iter().zip(&parent_cols) {
+        if child.columns[cc as usize].pg_enum.as_ref().map(|e| e.oid)
+            != parent.columns[pc as usize].pg_enum.as_ref().map(|e| e.oid) {
+            return Err(mismatch());
+        }
+    }
     // The parent key must be UNIQUE, or the "does a parent exist" question has
     // no single answer and `ON UPDATE CASCADE` no single row to carry. sqlite
     // calls this a mismatch too.

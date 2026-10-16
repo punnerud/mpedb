@@ -13,6 +13,14 @@ use crate::token::{Kw, Tok};
 use mpedb_types::Result;
 
 impl<'a> Parser<'a> {
+    fn insert_value(&mut self) -> Result<Expr> {
+        if self.dialect == mpedb_types::Dialect::Postgres && self.eat_word("DEFAULT") {
+            Ok(Expr::Default)
+        } else {
+            self.expr()
+        }
+    }
+
     pub(super) fn insert_stmt(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Insert, "INSERT")?;
         // sqlite's conflict-resolution prefix: INSERT OR {IGNORE | ABORT | FAIL
@@ -117,9 +125,9 @@ impl<'a> Parser<'a> {
             self.expect_kw(Kw::Values, "VALUES")?;
             loop {
                 self.expect(&Tok::LParen, "`(`")?;
-                let mut row = vec![self.expr()?];
+                let mut row = vec![self.insert_value()?];
                 while self.eat(&Tok::Comma) {
-                    row.push(self.expr()?);
+                    row.push(self.insert_value()?);
                 }
                 self.expect(&Tok::RParen, "`)`")?;
                 rows.push(row);

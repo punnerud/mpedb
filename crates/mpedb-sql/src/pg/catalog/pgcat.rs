@@ -72,6 +72,10 @@ pub(crate) const RELATIONS: &[CatalogRelation] = &[
             ("relrewrite", C::Int64),
             ("relacl", C::Text),
             ("reloptions", C::Text),
+            // Session materialization marks public relations shadowed by temp.
+            ("mpedb_visible", C::Bool),
+            ("mpedb_viewdef", C::Text),
+            ("mpedb_obj_description", C::Text),
         ],
         rows: pg_class,
     },
@@ -100,6 +104,7 @@ pub(crate) const RELATIONS: &[CatalogRelation] = &[
             ("attislocal", C::Bool),
             ("attinhcount", C::Int64),
             ("attcollation", C::Int64),
+            ("mpedb_formatted_type", C::Text),
         ],
         rows: pg_attribute,
     },
@@ -291,10 +296,9 @@ pub(crate) const RELATIONS: &[CatalogRelation] = &[
         rows: empty,
     },
     CatalogRelation {
-        // ENUM labels. mpedb has no `CREATE TYPE … AS ENUM`, so this is always
-        // EMPTY — but reflection JOINs it to read a column's enum labels, and
-        // a missing relation fails the whole query where an empty one just
-        // contributes no rows.
+        // Enum definitions also exist without any columns. The compiler's
+        // schema-only baseline is empty; the session materializer appends the
+        // persisted type registry's labels in declaration order.
         name: "pg_enum",
         schema: PgCatalog,
         columns: &[
@@ -503,6 +507,9 @@ fn pg_class(schema: &Schema) -> Vec<Vec<Value>> {
             int(0),
             Value::Null,
             Value::Null,
+            Value::Bool(true),
+            Value::Null,
+            Value::Null,
         ]);
         // Indexes are relations too, and `psql \d` reaches them through
         // pg_class → pg_index → pg_class. Omitting them makes every index
@@ -539,6 +546,9 @@ fn pg_class(schema: &Schema) -> Vec<Vec<Value>> {
                 text("n"),
                 Value::Bool(false),
                 int(0),
+                Value::Null,
+                Value::Null,
+                Value::Bool(true),
                 Value::Null,
                 Value::Null,
             ]);
@@ -605,29 +615,31 @@ fn pg_attribute(schema: &Schema) -> Vec<Vec<Value>> {
     let mut out = Vec::new();
     for t in live_tables(schema) {
         for (i, c) in visible_columns(t).iter().enumerate() {
-            let oid = column_type_oid(c.ty);
+            let declared = c.decl.as_deref().and_then(mpedb_types::pgtype::by_name);
+            let oid = c.pg_enum.as_ref().map(|e| i64::from(e.oid)).or_else(|| declared.map(|t| i64::from(t.oid))).unwrap_or_else(|| column_type_oid(c.ty));
+            let typmod = c.decl.as_deref().and_then(mpedb_types::pgtype::type_modifier).unwrap_or(-1);
             out.push(vec![
                 int(table_oid(t.id)),
                 text(&c.name),
                 int(oid),
                 int(-1),
-                int(column_type_len(c.ty)),
+                int(if c.pg_enum.is_some() { 4 } else { declared.map(|t| i64::from(t.typlen)).unwrap_or_else(|| column_type_len(c.ty)) }),
                 // attnum is 1-BASED. Zero would mean "whole row" and negative
                 // numbers are system columns; an off-by-one here makes every
                 // client read the wrong column for a constraint's conkey.
                 int(i as i64 + 1),
                 int(0),
                 int(-1),
-                int(-1),
-                Value::Bool(matches!(
+                int(typmod),
+                Value::Bool(c.pg_enum.is_some() || matches!(
                     c.ty,
                     mpedb_types::ColumnType::Int64
                         | mpedb_types::ColumnType::Float64
                         | mpedb_types::ColumnType::Bool
                         | mpedb_types::ColumnType::Timestamp
                 )),
-                text(storage_for(c.ty)),
-                text(align_for(c.ty)),
+                text(if c.pg_enum.is_some() { "p" } else { storage_for(c.ty) }),
+                text(if c.pg_enum.is_some() { "i" } else { align_for(c.ty) }),
                 Value::Bool(!c.nullable),
                 // `atthasdef` — whether pg_attrdef has a row for this column.
                 // The rowid alias has no DECLARED default and one REPORTED one
@@ -659,11 +671,12 @@ fn pg_attribute(schema: &Schema) -> Vec<Vec<Value>> {
                 // Text collates bytewise here (mpedb's memcmp order, sqlite's
                 // BINARY); 950 is PostgreSQL's "C" collation OID. Anything else
                 // would promise an ordering mpedb does not implement.
-                int(if c.ty == mpedb_types::ColumnType::Text {
+                int(if c.ty == mpedb_types::ColumnType::Text && c.pg_enum.is_none() {
                     950
                 } else {
                     0
                 }),
+                Value::Null,
             ]);
         }
     }
