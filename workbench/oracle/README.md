@@ -57,7 +57,7 @@ Registration follows `ProcEngine::define`'s existing idempotent name/hash
 contract; Oracle CREATE-versus-OR-REPLACE catalog behavior is not implemented
 by this host API.
 
-The first compiler supports IN parameters and local variables of BOOLEAN and
+The first compiler supports IN/OUT/IN OUT parameters and local variables of BOOLEAN and
 unconstrained NUMBER, exact numeric literals and comparisons, IS [NOT] NULL,
 assignment, IF/ELSIF/ELSE, WHILE/LOOP, EXIT/CONTINUE [WHEN], and RETURN. Static
 type checks cover even skipped short-circuit branches; IN parameters cannot
@@ -69,9 +69,22 @@ NUMBER values remain exact decimals; integers are normalized to decimals at
 parameter boundaries. Values beyond 38 significant digits or the supported
 Oracle exponent range currently raise instead of simulating Oracle rounding
 or underflow. Floating-point/text-to-NUMBER conversions and NLS settings are
-not implemented. **Arithmetic, OUT/IN OUT, defaults, constrained types, SQL
+not implemented. **Arithmetic, defaults, constrained types, SQL
 statements, calls to other routines, packages, exceptions, cursors, and dynamic
 SQL remain unimplemented**, so this is not full PL/SQL compatibility.
+
+The native `ProcEngine` calling convention supplies one argument slot for every
+formal parameter, including OUT placeholders. OUT values start NULL; IN OUT
+values are initialized and type-checked from the supplied value. Procedures
+with output parameters return a scalar-only tuple containing **all parameters
+in declaration order**. Functions with output parameters return a flat tuple
+containing the function result first, then all parameters. Routines without
+output parameters retain their scalar return convention. This is the native
+MPEdb host API, not an implemented Oracle DB-API `callproc`/`callfunc` adapter.
+Only successful calls copy values out; errors return no partial output tuple.
+`NOCOPY` is accepted for OUT/IN OUT and ignored, using the copy semantics that
+Oracle permits for this hint. Argument aliasing is not provided by this value
+API. See Oracle's [parameter-mode rules](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/subprogram-parameters.html).
 
 The separate SQL BOOLEAN/comparison IR instructions
 implement NULL propagation and three-valued AND/OR/NOT, with strict BOOLEAN

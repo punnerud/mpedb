@@ -5,12 +5,77 @@ use crate::interp::{self, testutil::MockBridge, Budget, ProcValue};
 use crate::ir::Proc;
 use mpedb_types::{Result, Value};
 
-fn call(source: &str, args: &[Value]) -> Result<Value> {
+fn tuple(values: Vec<Value>) -> ProcValue {
+    ProcValue::Tuple(values.into_iter().map(ProcValue::Scalar).collect())
+}
+
+#[test]
+fn out_parameters_start_null_and_copy_out_in_declaration_order() {
+    let source = "CREATE PROCEDURE copy_values(a NUMBER, b OUT NUMBER, c IN OUT BOOLEAN, d OUT BOOLEAN) IS BEGIN IF b IS NOT NULL THEN RETURN; END IF; b := a; c := NOT c; END;";
+    assert_eq!(
+        call_result(
+            source,
+            &[
+                Value::Int(7),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Int(9)
+            ]
+        )
+        .unwrap(),
+        tuple(vec![
+            Value::Numeric("7".into()),
+            Value::Numeric("7".into()),
+            Value::Bool(false),
+            Value::Null
+        ])
+    );
+}
+
+#[test]
+fn early_return_copies_outputs_and_nocopy_is_a_permitted_ignored_hint() {
+    let source = "CREATE PROCEDURE set_value(a OUT NOCOPY NUMBER, b IN OUT NOCOPY BOOLEAN) IS BEGIN a := 12.25; RETURN; b := FALSE; END;";
+    assert_eq!(
+        call_result(source, &[Value::Null, Value::Bool(true)]).unwrap(),
+        tuple(vec![Value::Numeric("12.25".into()), Value::Bool(true)])
+    );
+}
+
+#[test]
+fn functions_with_out_return_value_then_full_parameter_vector() {
+    let source = function(
+        "a NUMBER, b OUT NUMBER",
+        "BOOLEAN",
+        "BEGIN b := a; RETURN b IS NOT NULL; END;",
+    );
+    assert_eq!(
+        call_result(&source, &[Value::Int(42), Value::Null]).unwrap(),
+        tuple(vec![
+            Value::Bool(true),
+            Value::Numeric("42".into()),
+            Value::Numeric("42".into())
+        ])
+    );
+}
+
+#[test]
+fn failed_execution_never_returns_partial_out_values_or_mutates_inputs() {
+    let args = [Value::Null, Value::Bool(true)];
+    let source = function(
+        "a OUT NUMBER, b IN OUT BOOLEAN",
+        "NUMBER",
+        "BEGIN a := 1; b := FALSE; END;",
+    );
+    assert!(call_result(&source, &args).is_err());
+    assert_eq!(args, [Value::Null, Value::Bool(true)]);
+}
+
+fn call_result(source: &str, args: &[Value]) -> Result<ProcValue> {
     let s = compile(source)?;
     assert!(s.calls.is_empty());
     let p = Proc::new(s.name, s.argc, s.nlocals, vec![], s.consts, s.instrs)?;
     let p = Proc::decode(&p.encode())?;
-    match interp::run(
+    interp::run(
         &p,
         args,
         &mut MockBridge::new(),
@@ -19,7 +84,10 @@ fn call(source: &str, args: &[Value]) -> Result<Value> {
             db_calls: 0,
             rows: 0,
         },
-    )? {
+    )
+}
+fn call(source: &str, args: &[Value]) -> Result<Value> {
+    match call_result(source, args)? {
         ProcValue::Scalar(value) => Ok(value),
         _ => panic!("unexpected container"),
     }
@@ -149,12 +217,12 @@ fn procedure_return_and_input_parameter_immutability_are_checked() {
         "BEGIN p := FALSE; RETURN p; END;"
     ))
     .is_err());
-    assert!(
-        compile(&function("p OUT NUMBER", "NUMBER", "BEGIN RETURN p; END;"))
-            .unwrap_err()
-            .to_string()
-            .contains("OUT")
-    );
+    assert!(compile(&function(
+        "p IN NOCOPY NUMBER",
+        "NUMBER",
+        "BEGIN RETURN p; END;"
+    ))
+    .is_err());
 }
 
 #[test]

@@ -36,6 +36,8 @@ struct Parser<'a> {
     locals: HashMap<String, Local>,
     returns: Option<Type>,
     depth: usize,
+    parameters: Vec<u16>,
+    has_out: bool,
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
@@ -47,6 +49,8 @@ pub fn compile(source: &str) -> Result<Skeleton> {
         locals: HashMap::new(),
         returns: None,
         depth: 0,
+        parameters: Vec::new(),
+        has_out: false,
     };
     p.want_word("CREATE")?;
     if p.word("OR") {
@@ -69,15 +73,25 @@ pub fn compile(source: &str) -> Result<Skeleton> {
         }
         loop {
             let name = p.identifier()?;
-            p.word("IN");
-            if p.is_word("OUT") || p.is_word("NOCOPY") {
-                return Err(p.error("OUT/IN OUT/NOCOPY calling conventions are not implemented"));
+            let input = p.word("IN");
+            let output = p.word("OUT");
+            let out_only = output && !input;
+            if p.word("NOCOPY") && !output {
+                return Err(p.error("NOCOPY is only valid for OUT or IN OUT parameters"));
             }
+            // NOCOPY is an Oracle hint, not a guarantee. This runtime always
+            // uses value/copy-out semantics, which Oracle explicitly permits.
             let ty = p.data_type()?;
-            let slot = p.add_local(name, ty, false)?;
-            p.builder.emit(Op::LoadLocal(slot))?;
-            p.builder.emit(ty.check())?;
+            let slot = p.add_local(name, ty, output)?;
+            if out_only {
+                p.constant(Value::Null)?;
+            } else {
+                p.builder.emit(Op::LoadLocal(slot))?;
+                p.builder.emit(ty.check())?;
+            }
             p.builder.emit(Op::StoreLocal(slot))?;
+            p.parameters.push(slot);
+            p.has_out |= output;
             argc += 1;
             if !p.symbol(",") {
                 p.want_symbol(")")?;
@@ -133,7 +147,7 @@ pub fn compile(source: &str) -> Result<Skeleton> {
     if function {
         p.builder.emit(Op::MissingReturn)?;
     } else {
-        p.constant(Value::Null)?;
+        p.emit_procedure_result()?;
         p.builder.emit(Op::Return)?;
     }
     Ok(Skeleton {
@@ -147,6 +161,24 @@ pub fn compile(source: &str) -> Result<Skeleton> {
 }
 
 impl Parser<'_> {
+    fn emit_parameters(&mut self, with_return: bool) -> Result<()> {
+        let count = self.parameters.len() + usize::from(with_return);
+        if count > crate::ir::MAX_STACK {
+            return Err(self.error("OUT result exceeds the procedure stack bound"));
+        }
+        for &slot in &self.parameters {
+            self.builder.emit(Op::LoadLocal(slot))?;
+        }
+        self.builder.emit(Op::Tuple(count as u16))?;
+        Ok(())
+    }
+    fn emit_procedure_result(&mut self) -> Result<()> {
+        if self.has_out {
+            self.emit_parameters(false)
+        } else {
+            self.constant(Value::Null)
+        }
+    }
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.at).map(|t| &t.token)
     }
@@ -294,8 +326,11 @@ impl Parser<'_> {
                 let actual = self.expression()?;
                 self.compatible(ty, actual)?;
                 self.builder.emit(ty.check())?;
+                if self.has_out {
+                    self.emit_parameters(true)?;
+                }
             } else {
-                self.constant(Value::Null)?;
+                self.emit_procedure_result()?;
             }
             self.want_symbol(";")?;
             self.builder.emit(Op::Return)?;

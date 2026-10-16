@@ -679,3 +679,22 @@ fn plsql_routine_is_persisted_validated_and_callable_after_reopen() {
     assert_eq!(engine.call(&hash.to_string(), &[Value::Null, Value::Null]).unwrap(), ProcValue::Scalar(Value::Numeric("9007199254740992.125".into())));
     assert!(engine.call("CHOOSE_VALUE", &[Value::Int(1), Value::Int(1)]).is_err());
 }
+
+#[test]
+fn plsql_out_parameters_survive_storage_and_copy_out_only_on_success() {
+    let (cfg, _guard) = test_config("plsql-out");
+    let db = Database::open_with_config(cfg.clone()).unwrap();
+    let source = "CREATE PROCEDURE choose_out(input NUMBER, result OUT NUMBER, flag IN OUT BOOLEAN) IS BEGIN result := input; flag := NOT flag; END;";
+    let hash = ProcEngine::new(&db).define(source, Lang::PlSql).unwrap();
+    drop(db);
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    assert_eq!(engine.call(&hash.to_string(), &[Value::Int(42), Value::Null, Value::Bool(false)]).unwrap(), ProcValue::Tuple(vec![
+        ProcValue::Scalar(Value::Numeric("42".into())),
+        ProcValue::Scalar(Value::Numeric("42".into())),
+        ProcValue::Scalar(Value::Bool(true)),
+    ]));
+    let args = [Value::Int(42), Value::Null, Value::Int(1)];
+    assert!(engine.call(&hash.to_string(), &args).is_err());
+    assert_eq!(args, [Value::Int(42), Value::Null, Value::Int(1)]);
+}

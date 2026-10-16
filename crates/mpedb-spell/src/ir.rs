@@ -138,6 +138,8 @@ pub enum Op {
     SqlNumber,
     /// A function reached END without returning; always raises.
     MissingReturn,
+    /// Pop n scalars in source order and construct a scalar-only tuple.
+    Tuple(u16),
     /// Pop a BOOLEAN/NULL and jump only on SQL FALSE (NULL falls through).
     JumpIfSqlFalse(u32),
     /// Pop a BOOLEAN/NULL and jump only on SQL TRUE (NULL falls through).
@@ -222,6 +224,7 @@ const OP_JUMP_IF_SQL_FALSE: u8 = 43;
 const OP_JUMP_IF_SQL_TRUE: u8 = 44;
 const OP_SQL_NUMBER: u8 = 45;
 const OP_MISSING_RETURN: u8 = 46;
+const OP_TUPLE: u8 = 47;
 
 /// A validated procedure: everything the runtime needs, nothing it has to
 /// trust. Constructible only through [`Proc::new`] / [`Proc::decode`], both
@@ -430,6 +433,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
     };
     match op {
         Op::LoadConst(x) => u16arg(OP_LOAD_CONST, x),
+        Op::Tuple(x) => u16arg(OP_TUPLE, x),
         Op::LoadLocal(x) => u16arg(OP_LOAD_LOCAL, x),
         Op::StoreLocal(x) => u16arg(OP_STORE_LOCAL, x),
         Op::DbQuery(x) => u16arg(OP_DB_QUERY, x),
@@ -495,6 +499,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
     };
     Ok(match op {
         OP_LOAD_CONST => Op::LoadConst(u16arg()?),
+        OP_TUPLE => Op::Tuple(u16arg()?),
         OP_LOAD_LOCAL => Op::LoadLocal(u16arg()?),
         OP_STORE_LOCAL => Op::StoreLocal(u16arg()?),
         OP_DB_QUERY => Op::DbQuery(u16arg()?),
@@ -557,6 +562,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
 fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
     match op {
         Op::LoadConst(_) | Op::LoadLocal(_) => (0, 1),
+        Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
         Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber => (1, 1),
@@ -615,6 +621,9 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
     let mut any_exec = false;
     for &op in instrs {
         match op {
+            Op::Tuple(n) if n as usize > MAX_STACK => {
+                return Err(Error::Corrupt("proc: tuple arity exceeds stack bound".into()));
+            }
             Op::LoadLocal(i) | Op::StoreLocal(i) => {
                 if i >= nlocals {
                     return Err(Error::Corrupt("proc: local index out of range".into()));

@@ -23,6 +23,8 @@
 //! the validated, budgeted runtime without changing Python/Rust semantics.
 
 mod sql_logic;
+#[cfg(test)]
+mod tuple_tests;
 
 use crate::ir::{Op, PlanRef, Proc};
 use mpedb_types::{Error, Result, Value};
@@ -483,6 +485,20 @@ pub fn run(
             Op::Not => {
                 let v = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(Value::Bool(!truthy(&v))));
+            }
+            Op::Tuple(count) => {
+                let base = stack.len() - count as usize;
+                let mut items = Vec::with_capacity(count as usize);
+                for item in stack.drain(base..) {
+                    // A nested tuple constructor plus DUP could otherwise
+                    // create exponentially expanding return values in O(n)
+                    // instructions. OUT values are scalar; forbid containers.
+                    if !matches!(item, PValue::Scalar(_)) {
+                        return Err(type_err("procedure tuple elements must be scalar"));
+                    }
+                    items.push(item);
+                }
+                stack.push(PValue::Tuple(Rc::new(items)));
             }
             Op::MissingReturn => return Err(rt_err("PL/SQL function reached END without RETURN")),
             Op::SqlNumber => {
