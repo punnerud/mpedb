@@ -47,8 +47,33 @@ for full Oracle support.
 
 `mpedb-spell` now has an Oracle lexical frontend (`plsql::lex`) that preserves
 exact numeric spellings, national strings, alternative q-quoting, bind names,
-identifier case, and byte spans. It does not yet compile or execute Oracle
-functions/procedures. Its separate SQL BOOLEAN/comparison IR instructions
+identifier case, and byte spans. `plsql::compile` now compiles native CREATE
+FUNCTION/PROCEDURE definitions to the shared IR, available through
+`ProcEngine::define(source, Lang::PlSql)` and `mpedb proc define config.toml
+routine.pls` (`.plsql` also accepted). These routines persist by name/hash and
+remain callable after database reopen. This does not implement Oracle SQL DDL
+dispatch or an Oracle wire/DB-API backend.
+Registration follows `ProcEngine::define`'s existing idempotent name/hash
+contract; Oracle CREATE-versus-OR-REPLACE catalog behavior is not implemented
+by this host API.
+
+The first compiler supports IN parameters and local variables of BOOLEAN and
+unconstrained NUMBER, exact numeric literals and comparisons, IS [NOT] NULL,
+assignment, IF/ELSIF/ELSE, WHILE/LOOP, EXIT/CONTINUE [WHEN], and RETURN. Static
+type checks cover even skipped short-circuit branches; IN parameters cannot
+be assigned. A function that reaches END without RETURN raises. Routine END
+names must match, and an optional SQL*Plus slash must occupy its own line.
+Parameter lists follow Oracle's grammar: omit parentheses for zero parameters.
+
+NUMBER values remain exact decimals; integers are normalized to decimals at
+parameter boundaries. Values beyond 38 significant digits or the supported
+Oracle exponent range currently raise instead of simulating Oracle rounding
+or underflow. Floating-point/text-to-NUMBER conversions and NLS settings are
+not implemented. **Arithmetic, OUT/IN OUT, defaults, constrained types, SQL
+statements, calls to other routines, packages, exceptions, cursors, and dynamic
+SQL remain unimplemented**, so this is not full PL/SQL compatibility.
+
+The separate SQL BOOLEAN/comparison IR instructions
 implement NULL propagation and three-valued AND/OR/NOT, with strict BOOLEAN
 conditions and short-circuit jump primitives. Old Python/Rust instructions and
 stored blobs retain their semantics. New opcodes extend format 1 additively;

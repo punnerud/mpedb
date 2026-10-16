@@ -70,6 +70,8 @@ const POISON: &str = "proc cache lock poisoned";
 pub enum Lang {
     Python,
     Rust,
+    /// Oracle PL/SQL routines, compiled host-side to the shared IR.
+    PlSql,
 }
 
 /// Catalog entry summary (see [`ProcEngine::list`]).
@@ -123,6 +125,7 @@ impl<'db> ProcEngine<'db> {
         let skel = match lang {
             Lang::Python => py::compile(source)?,
             Lang::Rust => rs::compile(source)?,
+            Lang::PlSql => mpedb_spell::plsql::compile(source)?,
         };
         let proc = self.link(&skel, lang)?;
         let blob = proc.encode();
@@ -147,6 +150,7 @@ impl<'db> ProcEngine<'db> {
         let lang_tag = match lang {
             Lang::Python => "py",
             Lang::Rust => "rs",
+            Lang::PlSql => "plsql",
         };
         let schema = self.db.schema();
         // The v1 cursor rule, surfaced as a LOCATED define-time error (IR

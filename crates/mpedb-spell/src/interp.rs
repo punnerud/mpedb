@@ -484,6 +484,11 @@ pub fn run(
                 let v = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(Value::Bool(!truthy(&v))));
             }
+            Op::MissingReturn => return Err(rt_err("PL/SQL function reached END without RETURN")),
+            Op::SqlNumber => {
+                let value = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(sql_logic::number(value)?));
+            }
             Op::SqlNot | Op::SqlBool => {
                 let value = sql_logic::boolean(stack.pop().expect("validated"))?;
                 let value = if op == Op::SqlNot { value.map(|v| !v) } else { value };

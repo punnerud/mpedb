@@ -5,6 +5,38 @@ use super::{tyname, type_err, Op, PValue};
 use mpedb_types::{Result, Value};
 use std::cmp::Ordering;
 
+pub(super) fn number(value: PValue) -> Result<Value> {
+    match value {
+        PValue::Scalar(Value::Null) => Ok(Value::Null),
+        PValue::Scalar(Value::Int(n)) => Ok(Value::Numeric(n.to_string())),
+        PValue::Scalar(Value::Numeric(text)) => {
+            let text = mpedb_types::value::parse_numeric(&text)
+                .filter(|s| !matches!(s.as_str(), "NaN" | "Infinity" | "-Infinity"))
+                .ok_or_else(|| type_err("PL/SQL NUMBER requires a finite decimal"))?;
+            let unsigned = text.trim_start_matches('-');
+            let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+            let whole = whole.trim_start_matches('0');
+            let digits = format!("{whole}{fraction}");
+            let significant = digits.trim_start_matches('0').trim_end_matches('0');
+            if significant.len() > 38 {
+                return Err(type_err(
+                    "PL/SQL NUMBER rounding above 38 significant digits is not implemented",
+                ));
+            }
+            if whole.len() > 126
+                || (whole.is_empty() && fraction.find(|c| c != '0').is_some_and(|n| n >= 130))
+            {
+                return Err(type_err("PL/SQL NUMBER exponent outside supported range"));
+            }
+            Ok(Value::Numeric(text))
+        }
+        other => Err(type_err(format!(
+            "PL/SQL NUMBER conversion from {} is not implemented",
+            tyname(&other)
+        ))),
+    }
+}
+
 pub(super) fn boolean(value: PValue) -> Result<Option<bool>> {
     match value {
         PValue::Scalar(Value::Null) => Ok(None),

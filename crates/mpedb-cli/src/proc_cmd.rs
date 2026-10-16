@@ -11,7 +11,7 @@ use mpedb_proc::{Budget, Lang, ProcEngine, ProcValue};
 const USAGE: &str = "\
 usage: mpedb proc <subcommand>
 
-  proc define <config.toml> <file.py|file.rs>       compile + store, print name & hash
+  proc define <config.toml> <file.py|file.rs|file.pls>       compile + store, print name & hash
   proc call   <config.toml> <name|hash|prefix> [param ...] run a stored procedure
        --budget <instrs>[,<dbcalls>[,<rows>]]       raise/lower the call budgets
                                                     (defaults 1000000,10000,10000000)
@@ -35,13 +35,14 @@ pub fn run(args: &[String]) -> CliResult {
 
 fn cmd_define(args: &[String]) -> CliResult {
     let [config, file] = args else {
-        return usage("proc define needs <config.toml> <file.py|file.rs>");
+        return usage("proc define needs <config.toml> <file.py|file.rs|file.pls>");
     };
     let path = Path::new(file);
     let lang = match path.extension().and_then(|e| e.to_str()) {
         Some("py") => Lang::Python,
         Some("rs") => Lang::Rust,
-        _ => return usage("procedure source must be a .py or .rs file"),
+        Some("pls" | "plsql") => Lang::PlSql,
+        _ => return usage("procedure source must be a .py, .rs, .pls or .plsql file"),
     };
     let source = std::fs::read_to_string(path)
         .map_err(|e| Failure::Runtime(format!("cannot read {file}: {e}")))?;

@@ -134,6 +134,10 @@ pub enum Op {
     SqlGt,
     SqlGe,
     SqlBool,
+    /// Normalize a finite NUMBER value; integer inputs become exact decimals.
+    SqlNumber,
+    /// A function reached END without returning; always raises.
+    MissingReturn,
     /// Pop a BOOLEAN/NULL and jump only on SQL FALSE (NULL falls through).
     JumpIfSqlFalse(u32),
     /// Pop a BOOLEAN/NULL and jump only on SQL TRUE (NULL falls through).
@@ -216,6 +220,8 @@ const OP_SQL_GE: u8 = 41;
 const OP_SQL_BOOL: u8 = 42;
 const OP_JUMP_IF_SQL_FALSE: u8 = 43;
 const OP_JUMP_IF_SQL_TRUE: u8 = 44;
+const OP_SQL_NUMBER: u8 = 45;
+const OP_MISSING_RETURN: u8 = 46;
 
 /// A validated procedure: everything the runtime needs, nothing it has to
 /// trust. Constructible only through [`Proc::new`] / [`Proc::decode`], both
@@ -453,6 +459,8 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::SqlGt => b.push(OP_SQL_GT),
         Op::SqlGe => b.push(OP_SQL_GE),
         Op::SqlBool => b.push(OP_SQL_BOOL),
+        Op::SqlNumber => b.push(OP_SQL_NUMBER),
+        Op::MissingReturn => b.push(OP_MISSING_RETURN),
 
         Op::Add => b.push(OP_ADD),
         Op::Sub => b.push(OP_SUB),
@@ -518,6 +526,8 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_SQL_GT => Op::SqlGt,
         OP_SQL_GE => Op::SqlGe,
         OP_SQL_BOOL => Op::SqlBool,
+        OP_SQL_NUMBER => Op::SqlNumber,
+        OP_MISSING_RETURN => Op::MissingReturn,
 
         OP_ADD => Op::Add,
         OP_SUB => Op::Sub,
@@ -549,7 +559,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::LoadConst(_) | Op::LoadLocal(_) => (0, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool => (1, 1),
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber => (1, 1),
         Op::Add
         | Op::Sub
         | Op::Mul
@@ -573,7 +583,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         | Op::SqlGt
         | Op::SqlGe
         | Op::Index => (2, 1),
-        Op::Jump(_) => (0, 0),
+        Op::Jump(_) | Op::MissingReturn => (0, 0),
         Op::JumpIfFalse(_) | Op::JumpIfTrue(_) | Op::JumpIfSqlFalse(_) | Op::JumpIfSqlTrue(_) => (1, 0),
         Op::DbQuery(p) | Op::DbExec(p) | Op::CursorOpen(p) => {
             (plans[p as usize].argc as usize, 1)
@@ -689,7 +699,7 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
         }
         max = max.max(after);
         match op {
-            Op::Return => {}
+            Op::Return | Op::MissingReturn => {}
             Op::Jump(t) => visit(t as usize, after, &mut entry, &mut work)?,
             Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) => {
                 visit(t as usize, after, &mut entry, &mut work)?;

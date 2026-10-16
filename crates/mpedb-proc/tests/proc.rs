@@ -661,3 +661,21 @@ def edges(lo):
     );
     db.verify().unwrap();
 }
+
+#[test]
+fn plsql_routine_is_persisted_validated_and_callable_after_reopen() {
+    let (cfg, _guard) = test_config("plsql-persist");
+    let db = Database::open_with_config(cfg.clone()).unwrap();
+    let source = "CREATE OR REPLACE FUNCTION choose_value(p NUMBER, yes BOOLEAN) RETURN NUMBER IS BEGIN IF yes THEN RETURN p; ELSE RETURN 9007199254740992.125; END IF; END choose_value;";
+    let engine = ProcEngine::new(&db);
+    let hash = engine.define(source, Lang::PlSql).unwrap();
+    assert_eq!(engine.info(&hash.to_string()).unwrap().name, "CHOOSE_VALUE");
+    assert_eq!(engine.call("CHOOSE_VALUE", &[Value::Int(42), Value::Bool(true)]).unwrap(), ProcValue::Scalar(Value::Numeric("42".into())));
+    assert_eq!(engine.define(source, Lang::PlSql).unwrap(), hash);
+    drop(engine);
+    drop(db);
+    let reopened = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&reopened);
+    assert_eq!(engine.call(&hash.to_string(), &[Value::Null, Value::Null]).unwrap(), ProcValue::Scalar(Value::Numeric("9007199254740992.125".into())));
+    assert!(engine.call("CHOOSE_VALUE", &[Value::Int(1), Value::Int(1)]).is_err());
+}
