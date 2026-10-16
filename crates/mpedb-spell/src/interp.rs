@@ -17,6 +17,12 @@
 //! are errors. Divergences from CPython, chosen for a rigidly-typed store:
 //! bools are not ints (`True + 1` errors), and `bool`/`int` never compare
 //! equal.
+//!
+//! Explicit `Sql*` instructions instead use SQL three-valued comparisons and
+//! strictly typed BOOLEAN conditions. This lets procedural SQL frontends share
+//! the validated, budgeted runtime without changing Python/Rust semantics.
+
+mod sql_logic;
 
 use crate::ir::{Op, PlanRef, Proc};
 use mpedb_types::{Error, Result, Value};
@@ -477,6 +483,25 @@ pub fn run(
             Op::Not => {
                 let v = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(Value::Bool(!truthy(&v))));
+            }
+            Op::SqlNot | Op::SqlBool => {
+                let value = sql_logic::boolean(stack.pop().expect("validated"))?;
+                let value = if op == Op::SqlNot { value.map(|v| !v) } else { value };
+                stack.push(PValue::Scalar(value.map_or(Value::Null, Value::Bool)));
+            }
+            Op::SqlAnd | Op::SqlOr | Op::SqlEq | Op::SqlNe
+            | Op::SqlLt | Op::SqlLe | Op::SqlGt | Op::SqlGe => {
+                let b = stack.pop().expect("validated");
+                let a = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(sql_logic::binary(op, a, b)?));
+            }
+            Op::JumpIfSqlFalse(target) | Op::JumpIfSqlTrue(target) => {
+                let value = sql_logic::boolean(stack.pop().expect("validated"))?;
+                let wanted = matches!(op, Op::JumpIfSqlTrue(_));
+                if value == Some(wanted) {
+                    pc = target as usize;
+                    continue;
+                }
             }
             Op::Add
             | Op::Sub

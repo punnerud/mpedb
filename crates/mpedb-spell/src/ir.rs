@@ -17,6 +17,12 @@
 //! [`Op::FloorDiv`]/[`Op::PyMod`] carry Python semantics, [`Op::IntDiv`] and
 //! [`Op::IntRem`] carry Rust semantics; each frontend emits its own.
 //!
+//! SQL procedural frontends have separate `Sql*` comparison and BOOLEAN ops:
+//! comparisons propagate NULL; AND/OR/NOT use three-valued logic; conditions
+//! accept only BOOLEAN/NULL. `JumpIfSqlFalse` does not jump on NULL, which is
+//! necessary for short-circuit AND to evaluate its right operand when the left
+//! is unknown. Existing opcodes and persisted Python/Rust blobs are unchanged.
+//!
 //! # Budget
 //!
 //! Every *executed instruction* costs one unit of the instruction budget (so
@@ -117,6 +123,21 @@ pub enum Op {
     Le,
     Gt,
     Ge,
+    /// SQL/PLSQL three-valued logic, distinct from Python/Rust operators.
+    SqlNot,
+    SqlAnd,
+    SqlOr,
+    SqlEq,
+    SqlNe,
+    SqlLt,
+    SqlLe,
+    SqlGt,
+    SqlGe,
+    SqlBool,
+    /// Pop a BOOLEAN/NULL and jump only on SQL FALSE (NULL falls through).
+    JumpIfSqlFalse(u32),
+    /// Pop a BOOLEAN/NULL and jump only on SQL TRUE (NULL falls through).
+    JumpIfSqlTrue(u32),
     /// len() of a list/tuple/text/blob.
     Len,
     /// `container[index]`; negative indices wrap Python-style.
@@ -181,6 +202,20 @@ const OP_RETURN: u8 = 29;
 const OP_CURSOR_OPEN: u8 = 30;
 const OP_CURSOR_ADVANCE: u8 = 31;
 const OP_CURSOR_ROW: u8 = 32;
+// Additive format-1 extension, like cursors: legacy blobs retain their exact
+// semantics and older readers reject unknown instructions rather than guessing.
+const OP_SQL_NOT: u8 = 33;
+const OP_SQL_AND: u8 = 34;
+const OP_SQL_OR: u8 = 35;
+const OP_SQL_EQ: u8 = 36;
+const OP_SQL_NE: u8 = 37;
+const OP_SQL_LT: u8 = 38;
+const OP_SQL_LE: u8 = 39;
+const OP_SQL_GT: u8 = 40;
+const OP_SQL_GE: u8 = 41;
+const OP_SQL_BOOL: u8 = 42;
+const OP_JUMP_IF_SQL_FALSE: u8 = 43;
+const OP_JUMP_IF_SQL_TRUE: u8 = 44;
 
 /// A validated procedure: everything the runtime needs, nothing it has to
 /// trust. Constructible only through [`Proc::new`] / [`Proc::decode`], both
@@ -394,10 +429,12 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::DbQuery(x) => u16arg(OP_DB_QUERY, x),
         Op::DbExec(x) => u16arg(OP_DB_EXEC, x),
         Op::CursorOpen(x) => u16arg(OP_CURSOR_OPEN, x),
-        Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) => {
+        Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) => {
             b.push(match op {
                 Op::Jump(_) => OP_JUMP,
                 Op::JumpIfFalse(_) => OP_JUMP_IF_FALSE,
+                Op::JumpIfSqlFalse(_) => OP_JUMP_IF_SQL_FALSE,
+                Op::JumpIfSqlTrue(_) => OP_JUMP_IF_SQL_TRUE,
                 _ => OP_JUMP_IF_TRUE,
             });
             b.extend_from_slice(&t.to_le_bytes());
@@ -406,6 +443,17 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::Dup => b.push(OP_DUP),
         Op::Neg => b.push(OP_NEG),
         Op::Not => b.push(OP_NOT),
+        Op::SqlNot => b.push(OP_SQL_NOT),
+        Op::SqlAnd => b.push(OP_SQL_AND),
+        Op::SqlOr => b.push(OP_SQL_OR),
+        Op::SqlEq => b.push(OP_SQL_EQ),
+        Op::SqlNe => b.push(OP_SQL_NE),
+        Op::SqlLt => b.push(OP_SQL_LT),
+        Op::SqlLe => b.push(OP_SQL_LE),
+        Op::SqlGt => b.push(OP_SQL_GT),
+        Op::SqlGe => b.push(OP_SQL_GE),
+        Op::SqlBool => b.push(OP_SQL_BOOL),
+
         Op::Add => b.push(OP_ADD),
         Op::Sub => b.push(OP_SUB),
         Op::Mul => b.push(OP_MUL),
@@ -444,13 +492,15 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_DB_QUERY => Op::DbQuery(u16arg()?),
         OP_DB_EXEC => Op::DbExec(u16arg()?),
         OP_CURSOR_OPEN => Op::CursorOpen(u16arg()?),
-        OP_JUMP | OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE => {
+        OP_JUMP | OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE | OP_JUMP_IF_SQL_FALSE | OP_JUMP_IF_SQL_TRUE => {
             let raw = buf.get(*pos..*pos + 4).ok_or_else(err)?;
             *pos += 4;
             let t = u32::from_le_bytes(raw.try_into().unwrap());
             match op {
                 OP_JUMP => Op::Jump(t),
                 OP_JUMP_IF_FALSE => Op::JumpIfFalse(t),
+                OP_JUMP_IF_SQL_FALSE => Op::JumpIfSqlFalse(t),
+                OP_JUMP_IF_SQL_TRUE => Op::JumpIfSqlTrue(t),
                 _ => Op::JumpIfTrue(t),
             }
         }
@@ -458,6 +508,17 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_DUP => Op::Dup,
         OP_NEG => Op::Neg,
         OP_NOT => Op::Not,
+        OP_SQL_NOT => Op::SqlNot,
+        OP_SQL_AND => Op::SqlAnd,
+        OP_SQL_OR => Op::SqlOr,
+        OP_SQL_EQ => Op::SqlEq,
+        OP_SQL_NE => Op::SqlNe,
+        OP_SQL_LT => Op::SqlLt,
+        OP_SQL_LE => Op::SqlLe,
+        OP_SQL_GT => Op::SqlGt,
+        OP_SQL_GE => Op::SqlGe,
+        OP_SQL_BOOL => Op::SqlBool,
+
         OP_ADD => Op::Add,
         OP_SUB => Op::Sub,
         OP_MUL => Op::Mul,
@@ -488,7 +549,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::LoadConst(_) | Op::LoadLocal(_) => (0, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len => (1, 1),
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool => (1, 1),
         Op::Add
         | Op::Sub
         | Op::Mul
@@ -503,9 +564,17 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         | Op::Le
         | Op::Gt
         | Op::Ge
+        | Op::SqlAnd
+        | Op::SqlOr
+        | Op::SqlEq
+        | Op::SqlNe
+        | Op::SqlLt
+        | Op::SqlLe
+        | Op::SqlGt
+        | Op::SqlGe
         | Op::Index => (2, 1),
         Op::Jump(_) => (0, 0),
-        Op::JumpIfFalse(_) | Op::JumpIfTrue(_) => (1, 0),
+        Op::JumpIfFalse(_) | Op::JumpIfTrue(_) | Op::JumpIfSqlFalse(_) | Op::JumpIfSqlTrue(_) => (1, 0),
         Op::DbQuery(p) | Op::DbExec(p) | Op::CursorOpen(p) => {
             (plans[p as usize].argc as usize, 1)
         }
@@ -557,7 +626,7 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
                     "proc: cursor over a non-Query plan".into(),
                 ));
             }
-            Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) if t as usize >= n => {
+            Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) if t as usize >= n => {
                 return Err(Error::Corrupt("proc: jump target out of range".into()));
             }
             _ => {}
@@ -622,7 +691,7 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
         match op {
             Op::Return => {}
             Op::Jump(t) => visit(t as usize, after, &mut entry, &mut work)?,
-            Op::JumpIfFalse(t) | Op::JumpIfTrue(t) => {
+            Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) => {
                 visit(t as usize, after, &mut entry, &mut work)?;
                 visit(pc + 1, after, &mut entry, &mut work)?;
             }

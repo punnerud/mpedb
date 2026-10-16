@@ -385,11 +385,11 @@ def cap(v):
 
 /// DDL inside a WriteSession: `CREATE TRIGGER … EXECUTE PROCEDURE` in an open
 /// session resolves the procedure through the txn and, per the established
-/// in-txn DDL contract (`view_trigger_txn.rs`), becomes VISIBLE — and starts
-/// firing — after commit. The session's own writes between CREATE and commit
-/// do not fire it (the trigger set is built from committed state).
+/// in-txn DDL contract (`view_trigger_txn.rs`), sees its own trigger immediately.
+/// Other sessions see it after commit. Rules must use the session's own schema
+/// and registry rather than the committed trigger cache.
 #[test]
-fn create_in_write_session_resolves_and_fires_after_commit() {
+fn create_in_write_session_resolves_and_fires_before_and_after_commit() {
     let (cfg, _g) = test_config("session");
     let db = Database::open_with_config(cfg).unwrap();
     ProcEngine::new(&db).define(AUDIT_PY, Lang::Python).unwrap();
@@ -403,10 +403,30 @@ fn create_in_write_session_resolves_and_fires_after_commit() {
     s.query("INSERT INTO accounts (id, balance) VALUES (1, 1)", &[]).unwrap();
     s.commit().unwrap();
 
-    // The in-session insert predates visibility; the post-commit one fires.
-    assert_eq!(audit_rows(&db), vec![]);
+    // Both the in-session and post-commit insert fire the procedure.
+    assert_eq!(audit_rows(&db), vec![(1, "s".into())]);
     db.query("INSERT INTO accounts (id, balance) VALUES (2, 2)", &[]).unwrap();
-    assert_eq!(audit_rows(&db), vec![(2, "s".into())]);
+    assert_eq!(audit_rows(&db), vec![(1, "s".into()), (2, "s".into())]);
+}
+
+#[test]
+fn rolled_back_trigger_creation_and_effects_do_not_escape_the_session() {
+    let (cfg, _g) = test_config("session-rollback");
+    let db = Database::open_with_config(cfg).unwrap();
+    ProcEngine::new(&db).define(AUDIT_PY, Lang::Python).unwrap();
+    let mut session = db.begin().unwrap();
+    session.query("CREATE TRIGGER a_ins AFTER INSERT ON accounts EXECUTE PROCEDURE audit(NEW.id, 's')", &[]).unwrap();
+    session.query("INSERT INTO accounts (id, balance) VALUES (1, 1)", &[]).unwrap();
+    let ExecResult::Rows { rows, .. } = session.query("SELECT oid FROM audit", &[]).unwrap() else {
+        panic!("expected trigger audit rows");
+    };
+    assert_eq!(rows.len(), 1);
+    drop(session);
+    assert!(audit_rows(&db).is_empty());
+    // Rollback removed both the row and trigger; reusing the key succeeds,
+    // and the trigger cannot fire from a stale per-handle rule cache.
+    db.query("INSERT INTO accounts (id, balance) VALUES (1, 1)", &[]).unwrap();
+    assert!(audit_rows(&db).is_empty());
 }
 
 /// Backtest over a PROCEDURE body: the dry-run replays the spell through the

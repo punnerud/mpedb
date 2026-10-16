@@ -17,6 +17,7 @@ pub mod hash;
 pub mod interp;
 pub mod ir;
 pub mod plpgsql;
+pub mod plsql;
 pub mod py;
 pub mod rs;
 

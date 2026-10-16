@@ -153,6 +153,8 @@ impl FuncBuilder {
             Op::Jump(_) => Op::Jump(t),
             Op::JumpIfFalse(_) => Op::JumpIfFalse(t),
             Op::JumpIfTrue(_) => Op::JumpIfTrue(t),
+            Op::JumpIfSqlFalse(_) => Op::JumpIfSqlFalse(t),
+            Op::JumpIfSqlTrue(_) => Op::JumpIfSqlTrue(t),
             other => unreachable!("patching non-jump {other:?}"),
         };
     }

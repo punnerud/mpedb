@@ -43,6 +43,24 @@ not substitute for Oracle's NULL logic or Oracle transaction semantics. The
 upstream Oracle suites are initial reference coverage, not the completion gate
 for full Oracle support.
 
+## Native implementation progress
+
+`mpedb-spell` now has an Oracle lexical frontend (`plsql::lex`) that preserves
+exact numeric spellings, national strings, alternative q-quoting, bind names,
+identifier case, and byte spans. It does not yet compile or execute Oracle
+functions/procedures. Its separate SQL BOOLEAN/comparison IR instructions
+implement NULL propagation and three-valued AND/OR/NOT, with strict BOOLEAN
+conditions and short-circuit jump primitives. Old Python/Rust instructions and
+stored blobs retain their semantics. New opcodes extend format 1 additively;
+older readers reject them as unknown, as with the existing cursor extension.
+
+Tests execute serialized IR and cover full Boolean truth tables, comparisons,
+NULL, exact decimal ordering, invalid condition types, short-circuit error
+behavior, budget exhaustion, and malformed stack/jump programs. Lexer tests
+include multibyte input truncation and source locations. These are native unit
+tests against the public language specification, **not measured Oracle server
+conformance**. A real Oracle reference connection is still needed.
+
 ## Environment
 
 Prepared on the extra disk, outside Git:
