@@ -96,12 +96,12 @@ pub trait SourceAdapter {
     /// the xid-window changelog (CONF#11/27).
     ///
     /// Returns a vector index-aligned to `ops`: `true` = applied, `false` =
-    /// rejected because the source concurrently won. The default falls back to
-    /// unconditional [`push`] (all applied) for adapters without a changelog.
+    /// rejected because the source concurrently won or rejected the row. The
+    /// default delegates to [`SourceAdapter::push`] for adapters without a
+    /// changelog and preserves its per-row rejection flags.
     fn push_checked(&mut self, from: &Cursor, ops: &[NetOp]) -> Result<Vec<bool>> {
         let _ = from;
-        self.push(ops)?;
-        Ok(vec![true; ops.len()])
+        self.push(ops)
     }
 
     // ---- authority-switch fence (DESIGN-MIRROR §7) ----
@@ -134,4 +134,58 @@ pub trait SourceAdapter {
         new_epoch: u64,
         new_authority: &str,
     ) -> Result<bool>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RejectingAdapter;
+
+    impl SourceAdapter for RejectingAdapter {
+        fn pull(&mut self, _: &Cursor, _: usize) -> Result<Option<PullBatch>> {
+            unreachable!()
+        }
+        fn head(&mut self) -> Result<Cursor> {
+            unreachable!()
+        }
+        fn zero_cursor(&self) -> Cursor {
+            unreachable!()
+        }
+        fn read_table_rows(&mut self, _: u32) -> Result<Vec<Vec<Value>>> {
+            unreachable!()
+        }
+        fn push(&mut self, ops: &[NetOp]) -> Result<Vec<bool>> {
+            // Model a source accepting one row and rejecting a constraint
+            // violation at the next row's savepoint.
+            Ok(ops.iter().map(|op| op.table_id == 1).collect())
+        }
+        fn ensure_source_state(&mut self, _: &str, _: u64, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn read_source_state(&mut self, _: &str) -> Result<Option<(u64, String)>> {
+            unreachable!()
+        }
+        fn cas_source_state(&mut self, _: &str, _: u64, _: u64, _: &str) -> Result<bool> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn default_checked_push_preserves_source_rejections() {
+        let mut adapter = RejectingAdapter;
+        let ops: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|table_id| NetOp {
+                table_id,
+                pk: vec![Value::Int(1)],
+                kind: NetOpKind::Delete,
+            })
+            .collect();
+        assert_eq!(
+            adapter.push_checked(&vec![], &ops).unwrap(),
+            vec![true, false]
+        );
+        assert!(adapter.push_checked(&vec![], &[]).unwrap().is_empty());
+    }
 }

@@ -12,6 +12,37 @@ create stored functions. Django's Oracle backend tests include DB-API `callproc`
 These do not establish complete PL/SQL support (packages, cursors, exception
 handling, triggers, and transaction semantics need a later coverage audit).
 
+## Migration architecture
+
+The required migration path in **both directions** is:
+
+```text
+Oracle ⇄ MPEdb source representation ⇄ rRETL ⇄ MPEdb target representation ⇄ PostgreSQL
+```
+
+All transformations run in MPEdb through its existing rRETL lens pairs,
+residuals, lineage, verified apply/revert/putback, and incremental map machinery.
+Source adapters supply typed snapshots, change capture, and transactional
+write-back. They do not contain a parallel Oracle-to-PostgreSQL converter or
+bypass rRETL for the reverse direction. Identity mappings must also retain
+source type/schema provenance rather than infer reversibility from equal values.
+
+Live synchronization must preserve source commit boundaries, resume cursors,
+echo suppression, per-row rejection/conflict handling, and epoch-fenced authority
+switches. The current mirror engine permits one authoritative source per MPEdb
+file; connecting both source systems and rRETL therefore requires an explicit
+composition of mirror instances and maps. That composition, the Oracle source
+adapter, Oracle SQL execution, and full PL/SQL execution are **not implemented
+or verified by this test setup**. Existing PostgreSQL mirror support alone does
+not prove the requested topology works.
+
+PL/SQL coverage remains part of the end goal, including procedures/functions,
+IN/OUT/IN OUT parameters, packages, exceptions, cursors, dynamic SQL, triggers,
+and database/session transaction behavior. Python/Rust procedure semantics must
+not substitute for Oracle's NULL logic or Oracle transaction semantics. The
+upstream Oracle suites are initial reference coverage, not the completion gate
+for full Oracle support.
+
 ## Environment
 
 Prepared on the extra disk, outside Git:
