@@ -1571,3 +1571,33 @@ fn long_text_pks_apply_verify_and_revert() {
     assert_eq!(got[0][0], Value::Int(-7));
     assert_eq!(got[1][0], Value::Int(4));
 }
+
+#[test]
+fn plsql_functions_transform_and_reverse_through_rretl_with_lineage() {
+    let (d, path) = db("plsql-roundtrip");
+    d.create_function(SpellLang::PlSql, "CREATE FUNCTION flip(x BOOLEAN) RETURN BOOLEAN IS BEGIN RETURN NOT x; END;").unwrap();
+    let samples = d.create_lens("oracle_bool", "FLIP", "FLIP", LensClass::Bijective).unwrap();
+    assert!(samples >= 3);
+    let original = vec![Value::Bool(false), Value::Bool(true), Value::Null, Value::Bool(false)];
+    for (id, value) in original.iter().enumerate() {
+        d.query("INSERT INTO t (id, v, w) VALUES ($1, 0, $2)", &[Value::Int(id as i64), value.clone()]).unwrap();
+    }
+    let report = d.rretl_apply("oracle_bool", "t", "w").unwrap();
+    assert_eq!(report.rows, 4);
+    assert_eq!(rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap()), vec![vec![Value::Bool(true)], vec![Value::Bool(false)], vec![Value::Null], vec![Value::Bool(true)]]);
+    assert!(!d.rretl_log().unwrap().is_empty());
+    d.rretl_revert(report.run_id).unwrap();
+    assert_eq!(rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap()), original.into_iter().map(|v| vec![v]).collect::<Vec<_>>());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn oracle_number_coercion_is_not_misclassified_as_a_type_preserving_lens() {
+    let (d, path) = db("plsql-numeric-domain");
+    d.create_function(SpellLang::PlSql, "CREATE FUNCTION number_identity(x NUMBER) RETURN NUMBER IS BEGIN RETURN x; END;").unwrap();
+    // SQL legitimately coerces Int to Numeric. rRETL must preserve source
+    // representation too: Numeric(1) cannot silently restore an Int(1).
+    assert!(d.create_lens("wrong_domain", "NUMBER_IDENTITY", "NUMBER_IDENTITY", LensClass::Bijective).is_err());
+    assert!(d.list_lenses().unwrap().is_empty());
+    let _ = std::fs::remove_file(path);
+}

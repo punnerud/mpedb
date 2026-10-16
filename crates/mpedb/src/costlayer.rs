@@ -258,9 +258,9 @@ impl crate::Database {
             // LANGUAGE plpgsql` statement — it exists to eat what `pg_dump`
             // writes. A cost policy is an mpedb concept with no PostgreSQL
             // spelling, so there is nothing for it to compile.
-            crate::spellfn::SpellLang::PlPgSql => {
+            crate::spellfn::SpellLang::PlPgSql | crate::spellfn::SpellLang::PlSql => {
                 return Err(Error::Unsupported(
-                    "a cost policy is written in the Python or Rust subset; plpgsql compiles \
+                    "a cost policy is written in the Python or Rust subset; procedural SQL compiles \
                      a whole CREATE FUNCTION statement, which a cost policy is not"
                         .into(),
                 ))

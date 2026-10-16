@@ -46,6 +46,8 @@ pub enum SpellLang {
     /// writes. Its frontend refuses every SQL-bearing form by name, so the
     /// no-SQL rule below is one a plpgsql body cannot reach.
     PlPgSql,
+    /// Native Oracle scalar PL/SQL functions (no SQL, OUT parameters or procedures).
+    PlSql,
 }
 
 /// One stored function, as `list_functions` reports it.
@@ -139,6 +141,7 @@ pub(crate) fn compile_function_records(lang: SpellLang, source: &str) -> Result<
         SpellLang::Python => mpedb_spell::py::compile(source)?,
         SpellLang::Rust => mpedb_spell::rs::compile(source)?,
         SpellLang::PlPgSql => mpedb_spell::plpgsql::compile(source)?,
+        SpellLang::PlSql => mpedb_spell::plsql::compile_function(source)?,
     };
     if !skeleton.calls.is_empty() {
         return Err(Error::Unsupported(

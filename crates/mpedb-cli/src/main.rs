@@ -507,6 +507,7 @@ fn cmd_fn(args: &[String]) -> CliResult {
             let lang = match () {
                 _ if file.ends_with(".rs") => SpellLang::Rust,
                 _ if file.ends_with(".sql") => SpellLang::PlPgSql,
+                _ if file.ends_with(".pls") || file.ends_with(".plsql") => SpellLang::PlSql,
                 _ => SpellLang::Python,
             };
             let src = std::fs::read_to_string(file)

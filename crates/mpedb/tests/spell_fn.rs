@@ -158,3 +158,33 @@ fn refusals_and_budgets_are_deterministic() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn plsql_scalar_functions_run_from_sql_and_shared_prepared_plans() {
+    let (d, path) = db("plsql-sql");
+    let source = "CREATE FUNCTION oracle_scale(x NUMBER) RETURN NUMBER IS BEGIN RETURN x * 1.25; END;";
+    let (name, _) = d.create_function(SpellLang::PlSql, source).unwrap();
+    assert_eq!(name, "ORACLE_SCALE");
+    assert_eq!(rows(d.query("SELECT oracle_scale(4), ORACLE_SCALE(NULL)", &[]).unwrap()), vec![vec![Value::Numeric("5".into()), Value::Null]]);
+    d.query("INSERT INTO t (id, a) VALUES (1, 8)", &[]).unwrap();
+    let hash = d.prepare("SELECT oracle_scale(a) FROM t WHERE id = $1").unwrap();
+    let attached = Database::open_from_file(std::path::Path::new(&path)).unwrap();
+    assert_eq!(rows(attached.execute(&hash, &[Value::Int(1)]).unwrap()), vec![vec![Value::Numeric("10".into())]]);
+    d.create_function(SpellLang::PlSql, "CREATE FUNCTION oracle_scale(x NUMBER) RETURN NUMBER IS BEGIN RETURN x / 2; END;").unwrap();
+    assert_eq!(rows(attached.query("SELECT oracle_scale(a) FROM t", &[]).unwrap()), vec![vec![Value::Numeric("4".into())]]);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn procedure_and_out_signatures_cannot_be_registered_as_scalar_sql_functions() {
+    let (d, path) = db("plsql-signature");
+    for source in [
+        "CREATE PROCEDURE bad IS BEGIN NULL; END;",
+        "CREATE FUNCTION bad(x OUT NUMBER) RETURN NUMBER IS BEGIN x := 1; RETURN x; END;",
+        "CREATE FUNCTION bad(x IN OUT BOOLEAN) RETURN BOOLEAN IS BEGIN RETURN x; END;",
+    ] {
+        assert!(d.create_function(SpellLang::PlSql, source).is_err());
+    }
+    assert!(d.list_functions().unwrap().is_empty());
+    let _ = std::fs::remove_file(path);
+}

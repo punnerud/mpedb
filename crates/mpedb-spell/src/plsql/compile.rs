@@ -41,6 +41,16 @@ struct Parser<'a> {
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
+    compile_inner(source, false)
+}
+
+/// Compile only a scalar SQL function; procedures and OUT signatures belong
+/// to the procedure calling convention and must never enter a scalar catalog.
+pub fn compile_function(source: &str) -> Result<Skeleton> {
+    compile_inner(source, true)
+}
+
+fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
     let mut p = Parser {
         source,
         tokens: lex::lex(source)?,
@@ -62,6 +72,9 @@ pub fn compile(source: &str) -> Result<Skeleton> {
         p.want_word("PROCEDURE")?;
         false
     };
+    if scalar_only && !function {
+        return Err(p.error("a stored SQL function requires CREATE FUNCTION, not CREATE PROCEDURE"));
+    }
     let name = p.identifier()?;
     if p.symbol(".") {
         return Err(p.error("schema-qualified routine registration is not implemented"));
@@ -98,6 +111,11 @@ pub fn compile(source: &str) -> Result<Skeleton> {
                 break;
             }
         }
+    }
+    if scalar_only && p.has_out {
+        return Err(
+            p.error("a scalar SQL function cannot have OUT or IN OUT parameters; use ProcEngine")
+        );
     }
     if function {
         p.want_word("RETURN")?;

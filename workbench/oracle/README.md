@@ -52,7 +52,11 @@ FUNCTION/PROCEDURE definitions to the shared IR, available through
 `ProcEngine::define(source, Lang::PlSql)` and `mpedb proc define config.toml
 routine.pls` (`.plsql` also accepted). These routines persist by name/hash and
 remain callable after database reopen. This does not implement Oracle SQL DDL
-dispatch or an Oracle wire/DB-API backend.
+dispatch or an Oracle wire/DB-API backend. Scalar functions can also be
+registered with `Database::create_function(SpellLang::PlSql, source)` or
+`mpedb fn define config.toml routine.pls`, then called from MPEdb SQL and shared
+prepared plans. That scalar registration rejects procedures and OUT/IN OUT
+signatures before publishing any catalog record; those use `ProcEngine`.
 Registration follows `ProcEngine::define`'s existing idempotent name/hash
 contract; Oracle CREATE-versus-OR-REPLACE catalog behavior is not implemented
 by this host API.
@@ -98,6 +102,17 @@ Only successful calls copy values out; errors return no partial output tuple.
 `NOCOPY` is accepted for OUT/IN OUT and ignored, using the copy semantics that
 Oracle permits for this hint. Argument aliasing is not provided by this value
 API. See Oracle's [parameter-mode rules](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/subprogram-parameters.html).
+
+PL/SQL scalar functions use the **existing rRETL function/lens registry**, not
+a separate migration converter. An end-to-end native test registers a Boolean
+PL/SQL inverse pair, verifies it, applies it to stored rows through rRETL,
+records lineage, and reverts to the original values including NULL. Numeric
+domains need additional care: NUMBER legitimately coerces Int to Numeric,
+whereas rRETL's type-preserving round-trip law must restore the original Int
+representation too. The existing verifier correctly refuses to label that
+coercion bijective over its mixed-type corpus. Declared typed domains and/or
+residual provenance for such conversions remain required work; the Boolean
+test does not establish a full Oracle-to-PostgreSQL migration pipeline.
 
 The separate SQL BOOLEAN/comparison IR instructions
 implement NULL propagation and three-valued AND/OR/NOT, with strict BOOLEAN

@@ -153,10 +153,10 @@ impl crate::Database {
             SpellLang::Python => mpedb_spell::py::compile(source)?,
             SpellLang::Rust => mpedb_spell::rs::compile(source)?,
             // See `costlayer::set_cost_policy`: an operator macro RETURNS SQL
-            // text, and plpgsql compiles a whole CREATE FUNCTION statement.
-            SpellLang::PlPgSql => {
+            // text, and procedural SQL compiles a whole CREATE FUNCTION statement.
+            SpellLang::PlPgSql | SpellLang::PlSql => {
                 return Err(Error::Unsupported(
-                    "an operator macro is written in the Python or Rust subset; plpgsql \
+                    "an operator macro is written in the Python or Rust subset; procedural SQL \
                      compiles a whole CREATE FUNCTION statement, which a macro is not"
                         .into(),
                 ))
