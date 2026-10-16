@@ -247,6 +247,12 @@ Django 5.2's unmodified `backends.oracle basic` control also completed:
 full SQLAlchemy measurements are separate and must not be inferred from these
 subsets.
 
+`reference/number-boundaries.json` records direct SELECT results from Oracle
+23.26.3 with decimal fetching enabled. It includes recurring division, 39/40
+digit boundaries, underflow (`1e-131` becomes zero), and overflow (`1e126`
+raises ORA-01426). These measured values are inputs to the next NUMBER changes;
+they are not a claim that MPEdb already reproduces them.
+
 References:
 
 * [Oracle Free requirements](https://docs.oracle.com/en/database/oracle/oracle-database/26/xeinl/requirements.html)
