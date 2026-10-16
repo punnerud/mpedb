@@ -125,7 +125,8 @@ NULL, exact decimal ordering, invalid condition types, short-circuit error
 behavior, budget exhaustion, and malformed stack/jump programs. Lexer tests
 include multibyte input truncation and source locations. These are native unit
 tests against the public language specification, **not measured Oracle server
-conformance**. A real Oracle reference connection is still needed.
+conformance**. The real reference server below is now available for differential
+measurements; its framework results do not establish MPEdb compatibility.
 
 ## Environment
 
@@ -135,11 +136,14 @@ Prepared on the extra disk, outside Git:
 * `/mnt/HC_Volume_106406886/mpedb-oracle/sqlalchemy-src` (`rel_2_0_44`)
 * Django source: `/mnt/HC_Volume_106406885/codex-pg-tests/django-src`
 
-Install `oracledb`, `pytest<9`, `pytest-xdist`, `greenlet`, both upstream projects
-in editable mode, and Django's `tests/requirements/py3.txt`. On this machine
-`pylibmc` and `pywatchman` lack system build prerequisites; their absence must
-remain visible when interpreting full-suite counts. Python-oracledb uses Thin
-mode; Oracle Instant Client is not needed for this initial setup.
+Install `pytest<9`, `pytest-xdist`, `greenlet`, both upstream projects in editable
+mode, Django's `tests/requirements/py3.txt`, and its `requirements/oracle.txt`.
+The latter requires `oracledb >= 2.3.0, < 26.0.0`; the measured environment now
+uses **4.0.2**. All Python requirements, including `pylibmc` and `pywatchman`,
+are installed. Missing development headers/libraries were extracted into
+`native-build-deps` on the extra disk. Thin mode works without Oracle Client;
+the full Oracle-specific SQLAlchemy suite also tests Thick mode and uses the
+client libraries bundled with the reference server.
 
 Use a **dedicated disposable Oracle PDB**. Upstream tests create/drop users,
 tablespaces, tables, procedures, and functions. Django's administrative account
@@ -180,6 +184,13 @@ ORACLE_ARTIFACTS=/mnt/HC_Volume_106406886/mpedb-oracle/runs
 # --prepare-only verifies imports/source and records versions without a DB.
 ```
 
+For the configured local reference instance, add
+`--native-root /mnt/HC_Volume_106406886/mpedb-oracle` to either command. This
+loads credentials from the private external directory and selects the correct
+suite account and client-library paths; passwords never enter command-line
+arguments. Native-root configuration is optional: remote servers still use
+the environment variables above.
+
 Each run records source revision, package versions, server version (when
 connected), exit status, and a suite log. SQLAlchemy also writes JUnit XML.
 A timeout is recorded as **incomplete**, never green. Test failures, skips, and
@@ -187,18 +198,54 @@ setup errors remain in upstream output. Logs may contain test SQL and data and
 are kept in a private artifact directory. No Oracle tests have passed until
 they have actually run against an Oracle server.
 
-## Server choice on this Ubuntu host
+## Local Oracle reference on Ubuntu
 
-Oracle 26ai Free's supported native Linux distributions are Oracle Linux and
-RHEL, not Ubuntu. Its prebuilt VirtualBox appliance is now retired. With a
-preference against VMs, use a local Oracle Linux container (Podman can run
-without a VM on Linux) or a separate Oracle server. Keep image/data storage on
-the extra disk. Avoid converting RPMs into an Ubuntu installation as the test
-baseline, since installation failures obscure database compatibility results.
+An **unofficial Ubuntu user-directory installation** now runs Oracle AI
+Database 26ai Free **23.26.3.0.0**, without VM, Docker, Podman, sudo, or changes
+to host accounts. Oracle officially supports Oracle Linux/RHEL rather than
+Ubuntu; the retired VirtualBox appliance is not used.
 
-The inspected host has 3.7 GiB RAM, no `/dev/kvm`, no Docker/Podman, and no
-passwordless sudo. A server is **not installed or started** by this workbench.
-Local container startup requires installing/configuring a runtime first.
+The original Oracle Linux 9 RPM was downloaded from Oracle and SHA-256 checked:
+`895fc9df794685b515c4ac83f104dbdfb657eb0e92c41e45c58302fb8fd53e44`.
+It is extracted under `native-root` on the extra disk. Oracle's database
+binaries are unchanged. Launcher/base-path configuration is relocated locally;
+a private compatibility-library path supplies Ubuntu's libaio. Local admin
+processes use nss_wrapper account/group files in `native-accounts`, not changes
+to `/etc/passwd` or `/etc/group`. Normal framework connections authenticate
+with real database passwords and do not load this NSS fixture.
+
+DBCA could not complete its privileged helper checks. Oracle RMAN successfully
+restored the bundled seed controlfile/datafiles, recovered without redo, and
+opened FREE with RESETLOGS. FREEPDB1 is created, open read/write, and its open
+state saved. Datafiles are under `native-data`; the database uses an SPFILE.
+Start/stop/reopen have been tested. The listener binds **127.0.0.1:1521** only.
+The SGA is 1 GiB, including a 128 MiB vector area; open_cursors is 1000.
+
+SQLA_TEST, TEST_SCHEMA, TEST_SCHEMA_2, and DJANGO_ADMIN are dedicated test users
+inside FREEPDB1. SQLAlchemy's public test links use explicit localhost connect
+descriptors. Generated passwords and response files live in `native-private`
+(directory 0700, credential files 0600), outside Git.
+
+```sh
+python workbench/oracle/native_control.py status --root /mnt/HC_Volume_106406886/mpedb-oracle
+python workbench/oracle/native_control.py stop --root /mnt/HC_Volume_106406886/mpedb-oracle
+python workbench/oracle/native_control.py start --root /mnt/HC_Volume_106406886/mpedb-oracle
+```
+
+Reference measurement on 2026-10-16: SQLAlchemy **2.0.44**'s full
+`test/dialect/oracle` directory: **476 passed, no failures or skips**, with
+python-oracledb **4.0.2**, covering procedures/functions, OUT parameters,
+database links, Thin/Thick modes, reflection, numeric types, and vector indexes.
+Artifacts: `runs/sqlalchemy-dv5l1f43`. The initial run with driver 26.0.1 had
+467 passes and 9 environment failures; corrected client discovery, links,
+vector allocation, and the supported driver version produced the green run.
+This is a **real Oracle control**, not a MPEdb Oracle conformance result or a
+completed full SQLAlchemy/Django run.
+
+Django 5.2's unmodified `backends.oracle basic` control also completed:
+**104 passed, 5 skipped, 109 total**, in `runs/django-b7tvprbl`. Full Django and
+full SQLAlchemy measurements are separate and must not be inferred from these
+subsets.
 
 References:
 

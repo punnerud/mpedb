@@ -19,10 +19,36 @@ def main():
     parser.add_argument("--artifacts", required=True, type=Path)
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument(
+        "--native-root",
+        type=Path,
+        help="Use the local private Oracle reference profile",
+    )
     parser.add_argument("tests", nargs="*", help="Omit to run the full upstream suite")
-    args = parser.parse_args()
+    args = parser.parse_intermixed_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.native_root:
+        native = args.native_root.resolve()
+        profile = json.loads((native / "native-runtime.json").read_text())
+        credentials = json.loads(
+            (native / "native-private/credentials.json").read_text()
+        )
+        # Client processes use real database passwords. The NSS fixture is
+        # confined to local server administration, not injected into clients.
+        for key in ("ORACLE_HOME", "ORACLE_BASE", "TNS_ADMIN"):
+            os.environ[key] = profile[key]
+        os.environ["LD_LIBRARY_PATH"] = (
+            profile["LD_LIBRARY_PATH"]
+            + ":"
+            + str(native / "native-build-deps/usr/lib/x86_64-linux-gnu")
+        )
+        os.environ.update(
+            ORACLE_DSN="127.0.0.1:1521/FREEPDB1",
+            ORACLE_USER="DJANGO_ADMIN" if args.suite == "django" else "SQLA_TEST",
+            ORACLE_PASSWORD=credentials[args.suite],
+            ORACLE_TEST_PASSWORD=credentials["django_test"],
+        )
     source = args.source.resolve()
     entry = source / ("tests/runtests.py" if args.suite == "django" else "test")
     if not entry.exists():
