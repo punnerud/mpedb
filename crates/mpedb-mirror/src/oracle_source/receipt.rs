@@ -301,14 +301,53 @@ impl OracleSource {
         ops: &[NetOp],
         request: &OracleWriteRequest<'_>,
     ) -> Result<Vec<Option<Vec<Value>>>> {
+        self.write_receipted(tables, ops, request, None)
+    }
+    /// Conservative checked transport: on a FIRST attempt, refuse any target
+    /// identity changed since `from`. Touched tables take SHARE ROW EXCLUSIVE
+    /// NOWAIT locks, preventing concurrent DML (including absent-key inserts)
+    /// until the receipt/data commit. Active writers cause a retryable error.
+    /// All source changes count, including own earlier writes: pull/reconcile
+    /// before the next request. A committed retry returns ORIGINAL images and
+    /// performs no DML. This primitive provides no controller/echo policy.
+    pub fn write_batch_receipted_checked(
+        &mut self,
+        tables: &[OracleTable],
+        ops: &[NetOp],
+        request: &OracleWriteRequest<'_>,
+        from: &crate::oracle_cursor::OraclePosition,
+        max_events: usize,
+    ) -> Result<OracleWriteImages> {
+        self.write_receipted(tables, ops, request, Some((from, max_events)))
+    }
+    fn write_receipted(
+        &mut self,
+        tables: &[OracleTable],
+        ops: &[NetOp],
+        request: &OracleWriteRequest<'_>,
+        checked: Option<(&crate::oracle_cursor::OraclePosition, usize)>,
+    ) -> Result<OracleWriteImages> {
         let result = (|| {
             self.lock_write_authority(request)?;
             self.lock_write_ledger(request.ledger_identity)?;
             // Replays must also reject stale application schema metadata.
             let locked = self.lock_write_tables(tables, ops)?;
+            if let Some((from, budget)) = checked {
+                crate::oracle_cursor::OraclePosition::decode(
+                    &from.encode(),
+                    &self.identity()?,
+                    tables,
+                )?;
+                if budget == 0 || from.scn() > self.current_scn()? {
+                    return Err(Error::Config("Oracle checked write requires a valid past cursor and positive event budget".into()));
+                }
+            }
             let payload = self.receipt_payload(tables, ops, request)?;
             if let Some(bytes) = self.receipt_bytes(request, &payload)? {
                 return super::receipt_codec::decode(tables, ops, &bytes);
+            }
+            if let Some((from, budget)) = checked {
+                self.check_write_conflicts(tables, ops, from.scn(), budget)?;
             }
             let images = self.write_locked(&locked, ops)?;
             let bytes = super::receipt_codec::encode(tables, ops, &images)?;

@@ -200,6 +200,19 @@ transport fixture verifies a real generated column through receipted DML and
 this common ACK bridge; it deliberately has no foreign writer and does not
 implement production conflict or echo policy.
 
+`write_batch_receipted_checked` adds a conservative first-attempt conflict
+check against a realm-validated Oracle cursor. It takes SHARE ROW EXCLUSIVE
+NOWAIT locks on touched tables before reading the change window, closing both
+existing-row and absent-key races with foreign DML. Any changed target rejects
+the entire new batch without data/receipt changes; unrelated keys are allowed.
+Active foreign writers, expired history and event-budget failures stop safely.
+A committed retry still returns its original receipt without DML. Own prior
+writes count as changes too, so callers must pull/reconcile before a new request.
+This coarse table fence is a transport correctness baseline, not fine-grained
+continuous mirroring. Native tests cover foreign commits, compound-key moves,
+whole-batch rejection, busy writers, budgets, cursor realms and old-epoch
+receipt recovery. Production outbox/echo/controller wiring remains unfinished.
+
 Tokens must include a durable local FILE incarnation and dirty generation;
 a path/transaction number or payload hash alone can collide after reimport.
 Receipt images are bounded to 64 MiB per batch. This primitive never garbage

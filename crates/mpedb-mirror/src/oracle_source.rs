@@ -11,6 +11,7 @@ mod state;
 pub use capture::OracleChangeBatch;
 pub use snapshot::OracleSnapshot;
 pub use state::OracleStateIdentity;
+mod checked_write;
 mod receipt;
 mod receipt_codec;
 mod write;

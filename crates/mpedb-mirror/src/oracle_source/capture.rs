@@ -31,6 +31,21 @@ impl OracleSource {
         to_scn: u64,
         max_events: usize,
     ) -> Result<Vec<OracleChangeBatch>> {
+        let result = self.read_changes_uncommitted(tables, from_scn, to_scn, max_events);
+        // Public capture never commits a caller's writes and always releases
+        // its fences. Checked writes use the private form inside their txn.
+        self.connection
+            .rollback()
+            .map_err(|e| err("capture release", e))?;
+        result
+    }
+    pub(super) fn read_changes_uncommitted(
+        &mut self,
+        tables: &[OracleTable],
+        from_scn: u64,
+        to_scn: u64,
+        max_events: usize,
+    ) -> Result<Vec<OracleChangeBatch>> {
         if from_scn > to_scn || max_events == 0 {
             return Err(Error::Config(
                 "Oracle capture requires an ordered SCN interval and a positive event budget"
@@ -45,7 +60,7 @@ impl OracleSource {
                 "Oracle capture cannot read a future SCN".into(),
             ));
         }
-        let result = (|| {
+        (|| {
             let tables = crate::oracle::carrier_tables(tables)?;
             for table in &tables {
                 self.lock_schema(table)?;
@@ -157,12 +172,6 @@ impl OracleSource {
                 });
             }
             Ok(batches)
-        })();
-        // Release all DDL fences on both success and failure. This API never
-        // commits a caller's writes; exclusive &mut access protects the session.
-        self.connection
-            .rollback()
-            .map_err(|e| err("capture release", e))?;
-        result
+        })()
     }
 }
