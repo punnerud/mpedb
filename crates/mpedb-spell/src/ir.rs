@@ -161,6 +161,8 @@ pub enum Op {
     /// VARCHAR2 normalization. Low 15 bits: length (0 = unconstrained);
     /// high bit: CHAR semantics rather than BYTE. Absolute maximum 32767 bytes.
     OracleVarchar(u16),
+    /// Preserve a scalar value, raising VALUE_ERROR for NULL after coercion.
+    OracleNotNull,
     /// Numeric FOR bound: rounded signed 32-bit integer; NULL is an error.
     OracleLoopBound,
     OracleInteger,
@@ -328,6 +330,7 @@ const OP_ORACLE_SQLCODE: u8 = 87;
 const OP_ORACLE_SQLERRM: u8 = 88;
 const OP_ORACLE_RAISE_APPLICATION: u8 = 89;
 const OP_ORACLE_NUMBER_CONSTRAINT: u8 = 90;
+const OP_ORACLE_NOT_NULL: u8 = 91;
 
 
 
@@ -601,6 +604,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleRaiseApplication => b.push(OP_ORACLE_RAISE_APPLICATION),
         Op::OracleNeg => b.push(OP_ORACLE_NEG),
         Op::OracleVarchar(limit) => u16arg(OP_ORACLE_VARCHAR, limit),
+        Op::OracleNotNull => b.push(OP_ORACLE_NOT_NULL),
         Op::OracleLoopBound => b.push(OP_ORACLE_LOOP_BOUND),
         Op::OracleInteger => b.push(OP_ORACLE_INTEGER),
         Op::OracleIntAdd => b.push(OP_ORACLE_INT_ADD),
@@ -726,6 +730,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_RAISE_APPLICATION => Op::OracleRaiseApplication,
         OP_ORACLE_NEG => Op::OracleNeg,
         OP_ORACLE_VARCHAR => Op::OracleVarchar(u16arg()?),
+        OP_ORACLE_NOT_NULL => Op::OracleNotNull,
         OP_ORACLE_LOOP_BOUND => Op::OracleLoopBound,
         OP_ORACLE_INTEGER => Op::OracleInteger,
         OP_ORACLE_INT_ADD => Op::OracleIntAdd,
@@ -782,7 +787,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg | Op::OraclePlSqlNumber | Op::OracleNumberConstraint { .. } | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound | Op::OracleSelectOne => (1, 1),
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleNotNull | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg | Op::OraclePlSqlNumber | Op::OracleNumberConstraint { .. } | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound | Op::OracleSelectOne => (1, 1),
         Op::OracleIntAdd | Op::OracleIntSub | Op::OracleIntMul
         | Op::OracleConcat
         | Op::OracleCharEq
@@ -1314,6 +1319,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.max_stack(), 1);
+    }
+
+    #[test]
+    fn oracle_not_null_has_a_checked_stack_shape_and_roundtrips() {
+        assert!(mk(vec![Op::OracleNotNull, Op::Return],vec![],vec![]).is_err());
+        let p=mk(vec![Op::LoadConst(0),Op::OracleNotNull,Op::Return],vec![Value::Null],vec![]).unwrap();
+        let loaded=Proc::decode(&p.encode()).unwrap();
+        assert_eq!(loaded.instrs,p.instrs);
+        assert_eq!(loaded.hash(),p.hash());
+        assert_eq!(loaded.max_stack(),1);
     }
 
     #[test]

@@ -103,7 +103,7 @@ impl Parser<'_> {
                 self.builder.emit(Op::Dup)?;
                 self.constant(Value::Int(i as i64))?;
                 self.builder.emit(Op::Index)?;
-                self.builder.emit(target.ty.check())?;
+                self.emit_local_check(*target)?;
                 self.builder.emit(Op::StoreLocal(target.slot))?;
             }
         } else {

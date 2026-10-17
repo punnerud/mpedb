@@ -517,6 +517,28 @@ empty text and NULL share an Oracle representation. rRETL verification still
 requires an appropriate domain or retained provenance; this normalization does
 not authorize an unchecked bidirectional mirror.
 
+Local scalar declarations now support `NOT NULL`, including CONSTANT and
+DEFAULT initialization. Missing initializers and direct literal NULL
+initialization/assignment are compile errors, even in unreachable branches.
+Nullable expressions are checked after type coercion, so empty VARCHAR2 input
+also raises VALUE_ERROR. The check happens before storing the local; a failed
+assignment retains its previous value. Both static and literal dynamic SELECT
+INTO enforce the same constraint. Declaration failures remain outside their own
+block handler and can propagate to an enclosing handler. Additive opcode 91
+carries the runtime check through stored/cold-reopened IR and scalar SQL calls.
+
+The native `oracle_not_null` test verifies 36 cases across NUMBER, PLS_INTEGER,
+BOOLEAN, UTF-8 VARCHAR2, nested initialization, both SELECT INTO forms, SQLERRM,
+compile errors and cold reopen. It also exposed a pre-existing classification
+bug: PLS_INTEGER conversion/arithmetic overflow must be ORA-01426 (`numeric
+overflow`), not VALUE_ERROR/ORA-06502. Native handlers now select the correct
+branch; constrained NUMBER precision overflow remains VALUE_ERROR. The full
+compiler/procedure tests and native PL/SQL/static-SQL/number regressions pass.
+The PostgreSQL PL/pgSQL corpus test was explicitly run too. The near-data test's
+obsolete standalone Python extension staging was repaired. An explicitly run
+three-way test now requires all arms and fails on missing prerequisites or a
+broken Python arm rather than silently reporting a skip. All three arms are exercised for correctness without making debug-build speed claims.
+
 PLS_INTEGER and its BINARY_INTEGER alias use signed 32-bit values, round decimal
 inputs half away from zero, preserve NULL, and raise on overflow. Integer
 literals in range retain this type. Integer `+`, `-`, `*`, and unary minus check

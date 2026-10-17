@@ -927,3 +927,87 @@ fn oracle_integer_and_decimal_aliases_apply_local_constraints_only() {
         assert!(compile(&function("","NUMBER",&format!("n {ty}; BEGIN RETURN n; END;"))).is_err());
     }
 }
+
+#[test]
+fn not_null_locals_check_coerced_values_and_preserve_the_old_value_on_failure() {
+    let source=function("p NUMBER","NUMBER","n NUMBER NOT NULL:=7; BEGIN n:=p; RETURN n; EXCEPTION WHEN VALUE_ERROR THEN RETURN n; END;");
+    assert_eq!(
+        call(&source, &[Value::Null]).unwrap(),
+        Value::Numeric("7".into())
+    );
+    assert_eq!(
+        call(&source, &[Value::Numeric("3.5".into())]).unwrap(),
+        Value::Numeric("3.5".into())
+    );
+    let text=function("p VARCHAR2","VARCHAR2","n VARCHAR2(8 CHAR) NOT NULL DEFAULT 'old'; BEGIN n:=p; RETURN n; EXCEPTION WHEN VALUE_ERROR THEN RETURN n; END;");
+    for value in [Value::Null, Value::Text(String::new())] {
+        assert_eq!(call(&text, &[value]).unwrap(), Value::Text("old".into()));
+    }
+    assert_eq!(
+        call(&text, &[Value::Text("ø🙂漢".into())]).unwrap(),
+        Value::Text("ø🙂漢".into())
+    );
+    let boolean=function("p BOOLEAN","BOOLEAN","n BOOLEAN NOT NULL:=TRUE; BEGIN n:=p; RETURN n; EXCEPTION WHEN VALUE_ERROR THEN RETURN n; END;");
+    assert_eq!(call(&boolean, &[Value::Null]).unwrap(), Value::Bool(true));
+    assert_eq!(
+        call(&boolean, &[Value::Bool(false)]).unwrap(),
+        Value::Bool(false)
+    );
+}
+#[test]
+fn not_null_declarations_require_initializers_and_literal_null_assignments_are_compile_errors() {
+    for body in [
+        "n NUMBER NOT NULL; BEGIN RETURN 1; END;",
+        "n NUMBER NOT NULL:=NULL; BEGIN RETURN 1; END;",
+        "n NUMBER NOT NULL:=(NULL); BEGIN RETURN 1; END;",
+        "n NUMBER NOT NULL:=1; BEGIN n:=NULL; RETURN n; END;",
+        "n NUMBER NOT NULL:=1; BEGIN IF FALSE THEN n:=NULL; END IF; RETURN n; END;",
+    ] {
+        assert!(compile(&function("", "NUMBER", body)).is_err(), "{body}");
+    }
+    let constant = function(
+        "",
+        "NUMBER",
+        "n CONSTANT NUMBER NOT NULL:=2; BEGIN RETURN n; END;",
+    );
+    assert_eq!(call(&constant, &[]).unwrap(), Value::Numeric("2".into()));
+    let source = function(
+        "",
+        "VARCHAR2",
+        "n VARCHAR2(4) NOT NULL:=''; BEGIN RETURN n; END;",
+    );
+    assert!(matches!(
+        call(&source, &[]),
+        Err(mpedb_types::Error::Oracle { code: 6502, .. })
+    ));
+}
+#[test]
+fn not_null_initialization_errors_escape_their_own_block_handlers() {
+    let source=function("p NUMBER","NUMBER","BEGIN DECLARE n NUMBER NOT NULL:=p; BEGIN RETURN n; EXCEPTION WHEN VALUE_ERROR THEN RETURN 101; END; EXCEPTION WHEN VALUE_ERROR THEN RETURN 202; END;");
+    assert_eq!(
+        call(&source, &[Value::Null]).unwrap(),
+        Value::Numeric("202".into())
+    );
+    assert_eq!(
+        call(&source, &[Value::Numeric("3".into())]).unwrap(),
+        Value::Numeric("3".into())
+    );
+}
+
+#[test]
+fn integer_numeric_overflow_is_distinct_from_value_error_in_handlers() {
+    let source=function("p NUMBER","NUMBER","n PLS_INTEGER NOT NULL:=7; BEGIN n:=p; RETURN n; EXCEPTION WHEN VALUE_ERROR THEN RETURN n; WHEN OTHERS THEN RETURN SQLCODE; END;");
+    assert_eq!(
+        call(&source, &[Value::Null]).unwrap(),
+        Value::Numeric("7".into())
+    );
+    assert_eq!(
+        call(&source, &[Value::Numeric("2147483648".into())]).unwrap(),
+        Value::Numeric("-1426".into())
+    );
+    let arithmetic=function("","VARCHAR2","n PLS_INTEGER:=2147483647; BEGIN n:=n+1; RETURN 'bad'; EXCEPTION WHEN VALUE_ERROR THEN RETURN 'wrong handler'; WHEN OTHERS THEN RETURN SQLERRM; END;");
+    assert_eq!(
+        call(&arithmetic, &[]).unwrap(),
+        Value::Text("ORA-01426: numeric overflow".into())
+    );
+}

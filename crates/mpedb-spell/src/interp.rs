@@ -482,6 +482,13 @@ pub fn run(
             Op::OracleReraise => {
                 return Err(caught.pop().ok_or_else(|| rt_err("RAISE has no active exception"))?.error);
             }
+            Op::OracleNotNull => {
+                match stack.last().expect("validated") {
+                    PValue::Scalar(Value::Null) => return Err(Error::Oracle {code:6502,message:"PL/SQL: value or conversion error".into()}),
+                    PValue::Scalar(_) => {},
+                    _ => return Err(type_err("NOT NULL requires a scalar value")),
+                }
+            }
             Op::OracleRaise(code) => return Err(oracle_exception::named(code)),
             Op::OracleSqlCode => stack.push(PValue::Scalar(Value::Numeric(oracle_exception::sqlcode(&caught)?.to_string()))),
             Op::OracleSqlErrm => stack.push(PValue::Scalar(Value::Text(oracle_exception::sqlerrm(&caught)?))),

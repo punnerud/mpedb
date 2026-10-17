@@ -10,7 +10,7 @@
 //!    Requires `python3.12` and a built module
 //!    (`cargo build --release -p mpedb-py`; the test picks up
 //!    `target/release/libmpedb_py.so`, or set `MPEDB_PY_MODULE` to a
-//!    ready-made `mpedb.so`). Skipped loudly if unavailable.
+//!    ready-made `_native.so`). All three arms are required when explicitly run.
 //! 2. **proc-materializing** — Python-subset proc: `db.query` builds the
 //!    full interpreter list-of-tuples, a `while` loop sums it. Needs a
 //!    raised instruction budget (the default 1M dies at ~62k rows — by
@@ -242,14 +242,13 @@ def sum_stream():
     println!(
         "|--------------------|-------------------|-----------|--------------------------------|"
     );
-    if let Some((py_min, py_mean, traced, maxrss_kb)) = py {
+    let (py_min, py_mean, traced, maxrss_kb) = py;
+    {
         println!(
             "| client-python      | {py_min:>17.1} | {py_mean:>9.1} | {} tracemalloc rows-list peak (process ru_maxrss {} MiB) |",
             human(traced),
             maxrss_kb / 1024
         );
-    } else {
-        println!("| client-python      |            (skipped: python3.12 or mpedb.so unavailable) |");
     }
     println!(
         "| proc-materializing | {mat_min:>17.1} | {mat_mean:>9.1} | {} heap peak delta |",
@@ -274,13 +273,13 @@ def sum_stream():
 }
 
 /// Run the client-python phase in a subprocess; returns
-/// (min ms, mean ms, tracemalloc peak bytes, ru_maxrss KiB) or None if the
-/// environment lacks python3.12 / the module.
+/// (min ms, mean ms, tracemalloc peak bytes, ru_maxrss KiB). Prerequisite or
+/// script failures fail the explicitly requested three-way test.
 fn python_phase(
     db_path: &Path,
     toml: &str,
     expected: i64,
-) -> Option<(f64, f64, usize, usize)> {
+) -> (f64, f64, usize, usize) {
     // Locate a built module: MPEDB_PY_MODULE=<path to .so>, else the
     // workspace's target/release/libmpedb_py.so.
     let module = std::env::var("MPEDB_PY_MODULE").map(PathBuf::from).ok().or_else(|| {
@@ -288,19 +287,22 @@ fn python_phase(
             .join("../../target/release/libmpedb_py.so");
         p.exists().then_some(p)
     });
-    let Some(module) = module else {
-        eprintln!(
-            "SKIPPING client-python phase: no mpedb python module found \
-             (build with `cargo build --release -p mpedb-py` or set MPEDB_PY_MODULE)"
-        );
-        return None;
-    };
-    // Stage <scratch>/mpedb.so + config so `import mpedb` resolves.
+    let module = module.expect("client-python phase requires a built mpedb-py module; build it and set MPEDB_PY_MODULE");
+    // Stage the current package layout, whose extension exports PyInit__native.
+    // A legacy standalone mpedb.so hid a broken Python arm behind a skip.
     let scratch = db_path.with_extension("scratch");
-    std::fs::create_dir_all(&scratch).ok()?;
-    std::fs::copy(&module, scratch.join("mpedb.so")).ok()?;
+    let package = scratch.join("mpedb");
+    std::fs::create_dir_all(&package).expect("stage Python benchmark package");
+    let wrappers = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mpedb-py/python/mpedb");
+    for entry in std::fs::read_dir(wrappers).expect("read Python package wrappers") {
+        let entry = entry.expect("read Python wrapper entry");
+        if entry.path().extension().is_some_and(|ext|ext=="py") {
+            std::fs::copy(entry.path(),package.join(entry.file_name())).expect("stage Python wrapper");
+        }
+    }
+    std::fs::copy(&module, package.join("_native.so")).expect("stage native Python module");
     let cfg = scratch.join("db.toml");
-    std::fs::write(&cfg, toml).ok()?;
+    std::fs::write(&cfg, toml).expect("stage Python benchmark config");
 
     let script = format!(
         r#"
@@ -345,17 +347,8 @@ print("MAXRSS_KB", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
         .output();
     let out = match out {
         Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            eprintln!(
-                "SKIPPING client-python phase: script failed\n{}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            return None;
-        }
-        Err(e) => {
-            eprintln!("SKIPPING client-python phase: cannot run python3.12: {e}");
-            return None;
-        }
+        Ok(o) => panic!("client-python benchmark failed:\n{}",String::from_utf8_lossy(&o.stderr)),
+        Err(e) => panic!("client-python phase requires python3.12: {e}"),
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut times: Vec<f64> = Vec::new();
@@ -373,11 +366,9 @@ print("MAXRSS_KB", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
             maxrss = rest.trim().parse().unwrap_or(0);
         }
     }
-    if times.is_empty() {
-        eprintln!("SKIPPING client-python phase: unparseable output:\n{stdout}");
-        return None;
-    }
+    assert_eq!(times.len(),RUNS,"incomplete Python benchmark output: {stdout}");
+    assert!(times.iter().all(|t|t.is_finite() && *t>=0.0) && traced>0 && maxrss>0,"invalid Python benchmark metrics: {stdout}");
     let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
     let mean = times.iter().sum::<f64>() / times.len() as f64;
-    Some((min, mean, traced, maxrss))
+    (min, mean, traced, maxrss)
 }

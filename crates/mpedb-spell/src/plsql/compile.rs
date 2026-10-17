@@ -39,6 +39,7 @@ struct Local {
     slot: u16,
     ty: Type,
     writable: bool,
+    not_null: bool,
 }
 
 struct Parser<'a> {
@@ -231,21 +232,32 @@ impl Parser<'_> {
             let name = self.identifier()?;
             let constant = self.word("CONSTANT");
             let ty = self.data_type(true)?;
-            if self.word("NOT") {
-                return Err(self.error("NOT NULL variable constraints are not implemented"));
+            let not_null = self.word("NOT");
+            if not_null {
+                self.want_word("NULL")?;
             }
             if self.symbol(":=") || self.word("DEFAULT") {
                 let actual = self.expression()?;
                 self.compatible(ty, actual)?;
+                if not_null && actual.is_none() {
+                    return Err(self.error("a NOT NULL variable cannot be initialized with literal NULL"));
+                }
             } else {
+                if not_null {
+                    return Err(self.error("a NOT NULL declaration requires an initializer"));
+                }
                 if constant {
                     return Err(self.error("a CONSTANT declaration requires an initializer"));
                 }
                 self.constant(Value::Null)?;
             }
             self.builder.emit(ty.check())?;
+            if not_null {
+                self.builder.emit(Op::OracleNotNull)?;
+            }
             self.pending_declarations.remove(&name);
-            let slot = self.add_local(name, ty, !constant)?;
+            let slot = self.add_local(name.clone(), ty, !constant)?;
+            self.locals.get_mut(&name).unwrap().not_null = not_null;
             self.builder.emit(Op::StoreLocal(slot))?;
             self.want_symbol(";")?;
         }
@@ -414,8 +426,15 @@ impl Parser<'_> {
             return Err(self.error("duplicate parameter or variable name"));
         }
         let slot = self.builder.alloc_local()?;
-        self.locals.insert(name, Local { slot, ty, writable });
+        self.locals.insert(name, Local { slot, ty, writable, not_null: false });
         Ok(slot)
+    }
+    fn emit_local_check(&mut self, local: Local) -> Result<()> {
+        self.builder.emit(local.ty.check())?;
+        if local.not_null {
+            self.builder.emit(Op::OracleNotNull)?;
+        }
+        Ok(())
     }
     fn constant(&mut self, value: Value) -> Result<()> {
         let slot = self.builder.const_idx(value)?;
@@ -568,7 +587,10 @@ impl Parser<'_> {
         self.want_symbol(":=")?;
         let actual = self.expression()?;
         self.compatible(local.ty, actual)?;
-        self.builder.emit(local.ty.check())?;
+        if local.not_null && actual.is_none() {
+            return Err(self.error("a NOT NULL variable cannot be assigned literal NULL"));
+        }
+        self.emit_local_check(local)?;
         self.builder.emit(Op::StoreLocal(local.slot))?;
         self.want_symbol(";")
     }

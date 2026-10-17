@@ -38,8 +38,7 @@ pub(super) fn semantic(error: Error, op: Op) -> std::result::Result<Error, Error
         Error::ArithmeticOverflow
             if matches!(
                 op,
-                Op::OracleNumberConstraint { .. }
-                    | Op::OracleIntAdd
+                Op::OracleIntAdd
                     | Op::OracleIntSub
                     | Op::OracleIntMul
                     | Op::OracleIntNeg
@@ -47,8 +46,9 @@ pub(super) fn semantic(error: Error, op: Op) -> std::result::Result<Error, Error
                     | Op::OraclePlSqlLoopBound
             ) =>
         {
-            6502
+            1426
         }
+        Error::ArithmeticOverflow if matches!(op, Op::OracleNumberConstraint { .. }) => 6502,
         Error::TypeMismatch(_)
             if matches!(
                 op,
@@ -66,7 +66,11 @@ pub(super) fn semantic(error: Error, op: Op) -> std::result::Result<Error, Error
     };
     Ok(Error::Oracle {
         code,
-        message: error.to_string(),
+        message: if code == 1426 {
+            "numeric overflow".into()
+        } else {
+            error.to_string()
+        },
     })
 }
 
