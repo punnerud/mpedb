@@ -265,6 +265,18 @@ update without reapplying DML. The measured Oracle reference normalizes submitte
 that sign loss is detected and the entire write is rolled back rather than
 silently accepted. Shared postimage/ACK regression tests remain green.
 
+The full external mirror-library run also exercises PostgreSQL and SQLite,
+including the 100-round authority-switch drill. It exposed a PostgreSQL DATE
+write-back bug: the importer stores days, but the pusher treated them as
+microseconds. DATE now uses day arithmetic. Timestamp writes split whole days
+and sub-day microseconds instead of converting the epoch through float8, and
+construct naive/UTC values explicitly so session timezones cannot shift them.
+TIME retains PostgreSQL's distinct 24:00:00 value. A live PostgreSQL regression
+covers BC/year-9999 dates, exact microseconds, NULL, end-of-day and different
+import/push timezones. NUMERIC reflection/preflight fixtures use the actual
+Numeric carrier rather than stale Text expectations. All 14 external functional
+library tests pass with none skipped in that run.
+
 The large-value import test also found and fixed a shared storage bug:
 `row::encoded_len` omitted NUMERIC's variable-length body. This caused large
 NUMBER/LOB rows to fail extent insertion. A source-independent MPEdb regression

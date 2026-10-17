@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(r[0][0], Value::Int(30));
         assert_eq!(r[0][1], Value::Bool(true));
         assert_eq!(r[0][2], Value::Float(1.5));
-        assert_eq!(r[0][3], Value::Text("12.34".into())); // numeric -> canonical text
+        assert_eq!(r[0][3], Value::Numeric("12.34".into())); // exact decimal carrier
         // NULL preserved
         let r = rows(&db, "SELECT age FROM users WHERE id=$1", &[Value::Int(2)]);
         assert_eq!(r[0][0], Value::Null);
@@ -564,10 +564,8 @@ mod tests {
         assert_eq!(col("sku").source_type, "character varying(64)");
 
         // and the honest verdicts
-        // Exact since `numeric` became a type of its own: the digits AND the
-        // scale survive, so there is no text form in the middle to be honest
-        // about. (This test is `#[ignore]`d for want of a PostgreSQL, which is
-        // why the claim had to be corrected by hand rather than by a red run.)
+        // Numeric carriers retain both digits and scale. This assertion is
+        // exercised against PostgreSQL by the external functional test run.
         assert_eq!(col("price").policy, MapPolicy::Exact, "numeric is an exact decimal now");
         assert_eq!(col("qty").policy, MapPolicy::Widened, "int4->Int64: a local write can overflow it");
         assert_eq!(col("made").policy, MapPolicy::Exact);
@@ -604,14 +602,14 @@ mod tests {
         assert!(preflight(&db).unwrap().findings.is_empty());
 
         // Local writes mpedb accepts: int4 became Int64, varchar(4) became Text,
-        // numeric(5,2) became Text. All legal here, none legal at the source.
+        // numeric(5,2) became unconstrained Numeric. All legal here, none legal at the source.
         db.query(
             "INSERT INTO w (id, qty, code, price) VALUES ($1, $2, $3, $4)",
             &[
                 Value::Int(2),
                 Value::Int(2_147_483_648),
                 Value::Text("ok".into()),
-                Value::Text("1.00".into()),
+                Value::Numeric("1.00".into()),
             ],
         )
         .unwrap();
@@ -621,7 +619,7 @@ mod tests {
                 Value::Int(3),
                 Value::Int(1),
                 Value::Text("waytoolong".into()),
-                Value::Text("123456.00".into()),
+                Value::Numeric("123456.00".into()),
             ],
         )
         .unwrap();

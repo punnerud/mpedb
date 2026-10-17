@@ -11,6 +11,7 @@
 //! drained each round (so advancing the snapshot never skips an entry); bounded
 //! batching within a window is a later refinement.
 
+mod temporal;
 use std::collections::BTreeMap;
 
 use mpedb_types::{keycode, ColumnType, Error, Result, Value};
@@ -556,10 +557,7 @@ fn pg_value_expr(c: &PgColumn, idx: usize) -> String {
         "int2" | "int4" | "int8" | "float4" | "float8" | "bool" | "text" | "varchar" | "bpchar"
         | "name" | "citext" | "numeric" | "json" | "jsonb" | "uuid" => format!("{p}::{}", c.pg_type),
         "bytea" => format!("decode({p}, 'hex')"),
-        "timestamptz" => format!("to_timestamp({p}::float8 / 1000000.0)"),
-        "timestamp" => format!("to_timestamp({p}::float8 / 1000000.0)::timestamp"),
-        "date" => format!("to_timestamp({p}::float8 / 1000000.0)::date"),
-        "time" => format!("(time '00:00:00' + ({p}::bigint) * interval '1 microsecond')"),
+        "timestamptz" | "timestamp" | "date" | "time" => temporal::bind_expr(&c.pg_type, &p),
         other => format!("{p}::{other}"),
     }
 }

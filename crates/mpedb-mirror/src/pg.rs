@@ -358,9 +358,9 @@ mod tests {
 
         let schema = build_schema(&tables).unwrap();
         assert_eq!(schema.tables.len(), 2);
-        // orders.amount numeric → Text
+        // orders.amount remains an exact numeric carrier
         let orders = schema.tables.iter().find(|t| t.name == "orders").unwrap();
-        assert_eq!(orders.columns[1].ty, ColumnType::Text);
+        assert_eq!(orders.columns[1].ty, ColumnType::Numeric);
     }
 
     #[test]
