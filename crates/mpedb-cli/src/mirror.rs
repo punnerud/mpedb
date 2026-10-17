@@ -114,7 +114,13 @@ fn open_source(
             a.install_triggers()?;
             Box::new(a)
         }
-        SourceSpec::Oracle { .. } => return Err(Failure::Runtime("This Oracle command is not enabled; oracle-source builds support import and bounded pull, while production push/cutover remain unavailable".into())),
+        SourceSpec::Oracle { .. } => {
+            return Err(Failure::Runtime(
+                "This Oracle command is not enabled. oracle-source builds support import, \
+                 bounded pull, and push after --pin-ledgers. Sync and cutover remain unavailable"
+                    .into(),
+            ));
+        }
     };
     match recover(&db, adapter.as_mut())? {
         Recovered::Steady => {}
@@ -128,8 +134,12 @@ mpedb mirror <subcommand>
 
   import  (--source <sqlite-file> | --source-config <file>) --dest <new-mpedb-file>
           [--include t1,t2] [--exclude t3] [--size_mb N] [--durability none|commit|wal]
-          [--adapt exact|lossy]
+          [--adapt exact|lossy] [--pin-ledgers]
       Import sqlite, PostgreSQL, or Oracle (feature oracle-source) into a NEW mirror.
+      --pin-ledgers is Oracle-only. It creates the receipt and origin ledgers
+      before the snapshot so later `mirror push` can write those tables back.
+      Without it an Oracle import stays read-only. Sync and authority switch
+      stay unavailable either way.
       sqlite's declared types are affinities, not constraints, so a column may
       hold off-type values. By DEFAULT one of those fails the import (loudly,
       while you are watching). --adapt exact coerces only what parses WHOLLY and
@@ -187,7 +197,9 @@ SOURCE SELECTION
       Pull + apply source changes into mpedb until caught up.
 
   push    --db <mpedb-file> [--source <sqlite-file> | --source-config <file>]
-      Push local mpedb changes back to the source.
+      Push local mpedb changes back to the source. Oracle push sends one
+      durable request per round. It requires --pin-ledgers at import and
+      matching source authority, and it does not switch authority.
 
   sync    --db <mpedb-file> [--source <sqlite-file> | --source-config <file>]
       Pull then push (respecting which side is authoritative).
@@ -327,6 +339,18 @@ fn cmd_pull(argv: &[String]) -> CliResult {
 
 fn cmd_push(argv: &[String]) -> CliResult {
     let p = args::parse(argv, &["source", "db", "source-config"], &[])?;
+    #[cfg(feature = "oracle-source")]
+    if let Some(stats) = oracle_cli::push(p.require("db")?, &p)? {
+        println!("pushed {} row change(s) to the source", stats.upserts + stats.deletes);
+        if stats.conflicts > 0 {
+            println!(
+                "{} change(s) parked (the source concurrently won) — run `pull` to \
+                 resolve source-wins, or `conflicts` to inspect",
+                stats.conflicts
+            );
+        }
+        return Ok(());
+    }
     let (db, mut a) = open_source(p.require("db")?, &p)?;
     let s = drain_push(&db, a.as_mut())?;
     println!("pushed {} row change(s) to the source", s.upserts + s.deletes);
@@ -404,7 +428,7 @@ fn cmd_import(argv: &[String]) -> CliResult {
             "source", "dest", "include", "exclude", "size_mb", "durability", "adapt",
             "source-config",
         ],
-        &[],
+        &["pin-ledgers"],
     )?;
     let dest = PathBuf::from(p.require("dest")?);
     // Import is the one command with no mirror to read `mir/src` from, so the
@@ -418,6 +442,9 @@ fn cmd_import(argv: &[String]) -> CliResult {
             ))
         }
     };
+    if p.has("pin-ledgers") && !matches!(spec, SourceSpec::Oracle { .. }) {
+        return usage("--pin-ledgers applies only to an Oracle import");
+    }
 
     let include = p
         .value("include")
@@ -470,7 +497,7 @@ fn cmd_import(argv: &[String]) -> CliResult {
         }
         SourceSpec::Oracle { .. } => {
             #[cfg(feature = "oracle-source")]
-            { oracle_cli::import(&spec, &dest, &opts)? }
+            { oracle_cli::import(&spec, &dest, &opts, p.has("pin-ledgers"))? }
             #[cfg(not(feature = "oracle-source"))]
             { return Err(Failure::Runtime("Oracle import requires a build with --features oracle-source".into())); }
         },

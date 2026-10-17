@@ -1306,3 +1306,22 @@ fn a_plpgsql_function_can_be_created_called_and_dropped_over_sql() {
     assert!(!run(&[db_s, "DROP FUNCTION dbl"]).status.success());
     assert!(run(&[db_s, "DROP FUNCTION IF EXISTS dbl"]).status.success());
 }
+
+#[test]
+fn oracle_pin_ledgers_flag_is_rejected_for_sqlite() {
+    let out = run(&[
+        "mirror",
+        "import",
+        "--source",
+        "no-such.sqlite",
+        "--dest",
+        "no-such.mpedb",
+        "--pin-ledgers",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        text.contains("--pin-ledgers applies only to an Oracle import"),
+        "{text}"
+    );
+}

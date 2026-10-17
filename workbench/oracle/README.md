@@ -124,8 +124,9 @@ existing-destination rejection, altered content and truncated chunks. A native
 that capacity failure leaves no published destination or staging directory.
 Individual row/LOB carrier values are still materialized in memory; the import
 no longer retains the entire snapshot. CLI import and bounded pull are exposed
-by the opt-in CLI feature described below. Prepared imports also support the
-Rust durable push API; the continuous migration controller remains unfinished. SQL execution uses MPEdb's strict grouping mode, which does
+by the opt-in CLI feature described below. Prepared imports support the Rust
+durable push API and `mpedb mirror push`; the continuous migration controller
+remains unfinished. SQL execution uses MPEdb's strict grouping mode, which does
 not imply full Oracle SQL-dialect compatibility.
 
 The CLI exposes Oracle import and bounded pull when built with `oracle-source`
@@ -135,7 +136,9 @@ and the public OCI client available to the linker/runtime:
 cargo build -p mpedb-cli --features oracle-source
 # oracle.toml is a private 0600 SourceSpec file; credentials never go in argv.
 target/debug/mpedb mirror import --source-config oracle.toml --dest app.mpedb
+target/debug/mpedb mirror import --source-config oracle.toml --dest app.mpedb --pin-ledgers
 target/debug/mpedb mirror pull --db app.mpedb
+target/debug/mpedb mirror push --db app.mpedb
 target/debug/mpedb mirror status --db app.mpedb
 ```
 
@@ -143,10 +146,14 @@ Import records only the config file's path. Pull captures ONE source head and
 uses `OracleAdapter::pull_through`, so background/unrelated commits cannot keep
 the command draining indefinitely. It cold-resumes the persisted cursor, checks
 matching source authority, and refuses epoch mismatches instead of attempting
-an unsupported automatic Oracle cutover recovery. Native subprocess tests cover
-import, key moves, empty drains, status, secret redaction and epoch rejection;
-the default CLI still builds without Oracle/OCI. Push, switch and the remaining
-Oracle both-sides CLI commands stay explicitly unavailable.
+an unsupported automatic Oracle cutover recovery. `--pin-ledgers` prepares the
+receipt and origin ledgers before that snapshot. `mirror push` then sends one
+durable request per round and refuses a file that did not pin them. It uses
+the same authority check as pull and does not run cutover recovery. Native
+subprocess tests cover import, key moves, empty drains, status, secret
+redaction, epoch rejection, unpinned-push refusal, a pinned push, and sync
+or switch refusal. The default CLI still builds without Oracle/OCI. Sync,
+switch, verify, reconcile and conflict resolution stay explicitly unavailable.
 
 A native component test now runs both real engines: Oracle import → MPEdb
 PL/SQL Boolean lens/rRETL → PostgreSQL, then PostgreSQL changes → a second
@@ -196,9 +203,9 @@ for statement reuse. Native tests cover compound-PK changes, multi-table commits
 first inserts into empty tables, stale cursors, epoch mismatches, cold resume and
 DDL fences. The shared apply path now enforces source epochs when provided;
 legacy adapters that supply None retain their existing behavior.
-Oracle mirror push is now available through the shared `push_batch` Rust API
-when both tracking ledgers were pinned at import. MPEdb authority cutover
-remains gated pending its source-writer fence; CLI push/sync wiring is separate.
+Oracle mirror push is available through `push_batch` and `mpedb mirror push`
+when both tracking ledgers were pinned at import (`--pin-ledgers`). MPEdb
+authority cutover remains gated; `mirror sync` and `mirror switch` stay refused.
 
 `OracleSource::prepare_write_ledger` and `write_batch_receipted` now provide the
 low-level durable write primitive. Application writes and a BLAKE3-checked BLOB
