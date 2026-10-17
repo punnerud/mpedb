@@ -19,8 +19,8 @@ impl Type {
     fn check(self) -> Op {
         match self {
             Self::Boolean => Op::SqlBool,
-            Self::Number => Op::OracleNumber,
-            Self::PlsInteger => Op::OracleInteger,
+            Self::Number => Op::OraclePlSqlNumber,
+            Self::PlsInteger => Op::OraclePlSqlInteger,
             Self::Varchar(limit) => Op::OracleVarchar(limit),
             Self::CharLiteral => Op::OracleVarchar(0),
         }
@@ -554,12 +554,12 @@ impl Parser<'_> {
         let upper = self.builder.alloc_local()?;
         let ty = self.expression()?;
         self.compatible(Type::Number, ty)?;
-        self.builder.emit(Op::OracleLoopBound)?;
+        self.builder.emit(Op::OraclePlSqlLoopBound)?;
         self.builder.emit(Op::StoreLocal(lower))?;
         self.want_symbol("..")?;
         let ty = self.expression()?;
         self.compatible(Type::Number, ty)?;
-        self.builder.emit(Op::OracleLoopBound)?;
+        self.builder.emit(Op::OraclePlSqlLoopBound)?;
         self.builder.emit(Op::StoreLocal(upper))?;
         self.want_word("LOOP")?;
         let limit = if reverse { lower } else { upper };
@@ -722,9 +722,9 @@ impl Parser<'_> {
         let mut ty = self.multiplicative()?;
         loop {
             let op = if self.symbol("+") {
-                Op::OracleAdd
+                Op::OraclePlSqlAdd
             } else if self.symbol("-") {
-                Op::OracleSub
+                Op::OraclePlSqlSub
             } else if self.symbol("||") {
                 Op::OracleConcat
             } else {
@@ -742,7 +742,7 @@ impl Parser<'_> {
                 && matches!(ty, None | Some(Type::PlsInteger))
                 && matches!(right, None | Some(Type::PlsInteger));
             let op = if integer {
-                if op == Op::OracleAdd {
+                if op == Op::OraclePlSqlAdd {
                     Op::OracleIntAdd
                 } else {
                     Op::OracleIntSub
@@ -759,16 +759,16 @@ impl Parser<'_> {
         let mut ty = self.unary()?;
         loop {
             let op = if self.symbol("*") {
-                Op::OracleMul
+                Op::OraclePlSqlMul
             } else if self.symbol("/") {
-                Op::OraclePlSqlDiv
+                Op::OraclePlSqlDivide
             } else {
                 break;
             };
             self.compatible(Type::Number, ty)?;
             let right = self.unary()?;
             self.compatible(Type::Number, right)?;
-            let integer = op == Op::OracleMul
+            let integer = op == Op::OraclePlSqlMul
                 && matches!(ty, None | Some(Type::PlsInteger))
                 && matches!(right, None | Some(Type::PlsInteger));
             self.builder
@@ -802,7 +802,7 @@ impl Parser<'_> {
             self.builder.emit(if ty == Some(Type::PlsInteger) {
                 Op::OracleIntNeg
             } else {
-                Op::OracleNeg
+                Op::OraclePlSqlNeg
             })?;
         }
         Ok(if signed && ty.is_none() {
@@ -848,6 +848,8 @@ impl Parser<'_> {
                 .parse::<i32>()
                 .ok()
                 .filter(|_| text.bytes().all(|c| c.is_ascii_digit()));
+            crate::interp::validate_oracle_number_literal(&value)
+                .map_err(|_| self.error("NUMBER literal is outside Oracle's finite range"))?;
             self.at += 1;
             if let Some(integer) = integer {
                 self.constant(Value::Int(integer as i64))?;

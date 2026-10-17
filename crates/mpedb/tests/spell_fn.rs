@@ -207,6 +207,19 @@ fn plsql_integer_for_routines_survive_shared_plan_linking_and_overflow_checks() 
 }
 
 #[test]
+fn plsql_number_specials_preserve_identity_through_shared_sql_plans() {
+    let (d, path) = db("plsql-specials");
+    d.create_function(SpellLang::PlSql, "CREATE FUNCTION oracle_overflow(p NUMBER) RETURN NUMBER IS BEGIN RETURN p * 1e125; END;").unwrap();
+    let hash = d.prepare("SELECT oracle_overflow($1)").unwrap();
+    let attached = Database::open_from_file(std::path::Path::new(&path)).unwrap();
+    for (input, expected) in [("1e125", "Infinity"), ("-1e125", "-Infinity")] {
+        assert_eq!(rows(attached.execute(&hash, &[Value::Numeric(input.into())]).unwrap()), vec![vec![Value::Numeric(expected.into())]]);
+    }
+    assert_eq!(rows(attached.execute(&hash, &[Value::Null]).unwrap()), vec![vec![Value::Null]]);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn procedure_and_out_signatures_cannot_be_registered_as_scalar_sql_functions() {
     let (d, path) = db("plsql-signature");
     for source in [

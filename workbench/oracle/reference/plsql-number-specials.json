@@ -1,0 +1,721 @@
+{
+  "oracle_version": "23.26.3.0.0",
+  "results": [
+    {
+      "expression": "p + p",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p - p",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "p * p",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p / p",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p + m",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "p - m",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p * m",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "p / m",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "p + -1",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p - -1",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p * -1",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "p / -1",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "p + 0",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p - 0",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p * 0",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "p / 0",
+      "error_code": 1476
+    },
+    {
+      "expression": "p + 1",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p - 1",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p * 1",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p / 1",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "p + NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "p - NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "p * NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "p / NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "m + p",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m - p",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m * p",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m / p",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m + m",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m - m",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "m * m",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "m / m",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "m + -1",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m - -1",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m * -1",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "m / -1",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "m + 0",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m - 0",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m * 0",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "m / 0",
+      "error_code": 1476
+    },
+    {
+      "expression": "m + 1",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m - 1",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m * 1",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m / 1",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "m + NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "m - NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "m * NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "m / NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "-1 + p",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "-1 - p",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "-1 * p",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "-1 / p",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "-1 + m",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "-1 - m",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "-1 * m",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "-1 / m",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "-1 + -1",
+      "value": "-2",
+      "dump": "Typ=2 Len=3: 3e,63,66"
+    },
+    {
+      "expression": "-1 - -1",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "-1 * -1",
+      "value": "1",
+      "dump": "Typ=2 Len=2: c1,2"
+    },
+    {
+      "expression": "-1 / -1",
+      "value": "1",
+      "dump": "Typ=2 Len=2: c1,2"
+    },
+    {
+      "expression": "-1 + 0",
+      "value": "-1",
+      "dump": "Typ=2 Len=3: 3e,64,66"
+    },
+    {
+      "expression": "-1 - 0",
+      "value": "-1",
+      "dump": "Typ=2 Len=3: 3e,64,66"
+    },
+    {
+      "expression": "-1 * 0",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "-1 / 0",
+      "error_code": 1476
+    },
+    {
+      "expression": "-1 + 1",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "-1 - 1",
+      "value": "-2",
+      "dump": "Typ=2 Len=3: 3e,63,66"
+    },
+    {
+      "expression": "-1 * 1",
+      "value": "-1",
+      "dump": "Typ=2 Len=3: 3e,64,66"
+    },
+    {
+      "expression": "-1 / 1",
+      "value": "-1",
+      "dump": "Typ=2 Len=3: 3e,64,66"
+    },
+    {
+      "expression": "-1 + NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "-1 - NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "-1 * NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "-1 / NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "0 + p",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "0 - p",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "0 * p",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 / p",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 + m",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "0 - m",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "0 * m",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 / m",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 + -1",
+      "value": "-1",
+      "dump": "Typ=2 Len=3: 3e,64,66"
+    },
+    {
+      "expression": "0 - -1",
+      "value": "1",
+      "dump": "Typ=2 Len=2: c1,2"
+    },
+    {
+      "expression": "0 * -1",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 / -1",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 + 0",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 - 0",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 * 0",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 / 0",
+      "error_code": 1476
+    },
+    {
+      "expression": "0 + 1",
+      "value": "1",
+      "dump": "Typ=2 Len=2: c1,2"
+    },
+    {
+      "expression": "0 - 1",
+      "value": "-1",
+      "dump": "Typ=2 Len=3: 3e,64,66"
+    },
+    {
+      "expression": "0 * 1",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 / 1",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "0 + NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "0 - NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "0 * NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "0 / NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "1 + p",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "1 - p",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "1 * p",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "1 / p",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "1 + m",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "1 - m",
+      "value": "Infinity",
+      "dump": "Typ=2 Len=2: ff,65"
+    },
+    {
+      "expression": "1 * m",
+      "value": "-Infinity",
+      "dump": "Typ=2 Len=1: 0"
+    },
+    {
+      "expression": "1 / m",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "1 + -1",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "1 - -1",
+      "value": "2",
+      "dump": "Typ=2 Len=2: c1,3"
+    },
+    {
+      "expression": "1 * -1",
+      "value": "-1",
+      "dump": "Typ=2 Len=3: 3e,64,66"
+    },
+    {
+      "expression": "1 / -1",
+      "value": "-1",
+      "dump": "Typ=2 Len=3: 3e,64,66"
+    },
+    {
+      "expression": "1 + 0",
+      "value": "1",
+      "dump": "Typ=2 Len=2: c1,2"
+    },
+    {
+      "expression": "1 - 0",
+      "value": "1",
+      "dump": "Typ=2 Len=2: c1,2"
+    },
+    {
+      "expression": "1 * 0",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "1 / 0",
+      "error_code": 1476
+    },
+    {
+      "expression": "1 + 1",
+      "value": "2",
+      "dump": "Typ=2 Len=2: c1,3"
+    },
+    {
+      "expression": "1 - 1",
+      "value": "0",
+      "dump": "Typ=2 Len=1: 80"
+    },
+    {
+      "expression": "1 * 1",
+      "value": "1",
+      "dump": "Typ=2 Len=2: c1,2"
+    },
+    {
+      "expression": "1 / 1",
+      "value": "1",
+      "dump": "Typ=2 Len=2: c1,2"
+    },
+    {
+      "expression": "1 + NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "1 - NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "1 * NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "1 / NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL + p",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL - p",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL * p",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL / p",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL + m",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL - m",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL * m",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL / m",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL + -1",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL - -1",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL * -1",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL / -1",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL + 0",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL - 0",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL * 0",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL / 0",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL + 1",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL - 1",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL * 1",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL / 1",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL + NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL - NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL * NULL",
+      "value": null,
+      "dump": "NULL"
+    },
+    {
+      "expression": "NULL / NULL",
+      "value": null,
+      "dump": "NULL"
+    }
+  ],
+  "method": "NUMBER specials produced by multiplying bound 1e125 at runtime; values identified using public SQL DUMP."
+}

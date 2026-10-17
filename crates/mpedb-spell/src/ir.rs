@@ -145,6 +145,15 @@ pub enum Op {
     OracleDiv,
     /// PL/SQL division returns zero on underflow; legacy SQL-style op stays unchanged.
     OraclePlSqlDiv,
+    /// PL/SQL NUMBER special-value rules, versioned separately from finite ops.
+    OraclePlSqlNumber,
+    OraclePlSqlAdd,
+    OraclePlSqlSub,
+    OraclePlSqlMul,
+    OraclePlSqlDivide,
+    OraclePlSqlNeg,
+    OraclePlSqlInteger,
+    OraclePlSqlLoopBound,
     OracleNeg,
     /// VARCHAR2 normalization. Low 15 bits: length (0 = unconstrained);
     /// high bit: CHAR semantics rather than BYTE. Absolute maximum 32767 bytes.
@@ -287,6 +296,14 @@ const OP_ORACLE_INT_SUB: u8 = 70;
 const OP_ORACLE_INT_MUL: u8 = 71;
 const OP_ORACLE_INT_NEG: u8 = 72;
 const OP_ORACLE_PLSQL_DIV: u8 = 73;
+const OP_PLSQL_NUMBER: u8 = 74;
+const OP_PLSQL_ADD: u8 = 75;
+const OP_PLSQL_SUB: u8 = 76;
+const OP_PLSQL_MUL: u8 = 77;
+const OP_PLSQL_DIV: u8 = 78;
+const OP_PLSQL_NEG: u8 = 79;
+const OP_PLSQL_INTEGER: u8 = 80;
+const OP_PLSQL_LOOP_BOUND: u8 = 81;
 
 
 
@@ -534,6 +551,14 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleMul => b.push(OP_ORACLE_MUL),
         Op::OracleDiv => b.push(OP_ORACLE_DIV),
         Op::OraclePlSqlDiv => b.push(OP_ORACLE_PLSQL_DIV),
+        Op::OraclePlSqlNumber => b.push(OP_PLSQL_NUMBER),
+        Op::OraclePlSqlAdd => b.push(OP_PLSQL_ADD),
+        Op::OraclePlSqlSub => b.push(OP_PLSQL_SUB),
+        Op::OraclePlSqlMul => b.push(OP_PLSQL_MUL),
+        Op::OraclePlSqlDivide => b.push(OP_PLSQL_DIV),
+        Op::OraclePlSqlNeg => b.push(OP_PLSQL_NEG),
+        Op::OraclePlSqlInteger => b.push(OP_PLSQL_INTEGER),
+        Op::OraclePlSqlLoopBound => b.push(OP_PLSQL_LOOP_BOUND),
         Op::OracleNeg => b.push(OP_ORACLE_NEG),
         Op::OracleVarchar(limit) => u16arg(OP_ORACLE_VARCHAR, limit),
         Op::OracleLoopBound => b.push(OP_ORACLE_LOOP_BOUND),
@@ -630,6 +655,14 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_MUL => Op::OracleMul,
         OP_ORACLE_DIV => Op::OracleDiv,
         OP_ORACLE_PLSQL_DIV => Op::OraclePlSqlDiv,
+        OP_PLSQL_NUMBER => Op::OraclePlSqlNumber,
+        OP_PLSQL_ADD => Op::OraclePlSqlAdd,
+        OP_PLSQL_SUB => Op::OraclePlSqlSub,
+        OP_PLSQL_MUL => Op::OraclePlSqlMul,
+        OP_PLSQL_DIV => Op::OraclePlSqlDivide,
+        OP_PLSQL_NEG => Op::OraclePlSqlNeg,
+        OP_PLSQL_INTEGER => Op::OraclePlSqlInteger,
+        OP_PLSQL_LOOP_BOUND => Op::OraclePlSqlLoopBound,
         OP_ORACLE_NEG => Op::OracleNeg,
         OP_ORACLE_VARCHAR => Op::OracleVarchar(u16arg()?),
         OP_ORACLE_LOOP_BOUND => Op::OracleLoopBound,
@@ -685,7 +718,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg => (1, 1),
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg | Op::OraclePlSqlNumber | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound => (1, 1),
         Op::OracleIntAdd | Op::OracleIntSub | Op::OracleIntMul
         | Op::OracleConcat
         | Op::OracleCharEq
@@ -717,6 +750,10 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         | Op::OracleMul
         | Op::OracleDiv
         | Op::OraclePlSqlDiv
+        | Op::OraclePlSqlAdd
+        | Op::OraclePlSqlSub
+        | Op::OraclePlSqlMul
+        | Op::OraclePlSqlDivide
         | Op::SqlAnd
         | Op::SqlOr
         | Op::SqlEq

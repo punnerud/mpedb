@@ -102,3 +102,51 @@ fn plsql_underflow_instruction_does_not_change_stored_sql_style_division() {
         ProcValue::Scalar(Value::Numeric("0".into()))
     );
 }
+
+#[test]
+fn special_value_instructions_keep_finite_only_stored_routines_unchanged() {
+    let input = vec![Value::Numeric("Infinity".into())];
+    assert!(evaluate(
+        input.clone(),
+        vec![Op::LoadConst(0), Op::OracleNumber, Op::Return]
+    )
+    .is_err());
+    assert_eq!(
+        evaluate(
+            input,
+            vec![Op::LoadConst(0), Op::OraclePlSqlNumber, Op::Return]
+        )
+        .unwrap(),
+        ProcValue::Scalar(Value::Numeric("Infinity".into()))
+    );
+    let program = |op| {
+        Proc::new(
+            "overflow".into(),
+            0,
+            0,
+            vec![],
+            vec![Value::Numeric("1e125".into())],
+            vec![Op::LoadConst(0), Op::LoadConst(0), op, Op::Return],
+        )
+        .unwrap()
+    };
+    let old = program(Op::OracleMul);
+    let new = program(Op::OraclePlSqlMul);
+    assert_ne!(old.hash(), new.hash());
+    let execute = |p: Proc| {
+        run(
+            &Proc::decode(&p.encode()).unwrap(),
+            &[],
+            &mut MockBridge::new(),
+            Budget::default(),
+        )
+    };
+    assert!(matches!(
+        execute(old),
+        Err(mpedb_types::Error::ArithmeticOverflow)
+    ));
+    assert_eq!(
+        execute(new).unwrap(),
+        ProcValue::Scalar(Value::Numeric("Infinity".into()))
+    );
+}

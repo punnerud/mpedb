@@ -158,24 +158,37 @@ Runtime execution remains governed by the validated IR and instruction budgets.
 NUMBER values remain exact decimals; integer arguments are normalized at NUMBER
 parameter boundaries. Finite arithmetic uses twenty base-100 groups (39/40
 decimal digits according to exponent parity), measured against Oracle 23.26.3.
-Arithmetic uses bounded arbitrary-width integer intermediates, SQL NULL
-propagation, and proper precedence. Recurring division works: `1 / 3` retains
-forty fractional digits. The original NUMBER opcodes retain SQL-style range
-checks. New PL/SQL routines use a distinct division instruction that returns
-zero on underflow, matching the real procedural reference; already stored
-SQL-style division still raises. Literal/multiplication underflow also becomes
-zero. **PL/SQL overflow still needs separate special-value support; native
-execution currently raises rather than returning those special values.**
+Arithmetic uses bounded arbitrary-width integer intermediates, NULL propagation,
+and proper precedence. Recurring division works: `1 / 3` retains forty fractional
+digits. New PL/SQL division returns zero on underflow; already stored SQL-style
+division still raises. Literal and multiplication underflow also become zero.
 
-These NUMBER and integer instructions have distinct IR opcodes. Previously
-stored routines retain their original semantics and hashes; redefining source
-emits the new instructions. Older builds reject unknown instructions. Existing
-Python/Rust semantics and stored blobs are unchanged.
+New versioned instructions preserve Oracle's overflow specials as MPEdb
+`Numeric("Infinity")` / `Numeric("-Infinity")`, including parameter/return checks,
+serialization, and shared SQL plans. They are identified in the reference by
+public SQL `DUMP` bytes `ff,65` / `0`, not by TO_CHAR's ambiguous `#######` or a
+driver's finite +/-1e126 sentinel. NaN is not a supported Oracle NUMBER value.
+Source literals beyond the finite range fail during native compilation. Special
+values converted to PLS_INTEGER or numeric FOR bounds raise overflow.
+
+**Further arithmetic on these special values is experimental.** The initial
+anonymous-block profile yielded rules that differ from PostgreSQL/IEEE, so
+those operators have their own instructions. The broader function-wrapper
+matrix currently has 29 mismatches in 154 cases. Results differ between measured
+block/query shapes in the reference environment; this is a compatibility gap,
+not a verified universal infinity arithmetic contract. Both profiles and their
+counterexamples are retained. Generic MPEdb/PostgreSQL numeric operators are
+unchanged. Special-value identity support does not certify arithmetic on it.
+
+All new NUMBER/integer behavior has distinct IR opcodes. Previously stored
+routines retain their original semantics and hashes; redefining source emits
+new instructions. Older builds reject unknown instructions. Existing Python/
+Rust semantics and stored blobs are unchanged.
 
 The original NUMBER differential run matched Oracle SELECT results in 2016
 cases. That was SQL reference evidence, not proof of matching PL/SQL boundaries.
-The tool now compares the native PL/SQL compiler with real anonymous PL/SQL
-functions in the same context:
+The tool now uses real anonymous PL/SQL functions in the same context as the
+native frontend and inspects DUMP to retain special-value identity:
 
 ```bash
 cargo build -p mpedb-spell --example plsql_number_probe
@@ -183,21 +196,20 @@ python workbench/oracle/number_differential.py \
   --probe /path/to/target/debug/examples/plsql_number_probe \
   --native-root /path/to/private-oracle-root \
   --output /path/to/artifacts/number-report.json
+# Add --runtime-specials for the extended special-value matrix.
 ```
 
-**The corrected 2016-case NUMBER test now has 111 mismatches**, reduced from 155
-after fixing all 44 division underflows: 110 overflow results where Oracle produces special NUMBER values
-(displayed as `#######` by TO_CHAR), and one out-of-range source literal with a
-different compilation error. There were no differing returned finite values.
-Measured special representations include `DUMP` bytes `ff,65` and `0`; a driver
-may expose these as a finite sentinel, so they need explicit representation and
-provenance rather than silent numeric conversion. These remaining gaps are
-recorded, not counted as passing tests. New PL/SQL-specific range semantics must
-also preserve the meaning of already stored bytecode.
-See [Oracle NUMBER precision](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Data-Types.html).
+The corrected 2016-case NUMBER run now has **one mismatch**, reduced from 155:
+all 44 division underflows and 110 special overflow results match. The remaining
+out-of-range literal is rejected at compile time by both implementations, but
+native located errors do not yet carry Oracle's ORA-06550 code. The expanded
+154-case special-arithmetic test still has **29 mismatches** and exits with a
+failure status; those failures are not suppressed or counted as passing.
+See `reference/plsql-number-gaps.json`, `reference/plsql-number-specials.json`,
+and [Oracle NUMBER precision](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Data-Types.html).
 
 Floating-point/text-to-NUMBER conversions and NLS settings remain unimplemented.
-**Defaults, constrained types, SQL statements, calls to other routines, packages,
+**Parameter defaults, NUMBER precision/scale constraints, SQL statements, calls to other routines, packages,
 exceptions, cursors, and dynamic SQL remain unimplemented**; measured arithmetic
 agreement is not full PL/SQL compatibility.
 

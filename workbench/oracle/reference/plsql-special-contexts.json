@@ -1,0 +1,447 @@
+{
+  "oracle_version": "23.26.3.0.0",
+  "scope": "Diagnostic counterexamples; not a universal NUMBER arithmetic specification.",
+  "function_matrix_failures": [
+    {
+      "expression": "p + p",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "p - p",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\t0"
+    },
+    {
+      "expression": "p - m",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "p * m",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "p / m",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "p + -1",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "p - -1",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "p * -1",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "p / -1",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "p + 0",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "p - 0",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "p + 1",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "p - 1",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "p * 1",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "p / 1",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "m * p",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "m / p",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "m - m",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\t0"
+    },
+    {
+      "expression": "-1 + p",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "-1 - p",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "-1 * p",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "0 + p",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "0 - p",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "1 + p",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "1 - p",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "1 * p",
+      "oracle": "OK\t-Infinity",
+      "mpedb": "OK\tInfinity"
+    },
+    {
+      "expression": "-p",
+      "oracle": "OK\tInfinity",
+      "mpedb": "OK\t-Infinity"
+    },
+    {
+      "expression": "p = m",
+      "oracle": "OK\t1",
+      "mpedb": "OK\t0"
+    },
+    {
+      "expression": "p > 1e125",
+      "oracle": "OK\t0",
+      "mpedb": "OK\t1"
+    }
+  ],
+  "optimizer_level_observations": [
+    {
+      "level": 0,
+      "init": "1e125",
+      "expr": "p",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 0,
+      "init": "1e125",
+      "expr": "m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 0,
+      "init": "1e125",
+      "expr": "p-p",
+      "dump": "Typ=2 Len=1: 80",
+      "text": "0"
+    },
+    {
+      "level": 0,
+      "init": "1e125",
+      "expr": "p+m",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 0,
+      "init": "1e125",
+      "expr": "p/m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 0,
+      "init": ":base",
+      "expr": "p",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 0,
+      "init": ":base",
+      "expr": "m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 0,
+      "init": ":base",
+      "expr": "p-p",
+      "dump": "Typ=2 Len=1: 80",
+      "text": "0"
+    },
+    {
+      "level": 0,
+      "init": ":base",
+      "expr": "p+m",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 0,
+      "init": ":base",
+      "expr": "p/m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 1,
+      "init": "1e125",
+      "expr": "p",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 1,
+      "init": "1e125",
+      "expr": "m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 1,
+      "init": "1e125",
+      "expr": "p-p",
+      "dump": "Typ=2 Len=1: 80",
+      "text": "0"
+    },
+    {
+      "level": 1,
+      "init": "1e125",
+      "expr": "p+m",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 1,
+      "init": "1e125",
+      "expr": "p/m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 1,
+      "init": ":base",
+      "expr": "p",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 1,
+      "init": ":base",
+      "expr": "m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 1,
+      "init": ":base",
+      "expr": "p-p",
+      "dump": "Typ=2 Len=1: 80",
+      "text": "0"
+    },
+    {
+      "level": 1,
+      "init": ":base",
+      "expr": "p+m",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 1,
+      "init": ":base",
+      "expr": "p/m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 2,
+      "init": "1e125",
+      "expr": "p",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 2,
+      "init": "1e125",
+      "expr": "m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 2,
+      "init": "1e125",
+      "expr": "p-p",
+      "dump": "Typ=2 Len=1: 80",
+      "text": "0"
+    },
+    {
+      "level": 2,
+      "init": "1e125",
+      "expr": "p+m",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 2,
+      "init": "1e125",
+      "expr": "p/m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 2,
+      "init": ":base",
+      "expr": "p",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 2,
+      "init": ":base",
+      "expr": "m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 2,
+      "init": ":base",
+      "expr": "p-p",
+      "dump": "Typ=2 Len=1: 80",
+      "text": "0"
+    },
+    {
+      "level": 2,
+      "init": ":base",
+      "expr": "p+m",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 2,
+      "init": ":base",
+      "expr": "p/m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 3,
+      "init": "1e125",
+      "expr": "p",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 3,
+      "init": "1e125",
+      "expr": "m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 3,
+      "init": "1e125",
+      "expr": "p-p",
+      "dump": "Typ=2 Len=1: 80",
+      "text": "0"
+    },
+    {
+      "level": 3,
+      "init": "1e125",
+      "expr": "p+m",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 3,
+      "init": "1e125",
+      "expr": "p/m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 3,
+      "init": ":base",
+      "expr": "p",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 3,
+      "init": ":base",
+      "expr": "m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    },
+    {
+      "level": 3,
+      "init": ":base",
+      "expr": "p-p",
+      "dump": "Typ=2 Len=1: 80",
+      "text": "0"
+    },
+    {
+      "level": 3,
+      "init": ":base",
+      "expr": "p+m",
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######"
+    },
+    {
+      "level": 3,
+      "init": ":base",
+      "expr": "p/m",
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######"
+    }
+  ],
+  "repeated_exact_wrapper_observations": {
+    "size 128 nls False": {
+      "Typ=2 Len=1: 0": 8
+    },
+    "size 128 nls True": {
+      "Typ=2 Len=1: 0": 8
+    },
+    "size 1000 nls False": {
+      "Typ=2 Len=1: 0": 8
+    },
+    "size 1000 nls True": {
+      "Typ=2 Len=1: 0": 8
+    }
+  }
+}

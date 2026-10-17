@@ -64,9 +64,22 @@
   },
   "differential_summary": {
     "cases": 2016,
+    "mismatches": 1,
+    "division_underflow": 0,
+    "special_overflow": 0,
+    "literal_error_code": 1
+  },
+  "differential_summary_before_special_values": {
+    "cases": 2016,
     "mismatches": 111,
     "division_underflow": 0,
     "special_overflow": 110,
     "literal_error_code": 1
+  },
+  "extended_runtime_specials": {
+    "cases": 154,
+    "mismatches": 29,
+    "scope": "Anonymous function wrapper with runtime special-value arithmetic; not equivalent to the initial anonymous-block profile.",
+    "result": "failed; compatibility remains incomplete"
   }
 }

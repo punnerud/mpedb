@@ -24,6 +24,12 @@
 
 mod sql_logic;
 mod oracle_number;
+mod plsql_number;
+
+pub(crate) fn validate_oracle_number_literal(text: &str) -> Result<()> {
+    oracle_number::normalize(text).map(|_| ())
+}
+
 mod oracle_text;
 mod legacy_oracle_number;
 #[cfg(test)]
@@ -528,6 +534,22 @@ pub fn run(
             Op::OracleLoopBound => {
                 let value = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(oracle_number::loop_bound(value)?));
+            }
+            Op::OraclePlSqlNumber | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound => {
+                let value = stack.pop().expect("validated");
+                let value = match op {
+                    Op::OraclePlSqlNumber => plsql_number::number(value)?,
+                    Op::OraclePlSqlNeg => plsql_number::negate(value)?,
+                    Op::OraclePlSqlInteger => plsql_number::integer(value, false)?,
+                    Op::OraclePlSqlLoopBound => plsql_number::integer(value, true)?,
+                    _ => unreachable!(),
+                };
+                stack.push(PValue::Scalar(value));
+            }
+            Op::OraclePlSqlAdd | Op::OraclePlSqlSub | Op::OraclePlSqlMul | Op::OraclePlSqlDivide => {
+                let b = stack.pop().expect("validated");
+                let a = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(plsql_number::binary(op, a, b)?));
             }
             Op::OracleNumber => {
                 let value = stack.pop().expect("validated");

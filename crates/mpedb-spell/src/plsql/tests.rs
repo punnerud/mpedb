@@ -299,6 +299,46 @@ fn arithmetic_nulls_zero_division_and_short_circuit_match_sql_rules() {
 }
 
 #[test]
+fn number_special_arithmetic_uses_the_initial_anonymous_block_profile() {
+    for (expression, expected) in [
+        ("p + m", "-Infinity"),
+        ("m + p", "-Infinity"),
+        ("p - p", "0"),
+        ("m - m", "0"),
+        ("p - m", "Infinity"),
+        ("m - p", "-Infinity"),
+        ("p * 0", "0"),
+        ("m * -1", "Infinity"),
+        ("p / p", "Infinity"),
+        ("p / m", "-Infinity"),
+        ("1 / p", "0"),
+        ("-m", "Infinity"),
+    ] {
+        let source = function("", "NUMBER", &format!("a NUMBER := 1e125; p NUMBER; m NUMBER; BEGIN p := a * a; m := -p; RETURN {expression}; END;"));
+        assert_eq!(
+            call(&source, &[]).unwrap(),
+            Value::Numeric(expected.into()),
+            "{expression}"
+        );
+    }
+    let source = function(
+        "p NUMBER",
+        "BOOLEAN",
+        "BEGIN RETURN p > 1e125 AND p = p; END;",
+    );
+    assert_eq!(
+        call(&source, &[Value::Numeric("Infinity".into())]).unwrap(),
+        Value::Bool(true)
+    );
+    for body in [
+        "a NUMBER := 1e125; n NUMBER; i PLS_INTEGER; BEGIN n := a*a; i := n; RETURN i; END;",
+        "a NUMBER := 1e125; n NUMBER; BEGIN n := a*a; FOR i IN n..n LOOP NULL; END LOOP; RETURN 0; END;",
+    ] {
+        assert!(matches!(call(&function("", "NUMBER", body), &[]), Err(mpedb_types::Error::ArithmeticOverflow)));
+    }
+}
+
+#[test]
 fn rounded_arithmetic_matches_measured_oracle_values() {
     for (expression, expected) in [
         ("1 / 3", "0.3333333333333333333333333333333333333333"),
@@ -322,11 +362,14 @@ fn rounded_arithmetic_matches_measured_oracle_values() {
             "{expression}"
         );
     }
-    assert!(call(
-        &function("", "NUMBER", "BEGIN RETURN 1e125 * 100; END;"),
-        &[]
-    )
-    .is_err());
+    assert_eq!(
+        call(
+            &function("", "NUMBER", "BEGIN RETURN 1e125 * 100; END;"),
+            &[]
+        )
+        .unwrap(),
+        Value::Numeric("Infinity".into())
+    );
 }
 
 #[test]
@@ -692,7 +735,7 @@ fn end_names_and_client_terminators_preserve_source_identity() {
 }
 
 #[test]
-fn number_overflow_and_nonfinite_inputs_raise() {
+fn number_literals_and_nan_reject_while_special_results_round_trip() {
     for text in ["1e126", "-1e126"] {
         assert!(call(
             &function("", "NUMBER", &format!("BEGIN RETURN {text}; END;")),
@@ -701,9 +744,16 @@ fn number_overflow_and_nonfinite_inputs_raise() {
         .is_err());
     }
     let source = function("p NUMBER", "NUMBER", "BEGIN RETURN p; END;");
-    for text in ["NaN", "Infinity", "-Infinity", "garbage"] {
+    for text in ["NaN", "garbage", "1e126", "-1e126"] {
         assert!(call(&source, &[Value::Numeric(text.into())]).is_err());
     }
+    for text in ["Infinity", "-Infinity"] {
+        assert_eq!(
+            call(&source, &[Value::Numeric(text.into())]).unwrap(),
+            Value::Numeric(text.into())
+        );
+    }
+    assert!(compile(&function("", "NUMBER", "BEGIN RETURN 1e126; END;")).is_err());
     assert!(call(&source, &[Value::Float(0.1)]).is_err());
 }
 

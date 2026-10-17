@@ -20,6 +20,11 @@ def main():
     parser.add_argument("--native-root", type=Path)
     parser.add_argument("--pairs", type=int, default=500)
     parser.add_argument("--seed", type=int, default=20261017)
+    parser.add_argument(
+        "--runtime-specials",
+        action="store_true",
+        help="compare the measured runtime special-value matrix",
+    )
     args = parser.parse_args()
     if args.pairs < 1:
         parser.error("--pairs must be positive")
@@ -62,9 +67,37 @@ def main():
     for _ in range(args.pairs):
         a, b = literal(), literal()
         expressions.extend(f"({a}) {op} ({b})" for op in ("+", "-", "*", "/"))
+    bodies = [f"BEGIN RETURN {expression}; END;" for expression in expressions]
+    if args.runtime_specials:
+        matrix = json.loads(
+            (Path(__file__).parent / "reference/plsql-number-specials.json").read_text()
+        )
+        expressions = [row["expression"] for row in matrix["results"]] + ["-p", "-m"]
+        bodies = [
+            f"a NUMBER := 1e125; p NUMBER; m NUMBER; BEGIN p := a*a; m := -p; RETURN {expression}; END;"
+            for expression in expressions
+        ]
+        for condition in [
+            "p = p",
+            "p = m",
+            "p > 1e125",
+            "m < -1e125",
+            "p < m",
+            "p IS NULL",
+        ]:
+            expressions.append(condition)
+            bodies.append(
+                f"a NUMBER := 1e125; p NUMBER; m NUMBER; BEGIN p := a*a; m := -p; IF {condition} THEN RETURN 1; ELSE RETURN 0; END IF; END;"
+            )
+        for statement in ["i := p;", "FOR j IN p..p LOOP NULL; END LOOP;"]:
+            expressions.append(statement)
+            bodies.append(
+                f"a NUMBER := 1e125; p NUMBER; i PLS_INTEGER; BEGIN p := a*a; {statement} RETURN 0; END;"
+            )
     process = subprocess.run(
-        [str(args.probe.resolve())],
-        input="\n".join(expressions) + "\n",
+        [str(args.probe.resolve()), "--routine"],
+        input="\n".join(f"CREATE FUNCTION f RETURN NUMBER IS {body}" for body in bodies)
+        + "\n",
         text=True,
         capture_output=True,
         check=True,
@@ -78,19 +111,28 @@ def main():
     ) as connection:
         with connection.cursor() as cursor:
             output = cursor.var(oracledb.DB_TYPE_VARCHAR, size=32767)
-            for expression, actual in zip(expressions, native):
+            image = cursor.var(oracledb.DB_TYPE_VARCHAR, size=128)
+            for expression, body, actual in zip(expressions, bodies, native):
                 try:
                     # Compare the same PL/SQL context as the native compiler:
                     # integer-literal arithmetic can overflow in PL/SQL even
                     # when the corresponding Oracle SQL expression succeeds.
                     cursor.execute(
-                        "DECLARE FUNCTION f RETURN NUMBER IS BEGIN RETURN "
-                        + expression
-                        + "; END; BEGIN :out := TO_CHAR(f, 'TM9', "
+                        "DECLARE n NUMBER; FUNCTION f RETURN NUMBER IS "
+                        + body
+                        + " BEGIN n := f; SELECT DUMP(n,16) INTO :image FROM dual; :out := TO_CHAR(n, 'TM9', "
                         "'NLS_NUMERIC_CHARACTERS=''.,'''); END;",
                         out=output,
+                        image=image,
                     )
                     value = output.getvalue()
+                    # TO_CHAR displays both NUMBER specials as ####### and
+                    # some drivers decode them as +/-1e126. Use the public
+                    # DUMP representation to retain their actual identity.
+                    if image.getvalue() == "Typ=2 Len=2: ff,65":
+                        value = "Infinity"
+                    elif image.getvalue() == "Typ=2 Len=1: 0":
+                        value = "-Infinity"
                     expected = "NULL" if value is None else "OK\t" + str(value)
                 except oracledb.Error as error:
                     expected = "ERR\t" + error.args[0].full_code
@@ -109,9 +151,13 @@ def main():
             "oracle_version": connection.version,
             "driver": importlib.metadata.version("oracledb"),
             "seed": args.seed,
-            "pairs": args.pairs,
+            "pairs": None if args.runtime_specials else args.pairs,
             "cases": len(expressions),
-            "scope": "arithmetic with valid finite literals plus measured boundary corpus",
+            "scope": (
+                "runtime special-value matrix"
+                if args.runtime_specials
+                else "arithmetic with valid finite literals plus measured boundary corpus"
+            ),
             "context": "anonymous PL/SQL functions returning NUMBER",
             "mismatches": mismatches,
         }
