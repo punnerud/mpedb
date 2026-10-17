@@ -247,6 +247,20 @@ whole-batch rejection, busy writers, budgets, cursor realms and old-epoch
 receipt recovery. Production push/rejection-receipt and authority-controller
 wiring remain unfinished.
 
+`OracleSource::write_mirror_batch` now durably decides the whole immutable
+request, including conflict rejection. Its payload binds the exact checked
+cursor and authority mode, and its opaque result blob V2 retains original
+applied flags/postimages inside the existing owned storage table. A target
+conflict rejects every operation without application DML, preserving local
+transaction/key-move atomicity. Rejections commit an EMPTY origin footprint;
+they can never claim ownership of a requested key. Accepted requests retain
+full explicit footprints and final postimage verification. Replay seeks the
+receipt before checking the current epoch, while keeping incarnation, schema,
+ledger and origin fences, so old committed decisions remain recoverable after
+an authority change. Missing/corrupt origin evidence fails closed. This is the
+source decision primitive; production adapter/outbox and authority-controller
+wiring remain separate work. Existing low-level receipt APIs remain unchanged.
+
 Oracle writes re-read every requested target after the entire DML batch,
 before publishing data and receipts. A later trigger that changes an earlier
 writable value or resurrects an earlier delete rejects and rolls back the whole

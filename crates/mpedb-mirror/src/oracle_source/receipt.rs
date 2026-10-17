@@ -151,7 +151,7 @@ impl OracleSource {
             .map_err(|e| err("receipt ledger prepare release", e))?;
         result
     }
-    fn lock_write_incarnation(&self, request: &OracleWriteRequest<'_>) -> Result<()> {
+    pub(super) fn lock_write_incarnation(&self, request: &OracleWriteRequest<'_>) -> Result<()> {
         if request.mirror_id.is_empty()
             || request.mirror_id.len() > 128
             || request.token == [0; 32]
@@ -190,7 +190,7 @@ impl OracleSource {
         self.lock_write_incarnation(request)?;
         self.verify_write_authority(request)
     }
-    fn verify_write_authority(&self, request: &OracleWriteRequest<'_>) -> Result<()> {
+    pub(super) fn verify_write_authority(&self, request: &OracleWriteRequest<'_>) -> Result<()> {
         if self.source_state_identity(request.mirror_id)? != *request.state_identity
             || self.state_row(request.mirror_id, None)?
                 != Some((request.epoch, request.authority.into()))
@@ -201,7 +201,7 @@ impl OracleSource {
         }
         Ok(())
     }
-    fn receipt_bytes(
+    pub(super) fn receipt_bytes(
         &self,
         request: &OracleWriteRequest<'_>,
         payload: &[u8; 32],
@@ -240,7 +240,7 @@ impl OracleSource {
         }
         Ok(Some(bytes))
     }
-    fn receipt_payload(
+    pub(super) fn receipt_payload(
         &self,
         tables: &[OracleTable],
         ops: &[NetOp],
@@ -392,30 +392,7 @@ impl OracleSource {
                 self.insert_request_origin(request, &payload, footprint)?;
             }
             let bytes = super::receipt_codec::encode(tables, ops, &images)?;
-            let hash = blake3::hash(&bytes).as_bytes().to_vec();
-            let mut blob =
-                Blob::new(&self.connection).map_err(|e| err("receipt BLOB create", e))?;
-            blob.write_all(&bytes).map_err(|e| {
-                Error::Unsupported(format!("Oracle receipt BLOB write failed: {e}"))
-            })?;
-            let mirror = request.mirror_id.as_bytes().to_vec();
-            let token = request.token.to_vec();
-            let payload = payload.to_vec();
-            let sql=format!("INSERT INTO {}(mirror_id,request_token,payload_hash,result_hash,result_bytes,format_version) VALUES(:1,:2,:3,:4,:5,1)",self.receipt_target());
-            let refs: [&dyn ToSql; 5] = [&mirror, &token, &payload, &hash, &blob];
-            self.connection
-                .statement(&sql)
-                .lob_locator()
-                .build()
-                .map_err(|e| err("receipt insert prepare", e))?
-                .execute(&refs)
-                .map_err(|e| err("receipt insert", e))?;
-            let payload: [u8; 32] = payload.try_into().unwrap();
-            if self.receipt_bytes(request, &payload)?.as_deref() != Some(bytes.as_slice()) {
-                return Err(Error::Corrupt(
-                    "Oracle did not retain its write receipt; transaction rolled back".into(),
-                ));
-            }
+            self.store_write_receipt(request, &payload, &bytes)?;
             // Tracking writes must not invalidate the application postimages
             // that the receipt is about to publish. Keep the application row
             // locks until this final verification and commit.
@@ -449,5 +426,35 @@ impl OracleSource {
                 .map_err(|e| err("receipted write rollback", e))?;
         }
         result
+    }
+    pub(super) fn store_write_receipt(
+        &self,
+        request: &OracleWriteRequest<'_>,
+        payload: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let hash = blake3::hash(bytes).as_bytes().to_vec();
+        let mut blob = Blob::new(&self.connection).map_err(|e| err("receipt BLOB create", e))?;
+        blob.write_all(bytes)
+            .map_err(|e| Error::Unsupported(format!("Oracle receipt BLOB write failed: {e}")))?;
+        let mirror = request.mirror_id.as_bytes().to_vec();
+        let token = request.token.to_vec();
+        let payload = payload.to_vec();
+        let sql=format!("INSERT INTO {}(mirror_id,request_token,payload_hash,result_hash,result_bytes,format_version) VALUES(:1,:2,:3,:4,:5,1)",self.receipt_target());
+        let refs: [&dyn ToSql; 5] = [&mirror, &token, &payload, &hash, &blob];
+        self.connection
+            .statement(&sql)
+            .lob_locator()
+            .build()
+            .map_err(|e| err("receipt insert prepare", e))?
+            .execute(&refs)
+            .map_err(|e| err("receipt insert", e))?;
+        let payload: [u8; 32] = payload.try_into().unwrap();
+        if self.receipt_bytes(request, &payload)?.as_deref() != Some(bytes) {
+            return Err(Error::Corrupt(
+                "Oracle did not retain its write receipt; transaction rolled back".into(),
+            ));
+        }
+        Ok(())
     }
 }

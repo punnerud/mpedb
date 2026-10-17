@@ -17,11 +17,11 @@ fn types(table: &OracleTable) -> Result<Vec<ColumnType>> {
 fn same_key(table: &OracleTable, op: &NetOp, values: &[Value]) -> bool {
     op.pk.len() == table.pk.len()
         && !op.pk.contains(&Value::Null)
-        && table
-            .pk
-            .iter()
-            .zip(&op.pk)
-            .all(|(&k, v)| values.get(k).is_some_and(|actual| crate::adapter::same_carrier_value(actual, v)))
+        && table.pk.iter().zip(&op.pk).all(|(&k, v)| {
+            values
+                .get(k)
+                .is_some_and(|actual| crate::adapter::same_carrier_value(actual, v))
+        })
 }
 fn frame(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     if out
@@ -174,6 +174,73 @@ pub(super) fn decode(
     Ok(images)
 }
 
+/// The storage table stays V1. Its opaque, checksummed result blob uses V2
+/// for whole-request accepted/rejected decisions. Legacy readers fail closed.
+pub(super) fn encode_mirror(
+    tables: &[OracleTable],
+    ops: &[NetOp],
+    reply: &crate::adapter::PushReply,
+) -> Result<Vec<u8>> {
+    let images = reply
+        .postimages
+        .as_ref()
+        .ok_or_else(|| Error::Corrupt("missing Oracle mirror postimages".into()))?;
+    if reply.applied.len() != ops.len()
+        || images.len() != ops.len()
+        || ops.is_empty()
+        || ops.len() > 100_000
+    {
+        return Err(Error::Corrupt("invalid Oracle mirror receipt count".into()));
+    }
+    let accepted = reply.applied.iter().all(|v| *v);
+    let mut bytes = vec![2, u8::from(accepted)];
+    if accepted {
+        bytes.extend_from_slice(&encode(tables, ops, images)?);
+    } else {
+        if reply.applied.iter().any(|v| *v) || images.iter().any(Option::is_some) {
+            return Err(Error::Corrupt(
+                "Oracle mirror receipt must decide the whole batch".into(),
+            ));
+        }
+        bytes.extend_from_slice(&(ops.len() as u32).to_be_bytes());
+    }
+    if bytes.len() > LIMIT {
+        return Err(Error::Unsupported(
+            "Oracle mirror receipt exceeds 64 MiB".into(),
+        ));
+    }
+    Ok(bytes)
+}
+pub(super) fn decode_mirror(
+    tables: &[OracleTable],
+    ops: &[NetOp],
+    bytes: &[u8],
+) -> Result<crate::adapter::PushReply> {
+    if ops.is_empty() || ops.len() > 100_000 || bytes.len() > LIMIT || bytes.first() != Some(&2) {
+        return Err(Error::Corrupt(
+            "invalid Oracle mirror receipt version/count".into(),
+        ));
+    }
+    match bytes.get(1) {
+        Some(1) => Ok(crate::adapter::PushReply {
+            applied: vec![true; ops.len()],
+            postimages: Some(decode(tables, ops, &bytes[2..])?),
+        }),
+        Some(0)
+            if bytes.len() == 6
+                && u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize == ops.len() =>
+        {
+            Ok(crate::adapter::PushReply {
+                applied: vec![false; ops.len()],
+                postimages: Some(vec![None; ops.len()]),
+            })
+        }
+        _ => Err(Error::Corrupt(
+            "invalid Oracle mirror receipt outcome".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +312,33 @@ mod tests {
             payload(&tables, &ops, b"first incarnation").unwrap(),
             payload(&tables, &ops, b"second incarnation").unwrap()
         );
+        for accepted in [false, true] {
+            let reply = crate::adapter::PushReply {
+                applied: vec![accepted],
+                postimages: Some(if accepted { images.clone() } else { vec![None] }),
+            };
+            let bytes = encode_mirror(&tables, &ops, &reply).unwrap();
+            let decoded = decode_mirror(&tables, &ops, &bytes).unwrap();
+            assert_eq!(decoded.applied, reply.applied);
+            assert_eq!(decoded.postimages, reply.postimages);
+            assert!(decode(&tables, &ops, &bytes).is_err());
+            for end in 0..bytes.len() {
+                assert!(decode_mirror(&tables, &ops, &bytes[..end]).is_err());
+            }
+            let mut extra = bytes.clone();
+            extra.push(0);
+            assert!(decode_mirror(&tables, &ops, &extra).is_err());
+            for (index, value) in [(0, 1), (1, 2)] {
+                let mut bad = bytes.clone();
+                bad[index] = value;
+                assert!(decode_mirror(&tables, &ops, &bad).is_err());
+            }
+        }
+        assert!(decode_mirror(&tables, &ops, &bytes).is_err());
+        let mixed = crate::adapter::PushReply {
+            applied: vec![true, false],
+            postimages: Some(vec![images[0].clone(), None]),
+        };
+        assert!(encode_mirror(&tables, &[ops[0].clone(), ops[0].clone()], &mixed).is_err());
     }
 }

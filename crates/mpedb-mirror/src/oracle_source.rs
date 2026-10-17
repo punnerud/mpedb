@@ -15,6 +15,7 @@ pub use capture_evidence::OracleKeyTransactions;
 pub use snapshot::OracleSnapshot;
 pub use state::OracleStateIdentity;
 mod checked_write;
+mod mirror_write;
 mod receipt;
 mod origin;
 pub use origin::{
