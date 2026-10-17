@@ -22,6 +22,7 @@
 //! strictly typed BOOLEAN conditions. This lets procedural SQL frontends share
 //! the validated, budgeted runtime without changing Python/Rust semantics.
 
+mod oracle_exception;
 mod sql_logic;
 mod oracle_number;
 mod plsql_number;
@@ -454,7 +455,11 @@ pub fn run(
     let mut db_left = budget.db_calls;
     let mut rows_left = budget.rows;
     let mut pc = 0usize;
+    let mut frames: Vec<oracle_exception::Frame> = Vec::new();
+    let mut caught: Vec<oracle_exception::Caught> = Vec::new();
     loop {
+        while frames.last().is_some_and(|f| pc < f.start || pc >= f.end) { frames.pop(); }
+        while caught.last().is_some_and(|c| pc < c.start || pc >= c.end) { caught.pop(); }
         if instrs_left == 0 {
             return Err(budget_instr_err(budget.instrs));
         }
@@ -463,7 +468,20 @@ pub fn run(
         // successor exists and every terminal path ends in Return.
         let op = proc.instrs[pc];
         pc += 1;
+        let step = (|| -> Result<Option<ProcValue>> {
         match op {
+            Op::OracleTry { handler, end, handler_end } => {
+                if frames.len() == oracle_exception::MAX_SCOPES { return Err(rt_err("Oracle exception nesting budget exceeded")); }
+                frames.push(oracle_exception::Frame { start: pc, end: end as usize, handler: handler as usize, handler_end: handler_end as usize });
+            }
+            Op::OracleExceptionCode => {
+                let Some(oracle_exception::Caught { error: Error::Oracle { code, .. }, .. }) = caught.last() else { return Err(Error::Corrupt("proc: no active Oracle exception".into())); };
+                stack.push(PValue::Scalar(Value::Int(*code as i64)));
+            }
+            Op::OracleReraise => {
+                return Err(caught.pop().ok_or_else(|| rt_err("RAISE has no active exception"))?.error);
+            }
+            Op::OracleRaise(code) => return Err(oracle_exception::named(code)),
             Op::LoadConst(i) => stack.push(PValue::Scalar(proc.consts[i as usize].clone())),
             Op::LoadLocal(i) => match &locals[i as usize] {
                 Some(v) => stack.push(v.clone()),
@@ -608,7 +626,7 @@ pub fn run(
                 let wanted = matches!(op, Op::JumpIfSqlTrue(_));
                 if value == Some(wanted) {
                     pc = target as usize;
-                    continue;
+                    return Ok(None);
                 }
             }
             Op::Add
@@ -808,7 +826,22 @@ pub fn run(
             }
             Op::Return => {
                 let v = stack.pop().expect("validated");
-                return to_proc_value(v);
+                return to_proc_value(v).map(Some);
+            }
+        }
+        Ok(None)
+        })();
+        match step {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) => {},
+            Err(error) => {
+                let Some(frame) = frames.pop() else { return Err(error); };
+                let error = oracle_exception::semantic(error, op)?;
+                stack.clear(); // validator requires an empty stack at Try entry
+                pc = frame.handler;
+                caught.retain(|c| pc >= c.start && pc < c.end);
+                if caught.len() == oracle_exception::MAX_SCOPES { return Err(rt_err("Oracle exception context budget exceeded")); }
+                caught.push(oracle_exception::Caught { start: frame.handler, end: frame.handler_end, error });
             }
         }
     }

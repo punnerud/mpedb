@@ -2,6 +2,31 @@
 use super::*;
 
 impl WriteSession<'_> {
+    /// Execute one SELECT or DML statement with complete statement rollback.
+    /// A caller may handle a row/constraint error and keep earlier writes;
+    /// rollback/release failures poison the session and remain fatal.
+    pub fn execute_atomic(&mut self, hash: &PlanHash, params: &[Value]) -> Result<ExecResult> {
+        if self.poisoned { return Err(poisoned_err()); }
+        let plan = self.plan_by_hash(hash)?;
+        if !plan.footprint.read_only && !matches!(plan.stmt, PlanStmt::Insert { .. } | PlanStmt::Update { .. } | PlanStmt::Delete { .. }) {
+            return Err(Error::Unsupported("atomic execution requires SELECT or DML".into()));
+        }
+        let snapshot = self.txn.savepoint_full()?;
+        match self.execute(hash, params) {
+            Ok(value) => {
+                self.txn.release_savepoint_full(&snapshot).inspect_err(|_| { self.poisoned = true; })?;
+                Ok(value)
+            }
+            Err(original) => {
+                if let Err(error) = self.txn.rollback_to_full(&snapshot).and_then(|()| self.txn.release_savepoint_full(&snapshot)) {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+                self.poisoned = false;
+                Err(original)
+            }
+        }
+    }
     /// DDL in this transaction can change both triggers and foreign keys
     /// before schema_gen advances. Do not reuse the committed rules cache.
     pub(super) fn write_rules(&mut self) -> Result<Arc<trigger::WriteRules>> {

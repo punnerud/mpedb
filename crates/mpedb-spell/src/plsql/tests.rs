@@ -801,3 +801,39 @@ fn nested_and_truncated_sources_fail_without_stack_overflow_or_panic() {
     );
     assert!(compile(&source).is_err());
 }
+
+#[test]
+fn exception_handlers_match_named_alternatives_and_rethrow_to_outer_blocks() {
+    for (body,expected) in [
+        ("BEGIN RAISE ZERO_DIVIDE; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN 1; WHEN ZERO_DIVIDE OR TOO_MANY_ROWS THEN RETURN 2; WHEN OTHERS THEN RETURN 3; END;","2"),
+        ("BEGIN BEGIN RAISE NO_DATA_FOUND; EXCEPTION WHEN ZERO_DIVIDE THEN RETURN 1; END; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN 4; END;","4"),
+        ("BEGIN BEGIN RAISE NO_DATA_FOUND; EXCEPTION WHEN NO_DATA_FOUND THEN RAISE; END; EXCEPTION WHEN OTHERS THEN RETURN 5; END;","5"),
+        ("n NUMBER; BEGIN n:=10/0; RETURN 0; EXCEPTION WHEN ZERO_DIVIDE THEN RETURN 6; END;","6"),
+        ("v VARCHAR2(1); BEGIN v:='too long'; RETURN 0; EXCEPTION WHEN VALUE_ERROR THEN RETURN 7; END;","7"),
+        ("BEGIN DECLARE v VARCHAR2(1):='too long'; BEGIN RETURN 0; EXCEPTION WHEN OTHERS THEN RETURN 1; END; EXCEPTION WHEN VALUE_ERROR THEN RETURN 8; END;","8"),
+        ("BEGIN BEGIN RAISE ZERO_DIVIDE; EXCEPTION WHEN ZERO_DIVIDE THEN RAISE NO_DATA_FOUND; END; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN 9; END;","9"),
+    ] {
+        assert_eq!(call(&function("","NUMBER",body),&[]).unwrap(),Value::Numeric(expected.into()),"{body}");
+    }
+}
+
+#[test]
+fn leaving_exception_blocks_via_loop_control_does_not_leave_stale_handlers() {
+    let body="n NUMBER:=0; BEGIN FOR i IN 1..3 LOOP BEGIN IF i=1 THEN CONTINUE; END IF; EXIT; EXCEPTION WHEN ZERO_DIVIDE THEN RETURN 99; END; END LOOP; n:=1/0; RETURN 0; EXCEPTION WHEN ZERO_DIVIDE THEN RETURN 10; END;";
+    assert_eq!(call(&function("","NUMBER",body),&[]).unwrap(),Value::Numeric("10".into()));
+    // Normal handler completion also ends its current-exception context.
+    let body="n NUMBER:=0; BEGIN BEGIN RAISE ZERO_DIVIDE; EXCEPTION WHEN ZERO_DIVIDE THEN n:=1; END; BEGIN RAISE NO_DATA_FOUND; EXCEPTION WHEN NO_DATA_FOUND THEN RAISE; END; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN n+10; END;";
+    assert_eq!(call(&function("","NUMBER",body),&[]).unwrap(),Value::Numeric("11".into()));
+}
+
+#[test]
+fn malformed_handlers_and_raise_outside_a_handler_refuse() {
+    for body in [
+        "BEGIN RAISE; END;",
+        "BEGIN NULL; EXCEPTION END;",
+        "BEGIN NULL; EXCEPTION WHEN OTHERS THEN NULL; WHEN ZERO_DIVIDE THEN NULL; END;",
+        "BEGIN NULL; EXCEPTION WHEN ZERO_DIVIDE OR ZERO_DIVIDE THEN NULL; END;",
+        "BEGIN NULL; EXCEPTION WHEN OTHERS OR ZERO_DIVIDE THEN NULL; END;",
+        "BEGIN NULL; EXCEPTION WHEN unknown_exception THEN NULL; END;",
+    ] {assert!(compile(&function("","NUMBER",body)).is_err(),"{body}");}
+}

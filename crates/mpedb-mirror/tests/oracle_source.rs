@@ -22,7 +22,7 @@ fn native_oracle_snapshot_preserves_metadata_values_and_one_scn() {
     c.execute("CREATE TABLE MPEDB_SNAPSHOT_CASE (id NUMBER(10), amount NUMBER, v VARCHAR2(10 CHAR) DEFAULT 'ø', raw_value RAW(4), date_value DATE, stamp TIMESTAMP(9), flag BOOLEAN, text_lob CLOB, binary_lob BLOB, generated_value NUMBER GENERATED ALWAYS AS (id+1) VIRTUAL, PRIMARY KEY (id,v))",&[]).unwrap();
     c.execute("INSERT INTO MPEDB_SNAPSHOT_CASE (id,amount,v,raw_value,date_value,stamp,flag,text_lob,binary_lob) VALUES (1,12345678901234567890.1234567890123456789,'ø',HEXTORAW('00ff'),TO_DATE('2026-10-17 03:04:05','YYYY-MM-DD HH24:MI:SS'),TIMESTAMP '2026-10-17 03:04:05.123456789',TRUE,TO_CLOB('text'),TO_BLOB(HEXTORAW('001122')))",&[]).unwrap();
     c.commit().unwrap();
-    c.execute("CREATE OR REPLACE FUNCTION MPEDB_SOURCE_FLIP(x BOOLEAN) RETURN BOOLEAN IS BEGIN RETURN NOT x; END;",&[]).unwrap();
+    c.execute("CREATE OR REPLACE FUNCTION MPEDB_SOURCE_FLIP(x BOOLEAN) RETURN BOOLEAN IS BEGIN IF x IS NULL THEN RETURN NULL; END IF; IF x THEN RAISE ZERO_DIVIDE; END IF; RETURN TRUE; EXCEPTION WHEN ZERO_DIVIDE THEN RETURN FALSE; END;",&[]).unwrap();
     assert_eq!(
         c.query_row_as::<i64>(
             "SELECT CASE WHEN MPEDB_SOURCE_FLIP(TRUE) THEN 1 ELSE 0 END FROM dual",

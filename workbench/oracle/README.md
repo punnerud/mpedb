@@ -287,8 +287,24 @@ cursor attributes, DDL and anonymous dynamic blocks remain unsupported. The
 embedded statement also must be supported by MPEdb's SQL engine. See
 [Oracle's binding rules](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/native-dynamic-sql.html).
 
+Native exception blocks now support `NO_DATA_FOUND`, `TOO_MANY_ROWS`,
+`ZERO_DIVIDE`, `VALUE_ERROR`, `DUP_VAL_ON_INDEX`, OR alternatives, `WHEN OTHERS`,
+named `RAISE` and re-raise. Additive opcodes 83–86 preserve existing IR meanings.
+Protected blocks require an empty evaluation stack; scope ranges unwind on
+EXIT/CONTINUE and nested handlers propagate correctly. Declaration initializer
+errors bypass their own block's handlers. Engine budgets, I/O, corruption and
+unsupported operations cannot be hidden by `WHEN OTHERS`.
+
+For procedures with handlers, SQL statements execute under complete engine
+savepoints. A caught multi-row INSERT failure removes every inserted row while
+preserving preceding successful DML. Native Oracle tests compare that behavior,
+NO_DATA_FOUND fallback, and an exception-bearing Boolean function transported
+through rRETL apply/revert and source write-back. Full exception coverage still
+needs user-defined declarations, RAISE_APPLICATION_ERROR, SQLCODE/SQLERRM and
+complete Oracle classification of database errors.
+
 **Parameter defaults, NUMBER precision/scale constraints, static SQL statements,
-calls to other routines, packages, exceptions and cursors remain unimplemented**;
+calls to other routines, packages and cursors remain unimplemented**;
 measured arithmetic agreement is not full PL/SQL compatibility.
 
 The native `ProcEngine` calling convention supplies one argument slot for every

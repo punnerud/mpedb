@@ -22,6 +22,8 @@ fn native_oracle_application_dynamic_dml_runs_inside_mpedb_with_exact_binds() {
     c.execute("CREATE OR REPLACE PROCEDURE MPEDB_SQL_PUT(p_id NUMBER,p_amount NUMBER) IS BEGIN EXECUTE IMMEDIATE q'[INSERT INTO MPEDB_SQL_LEDGER (id,amount,note) VALUES(:x,:x,q'{:literal}')]' USING p_id,p_amount; END;",&[]).unwrap();
     c.execute("CREATE OR REPLACE FUNCTION MPEDB_SQL_GET(p_id NUMBER) RETURN NUMBER IS n NUMBER; BEGIN EXECUTE IMMEDIATE 'SELECT amount FROM MPEDB_SQL_LEDGER WHERE id=:key' INTO n USING p_id; RETURN n; END;",&[]).unwrap();
     c.execute("CREATE OR REPLACE FUNCTION MPEDB_SQL_ALL RETURN NUMBER IS n NUMBER; BEGIN EXECUTE IMMEDIATE 'SELECT amount FROM MPEDB_SQL_LEDGER' INTO n; RETURN n; END;",&[]).unwrap();
+    c.execute("CREATE OR REPLACE FUNCTION MPEDB_SQL_DEFAULT(p_id NUMBER) RETURN NUMBER IS n NUMBER; BEGIN EXECUTE IMMEDIATE 'SELECT amount FROM MPEDB_SQL_LEDGER WHERE id=:x' INTO n USING p_id; RETURN n; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN 123; END;",&[]).unwrap();
+    c.execute("CREATE OR REPLACE PROCEDURE MPEDB_SQL_HANDLE IS a NUMBER:=3; b NUMBER:=30; original NUMBER:=1; val NUMBER:=999; delta NUMBER:=10; note VARCHAR2(20):='duplicate'; BEGIN EXECUTE IMMEDIATE 'UPDATE MPEDB_SQL_LEDGER SET amount=amount+:x WHERE id=:x' USING delta,original; BEGIN EXECUTE IMMEDIATE 'INSERT INTO MPEDB_SQL_LEDGER(id,amount,note) VALUES(:x,:x,:x),(:x,:x,:x)' USING a,b,note,original,val,note; EXCEPTION WHEN DUP_VAL_ON_INDEX THEN NULL; END; END;",&[]).unwrap();
     c.execute("BEGIN MPEDB_SQL_PUT(1,9007199254740992.125); END;", &[])
         .unwrap();
     c.commit().unwrap();
@@ -73,12 +75,12 @@ fn native_oracle_application_dynamic_dml_runs_inside_mpedb_with_exact_binds() {
         actual, expected,
         "same application source executes through MPEdb's native IR and SQL engine"
     );
-    for routine in source
-        .routines()
-        .unwrap()
-        .into_iter()
-        .filter(|r| matches!(r.name.as_str(), "MPEDB_SQL_GET" | "MPEDB_SQL_ALL"))
-    {
+    for routine in source.routines().unwrap().into_iter().filter(|r| {
+        matches!(
+            r.name.as_str(),
+            "MPEDB_SQL_GET" | "MPEDB_SQL_ALL" | "MPEDB_SQL_DEFAULT" | "MPEDB_SQL_HANDLE"
+        )
+    }) {
         engine
             .define(&routine.create_source(), mpedb_proc::Lang::PlSql)
             .unwrap();
@@ -119,11 +121,40 @@ fn native_oracle_application_dynamic_dml_runs_inside_mpedb_with_exact_binds() {
         engine.call("MPEDB_SQL_ALL", &[]),
         Err(mpedb_types::Error::Oracle { code: 1422, .. })
     ));
+    let native: String = c
+        .query_row_as(
+            "SELECT TO_CHAR(MPEDB_SQL_DEFAULT(999),'TM9') FROM dual",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .call("MPEDB_SQL_DEFAULT", &[Value::Numeric("999".into())])
+            .unwrap(),
+        mpedb_proc::ProcValue::Scalar(Value::Numeric(native))
+    );
+    c.execute("BEGIN MPEDB_SQL_HANDLE; END;", &[]).unwrap();
+    c.commit().unwrap();
+    engine.call("MPEDB_SQL_HANDLE", &[]).unwrap();
+    let native = source
+        .read_snapshot(&tables[0], source.current_scn().unwrap())
+        .unwrap();
+    let actual = match db
+        .query("SELECT * FROM MPEDB_SQL_LEDGER ORDER BY id", &[])
+        .unwrap()
+    {
+        mpedb::ExecResult::Rows { rows, .. } => rows,
+        _ => panic!("rows required"),
+    };
+    assert_eq!(actual, native, "caught multi-row failure preserves prior writes and removes every row of the failed statement");
+    assert_eq!(actual.len(), 2);
     drop(engine);
     drop(db);
     let _ = std::fs::remove_file(db_path);
     c.execute("DROP PROCEDURE MPEDB_SQL_PUT", &[]).unwrap();
     c.execute("DROP FUNCTION MPEDB_SQL_GET", &[]).unwrap();
     c.execute("DROP FUNCTION MPEDB_SQL_ALL", &[]).unwrap();
+    c.execute("DROP FUNCTION MPEDB_SQL_DEFAULT", &[]).unwrap();
+    c.execute("DROP PROCEDURE MPEDB_SQL_HANDLE", &[]).unwrap();
     c.execute("DROP TABLE MPEDB_SQL_LEDGER PURGE", &[]).unwrap();
 }

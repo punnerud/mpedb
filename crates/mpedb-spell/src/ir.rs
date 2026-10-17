@@ -205,6 +205,12 @@ pub enum Op {
     /// Require exactly one query row, returning its tuple. Native PL/SQL
     /// NO_DATA_FOUND / TOO_MANY_ROWS are structured Oracle exceptions.
     OracleSelectOne,
+    /// A protected statement block, with an empty evaluation stack at entry.
+    /// Scope ranges also unwind frames on EXIT/CONTINUE and normal jumps.
+    OracleTry { handler: u32, end: u32, handler_end: u32 },
+    OracleExceptionCode,
+    OracleReraise,
+    OracleRaise(u16),
     /// Pop `plans[p].argc` scalar args, run the DML plan, push the affected
     /// row count as an int.
     DbExec(u16),
@@ -308,6 +314,10 @@ const OP_PLSQL_NEG: u8 = 79;
 const OP_PLSQL_INTEGER: u8 = 80;
 const OP_PLSQL_LOOP_BOUND: u8 = 81;
 const OP_ORACLE_SELECT_ONE: u8 = 82;
+const OP_ORACLE_TRY: u8 = 83;
+const OP_ORACLE_EXCEPTION_CODE: u8 = 84;
+const OP_ORACLE_RERAISE: u8 = 85;
+const OP_ORACLE_RAISE: u8 = 86;
 
 
 
@@ -564,6 +574,13 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OraclePlSqlInteger => b.push(OP_PLSQL_INTEGER),
         Op::OraclePlSqlLoopBound => b.push(OP_PLSQL_LOOP_BOUND),
         Op::OracleSelectOne => b.push(OP_ORACLE_SELECT_ONE),
+        Op::OracleTry { handler, end, handler_end } => {
+            b.push(OP_ORACLE_TRY);
+            for target in [handler, end, handler_end] { b.extend_from_slice(&target.to_le_bytes()); }
+        }
+        Op::OracleExceptionCode => b.push(OP_ORACLE_EXCEPTION_CODE),
+        Op::OracleReraise => b.push(OP_ORACLE_RERAISE),
+        Op::OracleRaise(code) => u16arg(OP_ORACLE_RAISE, code),
         Op::OracleNeg => b.push(OP_ORACLE_NEG),
         Op::OracleVarchar(limit) => u16arg(OP_ORACLE_VARCHAR, limit),
         Op::OracleLoopBound => b.push(OP_ORACLE_LOOP_BOUND),
@@ -669,6 +686,18 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_PLSQL_INTEGER => Op::OraclePlSqlInteger,
         OP_PLSQL_LOOP_BOUND => Op::OraclePlSqlLoopBound,
         OP_ORACLE_SELECT_ONE => Op::OracleSelectOne,
+        OP_ORACLE_TRY => {
+            let raw = buf.get(*pos..*pos + 12).ok_or_else(err)?;
+            *pos += 12;
+            Op::OracleTry {
+                handler: u32::from_le_bytes(raw[..4].try_into().unwrap()),
+                end: u32::from_le_bytes(raw[4..8].try_into().unwrap()),
+                handler_end: u32::from_le_bytes(raw[8..].try_into().unwrap()),
+            }
+        }
+        OP_ORACLE_EXCEPTION_CODE => Op::OracleExceptionCode,
+        OP_ORACLE_RERAISE => Op::OracleReraise,
+        OP_ORACLE_RAISE => Op::OracleRaise(u16arg()?),
         OP_ORACLE_NEG => Op::OracleNeg,
         OP_ORACLE_VARCHAR => Op::OracleVarchar(u16arg()?),
         OP_ORACLE_LOOP_BOUND => Op::OracleLoopBound,
@@ -720,6 +749,8 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
 /// table (operand bounds are checked before this is called).
 fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
     match op {
+        Op::OracleTry { .. } | Op::OracleReraise | Op::OracleRaise(_) => (0, 0),
+        Op::OracleExceptionCode => (0, 1),
         Op::LoadConst(_) | Op::LoadLocal(_) => (0, 1),
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
@@ -799,8 +830,16 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
     // Pass 1: operand bounds, including unreachable code.
     let mut any_cursor = false;
     let mut any_exec = false;
-    for &op in instrs {
+    for (pc, &op) in instrs.iter().enumerate() {
         match op {
+            Op::OracleTry { handler, end, handler_end } => {
+                if end as usize <= pc || handler < end || handler_end <= handler || handler_end as usize > n {
+                    return Err(Error::Corrupt("proc: invalid Oracle exception scope".into()));
+                }
+            }
+            Op::OracleRaise(code) if !matches!(code, 1 | 1403 | 1422 | 1476 | 6502) => {
+                return Err(Error::Corrupt("proc: unknown named Oracle exception".into()));
+            }
             Op::OracleVarchar(0x8000) => {
                 return Err(Error::Corrupt("proc: zero CHAR length constraint".into()));
             }
@@ -891,7 +930,12 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
         }
         max = max.max(after);
         match op {
-            Op::Return | Op::MissingReturn => {}
+            Op::Return | Op::MissingReturn | Op::OracleRaise(_) | Op::OracleReraise => {}
+            Op::OracleTry { handler, .. } => {
+                if depth != 0 { return Err(Error::Corrupt("proc: Oracle exception scope requires an empty stack".into())); }
+                visit(handler as usize, 0, &mut entry, &mut work)?;
+                visit(pc + 1, 0, &mut entry, &mut work)?;
+            }
             Op::Jump(t) => visit(t as usize, after, &mut entry, &mut work)?,
             Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) => {
                 visit(t as usize, after, &mut entry, &mut work)?;
@@ -1090,6 +1134,25 @@ mod tests {
         assert_eq!(decode_op(&[82], &mut offset).unwrap(), Op::OracleSelectOne);
         assert!(Proc::new("bad".into(), 0, 0, vec![], vec![],
             vec![Op::OracleSelectOne, Op::Return]).is_err());
+    }
+
+    #[test]
+    fn oracle_exception_scopes_round_trip_and_reject_forged_stack_or_ranges() {
+        let s = crate::plsql::compile("CREATE FUNCTION handled RETURN NUMBER IS BEGIN RAISE ZERO_DIVIDE; EXCEPTION WHEN ZERO_DIVIDE THEN RETURN 1; END;").unwrap();
+        let p = Proc::new(s.name, s.argc, s.nlocals, vec![], s.consts, s.instrs).unwrap();
+        let blob = p.encode();
+        assert_eq!(Proc::decode(&blob).unwrap(), p);
+        for i in 0..blob.len() { assert!(Proc::decode(&blob[..i]).is_err()); }
+        assert!(Proc::new("stack".into(), 0, 0, vec![], vec![Value::Int(1)], vec![
+            Op::LoadConst(0), Op::OracleTry { handler: 4, end: 3, handler_end: 6 },
+            Op::OracleRaise(1476), Op::Jump(6), Op::LoadConst(0), Op::Return,
+            Op::LoadConst(0), Op::Return,
+        ]).unwrap_err().to_string().contains("empty stack"));
+        for op in [Op::OracleRaise(0), Op::OracleRaise(99),
+            Op::OracleTry { handler: 1, end: 2, handler_end: 3 },
+            Op::OracleTry { handler: 1, end: 1, handler_end: u32::MAX }] {
+            assert!(Proc::new("range".into(), 0, 0, vec![], vec![], vec![op]).is_err());
+        }
     }
 
     /// Cursor ops: encode/decode roundtrip, full decode fuzz (truncation at

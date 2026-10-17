@@ -267,6 +267,7 @@ impl<'db> ProcEngine<'db> {
             let res = {
                 let mut bridge = SessionBridge {
                     session: &mut session,
+                    statement_atomic: proc.instrs.iter().any(|op| matches!(op, mpedb_spell::ir::Op::OracleTry { .. })),
                 };
                 interp::run(&proc, args, &mut bridge, self.budget)
             };
@@ -513,11 +514,19 @@ impl DbBridge for SnapshotBridge<'_> {
 /// own uncommitted writes, and the caller commits/rolls back atomically.
 struct SessionBridge<'a, 'db> {
     session: &'a mut WriteSession<'db>,
+    statement_atomic: bool,
+}
+
+impl SessionBridge<'_, '_> {
+    fn execute(&mut self, plan: &PlanRef, params: &[Value]) -> Result<ExecResult> {
+        if self.statement_atomic { self.session.execute_atomic(&plan.hash, params) }
+        else { self.session.execute(&plan.hash, params) }
+    }
 }
 
 impl DbBridge for SessionBridge<'_, '_> {
     fn query(&mut self, plan: &PlanRef, params: &[Value]) -> Result<Vec<Vec<Value>>> {
-        match self.session.execute(&plan.hash, params)? {
+        match self.execute(plan, params)? {
             ExecResult::Rows { rows, .. } => Ok(rows),
             _ => Err(Error::Corrupt(
                 "proc: query-kind plan did not produce rows".into(),
@@ -526,7 +535,7 @@ impl DbBridge for SessionBridge<'_, '_> {
     }
 
     fn exec(&mut self, plan: &PlanRef, params: &[Value]) -> Result<u64> {
-        match self.session.execute(&plan.hash, params)? {
+        match self.execute(plan, params)? {
             ExecResult::Affected(n) => Ok(n),
             _ => Err(Error::Corrupt(
                 "proc: exec-kind plan did not report an affected count".into(),

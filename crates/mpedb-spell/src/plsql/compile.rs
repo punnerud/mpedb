@@ -1,6 +1,7 @@
 //! Native Oracle routine compilation; no translation into Python or PL/pgSQL.
 
 mod sql;
+mod exception;
 
 use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
@@ -48,6 +49,8 @@ struct Parser<'a> {
     depth: usize,
     parameters: Vec<u16>,
     has_out: bool,
+    exception_blocks: bool,
+    in_handler: usize,
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
@@ -79,9 +82,11 @@ fn compile_on_stack(source: &str, scalar_only: bool) -> Result<Skeleton> {
 }
 
 fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
+    let tokens = lex::lex(source)?;
+    let exception_blocks = tokens.iter().any(|t| matches!(&t.token, Token::Identifier { name, quoted: false } if name == "EXCEPTION"));
     let mut p = Parser {
         source,
-        tokens: lex::lex(source)?,
+        tokens,
         at: 0,
         builder: FuncBuilder::new(),
         locals: HashMap::new(),
@@ -91,6 +96,8 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         depth: 0,
         parameters: Vec::new(),
         has_out: false,
+        exception_blocks,
+        in_handler: 0,
     };
     p.want_word("CREATE")?;
     if p.word("OR") {
@@ -156,7 +163,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
     }
     p.declarations()?;
     p.want_word("BEGIN")?;
-    p.statements()?;
+    p.block_body()?;
     p.want_word("END")?;
     if matches!(p.peek(), Some(Token::Identifier { .. })) {
         let end_name = p.identifier()?;
@@ -426,7 +433,7 @@ impl Parser<'_> {
         if self.depth > 128 {
             return Err(self.error("control-flow nesting exceeds 128 levels"));
         }
-        while !self.is_word("END") && !self.is_word("ELSE") && !self.is_word("ELSIF") {
+        while !self.is_word("END") && !self.is_word("ELSE") && !self.is_word("ELSIF") && !self.is_word("EXCEPTION") && !self.is_word("WHEN") {
             if self.peek().is_none() {
                 return Err(self.error("unterminated routine or control-flow block"));
             }
@@ -436,6 +443,7 @@ impl Parser<'_> {
         Ok(())
     }
     fn statement(&mut self) -> Result<()> {
+        if self.word("RAISE") { return self.raise_statement(); }
         if self.word("EXECUTE") { return self.execute_immediate(); }
         let declarations = self.word("DECLARE");
         if declarations || self.is_word("BEGIN") {
@@ -446,7 +454,7 @@ impl Parser<'_> {
                 self.declarations()?;
             }
             self.want_word("BEGIN")?;
-            self.statements()?;
+            self.block_body()?;
             self.want_word("END")?;
             self.want_symbol(";")?;
             self.locals = outer_locals;

@@ -777,3 +777,31 @@ fn plsql_dynamic_select_into_checks_cardinality_types_and_transaction_visibility
         "CREATE PROCEDURE bad IS n CONSTANT NUMBER:=0; BEGIN EXECUTE IMMEDIATE 'SELECT 1' INTO n; END;",
     ] {assert!(engine.define(source,Lang::PlSql).is_err(),"{source}");}
 }
+
+#[test]
+fn plsql_caught_statement_failure_rolls_back_only_that_statement() {
+    let (cfg,_guard)=test_config("plsql-caught-statement");
+    let db=Database::open_with_config(cfg).unwrap();seed_accounts(&db,&[(1,50),(2,20)]);
+    let engine=ProcEngine::new(&db);
+    engine.define("CREATE PROCEDURE handle_duplicate IS BEGIN EXECUTE IMMEDIATE 'UPDATE accounts SET balance=balance+10 WHERE id=1'; BEGIN EXECUTE IMMEDIATE 'INSERT INTO accounts(id,balance) VALUES(3,30),(1,999)'; EXCEPTION WHEN DUP_VAL_ON_INDEX THEN NULL; END; EXECUTE IMMEDIATE 'UPDATE accounts SET balance=balance+1 WHERE id=2'; END;",Lang::PlSql).unwrap();
+    engine.call("HANDLE_DUPLICATE",&[]).unwrap();
+    assert_eq!(balance(&db,1),60);assert_eq!(balance(&db,2),21);
+    assert!(matches!(db.query("SELECT id FROM accounts WHERE id=3",&[]).unwrap(),ExecResult::Rows{rows,..} if rows.is_empty()),"first row of the failed multi-row INSERT must also roll back");
+    engine.define("CREATE FUNCTION missing_default(p PLS_INTEGER) RETURN NUMBER IS n NUMBER; BEGIN EXECUTE IMMEDIATE 'SELECT balance FROM accounts WHERE id=:p' INTO n USING p; RETURN n; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN 123; END;",Lang::PlSql).unwrap();
+    assert_eq!(engine.call("MISSING_DEFAULT",&[Value::Int(99)]).unwrap(),ProcValue::Scalar(Value::Numeric("123".into())));
+    engine.define("CREATE PROCEDURE rethrow_duplicate IS BEGIN BEGIN EXECUTE IMMEDIATE 'INSERT INTO accounts VALUES(4,40),(1,0)'; EXCEPTION WHEN DUP_VAL_ON_INDEX THEN RAISE; END; END;",Lang::PlSql).unwrap();
+    assert!(matches!(engine.call("RETHROW_DUPLICATE",&[]),Err(Error::Oracle{code:1,..})));
+    assert!(matches!(db.query("SELECT id FROM accounts WHERE id=4",&[]).unwrap(),ExecResult::Rows{rows,..} if rows.is_empty()));
+}
+
+#[test]
+fn plsql_others_cannot_hide_engine_budgets_or_unsupported_execution() {
+    let (cfg,_guard)=test_config("plsql-handler-budget");
+    let db=Database::open_with_config(cfg).unwrap();seed_accounts(&db,&[(1,50)]);
+    let mut engine=ProcEngine::new(&db);
+    engine.define("CREATE FUNCTION spin_after_write RETURN NUMBER IS BEGIN EXECUTE IMMEDIATE 'UPDATE accounts SET balance=0'; LOOP NULL; END LOOP; EXCEPTION WHEN OTHERS THEN RETURN 999; END;",Lang::PlSql).unwrap();
+    engine.set_budget(100,100,100);
+    let error=engine.call("SPIN_AFTER_WRITE",&[]).unwrap_err().to_string();
+    assert!(error.contains("instruction budget"),"{error}");
+    assert_eq!(balance(&db,1),50);
+}
