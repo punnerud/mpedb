@@ -73,7 +73,7 @@ impl OracleSource {
                 rows,
                 source_state,
                 source_state_identity: mirror_id
-                    .map(|_| self.source_state_identity())
+                    .map(|id| self.state_identity_at(id, Some(scn)))
                     .transpose()?,
             };
             snapshot.position()?; // validate the complete resume domain before publication

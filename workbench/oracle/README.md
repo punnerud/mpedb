@@ -181,14 +181,18 @@ actual result and commits atomically. Native tests cover competing connections
 (one winner), stale CAS, old-SCN reads and refusing a disabled ownership marker.
 Durable Oracle import and the pull adapter use these foundations. Complete
 write-back, own-write echo suppression and the two-database controller remain
-unfinished. Bootstrap metadata version 2 also binds the control table's
-OBJECT_ID and DATA_OBJECT_ID. Adapter reconnect, capture and authority CAS
+unfinished. Bootstrap metadata version 3 binds the control table's
+OBJECT_ID and DATA_OBJECT_ID plus the authority row's SYS_GUID incarnation. Adapter reconnect, capture and authority CAS
 refuse a recreated or truncated control table even when its row was reseeded
-with the same epoch. CAS checks generation under its DDL lock, before UPDATE;
-established adapters never recreate missing authority rows. A dedicated test
-owner verifies TRUNCATE and DROP/CREATE without touching shared tracking state.
-Older development bootstrap files require reimport. A per-row incarnation token
-is still needed to detect DELETE/reinsert of an authority row in the same table.
+with the same epoch. CAS locks the authority row, compares its table generation and row token,
+updates the epoch, then verifies the token again before commit. Established
+adapters never recreate missing authority rows. A dedicated test owner verifies
+TRUNCATE, DROP/CREATE and DELETE/reinsert with the same id and epoch, without
+touching shared tracking state. Control-table format V2 adds INCARNATION RAW(16)
+DEFAULT SYS_GUID() NOT NULL; new API inserts explicitly generate a fresh token.
+Existing V1 tables are refused rather than automatically altered, and older
+development bootstrap files require reimport. The dedicated native test table
+was explicitly migrated with existing epochs preserved and a private backup.
 
 ## Native implementation progress
 

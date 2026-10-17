@@ -93,7 +93,7 @@ fn native_oracle_authority_state_initializes_once_cas_fences_and_reads_history()
         Some((4, winner.into()))
     );
     c.execute(
-        "ALTER TABLE MPEDB_MIRROR_STATE DISABLE CONSTRAINT MPEDB_MIRROR_STATE_V1",
+        "ALTER TABLE MPEDB_MIRROR_STATE DISABLE CONSTRAINT MPEDB_MIRROR_STATE_V2",
         &[],
     )
     .unwrap();
@@ -103,7 +103,7 @@ fn native_oracle_authority_state_initializes_once_cas_fences_and_reads_history()
         .to_string()
         .contains("ownership marker"));
     c.execute(
-        "ALTER TABLE MPEDB_MIRROR_STATE ENABLE VALIDATE CONSTRAINT MPEDB_MIRROR_STATE_V1",
+        "ALTER TABLE MPEDB_MIRROR_STATE ENABLE VALIDATE CONSTRAINT MPEDB_MIRROR_STATE_V2",
         &[],
     )
     .unwrap();

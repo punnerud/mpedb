@@ -5,7 +5,7 @@ use mpedb_mirror::{
 };
 #[test]
 #[ignore = "requires a dedicated MPEDB_ORACLE_FENCE test owner and private config"]
-fn native_oracle_control_truncate_and_recreate_invalidate_old_mirrors() {
+fn native_oracle_control_and_authority_row_recreation_invalidate_old_mirrors() {
     let config = std::env::var("MPEDB_ORACLE_FENCE_SOURCE_CONFIG")
         .expect("dedicated destructive-test config required");
     let spec = sourcecfg::load(std::path::Path::new(&config)).unwrap();
@@ -38,7 +38,7 @@ fn native_oracle_control_truncate_and_recreate_invalidate_old_mirrors() {
         size_bytes: 64 * 1024 * 1024,
         ..Default::default()
     };
-    for recreate in [false, true] {
+    for mutation in ["truncate", "recreate", "row"] {
         let mut source = OracleSource::connect(&spec).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let (db, _) = loop {
@@ -64,11 +64,33 @@ fn native_oracle_control_truncate_and_recreate_invalidate_old_mirrors() {
             .cas_source_state(&metadata.mirror_id, 1, 2, "source")
             .unwrap());
 
-        if recreate {
-            c.execute("DROP TABLE MPEDB_MIRROR_STATE PURGE", &[])
+        match mutation {
+            "recreate" => {
+                c.execute("DROP TABLE MPEDB_MIRROR_STATE PURGE", &[])
+                    .unwrap();
+            }
+            "truncate" => {
+                c.execute("TRUNCATE TABLE MPEDB_MIRROR_STATE", &[]).unwrap();
+            }
+            _ => {
+                c.execute(
+                    "DELETE FROM MPEDB_MIRROR_STATE WHERE mirror_id=:1",
+                    &[&metadata.mirror_id.as_bytes()],
+                )
                 .unwrap();
-        } else {
-            c.execute("TRUNCATE TABLE MPEDB_MIRROR_STATE", &[]).unwrap();
+                c.commit().unwrap();
+                assert!(adapter
+                    .ensure_source_state(&metadata.mirror_id, 1, "source")
+                    .is_err());
+                assert_eq!(
+                    c.query_row_as::<u64>(
+                        "SELECT COUNT(*) FROM MPEDB_MIRROR_STATE WHERE mirror_id=:1",
+                        &[&metadata.mirror_id.as_bytes()]
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
         }
         let mut fresh = OracleSource::connect(&spec).unwrap();
         fresh
@@ -93,21 +115,29 @@ fn native_oracle_control_truncate_and_recreate_invalidate_old_mirrors() {
             fresh.read_source_state(&metadata.mirror_id).unwrap(),
             Some((1, "source".into()))
         );
-        let identity = fresh.source_state_identity().unwrap();
-        if recreate {
+        let identity = fresh.source_state_identity(&metadata.mirror_id).unwrap();
+        if mutation == "recreate" {
             assert_ne!(identity.object_id, metadata.state_identity.object_id);
         } else {
             assert_eq!(identity.object_id, metadata.state_identity.object_id);
         }
-        assert_ne!(
-            identity.data_object_id,
-            metadata.state_identity.data_object_id
-        );
+        if mutation == "row" {
+            assert_eq!(
+                identity.data_object_id,
+                metadata.state_identity.data_object_id
+            );
+        } else {
+            assert_ne!(
+                identity.data_object_id,
+                metadata.state_identity.data_object_id
+            );
+        }
+        assert_ne!(identity.incarnation, metadata.state_identity.incarnation);
         assert!(adapter
             .pull(&from, 16)
             .unwrap_err()
             .to_string()
-            .contains("recreated or truncated"));
+            .contains("incarnation changed"));
         assert!(adapter.head().is_err());
         assert!(adapter
             .cas_source_state(&metadata.mirror_id, 1, 2, "source")

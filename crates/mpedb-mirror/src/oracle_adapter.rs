@@ -62,9 +62,10 @@ impl OracleAdapter {
         Ok(self)
     }
     fn check_identity(&self) -> Result<()> {
-        if self.source.source_state_identity()? != self.state_identity {
+        if self.source.source_state_identity(&self.mirror_id)? != self.state_identity {
             return Err(Error::Unsupported(
-                "Oracle control table was recreated or truncated; reimport is required".into(),
+                "Oracle control table or authority row incarnation changed; reimport is required"
+                    .into(),
             ));
         }
         if self.source.identity()? != self.identity {

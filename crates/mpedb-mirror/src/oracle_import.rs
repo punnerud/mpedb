@@ -28,7 +28,8 @@ pub struct OracleBootstrap {
 }
 impl OracleBootstrap {
     fn validate(&self) -> Result<()> {
-        if self.version != 2
+        if self.version != 3
+            || self.state_identity.incarnation == [0; 16]
             || self.state_identity.object_id == 0
             || self.state_identity.data_object_id == 0
             || self.epoch != 1
@@ -135,7 +136,7 @@ pub fn import_oracle(
         ));
     }
     let metadata = OracleBootstrap {
-        version: 2,
+        version: 3,
         cursor: snapshot.position()?.encode(),
         identity: snapshot.identity,
         tables: snapshot.tables,
