@@ -5,18 +5,21 @@ use crate::adapter::{NetOp, NetOpKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Committed net images at ONE SCN, across the entire selected table set.
-/// Multiple transactions sharing a commit SCN stay together. XIDs preserve
-/// source provenance; this is not yet an echo-filtered SourceAdapter batch.
+/// Multiple transactions sharing a commit SCN stay together. Batch-wide XIDs
+/// are diagnostics, not per-key ownership proof. This is not echo-filtered.
 #[derive(Debug)]
 pub struct OracleChangeBatch {
     pub scn: u64,
     pub xids: Vec<Vec<u8>>,
     pub ops: Vec<NetOp>,
+    /// Position-aligned key evidence; batch-wide XIDs are insufficient for echo proof.
+    pub key_transactions: Vec<OracleKeyTransactions>,
 }
 #[derive(Default)]
 struct Changes {
     xids: BTreeSet<Vec<u8>>,
     keys: BTreeMap<(u32, Vec<u8>), Vec<Value>>,
+    evidence: super::capture_evidence::Evidence,
 }
 impl OracleSource {
     /// Capture committed changes in `(from_scn, to_scn]`. `from_scn` must be a
@@ -97,7 +100,7 @@ impl OracleSource {
                     .join(",");
                 // Bind by name so repeated SCNs resolve unambiguously and
                 // consecutive windows reuse the same SQL statement text.
-                let sql=format!("SELECT versions_startscn,versions_endscn,versions_xid,versions_operation,{projection} FROM {}.{} VERSIONS BETWEEN SCN :from_scn AND :to_scn WHERE (versions_startscn>:from_scn AND versions_startscn<=:to_scn) OR (versions_endscn>:from_scn AND versions_endscn<=:to_scn)",quote(&table.owner),quote(&table.name));
+                let sql=format!("SELECT versions_startscn,versions_endscn,versions_xid,versions_operation,CAST(ROWID AS VARCHAR2(4000)),{projection} FROM {}.{} VERSIONS BETWEEN SCN :from_scn AND :to_scn WHERE (versions_startscn>:from_scn AND versions_startscn<=:to_scn) OR (versions_endscn>:from_scn AND versions_endscn<=:to_scn)",quote(&table.owner),quote(&table.name));
                 let rows = self
                     .connection
                     .query_named(&sql, &[("from_scn", &from_scn), ("to_scn", &to_scn)])
@@ -112,7 +115,8 @@ impl OracleSource {
                     let end: Option<u64> = get(&row, 1)?;
                     let xid: Option<Vec<u8>> = get(&row, 2)?;
                     let operation: Option<String> = get(&row, 3)?;
-                    let pk = decode_row(&row, &keys, 4)?;
+                    let physical_row: String = get(&row, 4)?;
+                    let pk = decode_row(&row, &keys, 5)?;
                     if pk.contains(&Value::Null) {
                         return Err(Error::Corrupt(
                             "Oracle committed version has NULL identity".into(),
@@ -132,6 +136,12 @@ impl OracleSource {
                             ));
                         }
                         let entry = changes.entry(scn).or_default();
+                        entry.evidence.start(
+                            table_id as u32,
+                            encoded.clone(),
+                            physical_row.clone(),
+                            xid.clone(),
+                        );
                         entry.xids.insert(xid);
                         entry
                             .keys
@@ -142,11 +152,11 @@ impl OracleSource {
                         // its started version. Also retain the expired key at
                         // END SCN, or the old identity would remain forever.
                         // This version's XID belongs to its START, not its end.
-                        changes
-                            .entry(scn)
-                            .or_default()
-                            .keys
-                            .insert((table_id as u32, encoded), pk);
+                        let entry = changes.entry(scn).or_default();
+                        entry
+                            .evidence
+                            .end(table_id as u32, encoded.clone(), physical_row);
+                        entry.keys.insert((table_id as u32, encoded), pk);
                     }
                 }
             }
@@ -156,7 +166,9 @@ impl OracleSource {
                     return Err(Error::Corrupt("Oracle version history has an expiration without its committing transaction".into()));
                 }
                 let mut ops = Vec::with_capacity(changes.keys.len());
-                for ((table_id, _), pk) in changes.keys {
+                let mut key_transactions = Vec::with_capacity(changes.keys.len());
+                for ((table_id, encoded), pk) in changes.keys {
+                    key_transactions.push(changes.evidence.resolve(table_id, &encoded));
                     // Index-key updates can appear as DELETE+INSERT, even for
                     // the same PK. The final image at the commit determines
                     // the net op, never the arbitrary order of version rows.
@@ -169,6 +181,7 @@ impl OracleSource {
                     scn,
                     xids: changes.xids.into_iter().collect(),
                     ops,
+                    key_transactions,
                 });
             }
             Ok(batches)

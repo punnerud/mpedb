@@ -124,6 +124,17 @@ fn native_oracle_capture_keeps_commits_historical_images_and_compound_key_change
     let all = source.read_changes(&tables, from, to, 100).unwrap();
     assert_eq!(all.len(), 4);
     assert!(all.windows(2).all(|w| w[0].scn < w[1].scn));
+    for batch in &all {
+        assert_eq!(batch.key_transactions.len(), batch.ops.len());
+        for evidence in &batch.key_transactions {
+            assert!(
+                evidence.complete,
+                "heap row transitions must be attributable"
+            );
+            assert_eq!(evidence.xids, batch.xids);
+        }
+    }
+
     assert!(all
         .iter()
         .all(|b| b.scn > from && b.scn <= to && b.xids.len() == 1));
@@ -214,6 +225,78 @@ fn native_oracle_capture_keeps_commits_historical_images_and_compound_key_change
     .unwrap();
     c.commit().unwrap();
     for name in ["MPEDB_CAPTURE_A", "MPEDB_CAPTURE_B"] {
+        c.execute(&format!("DROP TABLE {name} PURGE"), &[]).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires MPEDB_ORACLE_SOURCE_CONFIG and Oracle client libraries"]
+fn native_oracle_capture_handles_logical_rowids_and_partition_row_movement() {
+    let path = std::env::var("MPEDB_ORACLE_SOURCE_CONFIG").unwrap();
+    let spec = sourcecfg::load(std::path::Path::new(&path)).unwrap();
+    let SourceSpec::Oracle {
+        connect_string,
+        username,
+        password,
+    } = &spec
+    else {
+        panic!("Oracle required")
+    };
+    assert_eq!(username, "MPEDB_ORACLE_TEST");
+    let c = oracle_client::Connection::connect(username, password, connect_string).unwrap();
+    let names = ["MPEDB_CAPTURE_IOT", "MPEDB_CAPTURE_PART"];
+    for name in names {
+        c.execute(&format!("BEGIN EXECUTE IMMEDIATE 'DROP TABLE {name} PURGE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"), &[]).unwrap();
+    }
+    c.execute(
+        "CREATE TABLE MPEDB_CAPTURE_IOT(id NUMBER PRIMARY KEY,v NUMBER) ORGANIZATION INDEX",
+        &[],
+    )
+    .unwrap();
+    c.execute("CREATE TABLE MPEDB_CAPTURE_PART(id NUMBER PRIMARY KEY,p NUMBER,v NUMBER) PARTITION BY RANGE(p)(PARTITION lo VALUES LESS THAN(10),PARTITION hi VALUES LESS THAN(MAXVALUE)) ENABLE ROW MOVEMENT", &[]).unwrap();
+    c.execute("INSERT INTO MPEDB_CAPTURE_IOT VALUES(1,10)", &[])
+        .unwrap();
+    c.execute("INSERT INTO MPEDB_CAPTURE_PART VALUES(1,1,10)", &[])
+        .unwrap();
+    c.commit().unwrap();
+    let mut source = OracleSource::connect(&spec).unwrap();
+    let tables = source
+        .introspect(Some(&names.map(String::from)), &[])
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let snapshot = loop {
+        match source.snapshot(&tables) {
+            Ok(snapshot) => break snapshot,
+            Err(e)
+                if e.to_string().contains("ORA-01466") && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => panic!("snapshot failed: {e}"),
+        }
+    };
+    c.execute("UPDATE MPEDB_CAPTURE_IOT SET id=2,v=20 WHERE id=1", &[])
+        .unwrap();
+    c.execute("UPDATE MPEDB_CAPTURE_PART SET p=20,v=30 WHERE id=1", &[])
+        .unwrap();
+    c.commit().unwrap();
+    let to = source.current_scn().unwrap();
+    let changes = source.read_changes(&tables, snapshot.scn, to, 100).unwrap();
+    assert_eq!(changes.len(), 1);
+    let batch = &changes[0];
+    assert_eq!(batch.ops.len(), 3);
+    assert_eq!(batch.key_transactions.len(), batch.ops.len());
+    assert!(batch.ops.iter().any(|op| op.table_id == 0
+        && op.pk == vec![Value::Numeric("1".into())]
+        && matches!(op.kind, NetOpKind::Delete)));
+    assert!(batch.ops.iter().any(|op| op.table_id == 0 && matches!(&op.kind, NetOpKind::Upsert(row) if row == &vec![Value::Numeric("2".into()), Value::Numeric("20".into())])));
+    assert!(batch.ops.iter().any(|op| op.table_id == 1 && matches!(&op.kind, NetOpKind::Upsert(row) if row == &vec![Value::Numeric("1".into()), Value::Numeric("20".into()), Value::Numeric("30".into())])));
+    for evidence in &batch.key_transactions {
+        if evidence.complete {
+            assert_eq!(evidence.xids, batch.xids);
+        }
+    }
+    for name in names {
         c.execute(&format!("DROP TABLE {name} PURGE"), &[]).unwrap();
     }
 }

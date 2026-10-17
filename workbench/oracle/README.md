@@ -279,6 +279,17 @@ controller are connected. The outbox retains the full coalesced dirty set in
 one source transaction; its current 64 MiB/100000-op limit refuses oversized
 requests before RPC rather than splitting key moves or silently truncating.
 
+Native capture now returns position-aligned `key_transactions` evidence as well
+as batch-wide XIDs. An expiring version's creator XID is never attributed to the
+transaction that expires it. Started versions are correlated by table and ROWID
+at the same commit SCN, including old/new identities of a primary-key move.
+Unmatched expirations mark a key incomplete; consumers must treat it as unknown.
+All XIDs affecting a key are retained, so a shared commit SCN alone cannot prove
+ownership. Native historical/key-move capture, index-organized logical ROWIDs and
+partition row movement pass, along with deterministic tests for unrelated rows,
+table isolation and mixed/unknown evidence. This evidence
+still needs a source-side request ledger before it can attest mirror origins.
+
 The shared apply boundary also accepts optional source-attested per-key write
 provenance (`pull_provenanced` / `apply_provenanced_batch`). An ACK persists the
 applied request's explicit key/schema footprints in the SAME local transaction
