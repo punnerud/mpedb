@@ -1,10 +1,10 @@
 //! Real component roundtrip through MPEdb/rRETL, with isolated single writers.
 //! Deliberately not a production controller: no concurrent-writer/echo policy.
 use crate::{
-    apply_batch, import_oracle, import_pg, load_oracle_bootstrap,
+    apply_batch, import_oracle, import_pg, import_sqlite, load_oracle_bootstrap,
     oracle_source::{OracleSource, OracleWriteRequest},
-    sourcecfg, state, ImportOptions, NetOp, NetOpKind, OracleAdapter, PgAdapter, SourceAdapter,
-    SourceSpec,
+    sourcecfg, state, switch::{drain_pull, drain_push}, ImportOptions, NetOp, NetOpKind,
+    OracleAdapter, PgAdapter, SourceAdapter, SourceSpec, SqliteAdapter,
 };
 use mpedb::Database;
 use mpedb_types::{keycode, Value};
@@ -201,6 +201,9 @@ fn oracle_postgres_roundtrip_uses_mpedb_rretl_for_both_directions() {
     let check_path = dir.join("check.mpedb");
     let (check, _) = import_pg(&mut pg_client, &check_path, &options).unwrap();
     assert_eq!(rows(&check), rows(&raw));
+    // The same MPEdb carriers seed a separate SQLite mirror. SQLite does not
+    // read Oracle or PostgreSQL itself.
+    compose_sqlite(&dir, &rows(&raw));
     raw.rretl_revert(run).unwrap();
     raw.verify().unwrap();
     pg_mirror.verify().unwrap();
@@ -212,4 +215,98 @@ fn oracle_postgres_roundtrip_uses_mpedb_rretl_for_both_directions() {
             .execute(&format!("DROP TABLE {table} PURGE"), &[])
             .unwrap();
     }
+}
+fn text_cell(value: &Value) -> String {
+    match value {
+        Value::Text(text) => text.clone(),
+        Value::Null => String::new(),
+        other => panic!("text carrier required, got {other:?}"),
+    }
+}
+fn compose_sqlite(dir: &std::path::Path, carriers: &[Vec<Value>]) {
+    let sqlite_path = dir.join("composed.sqlite");
+    let mirror_path = dir.join("sqlite.mpedb");
+    let mut conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE migrated(id INTEGER NOT NULL, part TEXT NOT NULL, payload TEXT, PRIMARY KEY(id, part))",
+    )
+    .unwrap();
+    let oracle_row = carriers
+        .iter()
+        .find(|row| matches!(&row[0], Value::Numeric(id) if id == "1"))
+        .expect("migrated Oracle id 1");
+    let oracle_part = text_cell(&oracle_row[1]);
+    let oracle_payload = text_cell(&oracle_row[4]);
+    {
+        let tx = conn.transaction().unwrap();
+        for row in carriers {
+            let Value::Numeric(id) = &row[0] else {
+                panic!("id {row:?}");
+            };
+            let id: i64 = id.parse().expect("oracle id");
+            tx.execute(
+                "INSERT INTO migrated(id, part, payload) VALUES(?1, ?2, ?3)",
+                rusqlite::params![id, text_cell(&row[1]), text_cell(&row[4])],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let options = ImportOptions {
+        include: Some(vec!["migrated".into()]),
+        ..Default::default()
+    };
+    let (mirror, _) = import_sqlite(&mut conn, &mirror_path, &options).unwrap();
+    let imported = match mirror
+        .query(
+            "SELECT payload FROM migrated WHERE id=$1 AND part=$2",
+            &[Value::Int(1), Value::Text(oracle_part.clone())],
+        )
+        .unwrap()
+    {
+        mpedb::ExecResult::Rows { rows, .. } => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(imported, vec![vec![Value::Text(oracle_payload)]]);
+    conn.execute(
+        "UPDATE migrated SET payload='sqlite-commit' WHERE id=1",
+        [],
+    )
+    .unwrap();
+    let mut adapter = SqliteAdapter::new(conn, options.include.as_deref(), &[]).unwrap();
+    let pulled = drain_pull(&mirror, &mut adapter).unwrap();
+    assert!(pulled >= 1, "a committed SQLite change must land in MPEdb");
+    let pulled_row = match mirror
+        .query(
+            "SELECT payload FROM migrated WHERE id=$1 AND part=$2",
+            &[Value::Int(1), Value::Text(oracle_part.clone())],
+        )
+        .unwrap()
+    {
+        mpedb::ExecResult::Rows { rows, .. } => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(pulled_row, vec![vec![Value::Text("sqlite-commit".into())]]);
+    mirror
+        .query(
+            "UPDATE migrated SET payload=$1 WHERE id=$2 AND part=$3",
+            &[
+                Value::Text("mpedb-commit".into()),
+                Value::Int(1),
+                Value::Text(oracle_part),
+            ],
+        )
+        .unwrap();
+    let pushed = drain_push(&mirror, &mut adapter).unwrap();
+    assert!(pushed.upserts >= 1, "an MPEdb change must be written back to SQLite");
+    let stored: String = adapter
+        .conn()
+        .query_row(
+            "SELECT payload FROM migrated WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "mpedb-commit");
+    mirror.verify().unwrap();
 }
