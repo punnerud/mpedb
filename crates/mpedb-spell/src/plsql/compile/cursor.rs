@@ -1,9 +1,13 @@
-//! Explicit PL/SQL cursors: `CURSOR c IS SELECT ...; OPEN; FETCH INTO; CLOSE`.
-//! Packages, cursor attributes, and parameters in the cursor query stay refused.
+//! Explicit PL/SQL cursors: `CURSOR c IS SELECT ...; OPEN; FETCH INTO; CLOSE`
+//! and `%FOUND`, `%NOTFOUND`, `%ISOPEN`, `%ROWCOUNT`.
+//! Packages and parameters in the cursor query stay refused.
 //! A fetch that finds no row leaves its targets unchanged and leaves the
 //! cursor open. A NULL column assigns NULL. CLOSE releases the stream
 //! without fetching the remaining rows. `SELECT *` is refused: the select
 //! list must name its columns. `count(*)` is one column.
+//! `%FOUND` and `%NOTFOUND` are NULL after OPEN and before FETCH. A cursor
+//! that is not open makes `%ISOPEN` false and raises INVALID_CURSOR for
+//! the other three. `%NOTFOUND` is the boolean not of `%FOUND`.
 use super::*;
 use crate::emit::{line_col, CallKind, SqlCall};
 
@@ -158,6 +162,23 @@ impl Parser<'_> {
             .copied()
             .ok_or_else(|| self.error("unknown explicit cursor"))
     }
+
+    pub(super) fn cursor_attribute(&mut self, name: &str) -> Result<Option<Type>> {
+        let cursor = self.cursors.get(name).copied().ok_or_else(|| {
+            self.error("cursor attributes require an explicit cursor")
+        })?;
+        let attr = self.identifier()?;
+        let (code, ty) = match attr.as_str() {
+            "ISOPEN" => (crate::ir::CURSOR_ATTR_ISOPEN, Type::Boolean),
+            "FOUND" => (crate::ir::CURSOR_ATTR_FOUND, Type::Boolean),
+            "NOTFOUND" => (crate::ir::CURSOR_ATTR_NOTFOUND, Type::Boolean),
+            "ROWCOUNT" => (crate::ir::CURSOR_ATTR_ROWCOUNT, Type::PlsInteger),
+            _ => return Err(self.error(&format!("unknown cursor attribute {attr}"))),
+        };
+        self.builder.emit(Op::LoadLocal(cursor.slot))?;
+        self.builder.emit(Op::CursorAttr(code))?;
+        Ok(Some(ty))
+    }
 }
 
 enum WidthError {
@@ -233,11 +254,18 @@ mod tests {
     use super::super::compile;
     use crate::emit::CallKind;
     use crate::interp::{self, testutil::MockBridge, Budget, ProcValue};
-    use crate::ir::{PlanKind, PlanRef, Proc};
+    use crate::ir::{Op, PlanKind, PlanRef, Proc};
     use mpedb_types::{PlanHash, Value};
 
     fn run(rows: Vec<Vec<Value>>, body: &str) -> (Value, MockBridge) {
-        let source = format!("CREATE FUNCTION f RETURN NUMBER IS {body}");
+        let (value, bridge, _) = execute("NUMBER", rows, body);
+        (value, bridge)
+    }
+
+    /// Compile through the shipped compiler, round-trip the bytecode, and
+    /// execute it. The returned procedure is the one that ran.
+    fn execute(returns: &str, rows: Vec<Vec<Value>>, body: &str) -> (Value, MockBridge, Proc) {
+        let source = format!("CREATE FUNCTION f RETURN {returns} IS {body}");
         let skel = compile(&source).unwrap();
         assert!(skel.calls.iter().any(|call| call.kind == CallKind::Rows));
         let plans = skel
@@ -280,7 +308,7 @@ mod tests {
             ProcValue::Scalar(value) => value,
             other => panic!("{other:?}"),
         };
-        (value, bridge)
+        (value, bridge, proc)
     }
 
     #[test]
@@ -330,5 +358,172 @@ mod tests {
         let two = "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT a, b FROM dual; x NUMBER; y NUMBER; BEGIN OPEN c; FETCH c INTO x, y; CLOSE c; RETURN x; END;";
         let skel = compile(two).unwrap();
         assert_eq!(skel.calls[0].expected_columns, Some(2));
+    }
+
+    #[test]
+    fn cursor_attributes_follow_oracle_null_logic() {
+        let row = vec![vec![Value::Numeric("4".into())]];
+        let decl = "CURSOR c IS SELECT amount FROM dual; v NUMBER;";
+        let invalid = "ORA-01001: cursor number is invalid or does not exist";
+
+        let (found, bridge, proc) = execute(
+            "BOOLEAN",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; RETURN c%Found; END;"),
+        );
+        assert!(proc.instrs.contains(&Op::CursorAttr(crate::ir::CURSOR_ATTR_FOUND)));
+        assert_eq!(found, Value::Null);
+        assert_eq!(bridge.cursor_opens, 1);
+        assert_eq!(bridge.advances, 0);
+
+        let (notfound, _, proc) = execute(
+            "BOOLEAN",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; RETURN c%notfound; END;"),
+        );
+        assert!(proc.instrs.contains(&Op::CursorAttr(crate::ir::CURSOR_ATTR_NOTFOUND)));
+        assert_eq!(notfound, Value::Null);
+
+        let (open, _) = run(
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; IF c%ISOPEN THEN RETURN 1; ELSE RETURN 0; END IF; END;"),
+        );
+        assert_eq!(open, Value::Numeric("1".into()));
+        let (count, _, proc) = execute(
+            "PLS_INTEGER",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; RETURN c%ROWCOUNT; END;"),
+        );
+        assert!(proc.instrs.contains(&Op::CursorAttr(crate::ir::CURSOR_ATTR_ROWCOUNT)));
+        assert_eq!(count, Value::Int(0));
+
+        let (closed, bridge) = run(
+            vec![],
+            "CURSOR c IS SELECT amount FROM dual; BEGIN IF c%ISOPEN THEN RETURN 1; ELSE RETURN 0; END IF; END;",
+        );
+        assert_eq!(closed, Value::Numeric("0".into()));
+        assert_eq!(bridge.cursor_opens, 0);
+        for (attr, assign) in [
+            ("FOUND", "flag := c%FOUND;"),
+            ("NOTFOUND", "flag := c%NOTFOUND;"),
+            ("ROWCOUNT", "n := c%ROWCOUNT;"),
+        ] {
+            let (text, bridge, proc) = execute(
+                "VARCHAR2",
+                vec![],
+                &format!(
+                    "CURSOR c IS SELECT amount FROM dual; flag BOOLEAN; n PLS_INTEGER; BEGIN {assign} RETURN 'open'; EXCEPTION WHEN INVALID_CURSOR THEN RETURN SQLERRM; END;"
+                ),
+            );
+            assert!(
+                proc.instrs.iter().any(|op| matches!(op, Op::CursorAttr(_))),
+                "{attr}"
+            );
+            assert_eq!(text, Value::Text(invalid.into()), "{attr}");
+            assert_eq!(bridge.cursor_opens, 0, "{attr}");
+        }
+
+        let (found, bridge, _) = execute(
+            "BOOLEAN",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; RETURN c%FOUND; END;"),
+        );
+        assert_eq!(found, Value::Bool(true));
+        assert_eq!(bridge.advances, 1);
+        let (notfound, _) = run(
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; IF c%NOTFOUND THEN RETURN 1; ELSE RETURN 0; END IF; END;"),
+        );
+        assert_eq!(notfound, Value::Numeric("0".into()));
+        let (count, _, _) = execute(
+            "PLS_INTEGER",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; RETURN c%ROWCOUNT; END;"),
+        );
+        assert_eq!(count, Value::Int(1));
+
+        let (found, bridge, _) = execute(
+            "BOOLEAN",
+            vec![],
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; RETURN c%FOUND; END;"),
+        );
+        assert_eq!(found, Value::Bool(false));
+        assert_eq!(bridge.advances, 1);
+        let (notfound, _, _) = execute(
+            "BOOLEAN",
+            vec![],
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; RETURN c%NOTFOUND; END;"),
+        );
+        assert_eq!(notfound, Value::Bool(true));
+        let (count, _, _) = execute(
+            "PLS_INTEGER",
+            vec![],
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; RETURN c%ROWCOUNT; END;"),
+        );
+        assert_eq!(count, Value::Int(0));
+
+        let (count, bridge, _) = execute(
+            "PLS_INTEGER",
+            row.clone(),
+            &format!(
+                "{decl} BEGIN OPEN c; FETCH c INTO v; FETCH c INTO v; FETCH c INTO v; RETURN c%ROWCOUNT; END;"
+            ),
+        );
+        assert_eq!(count, Value::Int(1));
+        assert_eq!(bridge.advances, 2, "a fetch after exhaustion must not pull");
+        let (notfound, _, _) = execute(
+            "BOOLEAN",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; FETCH c INTO v; RETURN c%NOTFOUND; END;"),
+        );
+        assert_eq!(notfound, Value::Bool(true));
+        let (found, _, _) = execute(
+            "BOOLEAN",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; FETCH c INTO v; RETURN c%FOUND; END;"),
+        );
+        assert_eq!(found, Value::Bool(false));
+
+        let (open, bridge) = run(
+            vec![],
+            "CURSOR c IS SELECT amount FROM dual; BEGIN OPEN c; CLOSE c; IF c%ISOPEN THEN RETURN 1; ELSE RETURN 0; END IF; END;",
+        );
+        assert_eq!(open, Value::Numeric("0".into()));
+        assert_eq!(bridge.closes, 1);
+        assert_eq!(bridge.advances, 0);
+        assert_eq!(bridge.live_streams(), 0);
+        let (text, bridge, _) = execute(
+            "VARCHAR2",
+            row.clone(),
+            &format!(
+                "{decl} n PLS_INTEGER; BEGIN OPEN c; FETCH c INTO v; CLOSE c; n := c%ROWCOUNT; RETURN 'open'; EXCEPTION WHEN INVALID_CURSOR THEN RETURN SQLERRM; END;"
+            ),
+        );
+        assert_eq!(text, Value::Text(invalid.into()));
+        assert_eq!(bridge.advances, 1);
+        assert_eq!(bridge.closes, 1);
+        for (attr, assign) in [("FOUND", "flag := c%FOUND;"), ("NOTFOUND", "flag := c%NOTFOUND;")] {
+            let (text, _, _) = execute(
+                "VARCHAR2",
+                vec![],
+                &format!(
+                    "CURSOR c IS SELECT amount FROM dual; flag BOOLEAN; BEGIN OPEN c; CLOSE c; {assign} RETURN 'open'; EXCEPTION WHEN INVALID_CURSOR THEN RETURN SQLERRM; END;"
+                ),
+            );
+            assert_eq!(text, Value::Text(invalid.into()), "{attr}");
+        }
+
+        for source in [
+            "CREATE FUNCTION f RETURN BOOLEAN IS CURSOR c IS SELECT amount FROM dual; BEGIN RETURN c%ROWTYPE; END;",
+            "CREATE FUNCTION f RETURN BOOLEAN IS CURSOR c IS SELECT amount FROM dual; BEGIN RETURN SQL%FOUND; END;",
+        ] {
+            let err = compile(source).unwrap_err().to_string();
+            assert!(err.contains("PL/SQL at "), "{err}");
+            assert!(
+                err.contains("unknown cursor attribute")
+                    || err.contains("cursor attributes require an explicit cursor"),
+                "{err}"
+            );
+        }
     }
 }

@@ -473,11 +473,15 @@ fn arith(op: Op, a: PValue, b: PValue) -> Result<PValue> {
 /// bump the generation so stale handles error instead of aliasing. Oracle
 /// FETCH that finds no row sets `exhausted` and keeps the stream, so the
 /// handle stays open and a later OPEN cannot reuse the slot.
+/// `fetched` separates "OPEN, no FETCH yet" (`%FOUND` is NULL) from a
+/// FETCH that returned no row (`%FOUND` is false). `row == None` is both.
 struct CurSlot {
     gen: u32,
     stream: Option<u32>,
     row: Option<PValue>,
     exhausted: bool,
+    fetched: bool,
+    rowcount: u64,
 }
 
 /// Run a validated procedure. `args` were checked against `proc.argc` by
@@ -851,6 +855,8 @@ pub fn run(
                                     stream: None,
                                     row: None,
                                     exhausted: false,
+                                    fetched: false,
+                                    rowcount: 0,
                                 });
                                 cursors.len() - 1
                             }
@@ -866,6 +872,8 @@ pub fn run(
                         c.stream = Some(stream);
                         c.row = None;
                         c.exhausted = false;
+                        c.fetched = false;
+                        c.rowcount = 0;
                         stack.push(PValue::Cursor {
                             slot: slot as u16,
                             gen: c.gen,
@@ -886,17 +894,22 @@ pub fn run(
                     let stream = cursors[slot].stream.expect("pop_cursor checked");
                     match bridge.cursor_advance(stream)? {
                         Some(row) => {
-                            cursors[slot].row = Some(PValue::Tuple(Rc::new(
+                            let c = &mut cursors[slot];
+                            c.row = Some(PValue::Tuple(Rc::new(
                                 row.into_iter().map(PValue::Scalar).collect(),
                             )));
+                            c.fetched = true;
+                            c.rowcount = c.rowcount.saturating_add(1);
                             stack.push(PValue::Scalar(Value::Bool(true)));
                         }
                         None if fetch => {
                             // Oracle not-found: the cursor stays open. CLOSE
-                            // is what releases the stream.
+                            // is what releases the stream. ROWCOUNT does not
+                            // move, and FOUND becomes false rather than NULL.
                             let c = &mut cursors[slot];
                             c.row = None;
                             c.exhausted = true;
+                            c.fetched = true;
                             stack.push(PValue::Scalar(Value::Bool(false)));
                         }
                         None => {
@@ -912,6 +925,10 @@ pub fn run(
                 let stream = cursors[slot].stream.expect("pop_cursor checked");
                 bridge.cursor_close(stream)?;
                 release_cursor(&mut cursors[slot]);
+            }
+            Op::CursorAttr(which) => {
+                let value = stack.pop().expect("validated");
+                stack.push(cursor_attr(&cursors, value, which)?);
             }
             Op::CursorRow => {
                 let slot = pop_cursor(&mut stack, &cursors)?;
@@ -951,7 +968,53 @@ fn release_cursor(slot: &mut CurSlot) {
     slot.stream = None;
     slot.row = None;
     slot.exhausted = false;
+    slot.fetched = false;
+    slot.rowcount = 0;
     slot.gen = slot.gen.wrapping_add(1);
+}
+
+/// Explicit cursor attribute. A NULL handle is a cursor that was never
+/// opened or has been closed: `%ISOPEN` is false and the others raise
+/// INVALID_CURSOR. Do not use [`pop_cursor`] here; that reports a host
+/// error and rejects the NULL handle Oracle treats as "not open".
+fn cursor_attr(cursors: &[CurSlot], value: PValue, which: u8) -> Result<PValue> {
+    let open = match value {
+        PValue::Scalar(Value::Null) => None,
+        PValue::Cursor { slot, gen } => cursors
+            .get(slot as usize)
+            .filter(|cursor| cursor.gen == gen && cursor.stream.is_some()),
+        other => {
+            return Err(type_err(format!(
+                "expected a cursor, got {}",
+                tyname(&other)
+            )))
+        }
+    };
+    let Some(cursor) = open else {
+        return if which == crate::ir::CURSOR_ATTR_ISOPEN {
+            Ok(PValue::Scalar(Value::Bool(false)))
+        } else {
+            Err(Error::Oracle {
+                code: 1001,
+                message: "cursor number is invalid or does not exist".into(),
+            })
+        };
+    };
+    let found = if cursor.fetched {
+        Some(cursor.row.is_some())
+    } else {
+        None
+    };
+    let value = match which {
+        crate::ir::CURSOR_ATTR_ISOPEN => Value::Bool(true),
+        crate::ir::CURSOR_ATTR_FOUND => found.map_or(Value::Null, Value::Bool),
+        crate::ir::CURSOR_ATTR_NOTFOUND => found.map_or(Value::Null, |found| Value::Bool(!found)),
+        crate::ir::CURSOR_ATTR_ROWCOUNT => Value::Int(
+            i64::try_from(cursor.rowcount).map_err(|_| rt_err("cursor row count exceeds i64"))?,
+        ),
+        _ => return Err(Error::Corrupt("proc: invalid cursor attribute".into())),
+    };
+    Ok(PValue::Scalar(value))
 }
 
 /// Pop and resolve a cursor handle: must be a cursor value, its slot must

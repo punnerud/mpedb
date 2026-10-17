@@ -41,7 +41,11 @@
 //! cursor when the scan is exhausted (the Python/Rust loop path).
 //! `CursorFetch` is Oracle FETCH: exhaustion pushes false and leaves the
 //! handle open. `CursorClose` releases the stream without reading further
-//! rows. `CursorRow` pushes the current row as a tuple. Handles are runtime
+//! rows. `CursorAttr` reads `%ISOPEN`, `%FOUND`, `%NOTFOUND`, or
+//! `%ROWCOUNT`. `%FOUND` and `%NOTFOUND` are NULL until FETCH; a cursor
+//! that is not open makes `%ISOPEN` false and raises INVALID_CURSOR for
+//! the other three. `CursorRow` pushes the current row as a tuple. Handles
+//! are runtime
 //! values with slot+generation identity; the runtime bounds live cursors
 //! (see `interp::MAX_CURSORS`) and rejects stale handles. **v1 rule:**
 //! cursors are allowed only in read-only procedures — a program containing
@@ -247,6 +251,9 @@ pub enum Op {
     /// Pop an open cursor handle, including one FETCH has exhausted, and
     /// release its stream without reading the remaining rows.
     CursorClose,
+    /// Pop a cursor handle or NULL and push `%ISOPEN` (0), `%FOUND` (1),
+    /// `%NOTFOUND` (2), or `%ROWCOUNT` (3).
+    CursorAttr(u8),
     /// Pop a cursor handle, push its current row as a tuple.
     CursorRow,
     /// Pop the return value and finish the procedure.
@@ -357,6 +364,14 @@ const OP_ORACLE_SQLERRM_CODE: u8 = 95;
 // exhaustion. These tags stay additive so older blobs still decode.
 const OP_CURSOR_FETCH: u8 = 96;
 const OP_CURSOR_CLOSE: u8 = 97;
+// Explicit cursor attributes. Additive, so FETCH (96) and CLOSE (97) stay put.
+const OP_CURSOR_ATTR: u8 = 98;
+
+/// `Op::CursorAttr` selector. Any other byte fails validation.
+pub const CURSOR_ATTR_ISOPEN: u8 = 0;
+pub const CURSOR_ATTR_FOUND: u8 = 1;
+pub const CURSOR_ATTR_NOTFOUND: u8 = 2;
+pub const CURSOR_ATTR_ROWCOUNT: u8 = 3;
 
 
 
@@ -676,6 +691,10 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::CursorAdvance => b.push(OP_CURSOR_ADVANCE),
         Op::CursorFetch => b.push(OP_CURSOR_FETCH),
         Op::CursorClose => b.push(OP_CURSOR_CLOSE),
+        Op::CursorAttr(code) => {
+            b.push(OP_CURSOR_ATTR);
+            b.push(code);
+        }
         Op::CursorRow => b.push(OP_CURSOR_ROW),
         Op::Return => b.push(OP_RETURN),
     }
@@ -812,6 +831,11 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_CURSOR_ADVANCE => Op::CursorAdvance,
         OP_CURSOR_FETCH => Op::CursorFetch,
         OP_CURSOR_CLOSE => Op::CursorClose,
+        OP_CURSOR_ATTR => {
+            let code = *buf.get(*pos).ok_or_else(err)?;
+            *pos += 1;
+            Op::CursorAttr(code)
+        }
         OP_CURSOR_ROW => Op::CursorRow,
         OP_RETURN => Op::Return,
         other => return Err(Error::Corrupt(format!("proc: invalid opcode {other}"))),
@@ -879,7 +903,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::DbQuery(p) | Op::DbExec(p) | Op::CursorOpen(p) => {
             (plans[p as usize].argc as usize, 1)
         }
-        Op::CursorAdvance | Op::CursorFetch | Op::CursorRow => (1, 1),
+        Op::CursorAdvance | Op::CursorFetch | Op::CursorRow | Op::CursorAttr(_) => (1, 1),
         Op::CursorClose | Op::Return => (1, 0),
     }
 }
@@ -953,6 +977,9 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
                 return Err(Error::Corrupt(
                     "proc: cursor over a non-Query plan".into(),
                 ));
+            }
+            Op::CursorAttr(code) if code > CURSOR_ATTR_ROWCOUNT => {
+                return Err(Error::Corrupt("proc: invalid cursor attribute".into()));
             }
             Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) if t as usize >= n => {
                 return Err(Error::Corrupt("proc: jump target out of range".into()));
@@ -1366,6 +1393,22 @@ mod tests {
         let mut close = Vec::new();
         encode_op(&mut close, Op::CursorClose);
         assert_eq!(close, vec![97]);
+        let mut attr = Vec::new();
+        encode_op(&mut attr, Op::CursorAttr(CURSOR_ATTR_FOUND));
+        assert_eq!(attr, vec![98, CURSOR_ATTR_FOUND]);
+        assert!(decode_op(&attr[..1], &mut 0).is_err());
+        assert!(mk(
+            vec![Op::LoadConst(0), Op::CursorAttr(4), Op::Return],
+            vec![Value::Null],
+            vec![],
+        )
+        .is_err());
+        assert!(mk(
+            vec![Op::LoadConst(0), Op::CursorAttr(CURSOR_ATTR_ISOPEN), Op::Return],
+            vec![Value::Null],
+            vec![],
+        )
+        .is_ok());
         let fetched = mk(
             vec![
                 Op::CursorOpen(0),

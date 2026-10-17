@@ -960,6 +960,9 @@ impl Parser<'_> {
             return Ok(Some(Type::Number));
         }
         let name = self.identifier()?;
+        if self.symbol("%") {
+            return self.cursor_attribute(&name);
+        }
         if self.pending_declarations.contains(&name) {
             return Err(self.error("self or forward reference in a declaration initializer"));
         }
