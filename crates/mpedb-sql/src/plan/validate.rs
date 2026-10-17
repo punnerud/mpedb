@@ -946,7 +946,13 @@ impl CompiledPlan {
                                 if *i >= self.n_params {
                                     return Err(corrupt("param index out of range"));
                                 }
-                                if self.param_types[*i as usize] != Some(col.ty) {
+                                // The planner leaves converting columns unpinned:
+                                // their store conversion checks the resulting
+                                // value. A shared parameter may also be pinned
+                                // by a different rigid column in this INSERT.
+                                if !col.converts_on_store()
+                                    && self.param_types[*i as usize] != Some(col.ty)
+                                {
                                     return Err(corrupt("insert param type mismatch"));
                                 }
                             }

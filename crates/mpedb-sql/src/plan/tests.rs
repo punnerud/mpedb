@@ -1170,3 +1170,20 @@ fn projection_names_are_canonical() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn converting_insert_parameters_round_trip_without_relaxing_rigid_columns() {
+    let mut original=test_schema();
+    original.tables[2].columns[1].decl=Some("TEXT".into());
+    let schema=mpedb_types::Schema::new(original.tables).unwrap();
+    for sql in ["INSERT INTO users(id,email) VALUES($1,$2)","INSERT INTO users(id,email) VALUES($1,$1)"] {
+        let plan=prepare(sql,&schema).unwrap();
+        let decoded=CompiledPlan::decode(&plan.encode(),&schema).unwrap();
+        assert_eq!(decoded.hash(),plan.hash());
+        // Column id is still rigid, even though email converts on store.
+        let mut forged=plan.clone();forged.param_types[0]=None;
+        assert!(CompiledPlan::decode(&forged.encode(),&schema).is_err());
+        forged.param_types[0]=Some(mpedb_types::ColumnType::Float64);
+        assert!(CompiledPlan::decode(&forged.encode(),&schema).is_err());
+    }
+}
