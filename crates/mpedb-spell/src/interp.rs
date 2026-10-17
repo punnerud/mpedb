@@ -501,6 +501,20 @@ pub fn run(
     bridge: &mut dyn DbBridge,
     budget: Budget,
 ) -> Result<ProcValue> {
+    let mut package = HashMap::new();
+    run_with_package(proc, args, bridge, budget, &mut package)
+}
+
+/// Like [`run`], but package variables live in `package` across calls.
+/// A missing key is NULL. `PkgSet` writes immediately, including NULL, and
+/// a later error does not remove that write.
+pub fn run_with_package(
+    proc: &Proc,
+    args: &[Value],
+    bridge: &mut dyn DbBridge,
+    budget: Budget,
+    package: &mut HashMap<String, Value>,
+) -> Result<ProcValue> {
     debug_assert_eq!(args.len(), proc.argc as usize);
     // Option<PValue>: None = never assigned (UnboundLocalError analogue).
     let mut locals: Vec<Option<PValue>> = Vec::with_capacity(proc.nlocals as usize);
@@ -994,6 +1008,19 @@ pub fn run(
                 let index = stack.pop().expect("validated");
                 stack.push(nested_index(collection, index)?);
             }
+            Op::PkgGet(index) => {
+                let key = package_key(&proc.consts, index)?;
+                let value = package.get(key).cloned().unwrap_or(Value::Null);
+                stack.push(PValue::Scalar(value));
+            }
+            Op::PkgSet(index) => {
+                let key = package_key(&proc.consts, index)?;
+                let value = match stack.pop().expect("validated") {
+                    PValue::Scalar(value) => value,
+                    _ => return Err(type_err("a package variable requires a scalar value")),
+                };
+                package.insert(key.to_string(), value);
+            }
             Op::CursorRow => {
                 let slot = pop_cursor(&mut stack, &cursors)?;
                 match &cursors[slot].row {
@@ -1127,6 +1154,13 @@ fn bulk_index(value: PValue) -> Result<i64> {
 
 /// First column of a query row list. An empty result is an empty nested
 /// table, not NULL, and `SQL%ROWCOUNT` is the fetched count.
+fn package_key(consts: &[Value], index: u16) -> Result<&str> {
+    match consts.get(index as usize) {
+        Some(Value::Text(text)) if text.contains('.') => Ok(text.as_str()),
+        _ => Err(Error::Corrupt("proc: package variable key is invalid".into())),
+    }
+}
+
 fn bulk_collect_column(implicit_sql: &mut Option<(bool, i64)>, rows: PValue) -> Result<PValue> {
     let PValue::List(rows) = rows else {
         return Err(type_err("BULK COLLECT requires a query row set"));

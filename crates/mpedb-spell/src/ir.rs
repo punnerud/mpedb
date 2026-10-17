@@ -277,6 +277,12 @@ pub enum Op {
     /// `COLLECTION_IS_NULL`. A NULL index raises `VALUE_ERROR`. A missing
     /// element raises `SUBSCRIPT_BEYOND_COUNT`. A stored NULL stays NULL.
     NestedIndex,
+    /// Push the session value of package variable `consts[i]` (a text key).
+    /// A variable that has never been stored is NULL.
+    PkgGet(u16),
+    /// Pop a scalar and store it as package variable `consts[i]`. NULL stays
+    /// NULL. The store is kept when the call later raises.
+    PkgSet(u16),
     /// Pop a cursor handle, push its current row as a tuple.
     CursorRow,
     /// Pop the return value and finish the procedure.
@@ -398,6 +404,9 @@ const OP_SQL_BULK: u8 = 101;
 // Nested-table `BULK COLLECT`. Additive: `SqlBulk` keeps its mode byte.
 const OP_BULK_COLLECT: u8 = 102;
 const OP_NESTED_INDEX: u8 = 103;
+// Package session variables. Additive: `NestedIndex` stays 103.
+const OP_PKG_GET: u8 = 104;
+const OP_PKG_SET: u8 = 105;
 
 /// `Op::CursorAttr` selector. Any other byte fails validation.
 pub const CURSOR_ATTR_ISOPEN: u8 = 0;
@@ -606,19 +615,41 @@ impl Proc {
 }
 
 fn check_name(name: &str) -> Result<()> {
-    let mut chars = name.chars();
-    let head_ok = chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-    if !head_ok
-        || name.len() > MAX_NAME
-        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let part_ok = |part: &str| {
+        let mut chars = part.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let mut parts = name.split('.');
+    let first = parts.next().unwrap_or("");
+    let second = parts.next();
+    // A package subprogram is `PACKAGE.ROUTINE`. Any other dot is corrupt.
+    if name.len() > MAX_NAME
+        || parts.next().is_some()
+        || !part_ok(first)
+        || second.is_some_and(|part| !part_ok(part))
     {
         return Err(Error::Corrupt(format!(
             "proc: invalid procedure name {name:?}"
         )));
     }
     Ok(())
+}
+
+fn package_key_ok(text: &str) -> bool {
+    let mut parts = text.split('.');
+    let Some(package) = parts.next() else {
+        return false;
+    };
+    let Some(var) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !package.is_empty()
+        && !var.is_empty()
+        && text.len() <= MAX_NAME
 }
 
 fn encode_op(b: &mut Vec<u8>, op: Op) {
@@ -752,6 +783,8 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         }
         Op::BulkCollect => b.push(OP_BULK_COLLECT),
         Op::NestedIndex => b.push(OP_NESTED_INDEX),
+        Op::PkgGet(x) => u16arg(OP_PKG_GET, x),
+        Op::PkgSet(x) => u16arg(OP_PKG_SET, x),
         Op::CursorRow => b.push(OP_CURSOR_ROW),
         Op::Return => b.push(OP_RETURN),
     }
@@ -906,6 +939,8 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         }
         OP_BULK_COLLECT => Op::BulkCollect,
         OP_NESTED_INDEX => Op::NestedIndex,
+        OP_PKG_GET => Op::PkgGet(u16arg()?),
+        OP_PKG_SET => Op::PkgSet(u16arg()?),
         OP_CURSOR_ROW => Op::CursorRow,
         OP_RETURN => Op::Return,
         other => return Err(Error::Corrupt(format!("proc: invalid opcode {other}"))),
@@ -926,6 +961,8 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::SqlBulk(_) => (0, 0),
         Op::BulkCollect => (1, 1),
         Op::NestedIndex => (2, 1),
+        Op::PkgGet(_) => (0, 1),
+        Op::PkgSet(_) => (1, 0),
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
@@ -1043,6 +1080,14 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
                     return Err(Error::Corrupt("proc: const index out of range".into()));
                 }
             }
+            Op::PkgGet(i) | Op::PkgSet(i) => match consts.get(i as usize) {
+                Some(Value::Text(text)) if package_key_ok(text) => {}
+                _ => {
+                    return Err(Error::Corrupt(
+                        "proc: package variable key is invalid".into(),
+                    ))
+                }
+            },
             Op::DbQuery(p) | Op::DbExec(p) | Op::DbReturning(p) | Op::CursorOpen(p)
                 if p as usize >= plans.len() =>
             {
@@ -1549,6 +1594,21 @@ mod tests {
             Proc::decode(&collect_proc.encode()).unwrap().instrs,
             collect_proc.instrs
         );
+        let mut pkg = Vec::new();
+        encode_op(&mut pkg, Op::PkgGet(0));
+        assert_eq!(pkg, vec![104, 0, 0]);
+        encode_op(&mut pkg, Op::PkgSet(1));
+        assert_eq!(pkg, vec![104, 0, 0, 105, 1, 0]);
+        assert!(decode_op(&pkg[..1], &mut 0).is_err());
+        assert!(mk(vec![Op::PkgGet(0), Op::Return], vec![Value::Null], vec![]).is_err());
+        let pkg_proc = mk(
+            vec![Op::LoadConst(0), Op::PkgSet(0), Op::PkgGet(0), Op::Return],
+            vec![Value::Text("LEDGER.N".into())],
+            vec![],
+        )
+        .unwrap();
+        assert!(!pkg_proc.has_exec());
+        assert_eq!(Proc::decode(&pkg_proc.encode()).unwrap().instrs, pkg_proc.instrs);
         let fetched = mk(
             vec![
                 Op::CursorOpen(0),

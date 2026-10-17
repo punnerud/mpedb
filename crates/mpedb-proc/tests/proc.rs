@@ -1046,3 +1046,54 @@ fn plsql_others_cannot_hide_engine_budgets_or_unsupported_execution() {
     assert!(error.contains("instruction budget"),"{error}");
     assert_eq!(balance(&db,1),50);
 }
+
+#[test]
+fn plsql_package_variable_starts_null_and_survives_the_session() {
+    let (cfg, _guard) = test_config("plsql-package");
+    let db = Database::open_with_config(cfg).unwrap();
+    let source = r#"
+CREATE OR REPLACE PACKAGE BODY ledger AS
+  n PLS_INTEGER := NULL;
+  FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS
+    previous PLS_INTEGER;
+  BEGIN
+    previous := n;
+    n := v;
+    IF v IS NULL THEN
+      RAISE NO_DATA_FOUND;
+    END IF;
+    RETURN previous;
+  END touch;
+END ledger;
+"#;
+    let engine = ProcEngine::new(&db);
+    engine.define(source, Lang::PlSql).unwrap();
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(4)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(9)]).unwrap(),
+        ProcValue::Scalar(Value::Int(4))
+    );
+    let err = engine.call("LEDGER.TOUCH", &[Value::Null]).unwrap_err().to_string();
+    assert!(err.contains("ORA-01403"), "{err}");
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(1)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    let other = ProcEngine::new(&db);
+    assert_eq!(
+        other.call("LEDGER.TOUCH", &[Value::Int(2)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(3)]).unwrap(),
+        ProcValue::Scalar(Value::Int(1))
+    );
+    engine.define(source, Lang::PlSql).unwrap();
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(5)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+}

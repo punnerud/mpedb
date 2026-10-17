@@ -10,6 +10,7 @@ mod static_sql;
 mod cursor;
 mod forall;
 mod bulk_collect;
+mod package;
 
 use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
@@ -64,6 +65,16 @@ struct NestedVar {
     elem: Type,
 }
 
+/// One package-level scalar. NULL means it has not been stored in this
+/// session, and an explicit NULL store stays NULL. The key const is
+/// `PACKAGE.NAME`.
+#[derive(Clone)]
+struct PackageVar {
+    name: String,
+    key_const: u16,
+    ty: Type,
+}
+
 struct Parser<'a> {
     source: &'a str,
     routine_name: String,
@@ -91,6 +102,10 @@ struct Parser<'a> {
     /// How many nested-table subscripts are being compiled. A `FORALL`
     /// index is legal only there.
     forall_subscripts: u16,
+    /// Set while a package body is compiled. The stored routine name is
+    /// `PACKAGE.ROUTINE`; `routine_name` stays the unqualified name.
+    package_name: Option<String>,
+    package_var: Option<PackageVar>,
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
@@ -147,6 +162,8 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         nested_vars: HashMap::new(),
         forall_index: None,
         forall_subscripts: 0,
+        package_name: None,
+        package_var: None,
     };
     if p.is_word("DECLARE") || p.is_word("BEGIN") {
         if scalar_only {
@@ -160,105 +177,143 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
     if p.word("OR") {
         p.want_word("REPLACE")?;
     }
-    let function = if p.word("FUNCTION") {
-        true
-    } else {
-        p.want_word("PROCEDURE")?;
-        false
-    };
-    if scalar_only && !function {
-        return Err(p.error("a stored SQL function requires CREATE FUNCTION, not CREATE PROCEDURE"));
-    }
-    let name = p.identifier()?;
-    p.routine_name = name.clone();
-    if p.symbol(".") {
-        return Err(p.error("schema-qualified routine registration is not implemented"));
-    }
-    let mut argc = 0;
-    if p.symbol("(") {
-        if matches!(p.peek(), Some(Token::Symbol(")"))) {
-            return Err(p.error("Oracle parameter lists cannot be empty; omit parentheses for a no-argument routine"));
+    if p.word("PACKAGE") {
+        if scalar_only {
+            return Err(p.error("a stored SQL function requires CREATE FUNCTION, not a package"));
         }
-        loop {
-            let name = p.identifier()?;
-            let input = p.word("IN");
-            let output = p.word("OUT");
-            let out_only = output && !input;
-            if p.word("NOCOPY") && !output {
-                return Err(p.error("NOCOPY is only valid for OUT or IN OUT parameters"));
-            }
-            // NOCOPY is an Oracle hint, not a guarantee. This runtime always
-            // uses value/copy-out semantics, which Oracle explicitly permits.
-            let ty = p.data_type(false)?;
-            let slot = p.add_local(name, ty, output)?;
-            if out_only {
-                p.constant(Value::Null)?;
-            } else {
-                p.builder.emit(Op::LoadLocal(slot))?;
-                p.builder.emit(ty.check())?;
-            }
-            p.builder.emit(Op::StoreLocal(slot))?;
-            p.parameters.push(slot);
-            p.has_out |= output;
-            argc += 1;
-            if !p.symbol(",") {
-                p.want_symbol(")")?;
-                break;
-            }
-        }
+        return p.compile_package(source);
     }
-    if scalar_only && p.has_out {
-        return Err(
-            p.error("a scalar SQL function cannot have OUT or IN OUT parameters; use ProcEngine")
-        );
-    }
-    if function {
-        p.want_word("RETURN")?;
-        p.returns = Some(p.data_type(false)?);
-    }
-    if !(p.word("IS") || p.word("AS")) {
-        return Err(p.error("expected IS or AS before routine body"));
-    }
-    p.declarations()?;
-    p.routine_locals = p.locals.clone();
-    p.want_word("BEGIN")?;
-    p.block_body()?;
-    p.want_word("END")?;
-    if matches!(p.peek(), Some(Token::Identifier { .. })) {
-        let end_name = p.identifier()?;
-        if end_name != name {
-            return Err(p.error("END name does not match routine name"));
-        }
-    }
-    p.want_symbol(";")?;
-    if p.symbol("/") {
-        let span = &p.tokens[p.at - 1].span;
-        let before = source[..span.start].rsplit('\n').next().unwrap_or("");
-        let after = source[span.end..].split('\n').next().unwrap_or("");
-        if !before.trim().is_empty() || !after.trim().is_empty() {
-            return Err(p.error("SQL*Plus slash terminator must occupy its own line"));
-        }
-    }
-    if p.at != p.tokens.len() {
-        return Err(p.error("trailing input after routine"));
-    }
-    if function {
-        p.builder.emit(Op::MissingReturn)?;
-    } else {
-        p.emit_procedure_result()?;
-        p.builder.emit(Op::Return)?;
-    }
-    Ok(Skeleton {
-        name,
-        argc,
-        nlocals: p.builder.nlocals(),
-        consts: p.builder.consts,
-        instrs: p.builder.instrs,
-        calls: p.builder.calls,
-    })
+    p.compile_routine(source, scalar_only, false)
 }
 
 impl Parser<'_> {
+    fn compile_routine(
+        &mut self,
+        source: &str,
+        scalar_only: bool,
+        embedded: bool,
+    ) -> Result<Skeleton> {
+        let function = if self.word("FUNCTION") {
+            true
+        } else {
+            self.want_word("PROCEDURE")?;
+            false
+        };
+        if scalar_only && !function {
+            return Err(self.error("a stored SQL function requires CREATE FUNCTION, not CREATE PROCEDURE"));
+        }
+        if self.package_name.is_some()
+            && matches!(self.peek(), Some(Token::Identifier { quoted: true, .. }))
+        {
+            return Err(self.error("quoted package names are not implemented"));
+        }
+        let name = self.identifier()?;
+        if self
+            .package_var
+            .as_ref()
+            .is_some_and(|package| package.name == name)
+        {
+            return Err(self.error("duplicate package variable and subprogram name"));
+        }
+        self.routine_name = name.clone();
+        if self.symbol(".") {
+            return Err(self.error("schema-qualified routine registration is not implemented"));
+        }
+        let mut argc = 0;
+        if self.symbol("(") {
+            if matches!(self.peek(), Some(Token::Symbol(")"))) {
+                return Err(self.error("Oracle parameter lists cannot be empty; omit parentheses for a no-argument routine"));
+            }
+            loop {
+                let name = self.identifier()?;
+                let input = self.word("IN");
+                let output = self.word("OUT");
+                let out_only = output && !input;
+                if self.word("NOCOPY") && !output {
+                    return Err(self.error("NOCOPY is only valid for OUT or IN OUT parameters"));
+                }
+                // NOCOPY is an Oracle hint, not a guarantee. This runtime always
+                // uses value/copy-out semantics, which Oracle explicitly permits.
+                let ty = self.data_type(false)?;
+                let slot = self.add_local(name, ty, output)?;
+                if out_only {
+                    self.constant(Value::Null)?;
+                } else {
+                    self.builder.emit(Op::LoadLocal(slot))?;
+                    self.builder.emit(ty.check())?;
+                }
+                self.builder.emit(Op::StoreLocal(slot))?;
+                self.parameters.push(slot);
+                self.has_out |= output;
+                argc += 1;
+                if !self.symbol(",") {
+                    self.want_symbol(")")?;
+                    break;
+                }
+            }
+        }
+        if scalar_only && self.has_out {
+            return Err(
+                self.error("a scalar SQL function cannot have OUT or IN OUT parameters; use ProcEngine")
+            );
+        }
+        if function {
+            self.want_word("RETURN")?;
+            self.returns = Some(self.data_type(false)?);
+        }
+        if !(self.word("IS") || self.word("AS")) {
+            return Err(self.error("expected IS or AS before routine body"));
+        }
+        self.declarations()?;
+        self.routine_locals = self.locals.clone();
+        self.want_word("BEGIN")?;
+        self.block_body()?;
+        self.want_word("END")?;
+        if matches!(self.peek(), Some(Token::Identifier { .. })) {
+            let end_name = self.identifier()?;
+            if end_name != name {
+                return Err(self.error("END name does not match routine name"));
+            }
+        }
+        self.want_symbol(";")?;
+        if !embedded {
+            self.finish_unit(source)?;
+        }
+        if function {
+            self.builder.emit(Op::MissingReturn)?;
+        } else {
+            self.emit_procedure_result()?;
+            self.builder.emit(Op::Return)?;
+        }
+        let stored = match &self.package_name {
+            Some(package) => format!("{package}.{name}"),
+            None => name,
+        };
+        Ok(Skeleton {
+            name: stored,
+            argc,
+            nlocals: self.builder.nlocals(),
+            consts: std::mem::take(&mut self.builder.consts),
+            instrs: std::mem::take(&mut self.builder.instrs),
+            calls: std::mem::take(&mut self.builder.calls),
+        })
+    }
+
+    fn finish_unit(&mut self, source: &str) -> Result<()> {
+        if self.symbol("/") {
+            let span = &self.tokens[self.at - 1].span;
+            let before = source[..span.start].rsplit('\n').next().unwrap_or("");
+            let after = source[span.end..].split('\n').next().unwrap_or("");
+            if !before.trim().is_empty() || !after.trim().is_empty() {
+                return Err(self.error("SQL*Plus slash terminator must occupy its own line"));
+            }
+        }
+        if self.at != self.tokens.len() {
+            return Err(self.error("trailing input after routine"));
+        }
+        Ok(())
+    }
+
     /// `[DECLARE …] BEGIN … [EXCEPTION …] END;` with no routine name.
     /// `RETURN;` leaves the block. `RETURN <expr>` stays a statement error
     /// because an anonymous block has no return type.
@@ -841,6 +896,11 @@ impl Parser<'_> {
             if let Some(nested) = self.nested_vars.get(&name).copied() {
                 return self.assign_nested(nested);
             }
+            if let Some(package) = self.package_var.clone() {
+                if package.name == name {
+                    return self.assign_package(package);
+                }
+            }
         }
         let local = *self.locals.get(&name).ok_or_else(|| {
             self.error(&format!(
@@ -1221,6 +1281,11 @@ impl Parser<'_> {
         }
         if let Some(nested) = self.nested_vars.get(&name).copied() {
             return self.nested_expr(nested);
+        }
+        if let Some(package) = self.package_var.clone() {
+            if package.name == name {
+                return self.package_expr(package);
+            }
         }
         Err(self.error(&format!(
             "unknown variable or unsupported expression {name}"

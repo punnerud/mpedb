@@ -55,7 +55,7 @@ use mpedb_spell::{py, rs};
 use mpedb::{Database, Error, ExecResult, Result, Value, WriteSession};
 use mpedb_sql::PlanStmt;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 // The proc namespaces are owned by `mpedb` (the trigger catalog reads them
 // too); re-exported here so existing `mpedb_proc::NS_PROC` users are unmoved.
@@ -91,6 +91,10 @@ pub struct ProcEngine<'db> {
     db: &'db Database,
     cache: RwLock<HashMap<ProcHash, Arc<Proc>>>,
     budget: Budget,
+    /// Package variables for this engine. A new engine is a new session:
+    /// every variable starts NULL. Replacing a package body discards that
+    /// package's values. An error does not roll them back.
+    package: Mutex<HashMap<String, Value>>,
 }
 
 impl<'db> ProcEngine<'db> {
@@ -99,6 +103,7 @@ impl<'db> ProcEngine<'db> {
             db,
             cache: RwLock::new(HashMap::new()),
             budget: Budget::default(),
+            package: Mutex::new(HashMap::new()),
         }
     }
 
@@ -128,6 +133,7 @@ impl<'db> ProcEngine<'db> {
             Lang::PlSql => mpedb_spell::plsql::compile(source)?,
         };
         let proc = self.link(&skel, lang)?;
+        self.discard_package_state(&proc.name);
         let blob = proc.encode();
         let hash = proc.hash();
         // Read-first publication, same shape as the plan registry.
@@ -269,7 +275,13 @@ impl<'db> ProcEngine<'db> {
                     session: &mut session,
                     statement_atomic: proc.instrs.iter().any(|op| matches!(op, mpedb_spell::ir::Op::OracleTry { .. })),
                 };
-                interp::run(&proc, args, &mut bridge, self.budget)
+                interp::run_with_package(
+                    &proc,
+                    args,
+                    &mut bridge,
+                    self.budget,
+                    &mut self.package.lock().expect(POISON),
+                )
             };
             match res {
                 Ok(v) => {
@@ -289,7 +301,13 @@ impl<'db> ProcEngine<'db> {
                 db: self.db,
                 streams: Vec::new(),
             };
-            interp::run(&proc, args, &mut bridge, self.budget)
+            interp::run_with_package(
+                &proc,
+                args,
+                &mut bridge,
+                self.budget,
+                &mut self.package.lock().expect(POISON),
+            )
         }
     }
 
@@ -323,6 +341,22 @@ impl<'db> ProcEngine<'db> {
             argc: proc.argc,
             writes: proc.has_exec(),
         })
+    }
+
+    /// `PACKAGE.ROUTINE` belongs to `PACKAGE`. A successful define replaces
+    /// that body, so the session loses the package's variables.
+    fn discard_package_state(&self, name: &str) {
+        let Some((package, routine)) = name.split_once('.') else {
+            return;
+        };
+        if package.is_empty() || routine.is_empty() || routine.contains('.') {
+            return;
+        }
+        let prefix = format!("{package}.");
+        self.package
+            .lock()
+            .expect(POISON)
+            .retain(|key, _| !key.starts_with(&prefix));
     }
 
     // ------------------------------------------------------------ loading
