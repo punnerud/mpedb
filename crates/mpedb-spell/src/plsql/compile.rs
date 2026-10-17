@@ -8,6 +8,7 @@ mod exception;
 mod number;
 mod static_sql;
 mod cursor;
+mod forall;
 
 use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
@@ -72,6 +73,9 @@ struct Parser<'a> {
     exceptions: HashMap<String, exception::ExceptionRef>,
     cursors: HashMap<String, cursor::CursorDecl>,
     records: HashMap<String, RecordDecl>,
+    /// Set only while the single `FORALL` statement is compiled. The index
+    /// is not an expression; every use is a named refusal.
+    forall_index: Option<String>,
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
@@ -124,6 +128,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         exceptions: HashMap::new(),
         cursors: HashMap::new(),
         records: HashMap::new(),
+        forall_index: None,
     };
     if p.is_word("DECLARE") || p.is_word("BEGIN") {
         if scalar_only {
@@ -430,6 +435,7 @@ impl Parser<'_> {
                     | "LOOP"
                     | "WHILE"
                     | "FOR"
+                    | "FORALL"
                     | "IN"
                     | "REVERSE"
                     | "RETURN"
@@ -734,6 +740,9 @@ impl Parser<'_> {
         }
         if self.word("IF") {
             return self.if_statement();
+        }
+        if self.word("FORALL") {
+            return self.forall_statement();
         }
         if self.word("FOR") {
             return self.for_statement();
@@ -1156,6 +1165,9 @@ impl Parser<'_> {
         let name = self.identifier()?;
         if self.symbol("%") {
             return self.cursor_attribute(&name);
+        }
+        if self.forall_index.as_deref() == Some(name.as_str()) {
+            return Err(self.error("a FORALL index can only subscript a collection"));
         }
         if self.pending_declarations.contains(&name) {
             return Err(self.error("self or forward reference in a declaration initializer"));

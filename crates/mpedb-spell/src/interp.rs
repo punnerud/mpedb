@@ -78,6 +78,7 @@ mod tuple_tests;
 
 use crate::ir::{Op, PlanRef, Proc};
 use mpedb_types::{Error, Result, Value};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Execution budgets. Every executed instruction costs one instruction unit
@@ -512,7 +513,9 @@ pub fn run(
     // Implicit SQL% cursor. None until a SELECT INTO or DML completes.
     // Explicit OPEN/FETCH/CLOSE do not write it, and a caught error leaves
     // it in place so the handler can read the statement that raised.
+    // Ordinary DML does not write `bulk`. A FORALL publishes through FINISH.
     let mut implicit_sql: Option<(bool, i64)> = None;
+    let mut bulk = BulkCursor::new();
     let mut instrs_left = budget.instrs;
     let mut db_left = budget.db_calls;
     let mut rows_left = budget.rows;
@@ -979,6 +982,9 @@ pub fn run(
             Op::SqlAttr(which) => {
                 stack.push(implicit_sql_attr(implicit_sql, which)?);
             }
+            Op::SqlBulk(mode) => {
+                bulk.step(mode, &mut stack, &mut implicit_sql)?;
+            }
             Op::CursorRow => {
                 let slot = pop_cursor(&mut stack, &cursors)?;
                 match &cursors[slot].row {
@@ -1020,6 +1026,94 @@ fn release_cursor(slot: &mut CurSlot) {
     slot.fetched = false;
     slot.rowcount = 0;
     slot.gen = slot.gen.wrapping_add(1);
+}
+
+/// Row counts for the most recent dense `FORALL`.
+///
+/// `BEGIN` runs after the bounds are evaluated and replaces the map, so a
+/// bounds error leaves the previous counts. Each recorded iteration stores
+/// the `DbExec` count, and zero is a real count. A subscript this `FORALL`
+/// did not execute is NULL; it does not raise `NO_DATA_FOUND`. `FINISH`
+/// sets `SQL%ROWCOUNT` to the sum and `SQL%FOUND` from the last iteration,
+/// and only when at least one iteration ran. Ordinary DML does not write
+/// this map.
+///
+/// An exception in a later iteration does not roll back earlier iterations
+/// of that `FORALL`. Oracle does that without `SAVE EXCEPTIONS`. This
+/// runtime stops and keeps the counts already recorded.
+struct BulkCursor {
+    map: Option<HashMap<i64, i64>>,
+    sum: i64,
+    iters: u64,
+    last_found: bool,
+}
+
+impl BulkCursor {
+    fn new() -> Self {
+        Self {
+            map: None,
+            sum: 0,
+            iters: 0,
+            last_found: false,
+        }
+    }
+
+    fn step(
+        &mut self,
+        mode: u8,
+        stack: &mut Vec<PValue>,
+        implicit_sql: &mut Option<(bool, i64)>,
+    ) -> Result<()> {
+        match mode {
+            crate::ir::SQL_BULK_BEGIN => {
+                self.map = Some(HashMap::new());
+                self.sum = 0;
+                self.iters = 0;
+                self.last_found = false;
+            }
+            crate::ir::SQL_BULK_RECORD => {
+                let index = bulk_index(stack.pop().expect("validated"))?;
+                let Some((found, count)) = *implicit_sql else {
+                    return Err(rt_err("FORALL recorded no row count"));
+                };
+                self.map.get_or_insert_with(HashMap::new).insert(index, count);
+                self.sum = self
+                    .sum
+                    .checked_add(count)
+                    .ok_or_else(|| oracle_exception::named(6502))?;
+                self.last_found = found;
+                self.iters = self.iters.saturating_add(1);
+            }
+            crate::ir::SQL_BULK_FINISH => {
+                if self.iters > 0 {
+                    *implicit_sql = Some((self.last_found, self.sum));
+                }
+            }
+            crate::ir::SQL_BULK_LOAD => {
+                let index = bulk_index(stack.pop().expect("validated"))?;
+                let value = self
+                    .map
+                    .as_ref()
+                    .and_then(|map| map.get(&index).copied())
+                    .map_or(Value::Null, Value::Int);
+                stack.push(PValue::Scalar(value));
+            }
+            _ => {
+                return Err(Error::Corrupt(
+                    "proc: invalid SQL%BULK_ROWCOUNT operation".into(),
+                ))
+            }
+        }
+        Ok(())
+    }
+}
+
+fn bulk_index(value: PValue) -> Result<i64> {
+    match value {
+        PValue::Scalar(Value::Int(index)) => Ok(index),
+        // A NULL subscript is Oracle 6502, not a missing FORALL entry.
+        _ => Err(oracle_exception::named(6502)),
+    }
 }
 
 /// Implicit `SQL%` attribute. `ISOPEN` is always false. The other three
@@ -1118,6 +1212,10 @@ pub mod testutil {
         pub returning_rows: Option<Vec<Vec<Value>>>,
         /// Parameters each `exec_returning` received, in call order.
         pub exec_params: Vec<Vec<Value>>,
+        /// Parameters each plain `exec` received, in call order.
+        /// `exec_params` stays the RETURNING list so existing callers
+        /// can tell a count-only DML from a RETURNING call.
+        pub dml_params: Vec<Vec<Value>>,
         /// Rows `cursor_advance` actually pulled, including a not-found pull.
         pub advances: usize,
         /// Streams `cursor_close` released.
@@ -1137,6 +1235,7 @@ pub mod testutil {
                 cursor_params: Vec::new(),
                 returning_rows: None,
                 exec_params: Vec::new(),
+                dml_params: Vec::new(),
                 advances: 0,
                 closes: 0,
                 streams: Vec::new(),
@@ -1155,8 +1254,9 @@ pub mod testutil {
             self.queries += 1;
             Ok(self.rows.clone())
         }
-        fn exec(&mut self, _plan: &PlanRef, _params: &[Value]) -> Result<u64> {
+        fn exec(&mut self, _plan: &PlanRef, params: &[Value]) -> Result<u64> {
             self.execs += 1;
+            self.dml_params.push(params.to_vec());
             Ok(self.affected)
         }
         fn exec_returning(&mut self, _plan: &PlanRef, params: &[Value]) -> Result<Vec<Vec<Value>>> {

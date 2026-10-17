@@ -569,6 +569,9 @@ impl Parser<'_> {
         if attr == "ROWTYPE" {
             return Err(self.error("%ROWTYPE is a type, not a value"));
         }
+        if attr == "BULK_ROWCOUNT" {
+            return self.bulk_rowcount(name);
+        }
         let (code, ty) = match attr.as_str() {
             "ISOPEN" => (crate::ir::CURSOR_ATTR_ISOPEN, Type::Boolean),
             "FOUND" => (crate::ir::CURSOR_ATTR_FOUND, Type::Boolean),
@@ -1626,7 +1629,7 @@ mod tests {
             ),
             (
                 "CREATE FUNCTION f RETURN BOOLEAN IS BEGIN RETURN SQL%BULK_ROWCOUNT; END;",
-                "unknown cursor attribute",
+                "SQL%BULK_ROWCOUNT requires an index",
             ),
             (
                 "CREATE FUNCTION f RETURN BOOLEAN IS BEGIN RETURN missing%FOUND; END;",

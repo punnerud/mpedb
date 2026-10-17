@@ -265,6 +265,10 @@ pub enum Op {
     /// and no handle: `%ISOPEN` is always false, and the other three stay
     /// NULL until a SELECT INTO or DML has run.
     SqlAttr(u8),
+    /// Dense `FORALL` counts read by `SQL%BULK_ROWCOUNT`. The byte is
+    /// `SQL_BULK_BEGIN`, `SQL_BULK_RECORD`, `SQL_BULK_FINISH`, or
+    /// `SQL_BULK_LOAD`. A missing subscript pushes NULL.
+    SqlBulk(u8),
     /// Pop a cursor handle, push its current row as a tuple.
     CursorRow,
     /// Pop the return value and finish the procedure.
@@ -381,12 +385,20 @@ const OP_CURSOR_ATTR: u8 = 98;
 const OP_DB_RETURNING: u8 = 99;
 // Implicit SQL% attributes. Additive: `CursorAttr` still pops a handle.
 const OP_SQL_ATTR: u8 = 100;
+// `SQL%BULK_ROWCOUNT`. Additive: `SqlAttr` still pushes one scalar attribute.
+const OP_SQL_BULK: u8 = 101;
 
 /// `Op::CursorAttr` selector. Any other byte fails validation.
 pub const CURSOR_ATTR_ISOPEN: u8 = 0;
 pub const CURSOR_ATTR_FOUND: u8 = 1;
 pub const CURSOR_ATTR_NOTFOUND: u8 = 2;
 pub const CURSOR_ATTR_ROWCOUNT: u8 = 3;
+
+/// `Op::SqlBulk` modes. Any other byte fails validation.
+pub const SQL_BULK_BEGIN: u8 = 0;
+pub const SQL_BULK_RECORD: u8 = 1;
+pub const SQL_BULK_FINISH: u8 = 2;
+pub const SQL_BULK_LOAD: u8 = 3;
 
 
 
@@ -723,6 +735,10 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
             b.push(OP_SQL_ATTR);
             b.push(code);
         }
+        Op::SqlBulk(mode) => {
+            b.push(OP_SQL_BULK);
+            b.push(mode);
+        }
         Op::CursorRow => b.push(OP_CURSOR_ROW),
         Op::Return => b.push(OP_RETURN),
     }
@@ -870,6 +886,11 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
             *pos += 1;
             Op::SqlAttr(code)
         }
+        OP_SQL_BULK => {
+            let mode = *buf.get(*pos).ok_or_else(err)?;
+            *pos += 1;
+            Op::SqlBulk(mode)
+        }
         OP_CURSOR_ROW => Op::CursorRow,
         OP_RETURN => Op::Return,
         other => return Err(Error::Corrupt(format!("proc: invalid opcode {other}"))),
@@ -884,6 +905,10 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::OracleExceptionCode | Op::OracleSqlCode | Op::OracleSqlErrm | Op::OracleMatchUser(_) => (0, 1),
         Op::OracleRaiseApplication => (2, 0),
         Op::LoadConst(_) | Op::LoadLocal(_) | Op::SqlAttr(_) => (0, 1),
+        Op::SqlBulk(SQL_BULK_BEGIN | SQL_BULK_FINISH) => (0, 0),
+        Op::SqlBulk(SQL_BULK_RECORD) => (1, 0),
+        Op::SqlBulk(SQL_BULK_LOAD) => (1, 1),
+        Op::SqlBulk(_) => (0, 0),
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
@@ -1019,6 +1044,11 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
             }
             Op::CursorAttr(code) | Op::SqlAttr(code) if code > CURSOR_ATTR_ROWCOUNT => {
                 return Err(Error::Corrupt("proc: invalid cursor attribute".into()));
+            }
+            Op::SqlBulk(mode) if mode > SQL_BULK_LOAD => {
+                return Err(Error::Corrupt(
+                    "proc: invalid SQL%BULK_ROWCOUNT operation".into(),
+                ));
             }
             Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) if t as usize >= n => {
                 return Err(Error::Corrupt("proc: jump target out of range".into()));
@@ -1464,6 +1494,22 @@ mod tests {
         assert_eq!(
             Proc::decode(&implicit_proc.encode()).unwrap().instrs,
             implicit_proc.instrs
+        );
+        let mut bulk = Vec::new();
+        encode_op(&mut bulk, Op::SqlBulk(SQL_BULK_LOAD));
+        assert_eq!(bulk, vec![101, SQL_BULK_LOAD]);
+        assert!(decode_op(&bulk[..1], &mut 0).is_err());
+        assert!(mk(vec![Op::SqlBulk(4), Op::Return], vec![], vec![]).is_err());
+        let bulk_proc = mk(
+            vec![Op::LoadConst(0), Op::SqlBulk(SQL_BULK_LOAD), Op::Return],
+            vec![Value::Null],
+            vec![],
+        )
+        .unwrap();
+        assert!(!bulk_proc.has_exec());
+        assert_eq!(
+            Proc::decode(&bulk_proc.encode()).unwrap().instrs,
+            bulk_proc.instrs
         );
         let fetched = mk(
             vec![
