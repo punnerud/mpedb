@@ -1,4 +1,7 @@
-//! Native Oracle routine compilation; no translation into Python or PL/pgSQL.
+//! Native Oracle routine compilation. A top-level `DECLARE`/`BEGIN` block is
+//! an anonymous block: it is not stored under a caller-chosen name, its
+//! uninitialized variables are NULL, and an unhandled exception leaves the
+//! block. No translation into Python or PL/pgSQL.
 
 mod sql;
 mod exception;
@@ -113,6 +116,14 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         exceptions: HashMap::new(),
         cursors: HashMap::new(),
     };
+    if p.is_word("DECLARE") || p.is_word("BEGIN") {
+        if scalar_only {
+            return Err(p.error(
+                "a stored SQL function requires CREATE FUNCTION, not an anonymous block",
+            ));
+        }
+        return p.compile_anonymous(source);
+    }
     p.want_word("CREATE")?;
     if p.word("OR") {
         p.want_word("REPLACE")?;
@@ -216,6 +227,44 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
 }
 
 impl Parser<'_> {
+    /// `[DECLARE …] BEGIN … [EXCEPTION …] END;` with no routine name.
+    /// `RETURN;` leaves the block. `RETURN <expr>` stays a statement error
+    /// because an anonymous block has no return type.
+    fn compile_anonymous(&mut self, source: &str) -> Result<Skeleton> {
+        if self.word("DECLARE") {
+            self.declarations()?;
+        }
+        self.routine_locals = self.locals.clone();
+        self.want_word("BEGIN")?;
+        self.block_body()?;
+        self.want_word("END")?;
+        if matches!(self.peek(), Some(Token::Identifier { .. })) {
+            return Err(self.error("an anonymous block cannot have an END name"));
+        }
+        self.want_symbol(";")?;
+        if self.symbol("/") {
+            let span = &self.tokens[self.at - 1].span;
+            let before = source[..span.start].rsplit('\n').next().unwrap_or("");
+            let after = source[span.end..].split('\n').next().unwrap_or("");
+            if !before.trim().is_empty() || !after.trim().is_empty() {
+                return Err(self.error("SQL*Plus slash terminator must occupy its own line"));
+            }
+        }
+        if self.at != self.tokens.len() {
+            return Err(self.error("trailing input after anonymous block"));
+        }
+        self.emit_procedure_result()?;
+        self.builder.emit(Op::Return)?;
+        Ok(Skeleton {
+            name: "ANON".into(),
+            argc: 0,
+            nlocals: self.builder.nlocals(),
+            consts: std::mem::take(&mut self.builder.consts),
+            instrs: std::mem::take(&mut self.builder.instrs),
+            calls: std::mem::take(&mut self.builder.calls),
+        })
+    }
+
     fn declarations(&mut self) -> Result<()> {
         // All names in a declaration section hide outer names, including
         // declarations not initialized yet. A self/forward reference must

@@ -1204,3 +1204,101 @@ fn standard_qualification_reaches_predefined_exception_under_local_shadowing() {
     ))
     .is_err());
 }
+
+#[test]
+fn anonymous_block_treats_an_uninitialized_variable_as_null() {
+    let err = call(
+        "DECLARE v NUMBER; BEGIN IF v IS NULL THEN RAISE NO_DATA_FOUND; END IF; END;",
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("ORA-01403: no data found"), "{err}");
+
+    assert_eq!(
+        call(
+            "DECLARE v NUMBER := 4; BEGIN IF v IS NULL THEN RAISE NO_DATA_FOUND; END IF; END;",
+            &[],
+        )
+        .unwrap(),
+        Value::Null
+    );
+    let err = call(
+        "DECLARE v NUMBER := 4; BEGIN v := NULL; IF v IS NULL THEN RAISE NO_DATA_FOUND; END IF; END;",
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("ORA-01403: no data found"), "{err}");
+
+    assert_eq!(
+        call(
+            "DECLARE v NUMBER; BEGIN BEGIN IF v IS NULL THEN RAISE NO_DATA_FOUND; END IF; RAISE ZERO_DIVIDE; EXCEPTION WHEN NO_DATA_FOUND THEN NULL; END; END;",
+            &[],
+        )
+        .unwrap(),
+        Value::Null
+    );
+    let err = call(
+        "DECLARE v NUMBER := 4; BEGIN BEGIN IF v IS NULL THEN RAISE NO_DATA_FOUND; END IF; RAISE ZERO_DIVIDE; EXCEPTION WHEN NO_DATA_FOUND THEN NULL; END; END;",
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("ORA-01476: divisor is equal to zero"), "{err}");
+
+    assert_eq!(
+        call(
+            "DECLARE n NUMBER NOT NULL := 7; v NUMBER; BEGIN n := v; RAISE ZERO_DIVIDE; EXCEPTION WHEN VALUE_ERROR THEN NULL; END;",
+            &[],
+        )
+        .unwrap(),
+        Value::Null
+    );
+    let err = call(
+        "DECLARE n NUMBER NOT NULL := 7; v NUMBER; BEGIN n := v; END;",
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("ORA-06502:"), "{err}");
+
+    assert_eq!(
+        call(
+            "DECLARE v NUMBER := 4; BEGIN DECLARE v NUMBER; BEGIN IF v IS NOT NULL THEN RAISE ZERO_DIVIDE; END IF; END; IF v IS NULL THEN RAISE NO_DATA_FOUND; END IF; END;",
+            &[],
+        )
+        .unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        call(
+            "DECLARE v NUMBER; BEGIN IF v IS NULL THEN RETURN; END IF; RAISE NO_DATA_FOUND; END;",
+            &[],
+        )
+        .unwrap(),
+        Value::Null
+    );
+    assert_eq!(call("BEGIN NULL; END;", &[]).unwrap(), Value::Null);
+    assert_eq!(call("BEGIN\nNULL;\nEND;\n/\n", &[]).unwrap(), Value::Null);
+
+    for (source, needle) in [
+        ("BEGIN NULL; END block;", "cannot have an END name"),
+        ("BEGIN RETURN 1; END;", "expected ;"),
+        ("BEGIN NULL; END; DROP TABLE t;", "trailing input"),
+        ("BEGIN NULL; END; /", "its own line"),
+        (
+            "DECLARE v NUMBER; v NUMBER; BEGIN NULL; END;",
+            "duplicate parameter or variable name",
+        ),
+    ] {
+        let err = compile(source).unwrap_err().to_string();
+        assert!(err.contains("PL/SQL at "), "{needle}: {err}");
+        assert!(err.contains(needle), "{needle}: {err}");
+    }
+    let err = super::compile_function("BEGIN NULL; END;")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("PL/SQL at "), "{err}");
+    assert!(err.contains("anonymous block"), "{err}");
+}
