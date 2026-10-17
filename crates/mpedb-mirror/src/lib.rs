@@ -24,6 +24,10 @@ pub use oracle_adapter::OracleAdapter;
 pub mod oracle_import;
 #[cfg(feature = "oracle-source")]
 pub mod oracle_source;
+pub mod mysql_adapter;
+pub mod mysql_import;
+pub mod mysql_src;
+pub mod mysql_track;
 pub mod pg;
 pub mod preflight;
 pub mod pg_adapter;
@@ -51,6 +55,8 @@ pub use adapter::{Cursor, NetOp, NetOpKind, ProvenancedPullBatch, PullBatch, Pus
 pub use apply::{apply_batch, apply_provenanced_batch, ApplyStats};
 pub use export::{diff_sqlite_data, export_sqlite, load_sqlite_provenance, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
+pub use mysql_adapter::MysqlAdapter;
+pub use mysql_import::import_mysql;
 #[cfg(feature = "oracle-source")]
 pub use oracle_import::{import_oracle, load_bootstrap as load_oracle_bootstrap, OracleBootstrap};
 pub use pg_adapter::PgAdapter;
@@ -72,3 +78,6 @@ pub use state::{
 
 #[cfg(all(test, feature = "oracle-source"))]
 mod oracle_roundtrip_tests;
+
+#[cfg(test)]
+mod mysql_tests;

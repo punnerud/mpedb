@@ -38,6 +38,15 @@ pub enum SourceSpec {
         username: String,
         password: String,
     },
+    /// MySQL protocol. `mysql` and `mariadb` in the config file are this same
+    /// spec: one server speaks the protocol, and the adapter does not care
+    /// which brand answered.
+    Mysql {
+        socket: String,
+        user: String,
+        password: String,
+        database: String,
+    },
 }
 
 impl SourceSpec {
@@ -46,6 +55,7 @@ impl SourceSpec {
             SourceSpec::Sqlite { .. } => SourceKind::Sqlite,
             SourceSpec::Postgres { .. } => SourceKind::Postgres,
             SourceSpec::Oracle { .. } => SourceKind::Oracle,
+            SourceSpec::Mysql { .. } => SourceKind::Mysql,
         }
     }
 
@@ -57,6 +67,9 @@ impl SourceSpec {
             SourceSpec::Postgres { dsn } => format!("postgres:{}", redact_dsn(dsn)),
             // Oracle connect descriptors can themselves contain secrets.
             SourceSpec::Oracle { .. } => "oracle:<redacted>".into(),
+            SourceSpec::Mysql { socket, user, database, .. } => {
+                format!("mysql:socket={socket} user={user} db={database}")
+            }
         }
     }
 }
@@ -147,7 +160,10 @@ pub fn parse(text: &str) -> Result<SourceSpec> {
         .as_table()
         .ok_or_else(|| Error::Config("source-config: expected a TOML table".into()))?;
     let kind = t.get("kind").and_then(|v| v.as_str()).ok_or_else(|| {
-        Error::Config("source-config: `kind` must be \"sqlite\", \"postgres\" or \"oracle\"".into())
+        Error::Config(
+            "source-config: `kind` must be \"sqlite\", \"postgres\", \"oracle\", \"mysql\", or \"mariadb\""
+                .into(),
+        )
     })?;
     let get = |k: &str| -> Result<String> {
         t.get(k)
@@ -167,8 +183,16 @@ pub fn parse(text: &str) -> Result<SourceSpec> {
             username: get("username")?,
             password: get("password")?,
         }),
+        // Empty password is a real value (`--skip-grant-tables` has none). The
+        // key still has to be present so a forgotten field is an error.
+        "mysql" | "mariadb" => Ok(SourceSpec::Mysql {
+            socket: get("socket")?,
+            user: get("user")?,
+            password: get("password")?,
+            database: get("database")?,
+        }),
         _ => Err(Error::Config(
-            "source-config: unknown kind (want sqlite, postgres or oracle)".into(),
+            "source-config: unknown kind (want sqlite, postgres, oracle, mysql, or mariadb)".into(),
         )),
     }
 }
@@ -203,6 +227,13 @@ pub fn write_new(path: &Path, spec: &SourceSpec) -> Result<()> {
             toml_str(connect_string),
             toml_str(username),
             toml_str(password)
+        ),
+        SourceSpec::Mysql { socket, user, password, database } => format!(
+            "kind = \"mysql\"\nsocket = {}\nuser = {}\npassword = {}\ndatabase = {}\n",
+            toml_str(socket),
+            toml_str(user),
+            toml_str(password),
+            toml_str(database)
         ),
     };
     f.write_all(body.as_bytes())
@@ -249,9 +280,38 @@ mod tests {
         assert!(parse("kind = \"postgres\"\n").is_err());
         assert!(parse("kind = \"sqlite\"\n").is_err());
         assert!(parse("kind = \"mysql\"\n").is_err());
+        assert!(parse("kind = \"mariadb\"\n").is_err());
         assert!(parse("").is_err());
         assert!(parse("not toml at all {{{").is_err());
         assert!(parse("kind = 7\n").is_err());
+    }
+
+    #[test]
+    fn mysql_and_mariadb_are_one_spec_and_the_password_stays_out_of_logs() {
+        let body = "\
+kind = \"mariadb\"
+socket = \"/run/mirror.sock\"
+user = \"root\"
+password = \"socket-secret\"
+database = \"app\"
+";
+        let spec = parse(body).unwrap();
+        assert_eq!(spec.kind(), SourceKind::Mysql);
+        assert_eq!(
+            spec,
+            SourceSpec::Mysql {
+                socket: "/run/mirror.sock".into(),
+                user: "root".into(),
+                password: "socket-secret".into(),
+                database: "app".into(),
+            }
+        );
+        let shown = format!("{spec:?} {}", spec.redacted());
+        assert!(!shown.contains("socket-secret"), "{shown}");
+        assert!(shown.contains("socket=/run/mirror.sock"), "{shown}");
+        assert!(shown.contains("db=app"), "{shown}");
+        let message = parse("kind = \"mysql\"\npassword = \"socket-secret\"").unwrap_err().to_string();
+        assert!(!message.contains("socket-secret"), "{message}");
     }
 
     /// The whole point of the module: a password must not reach a log line.

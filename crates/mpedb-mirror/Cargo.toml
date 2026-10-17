@@ -23,6 +23,9 @@ getrandom = "0.4"
 # PostgreSQL via the sync postgres client.
 rusqlite = { version = "0.31", features = ["bundled"] }
 postgres = "0.19"
+# MySQL protocol for MariaDB and MySQL. `minimal` is the same client the OLAP
+# bench already builds; the mirror only needs the socket protocol.
+mysql = { version = "25", default-features = false, features = ["minimal"] }
 # Public OCI client API only; Oracle engine remains a black-box dependency.
 oracle-client = { package = "oracle", version = "0.6.3", optional = true }
 # §12 credential channel: 0600 TOML source-config + geteuid ownership check.

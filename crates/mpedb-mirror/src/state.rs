@@ -167,6 +167,9 @@ pub enum SourceKind {
     Sqlite = 1,
     Postgres = 2,
     Oracle = 3,
+    /// MySQL protocol, including MariaDB. Additive: tags 1–3 stay put so an
+    /// existing mirror file still decodes as the engine it was imported from.
+    Mysql = 4,
 }
 
 impl SourceKind {
@@ -179,6 +182,7 @@ impl SourceKind {
             1 => Ok(SourceKind::Sqlite),
             2 => Ok(SourceKind::Postgres),
             3 => Ok(SourceKind::Oracle),
+            4 => Ok(SourceKind::Mysql),
             other => Err(Error::Corrupt(format!("bad mirror source_kind {other}"))),
         }
     }

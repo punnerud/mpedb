@@ -76,7 +76,7 @@ pub fn regenerate(db_path: &Path, size_bytes: u64) -> Result<RegenReport> {
     let dialect = match old.sys_record_get(state::MIR_NS, state::KEY_CFG)? {
         Some(bytes) => match state::MirrorConfig::decode(&bytes)?.source_kind {
             state::SourceKind::Postgres => mpedb_types::Dialect::Postgres,
-            state::SourceKind::Sqlite => mpedb_types::Dialect::Sqlite,
+            state::SourceKind::Sqlite | state::SourceKind::Mysql => mpedb_types::Dialect::Sqlite,
             state::SourceKind::Oracle => return Err(Error::Unsupported("Oracle schema regeneration is not linked yet".into())),
         },
         None => mpedb_types::Dialect::Sqlite,

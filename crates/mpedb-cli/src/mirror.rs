@@ -15,8 +15,8 @@ use mpedb_mirror::switch::{
 };
 use mpedb_mirror::sourcecfg::{self, SourceSpec};
 use mpedb_mirror::{
-    diff_sqlite_data, export_sqlite, import_pg, import_sqlite, reconcile, verify, ImportOptions,
-    PgAdapter, SourceAdapter, SqliteAdapter,
+    diff_sqlite_data, export_sqlite, import_mysql, import_pg, import_sqlite, reconcile, verify,
+    ImportOptions, MysqlAdapter, PgAdapter, SourceAdapter, SqliteAdapter,
 };
 use mpedb_types::Durability;
 use rusqlite::Connection;
@@ -121,6 +121,11 @@ fn open_source(
                     .into(),
             ));
         }
+        SourceSpec::Mysql { .. } => {
+            let mut a = MysqlAdapter::connect(&spec, None, &[])?;
+            a.install_triggers()?;
+            Box::new(a)
+        }
     };
     match recover(&db, adapter.as_mut())? {
         Recovered::Steady => {}
@@ -135,7 +140,8 @@ mpedb mirror <subcommand>
   import  (--source <sqlite-file> | --source-config <file>) --dest <new-mpedb-file>
           [--include t1,t2] [--exclude t3] [--size_mb N] [--durability none|commit|wal]
           [--adapt exact|lossy] [--pin-ledgers]
-      Import sqlite, PostgreSQL, or Oracle (feature oracle-source) into a NEW mirror.
+      Import sqlite, PostgreSQL, MySQL/MariaDB, or Oracle (feature oracle-source)
+      into a NEW mirror.
       --pin-ledgers is Oracle-only. It creates the receipt and origin ledgers
       before the snapshot so later `mirror push` and `mirror sync` can write
       those tables back. Without it an Oracle import stays read-only.
@@ -175,6 +181,10 @@ SOURCE SELECTION
   --db alone is enough:
 
       $ mpedb mirror sync --db app.mpedb
+
+  MySQL and MariaDB use that same 0600 file. kind mysql and kind mariadb are
+  one source: socket, user, password, and database. Sync pulls and pushes.
+  It does not switch authority.
 
   The file's mode and owner are re-checked on every read: if it ever becomes
   readable by group or other, commands refuse to run rather than use it.
@@ -420,7 +430,16 @@ fn cmd_reconcile(argv: &[String]) -> CliResult {
 
 fn cmd_switch(argv: &[String]) -> CliResult {
     let p = args::parse(argv, &["source", "db", "to", "source-config"], &[])?;
-    let (db, mut a) = open_source(p.require("db")?, &p)?;
+    let db_path = p.require("db")?;
+    {
+        let db = Database::open_from_file(std::path::Path::new(db_path))?;
+        if matches!(resolve_spec(&db, &p)?, SourceSpec::Mysql { .. }) {
+            return Err(Failure::Runtime(
+                "MySQL/MariaDB mirror sync does not switch authority".into(),
+            ));
+        }
+    }
+    let (db, mut a) = open_source(db_path, &p)?;
     match p.require("to")? {
         "mpedb" => {
             switch_to_mpedb(&db, a.as_mut())?;
@@ -515,6 +534,7 @@ fn cmd_import(argv: &[String]) -> CliResult {
             #[cfg(not(feature = "oracle-source"))]
             { return Err(Failure::Runtime("Oracle import requires a build with --features oracle-source".into())); }
         },
+        SourceSpec::Mysql { .. } => import_mysql(&spec, &dest, &opts)?,
     };
 
     // Record WHERE the credentials live (never the DSN itself — §12), so every
