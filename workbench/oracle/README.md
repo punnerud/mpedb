@@ -80,8 +80,20 @@ A live native Oracle test reads a compound-key snapshot, loads its carrier into
 MPEdb, compiles a function extracted from that application's `ALL_SOURCE`, and
 verifies rRETL apply, lineage and revert. In-place rRETL now uses every primary
 key component while retaining single-key residual compatibility. Incremental
-maps still require single-key identities. Oracle change capture, transactional
-write-back, CLI import and the complete two-database topology remain unfinished.
+maps still require single-key identities. A low-level Oracle write batch now
+transports MPEdb carrier rows in one source transaction. It fences source DDL,
+checks object identity and original DDL, reads actual postimages, and rolls back
+the entire batch if Oracle rounds, truncates or substitutes a writable value.
+Generated columns return their actual source values. The live test writes the
+rRETL-transformed Boolean back to Oracle and restores it through rRETL; another
+test verifies rounding rejection, whole-batch rollback, inserts/deletes,
+generated values and stale-schema rejection.
+
+This transport is not a complete mirror push: capture, echo suppression,
+conflict checks, authority fencing, CLI import and the two-database topology
+remain unfinished. Writes currently refuse identity columns, special NUMBERs,
+zoned timestamps, intervals and LONGs, and accept only small LOB binds (4000
+text bytes / 2000 binary bytes). Larger LOBs need streaming OCI bindings.
 Metadata inspection currently precedes snapshot capture; a production import
 must also fence concurrent source DDL.
 
