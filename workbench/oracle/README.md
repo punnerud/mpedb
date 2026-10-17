@@ -126,6 +126,14 @@ no longer retains the entire snapshot. CLI import and full live adapter wiring
 remain unfinished. SQL execution uses MPEdb's strict grouping mode, which does
 not imply full Oracle SQL-dialect compatibility.
 
+A native component test now runs both real engines: Oracle import → MPEdb
+PL/SQL Boolean lens/rRETL → PostgreSQL, then PostgreSQL changes → a second
+MPEdb mirror/rRETL → receipted Oracle writes → Oracle CDC into the first mirror.
+It checks compound-key moves, deletes, inserts, exact decimals, Unicode CLOB
+carriers and a subsequent Oracle update sent forward again. Every representation
+change executes in MPEdb; the adapters only transport carriers. This isolated
+single-writer fixture does not implement a continuous bidirectional controller.
+
 This transport is not a complete mirror push: capture, echo suppression,
 conflict checks, authority fencing, CLI import and the two-database topology
 remain unfinished. Writes currently refuse identity columns, special NUMBERs,

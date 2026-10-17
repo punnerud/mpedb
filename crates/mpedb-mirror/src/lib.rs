@@ -69,3 +69,6 @@ pub use state::{
     Authority, CaptureMode, ColumnMap, Epoch, MapPolicy, MirrorConfig, MirrorState, SourceKind,
     TableMap, MIR_NS,
 };
+
+#[cfg(all(test, feature = "oracle-source"))]
+mod oracle_roundtrip_tests;
