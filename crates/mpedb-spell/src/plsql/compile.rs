@@ -2,6 +2,7 @@
 
 mod sql;
 mod exception;
+mod number;
 
 use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
@@ -13,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 enum Type {
     Boolean,
     Number,
+    ConstrainedNumber { precision: u8, scale: i16 },
     PlsInteger,
     Varchar(u16),
     CharLiteral,
@@ -23,6 +25,7 @@ impl Type {
         match self {
             Self::Boolean => Op::SqlBool,
             Self::Number => Op::OraclePlSqlNumber,
+            Self::ConstrainedNumber { precision, scale } => Op::OracleNumberConstraint { precision, scale },
             Self::PlsInteger => Op::OraclePlSqlInteger,
             Self::Varchar(limit) => Op::OracleVarchar(limit),
             Self::CharLiteral => Op::OracleVarchar(0),
@@ -356,7 +359,7 @@ impl Parser<'_> {
         if self.word("BOOLEAN") {
             Ok(Type::Boolean)
         } else if self.word("NUMBER") {
-            Ok(Type::Number)
+            self.number_type(local)
         } else if self.word("PLS_INTEGER") || self.word("BINARY_INTEGER") {
             Ok(Type::PlsInteger)
         } else if self.word("VARCHAR2") {
@@ -412,8 +415,8 @@ impl Parser<'_> {
                         Type::Varchar(_) | Type::CharLiteral,
                         Type::Varchar(_) | Type::CharLiteral
                     ) | (
-                        Type::Number | Type::PlsInteger,
-                        Type::Number | Type::PlsInteger
+                        Type::Number | Type::ConstrainedNumber { .. } | Type::PlsInteger,
+                        Type::Number | Type::ConstrainedNumber { .. } | Type::PlsInteger
                     )
                 )
         }) {

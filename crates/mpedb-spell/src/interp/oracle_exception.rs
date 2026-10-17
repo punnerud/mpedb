@@ -38,7 +38,8 @@ pub(super) fn semantic(error: Error, op: Op) -> std::result::Result<Error, Error
         Error::ArithmeticOverflow
             if matches!(
                 op,
-                Op::OracleIntAdd
+                Op::OracleNumberConstraint { .. }
+                    | Op::OracleIntAdd
                     | Op::OracleIntSub
                     | Op::OracleIntMul
                     | Op::OracleIntNeg
@@ -51,7 +52,8 @@ pub(super) fn semantic(error: Error, op: Op) -> std::result::Result<Error, Error
         Error::TypeMismatch(_)
             if matches!(
                 op,
-                Op::OracleVarchar(_)
+                Op::OracleNumberConstraint { .. }
+                    | Op::OracleVarchar(_)
                     | Op::OraclePlSqlNumber
                     | Op::OraclePlSqlInteger
                     | Op::OraclePlSqlLoopBound

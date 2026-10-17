@@ -873,3 +873,37 @@ fn application_errors_preserve_codes_messages_rounding_and_utf8_limits() {
     assert!(matches!(error,mpedb_types::Error::Oracle{code:20001,ref message} if message.len()==2034));
     assert!(compile(&function("","NUMBER","BEGIN RAISE_APPLICATION_ERROR(-20001,'x',TRUE); END;")).is_err());
 }
+
+#[test]
+fn constrained_numbers_round_assignments_before_checking_precision() {
+    for (ty, input, expected) in [
+        ("NUMBER(4,2)", "99.994", "99.99"),
+        ("NUMBER(4,2)", "99.995", "-6502"),
+        ("NUMBER(4,2)", "-12.345", "-12.35"),
+        ("NUMBER(3,-2)", "99949", "99900"),
+        ("NUMBER(3,-2)", "99950", "-6502"),
+        ("NUMBER(3,-2)", "-150", "-200"),
+        ("NUMBER(4,5)", "0.012345", "0.01235"),
+        ("NUMBER(4,5)", "0.099995", "-6502"),
+        ("NUMBER(2)", "99.4", "99"),
+        ("NUMBER(2)", "99.5", "-6502"),
+        ("NUMBER(1,+2)", "0.004", "0"),
+    ] {
+        let source = function("p NUMBER", "NUMBER", &format!("n {ty}; BEGIN n:=p; RETURN n; EXCEPTION WHEN VALUE_ERROR THEN RETURN -6502; END;"));
+        assert_eq!(call(&source, &[Value::Numeric(input.into())]).unwrap(), Value::Numeric(expected.into()), "{ty}: {input}");
+        assert_eq!(call(&source, &[Value::Null]).unwrap(), Value::Null);
+    }
+    let source = function("", "NUMBER", "n NUMBER(3,1):=1.24; BEGIN n:=n*10+0.05; RETURN n; END;");
+    assert_eq!(call(&source, &[]).unwrap(), Value::Numeric("12.1".into()));
+    let source = function("", "NUMBER", "n CONSTANT NUMBER(4,2):=-1.235; BEGIN RETURN n; END;");
+    assert_eq!(call(&source, &[]).unwrap(), Value::Numeric("-1.24".into()));
+}
+
+#[test]
+fn constrained_number_declarations_reject_invalid_or_formal_constraints() {
+    for ty in ["NUMBER(0)", "NUMBER(39)", "NUMBER(-1)", "NUMBER(1.0)", "NUMBER(2,-85)", "NUMBER(2,128)", "NUMBER(2,1.5)", "NUMBER(*,2)", "NUMBER(2,32768)"] {
+        assert!(compile(&function("", "NUMBER", &format!("n {ty}; BEGIN RETURN n; END;"))).is_err(), "{ty}");
+    }
+    assert!(compile(&function("p NUMBER(4,2)", "NUMBER", "BEGIN RETURN p; END;")).is_err());
+    assert!(compile(&function("", "NUMBER(4,2)", "BEGIN RETURN 1; END;")).is_err());
+}

@@ -147,6 +147,9 @@ pub enum Op {
     OraclePlSqlDiv,
     /// PL/SQL NUMBER special-value rules, versioned separately from finite ops.
     OraclePlSqlNumber,
+    /// Local NUMBER(p,s) assignment; scale rounds half away from zero before
+    /// checking precision. Precision 1..38, scale -84..127.
+    OracleNumberConstraint { precision: u8, scale: i16 },
     OraclePlSqlAdd,
     OraclePlSqlSub,
     OraclePlSqlMul,
@@ -324,6 +327,7 @@ const OP_ORACLE_RAISE: u8 = 86;
 const OP_ORACLE_SQLCODE: u8 = 87;
 const OP_ORACLE_SQLERRM: u8 = 88;
 const OP_ORACLE_RAISE_APPLICATION: u8 = 89;
+const OP_ORACLE_NUMBER_CONSTRAINT: u8 = 90;
 
 
 
@@ -572,6 +576,11 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleDiv => b.push(OP_ORACLE_DIV),
         Op::OraclePlSqlDiv => b.push(OP_ORACLE_PLSQL_DIV),
         Op::OraclePlSqlNumber => b.push(OP_PLSQL_NUMBER),
+        Op::OracleNumberConstraint { precision, scale } => {
+            b.push(OP_ORACLE_NUMBER_CONSTRAINT);
+            b.push(precision);
+            b.extend_from_slice(&scale.to_le_bytes());
+        }
         Op::OraclePlSqlAdd => b.push(OP_PLSQL_ADD),
         Op::OraclePlSqlSub => b.push(OP_PLSQL_SUB),
         Op::OraclePlSqlMul => b.push(OP_PLSQL_MUL),
@@ -687,6 +696,11 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_DIV => Op::OracleDiv,
         OP_ORACLE_PLSQL_DIV => Op::OraclePlSqlDiv,
         OP_PLSQL_NUMBER => Op::OraclePlSqlNumber,
+        OP_ORACLE_NUMBER_CONSTRAINT => {
+            let raw = buf.get(*pos..*pos + 3).ok_or_else(err)?;
+            *pos += 3;
+            Op::OracleNumberConstraint { precision: raw[0], scale: i16::from_le_bytes(raw[1..].try_into().unwrap()) }
+        }
         OP_PLSQL_ADD => Op::OraclePlSqlAdd,
         OP_PLSQL_SUB => Op::OraclePlSqlSub,
         OP_PLSQL_MUL => Op::OraclePlSqlMul,
@@ -768,7 +782,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg | Op::OraclePlSqlNumber | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound | Op::OracleSelectOne => (1, 1),
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg | Op::OraclePlSqlNumber | Op::OracleNumberConstraint { .. } | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound | Op::OracleSelectOne => (1, 1),
         Op::OracleIntAdd | Op::OracleIntSub | Op::OracleIntMul
         | Op::OracleConcat
         | Op::OracleCharEq
@@ -852,6 +866,10 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
             }
             Op::OracleRaise(code) if !matches!(code, 1 | 1403 | 1422 | 1476 | 6502) => {
                 return Err(Error::Corrupt("proc: unknown named Oracle exception".into()));
+            }
+            Op::OracleNumberConstraint { precision, scale }
+                if !(1..=38).contains(&precision) || !(-84..=127).contains(&scale) => {
+                return Err(Error::Corrupt("proc: invalid Oracle NUMBER constraint".into()));
             }
             Op::OracleVarchar(0x8000) => {
                 return Err(Error::Corrupt("proc: zero CHAR length constraint".into()));
@@ -1166,6 +1184,24 @@ mod tests {
             Op::OracleTry { handler: 1, end: 1, handler_end: u32::MAX }] {
             assert!(Proc::new("range".into(), 0, 0, vec![], vec![], vec![op]).is_err());
         }
+    }
+
+    #[test]
+    fn oracle_number_constraint_codec_bounds_and_stack_are_validated() {
+        let op = Op::OracleNumberConstraint { precision: 4, scale: -2 };
+        let p = Proc::new("constraint".into(), 0, 0, vec![], vec![Value::Int(12345)],
+            vec![Op::LoadConst(0), op, Op::Return]).unwrap();
+        let bytes = p.encode();
+        assert_eq!(Proc::decode(&bytes).unwrap(), p);
+        for i in 0..bytes.len() { assert!(Proc::decode(&bytes[..i]).is_err()); }
+        let encoded = [90, 4, 254, 255];
+        assert_eq!(decode_op(&encoded, &mut 0).unwrap(), op);
+        for i in 0..encoded.len() { assert!(decode_op(&encoded[..i], &mut 0).is_err()); }
+        for (precision, scale) in [(0, 0), (39, 0), (4, -85), (4, 128)] {
+            assert!(Proc::new("bad".into(), 0, 0, vec![], vec![Value::Int(1)],
+                vec![Op::LoadConst(0), Op::OracleNumberConstraint { precision, scale }, Op::Return]).is_err());
+        }
+        assert!(Proc::new("stack".into(), 0, 0, vec![], vec![], vec![op, Op::Return]).is_err());
     }
 
     #[test]

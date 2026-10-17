@@ -26,6 +26,7 @@ mod oracle_exception;
 mod sql_logic;
 mod oracle_number;
 mod plsql_number;
+mod oracle_constraint;
 
 pub(crate) fn validate_oracle_number_literal(text: &str) -> Result<()> {
     oracle_number::normalize(text).map(|_| ())
@@ -551,6 +552,10 @@ pub fn run(
                     }
                     _ => return Err(Error::Oracle { code: 1422, message: "exact fetch returns more than requested number of rows".into() }),
                 }
+            }
+            Op::OracleNumberConstraint { precision, scale } => {
+                let value = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(oracle_constraint::number(value, precision, scale)?));
             }
             Op::OracleVarchar(limit) => {
                 let value = stack.pop().expect("validated");

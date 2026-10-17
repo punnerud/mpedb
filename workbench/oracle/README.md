@@ -281,7 +281,7 @@ contract; Oracle CREATE-versus-OR-REPLACE catalog behavior is not implemented
 by this host API.
 
 The first compiler supports IN/OUT/IN OUT parameters, local variables and
-initialized CONSTANT declarations of BOOLEAN, unconstrained NUMBER, PLS_INTEGER /
+initialized CONSTANT declarations of BOOLEAN, NUMBER, PLS_INTEGER /
 BINARY_INTEGER, and VARCHAR2,
 exact numeric literals and comparisons, IS [NOT] NULL,
 assignment, nested DECLARE/BEGIN blocks, IF/ELSIF/ELSE, WHILE/LOOP, numeric FOR /
@@ -300,6 +300,16 @@ Block labels, qualified local names, and exception handlers are not yet supporte
 
 VARCHAR2 follows the measured Oracle 26ai reference profile: AL32UTF8, binary
 comparison, and BYTE default length semantics. Local declarations accept
+Local `NUMBER(p,s)` and `NUMBER(p)` variables/constants now round on assignment
+using exact decimal arithmetic, then enforce precision. Precision is 1..38 and
+scale -84..127, including negative scale and scale greater than precision.
+Intermediate expressions remain unconstrained. Overflow raises VALUE_ERROR in
+handlers; formal parameter/return constraints and invalid bounds are rejected.
+A new additive IR opcode (90) validates its bounds and stack on decode. Unit
+checks cover ties, overflow after rounding, NULL, constants and arithmetic;
+128 differential calls match the same application functions on native Oracle.
+See Oracle's [NUMBER type rules](https://docs.oracle.com/en/database/oracle/oracle-database/26/sqlrf/Data-Types.html).
+
 `VARCHAR2(n BYTE)` or `VARCHAR2(n CHAR)` with n from 1 to 32767; unconstrained
 VARCHAR2 accepts up to 32767 bytes. Formal parameters and return types cannot
 specify a length. CHAR length constraints still have the absolute 32767-byte
