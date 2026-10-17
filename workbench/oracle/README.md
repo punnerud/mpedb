@@ -465,8 +465,21 @@ and complete Oracle classification of database errors. See
 [Oracle error reporting](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/retrieving-error-code-and-error-message.html)
 and [raising exceptions](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/raising-exceptions-explicitly.html).
 
-**Parameter defaults, NUMBER precision/scale constraints, static SQL statements,
-calls to other routines, packages and cursors remain unimplemented**;
+Static INSERT/UPDATE/DELETE and SELECT INTO now lower into the same MPEdb
+plans and exact-fetch/exception bridge as literal dynamic SQL. Input variables
+must use `routine.variable` qualification; that binding refers to the routine's
+scope even inside a nested block with a shadowing local. SQL numeric literals
+become exact NUMBER bindings, never int64/f64 approximations. Native tests use
+identical application source for both engines and cover nested shadowing,
+large exact numbers, empty-string NULLs, DML, duplicate handling, fetch errors,
+INTO precision checks and cold reopen. Bare PL/SQL names are refused until
+schema-aware column-priority resolution is available; qualify SQL columns with
+a table alias when names overlap. Numeric literals with ORDER/GROUP BY,
+qualified/record INTO targets, DML RETURNING and full Oracle SQL syntax remain
+gaps. See Oracle's [column precedence rules](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/column-name-precedence.html).
+
+**Parameter defaults, complete static SQL name resolution, calls to other
+routines, packages and cursors remain unimplemented**;
 measured arithmetic agreement is not full PL/SQL compatibility.
 
 The native `ProcEngine` calling convention supplies one argument slot for every

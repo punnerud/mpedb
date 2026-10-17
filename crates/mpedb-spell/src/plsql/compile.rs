@@ -3,6 +3,7 @@
 mod sql;
 mod exception;
 mod number;
+mod static_sql;
 
 use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
@@ -42,6 +43,8 @@ struct Local {
 
 struct Parser<'a> {
     source: &'a str,
+    routine_name: String,
+    routine_locals: HashMap<String, Local>,
     tokens: Vec<Lexed>,
     at: usize,
     builder: FuncBuilder,
@@ -89,6 +92,8 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
     let exception_blocks = tokens.iter().any(|t| matches!(&t.token, Token::Identifier { name, quoted: false } if name == "EXCEPTION"));
     let mut p = Parser {
         source,
+        routine_name: String::new(),
+        routine_locals: HashMap::new(),
         tokens,
         at: 0,
         builder: FuncBuilder::new(),
@@ -116,6 +121,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         return Err(p.error("a stored SQL function requires CREATE FUNCTION, not CREATE PROCEDURE"));
     }
     let name = p.identifier()?;
+    p.routine_name = name.clone();
     if p.symbol(".") {
         return Err(p.error("schema-qualified routine registration is not implemented"));
     }
@@ -165,6 +171,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         return Err(p.error("expected IS or AS before routine body"));
     }
     p.declarations()?;
+    p.routine_locals = p.locals.clone();
     p.want_word("BEGIN")?;
     p.block_body()?;
     p.want_word("END")?;
@@ -446,6 +453,9 @@ impl Parser<'_> {
         Ok(())
     }
     fn statement(&mut self) -> Result<()> {
+        if self.is_word("SELECT") || self.is_word("INSERT") || self.is_word("UPDATE") || self.is_word("DELETE") {
+            return self.static_sql();
+        }
         if self.is_word("RAISE_APPLICATION_ERROR") && !self.locals.contains_key("RAISE_APPLICATION_ERROR") { self.at += 1; return self.raise_application(); }
         if self.word("RAISE") { return self.raise_statement(); }
         if self.word("EXECUTE") { return self.execute_immediate(); }

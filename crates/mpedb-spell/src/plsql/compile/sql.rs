@@ -72,6 +72,17 @@ impl Parser<'_> {
             ));
         }
         self.want_symbol(";")?;
+        self.emit_sql_call(sql, kind, argc, &into, span)
+    }
+    pub(super) fn emit_sql_call(
+        &mut self,
+        sql: String,
+        kind: CallKind,
+        argc: usize,
+        into: &[Local],
+        span: usize,
+    ) -> Result<()> {
+        let query = kind == CallKind::Query;
         let (line, col) = crate::emit::line_col(self.source, span);
         let index = self.builder.add_call(SqlCall {
             sql,
@@ -108,7 +119,7 @@ fn normalize_dml(source: &str) -> Result<(String, usize)> {
     normalize_sql(source, CallKind::Exec)
 }
 
-fn normalize_sql(source: &str, kind: CallKind) -> Result<(String, usize)> {
+pub(super) fn normalize_sql(source: &str, kind: CallKind) -> Result<(String, usize)> {
     let tokens = lex::lex(source)?;
     if !matches!(tokens.first().map(|t|&t.token),Some(Token::Identifier{name,quoted:false}) if match kind { CallKind::Query=>name=="SELECT", CallKind::Exec=>matches!(name.as_str(),"INSERT"|"UPDATE"|"DELETE"), CallKind::Rows=>false })
     {
