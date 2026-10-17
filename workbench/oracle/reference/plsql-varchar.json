@@ -1,0 +1,77 @@
+{
+  "oracle_version": "23.26.3.0.0",
+  "nls": {
+    "NLS_LENGTH_SEMANTICS": "BYTE",
+    "NLS_COMP": "BINARY",
+    "NLS_SORT": "BINARY",
+    "NLS_CHARACTERSET": "AL32UTF8"
+  },
+  "results": {
+    "empty": {
+      "source": "DECLARE x VARCHAR2(10) := ''; BEGIN :out := CASE WHEN x IS NULL THEN 'null' ELSE 'text' END; END;",
+      "value": "null"
+    },
+    "concat_null": {
+      "source": "BEGIN :out := 'abc' || NULL; END;",
+      "value": "abc"
+    },
+    "concat_nulls": {
+      "source": "BEGIN :out := NULL || ''; END;",
+      "value": null
+    },
+    "literal_compare": {
+      "source": "BEGIN IF 'a' = 'a ' THEN :out := 'true'; ELSE :out := 'false'; END IF; END;",
+      "value": "true"
+    },
+    "varchar_compare": {
+      "source": "DECLARE x VARCHAR2(3) := 'a'; BEGIN IF x = 'a ' THEN :out := 'true'; ELSE :out := 'false'; END IF; END;",
+      "value": "false"
+    },
+    "byte_overflow": {
+      "source": "DECLARE x VARCHAR2(3 BYTE) := 'øø'; BEGIN :out := x; END;",
+      "error": "ORA-06502: PL/SQL: value or conversion error: character string buffer too small\nORA-06512: at line 1\nHelp: https://docs.oracle.com/error-help/db/ora-06502/"
+    },
+    "char_valid": {
+      "source": "DECLARE x VARCHAR2(3 CHAR) := 'øø'; BEGIN :out := x; END;",
+      "value": "øø"
+    },
+    "char_overflow": {
+      "source": "DECLARE x VARCHAR2(1 CHAR) := 'øø'; BEGIN :out := x; END;",
+      "error": "ORA-06502: PL/SQL: value or conversion error: character string buffer too small\nORA-06512: at line 1\nHelp: https://docs.oracle.com/error-help/db/ora-06502/"
+    },
+    "no_length": {
+      "source": "DECLARE x VARCHAR2 := 'a'; BEGIN :out := x; END;",
+      "value": "a"
+    },
+    "param_length": {
+      "source": "DECLARE FUNCTION f(x VARCHAR2(3)) RETURN VARCHAR2 IS BEGIN RETURN x; END; BEGIN :out := f('a'); END;",
+      "error": "ORA-06550: line 1, column 30:\nPLS-00103: Encountered the symbol \"(\" when expecting one of the following:\n\n   := . ) , @ % default character\nThe symbol \":=\" was substituted for \"(\" to continue.\nHelp: https://docs.oracle.com/error-help/db/ora-06550/"
+    },
+    "return_length": {
+      "source": "DECLARE FUNCTION f RETURN VARCHAR2(3) IS BEGIN RETURN 'a'; END; BEGIN :out := f; END;",
+      "error": "ORA-06550: line 1, column 35:\nPLS-00103: Encountered the symbol \"(\" when expecting one of the following:\n\n   . @ % ; is default authid as cluster order using external\n   character deterministic shard_enable parallel_enable\n   pipelined aggregate result_cache accessible sql_macro\nHelp: https://docs.oracle.com/error-help/db/ora-06550/"
+    },
+    "concat_precedence": {
+      "source": "BEGIN :out := 'a' || 'b' || 'c'; END;",
+      "value": "abc"
+    },
+    "parameter_large": {
+      "source": "DECLARE FUNCTION f(x VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN x; END; BEGIN :out := f(RPAD('a', 32767, 'a')); END;",
+      "value": {
+        "length": 32767
+      }
+    }
+  },
+  "additional_boundary_results": {
+    "1": 1,
+    "2": 2,
+    "10": 10,
+    "32767": 32767,
+    "32768": "ORA-06502: PL/SQL: value or conversion error\nORA-06512: at line 1\nHelp: https://docs.oracle.com/error-help/db/ora-06502/",
+    "size 0": "ORA-06550: line 1, column 20:\nPLS-00215: String length constraints must be in range (1 .. 32767)\nHelp: https://docs.oracle.com/error-help/db/ora-06550/",
+    "size 32768": "ORA-06550: line 1, column 20:\nPLS-00215: String length constraints must be in range (1 .. 32767)\nHelp: https://docs.oracle.com/error-help/db/ora-06550/",
+    "size 1": 1,
+    "size 3 CHAR": 1,
+    "size 3 BYTE": 1
+  }
+}

@@ -144,6 +144,17 @@ pub enum Op {
     OracleMul,
     OracleDiv,
     OracleNeg,
+    /// VARCHAR2 normalization. Low 15 bits: length (0 = unconstrained);
+    /// high bit: CHAR semantics rather than BYTE. Absolute maximum 32767 bytes.
+    OracleVarchar(u16),
+    OracleConcat,
+    /// Blank-padded comparisons when both operands are character literals.
+    OracleCharEq,
+    OracleCharNe,
+    OracleCharLt,
+    OracleCharLe,
+    OracleCharGt,
+    OracleCharGe,
 
     /// Exact decimal arithmetic; rounding-dependent results currently refuse.
     SqlAdd,
@@ -252,6 +263,14 @@ const OP_ORACLE_SUB: u8 = 55;
 const OP_ORACLE_MUL: u8 = 56;
 const OP_ORACLE_DIV: u8 = 57;
 const OP_ORACLE_NEG: u8 = 58;
+const OP_ORACLE_VARCHAR: u8 = 59;
+const OP_ORACLE_CONCAT: u8 = 60;
+const OP_ORACLE_CHAR_EQ: u8 = 61;
+const OP_ORACLE_CHAR_NE: u8 = 62;
+const OP_ORACLE_CHAR_LT: u8 = 63;
+const OP_ORACLE_CHAR_LE: u8 = 64;
+const OP_ORACLE_CHAR_GT: u8 = 65;
+const OP_ORACLE_CHAR_GE: u8 = 66;
 
 
 
@@ -499,6 +518,14 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleMul => b.push(OP_ORACLE_MUL),
         Op::OracleDiv => b.push(OP_ORACLE_DIV),
         Op::OracleNeg => b.push(OP_ORACLE_NEG),
+        Op::OracleVarchar(limit) => u16arg(OP_ORACLE_VARCHAR, limit),
+        Op::OracleConcat => b.push(OP_ORACLE_CONCAT),
+        Op::OracleCharEq => b.push(OP_ORACLE_CHAR_EQ),
+        Op::OracleCharNe => b.push(OP_ORACLE_CHAR_NE),
+        Op::OracleCharLt => b.push(OP_ORACLE_CHAR_LT),
+        Op::OracleCharLe => b.push(OP_ORACLE_CHAR_LE),
+        Op::OracleCharGt => b.push(OP_ORACLE_CHAR_GT),
+        Op::OracleCharGe => b.push(OP_ORACLE_CHAR_GE),
 
         Op::SqlAdd => b.push(OP_SQL_ADD),
         Op::SqlSub => b.push(OP_SQL_SUB),
@@ -580,6 +607,14 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_MUL => Op::OracleMul,
         OP_ORACLE_DIV => Op::OracleDiv,
         OP_ORACLE_NEG => Op::OracleNeg,
+        OP_ORACLE_VARCHAR => Op::OracleVarchar(u16arg()?),
+        OP_ORACLE_CONCAT => Op::OracleConcat,
+        OP_ORACLE_CHAR_EQ => Op::OracleCharEq,
+        OP_ORACLE_CHAR_NE => Op::OracleCharNe,
+        OP_ORACLE_CHAR_LT => Op::OracleCharLt,
+        OP_ORACLE_CHAR_LE => Op::OracleCharLe,
+        OP_ORACLE_CHAR_GT => Op::OracleCharGt,
+        OP_ORACLE_CHAR_GE => Op::OracleCharGe,
 
         OP_SQL_ADD => Op::SqlAdd,
         OP_SQL_SUB => Op::SqlSub,
@@ -620,8 +655,15 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg => (1, 1),
-        Op::Add
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) => (1, 1),
+        Op::OracleConcat
+        | Op::OracleCharEq
+        | Op::OracleCharNe
+        | Op::OracleCharLt
+        | Op::OracleCharLe
+        | Op::OracleCharGt
+        | Op::OracleCharGe
+        | Op::Add
         | Op::Sub
         | Op::Mul
         | Op::TrueDiv
@@ -684,6 +726,9 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
     let mut any_exec = false;
     for &op in instrs {
         match op {
+            Op::OracleVarchar(0x8000) => {
+                return Err(Error::Corrupt("proc: zero CHAR length constraint".into()));
+            }
             Op::Tuple(n) if n as usize > MAX_STACK => {
                 return Err(Error::Corrupt("proc: tuple arity exceeds stack bound".into()));
             }

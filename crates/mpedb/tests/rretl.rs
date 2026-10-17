@@ -1601,3 +1601,14 @@ fn oracle_number_coercion_is_not_misclassified_as_a_type_preserving_lens() {
     assert!(d.list_lenses().unwrap().is_empty());
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn oracle_empty_text_normalization_cannot_publish_an_unchecked_bijective_lens() {
+    let (d, path) = db("plsql-text-domain");
+    d.create_function(SpellLang::PlSql, "CREATE FUNCTION text_identity(x VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN x; END;").unwrap();
+    // Oracle represents both empty text and NULL as NULL. Recovering the
+    // original MPEdb value requires an explicit domain or retained provenance.
+    assert!(d.create_lens("wrong_text_domain", "TEXT_IDENTITY", "TEXT_IDENTITY", LensClass::Bijective).is_err());
+    assert!(d.list_lenses().unwrap().is_empty());
+    let _ = std::fs::remove_file(path);
+}

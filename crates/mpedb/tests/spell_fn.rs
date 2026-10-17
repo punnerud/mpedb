@@ -176,6 +176,24 @@ fn plsql_scalar_functions_run_from_sql_and_shared_prepared_plans() {
 }
 
 #[test]
+fn plsql_varchar_functions_run_from_shared_sql_plans_with_oracle_null_rules() {
+    let (d, path) = db("plsql-varchar");
+    d.create_function(SpellLang::PlSql, "CREATE FUNCTION oracle_greet(x VARCHAR2) RETURN VARCHAR2 IS prefix CONSTANT VARCHAR2(4 CHAR) := q'[Hei ]'; BEGIN RETURN prefix || x; END;").unwrap();
+    let hash = d.prepare("SELECT oracle_greet($1)").unwrap();
+    let attached = Database::open_from_file(std::path::Path::new(&path)).unwrap();
+    for (input, expected) in [
+        (Value::Text("ø".into()), "Hei ø"),
+        (Value::Text("".into()), "Hei "),
+        (Value::Null, "Hei "),
+    ] {
+        assert_eq!(rows(attached.execute(&hash, &[input]).unwrap()), vec![vec![Value::Text(expected.into())]]);
+    }
+    d.create_function(SpellLang::PlSql, "CREATE FUNCTION oracle_greet(x VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN x || '!'; END;").unwrap();
+    assert_eq!(rows(attached.query("SELECT oracle_greet('ø')", &[]).unwrap()), vec![vec![Value::Text("ø!".into())]]);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn procedure_and_out_signatures_cannot_be_registered_as_scalar_sql_functions() {
     let (d, path) = db("plsql-signature");
     for source in [

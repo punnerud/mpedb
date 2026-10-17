@@ -62,7 +62,7 @@ contract; Oracle CREATE-versus-OR-REPLACE catalog behavior is not implemented
 by this host API.
 
 The first compiler supports IN/OUT/IN OUT parameters, local variables and
-initialized CONSTANT declarations of BOOLEAN and unconstrained NUMBER,
+initialized CONSTANT declarations of BOOLEAN, unconstrained NUMBER, and VARCHAR2,
 exact numeric literals and comparisons, IS [NOT] NULL,
 assignment, nested DECLARE/BEGIN blocks, IF/ELSIF/ELSE, WHILE/LOOP,
 EXIT/CONTINUE [WHEN], and RETURN. Static
@@ -76,6 +76,34 @@ Nested blocks provide lexical scope, shadow outer names, and initialize local
 variables on every entry. Self/forward references in initializers are rejected,
 including references that would otherwise resolve to an outer variable.
 Block labels, qualified local names, and exception handlers are not yet supported.
+
+VARCHAR2 follows the measured Oracle 26ai reference profile: AL32UTF8, binary
+comparison, and BYTE default length semantics. Local declarations accept
+`VARCHAR2(n BYTE)` or `VARCHAR2(n CHAR)` with n from 1 to 32767; unconstrained
+VARCHAR2 accepts up to 32767 bytes. Formal parameters and return types cannot
+specify a length. CHAR length constraints still have the absolute 32767-byte
+ceiling. Empty text becomes NULL. Concatenation `||` treats NULL as empty text,
+returning NULL if both operands are empty. Literal-to-literal comparisons use
+blank padding; comparisons involving VARCHAR2 and concatenation results do not.
+Ordinary and q-quoted strings are supported; national strings, NVARCHAR2, CHAR
+variables, session-dependent NLS behavior, and implicit number/text conversion
+are not implemented. The new instructions preserve existing stored IR semantics.
+
+The reproducible VARCHAR2 differential test measured 3825 cases with no
+mismatches, including Unicode, control characters, quotes, NULL, comparisons,
+concatenation, and length errors:
+
+```bash
+python workbench/oracle/varchar_differential.py \
+  --probe /path/to/target/debug/examples/plsql_number_probe \
+  --native-root /path/to/private-oracle-root \
+  --output /path/to/artifacts/varchar-differential.json
+```
+
+VARCHAR2 normalization is not a bijection over arbitrary MPEdb text values:
+empty text and NULL share an Oracle representation. rRETL verification still
+requires an appropriate domain or retained provenance; this normalization does
+not authorize an unchecked bidirectional mirror.
 
 NUMBER values remain exact decimals; integers are normalized at parameter
 boundaries. New routines use Oracle's twenty base-100 groups (39/40 decimal

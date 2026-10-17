@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 enum Type {
     Boolean,
     Number,
+    Varchar(u16),
+    CharLiteral,
 }
 
 impl Type {
@@ -17,6 +19,8 @@ impl Type {
         match self {
             Self::Boolean => Op::SqlBool,
             Self::Number => Op::OracleNumber,
+            Self::Varchar(limit) => Op::OracleVarchar(limit),
+            Self::CharLiteral => Op::OracleVarchar(0),
         }
     }
 }
@@ -98,7 +102,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
             }
             // NOCOPY is an Oracle hint, not a guarantee. This runtime always
             // uses value/copy-out semantics, which Oracle explicitly permits.
-            let ty = p.data_type()?;
+            let ty = p.data_type(false)?;
             let slot = p.add_local(name, ty, output)?;
             if out_only {
                 p.constant(Value::Null)?;
@@ -123,7 +127,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
     }
     if function {
         p.want_word("RETURN")?;
-        p.returns = Some(p.data_type()?);
+        p.returns = Some(p.data_type(false)?);
     }
     if !(p.word("IS") || p.word("AS")) {
         return Err(p.error("expected IS or AS before routine body"));
@@ -187,7 +191,7 @@ impl Parser<'_> {
         while !self.is_word("BEGIN") {
             let name = self.identifier()?;
             let constant = self.word("CONSTANT");
-            let ty = self.data_type()?;
+            let ty = self.data_type(true)?;
             if self.word("NOT") {
                 return Err(self.error("NOT NULL variable constraints are not implemented"));
             }
@@ -316,13 +320,40 @@ impl Parser<'_> {
         self.at += 1;
         Ok(name)
     }
-    fn data_type(&mut self) -> Result<Type> {
+    fn data_type(&mut self, local: bool) -> Result<Type> {
         if self.word("BOOLEAN") {
             Ok(Type::Boolean)
         } else if self.word("NUMBER") {
             Ok(Type::Number)
+        } else if self.word("VARCHAR2") {
+            let mut constraint = 0;
+            if self.symbol("(") {
+                if !local {
+                    return Err(self.error(
+                        "formal parameters and return types cannot specify a VARCHAR2 length",
+                    ));
+                }
+                let Some(Token::Number(text)) = self.peek() else {
+                    return Err(self.error("VARCHAR2 length must be an integer from 1 to 32767"));
+                };
+                constraint = text
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|n| (1..=32767).contains(n))
+                    .ok_or_else(|| {
+                        self.error("VARCHAR2 length must be an integer from 1 to 32767")
+                    })?;
+                self.at += 1;
+                if self.word("CHAR") {
+                    constraint |= 0x8000;
+                } else {
+                    self.word("BYTE");
+                }
+                self.want_symbol(")")?;
+            }
+            Ok(Type::Varchar(constraint))
         } else {
-            Err(self.error("this PL/SQL compiler currently supports BOOLEAN and unconstrained NUMBER; other types require typed runtime support"))
+            Err(self.error("this PL/SQL compiler currently supports BOOLEAN, unconstrained NUMBER and VARCHAR2; other types require typed runtime support"))
         }
     }
     fn add_local(&mut self, name: String, ty: Type, writable: bool) -> Result<u16> {
@@ -339,7 +370,16 @@ impl Parser<'_> {
         Ok(())
     }
     fn compatible(&self, expected: Type, actual: Option<Type>) -> Result<()> {
-        if actual.is_some_and(|actual| actual != expected) {
+        if actual.is_some_and(|actual| {
+            actual != expected
+                && !matches!(
+                    (expected, actual),
+                    (
+                        Type::Varchar(_) | Type::CharLiteral,
+                        Type::Varchar(_) | Type::CharLiteral
+                    )
+                )
+        }) {
             Err(self.error("incompatible expression type"))
         } else {
             Ok(())
@@ -562,6 +602,19 @@ impl Parser<'_> {
                 if let Some(ty) = ty {
                     self.compatible(ty, right)?;
                 }
+                let op = if ty == Some(Type::CharLiteral) && right == Some(Type::CharLiteral) {
+                    match op {
+                        Op::SqlEq => Op::OracleCharEq,
+                        Op::SqlNe => Op::OracleCharNe,
+                        Op::SqlLt => Op::OracleCharLt,
+                        Op::SqlLe => Op::OracleCharLe,
+                        Op::SqlGt => Op::OracleCharGt,
+                        Op::SqlGe => Op::OracleCharGe,
+                        _ => unreachable!("comparison operator"),
+                    }
+                } else {
+                    op
+                };
                 self.builder.emit(op)?;
                 Ok(Some(Type::Boolean))
             } else {
@@ -576,14 +629,21 @@ impl Parser<'_> {
                 Op::OracleAdd
             } else if self.symbol("-") {
                 Op::OracleSub
+            } else if self.symbol("||") {
+                Op::OracleConcat
             } else {
                 break;
             };
-            self.compatible(Type::Number, ty)?;
+            let expected = if op == Op::OracleConcat {
+                Type::Varchar(0)
+            } else {
+                Type::Number
+            };
+            self.compatible(expected, ty)?;
             let right = self.multiplicative()?;
-            self.compatible(Type::Number, right)?;
+            self.compatible(expected, right)?;
             self.builder.emit(op)?;
-            ty = Some(Type::Number);
+            ty = Some(expected);
         }
         Ok(ty)
     }
@@ -644,6 +704,18 @@ impl Parser<'_> {
             let ty = self.expression()?;
             self.want_symbol(")")?;
             return Ok(ty);
+        }
+        if let Some(Token::String { value, national }) = self.peek() {
+            if *national {
+                return Err(
+                    self.error("national character strings require NVARCHAR2 runtime support")
+                );
+            }
+            let value = value.clone();
+            self.at += 1;
+            self.constant(Value::Text(value))?;
+            self.builder.emit(Op::OracleVarchar(0))?;
+            return Ok(Some(Type::CharLiteral));
         }
         if let Some(Token::Number(text)) = self.peek() {
             let value = mpedb_types::value::parse_numeric(text)

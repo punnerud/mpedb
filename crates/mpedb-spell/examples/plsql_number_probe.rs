@@ -1,4 +1,6 @@
-//! Host-side arithmetic probe for differential tests against real Oracle.
+//! Host-side scalar probe for differential tests against real Oracle.
+//! Default: one NUMBER expression per line. --routine: complete no-arg
+//! functions per line, with exact hex-encoded text and explicit BOOLEAN/NULL.
 use mpedb_spell::interp::{self, Budget, DbBridge, ProcValue};
 use mpedb_spell::ir::{PlanRef, Proc};
 use mpedb_types::{Error, Result, Value};
@@ -25,12 +27,21 @@ impl DbBridge for NoDb {
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    let routine = match arguments.as_slice() {
+        [] => false,
+        [arg] if arg == "--routine" => true,
+        _ => return Err("usage: plsql_number_probe [--routine]".into()),
+    };
     let mut output = io::stdout().lock();
     for expression in io::stdin().lock().lines() {
         let expression = expression?;
         let result = (|| -> Result<ProcValue> {
-            let source =
-                format!("CREATE FUNCTION f RETURN NUMBER IS BEGIN RETURN {expression}; END;");
+            let source = if routine {
+                expression.clone()
+            } else {
+                format!("CREATE FUNCTION f RETURN NUMBER IS BEGIN RETURN {expression}; END;")
+            };
             let s = mpedb_spell::plsql::compile_function(&source)?;
             let p = Proc::new(s.name, s.argc, s.nlocals, vec![], s.consts, s.instrs)?;
             let p = Proc::decode(&p.encode())?;
@@ -39,6 +50,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok(ProcValue::Scalar(Value::Numeric(value))) => writeln!(output, "OK\t{value}")?,
             Ok(ProcValue::Scalar(Value::Null)) => writeln!(output, "NULL")?,
+            Ok(ProcValue::Scalar(Value::Bool(value))) => writeln!(output, "BOOL\t{value}")?,
+            Ok(ProcValue::Scalar(Value::Text(value))) => {
+                write!(output, "TEXT\t")?;
+                for byte in value.as_bytes() {
+                    write!(output, "{byte:02x}")?;
+                }
+                writeln!(output)?;
+            }
             other => writeln!(output, "ERR\t{}", format!("{other:?}").replace('\n', " "))?,
         }
     }

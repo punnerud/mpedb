@@ -24,6 +24,7 @@
 
 mod sql_logic;
 mod oracle_number;
+mod oracle_text;
 mod legacy_oracle_number;
 #[cfg(test)]
 mod oracle_number_tests;
@@ -505,6 +506,15 @@ pub fn run(
                 stack.push(PValue::Tuple(Rc::new(items)));
             }
             Op::MissingReturn => return Err(rt_err("PL/SQL function reached END without RETURN")),
+            Op::OracleVarchar(limit) => {
+                let value = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(oracle_text::varchar(value, limit)?));
+            }
+            Op::OracleConcat | Op::OracleCharEq | Op::OracleCharNe | Op::OracleCharLt | Op::OracleCharLe | Op::OracleCharGt | Op::OracleCharGe => {
+                let b = stack.pop().expect("validated");
+                let a = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(oracle_text::binary(op, a, b)?));
+            }
             Op::OracleNumber => {
                 let value = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(oracle_number::number(value)?));

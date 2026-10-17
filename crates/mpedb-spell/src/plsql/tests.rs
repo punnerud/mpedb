@@ -10,6 +10,128 @@ fn tuple(values: Vec<Value>) -> ProcValue {
 }
 
 #[test]
+fn varchar_normalizes_empty_text_and_concatenates_null_without_losing_spaces() {
+    let source = function(
+        "p VARCHAR2",
+        "VARCHAR2",
+        "v VARCHAR2(10 CHAR) := p; BEGIN RETURN q'[ø]' || v || ' '; END;",
+    );
+    for (input, expected) in [
+        (Value::Null, "ø "),
+        (Value::Text("".into()), "ø "),
+        (Value::Text("abc".into()), "øabc "),
+    ] {
+        assert_eq!(
+            call(&source, &[input]).unwrap(),
+            Value::Text(expected.into())
+        );
+    }
+    let source = function("", "VARCHAR2", "BEGIN RETURN NULL || ''; END;");
+    assert_eq!(call(&source, &[]).unwrap(), Value::Null);
+    let source = function("", "BOOLEAN", "BEGIN RETURN '' IS NULL; END;");
+    assert_eq!(call(&source, &[]).unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn varchar_byte_and_character_limits_enforce_utf8_and_absolute_byte_bound() {
+    let source = function(
+        "p VARCHAR2",
+        "VARCHAR2",
+        "v VARCHAR2(3 CHAR) := p; BEGIN RETURN v; END;",
+    );
+    assert_eq!(
+        call(&source, &[Value::Text("øø".into())]).unwrap(),
+        Value::Text("øø".into())
+    );
+    assert!(call(&source, &[Value::Text("øøøø".into())]).is_err());
+    let source = function(
+        "p VARCHAR2",
+        "VARCHAR2",
+        "v VARCHAR2(3 BYTE) := p; BEGIN RETURN v; END;",
+    );
+    assert!(call(&source, &[Value::Text("øø".into())]).is_err());
+    let source = function(
+        "p VARCHAR2",
+        "VARCHAR2",
+        "v VARCHAR2(3) := p; BEGIN RETURN v; END;",
+    );
+    assert!(call(&source, &[Value::Text("øø".into())]).is_err());
+    let source = function(
+        "p VARCHAR2",
+        "VARCHAR2",
+        "v VARCHAR2 := p; BEGIN RETURN v; END;",
+    );
+    let large = Value::Text("a".repeat(32767));
+    assert_eq!(call(&source, std::slice::from_ref(&large)).unwrap(), large);
+    assert!(call(&source, &[Value::Text("a".repeat(32768))]).is_err());
+    assert!(call(&source, &[Value::Int(1)]).is_err());
+    let source = function(
+        "p VARCHAR2",
+        "VARCHAR2",
+        "v VARCHAR2(32767 CHAR) := p; BEGIN RETURN v || v; END;",
+    );
+    assert!(call(&source, &[Value::Text("ø".repeat(9000))]).is_err());
+}
+
+#[test]
+fn literal_blank_padding_is_distinct_from_varchar_and_concat_comparison() {
+    for (expression, expected) in [
+        ("'a' = 'a '", Some(true)),
+        ("'a ' <> 'a'", Some(false)),
+        ("'a' <= 'a '", Some(true)),
+        ("'a ' >= 'a'", Some(true)),
+        ("'a' > 'a '", Some(false)),
+        ("'a ' < 'a'", Some(false)),
+        ("'a\t' < 'a '", Some(true)),
+        ("'a' || '' = 'a '", Some(false)),
+        ("'a' || 'b' = 'ab '", Some(false)),
+        ("'' = ''", None),
+    ] {
+        let source = function("", "BOOLEAN", &format!("BEGIN RETURN {expression}; END;"));
+        assert_eq!(
+            call(&source, &[]).unwrap(),
+            expected.map_or(Value::Null, Value::Bool),
+            "{expression}"
+        );
+    }
+    let source = function("p VARCHAR2", "BOOLEAN", "BEGIN RETURN p = 'a '; END;");
+    assert_eq!(
+        call(&source, &[Value::Text("a".into())]).unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        call(&source, &[Value::Text("a ".into())]).unwrap(),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn varchar_output_parameters_preserve_the_procedure_copy_out_contract() {
+    let source = "CREATE PROCEDURE p(a IN OUT VARCHAR2, b OUT VARCHAR2) IS BEGIN b := a || '!'; a := ''; END;";
+    assert_eq!(
+        call_result(source, &[Value::Text("ø".into()), Value::Int(8)]).unwrap(),
+        tuple(vec![Value::Null, Value::Text("ø!".into())])
+    );
+}
+
+#[test]
+fn varchar_declarations_and_static_types_reject_unsupported_coercions() {
+    for source in [
+        function("p VARCHAR2(10)", "VARCHAR2", "BEGIN RETURN p; END;"),
+        function("", "VARCHAR2(10)", "BEGIN RETURN 'x'; END;"),
+        function("", "VARCHAR2", "v VARCHAR2(0); BEGIN RETURN v; END;"),
+        function("", "VARCHAR2", "v VARCHAR2(32768); BEGIN RETURN v; END;"),
+        function("", "VARCHAR2", "v VARCHAR2(1.5); BEGIN RETURN v; END;"),
+        function("", "VARCHAR2", "BEGIN RETURN N'x'; END;"),
+        function("", "VARCHAR2", "BEGIN RETURN 'x' || 1; END;"),
+        function("", "NUMBER", "BEGIN RETURN '1'; END;"),
+        function("", "BOOLEAN", "BEGIN RETURN TRUE OR 'x' = 1; END;"),
+    ] {
+        assert!(compile(&source).is_err(), "{source}");
+    }
+}
+
+#[test]
 fn exact_arithmetic_obeys_precedence_and_preserves_full_exponent_range() {
     for (expression, expected) in [
         ("0.1 + 0.2", "0.3"),
