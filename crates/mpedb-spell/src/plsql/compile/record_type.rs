@@ -243,9 +243,7 @@ impl Parser<'_> {
                 Some(Token::Symbol("."))
             )
         {
-            return Err(self.error(
-                "table, view, and record-field %TYPE anchors are not implemented",
-            ));
+            return self.resolve_dotted_type();
         }
         if self.type_word_at(self.at + 2)
             && matches!(
@@ -453,7 +451,7 @@ mod tests {
             ),
             (
                 "TYPE pair IS RECORD (note employees.last_name%TYPE); r pair; BEGIN RETURN 'x'; END;",
-                "record-field %TYPE anchors are not implemented",
+                "no such table EMPLOYEES",
             ),
             (
                 "TYPE pair IS RECORD (id PLS_INTEGER); TYPE box IS RECORD (inner pair); BEGIN RETURN 1; END;",
@@ -527,5 +525,35 @@ mod tests {
             let err = compile(&function("VARCHAR2", body)).unwrap_err().to_string();
             assert!(err.contains(expected), "{body}\n{err}");
         }
+    }
+
+    #[test]
+    fn record_field_anchored_to_a_field_starts_null() {
+        let source = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4) := 'kept'); \
+             r pair; \
+             TYPE box IS RECORD (note r.note%TYPE); \
+             b box; \
+             BEGIN \
+               IF b.note IS NULL THEN b.note := NULL; END IF; \
+               RETURN b.note; \
+             END;",
+        );
+        assert_eq!(call(&source).unwrap(), Value::Null);
+
+        let err = compile(&function(
+            "NUMBER",
+            "TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 7); \
+             r pair; \
+             TYPE box IS RECORD (id r.id%TYPE); \
+             BEGIN RETURN 1; END;",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("NOT NULL record field requires an initializer"),
+            "{err}"
+        );
     }
 }

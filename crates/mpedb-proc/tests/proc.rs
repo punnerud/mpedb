@@ -1333,3 +1333,44 @@ fn plsql_record_assignment_copies_null() {
         .to_string();
     assert!(refused.contains("same type"), "{refused}");
 }
+
+#[test]
+fn plsql_record_column_field_starts_null() {
+    let (cfg, _guard) = test_config("plsql-record-column-field");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query(
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        &[],
+    )
+    .unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_note RETURN VARCHAR2 IS \
+             TYPE pair IS RECORD (note people.name%TYPE); \
+             r pair; \
+             BEGIN \
+               IF r.note IS NULL THEN r.note := NULL; END IF; \
+               RETURN r.note; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_NOTE", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_balance RETURN NUMBER IS \
+             TYPE pair IS RECORD (id accounts.balance%TYPE); \
+             r pair; \
+             BEGIN RETURN r.id; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_BALANCE", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+}

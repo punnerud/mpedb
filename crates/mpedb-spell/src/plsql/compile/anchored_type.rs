@@ -51,8 +51,16 @@ impl Parser<'_> {
         Ok(true)
     }
 
-    /// `table.column%TYPE`. The column's `NOT NULL` is not inherited.
+    /// `table.column%TYPE` or `record.field%TYPE` as a variable.
     fn declare_column_anchor(&mut self, name: &str, constant: bool) -> Result<bool> {
+        let (ty, inherited) = self.resolve_dotted_type()?;
+        self.bind_anchored(name, constant, ty, inherited)?;
+        Ok(true)
+    }
+
+    /// Dotted `%TYPE`. A column does not pass on `NOT NULL`. A record field
+    /// does, because it is a PL/SQL item. Neither passes on its value.
+    pub(super) fn resolve_dotted_type(&mut self) -> Result<(Type, bool)> {
         let table = self.identifier()?;
         self.want_symbol(".")?;
         let column = self.identifier()?;
@@ -73,7 +81,7 @@ impl Parser<'_> {
             return Err(self.error("a %TYPE anchor is not declared yet"));
         }
         if self.records.contains_key(&table) {
-            return self.declare_record_field_anchor(name, constant, &table, &column);
+            return self.record_field_anchor_type(&table, &column);
         }
         if self.record_types.contains_key(&table) {
             return Err(self.error(
@@ -104,19 +112,12 @@ impl Parser<'_> {
                 return Err(self.error("a %TYPE column supports TEXT and INTEGER only"));
             }
         };
-        self.bind_anchored(name, constant, ty, false)?;
-        Ok(true)
+        Ok((ty, false))
     }
 
-    /// `record.field%TYPE`. The field is a PL/SQL item, so its `NOT NULL`
-    /// is inherited. Its current value, including a default, is not.
-    fn declare_record_field_anchor(
-        &mut self,
-        name: &str,
-        constant: bool,
-        record: &str,
-        field: &str,
-    ) -> Result<bool> {
+    /// `record.field%TYPE`. The field's `NOT NULL` is inherited. Its value
+    /// and default are not.
+    fn record_field_anchor_type(&mut self, record: &str, field: &str) -> Result<(Type, bool)> {
         let slot = {
             let decl = self
                 .records
@@ -128,8 +129,7 @@ impl Parser<'_> {
         let Some(info) = self.record_field_info.get(&slot).copied() else {
             return Err(self.error("a %ROWTYPE field %TYPE anchor is not implemented"));
         };
-        self.bind_anchored(name, constant, info.ty, info.not_null)?;
-        Ok(true)
+        Ok((info.ty, info.not_null))
     }
 
     fn bind_anchored(
