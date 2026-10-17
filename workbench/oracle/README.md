@@ -25,8 +25,9 @@ The private interpreter ran 17,587 tests successfully; the missing 606 cache
 cases also passed separately. Their combined coverage is 18,193 tests,
 1512 skips and 6 expected failures. The harness now starts in upstream's
 `tests` directory: a cache directory created in the source root had shadowed
-`cache.tests` during discovery. A fresh single full run is in progress with
-that correction. See `reference/framework-baseline.json` for measured counts.
+`cache.tests` during discovery. The corrected single full run completed successfully: **18,193 tests in
+1984.367 seconds, zero failures, 1512 skipped and 6 expected failures**. See
+`reference/framework-baseline.json` for measured counts.
 
 The full broad SQLAlchemy 2.0.44 reference run completed with early failure
 stopping disabled: **22,260 passed, 259 failed, 497 setup/teardown errors,

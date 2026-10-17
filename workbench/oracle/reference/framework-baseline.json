@@ -27,7 +27,7 @@
       "result": "passed",
       "assertions_modified": false
     },
-    "follow_up": "Private CPython 3.12.15: 17,587 tests green plus all 606 cache tests green separately (1512 total skips, 6 expected failures). A fresh single full run is in progress after fixing harness cwd to upstream tests directory; a generated root cache directory had shadowed cache.tests during discovery.",
+    "follow_up": "Completed single full run with private CPython 3.12.15 and corrected upstream tests working directory: 18,193 tests, zero failures. No assertions modified.",
     "python31215_full_and_cache_recheck": {
       "tests_ran": 18193,
       "failure_entries": 0,
@@ -47,6 +47,19 @@
       ],
       "assertions_modified": false,
       "single_full_run_complete": false
+    },
+    "python31215_full": {
+      "python": "3.12.15",
+      "tests_ran": 18193,
+      "seconds": 1984.367,
+      "failure_entries": 0,
+      "skipped": 1512,
+      "expected_failures": 6,
+      "exit_code": 0,
+      "scope_complete": true,
+      "green": true,
+      "assertions_modified": false,
+      "collection_fix": "Run from upstream tests directory to avoid a generated source-root cache directory shadowing cache.tests."
     }
   },
   "sqlalchemy_initial_broad_run": {
