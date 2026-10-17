@@ -2,7 +2,8 @@
 //! An uninitialized nested table is NULL. Zero fetched rows leave an empty
 //! table, so `IS NULL` is false and `SQL%ROWCOUNT` is 0. A NULL column stays
 //! NULL. `COUNT` of an uninitialized table raises `COLLECTION_IS_NULL`.
-//! An empty table's `COUNT` is 0, and a NULL element still counts.
+//! `EXISTS` of an uninitialized table or a NULL index is NULL. An empty
+//! table's `COUNT` is 0, and a NULL element still counts and still exists.
 //! `INDEX BY` and `VARRAY` stay refused.
 
 use super::*;
@@ -104,6 +105,16 @@ impl Parser<'_> {
                 self.builder.emit(Op::LoadLocal(nested.slot))?;
                 self.builder.emit(Op::NestedCount)?;
                 return Ok(Some(Type::PlsInteger));
+            }
+            if self.word("EXISTS") {
+                self.want_symbol("(")?;
+                let actual = self.expression()?;
+                self.compatible(Type::PlsInteger, actual)?;
+                self.builder.emit(Op::OraclePlSqlInteger)?;
+                self.want_symbol(")")?;
+                self.builder.emit(Op::LoadLocal(nested.slot))?;
+                self.builder.emit(Op::NestedExists)?;
+                return Ok(Some(Type::Boolean));
             }
             return Err(self.error("nested table methods are not implemented"));
         }
@@ -578,5 +589,57 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("nested table methods are not implemented"), "{err}");
+    }
+
+    #[test]
+    fn nested_table_exists_of_null_is_null_and_a_null_element_exists() {
+        let decl = "TYPE nums IS TABLE OF NUMBER; n nums;";
+        let (missing, _, _) = scene(
+            "BOOLEAN",
+            &format!("{decl} BEGIN RETURN n.EXISTS(1); END;"),
+            vec![],
+        );
+        assert_eq!(missing, Value::Null);
+        let (cleared, _, _) = scene(
+            "BOOLEAN",
+            &format!("{decl} BEGIN n := NULL; RETURN n.EXISTS(1); END;"),
+            vec![],
+        );
+        assert_eq!(cleared, Value::Null);
+
+        let collect = format!("{decl} BEGIN SELECT amount BULK COLLECT INTO n FROM t;");
+        let rows = vec![vec![Value::Numeric("4".into())], vec![Value::Null]];
+        let (first, _, _) = scene(
+            "BOOLEAN",
+            &format!("{collect} RETURN n.EXISTS(1); END;"),
+            rows.clone(),
+        );
+        assert_eq!(first, Value::Bool(true));
+        let (second, _, _) = scene(
+            "BOOLEAN",
+            &format!("{collect} RETURN n.EXISTS(2); END;"),
+            rows,
+        );
+        assert_eq!(second, Value::Bool(true));
+        let (past, _, _) = scene(
+            "BOOLEAN",
+            &format!("{collect} RETURN n.EXISTS(3); END;"),
+            vec![vec![Value::Null]],
+        );
+        assert_eq!(past, Value::Bool(false));
+        let (empty, _, _) = scene(
+            "BOOLEAN",
+            &format!("{collect} RETURN n.EXISTS(1); END;"),
+            vec![],
+        );
+        assert_eq!(empty, Value::Bool(false));
+        let (null_index, _, _) = scene(
+            "BOOLEAN",
+            &format!(
+                "{decl} v NUMBER; BEGIN SELECT amount BULK COLLECT INTO n FROM t; RETURN n.EXISTS(v); END;"
+            ),
+            vec![vec![Value::Numeric("4".into())]],
+        );
+        assert_eq!(null_index, Value::Null);
     }
 }

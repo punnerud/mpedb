@@ -1012,6 +1012,11 @@ pub fn run_with_package(
                 let collection = stack.pop().expect("validated");
                 stack.push(nested_count(collection)?);
             }
+            Op::NestedExists => {
+                let collection = stack.pop().expect("validated");
+                let index = stack.pop().expect("validated");
+                stack.push(nested_exists(collection, index)?);
+            }
             Op::PkgGet(index) => {
                 let key = package_key(&proc.consts, index)?;
                 let value = package.get(key).cloned().unwrap_or(Value::Null);
@@ -1234,6 +1239,28 @@ fn nested_count(collection: PValue) -> Result<PValue> {
     };
     let count = i64::try_from(len).map_err(|_| rt_err("nested table COUNT exceeds i64"))?;
     Ok(PValue::Scalar(Value::Int(count)))
+}
+
+/// `EXISTS` does not raise on a NULL collection or a NULL index. Both are NULL.
+/// An element whose value is NULL still exists.
+fn nested_exists(collection: PValue, index: PValue) -> Result<PValue> {
+    let list = match collection {
+        PValue::Scalar(Value::Null) => return Ok(PValue::Scalar(Value::Null)),
+        PValue::List(list) => list,
+        other => {
+            return Err(type_err(format!(
+                "expected a nested table, got {}",
+                tyname(&other)
+            )))
+        }
+    };
+    let index = match index {
+        PValue::Scalar(Value::Null) => return Ok(PValue::Scalar(Value::Null)),
+        PValue::Scalar(Value::Int(index)) => index,
+        _ => return Err(oracle_exception::named(6502)),
+    };
+    let exists = index >= 1 && index as usize <= list.len();
+    Ok(PValue::Scalar(Value::Bool(exists)))
 }
 
 /// Implicit `SQL%` attribute. `ISOPEN` is always false. The other three

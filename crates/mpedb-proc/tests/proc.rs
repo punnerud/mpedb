@@ -1699,3 +1699,58 @@ fn plsql_nested_table_count_of_null() {
         ProcValue::Scalar(Value::Int(2))
     );
 }
+
+#[test]
+fn plsql_nested_table_exists_of_null() {
+    let (cfg, _guard) = test_config("plsql-nested-exists");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query(
+        "CREATE TABLE marks (id INTEGER PRIMARY KEY, score INTEGER)",
+        &[],
+    )
+    .unwrap();
+    db.query("INSERT INTO marks (id, score) VALUES (1, 4)", &[])
+        .unwrap();
+    db.query("INSERT INTO marks (id, score) VALUES (2, NULL)", &[])
+        .unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_missing RETURN VARCHAR2 IS \
+             TYPE nums IS TABLE OF NUMBER; \
+             n nums; \
+             flag BOOLEAN; \
+             BEGIN \
+               flag := n.EXISTS(1); \
+               IF flag IS NULL THEN RETURN NULL; END IF; \
+               IF flag THEN RETURN 'yes'; END IF; \
+               RETURN 'no'; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_MISSING", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_exists RETURN VARCHAR2 IS \
+             TYPE nums IS TABLE OF NUMBER; \
+             n nums; \
+             BEGIN \
+               SELECT score BULK COLLECT INTO n FROM marks; \
+               IF n.EXISTS(2) IS NULL THEN RETURN NULL; END IF; \
+               IF NOT n.EXISTS(2) THEN RETURN 'missing'; END IF; \
+               IF n.EXISTS(3) THEN RETURN 'past'; END IF; \
+               IF n(2) IS NULL THEN RETURN 'kept'; END IF; \
+               RETURN 'filled'; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_EXISTS", &[]).unwrap(),
+        ProcValue::Scalar(Value::Text("kept".into()))
+    );
+}
