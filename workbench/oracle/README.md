@@ -124,8 +124,8 @@ existing-destination rejection, altered content and truncated chunks. A native
 that capacity failure leaves no published destination or staging directory.
 Individual row/LOB carrier values are still materialized in memory; the import
 no longer retains the entire snapshot. CLI import and bounded pull are exposed
-by the opt-in CLI feature described below; production write-back/controller
-wiring remains unfinished. SQL execution uses MPEdb's strict grouping mode, which does
+by the opt-in CLI feature described below. Prepared imports also support the
+Rust durable push API; the continuous migration controller remains unfinished. SQL execution uses MPEdb's strict grouping mode, which does
 not imply full Oracle SQL-dialect compatibility.
 
 The CLI exposes Oracle import and bounded pull when built with `oracle-source`
@@ -156,9 +156,9 @@ carriers and a subsequent Oracle update sent forward again. Every representation
 change executes in MPEdb; the adapters only transport carriers. This isolated
 single-writer fixture does not implement a continuous bidirectional controller.
 
-Production mirror push still requires durable local outbox wiring, key-level
-echo suppression and conflict policy; continuous two-database topology/controller
-wiring remains unfinished. Writes currently refuse identity columns, special NUMBERs and LONGs. CLOB, NCLOB and BLOB writes use native
+The Rust mirror push now connects the durable outbox, key-level echo proofs
+and whole-request source-wins conflict decisions. Continuous multi-database
+topology/controller wiring and authority cutover remain unfinished. Writes currently refuse identity columns, special NUMBERs and LONGs. CLOB, NCLOB and BLOB writes use native
 temporary LOB locators; reads use explicit locators and fixed Unicode-safe
 buffers. Native tests cover large Unicode and binary values, empty LOBs distinct
 from NULL, and repeated upserts. Scalar text/RAW binds remain bounded at 4000/2000
@@ -196,8 +196,9 @@ for statement reuse. Native tests cover compound-PK changes, multi-table commits
 first inserts into empty tables, stale cursors, epoch mismatches, cold resume and
 DDL fences. The shared apply path now enforces source epochs when provided;
 legacy adapters that supply None retain their existing behavior.
-Oracle mirror push and MPEdb authority cutover remain explicitly refused until
-the durable own-write ledger, postimage handling and checked push are connected.
+Oracle mirror push is now available through the shared `push_batch` Rust API
+when both tracking ledgers were pinned at import. MPEdb authority cutover
+remains gated pending its source-writer fence; CLI push/sync wiring is separate.
 
 `OracleSource::prepare_write_ledger` and `write_batch_receipted` now provide the
 low-level durable write primitive. Application writes and a BLAKE3-checked BLOB
@@ -217,8 +218,8 @@ with writes/cutover on the authority row and still validates the database realm,
 control-row incarnation, ledger, application schema, payload and image hashes.
 A missing receipt does not authorize retry or local acknowledgement. Native
 tests cover old-epoch recovery, role changes, absent/corrupt/mismatched receipts,
-and recreation/DDL fences. Durable local outbox/controller recovery remains to
-be connected to this primitive.
+and recreation/DDL fences. The adapter outbox uses the mirror-decision API
+below, which also stores durable rejection outcomes.
 The shared push protocol now supplies `PushContext` from the SAME local
 snapshot as rows, dirty generations, cursor and authority. `PushReply` can return
 actual postimages. Matching generations update those rows and clear dirty/park
@@ -244,8 +245,8 @@ writes count as changes too, so callers must pull/reconcile before a new request
 This coarse table fence is a transport correctness baseline, not fine-grained
 continuous mirroring. Native tests cover foreign commits, compound-key moves,
 whole-batch rejection, busy writers, budgets, cursor realms and old-epoch
-receipt recovery. Production push/rejection-receipt and authority-controller
-wiring remain unfinished.
+receipt recovery. Durable rejection decisions and adapter wiring are described
+below; the authority controller remains unfinished.
 
 `OracleSource::write_mirror_batch` now durably decides the whole immutable
 request, including conflict rejection. Its payload binds the exact checked
@@ -258,8 +259,32 @@ full explicit footprints and final postimage verification. Replay seeks the
 receipt before checking the current epoch, while keeping incarnation, schema,
 ledger and origin fences, so old committed decisions remain recoverable after
 an authority change. Missing/corrupt origin evidence fails closed. This is the
-source decision primitive; production adapter/outbox and authority-controller
-wiring remain separate work. Existing low-level receipt APIs remain unchanged.
+source decision primitive used by the adapter; authority-controller wiring
+remains separate work. Existing low-level receipt APIs remain unchanged.
+
+`OracleBootstrap` also pins the owned receipt ledger identity (object, segment
+and logical DDL) alongside the origin ledger. The optional manifest field keeps
+older V3 files readable; a file without BOTH pinned ledgers stays read-only.
+Prepare both ledgers explicitly before import to enable `OracleAdapter` push:
+`source.prepare_write_ledger()?; source.prepare_origin_ledger()?;` followed by
+`import_oracle(...)`. The adapter never creates or adopts tracking during an
+RPC or reconnect. A pure local `validate_push_target` check rejects a different
+FILE/bootstrap before creating an outbox; adapter wrappers must forward that
+check along with the request hooks. Its pure `push_outbox_identity` enables the shared durable
+request path using the persisted FILE incarnation. `push_versioned` validates
+the immutable request's generations, token, cursor and epoch, then returns the
+source's durable decision and actual images to the shared atomic ACK path.
+Legacy tokenless push methods continue to refuse. Pull between new requests:
+the conservative checked writer includes prior own changes as conflicts until
+the cursor has caught up. Pending retries keep their original cursor/payload.
+
+The native adapter test uses commit durability and the REAL adapter, rejects
+accidental cross-FILE adapter reuse, injects lost responses,
+closes/reopens the FILE, preserves newer local generations through ACK and own
+CDC echoes, treats equal-image foreign writes as foreign, replays rejected
+batches before source-wins resolution, ACKs generated columns and deletes, and
+refuses to resend pending work after receipt-table recreation. Source cutover
+is still unavailable; this does not implement the complete migration controller.
 
 Oracle writes re-read every requested target after the entire DML batch,
 before publishing data and receipts. A later trigger that changes an earlier
@@ -289,8 +314,8 @@ postimages, changed chunks during RPC and concurrent ACK/new-request races.
 The native Oracle receipt fixture also loses a committed reply, cold-reopens,
 changes the local row again and verifies that retry recovers the OLD request
 before sending the new generation; its Unicode payload spans metadata chunks.
-Oracle production push remains gated until rejection receipts, prepared-request
-recovery and the authority controller are connected. The outbox retains the full coalesced dirty set in
+Prepared Oracle imports recover those requests through `OracleAdapter`. Authority
+cutover stays separate. The outbox retains the full coalesced dirty set in
 one source transaction; its current 64 MiB/100000-op limit refuses oversized
 requests before RPC rather than splitting key moves or silently truncating.
 

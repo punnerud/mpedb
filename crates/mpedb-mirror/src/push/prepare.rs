@@ -6,6 +6,7 @@ pub(super) fn prepare<A: SourceAdapter + ?Sized>(
     db: &Database,
     adapter: &A,
 ) -> Result<PreparedPush> {
+    adapter.validate_push_target(db)?;
     let identity = adapter.push_outbox_identity();
     if identity == Some([0; 16]) {
         return Err(Error::Config(

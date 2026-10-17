@@ -153,6 +153,13 @@ pub trait SourceAdapter {
         self.push(ops)
     }
 
+    /// Pure local binding check before outbox preparation or source I/O.
+    /// FILE-bound adapters must reject another mirror; wrappers must forward
+    /// this check along with the durable request hooks.
+    fn validate_push_target(&self, _db: &mpedb::Database) -> Result<()> {
+        Ok(())
+    }
+
     /// Opt into durable local request preparation. This must be a nonzero,
     /// persisted per-FILE incarnation, not a path/hash/transaction number.
     /// The adapter MUST support idempotent replay by PushContext::request_id:

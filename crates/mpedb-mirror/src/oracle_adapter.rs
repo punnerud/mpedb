@@ -1,13 +1,16 @@
-//! Oracle pull adapter over durable bootstrap metadata. Captured transactions
-//! enter MPEdb through the shared atomic apply protocol. Write-back is refused
-//! until its durable echo ledger and conflict protocol are connected.
+//! Oracle pull and receipted push over durable bootstrap identities.
+//! Source transactions and local acknowledgements use the shared mirror protocol.
+mod push;
 use crate::{
-    adapter::{Cursor, NetOp, ProvenancedPullBatch, PullBatch, SourceAdapter},
+    adapter::{
+        Cursor, NetOp, ProvenancedPullBatch, PullBatch, PushContext, PushReply, SourceAdapter,
+    },
     oracle::{carrier_tables, OracleTable},
     oracle_cursor::{OracleIdentity, OraclePosition},
     oracle_import::{load_bootstrap, load_file_incarnation},
     oracle_source::{
-        attest_write_origins, OracleOriginLedgerIdentity, OracleSource, OracleStateIdentity,
+        attest_write_origins, OracleLedgerIdentity, OracleOriginLedgerIdentity, OracleSource,
+        OracleStateIdentity,
     },
 };
 use mpedb::Database;
@@ -22,6 +25,7 @@ pub struct OracleAdapter {
     mirror_id: String,
     max_events: usize,
     origin_ledger: Option<OracleOriginLedgerIdentity>,
+    receipt_ledger: Option<OracleLedgerIdentity>,
     file_incarnation: Option<[u8; 16]>,
 }
 impl OracleAdapter {
@@ -47,6 +51,7 @@ impl OracleAdapter {
                 .map(|_| load_file_incarnation(db))
                 .transpose()?,
             origin_ledger: metadata.origin_ledger,
+            receipt_ledger: metadata.receipt_ledger,
         };
         adapter.check_identity()?;
         if adapter
@@ -269,12 +274,32 @@ impl SourceAdapter for OracleAdapter {
         Ok(snapshot.rows.into_iter().next().unwrap_or_default())
     }
     fn push(&mut self, _ops: &[NetOp]) -> Result<Vec<bool>> {
-        Err(Error::Unsupported("Oracle mirror write-back requires the durable echo ledger and conflict protocol; use verified low-level write_batch only for explicit transport".into()))
+        Err(Error::Unsupported(
+            "Oracle mirror writes require push_versioned with a durable FILE request".into(),
+        ))
     }
     fn push_checked(&mut self, _from: &Cursor, _ops: &[NetOp]) -> Result<Vec<bool>> {
         Err(Error::Unsupported(
-            "Oracle conflict-checked write-back is not connected".into(),
+            "Oracle checked writes require push_versioned with a durable FILE request".into(),
         ))
+    }
+    fn validate_push_target(&self, db: &Database) -> Result<()> {
+        self.check_push_target(db)
+    }
+    fn push_outbox_identity(&self) -> Option<[u8; 16]> {
+        if self.origin_ledger.is_some() && self.receipt_ledger.is_some() {
+            self.file_incarnation
+        } else {
+            None
+        }
+    }
+    fn push_versioned(
+        &mut self,
+        from: Option<&Cursor>,
+        ops: &[NetOp],
+        context: &PushContext,
+    ) -> Result<PushReply> {
+        self.write_back(from, ops, context)
     }
     fn ensure_source_state(&mut self, id: &str, epoch: u64, authority: &str) -> Result<()> {
         self.same_mirror(id)?;

@@ -28,6 +28,8 @@ pub struct OracleBootstrap {
     pub state_identity: OracleStateIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_ledger: Option<crate::oracle_source::OracleOriginLedgerIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_ledger: Option<crate::oracle_source::OracleLedgerIdentity>,
 }
 impl OracleBootstrap {
     fn validate(&self) -> Result<()> {
@@ -46,6 +48,13 @@ impl OracleBootstrap {
         }) {
             return Err(Error::Corrupt(
                 "invalid Oracle bootstrap origin ledger".into(),
+            ));
+        }
+        if self.receipt_ledger.as_ref().is_some_and(|ledger| {
+            ledger.object_id == 0 || ledger.data_object_id == 0 || ledger.schema_ddl.is_empty()
+        }) {
+            return Err(Error::Corrupt(
+                "invalid Oracle bootstrap receipt ledger".into(),
             ));
         }
         OraclePosition::decode(&self.cursor, &self.identity, &self.tables)?;
@@ -287,6 +296,7 @@ pub fn import_oracle(
     let metadata = OracleBootstrap {
         version: 3,
         origin_ledger: origins,
+        receipt_ledger: ledger,
         cursor: snapshot.position()?.encode(),
         identity: snapshot.identity,
         tables: snapshot.tables,
