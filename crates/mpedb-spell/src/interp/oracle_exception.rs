@@ -161,23 +161,38 @@ pub(super) fn entry_boundary(error: Error) -> Error {
 }
 
 pub(super) fn bound(code: u32) -> Error {
-    // Text measured through public Oracle 23.26.3 PL/SQL. A complete localized
-    // Oracle message catalog is separate work; unknown entries say so.
-    let message = match code {
-        1 => "unique constraint (.) violated on table . columns ()",
-        1400 => "cannot insert NULL into ()",
-        1403 => "no data found",
-        1422 => "exact fetch returns more than requested number of rows",
-        1426 => "numeric overflow",
-        1476 => "divisor is equal to zero",
-        2290 => "check constraint (.) violated",
-        6502 => "PL/SQL: numeric or value error",
-        65535 => "Oracle Database client does not support error number exceeding 65535.",
-        20000..=20999 => "",
-        _ => "PL/SQL exception (Oracle message catalog entry unavailable)",
-    };
+    let message = crate::oracle_exceptions::message(code)
+        .unwrap_or("PL/SQL exception (Oracle message catalog entry unavailable)");
     Error::Oracle {
         code,
         message: message.into(),
     }
+}
+
+/// Explicit arguments use the active error's detail when the rounded code
+/// matches it. Other codes use catalog text; positive non-Oracle values keep
+/// Oracle's signed non-ORACLE envelope (including the i32::MIN wrap case).
+pub(super) fn explicit(value: PValue, caught: &[Caught]) -> Result<Value> {
+    let value = super::plsql_number::integer(value, false).map_err(|error| match error {
+        Error::ArithmeticOverflow => bound(1426),
+        Error::TypeMismatch(_) => bound(6502),
+        other => other,
+    })?;
+    let code = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Int(code) => code as i32,
+        _ => unreachable!("integer conversion"),
+    };
+    let active = sqlcode(caught)?;
+    if i64::from(code) == active || (code == -1403 && active == 100) {
+        return sqlerrm(caught).map(Value::Text);
+    }
+    let text = match code {
+        0 => "ORA-0000: normal, successful completion".into(),
+        1 => "User-Defined Exception".into(),
+        100 => bound(1403).to_string(),
+        -65535..=-1 => bound(code.unsigned_abs()).to_string(),
+        other => format!(" {}: non-ORACLE exception ", other.wrapping_neg()),
+    };
+    Ok(Value::Text(text))
 }

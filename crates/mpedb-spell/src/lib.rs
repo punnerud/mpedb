@@ -18,6 +18,7 @@ pub mod interp;
 pub mod ir;
 pub mod plpgsql;
 pub mod plsql;
+mod oracle_exceptions;
 pub mod py;
 pub mod rs;
 

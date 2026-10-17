@@ -1,16 +1,6 @@
 //! Native block handlers; declarations execute outside their own protected body.
 use super::*;
 
-pub(super) fn code(name: &str) -> Option<u32> {
-    Some(match name {
-        "DUP_VAL_ON_INDEX" => 1,
-        "NO_DATA_FOUND" => 1403,
-        "TOO_MANY_ROWS" => 1422,
-        "ZERO_DIVIDE" => 1476,
-        "VALUE_ERROR" => 6502,
-        _ => return None,
-    })
-}
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ExceptionRef {
     Code(u32),
@@ -71,8 +61,25 @@ impl Parser<'_> {
         self.exceptions
             .get(name)
             .copied()
-            .or_else(|| code(name).map(ExceptionRef::Code))
+            .or_else(|| crate::oracle_exceptions::code(name).map(ExceptionRef::Code))
             .ok_or_else(|| self.error("unknown exception name"))
+    }
+    fn read_exception_ref(&mut self) -> Result<ExceptionRef> {
+        let name = self.identifier()?;
+        if !self.symbol(".") {
+            return self.exception_ref(&name);
+        }
+        if name != "STANDARD"
+            || self.locals.contains_key(&name)
+            || self.exceptions.contains_key(&name)
+            || self.pending_declarations.contains(&name)
+        {
+            return Err(self.error("qualified exception requires the unshadowed STANDARD package"));
+        }
+        let name = self.identifier()?;
+        crate::oracle_exceptions::code(&name)
+            .map(ExceptionRef::Code)
+            .ok_or_else(|| self.error("unknown STANDARD exception"))
     }
     pub(super) fn raise_statement(&mut self) -> Result<()> {
         if self.symbol(";") {
@@ -81,13 +88,9 @@ impl Parser<'_> {
             }
             self.builder.emit(Op::OracleReraise)?;
         } else {
-            let name = self.identifier()?;
-            let exception = self.exception_ref(&name)?;
+            let exception = self.read_exception_ref()?;
             self.want_symbol(";")?;
             self.builder.emit(match exception {
-                ExceptionRef::Code(code) if !self.exceptions.contains_key(&name) => {
-                    Op::OracleRaise(code as u16)
-                }
                 ExceptionRef::Code(code) => Op::OracleRaiseBound(code),
                 ExceptionRef::User(index) => Op::OracleRaiseUser(index),
             })?;
@@ -131,8 +134,7 @@ impl Parser<'_> {
                 }
             } else {
                 loop {
-                    let name = self.identifier()?;
-                    let exception = self.exception_ref(&name)?;
+                    let exception = self.read_exception_ref()?;
                     if seen.contains(&exception) {
                         return Err(
                             self.error("exception appears in more than one handler alternative")

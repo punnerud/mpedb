@@ -540,6 +540,10 @@ pub fn run(
             Op::OracleRaise(code) => return Err(oracle_exception::named(code)),
             Op::OracleSqlCode => stack.push(PValue::Scalar(Value::Numeric(oracle_exception::sqlcode(&caught)?.to_string()))),
             Op::OracleSqlErrm => stack.push(PValue::Scalar(Value::Text(oracle_exception::sqlerrm(&caught)?))),
+            Op::OracleSqlErrmCode => {
+                let value = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(oracle_exception::explicit(value, &caught)?));
+            }
             Op::OracleRaiseApplication => {
                 let message = stack.pop().expect("validated");
                 let code = stack.pop().expect("validated");

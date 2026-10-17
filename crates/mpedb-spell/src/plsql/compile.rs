@@ -886,7 +886,12 @@ impl Parser<'_> {
             if self.is_word(name) && !self.locals.contains_key(name) {
                 self.at += 1;
                 if self.symbol("(") && !self.symbol(")") {
-                    return Err(self.error("explicit SQLERRM error-code arguments are not implemented"));
+                    if name == "SQLCODE" { return Err(self.error("SQLCODE does not take arguments")); }
+                    let actual = self.expression()?;
+                    self.compatible(Type::Number, actual)?;
+                    self.want_symbol(")")?;
+                    self.builder.emit(Op::OracleSqlErrmCode)?;
+                    return Ok(Some(ty));
                 }
                 self.builder.emit(op)?;
                 return Ok(Some(ty));

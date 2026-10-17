@@ -223,6 +223,8 @@ pub enum Op {
     OracleMatchUser(u16),
     OracleSqlCode,
     OracleSqlErrm,
+    /// SQLERRM with one numeric argument; NULL remains NULL.
+    OracleSqlErrmCode,
     OracleRaiseApplication,
     /// Pop `plans[p].argc` scalar args, run the DML plan, push the affected
     /// row count as an int.
@@ -339,6 +341,7 @@ const OP_ORACLE_NOT_NULL: u8 = 91;
 const OP_ORACLE_RAISE_USER: u8 = 92;
 const OP_ORACLE_MATCH_USER: u8 = 93;
 const OP_ORACLE_RAISE_BOUND: u8 = 94;
+const OP_ORACLE_SQLERRM_CODE: u8 = 95;
 
 
 
@@ -612,6 +615,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleMatchUser(i) => u16arg(OP_ORACLE_MATCH_USER, i),
         Op::OracleSqlCode => b.push(OP_ORACLE_SQLCODE),
         Op::OracleSqlErrm => b.push(OP_ORACLE_SQLERRM),
+        Op::OracleSqlErrmCode => b.push(OP_ORACLE_SQLERRM_CODE),
         Op::OracleRaiseApplication => b.push(OP_ORACLE_RAISE_APPLICATION),
         Op::OracleNeg => b.push(OP_ORACLE_NEG),
         Op::OracleVarchar(limit) => u16arg(OP_ORACLE_VARCHAR, limit),
@@ -745,6 +749,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_MATCH_USER => Op::OracleMatchUser(u16arg()?),
         OP_ORACLE_SQLCODE => Op::OracleSqlCode,
         OP_ORACLE_SQLERRM => Op::OracleSqlErrm,
+        OP_ORACLE_SQLERRM_CODE => Op::OracleSqlErrmCode,
         OP_ORACLE_RAISE_APPLICATION => Op::OracleRaiseApplication,
         OP_ORACLE_NEG => Op::OracleNeg,
         OP_ORACLE_VARCHAR => Op::OracleVarchar(u16arg()?),
@@ -805,7 +810,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleNotNull | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg | Op::OraclePlSqlNumber | Op::OracleNumberConstraint { .. } | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound | Op::OracleSelectOne => (1, 1),
+        Op::OracleSqlErrmCode | Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleNotNull | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg | Op::OraclePlSqlNumber | Op::OracleNumberConstraint { .. } | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound | Op::OracleSelectOne => (1, 1),
         Op::OracleIntAdd | Op::OracleIntSub | Op::OracleIntMul
         | Op::OracleConcat
         | Op::OracleCharEq
@@ -1457,6 +1462,37 @@ mod bound_exception_tests {
                 vec![Op::OracleRaiseBound(code)]
             )
             .is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod sqlerrm_argument_tests {
+    use super::*;
+    #[test]
+    fn argument_opcode_checks_stack_and_round_trips() {
+        assert!(Proc::new(
+            "bad".into(),
+            0,
+            0,
+            vec![],
+            vec![],
+            vec![Op::OracleSqlErrmCode, Op::Return]
+        )
+        .is_err());
+        let p = Proc::new(
+            "message".into(),
+            0,
+            0,
+            vec![],
+            vec![Value::Null],
+            vec![Op::LoadConst(0), Op::OracleSqlErrmCode, Op::Return],
+        )
+        .unwrap();
+        assert_eq!(Proc::decode(&p.encode()).unwrap(), p);
+        assert_eq!(decode_op(&[95], &mut 0).unwrap(), Op::OracleSqlErrmCode);
+        for len in 0..p.encode().len() {
+            assert!(Proc::decode(&p.encode()[..len]).is_err());
         }
     }
 }

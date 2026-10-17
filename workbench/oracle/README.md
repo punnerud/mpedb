@@ -641,8 +641,9 @@ cursor attributes, DDL and anonymous dynamic blocks remain unsupported. The
 embedded statement also must be supported by MPEdb's SQL engine. See
 [Oracle's binding rules](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/native-dynamic-sql.html).
 
-Native exception blocks now support `NO_DATA_FOUND`, `TOO_MANY_ROWS`,
-`ZERO_DIVIDE`, `VALUE_ERROR`, `DUP_VAL_ON_INDEX`, OR alternatives, `WHEN OTHERS`,
+Native exception blocks now resolve all 22 documented predefined exception
+names, including `STANDARD.name` qualification under local name shadowing.
+They support explicit named raises, OR alternatives, `WHEN OTHERS`,
 named `RAISE` and re-raise. Additive opcodes 83–86 preserve existing IR meanings.
 Protected blocks require an empty evaluation stack; scope ranges unwind on
 EXIT/CONTINUE and nested handlers propagate correctly. Declaration initializer
@@ -692,8 +693,20 @@ constraint/arithmetic/application codes and the large-code envelope. The full
 localized message catalog is not implemented: explicit raises of other codes
 retain numeric dispatch but report that their message entry is unavailable.
 
-Full exception coverage still needs
-TRUE error-stack preservation, SQLERRM(error_code), localized/detailed messages
+`SQLERRM(numeric_expression)` now supports NULL, BINARY_INTEGER rounding and
+overflow, +100/negative Oracle codes, positive user/non-Oracle codes, and
+large-code sign/wrapping behavior. A code matching the active exception retains
+its actual detail (including application messages); other codes use the shared
+message table. Native tests compare all 22 predefined names' explicit raises,
+SQLCODE and English SQLERRM, 21 argument values, overflow, active application
+error detail, STANDARD qualification and cold procedure/scalar SQL catalogs.
+The legacy u16 raise opcode remains unchanged; new compiled named raises use
+the numeric opcode and additive SQLERRM opcode 95.
+
+This adds name resolution and explicit raises/handlers; automatic exceptions
+from unimplemented record, collection, cursor or CASE operations still require
+those features. Full exception coverage still needs TRUE error-stack
+preservation, complete implicit argument coercion, localized/detailed messages
 and complete Oracle classification of database errors. See
 [Oracle error reporting](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/retrieving-error-code-and-error-message.html)
 and [raising exceptions](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/raising-exceptions-explicitly.html).

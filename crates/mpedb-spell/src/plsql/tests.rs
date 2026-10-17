@@ -1128,3 +1128,79 @@ fn exception_init_rejects_invalid_codes_scope_and_separate_alias_handlers() {
         "e EXCEPTION;PRAGMA EXCEPTION_INIT(e,-1);BEGIN RAISE e;EXCEPTION WHEN e THEN RETURN 1;WHEN DUP_VAL_ON_INDEX THEN RETURN 2;END;",
     ] {assert!(compile(&function("","NUMBER",body)).is_err(),"{body}");}
 }
+
+#[test]
+fn every_predefined_exception_resolves_catches_and_renders_native_text() {
+    for &(name, code, message) in crate::oracle_exceptions::PREDEFINED {
+        let body = format!("BEGIN RAISE {name}; EXCEPTION WHEN {name} THEN RETURN SQLCODE; END;");
+        let expected = if code == 1403 { 100 } else { -i64::from(code) };
+        assert_eq!(
+            call(&function("", "NUMBER", &body), &[]).unwrap(),
+            Value::Numeric(expected.to_string()),
+            "{name}"
+        );
+        let body = format!("BEGIN RAISE {name}; EXCEPTION WHEN {name} THEN RETURN SQLERRM; END;");
+        assert_eq!(
+            call(&function("", "VARCHAR2", &body), &[]).unwrap(),
+            Value::Text(format!("ORA-{code:05}: {message}")),
+            "{name}"
+        );
+    }
+}
+#[test]
+fn sqlerrm_arguments_preserve_null_rounding_sign_and_current_error_detail() {
+    for (arg, expected) in [
+        ("NULL", None),
+        ("0", Some("ORA-0000: normal, successful completion")),
+        ("1", Some("User-Defined Exception")),
+        ("2", Some(" -2: non-ORACLE exception ")),
+        ("100", Some("ORA-01403: no data found")),
+        ("-1403", Some("ORA-01403: no data found")),
+        ("1403", Some(" -1403: non-ORACLE exception ")),
+        ("-20001", Some("ORA-20001: ")),
+        ("20001", Some(" -20001: non-ORACLE exception ")),
+        ("-65536", Some(" 65536: non-ORACLE exception ")),
+        ("-2147483648", Some(" -2147483648: non-ORACLE exception ")),
+        ("2147483647", Some(" -2147483647: non-ORACLE exception ")),
+        (
+            "-1.5",
+            Some("ORA-00002: Message 2 not found;  product=RDBMS; facility=ORA"),
+        ),
+        ("1.5", Some(" -2: non-ORACLE exception ")),
+    ] {
+        let body = format!("BEGIN RETURN SQLERRM({arg}); END;");
+        assert_eq!(
+            call(&function("", "VARCHAR2", &body), &[]).unwrap(),
+            expected.map_or(Value::Null, |s| Value::Text(s.into())),
+            "{arg}"
+        );
+    }
+    for arg in ["SQLCODE", "-20001"] {
+        let body=format!("BEGIN RAISE_APPLICATION_ERROR(-20001,'ø detail');EXCEPTION WHEN OTHERS THEN RETURN SQLERRM({arg});END;");
+        assert_eq!(
+            call(&function("", "VARCHAR2", &body), &[]).unwrap(),
+            Value::Text("ORA-20001: ø detail".into())
+        );
+    }
+    let body = "BEGIN RETURN SQLERRM(2147483648);EXCEPTION WHEN OTHERS THEN RETURN SQLERRM;END;";
+    assert_eq!(
+        call(&function("", "VARCHAR2", body), &[]).unwrap(),
+        Value::Text("ORA-01426: numeric overflow".into())
+    );
+    assert!(compile(&function("", "NUMBER", "BEGIN RETURN SQLCODE(1);END;")).is_err());
+}
+
+#[test]
+fn standard_qualification_reaches_predefined_exception_under_local_shadowing() {
+    let body="ZERO_DIVIDE EXCEPTION;BEGIN RAISE STANDARD.ZERO_DIVIDE;EXCEPTION WHEN ZERO_DIVIDE THEN RETURN 999;WHEN STANDARD.ZERO_DIVIDE THEN RETURN SQLCODE;END;";
+    assert_eq!(
+        call(&function("", "NUMBER", body), &[]).unwrap(),
+        Value::Numeric("-1476".into())
+    );
+    assert!(compile(&function(
+        "",
+        "NUMBER",
+        "STANDARD NUMBER;BEGIN RAISE STANDARD.ZERO_DIVIDE;END;"
+    ))
+    .is_err());
+}
