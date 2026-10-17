@@ -85,9 +85,36 @@ pub fn load_bootstrap(db: &Database) -> Result<OracleBootstrap> {
         .sys_record_get(state::MIR_NS, state::KEY_CFG)?
         .ok_or_else(|| Error::Corrupt("Oracle mirror config is missing".into()))?;
     let cfg = state::MirrorConfig::decode(&cfg)?;
+    let expected = oracle::build_schema(&metadata.tables)?;
+    if cfg.scope != (0..expected.tables.len() as u32).collect::<Vec<_>>() {
+        return Err(Error::Corrupt(
+            "Oracle bootstrap table-id scope changed".into(),
+        ));
+    }
+    // rRETL lineage, maps and local tables may extend the MPEdb schema. Only
+    // the pinned carrier scope belongs to this source; its ids and full table
+    // definitions must still match exactly.
+    let bundle = db.schema();
+    let carriers = cfg
+        .scope
+        .iter()
+        .map(|&id| {
+            let table = bundle
+                .tables
+                .get(id as usize)
+                .ok_or_else(|| Error::Corrupt("Oracle carrier table is missing".into()))?;
+            if table.id != id || table.dead {
+                return Err(Error::Corrupt(
+                    "Oracle carrier table identity changed".into(),
+                ));
+            }
+            Ok(table.clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let actual = mpedb_types::Schema::new(carriers)?;
     if cfg.source_kind != state::SourceKind::Oracle
         || mirror_name(cfg.mirror_id) != metadata.mirror_id
-        || oracle::build_schema(&metadata.tables)?.hash() != db.schema().hash()
+        || expected.hash() != actual.hash()
     {
         return Err(Error::Corrupt(
             "Oracle bootstrap does not match its MPEdb carrier".into(),

@@ -106,8 +106,11 @@ initial cursor persist in checksummed 64 KiB JSON chunks (64 MiB metadata limit)
 The start cursor, mirror config, provenance and CDC flags publish in ONE final
 commit; failed bootstrap reads publish none of them. Partial row imports can
 leave an unpublished file, which is refused as an existing destination.
-`load_oracle_bootstrap` verifies metadata and carrier schema without contacting
-Oracle. Native tests cover cold reopen, multiple metadata chunks, data values,
+`load_oracle_bootstrap` verifies metadata and the pinned carrier-table scope
+without contacting Oracle. Extra rRETL lineage/maps and local tables are allowed;
+the original scope ids and full carrier definitions must still match. Native
+tests apply/revert an Oracle PL/SQL Boolean lens, cold-reopen the adapter after
+lineage creation, and still reject an added column on a mirrored table. Native tests cover cold reopen, multiple metadata chunks, data values,
 existing-destination rejection, altered content and truncated chunks. Snapshot
 rows are still materialized in memory; CLI import and full live adapter wiring
 remain unfinished. SQL execution uses MPEdb's strict grouping mode, which does

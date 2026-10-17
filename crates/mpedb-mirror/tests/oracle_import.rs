@@ -88,12 +88,51 @@ fn native_oracle_import_reopens_with_verified_chunked_provenance_and_cursor() {
         .unwrap()
         .is_some());
     assert!(import_oracle(&mut source, &path, &opts).is_err());
+    db.create_function(
+        mpedb::spellfn::SpellLang::PlSql,
+        "CREATE FUNCTION MPEDB_IMPORT_FLIP(x BOOLEAN) RETURN BOOLEAN IS BEGIN RETURN NOT x; END;",
+    )
+    .unwrap();
+    db.create_lens(
+        "oracle_import_flip",
+        "MPEDB_IMPORT_FLIP",
+        "MPEDB_IMPORT_FLIP",
+        mpedb::lens::LensClass::Bijective,
+    )
+    .unwrap();
+    let run = db
+        .rretl_apply("oracle_import_flip", "MPEDB_IMPORT_CASE", "FLAG")
+        .unwrap();
+    assert_eq!(run.rows, 1);
+    assert!(!db.rretl_log().unwrap().is_empty());
+    assert_eq!(load_bootstrap(&db).unwrap(), original);
+    db.rretl_revert(run.run_id).unwrap();
+
     drop(db);
     let db = mpedb::Database::open_from_file(&path).unwrap();
     assert_eq!(load_bootstrap(&db).unwrap(), original);
+    let mut adapter =
+        mpedb_mirror::OracleAdapter::from_database(OracleSource::connect(&spec).unwrap(), &db)
+            .unwrap();
+    assert_eq!(
+        mpedb_mirror::SourceAdapter::read_table_rows(&mut adapter, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(adapter);
     assert!(
         matches!(db.query("SELECT \"ID\",\"FLAG\" FROM \"MPEDB_IMPORT_CASE\"", &[]).unwrap(), mpedb::ExecResult::Rows{rows,..} if rows == vec![vec![Value::Numeric("1".into()),Value::Bool(true)]])
     );
+    db.query(
+        "ALTER TABLE \"MPEDB_IMPORT_CASE\" ADD COLUMN \"LOCAL_EXTRA\" TEXT",
+        &[],
+    )
+    .unwrap();
+    assert!(load_bootstrap(&db)
+        .unwrap_err()
+        .to_string()
+        .contains("does not match its MPEdb carrier"));
     let mut damaged = db
         .sys_record_get(state::MIR_NS, b"ora/bootstrap/00000001")
         .unwrap()
