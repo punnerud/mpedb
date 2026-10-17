@@ -149,6 +149,34 @@ impl FuncBuilder {
         self.emit(op)
     }
 
+    /// Add `delta` to every jump target. Used when an instruction is inserted
+    /// in front of an already compiled routine.
+    pub fn shift_jump_targets(&mut self, delta: u32) {
+        for op in &mut self.instrs {
+            match op {
+                Op::Jump(target)
+                | Op::JumpIfFalse(target)
+                | Op::JumpIfTrue(target)
+                | Op::JumpIfSqlFalse(target)
+                | Op::JumpIfSqlTrue(target) => {
+                    *target = target.checked_add(delta).expect("jump target overflow");
+                }
+                Op::OracleTry {
+                    handler,
+                    end,
+                    handler_end,
+                } => {
+                    *handler = handler.checked_add(delta).expect("jump target overflow");
+                    *end = end.checked_add(delta).expect("jump target overflow");
+                    *handler_end = handler_end
+                        .checked_add(delta)
+                        .expect("jump target overflow");
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Point the jump at `at` to the *current* end of the program.
     pub fn patch_to_here(&mut self, at: usize) {
         let t = self.here();

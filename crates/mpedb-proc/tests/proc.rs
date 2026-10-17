@@ -1374,3 +1374,42 @@ fn plsql_record_column_field_starts_null() {
         ProcValue::Scalar(Value::Null)
     );
 }
+
+#[test]
+fn plsql_package_init_runs_once_and_stores_null() {
+    let (cfg, _guard) = test_config("plsql-package-init");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE PACKAGE BODY ledger AS \
+             n PLS_INTEGER; \
+             FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS \
+               previous PLS_INTEGER; \
+             BEGIN \
+               previous := n; \
+               n := v; \
+               RETURN previous; \
+             END; \
+             BEGIN \
+               n := 4; \
+               n := NULL; \
+             END; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(9)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(1)]).unwrap(),
+        ProcValue::Scalar(Value::Int(9))
+    );
+    let fresh = ProcEngine::new(&db);
+    assert_eq!(
+        fresh.call("LEDGER.TOUCH", &[Value::Int(2)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+}

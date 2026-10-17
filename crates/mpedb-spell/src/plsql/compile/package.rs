@@ -1,7 +1,8 @@
 //! A package-body variable is session state. It starts NULL. Assigning NULL
 //! stores NULL. The value survives the next call on the same package state,
 //! including when that call raises. A new state starts NULL again.
-//! A package specification and an initialization section are refused.
+//! The optional initialization section runs once per session, before the
+//! subprogram, and can store NULL. A package specification is refused.
 
 use super::*;
 
@@ -46,9 +47,13 @@ impl Parser<'_> {
             ty,
         });
         self.package_name = Some(package.clone());
-        let skel = self.compile_routine(source, false, true)?;
-        if self.is_word("BEGIN") {
-            return Err(self.error("package initialization is not implemented"));
+        let mut skel = self.compile_routine(source, false, true)?;
+        if self.word("BEGIN") {
+            self.builder.consts = std::mem::take(&mut skel.consts);
+            self.builder.instrs = std::mem::take(&mut skel.instrs);
+            self.compile_package_init(&package)?;
+            skel.consts = std::mem::take(&mut self.builder.consts);
+            skel.instrs = std::mem::take(&mut self.builder.instrs);
         }
         if self.is_word("FUNCTION") || self.is_word("PROCEDURE") {
             return Err(self.error("a package body supports one subprogram"));
@@ -63,6 +68,33 @@ impl Parser<'_> {
         self.want_symbol(";")?;
         self.finish_unit(source)?;
         Ok(skel)
+    }
+
+    /// Session init. A missing flag means this session has not finished init.
+    /// The flag is stored only after the section completes, so a raise retries
+    /// on the next call. Assignments made before the raise stay stored.
+    fn compile_package_init(&mut self, package: &str) -> Result<()> {
+        self.builder.shift_jump_targets(1);
+        self.builder.instrs.insert(0, Op::Jump(0));
+        let function_at = 1u32;
+        let init_at = self.builder.here();
+        self.builder.instrs[0] = Op::Jump(init_at);
+        let flag = self.builder.const_idx(Value::Text(format!("{package}.\u{1}INIT")))?;
+        self.builder.emit(Op::PkgGet(flag))?;
+        self.constant(Value::Null)?;
+        self.builder.emit(Op::Eq)?;
+        self.builder.emit(Op::JumpIfFalse(function_at))?;
+        self.statements()?;
+        if self.is_word("EXCEPTION") {
+            return Err(self.error(
+                "package initialization exception handlers are not implemented",
+            ));
+        }
+        self.constant(Value::Int(1))?;
+        self.builder.emit(Op::PkgSet(flag))?;
+        self.builder.emit(Op::Jump(function_at))?;
+        self.want_word("END")?;
+        self.want_symbol(";")
     }
 
     fn plain_name(&mut self) -> Result<String> {
@@ -214,8 +246,8 @@ END ledger;
                 "a package body supports one subprogram",
             ),
             (
-                "CREATE PACKAGE BODY ledger AS n PLS_INTEGER; FUNCTION touch RETURN PLS_INTEGER IS BEGIN RETURN n; END; BEGIN n := 1; END;",
-                "package initialization is not implemented",
+                "CREATE PACKAGE BODY ledger AS n PLS_INTEGER; FUNCTION touch RETURN PLS_INTEGER IS BEGIN RETURN n; END; BEGIN n := 1; EXCEPTION WHEN OTHERS THEN NULL; END;",
+                "package initialization exception handlers are not implemented",
             ),
             (
                 "CREATE PACKAGE BODY ledger AS n PLS_INTEGER; FUNCTION n RETURN PLS_INTEGER IS BEGIN RETURN 1; END; END;",
@@ -231,5 +263,51 @@ END ledger;
             err.contains("a stored SQL function requires CREATE FUNCTION, not a package"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn package_init_runs_once_and_a_failed_init_keeps_null() {
+        let once = r#"
+CREATE PACKAGE BODY ledger AS
+  n PLS_INTEGER;
+  FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS
+    previous PLS_INTEGER;
+  BEGIN
+    previous := n;
+    n := v;
+    RETURN previous;
+  END;
+BEGIN
+  n := 4;
+  n := NULL;
+END;
+END;
+"#;
+        let proc = compiled(once);
+        let mut session = HashMap::new();
+        assert_eq!(call(&proc, &mut session, Value::Int(9)).unwrap(), Value::Null);
+        assert_eq!(call(&proc, &mut session, Value::Int(1)).unwrap(), Value::Int(9));
+
+        let failed = r#"
+CREATE PACKAGE BODY ledger AS
+  n PLS_INTEGER;
+  FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS
+  BEGIN
+    RETURN n;
+  END;
+BEGIN
+  n := 4;
+  n := NULL;
+  RAISE NO_DATA_FOUND;
+END;
+END;
+"#;
+        let proc = compiled(failed);
+        let mut session = HashMap::new();
+        let err = call(&proc, &mut session, Value::Null).unwrap_err();
+        assert!(err.contains("ORA-01403"), "{err}");
+        assert_eq!(session.get("LEDGER.N"), Some(&Value::Null));
+        let again = call(&proc, &mut session, Value::Null).unwrap_err();
+        assert!(again.contains("ORA-01403"), "{again}");
     }
 }
