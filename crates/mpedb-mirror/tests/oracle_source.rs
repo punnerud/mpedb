@@ -292,3 +292,71 @@ fn native_oracle_write_batch_rejects_rounding_and_rolls_back_every_row() {
         .is_ok());
     c.execute("DROP TABLE MPEDB_WRITE_CASE PURGE", &[]).unwrap();
 }
+
+#[test]
+#[ignore = "requires MPEDB_ORACLE_SOURCE_CONFIG and Oracle client libraries"]
+fn native_oracle_lob_writes_preserve_large_empty_and_null_values() {
+    use mpedb_mirror::adapter::{NetOp, NetOpKind};
+    let path = std::env::var("MPEDB_ORACLE_SOURCE_CONFIG").unwrap();
+    let spec = sourcecfg::load(std::path::Path::new(&path)).unwrap();
+    let SourceSpec::Oracle {
+        connect_string,
+        username,
+        password,
+    } = &spec
+    else {
+        panic!("Oracle required")
+    };
+    let c = oracle_client::Connection::connect(username, password, connect_string).unwrap();
+    c.execute("BEGIN EXECUTE IMMEDIATE 'DROP TABLE MPEDB_LOB_WRITE_CASE PURGE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;", &[]).unwrap();
+    c.execute("CREATE TABLE MPEDB_LOB_WRITE_CASE (id NUMBER PRIMARY KEY, text_value CLOB, national_value NCLOB, binary_value BLOB) SEGMENT CREATION IMMEDIATE", &[]).unwrap();
+    let mut source = OracleSource::connect(&spec).unwrap();
+    let tables = source
+        .introspect(Some(&["MPEDB_LOB_WRITE_CASE".into()]), &[])
+        .unwrap();
+    let large = "ø🙂漢字".repeat(10000);
+    let binary = (0..131073).map(|i| (i % 256) as u8).collect::<Vec<_>>();
+    let cases = vec![
+        vec![
+            Value::Numeric("1".into()),
+            Value::Text(large.clone()),
+            Value::Text(large),
+            Value::Blob(binary),
+        ],
+        vec![
+            Value::Numeric("2".into()),
+            Value::Text(String::new()),
+            Value::Text(String::new()),
+            Value::Blob(Vec::new()),
+        ],
+        vec![
+            Value::Numeric("3".into()),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+    ];
+    let ops = cases
+        .iter()
+        .map(|row| NetOp {
+            table_id: 0,
+            pk: vec![row[0].clone()],
+            kind: NetOpKind::Upsert(row.clone()),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source.write_batch(&tables, &ops).unwrap(),
+        cases.iter().cloned().map(Some).collect::<Vec<_>>()
+    );
+    for row in cases {
+        let op = NetOp {
+            table_id: 0,
+            pk: vec![row[0].clone()],
+            kind: NetOpKind::Upsert(row.clone()),
+        };
+        assert_eq!(source.write_batch(&tables, &[op]).unwrap(), vec![Some(row)]);
+    }
+    assert_eq!(c.query_row_as::<i64>("SELECT COUNT(*) FROM MPEDB_LOB_WRITE_CASE WHERE id=2 AND text_value IS NOT NULL AND national_value IS NOT NULL AND binary_value IS NOT NULL AND DBMS_LOB.GETLENGTH(text_value)=0 AND DBMS_LOB.GETLENGTH(national_value)=0 AND DBMS_LOB.GETLENGTH(binary_value)=0", &[]).unwrap(), 1);
+    c.execute("DROP TABLE MPEDB_LOB_WRITE_CASE PURGE", &[])
+        .unwrap();
+}

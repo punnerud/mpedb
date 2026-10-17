@@ -101,8 +101,14 @@ generated values and stale-schema rejection.
 This transport is not a complete mirror push: capture, echo suppression,
 conflict checks, authority fencing, CLI import and the two-database topology
 remain unfinished. Writes currently refuse identity columns, special NUMBERs,
-zoned timestamps, intervals and LONGs, and accept only small LOB binds (4000
-text bytes / 2000 binary bytes). Larger LOBs need streaming OCI bindings.
+zoned timestamps, intervals and LONGs. CLOB, NCLOB and BLOB writes use native
+temporary LOB locators; reads use explicit locators and fixed Unicode-safe
+buffers. Native tests cover large Unicode and binary values, empty LOBs distinct
+from NULL, and repeated upserts. Scalar text/RAW binds remain bounded at 4000/2000
+bytes. Snapshot results still materialize complete carrier values in memory.
+A separate known issue remains: deferred segment allocation changes the physical
+DDL text and currently trips the schema fence after the first insert; the LOB
+fixture uses SEGMENT CREATION IMMEDIATE to isolate this from LOB correctness.
 The native source boundary also captures bounded Flashback Versions windows.
 It discovers identities from both version start and end SCNs, then reads their
 net images at each commit SCN across all selected tables. Tests cover an

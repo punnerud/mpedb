@@ -1,5 +1,7 @@
 //! Canonical Oracle carriers shared by snapshot and verified write-back.
 use super::*;
+use oracle_client::sql_type::{Blob, Clob, Nclob};
+use std::io::Read;
 
 pub(super) fn decode_row(
     row: &Row,
@@ -34,6 +36,31 @@ pub(super) fn decode_row(
             }
             ColumnType::Bool => {
                 get::<Option<i64>>(row, offset)?.map_or(Value::Null, |b| Value::Bool(b != 0))
+            }
+            ColumnType::Blob if c.data_type == "BLOB" => match get::<Option<Blob>>(row, offset)? {
+                None => Value::Null,
+                Some(mut lob) => {
+                    let mut bytes = Vec::new();
+                    lob.read_to_end(&mut bytes)
+                        .map_err(|e| Error::Unsupported(format!("Oracle BLOB read failed: {e}")))?;
+                    Value::Blob(bytes)
+                }
+            },
+            ColumnType::Text if c.data_type == "CLOB" => match get::<Option<Clob>>(row, offset)? {
+                None => Value::Null,
+                Some(mut lob) => {
+                    let text = read_text_lob(&mut lob)?;
+                    Value::Text(text)
+                }
+            },
+            ColumnType::Text if c.data_type == "NCLOB" => {
+                match get::<Option<Nclob>>(row, offset)? {
+                    None => Value::Null,
+                    Some(mut lob) => {
+                        let text = read_text_lob(&mut lob)?;
+                        Value::Text(text)
+                    }
+                }
             }
             ColumnType::Blob => {
                 get::<Option<Vec<u8>>>(row, offset)?.map_or(Value::Null, Value::Blob)
@@ -83,4 +110,22 @@ pub(super) fn read_expr(c: &OracleColumn) -> Result<Vec<String>> {
         t if t.starts_with("INTERVAL") => vec![format!("TO_CHAR({name})")],
         _ => vec![name],
     })
+}
+
+// Fixed buffers avoid Read::read_to_string's tiny tail buffers, which cannot
+// always hold a complete Unicode character in the Oracle LOB client API.
+fn read_text_lob(lob: &mut impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0; 65536];
+    loop {
+        let n = lob
+            .read(&mut buffer)
+            .map_err(|e| Error::Unsupported(format!("Oracle text LOB read failed: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..n]);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| Error::Config("Oracle text LOB returned invalid UTF-8".into()))
 }

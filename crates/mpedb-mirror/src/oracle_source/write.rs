@@ -3,7 +3,8 @@
 //! fencing and conflict-aware push still require the higher-level adapter.
 use super::*;
 use crate::adapter::{NetOp, NetOpKind};
-use oracle_client::sql_type::ToSql;
+use oracle_client::sql_type::{Blob, Clob, Lob, Nclob, ToSql};
+use std::io::Write;
 
 enum Bind {
     Text(String),
@@ -11,6 +12,9 @@ enum Bind {
     Int(i64),
     Bytes(Vec<u8>),
     Null(Option<String>),
+    Clob(Clob),
+    Blob(Blob),
+    Nclob(Nclob),
 }
 impl Bind {
     fn sql(&self) -> &dyn ToSql {
@@ -20,6 +24,9 @@ impl Bind {
             Self::Int(v) => v,
             Self::Bytes(v) => v,
             Self::Null(v) => v,
+            Self::Clob(v) => v,
+            Self::Blob(v) => v,
+            Self::Nclob(v) => v,
         }
     }
 }
@@ -50,7 +57,7 @@ impl OracleSource {
                 self.lock_schema(table)?;
             }
             let mut images = Vec::with_capacity(ops.len());
-            for op in ops {
+            for (operation_index, op) in ops.iter().enumerate() {
                 let table = tables.get(op.table_id as usize).ok_or_else(|| {
                     Error::Config("Oracle write references an unknown carrier table".into())
                 })?;
@@ -90,7 +97,7 @@ impl OracleSource {
                             .pk
                             .iter()
                             .zip(&op.pk)
-                            .map(|(&k, v)| bind(&table.columns[k], v))
+                            .map(|(&k, v)| bind(&self.connection, &table.columns[k], v))
                             .collect::<Result<Vec<_>>>()?;
                         let refs = owned.iter().map(Bind::sql).collect::<Vec<_>>();
                         self.connection
@@ -120,7 +127,7 @@ impl OracleSource {
                             .collect::<Vec<_>>();
                         let owned = writable
                             .iter()
-                            .map(|(i, c)| bind(c, &values[*i]))
+                            .map(|(i, c)| bind(&self.connection, c, &values[*i]))
                             .collect::<Result<Vec<_>>>()?;
                         let projection = writable
                             .iter()
@@ -164,15 +171,20 @@ impl OracleSource {
                         let sql=format!("MERGE INTO {target} d USING (SELECT {projection} FROM dual) s ON ({on}){update} WHEN NOT MATCHED THEN INSERT ({}) VALUES ({source})",names.join(","));
                         let refs = owned.iter().map(Bind::sql).collect::<Vec<_>>();
                         self.connection
-                            .execute(&sql, &refs)
+                            .statement(&sql)
+                            .lob_locator()
+                            .build()
+                            .map_err(|e| err("upsert prepare", e))?
+                            .execute(&refs)
                             .map_err(|e| err("upsert", e))?;
                         let image = self.read_key(table, &op.pk, None)?.ok_or_else(|| {
                             Error::Unsupported(
                                 "Oracle upsert did not retain the requested identity".into(),
                             )
                         })?;
-                        if writable.iter().any(|(i, _)| image[*i] != values[*i]) {
-                            return Err(Error::Unsupported("Oracle changed a submitted carrier value; the entire batch was rolled back".into()));
+                        if let Some((_, c)) = writable.iter().find(|(i, _)| image[*i] != values[*i])
+                        {
+                            return Err(Error::Unsupported(format!("Oracle changed a submitted carrier value in {} at operation {operation_index}; the entire batch was rolled back", c.name)));
                         }
                         images.push(Some(image));
                     }
@@ -203,7 +215,7 @@ impl OracleSource {
             .pk
             .iter()
             .zip(pk)
-            .map(|(&k, v)| bind(&table.columns[k], v))
+            .map(|(&k, v)| bind(&self.connection, &table.columns[k], v))
             .collect::<Result<Vec<_>>>()?;
         let refs = owned.iter().map(Bind::sql).collect::<Vec<_>>();
         let keys = table
@@ -234,9 +246,14 @@ impl OracleSource {
             quote(&table.owner),
             quote(&table.name)
         );
-        let mut rows = self
+        let mut statement = self
             .connection
-            .query(&sql, &refs)
+            .statement(&sql)
+            .lob_locator()
+            .build()
+            .map_err(|e| err("write verification prepare", e))?;
+        let mut rows = statement
+            .query(&refs)
             .map_err(|e| err("write verification", e))?;
         let image = rows
             .next()
@@ -253,9 +270,51 @@ impl OracleSource {
     }
 }
 
-fn bind(c: &OracleColumn, value: &Value) -> Result<Bind> {
+fn bind(connection: &oracle_client::Connection, c: &OracleColumn, value: &Value) -> Result<Bind> {
     if matches!(value, Value::Null) {
         return Ok(Bind::Null(None));
+    }
+    match (c.data_type.as_str(), value) {
+        ("CLOB", Value::Text(text)) => {
+            let mut lob = Clob::new(connection).map_err(|e| err("temporary CLOB", e))?;
+            if text.is_empty() {
+                lob.write_all(b" ").map_err(|e| {
+                    Error::Unsupported(format!("Oracle temporary CLOB initialization failed: {e}"))
+                })?;
+                lob.truncate(0).map_err(|e| err("empty CLOB", e))?;
+            }
+            lob.write_all(text.as_bytes()).map_err(|e| {
+                Error::Unsupported(format!("Oracle temporary CLOB write failed: {e}"))
+            })?;
+            return Ok(Bind::Clob(lob));
+        }
+        ("NCLOB", Value::Text(text)) => {
+            let mut lob = Nclob::new(connection).map_err(|e| err("temporary NCLOB", e))?;
+            if text.is_empty() {
+                lob.write_all(b" ").map_err(|e| {
+                    Error::Unsupported(format!("Oracle temporary NCLOB initialization failed: {e}"))
+                })?;
+                lob.truncate(0).map_err(|e| err("empty NCLOB", e))?;
+            }
+            lob.write_all(text.as_bytes()).map_err(|e| {
+                Error::Unsupported(format!("Oracle temporary NCLOB write failed: {e}"))
+            })?;
+            return Ok(Bind::Nclob(lob));
+        }
+        ("BLOB", Value::Blob(bytes)) => {
+            let mut lob = Blob::new(connection).map_err(|e| err("temporary BLOB", e))?;
+            if bytes.is_empty() {
+                lob.write_all(&[0]).map_err(|e| {
+                    Error::Unsupported(format!("Oracle temporary BLOB initialization failed: {e}"))
+                })?;
+                lob.truncate(0).map_err(|e| err("empty BLOB", e))?;
+            }
+            lob.write_all(bytes).map_err(|e| {
+                Error::Unsupported(format!("Oracle temporary BLOB write failed: {e}"))
+            })?;
+            return Ok(Bind::Blob(lob));
+        }
+        _ => {}
     }
     match (c.mapped(), value) {
         (Some(ColumnType::Numeric), Value::Numeric(v))
@@ -268,7 +327,7 @@ fn bind(c: &OracleColumn, value: &Value) -> Result<Bind> {
         (Some(ColumnType::Text), Value::Text(v)) if v.len() <= 4000 => Ok(Bind::Text(v.clone())),
         (Some(ColumnType::Blob), Value::Blob(v)) if v.len() <= 2000 => Ok(Bind::Bytes(v.clone())),
         _ => Err(Error::Unsupported(
-            "Oracle write carrier type, special NUMBER or large LOB is not supported".into(),
+            "Oracle write carrier type or special NUMBER is not supported".into(),
         )),
     }
 }
@@ -280,9 +339,8 @@ fn expression(c: &OracleColumn, n: usize) -> Result<String> {
         "NUMBER" | "FLOAT" => format!("TO_NUMBER({b})"),
         "BOOLEAN" => format!("CASE {b} WHEN 1 THEN TRUE WHEN 0 THEN FALSE ELSE NULL END"),
         "DATE" => format!("TO_DATE({b},'SYYYY-MM-DD\"T\"HH24:MI:SS','NLS_DATE_LANGUAGE=English')"),
-        "CLOB" => format!("TO_CLOB({b})"),
-        "NCLOB" => format!("TO_NCLOB({b})"),
-        "BLOB" => format!("TO_BLOB({b})"),
+        "CLOB" | "NCLOB" | "BLOB" => b,
+
         t if t.starts_with("TIMESTAMP") && !t.contains("TIME ZONE") => format!(
             "TO_TIMESTAMP({b},'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9','NLS_DATE_LANGUAGE=English')"
         ),

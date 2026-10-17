@@ -3,13 +3,13 @@
 //! Bounded capture, atomic writes and verified bootstrap positions are exposed
 //! as low-level APIs. Full SourceAdapter and CLI import remain unfinished.
 mod capture;
-mod identity;
 mod codec;
+mod identity;
 mod schema;
-mod state;
 mod snapshot;
-pub use snapshot::OracleSnapshot;
+mod state;
 pub use capture::OracleChangeBatch;
+pub use snapshot::OracleSnapshot;
 mod write;
 use codec::{decode_row, read_expr};
 
@@ -234,10 +234,13 @@ impl OracleSource {
             quote(&table.name),
             order
         );
-        let rows = self
+        let mut statement = self
             .connection
-            .query(&sql, &[&scn])
-            .map_err(|e| err("snapshot", e))?;
+            .statement(&sql)
+            .lob_locator()
+            .build()
+            .map_err(|e| err("snapshot prepare", e))?;
+        let rows = statement.query(&[&scn]).map_err(|e| err("snapshot", e))?;
         rows.map(|row| {
             let row = row.map_err(|e| err("snapshot row", e))?;
             decode_row(&row, &table.columns, 0)
