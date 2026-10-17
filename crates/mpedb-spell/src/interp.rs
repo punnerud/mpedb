@@ -83,10 +83,12 @@ use std::rc::Rc;
 /// Execution budgets. Every executed instruction costs one instruction unit
 /// (backward jumps therefore pay on every loop iteration); every
 /// `DbQuery`/`DbExec`/`CursorOpen` costs one db-call unit on top; every
-/// `CursorAdvance` costs one **row** unit — its own dimension, deliberately
-/// generous (10M): charging cursor rows against the 10k db-call budget
-/// would burn it on a single medium scan, while leaving them uncharged
-/// would let `SELECT`-all cursors bypass row accounting entirely.
+/// `CursorAdvance`, and every `CursorFetch` that pulls, costs one **row**
+/// unit — its own dimension, deliberately generous (10M): charging cursor
+/// rows against the 10k db-call budget would burn it on a single medium
+/// scan, while leaving them uncharged would let `SELECT`-all cursors bypass
+/// row accounting entirely. A fetch that already found no row, and
+/// `CursorClose`, cost no further row unit.
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
     pub instrs: u64,
@@ -199,9 +201,12 @@ fn to_proc_value(v: PValue) -> Result<ProcValue> {
 /// lock-free `Database::execute` snapshots. The interpreter itself neither
 /// knows nor cares — it only ever presents plan *hashes*.
 ///
-/// The cursor pair backs `CursorOpen`/`CursorAdvance`: `cursor_open`
-/// returns a bridge-side stream id, `cursor_advance` pulls ONE row (O(1)
-/// bridge memory) and frees the stream when it returns `None`. Only the
+/// The cursor trio backs `CursorOpen`/`CursorAdvance`/`CursorFetch`/
+/// `CursorClose`. `cursor_open` returns a bridge-side stream id.
+/// `cursor_advance` pulls ONE row (O(1) bridge memory) and leaves the
+/// stream allocated when it returns `None`. `cursor_close` drops that
+/// stream without reading. Python `CursorAdvance` closes on exhaustion;
+/// Oracle `CursorFetch` does not, so CLOSE can still succeed. Only the
 /// read path implements them for real — IR validation guarantees a proc
 /// with `DbExec` never contains `CursorOpen` (v1 rule), so the write
 /// bridge's implementations are unreachable-by-construction guards.
@@ -210,6 +215,7 @@ pub trait DbBridge {
     fn exec(&mut self, plan: &PlanRef, params: &[Value]) -> Result<u64>;
     fn cursor_open(&mut self, plan: &PlanRef, params: &[Value]) -> Result<u32>;
     fn cursor_advance(&mut self, stream: u32) -> Result<Option<Vec<Value>>>;
+    fn cursor_close(&mut self, stream: u32) -> Result<()>;
 }
 
 fn rt_err(msg: impl Into<String>) -> Error {
@@ -462,13 +468,16 @@ fn arith(op: Op, a: PValue, b: PValue) -> Result<PValue> {
 }
 
 /// One interpreter-side cursor slot: the bridge's stream id, the current
-/// row (set by `CursorAdvance`, read by `CursorRow`), and the generation
-/// that must match the handle. Exhaustion frees the slot for reuse and
-/// bumps the generation so stale handles error instead of aliasing.
+/// row (set by a pull, read by `CursorRow`), and the generation that must
+/// match the handle. Python exhaustion and Oracle CLOSE free the slot and
+/// bump the generation so stale handles error instead of aliasing. Oracle
+/// FETCH that finds no row sets `exhausted` and keeps the stream, so the
+/// handle stays open and a later OPEN cannot reuse the slot.
 struct CurSlot {
     gen: u32,
     stream: Option<u32>,
     row: Option<PValue>,
+    exhausted: bool,
 }
 
 /// Run a validated procedure. `args` were checked against `proc.argc` by
@@ -831,13 +840,17 @@ pub fn run(
                     _ => {
                         // CursorOpen: claim a free slot (bounded), open the
                         // stream, hand out a slot+generation handle.
-                        let slot = match cursors.iter().position(|c| c.stream.is_none()) {
+                        let slot = match cursors
+                            .iter()
+                            .position(|c| c.stream.is_none() && !c.exhausted)
+                        {
                             Some(i) => i,
                             None if cursors.len() < MAX_CURSORS => {
                                 cursors.push(CurSlot {
                                     gen: 0,
                                     stream: None,
                                     row: None,
+                                    exhausted: false,
                                 });
                                 cursors.len() - 1
                             }
@@ -852,6 +865,7 @@ pub fn run(
                         let c = &mut cursors[slot];
                         c.stream = Some(stream);
                         c.row = None;
+                        c.exhausted = false;
                         stack.push(PValue::Cursor {
                             slot: slot as u16,
                             gen: c.gen,
@@ -859,30 +873,45 @@ pub fn run(
                     }
                 }
             }
-            Op::CursorAdvance => {
+            Op::CursorAdvance | Op::CursorFetch => {
+                let fetch = matches!(op, Op::CursorFetch);
                 let slot = pop_cursor(&mut stack, &cursors)?;
-                if rows_left == 0 {
-                    return Err(budget_rows_err(budget.rows));
+                if fetch && cursors[slot].exhausted {
+                    stack.push(PValue::Scalar(Value::Bool(false)));
+                } else {
+                    if rows_left == 0 {
+                        return Err(budget_rows_err(budget.rows));
+                    }
+                    rows_left -= 1;
+                    let stream = cursors[slot].stream.expect("pop_cursor checked");
+                    match bridge.cursor_advance(stream)? {
+                        Some(row) => {
+                            cursors[slot].row = Some(PValue::Tuple(Rc::new(
+                                row.into_iter().map(PValue::Scalar).collect(),
+                            )));
+                            stack.push(PValue::Scalar(Value::Bool(true)));
+                        }
+                        None if fetch => {
+                            // Oracle not-found: the cursor stays open. CLOSE
+                            // is what releases the stream.
+                            let c = &mut cursors[slot];
+                            c.row = None;
+                            c.exhausted = true;
+                            stack.push(PValue::Scalar(Value::Bool(false)));
+                        }
+                        None => {
+                            bridge.cursor_close(stream)?;
+                            release_cursor(&mut cursors[slot]);
+                            stack.push(PValue::Scalar(Value::Bool(false)));
+                        }
+                    }
                 }
-                rows_left -= 1;
+            }
+            Op::CursorClose => {
+                let slot = pop_cursor(&mut stack, &cursors)?;
                 let stream = cursors[slot].stream.expect("pop_cursor checked");
-                match bridge.cursor_advance(stream)? {
-                    Some(row) => {
-                        cursors[slot].row = Some(PValue::Tuple(Rc::new(
-                            row.into_iter().map(PValue::Scalar).collect(),
-                        )));
-                        stack.push(PValue::Scalar(Value::Bool(true)));
-                    }
-                    None => {
-                        // Exhausted: the bridge freed the stream; recycle
-                        // the slot and invalidate outstanding handles.
-                        let c = &mut cursors[slot];
-                        c.stream = None;
-                        c.row = None;
-                        c.gen = c.gen.wrapping_add(1);
-                        stack.push(PValue::Scalar(Value::Bool(false)));
-                    }
-                }
+                bridge.cursor_close(stream)?;
+                release_cursor(&mut cursors[slot]);
             }
             Op::CursorRow => {
                 let slot = pop_cursor(&mut stack, &cursors)?;
@@ -918,9 +947,16 @@ pub fn run(
     }
 }
 
+fn release_cursor(slot: &mut CurSlot) {
+    slot.stream = None;
+    slot.row = None;
+    slot.exhausted = false;
+    slot.gen = slot.gen.wrapping_add(1);
+}
+
 /// Pop and resolve a cursor handle: must be a cursor value, its slot must
 /// be live, and its generation must match (a mismatch means the cursor was
-/// exhausted — and the slot possibly reopened for a different cursor).
+/// closed — and the slot possibly reopened for a different cursor).
 fn pop_cursor(stack: &mut Vec<PValue>, cursors: &[CurSlot]) -> Result<usize> {
     let v = stack.pop().expect("validated");
     let PValue::Cursor { slot, gen } = v else {
@@ -948,6 +984,10 @@ pub mod testutil {
         pub queries: usize,
         pub execs: usize,
         pub cursor_opens: usize,
+        /// Rows `cursor_advance` actually pulled, including a not-found pull.
+        pub advances: usize,
+        /// Streams `cursor_close` released.
+        pub closes: usize,
         streams: Vec<Option<VecDeque<Vec<Value>>>>,
     }
 
@@ -960,11 +1000,14 @@ pub mod testutil {
                 queries: 0,
                 execs: 0,
                 cursor_opens: 0,
+                advances: 0,
+                closes: 0,
                 streams: Vec::new(),
             }
         }
 
-        /// Streams still open (an exhausted stream must have been freed).
+        /// Streams the bridge still holds. Python exhaustion and Oracle
+        /// CLOSE both release theirs; a FETCH that found no row does not.
         pub fn live_streams(&self) -> usize {
             self.streams.iter().filter(|s| s.is_some()).count()
         }
@@ -985,6 +1028,7 @@ pub mod testutil {
             Ok((self.streams.len() - 1) as u32)
         }
         fn cursor_advance(&mut self, stream: u32) -> Result<Option<Vec<Value>>> {
+            self.advances += 1;
             let slot = self
                 .streams
                 .get_mut(stream as usize)
@@ -992,13 +1036,19 @@ pub mod testutil {
             let Some(q) = slot else {
                 return Err(rt_err("mock: advance on a freed stream"));
             };
-            match q.pop_front() {
-                Some(row) => Ok(Some(row)),
-                None => {
-                    *slot = None; // contract: freed on exhaustion
-                    Ok(None)
-                }
+            Ok(q.pop_front())
+        }
+        fn cursor_close(&mut self, stream: u32) -> Result<()> {
+            self.closes += 1;
+            let slot = self
+                .streams
+                .get_mut(stream as usize)
+                .ok_or_else(|| rt_err("mock: bad stream id"))?;
+            if slot.is_none() {
+                return Err(rt_err("mock: close on a freed stream"));
             }
+            *slot = None;
+            Ok(())
         }
     }
 }

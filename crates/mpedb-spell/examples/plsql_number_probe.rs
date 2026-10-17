@@ -24,6 +24,11 @@ impl DbBridge for NoDb {
             "arithmetic probe cannot advance cursors".into(),
         ))
     }
+    fn cursor_close(&mut self, _: u32) -> Result<()> {
+        Err(Error::Unsupported(
+            "arithmetic probe cannot close cursors".into(),
+        ))
+    }
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {

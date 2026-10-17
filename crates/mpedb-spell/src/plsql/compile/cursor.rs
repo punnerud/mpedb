@@ -1,8 +1,9 @@
 //! Explicit PL/SQL cursors: `CURSOR c IS SELECT ...; OPEN; FETCH INTO; CLOSE`.
 //! Packages, cursor attributes, and parameters in the cursor query stay refused.
-//! A fetch that finds no row leaves its targets unchanged. A NULL column assigns
-//! NULL. CLOSE walks the existing cursor until it is exhausted, which is what
-//! releases the stream.
+//! A fetch that finds no row leaves its targets unchanged and leaves the
+//! cursor open. A NULL column assigns NULL. CLOSE releases the stream
+//! without fetching the remaining rows. `SELECT *` is refused: the select
+//! list must name its columns. `count(*)` is one column.
 use super::*;
 use crate::emit::{line_col, CallKind, SqlCall};
 
@@ -52,7 +53,20 @@ impl Parser<'_> {
         let source_start = self.tokens[start].span.start;
         let source_end = self.tokens[end].span.start;
         let source = self.source[source_start..source_end].to_string();
-        let width = select_width(&self.tokens[start..end])?;
+        let width = match select_width(&self.tokens[start..end]) {
+            Ok(width) => width,
+            Err(WidthError::Star { at }) => {
+                let saved = self.at;
+                self.at = start + at;
+                let err = self.error("cursor SELECT * is not expanded; name the columns");
+                self.at = saved;
+                return Err(err);
+            }
+            Err(WidthError::TooWide) => return Err(self.error("cursor SELECT list is too wide")),
+            Err(WidthError::MissingFrom) => {
+                return Err(self.error("a cursor SELECT requires FROM"))
+            }
+        };
         self.at = end + 1;
         let (sql, count) = super::sql::normalize_sql(&source, CallKind::Query)
             .map_err(|e| self.error(&e.to_string()))?;
@@ -108,7 +122,7 @@ impl Parser<'_> {
             }
             self.want_symbol(";")?;
             self.builder.emit(Op::LoadLocal(cursor.slot))?;
-            self.builder.emit(Op::CursorAdvance)?;
+            self.builder.emit(Op::CursorFetch)?;
             let none = self.builder.emit_jump(Op::JumpIfFalse(u32::MAX))?;
             self.builder.emit(Op::LoadLocal(cursor.slot))?;
             self.builder.emit(Op::CursorRow)?;
@@ -128,12 +142,8 @@ impl Parser<'_> {
         if self.word("CLOSE") {
             let cursor = self.cursor_name()?;
             self.want_symbol(";")?;
-            let top = self.builder.here();
             self.builder.emit(Op::LoadLocal(cursor.slot))?;
-            self.builder.emit(Op::CursorAdvance)?;
-            let done = self.builder.emit_jump(Op::JumpIfFalse(u32::MAX))?;
-            self.builder.emit(Op::Jump(top))?;
-            self.builder.patch_to_here(done);
+            self.builder.emit(Op::CursorClose)?;
             self.constant(Value::Null)?;
             self.builder.emit(Op::StoreLocal(cursor.slot))?;
             return Ok(true);
@@ -150,30 +160,70 @@ impl Parser<'_> {
     }
 }
 
-fn select_width(tokens: &[Lexed]) -> Result<u16> {
+enum WidthError {
+    Star { at: usize },
+    TooWide,
+    MissingFrom,
+}
+
+/// Column count of a cursor SELECT list. A `*` at item-start or after `.`
+/// is star expansion and is refused. A `*` inside parentheses, including
+/// `count(*)`, is one expression. Multiplication (`1 * 2`) is not expansion.
+fn select_width(tokens: &[Lexed]) -> std::result::Result<u16, WidthError> {
     let mut depth = 0i32;
     let mut width = 1u16;
     let mut saw_from = false;
-    for token in tokens {
+    let mut item_boundary = false;
+    let mut after_dot = false;
+    for (index, token) in tokens.iter().enumerate() {
         match &token.token {
-            Token::Symbol("(") => depth += 1,
-            Token::Symbol(")") => depth -= 1,
+            Token::Symbol("(") => {
+                depth += 1;
+                after_dot = false;
+                item_boundary = false;
+            }
+            Token::Symbol(")") => {
+                depth -= 1;
+                after_dot = false;
+            }
             Token::Identifier { name, quoted: false } if depth == 0 && name == "FROM" => {
                 saw_from = true;
                 break;
             }
+            Token::Identifier { name, quoted: false }
+                if depth == 0 && name == "SELECT" && index == 0 =>
+            {
+                item_boundary = true;
+                after_dot = false;
+            }
+            Token::Identifier { name, quoted: false }
+                if depth == 0
+                    && item_boundary
+                    && matches!(name.as_str(), "DISTINCT" | "ALL" | "UNIQUE") =>
+            {
+                after_dot = false;
+            }
             Token::Symbol(",") if depth == 0 => {
-                width = width
-                    .checked_add(1)
-                    .ok_or_else(|| mpedb_types::Error::Unsupported("cursor SELECT list is too wide".into()))?;
+                width = width.checked_add(1).ok_or(WidthError::TooWide)?;
+                item_boundary = true;
+                after_dot = false;
+            }
+            Token::Symbol(".") if depth == 0 => {
+                after_dot = true;
+                item_boundary = false;
+            }
+            Token::Symbol("*") if depth == 0 && (item_boundary || after_dot) => {
+                return Err(WidthError::Star { at: index });
+            }
+            _ if depth == 0 => {
+                item_boundary = false;
+                after_dot = false;
             }
             _ => {}
         }
     }
     if !saw_from {
-        return Err(mpedb_types::Error::Unsupported(
-            "a cursor SELECT requires FROM".into(),
-        ));
+        return Err(WidthError::MissingFrom);
     }
     Ok(width)
 }
@@ -242,9 +292,43 @@ mod tests {
         assert_eq!(bridge.live_streams(), 0);
         let (value, _) = run(vec![vec![Value::Numeric("4".into())]], body);
         assert_eq!(value, Value::Numeric("4".into()));
-        let missing = "CURSOR c IS SELECT amount FROM dual; v NUMBER := 7; BEGIN OPEN c; FETCH c INTO v; RETURN v; END;";
-        let (value, bridge) = run(vec![], missing);
+        let (value, bridge) = run(vec![], body);
         assert_eq!(value, Value::Numeric("7".into()));
+        assert_eq!(bridge.advances, 1);
+        assert_eq!(bridge.closes, 1);
         assert_eq!(bridge.live_streams(), 0);
+        let (value, bridge) = run(
+            vec![
+                vec![Value::Numeric("4".into())],
+                vec![Value::Numeric("9".into())],
+            ],
+            body,
+        );
+        assert_eq!(value, Value::Numeric("4".into()));
+        assert_eq!(bridge.advances, 1, "CLOSE must not fetch the remaining row");
+        assert_eq!(bridge.closes, 1);
+        assert_eq!(bridge.live_streams(), 0);
+    }
+
+    #[test]
+    fn explicit_cursor_refuses_star_expansion_and_counts_parenthesized_star() {
+        for query in ["SELECT * FROM dual", "SELECT t.* FROM dual", "SELECT DISTINCT * FROM dual"] {
+            let source = format!(
+                "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS {query}; BEGIN RETURN 1; END;"
+            );
+            let err = compile(&source).unwrap_err().to_string();
+            assert!(err.contains("PL/SQL at "), "{err}");
+            assert!(err.contains("SELECT *"), "{err}");
+            assert!(!err.starts_with("unsupported: cursor SELECT list"), "{err}");
+        }
+        let count = "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT count(*) FROM dual; n NUMBER; BEGIN OPEN c; FETCH c INTO n; CLOSE c; RETURN n; END;";
+        let skel = compile(count).unwrap();
+        assert_eq!(skel.calls[0].expected_columns, Some(1));
+        let product = "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT 1 * 2 FROM dual; n NUMBER; BEGIN OPEN c; FETCH c INTO n; CLOSE c; RETURN n; END;";
+        let skel = compile(product).unwrap();
+        assert_eq!(skel.calls[0].expected_columns, Some(1));
+        let two = "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT a, b FROM dual; x NUMBER; y NUMBER; BEGIN OPEN c; FETCH c INTO x, y; CLOSE c; RETURN x; END;";
+        let skel = compile(two).unwrap();
+        assert_eq!(skel.calls[0].expected_columns, Some(2));
     }
 }

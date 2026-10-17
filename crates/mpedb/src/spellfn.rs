@@ -95,6 +95,9 @@ impl DbBridge for RefuseDb {
     fn cursor_advance(&mut self, _: u32) -> Result<Option<Vec<Value>>> {
         Err(Error::Unsupported("a stored SQL function cannot touch the database".into()))
     }
+    fn cursor_close(&mut self, _: u32) -> Result<()> {
+        Err(Error::Unsupported("a stored SQL function cannot touch the database".into()))
+    }
 }
 
 /// Run one stored function over already-evaluated arguments — the

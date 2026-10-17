@@ -1100,13 +1100,20 @@ impl mpedb_spell::interp::DbBridge for CtxBridge<'_> {
             .get_mut(stream as usize)
             .ok_or_else(|| internal("trigger procedure advanced an unknown cursor"))?;
         let Some(it) = slot else {
-            return Ok(None);
+            return Err(internal(
+                "trigger procedure advanced a closed cursor stream",
+            ));
         };
-        let row = it.next();
-        if row.is_none() {
-            *slot = None;
-        }
-        Ok(row)
+        Ok(it.next())
+    }
+
+    fn cursor_close(&mut self, stream: u32) -> Result<()> {
+        let slot = self
+            .streams
+            .get_mut(stream as usize)
+            .ok_or_else(|| internal("trigger procedure closed an unknown cursor"))?;
+        *slot = None;
+        Ok(())
     }
 }
 

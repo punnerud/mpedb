@@ -28,17 +28,20 @@
 //! Every *executed instruction* costs one unit of the instruction budget (so
 //! in particular every backward jump does), and every
 //! `DbQuery`/`DbExec`/`CursorOpen` additionally costs one unit of the
-//! db-call budget. `CursorAdvance` deliberately does NOT cost a db call —
-//! one full-table scan would burn the whole 10k db-call budget — it costs
-//! one unit of the separate, generous row budget (default 10M rows).
+//! db-call budget. `CursorAdvance` and `CursorFetch` deliberately do NOT
+//! cost a db call — one full-table scan would burn the whole 10k db-call
+//! budget — each pull costs one unit of the separate, generous row budget
+//! (default 10M rows). `CursorClose` reads nothing and costs no row unit.
 //!
 //! # Cursors
 //!
 //! `CursorOpen(p)` opens a streaming scan over `plans[p]` (which must be
 //! `Query`-kind — validated statically, decode included) and pushes an
-//! opaque cursor handle; `CursorAdvance` pulls ONE row from the engine
-//! (O(1) interpreter memory) and pushes whether a row is available;
-//! `CursorRow` pushes the current row as a tuple. Handles are runtime
+//! opaque cursor handle. `CursorAdvance` pulls ONE row and closes the
+//! cursor when the scan is exhausted (the Python/Rust loop path).
+//! `CursorFetch` is Oracle FETCH: exhaustion pushes false and leaves the
+//! handle open. `CursorClose` releases the stream without reading further
+//! rows. `CursorRow` pushes the current row as a tuple. Handles are runtime
 //! values with slot+generation identity; the runtime bounds live cursors
 //! (see `interp::MAX_CURSORS`) and rejects stale handles. **v1 rule:**
 //! cursors are allowed only in read-only procedures — a program containing
@@ -236,6 +239,14 @@ pub enum Op {
     /// cursor's current row), push `true`; or push `false` and close the
     /// cursor when the scan is exhausted. Costs one row-budget unit.
     CursorAdvance,
+    /// Oracle FETCH. Same pull as `CursorAdvance`, but exhaustion pushes
+    /// `false` and leaves the handle open. A later fetch on that handle
+    /// pushes `false` without another pull. Costs one row-budget unit only
+    /// when it pulls.
+    CursorFetch,
+    /// Pop an open cursor handle, including one FETCH has exhausted, and
+    /// release its stream without reading the remaining rows.
+    CursorClose,
     /// Pop a cursor handle, push its current row as a tuple.
     CursorRow,
     /// Pop the return value and finish the procedure.
@@ -342,6 +353,10 @@ const OP_ORACLE_RAISE_USER: u8 = 92;
 const OP_ORACLE_MATCH_USER: u8 = 93;
 const OP_ORACLE_RAISE_BOUND: u8 = 94;
 const OP_ORACLE_SQLERRM_CODE: u8 = 95;
+// Oracle FETCH must not reuse CursorAdvance: that opcode closes on
+// exhaustion. These tags stay additive so older blobs still decode.
+const OP_CURSOR_FETCH: u8 = 96;
+const OP_CURSOR_CLOSE: u8 = 97;
 
 
 
@@ -659,6 +674,8 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::Len => b.push(OP_LEN),
         Op::Index => b.push(OP_INDEX),
         Op::CursorAdvance => b.push(OP_CURSOR_ADVANCE),
+        Op::CursorFetch => b.push(OP_CURSOR_FETCH),
+        Op::CursorClose => b.push(OP_CURSOR_CLOSE),
         Op::CursorRow => b.push(OP_CURSOR_ROW),
         Op::Return => b.push(OP_RETURN),
     }
@@ -793,6 +810,8 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_LEN => Op::Len,
         OP_INDEX => Op::Index,
         OP_CURSOR_ADVANCE => Op::CursorAdvance,
+        OP_CURSOR_FETCH => Op::CursorFetch,
+        OP_CURSOR_CLOSE => Op::CursorClose,
         OP_CURSOR_ROW => Op::CursorRow,
         OP_RETURN => Op::Return,
         other => return Err(Error::Corrupt(format!("proc: invalid opcode {other}"))),
@@ -860,8 +879,8 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::DbQuery(p) | Op::DbExec(p) | Op::CursorOpen(p) => {
             (plans[p as usize].argc as usize, 1)
         }
-        Op::CursorAdvance | Op::CursorRow => (1, 1),
-        Op::Return => (1, 0),
+        Op::CursorAdvance | Op::CursorFetch | Op::CursorRow => (1, 1),
+        Op::CursorClose | Op::Return => (1, 0),
     }
 }
 
@@ -1336,9 +1355,32 @@ mod tests {
             vec![plan(PlanKind::Query, 0), plan(PlanKind::Exec, 1)],
         )
         .is_err());
-        // Advance/Row on an empty stack underflow.
+        // Advance/Fetch/Row/Close on an empty stack underflow.
         assert!(mk(vec![Op::CursorAdvance, Op::Return], vec![], vec![]).is_err());
+        assert!(mk(vec![Op::CursorFetch, Op::Return], vec![], vec![]).is_err());
+        assert!(mk(vec![Op::CursorClose, Op::Return], vec![], vec![]).is_err());
         assert!(mk(vec![Op::CursorRow, Op::Return], vec![], vec![]).is_err());
+        let mut fetch = Vec::new();
+        encode_op(&mut fetch, Op::CursorFetch);
+        assert_eq!(fetch, vec![96]);
+        let mut close = Vec::new();
+        encode_op(&mut close, Op::CursorClose);
+        assert_eq!(close, vec![97]);
+        let fetched = mk(
+            vec![
+                Op::CursorOpen(0),
+                Op::CursorFetch,
+                Op::Pop,
+                Op::CursorOpen(0),
+                Op::CursorClose,
+                Op::LoadConst(0),
+                Op::Return,
+            ],
+            vec![Value::Int(1)],
+            vec![plan(PlanKind::Query, 0)],
+        )
+        .unwrap();
+        assert_eq!(Proc::decode(&fetched.encode()).unwrap().instrs, fetched.instrs);
         // The happy shape validates.
         let p = mk(
             vec![

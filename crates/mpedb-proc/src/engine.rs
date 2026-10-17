@@ -502,11 +502,16 @@ impl DbBridge for SnapshotBridge<'_> {
                 "proc: advance on an exhausted cursor stream".into(),
             ));
         };
-        let row = s.next()?;
-        if row.is_none() {
-            *slot = None; // drop the stream: releases its reader slot NOW
-        }
-        Ok(row)
+        s.next()
+    }
+
+    fn cursor_close(&mut self, stream: u32) -> Result<()> {
+        let slot = self
+            .streams
+            .get_mut(stream as usize)
+            .ok_or_else(|| Error::Internal("proc: unknown cursor stream id".into()))?;
+        *slot = None;
+        Ok(())
     }
 }
 
@@ -555,6 +560,12 @@ impl DbBridge for SessionBridge<'_, '_> {
     fn cursor_advance(&mut self, _stream: u32) -> Result<Option<Vec<Value>>> {
         Err(Error::Internal(
             "write procedure attempted a cursor advance (validator bug)".into(),
+        ))
+    }
+
+    fn cursor_close(&mut self, _stream: u32) -> Result<()> {
+        Err(Error::Internal(
+            "write procedure attempted a cursor close (validator bug)".into(),
         ))
     }
 }
