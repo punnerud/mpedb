@@ -126,18 +126,22 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
     }
     while !p.is_word("BEGIN") {
         let name = p.identifier()?;
+        let constant = p.word("CONSTANT");
         let ty = p.data_type()?;
-        if p.word("CONSTANT") || p.word("NOT") {
-            return Err(p.error("CONSTANT/NOT NULL variable constraints are not implemented"));
+        if p.word("NOT") {
+            return Err(p.error("NOT NULL variable constraints are not implemented"));
         }
         if p.symbol(":=") || p.word("DEFAULT") {
             let actual = p.expression()?;
             p.compatible(ty, actual)?;
         } else {
+            if constant {
+                return Err(p.error("a CONSTANT declaration requires an initializer"));
+            }
             p.constant(Value::Null)?;
         }
         p.builder.emit(ty.check())?;
-        let slot = p.add_local(name, ty, true)?;
+        let slot = p.add_local(name, ty, !constant)?;
         p.builder.emit(Op::StoreLocal(slot))?;
         p.want_symbol(";")?;
     }
@@ -411,7 +415,7 @@ impl Parser<'_> {
             ))
         })?;
         if !local.writable {
-            return Err(self.error("cannot assign to an IN parameter"));
+            return Err(self.error("cannot assign to an IN parameter or CONSTANT"));
         }
         self.want_symbol(":=")?;
         let actual = self.expression()?;

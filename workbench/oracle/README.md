@@ -61,11 +61,14 @@ Registration follows `ProcEngine::define`'s existing idempotent name/hash
 contract; Oracle CREATE-versus-OR-REPLACE catalog behavior is not implemented
 by this host API.
 
-The first compiler supports IN/OUT/IN OUT parameters and local variables of BOOLEAN and
-unconstrained NUMBER, exact numeric literals and comparisons, IS [NOT] NULL,
+The first compiler supports IN/OUT/IN OUT parameters, local variables and
+initialized CONSTANT declarations of BOOLEAN and unconstrained NUMBER,
+exact numeric literals and comparisons, IS [NOT] NULL,
 assignment, IF/ELSIF/ELSE, WHILE/LOOP, EXIT/CONTINUE [WHEN], and RETURN. Static
 type checks cover even skipped short-circuit branches; IN parameters cannot
-be assigned. A function that reaches END without RETURN raises. Routine END
+be assigned. Constants accept `:=` or `DEFAULT` initializers (including NULL),
+can reference earlier declarations, and reject assignment even in unreachable
+branches. A function that reaches END without RETURN raises. Routine END
 names must match, and an optional SQL*Plus slash must occupy its own line.
 Parameter lists follow Oracle's grammar: omit parentheses for zero parameters.
 

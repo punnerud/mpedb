@@ -264,6 +264,42 @@ fn boolean_logic_preserves_unknown_through_actual_frontend() {
 }
 
 #[test]
+fn constants_initialize_in_order_and_remain_read_only() {
+    let source = function(
+        "p NUMBER",
+        "NUMBER",
+        "a CONSTANT NUMBER := p / 3; b CONSTANT NUMBER DEFAULT a * 2; BEGIN RETURN b; END;",
+    );
+    assert_eq!(
+        call(&source, &[Value::Int(3)]).unwrap(),
+        Value::Numeric("2".into())
+    );
+    assert_eq!(call(&source, &[Value::Null]).unwrap(), Value::Null);
+    let source = function(
+        "",
+        "BOOLEAN",
+        "c CONSTANT BOOLEAN DEFAULT TRUE; BEGIN RETURN c; END;",
+    );
+    assert_eq!(call(&source, &[]).unwrap(), Value::Bool(true));
+    let source = function(
+        "",
+        "NUMBER",
+        "c CONSTANT NUMBER := NULL; BEGIN RETURN c; END;",
+    );
+    assert_eq!(call(&source, &[]).unwrap(), Value::Null);
+    for body in [
+        "c CONSTANT NUMBER; BEGIN RETURN c; END;",
+        "c CONSTANT NUMBER := 1; BEGIN c := 2; RETURN c; END;",
+        "c CONSTANT NUMBER := 1; BEGIN IF FALSE THEN c := 2; END IF; RETURN c; END;",
+        "c CONSTANT NUMBER := TRUE; BEGIN RETURN c; END;",
+        "c CONSTANT BOOLEAN DEFAULT 1; BEGIN RETURN c; END;",
+        "c CONSTANT NUMBER := c; BEGIN RETURN c; END;",
+    ] {
+        assert!(compile(&function("", "NUMBER", body)).is_err(), "{body}");
+    }
+}
+
+#[test]
 fn branches_declarations_and_assignments_keep_exact_numbers() {
     let source = function("p NUMBER", "NUMBER", "v NUMBER := -9007199254740992.12345; BEGIN IF p IS NULL THEN RETURN v; ELSIF p > 10 THEN v := p; ELSE v := 1.25; END IF; RETURN v; END;");
     assert_eq!(

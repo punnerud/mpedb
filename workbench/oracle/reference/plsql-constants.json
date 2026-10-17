@@ -1,0 +1,26 @@
+{
+  "oracle_version": "23.26.3.0.0",
+  "method": "Anonymous PL/SQL blocks executed against the real Oracle reference server; numeric output via TO_CHAR.",
+  "results": {
+    "numeric": {
+      "value": ".3333333333333333333333333333333333333333",
+      "source": "DECLARE c CONSTANT NUMBER := 1 / 3; BEGIN :out := TO_CHAR(c); END;"
+    },
+    "null": {
+      "value": null,
+      "source": "DECLARE c CONSTANT NUMBER := NULL; BEGIN :out := TO_CHAR(c); END;"
+    },
+    "boolean": {
+      "value": "true",
+      "source": "DECLARE c CONSTANT BOOLEAN DEFAULT TRUE; BEGIN IF c THEN :out := 'true'; ELSE :out := 'false'; END IF; END;"
+    },
+    "missing": {
+      "error": "ORA-06550: line 1, column 9:\nPLS-00322: declaration of a constant 'C' must contain an initialization assignment\nORA-06550: line 0, column 0:\nPL/SQL: Compilation unit analysis terminated\nHelp: https://docs.oracle.com/error-help/db/ora-06550/",
+      "source": "DECLARE c CONSTANT NUMBER; BEGIN :out := TO_CHAR(c); END;"
+    },
+    "assign": {
+      "error": "ORA-06550: line 1, column 39:\nPLS-00363: expression 'C' cannot be used as an assignment target\nORA-06550: line 1, column 39:\nPL/SQL: Statement ignored\nHelp: https://docs.oracle.com/error-help/db/ora-06550/",
+      "source": "DECLARE c CONSTANT NUMBER := 1; BEGIN c := 2; :out := TO_CHAR(c); END;"
+    }
+  }
+}
