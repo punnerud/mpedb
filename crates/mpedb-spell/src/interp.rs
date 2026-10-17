@@ -512,6 +512,21 @@ pub fn run(
                 stack.push(PValue::Tuple(Rc::new(items)));
             }
             Op::MissingReturn => return Err(rt_err("PL/SQL function reached END without RETURN")),
+            Op::OracleSelectOne => {
+                let PValue::List(rows) = stack.pop().expect("validated") else {
+                    return Err(type_err("PL/SQL INTO requires a query row set"));
+                };
+                match rows.len() {
+                    0 => return Err(Error::Oracle { code: 1403, message: "no data found".into() }),
+                    1 => {
+                        if !matches!(&rows[0], PValue::Tuple(_)) {
+                            return Err(type_err("PL/SQL INTO requires a query row tuple"));
+                        }
+                        stack.push(rows[0].clone());
+                    }
+                    _ => return Err(Error::Oracle { code: 1422, message: "exact fetch returns more than requested number of rows".into() }),
+                }
+            }
             Op::OracleVarchar(limit) => {
                 let value = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(oracle_text::varchar(value, limit)?));

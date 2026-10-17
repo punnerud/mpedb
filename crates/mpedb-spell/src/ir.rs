@@ -202,6 +202,9 @@ pub enum Op {
     /// Pop `plans[p].argc` scalar args, run the SELECT plan, push the rows
     /// as a list of tuples.
     DbQuery(u16),
+    /// Require exactly one query row, returning its tuple. Native PL/SQL
+    /// NO_DATA_FOUND / TOO_MANY_ROWS are structured Oracle exceptions.
+    OracleSelectOne,
     /// Pop `plans[p].argc` scalar args, run the DML plan, push the affected
     /// row count as an int.
     DbExec(u16),
@@ -304,6 +307,7 @@ const OP_PLSQL_DIV: u8 = 78;
 const OP_PLSQL_NEG: u8 = 79;
 const OP_PLSQL_INTEGER: u8 = 80;
 const OP_PLSQL_LOOP_BOUND: u8 = 81;
+const OP_ORACLE_SELECT_ONE: u8 = 82;
 
 
 
@@ -559,6 +563,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OraclePlSqlNeg => b.push(OP_PLSQL_NEG),
         Op::OraclePlSqlInteger => b.push(OP_PLSQL_INTEGER),
         Op::OraclePlSqlLoopBound => b.push(OP_PLSQL_LOOP_BOUND),
+        Op::OracleSelectOne => b.push(OP_ORACLE_SELECT_ONE),
         Op::OracleNeg => b.push(OP_ORACLE_NEG),
         Op::OracleVarchar(limit) => u16arg(OP_ORACLE_VARCHAR, limit),
         Op::OracleLoopBound => b.push(OP_ORACLE_LOOP_BOUND),
@@ -663,6 +668,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_PLSQL_NEG => Op::OraclePlSqlNeg,
         OP_PLSQL_INTEGER => Op::OraclePlSqlInteger,
         OP_PLSQL_LOOP_BOUND => Op::OraclePlSqlLoopBound,
+        OP_ORACLE_SELECT_ONE => Op::OracleSelectOne,
         OP_ORACLE_NEG => Op::OracleNeg,
         OP_ORACLE_VARCHAR => Op::OracleVarchar(u16arg()?),
         OP_ORACLE_LOOP_BOUND => Op::OracleLoopBound,
@@ -718,7 +724,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg | Op::OraclePlSqlNumber | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound => (1, 1),
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg | Op::OraclePlSqlNumber | Op::OraclePlSqlNeg | Op::OraclePlSqlInteger | Op::OraclePlSqlLoopBound | Op::OracleSelectOne => (1, 1),
         Op::OracleIntAdd | Op::OracleIntSub | Op::OracleIntMul
         | Op::OracleConcat
         | Op::OracleCharEq
@@ -1071,6 +1077,19 @@ mod tests {
         .unwrap();
         assert!(!p.has_exec());
         assert_eq!(p.max_stack(), 2);
+    }
+
+    #[test]
+    fn oracle_exact_fetch_round_trips_with_a_distinct_additive_opcode() {
+        let p = Proc::new("fetch".into(), 0, 0, vec![plan(PlanKind::Query, 0)], vec![],
+            vec![Op::DbQuery(0), Op::OracleSelectOne, Op::Return]).unwrap();
+        let blob = p.encode();
+        assert_eq!(Proc::decode(&blob).unwrap(), p);
+        for i in 0..blob.len() { assert!(Proc::decode(&blob[..i]).is_err()); }
+        let mut offset = 0;
+        assert_eq!(decode_op(&[82], &mut offset).unwrap(), Op::OracleSelectOne);
+        assert!(Proc::new("bad".into(), 0, 0, vec![], vec![],
+            vec![Op::OracleSelectOne, Op::Return]).is_err());
     }
 
     /// Cursor ops: encode/decode roundtrip, full decode fuzz (truncation at

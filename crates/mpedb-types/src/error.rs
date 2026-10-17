@@ -83,6 +83,9 @@ pub enum Error {
     /// the statement aborts and unwinds atomically. The payload is the raise
     /// message VERBATIM — sqlite reports exactly the user's text.
     Raise(String),
+    /// A native Oracle semantic exception. The positive ORA number is kept
+    /// separate from its text so PL/SQL handlers never parse error messages.
+    Oracle { code: u32, message: String },
     PrimaryKeyViolation {
         table: String,
         /// The PK columns, sqlite-spelled (`t.a` / `t.a, t.b`) — sqlite
@@ -238,6 +241,7 @@ impl fmt::Display for Error {
                 write!(f, "CHECK violation: {table}.{column} failed `{expr}`")
             }
             Error::Raise(m) => write!(f, "{m}"),
+            Error::Oracle { code, message } => write!(f, "ORA-{code:05}: {message}"),
             Error::PrimaryKeyViolation { table, pk } => {
                 let _ = table;
                 write!(f, "PRIMARY KEY violation in {pk}")

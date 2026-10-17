@@ -209,6 +209,12 @@ impl<'db> ProcEngine<'db> {
                     ))
                 }
             };
+            if let Some(expected) = call.expected_columns {
+                let actual = plan.output_decltypes(&schema).len();
+                if actual != expected as usize {
+                    return Err(at(format!("query returns {actual} columns but INTO has {expected} targets")));
+                }
+            }
             // Count what the CALLER supplies — `n_params` also counts the
             // reserved subplan/context tail (a scalar subquery, a literal
             // `'now'`), which the executor fills itself; requiring arguments

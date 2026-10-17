@@ -746,7 +746,7 @@ fn plsql_dynamic_dml_rejects_unimplemented_forms_before_publication() {
         "EXECUTE IMMEDIATE 'UPDATE accounts SET balance=:x';",
         "EXECUTE IMMEDIATE 'UPDATE accounts SET balance=1' USING n;",
         "EXECUTE IMMEDIATE sql_text;",
-        "EXECUTE IMMEDIATE 'SELECT balance FROM accounts' INTO n;",
+        "EXECUTE IMMEDIATE 'SELECT balance FROM accounts' BULK COLLECT INTO n;",
         "EXECUTE IMMEDIATE 'CREATE TABLE x(id NUMBER)';",
         "EXECUTE IMMEDIATE 'UPDATE accounts SET balance=1; DELETE FROM accounts';",
     ] {
@@ -754,4 +754,26 @@ fn plsql_dynamic_dml_rejects_unimplemented_forms_before_publication() {
         assert!(engine.define(&source,Lang::PlSql).is_err(),"{body}");
         assert!(engine.info("REFUSED").is_err(),"a rejected routine must not publish");
     }
+}
+
+#[test]
+fn plsql_dynamic_select_into_checks_cardinality_types_and_transaction_visibility() {
+    let (cfg,_guard)=test_config("plsql-select-into");
+    let db=Database::open_with_config(cfg).unwrap();seed_accounts(&db,&[(1,50),(2,20)]);
+    let engine=ProcEngine::new(&db);
+    engine.define("CREATE FUNCTION get_balance(p PLS_INTEGER) RETURN NUMBER IS n NUMBER; BEGIN EXECUTE IMMEDIATE 'SELECT balance FROM accounts WHERE id=:key' INTO n USING p; RETURN n; END;",Lang::PlSql).unwrap();
+    assert_eq!(engine.call("GET_BALANCE",&[Value::Int(1)]).unwrap(),ProcValue::Scalar(Value::Numeric("50".into())));
+    assert!(matches!(engine.call("GET_BALANCE",&[Value::Int(99)]),Err(Error::Oracle{code:1403,..})));
+    engine.define("CREATE FUNCTION adjust_read(p PLS_INTEGER,delta PLS_INTEGER) RETURN NUMBER IS n NUMBER; BEGIN EXECUTE IMMEDIATE 'UPDATE accounts SET balance=balance+:x WHERE id=:x' USING delta,p; EXECUTE IMMEDIATE 'SELECT balance FROM accounts WHERE id=:x' INTO n USING p; RETURN n; END;",Lang::PlSql).unwrap();
+    assert_eq!(engine.call("ADJUST_READ",&[Value::Int(1),Value::Int(10)]).unwrap(),ProcValue::Scalar(Value::Numeric("60".into())));
+    engine.define("CREATE FUNCTION too_many RETURN NUMBER IS n NUMBER; BEGIN EXECUTE IMMEDIATE 'UPDATE accounts SET balance=0'; EXECUTE IMMEDIATE 'SELECT balance FROM accounts' INTO n; RETURN n; END;",Lang::PlSql).unwrap();
+    assert!(matches!(engine.call("TOO_MANY",&[]),Err(Error::Oracle{code:1422,..})));
+    assert_eq!(balance(&db,1),60);assert_eq!(balance(&db,2),20);
+    engine.define("CREATE PROCEDURE fetch_pair(a OUT NUMBER,b OUT NUMBER) IS BEGIN EXECUTE IMMEDIATE 'SELECT balance,id FROM accounts WHERE id=1' INTO a,b; END;",Lang::PlSql).unwrap();
+    assert_eq!(engine.call("FETCH_PAIR",&[Value::Null,Value::Null]).unwrap(),ProcValue::Tuple(vec![ProcValue::Scalar(Value::Numeric("60".into())),ProcValue::Scalar(Value::Numeric("1".into()))]));
+    for source in [
+        "CREATE PROCEDURE bad(p IN NUMBER) IS BEGIN EXECUTE IMMEDIATE 'SELECT 1' INTO p; END;",
+        "CREATE PROCEDURE bad IS n NUMBER; m NUMBER; BEGIN EXECUTE IMMEDIATE 'SELECT 1' INTO n,m; END;",
+        "CREATE PROCEDURE bad IS n CONSTANT NUMBER:=0; BEGIN EXECUTE IMMEDIATE 'SELECT 1' INTO n; END;",
+    ] {assert!(engine.define(source,Lang::PlSql).is_err(),"{source}");}
 }

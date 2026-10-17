@@ -576,6 +576,7 @@ impl Compiler<'_> {
                 sql: sql.clone(),
                 kind,
                 argc: argc as u8,
+                expected_columns: None,
                 line,
                 col,
             })

@@ -28,6 +28,9 @@ pub struct SqlCall {
     pub sql: String,
     pub kind: CallKind,
     pub argc: u8,
+    /// Define-time query result width required by PL/SQL INTO; no stored
+    /// format change, because the linked plan and IR carry execution semantics.
+    pub expected_columns: Option<u16>,
     pub line: usize,
     pub col: usize,
 }
@@ -171,7 +174,7 @@ impl FuncBuilder {
         if let Some(i) = self
             .calls
             .iter()
-            .position(|c| c.sql == call.sql && c.kind == call.kind && c.argc == call.argc)
+            .position(|c| c.sql == call.sql && c.kind == call.kind && c.argc == call.argc && c.expected_columns == call.expected_columns)
         {
             return Ok(i as u16);
         }

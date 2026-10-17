@@ -274,8 +274,15 @@ strings become NULL. A real Oracle application procedure is extracted from
 Procedure errors roll back already-executed DML; stored procedures and their
 plans survive reopen. Scalar SQL functions continue to reject database work.
 
-This is a limited native dynamic-DML frontend, not complete dynamic SQL.
-Runtime-generated SQL strings, SELECT INTO, RETURNING/OUT binds, implicit SQL
+Literal dynamic SELECT now supports typed `INTO` targets too. The linker
+checks query column count, and additive IR opcode 82 performs exact fetch.
+No rows raises structured ORA-01403; multiple rows raises ORA-01422. Native
+Oracle application-source tests verify both errors and exact NUMBER results;
+transaction tests verify read-your-writes and rollback on a later fetch error.
+The existing Python/Rust opcodes and stored hashes keep their meanings.
+
+This is a limited native dynamic-SQL frontend, not complete dynamic SQL.
+Runtime-generated SQL strings, RETURNING/OUT binds, implicit SQL
 cursor attributes, DDL and anonymous dynamic blocks remain unsupported. The
 embedded statement also must be supported by MPEdb's SQL engine. See
 [Oracle's binding rules](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/native-dynamic-sql.html).

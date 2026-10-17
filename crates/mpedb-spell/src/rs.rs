@@ -626,6 +626,7 @@ impl Compiler {
                 sql: sql.value(),
                 kind,
                 argc: argc as u8,
+                expected_columns: None,
                 line: lc.line,
                 col: lc.column,
             })

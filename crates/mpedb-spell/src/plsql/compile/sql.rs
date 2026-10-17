@@ -1,5 +1,5 @@
-//! Literal native dynamic DML lowered to MPEdb's existing shared SQL plans.
-//! Runtime-generated SQL text, query INTO, OUT binds, DDL and anonymous blocks
+//! Literal native dynamic SQL lowered to MPEdb's existing shared SQL plans.
+//! Runtime-generated SQL text, OUT binds, DDL and anonymous blocks
 //! remain explicit gaps; no Python or PostgreSQL procedure translation occurs.
 use super::*;
 use crate::emit::{CallKind, SqlCall};
@@ -19,7 +19,32 @@ impl Parser<'_> {
         let source = value.clone();
         let span = self.tokens[self.at].span.start;
         self.at += 1;
-        let (sql, required) = normalize_dml(&source).map_err(|e| self.error(&e.to_string()))?;
+        let query = matches!(lex::lex(&source)?.first().map(|t| &t.token), Some(Token::Identifier { name, quoted: false }) if name == "SELECT");
+        let kind = if query {
+            CallKind::Query
+        } else {
+            CallKind::Exec
+        };
+        let (sql, required) =
+            normalize_sql(&source, kind).map_err(|e| self.error(&e.to_string()))?;
+        let mut into = Vec::new();
+        if query {
+            self.want_word("INTO")?;
+            loop {
+                let name = self.identifier()?;
+                let target = *self
+                    .locals
+                    .get(&name)
+                    .ok_or_else(|| self.error("unknown INTO target"))?;
+                if !target.writable {
+                    return Err(self.error("INTO target is constant or an IN parameter"));
+                }
+                into.push(target);
+                if !self.symbol(",") {
+                    break;
+                }
+            }
+        }
         let mut argc = 0usize;
         if self.word("USING") {
             loop {
@@ -50,23 +75,45 @@ impl Parser<'_> {
         let (line, col) = crate::emit::line_col(self.source, span);
         let index = self.builder.add_call(SqlCall {
             sql,
-            kind: CallKind::Exec,
+            kind,
             argc: u8::try_from(argc).map_err(|_| self.error("too many USING arguments"))?,
+            expected_columns: if query {
+                Some(u16::try_from(into.len()).map_err(|_| self.error("too many INTO targets"))?)
+            } else {
+                None
+            },
             line,
             col,
         })?;
-        self.builder.emit(Op::DbExec(index))?;
+        if query {
+            self.builder.emit(Op::DbQuery(index))?;
+            self.builder.emit(Op::OracleSelectOne)?;
+            for (i, target) in into.iter().enumerate() {
+                self.builder.emit(Op::Dup)?;
+                self.constant(Value::Int(i as i64))?;
+                self.builder.emit(Op::Index)?;
+                self.builder.emit(target.ty.check())?;
+                self.builder.emit(Op::StoreLocal(target.slot))?;
+            }
+        } else {
+            self.builder.emit(Op::DbExec(index))?;
+        }
         self.builder.emit(Op::Pop)?;
         Ok(())
     }
 }
 
+#[cfg(test)]
 fn normalize_dml(source: &str) -> Result<(String, usize)> {
+    normalize_sql(source, CallKind::Exec)
+}
+
+fn normalize_sql(source: &str, kind: CallKind) -> Result<(String, usize)> {
     let tokens = lex::lex(source)?;
-    if !matches!(tokens.first().map(|t|&t.token),Some(Token::Identifier{name,quoted:false}) if matches!(name.as_str(),"INSERT"|"UPDATE"|"DELETE"))
+    if !matches!(tokens.first().map(|t|&t.token),Some(Token::Identifier{name,quoted:false}) if match kind { CallKind::Query=>name=="SELECT", CallKind::Exec=>matches!(name.as_str(),"INSERT"|"UPDATE"|"DELETE"), CallKind::Rows=>false })
     {
         return Err(mpedb_types::Error::Unsupported(
-            "EXECUTE IMMEDIATE currently accepts INSERT, UPDATE and DELETE only".into(),
+            "EXECUTE IMMEDIATE accepts literal INSERT/UPDATE/DELETE or SELECT INTO only".into(),
         ));
     }
     let mut output = String::new();
@@ -99,7 +146,7 @@ fn normalize_dml(source: &str) -> Result<(String, usize)> {
             }
             Token::Symbol(";") => {
                 return Err(mpedb_types::Error::Unsupported(
-                    "dynamic DML must contain one SQL statement without a semicolon".into(),
+                    "dynamic SQL must contain one SQL statement without a semicolon".into(),
                 ))
             }
             Token::Identifier {
