@@ -36,6 +36,14 @@ generated primary keys; cleanup errors also cascade. These failures still need
 classification. Upstream assertions and requirement flags remain unchanged.
 These reference results do not describe MPEdb's implementation.
 
+A separate **clean SQLAlchemy backend conformance suite** (`test/dialect/test_suite.py`)
+completed with **1355 passed, 87 skipped, zero failures/errors**, in 162.91 seconds
+on private Python 3.12.15. Broad ORM fixture failures had left a `joined_base`
+table which polluted subsequent reflection assertions. Only idle disposable
+SQLAlchemy schemas were reset, with original grants/passwords preserved;
+upstream assertions and capability requirements remained unchanged. This clean
+backend result does not erase failures in the broad ORM run.
+
 ## Migration architecture
 
 The required migration path in **both directions** is:

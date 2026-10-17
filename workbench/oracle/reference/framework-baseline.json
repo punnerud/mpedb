@@ -88,5 +88,20 @@
     "assertions_modified": false,
     "early_failure_stop": false,
     "notes": "Clean disposable schemas; includes ORM fixtures without Oracle sequence-based primary key generation and cascading cleanup errors. Failures require classification; not MPEdb conformance."
+  },
+  "sqlalchemy_clean_backend_suite": {
+    "revision": "29e4255f413b9791e117b40ab12c76c9df6313d8",
+    "version": "2.0.44.dev0",
+    "python": "3.12.15",
+    "selection": "test/dialect/test_suite.py",
+    "passed": 1355,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 87,
+    "seconds": 162.91,
+    "exit_code": 0,
+    "green": true,
+    "assertions_modified": false,
+    "notes": "Original grants/passwords preserved; reset only idle SQLA_TEST, TEST_SCHEMA, TEST_SCHEMA_2. Broad ORM failures had left a joined_base table that contaminated reflection tests."
   }
 }
