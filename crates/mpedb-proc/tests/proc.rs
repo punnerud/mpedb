@@ -1572,3 +1572,80 @@ fn plsql_package_init_handler_stores_null() {
         ProcValue::Scalar(Value::Null)
     );
 }
+
+#[test]
+fn plsql_package_constant_starts_null() {
+    let (cfg, _guard) = test_config("plsql-package-constant");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE PACKAGE BODY ledger AS \
+             n CONSTANT PLS_INTEGER := NULL; \
+             m PLS_INTEGER; \
+             FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS \
+               seen PLS_INTEGER; \
+             BEGIN \
+               IF v IS NULL THEN \
+                 seen := m; \
+                 m := NULL; \
+                 RETURN seen; \
+               END IF; \
+               m := v; \
+               RETURN n; \
+             END; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(4)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Null]).unwrap(),
+        ProcValue::Scalar(Value::Int(4))
+    );
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(1)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE PACKAGE BODY kept AS \
+             n CONSTANT PLS_INTEGER := 7; \
+             m PLS_INTEGER; \
+             FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS \
+             BEGIN \
+               IF v IS NULL THEN \
+                 m := NULL; \
+                 RETURN n; \
+               END IF; \
+               m := v; \
+               RETURN n; \
+             END; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("KEPT.TOUCH", &[Value::Int(4)]).unwrap(),
+        ProcValue::Scalar(Value::Int(7))
+    );
+    assert_eq!(
+        engine.call("KEPT.TOUCH", &[Value::Null]).unwrap(),
+        ProcValue::Scalar(Value::Int(7))
+    );
+    let refused = engine
+        .define(
+            "CREATE PACKAGE BODY bad AS \
+             n CONSTANT PLS_INTEGER := NULL; \
+             FUNCTION touch RETURN PLS_INTEGER IS \
+             BEGIN n := NULL; RETURN n; END; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("cannot assign to a package constant"), "{refused}");
+}

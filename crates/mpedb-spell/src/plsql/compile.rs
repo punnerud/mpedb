@@ -76,12 +76,13 @@ struct NestedVar {
 }
 
 /// One package-level scalar. NULL means it has not been stored in this
-/// session, and an explicit NULL store stays NULL. The key const is
-/// `PACKAGE.NAME`.
+/// session, and an explicit NULL store stays NULL. A constant is never
+/// assigned after its initializer. The key const is `PACKAGE.NAME`.
 #[derive(Clone)]
 struct PackageVar {
     key_const: u16,
     ty: Type,
+    constant: bool,
 }
 
 struct Parser<'a> {

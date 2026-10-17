@@ -5,7 +5,8 @@
 //! The optional initialization section runs once per session, before the
 //! subprogram, and can store NULL. A handler that catches the section's
 //! exception can store NULL, and that finishes initialization. An exception
-//! that leaves the section does not. A package specification is refused.
+//! that leaves the section does not. A package constant may be initialized
+//! with NULL and cannot be assigned. A package specification is refused.
 
 use super::*;
 
@@ -24,6 +25,7 @@ impl Parser<'_> {
             ));
         }
         let mut vars = HashMap::new();
+        let mut initializers = Vec::new();
         while !self.is_word("FUNCTION") && !self.is_word("PROCEDURE") {
             if self.is_word("BEGIN") {
                 return Err(self.error(
@@ -31,15 +33,26 @@ impl Parser<'_> {
                 ));
             }
             let var_name = self.plain_name()?;
-            if self.word("CONSTANT") {
-                return Err(self.error("package constants are not implemented"));
-            }
+            let constant = self.word("CONSTANT");
             let ty = self.data_type(true)?;
             if self.word("NOT") {
                 return Err(self.error("a package variable cannot be NOT NULL"));
             }
-            // `:=` / `DEFAULT` is consumed even when the initializer is NULL.
-            if (self.symbol(":=") || self.word("DEFAULT")) && !self.word("NULL") {
+            let initializer = if self.symbol(":=") || self.word("DEFAULT") {
+                Some(self.package_literal()?)
+            } else {
+                None
+            };
+            if constant {
+                match &initializer {
+                    None => {
+                        return Err(self.error(
+                            "a CONSTANT declaration requires an initializer",
+                        ));
+                    }
+                    Some(value) => self.package_literal_fits(ty, value)?,
+                }
+            } else if matches!(&initializer, Some(value) if !matches!(value, Value::Null)) {
                 return Err(self.error("a package variable can only be initialized with NULL"));
             }
             self.want_symbol(";")?;
@@ -49,15 +62,26 @@ impl Parser<'_> {
             let key_const = self
                 .builder
                 .const_idx(Value::Text(format!("{package}.{var_name}")))?;
-            vars.insert(var_name, PackageVar { key_const, ty });
+            if let Some(value) = initializer.filter(|value| !matches!(value, Value::Null)) {
+                initializers.push((key_const, ty, value));
+            }
+            vars.insert(
+                var_name,
+                PackageVar {
+                    key_const,
+                    ty,
+                    constant,
+                },
+            );
         }
         self.package_vars = vars;
         self.package_name = Some(package.clone());
         let mut skel = self.compile_routine(source, false, true)?;
-        if self.word("BEGIN") {
+        let user_body = self.word("BEGIN");
+        if user_body || !initializers.is_empty() {
             self.builder.consts = std::mem::take(&mut skel.consts);
             self.builder.instrs = std::mem::take(&mut skel.instrs);
-            self.compile_package_init(&package)?;
+            self.compile_package_init(&package, &initializers, user_body)?;
             skel.consts = std::mem::take(&mut self.builder.consts);
             skel.instrs = std::mem::take(&mut self.builder.instrs);
         }
@@ -80,7 +104,12 @@ impl Parser<'_> {
     /// The flag is stored only after the section completes, including a
     /// handler that catches its exception. A raise that leaves the section
     /// retries on the next call. Assignments made before that raise stay stored.
-    fn compile_package_init(&mut self, package: &str) -> Result<()> {
+    fn compile_package_init(
+        &mut self,
+        package: &str,
+        initializers: &[(u16, Type, Value)],
+        user_body: bool,
+    ) -> Result<()> {
         self.builder.shift_jump_targets(1);
         self.builder.instrs.insert(0, Op::Jump(0));
         let function_at = 1u32;
@@ -91,14 +120,85 @@ impl Parser<'_> {
         self.constant(Value::Null)?;
         self.builder.emit(Op::Eq)?;
         self.builder.emit(Op::JumpIfFalse(function_at))?;
-        // Handlers jump to the next instruction. The flag store is that
-        // instruction, so a caught exception finishes init and a re-raise does not.
-        self.block_body()?;
+        for (key_const, ty, value) in initializers {
+            self.emit_package_initializer(*key_const, *ty, value)?;
+        }
+        if user_body {
+            // Handlers jump to the next instruction. The flag store is that
+            // instruction, so a caught exception finishes init and a re-raise does not.
+            self.block_body()?;
+        }
         self.constant(Value::Int(1))?;
         self.builder.emit(Op::PkgSet(flag))?;
         self.builder.emit(Op::Jump(function_at))?;
-        self.want_word("END")?;
-        self.want_symbol(";")
+        if user_body {
+            self.want_word("END")?;
+            self.want_symbol(";")?;
+        }
+        Ok(())
+    }
+
+    fn emit_package_initializer(&mut self, key_const: u16, ty: Type, value: &Value) -> Result<()> {
+        let stored = match value {
+            Value::Int(number)
+                if matches!(ty, Type::Number | Type::ConstrainedNumber { .. }) =>
+            {
+                Value::Numeric(number.to_string())
+            }
+            other => other.clone(),
+        };
+        self.constant(stored)?;
+        self.builder.emit(ty.check())?;
+        self.builder.emit(Op::PkgSet(key_const))?;
+        Ok(())
+    }
+
+    fn package_literal(&mut self) -> Result<Value> {
+        if self.word("NULL") {
+            return Ok(Value::Null);
+        }
+        if let Some(Token::Number(text)) = self.peek().cloned() {
+            self.at += 1;
+            if text.bytes().all(|byte| byte.is_ascii_digit()) {
+                let number = text.parse::<i64>().map_err(|_| {
+                    self.error("a package constant initializer is outside the supported integer range")
+                })?;
+                return Ok(Value::Int(number));
+            }
+            let numeric = mpedb_types::value::parse_numeric(&text)
+                .ok_or_else(|| self.error("unsupported NUMBER literal"))?;
+            return Ok(Value::Numeric(numeric));
+        }
+        if let Some(Token::String { value, national }) = self.peek().cloned() {
+            if national {
+                return Err(self.error(
+                    "national character strings require NVARCHAR2 runtime support",
+                ));
+            }
+            self.at += 1;
+            return Ok(Value::Text(value));
+        }
+        Err(self.error("a package constant initializer must be a literal"))
+    }
+
+    fn package_literal_fits(&self, ty: Type, value: &Value) -> Result<()> {
+        if matches!(value, Value::Null) {
+            return Ok(());
+        }
+        let ok = match (ty, value) {
+            (Type::Varchar(_), Value::Text(_)) => true,
+            (Type::PlsInteger, Value::Int(number)) => i32::try_from(*number).is_ok(),
+            (
+                Type::Number | Type::ConstrainedNumber { .. },
+                Value::Int(_) | Value::Numeric(_),
+            ) => true,
+            _ => false,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(self.error("incompatible package constant initializer"))
+        }
     }
 
     fn plain_name(&mut self) -> Result<String> {
@@ -109,6 +209,9 @@ impl Parser<'_> {
     }
 
     pub(super) fn assign_package(&mut self, package: PackageVar) -> Result<()> {
+        if package.constant {
+            return Err(self.error("cannot assign to a package constant"));
+        }
         self.want_symbol(":=")?;
         let actual = self.expression()?;
         self.compatible(package.ty, actual)?;
@@ -234,8 +337,12 @@ END ledger;
                 "duplicate package variable",
             ),
             (
-                "CREATE PACKAGE BODY ledger AS n CONSTANT PLS_INTEGER := NULL; FUNCTION touch RETURN PLS_INTEGER IS BEGIN RETURN 1; END; END;",
-                "package constants are not implemented",
+                "CREATE PACKAGE BODY ledger AS n CONSTANT PLS_INTEGER; FUNCTION touch RETURN PLS_INTEGER IS BEGIN RETURN 1; END; END;",
+                "a CONSTANT declaration requires an initializer",
+            ),
+            (
+                "CREATE PACKAGE BODY ledger AS n CONSTANT PLS_INTEGER := 1; FUNCTION touch RETURN PLS_INTEGER IS BEGIN n := NULL; RETURN n; END; END;",
+                "cannot assign to a package constant",
             ),
             (
                 "CREATE PACKAGE BODY ledger AS n PLS_INTEGER NOT NULL := 1; FUNCTION touch RETURN PLS_INTEGER IS BEGIN RETURN 1; END; END;",
@@ -422,5 +529,55 @@ END;
         assert_eq!(session.get("LEDGER.N"), Some(&Value::Null));
         let again = call(&proc, &mut session, Value::Null).unwrap_err();
         assert!(again.contains("ORA-01403"), "{again}");
+    }
+
+    #[test]
+    fn package_constant_starts_null_and_cannot_be_assigned() {
+        let source = r#"
+CREATE PACKAGE BODY ledger AS
+  n CONSTANT PLS_INTEGER := NULL;
+  m PLS_INTEGER;
+  FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS
+    seen PLS_INTEGER;
+  BEGIN
+    IF v IS NULL THEN
+      seen := m;
+      m := NULL;
+      RETURN seen;
+    END IF;
+    m := v;
+    RETURN n;
+  END;
+END;
+"#;
+        let proc = compiled(source);
+        let mut session = HashMap::new();
+        assert_eq!(call(&proc, &mut session, Value::Int(4)).unwrap(), Value::Null);
+        assert_eq!(call(&proc, &mut session, Value::Null).unwrap(), Value::Int(4));
+        assert_eq!(session.get("LEDGER.M"), Some(&Value::Null));
+        assert_eq!(call(&proc, &mut session, Value::Int(1)).unwrap(), Value::Null);
+        assert_ne!(session.get("LEDGER.N"), Some(&Value::Int(4)), "{session:?}");
+
+        let kept = r#"
+CREATE PACKAGE BODY ledger AS
+  n CONSTANT PLS_INTEGER := 7;
+  m PLS_INTEGER;
+  FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS
+  BEGIN
+    IF v IS NULL THEN
+      m := NULL;
+      RETURN n;
+    END IF;
+    m := v;
+    RETURN n;
+  END;
+END;
+"#;
+        let proc = compiled(kept);
+        let mut session = HashMap::new();
+        assert_eq!(call(&proc, &mut session, Value::Int(4)).unwrap(), Value::Int(7));
+        assert_eq!(call(&proc, &mut session, Value::Null).unwrap(), Value::Int(7));
+        assert_eq!(session.get("LEDGER.N"), Some(&Value::Int(7)));
+        assert_eq!(session.get("LEDGER.M"), Some(&Value::Null));
     }
 }
