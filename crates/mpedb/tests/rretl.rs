@@ -1533,12 +1533,36 @@ fn an_implicit_rowid_table_applies_and_puts_back() {
     assert_eq!(got, vec![-9, 4, -1], "edit carried back through the sign residual");
     assert!(d.rretl_fsck().unwrap().is_empty());
 
-    // A composite PK is still refused, with the shape named.
+    // An empty composite-key table is a valid zero-row transformation.
     d.query("CREATE TABLE pair (a INTEGER, b INTEGER, v ANY, PRIMARY KEY (a, b))", &[])
         .unwrap();
-    let e = d.rretl_apply("mag", "pair", "v").unwrap_err().to_string();
-    assert!(e.contains("2-column primary key"), "{e}");
+    assert_eq!(d.rretl_apply("mag", "pair", "v").unwrap().rows, 0);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn composite_keys_resume_across_chunks_and_keep_residuals_through_reopen() {
+    let _chunk=mpedb::rretl::ChunkGuard::new(2);
+    let (d,path)=db("composite-keys");define_abs_pair(&d);
+    d.query("CREATE TABLE compound (tenant TEXT, id INTEGER, v ANY, PRIMARY KEY (tenant,id))",&[]).unwrap();
+    let mut original=Vec::new();
+    for tenant in ["a","b","c"] {
+        for id in -2..=2 {
+            let value=if id%2==0 {-10-id} else {20+id};
+            d.query("INSERT INTO compound (tenant,id,v) VALUES ($1,$2,$3)",&[Value::Text(tenant.into()),Value::Int(id),Value::Int(value)]).unwrap();
+            original.push(vec![Value::Text(tenant.into()),Value::Int(id),Value::Int(value)]);
+        }
+    }
+    let run=d.rretl_apply("mag","compound","v").unwrap();assert_eq!(run.rows,15);assert_eq!(run.residuals,15);assert!(d.rretl_fsck().unwrap().is_empty());
+    d.rretl_revert(run.run_id).unwrap();assert_eq!(rows(d.query("SELECT tenant,id,v FROM compound ORDER BY tenant,id",&[]).unwrap()),original);
+    for column in ["tenant","id"] {assert!(d.rretl_apply("mag","compound",column).is_err());}
+    let run=d.rretl_apply("mag","compound","v").unwrap();drop(d);
+    let reopened=Database::open_from_file(std::path::Path::new(&path)).unwrap();
+    reopened.query("UPDATE compound SET v=99 WHERE tenant='b' AND id=0",&[]).unwrap();
+    reopened.rretl_putback(run.run_id).unwrap();
+    original[7][2]=Value::Int(-99);
+    assert_eq!(rows(reopened.query("SELECT tenant,id,v FROM compound ORDER BY tenant,id",&[]).unwrap()),original);
+    assert!(reopened.rretl_fsck().unwrap().is_empty());drop(reopened);let _=std::fs::remove_file(path);
 }
 
 /// The value saboteur's finding: a legal ~970-char TEXT pk overflowed the
@@ -1584,8 +1608,9 @@ fn plsql_functions_transform_and_reverse_through_rretl_with_lineage() {
     }
     let report = d.rretl_apply("oracle_bool", "t", "w").unwrap();
     assert_eq!(report.rows, 4);
-    assert_eq!(rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap()), vec![vec![Value::Bool(true)], vec![Value::Bool(false)], vec![Value::Null], vec![Value::Bool(true)]]);
+    // Querying the log must refresh DDL committed by apply itself.
     assert!(!d.rretl_log().unwrap().is_empty());
+    assert_eq!(rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap()), vec![vec![Value::Bool(true)], vec![Value::Bool(false)], vec![Value::Null], vec![Value::Bool(true)]]);
     d.rretl_revert(report.run_id).unwrap();
     assert_eq!(rows(d.query("SELECT w FROM t ORDER BY id", &[]).unwrap()), original.into_iter().map(|v| vec![v]).collect::<Vec<_>>());
     let _ = std::fs::remove_file(path);

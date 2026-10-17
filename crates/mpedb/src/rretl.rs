@@ -29,6 +29,9 @@
 //! false "artifact changed" (§12.2 attack 2). Each value is length-framed in
 //! the chain for the same reason the joint collision key is (§12.2 attack 1).
 
+mod identity;
+use identity::{RowKey, scan_sql, update_sql};
+
 use std::sync::Arc;
 
 use mpedb_spell::ir::Proc;
@@ -198,7 +201,7 @@ pub(crate) fn rows_of(r: ExecResult) -> Result<Vec<Vec<Value>>> {
 
 /// Resolved facts about the target column, checked against the LIVE schema.
 struct Target {
-    pk_col: String,
+    pk_cols: Vec<String>,
     col_type: ColumnType,
 }
 
@@ -220,28 +223,12 @@ impl crate::Database {
             .iter()
             .find(|t| t.name == table && !t.dead)
             .ok_or_else(|| Error::Unsupported(format!("no table named `{table}`")))?;
-        // Row identity: a declared single-column PK, or the hidden rowid of
-        // an implicit-rowid table — `rowid` is queryable, point-updatable and
-        // range-scannable exactly like a declared INTEGER PK (probed:
-        // PkRange + elided sort + PkPoint), and it is stable for the life of
-        // the row. Identity semantics are the PK contract either way: delete
-        // a row and re-use its identity (an explicit pk value, or a re-issued
-        // rowid) and putback treats the newcomer as an EDIT of that row,
-        // PutRes-gated like any other. Composite PKs stay a named refusal —
-        // their chunk resume needs a tuple comparison the planner does not
-        // have.
-        // #94's implicit rowid materializes IN the schema as a real column
-        // named `rowid` carrying the single-column PK — so the one-column
-        // branch covers it, and there is nothing special to detect here.
-        let pk_col = if t.primary_key.len() == 1 {
-            t.columns[t.primary_key[0] as usize].name.clone()
-        } else {
-            return Err(Error::Unsupported(format!(
-                "`{table}` has a {}-column primary key; rretl needs a single row \
-                 identity — a one-column PK or an implicit rowid",
-                t.primary_key.len()
-            )));
-        };
+        // Keep every PK component. The bounded scanner resumes with a
+        // lexicographic predicate, and the identity digest frames all fields.
+        if t.primary_key.is_empty() {
+            return Err(Error::Unsupported(format!("`{table}` has no row identity")));
+        }
+        let pk_cols = t.primary_key.iter().map(|&i| t.columns[i as usize].name.clone()).collect::<Vec<_>>();
         let col = t
             .columns
             .iter()
@@ -249,13 +236,13 @@ impl crate::Database {
             .ok_or_else(|| {
                 Error::Unsupported(format!("no column `{column}` in `{table}`"))
             })?;
-        if col.name == pk_col {
+        if pk_cols.contains(&col.name) {
             return Err(Error::Unsupported(
                 "transforming the PRIMARY KEY in place would change row identity; refused"
                     .into(),
             ));
         }
-        Ok(Target { pk_col, col_type: col.ty })
+        Ok(Target { pk_cols, col_type: col.ty })
     }
 
     /// Apply `pair` to every value of `table.column`, in place, in one
@@ -439,7 +426,7 @@ impl crate::Database {
                     continue;
                 }
             };
-            let pk_col = &target.pk_col;
+            let pk_col = &target.pk_cols;
             if top_for.get(&(table.clone(), column.clone())) == Some(&run_id) {
                 let mut c = CanonChain::new();
                 scan_pairs_ro(self, &table, pk_col, &column, |_, y| {
@@ -459,7 +446,7 @@ impl crate::Database {
                     let res = rows_of(self.query(
                         "SELECT count(*) FROM rretl_residual \
                          WHERE run_id = $1 AND pk_enc = $2",
-                        &[Value::Int(run_id), Value::Blob(pk_ref(pk))],
+                        &[Value::Int(run_id), Value::Blob(pk.reference())],
                     )?)?;
                     if res[0][0] == Value::Int(0) {
                         findings.push(format!(
@@ -478,6 +465,7 @@ impl crate::Database {
 
     /// Every lineage row, oldest first.
     pub fn rretl_log(&self) -> Result<Vec<RretlLogRow>> {
+        self.engine.refresh_schema_if_stale()?;
         let bundle = self.engine.schema();
         if !bundle.schema.tables.iter().any(|t| t.name == T_LINEAGE && !t.dead) {
             return Ok(Vec::new());
@@ -747,34 +735,29 @@ fn call1(p: &Arc<Proc>, x: &Value) -> Result<Value> {
 fn scan_pairs(
     s: &mut WriteSession<'_>,
     table: &str,
-    pk_col: &str,
+    pk_col: &[String],
     column: &str,
-    mut f: impl FnMut(&mut WriteSession<'_>, &Value, &Value) -> Result<()>,
+    mut f: impl FnMut(&mut WriteSession<'_>, &RowKey, &Value) -> Result<()>,
 ) -> Result<u64> {
     let chunk = chunk_rows();
-    let first = format!(
-        "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" ORDER BY \"{pk_col}\" LIMIT {chunk}"
-    );
-    let next = format!(
-        "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" WHERE \"{pk_col}\" > $1 \
-         ORDER BY \"{pk_col}\" LIMIT {chunk}"
-    );
-    let mut last: Option<Value> = None;
+    let (first, next) = scan_sql(table, pk_col, column, chunk);
+    let mut last: Option<RowKey> = None;
     let mut n = 0u64;
     loop {
         let rows = match &last {
             None => rows_of(s.query(&first, &[])?)?,
-            Some(pk) => rows_of(s.query(&next, std::slice::from_ref(pk))?)?,
+            Some(pk) => rows_of(s.query(&next, &pk.0)?)?,
         };
         let got = rows.len();
         if got == 0 {
             return Ok(n);
         }
         for row in &rows {
-            f(s, &row[0], &row[1])?;
+            let key = RowKey::from_row(row, pk_col.len())?;
+            f(s, &key, &row[pk_col.len()])?;
             n += 1;
         }
-        last = Some(rows[got - 1][0].clone());
+        last = Some(RowKey::from_row(&rows[got - 1], pk_col.len())?);
         if got < chunk {
             return Ok(n);
         }
@@ -840,34 +823,29 @@ fn residual_chain(s: &mut WriteSession<'_>, run_id: i64) -> Result<(String, u64)
 fn scan_pairs_ro(
     db: &crate::Database,
     table: &str,
-    pk_col: &str,
+    pk_col: &[String],
     column: &str,
-    mut f: impl FnMut(&Value, &Value) -> Result<()>,
+    mut f: impl FnMut(&RowKey, &Value) -> Result<()>,
 ) -> Result<u64> {
     let chunk = chunk_rows();
-    let first = format!(
-        "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" ORDER BY \"{pk_col}\" LIMIT {chunk}"
-    );
-    let next = format!(
-        "SELECT \"{pk_col}\", \"{column}\" FROM \"{table}\" WHERE \"{pk_col}\" > $1 \
-         ORDER BY \"{pk_col}\" LIMIT {chunk}"
-    );
-    let mut last: Option<Value> = None;
+    let (first, next) = scan_sql(table, pk_col, column, chunk);
+    let mut last: Option<RowKey> = None;
     let mut n = 0u64;
     loop {
         let rows = match &last {
             None => rows_of(db.query(&first, &[])?)?,
-            Some(pk) => rows_of(db.query(&next, std::slice::from_ref(pk))?)?,
+            Some(pk) => rows_of(db.query(&next, &pk.0)?)?,
         };
         let got = rows.len();
         if got == 0 {
             return Ok(n);
         }
         for row in &rows {
-            f(&row[0], &row[1])?;
+            let key = RowKey::from_row(row, pk_col.len())?;
+            f(&key, &row[pk_col.len()])?;
             n += 1;
         }
-        last = Some(rows[got - 1][0].clone());
+        last = Some(RowKey::from_row(&rows[got - 1], pk_col.len())?);
         if got < chunk {
             return Ok(n);
         }
@@ -946,13 +924,13 @@ fn apply_in(
     // strictly LIFO — see `lifo_gate`.
 
     let run_id = next_run_id(s)?;
-    let pk_col = &target.pk_col;
+    let pk_col = &target.pk_cols;
 
     // Pass 1, streaming (O(chunk) heap regardless of table size): transform,
     // persist, and chain — the chains see the same pk-ordered stream a
     // one-shot scan would produce, because chunk resume is `pk > last` on a
     // key the run never changes.
-    let update = format!("UPDATE \"{table}\" SET \"{column}\" = $1 WHERE \"{pk_col}\" = $2");
+    let update = update_sql(table, pk_col, column);
     let mut source = CanonChain::new();
     let mut output = CanonChain::new();
     let mut seen: std::collections::HashMap<[u8; 32], Vec<u8>> = std::collections::HashMap::new();
@@ -1024,13 +1002,13 @@ fn apply_in(
 
         source.push(x);
         output.push(&y);
-        s.query(&update, &[y, pk.clone()])?;
+        s.query(&update, &pk.update_args(y))?;
         if let Some(r) = r {
             s.query(
                 "INSERT INTO rretl_residual (run_id, pk_enc, residual) VALUES ($1, $2, $3)",
                 &[
                     Value::Int(run_id),
-                    Value::Blob(pk_ref(pk)),
+                    Value::Blob(pk.reference()),
                     r,
                 ],
             )?;
@@ -1054,7 +1032,7 @@ fn apply_in(
             Some(_) => {
                 let res = rows_of(s.query(
                     "SELECT residual FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
-                    &[Value::Int(run_id), Value::Blob(pk_ref(pk))],
+                    &[Value::Int(run_id), Value::Blob(pk.reference())],
                 )?)?;
                 let Some(r) = res.into_iter().next().and_then(|mut r| {
                     if r.is_empty() { None } else { Some(r.remove(0)) }
@@ -1182,7 +1160,7 @@ fn revert_in(
     lifo_gate(s, run_id, &table, &column)?;
     let lens = db.load_lens_for_rretl(&pair)?;
     let target = db.resolve_target(&table, &column)?;
-    let pk_col = &target.pk_col;
+    let pk_col = &target.pk_cols;
 
     // The residuals themselves are gated FIRST (they are not user-editable
     // state, and the final source-hash check would catch a tampered one only
@@ -1204,14 +1182,14 @@ fn revert_in(
         )));
     }
 
-    let update = format!("UPDATE \"{table}\" SET \"{column}\" = $1 WHERE \"{pk_col}\" = $2");
+    let update = update_sql(&table, pk_col, &column);
     let mut back = CanonChain::new();
     let n_rows = scan_pairs(s, &table, pk_col, &column, |s, pk, y| {
         let x = match &lens.rex {
             Some(_) => {
                 let res = rows_of(s.query(
                     "SELECT residual FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
-                    &[Value::Int(run_id), Value::Blob(pk_ref(pk))],
+                    &[Value::Int(run_id), Value::Blob(pk.reference())],
                 )?)?;
                 // NULL as a residual VALUE would arrive here as Value::Null in
                 // a present row and feed inverse(y, NULL); an ABSENT row is
@@ -1229,7 +1207,7 @@ fn revert_in(
             None => call1(&lens.inverse, y)?,
         };
         back.push(&x);
-        s.query(&update, &[x, pk.clone()])?;
+        s.query(&update, &pk.update_args(x))?;
         Ok(())
     })?;
     if back.hex() != source_hash {
@@ -1284,7 +1262,7 @@ fn putback_in(
     lifo_gate(s, run_id, &table, &column)?;
     let lens = db.load_lens_for_rretl(&pair)?;
     let target = db.resolve_target(&table, &column)?;
-    let pk_col = &target.pk_col;
+    let pk_col = &target.pk_cols;
 
     // Deliberately NO output-hash gate here — an edited column is the entire
     // point of putback. What replaces it: the RESIDUAL gate (the residual
@@ -1295,14 +1273,14 @@ fn putback_in(
     // path).
     residual_gate(s, run_id, &residual_hash, "putback")?;
 
-    let update = format!("UPDATE \"{table}\" SET \"{column}\" = $1 WHERE \"{pk_col}\" = $2");
+    let update = update_sql(&table, pk_col, &column);
     let mut consumed = 0u64;
     let n_rows = scan_pairs(s, &table, pk_col, &column, |s, pk, y| {
         let x = match &lens.rex {
             Some(rex) => {
                 let res = rows_of(s.query(
                     "SELECT residual FROM rretl_residual WHERE run_id = $1 AND pk_enc = $2",
-                    &[Value::Int(run_id), Value::Blob(pk_ref(pk))],
+                    &[Value::Int(run_id), Value::Blob(pk.reference())],
                 )?)?;
                 let Some(r) = res.into_iter().next().and_then(|mut r| {
                     if r.is_empty() { None } else { Some(r.remove(0)) }
@@ -1366,7 +1344,7 @@ fn putback_in(
                 x
             }
         };
-        s.query(&update, &[x, pk.clone()])?;
+        s.query(&update, &pk.update_args(x))?;
         Ok(())
     })?;
 
@@ -1381,7 +1359,7 @@ fn putback_in(
     Ok(RretlReport { run_id, rows: n_rows, residuals: consumed })
 }
 
-fn putres_err(pk: &Value, y: &Value, e: &Error) -> Error {
+fn putres_err(pk: &RowKey, y: &Value, e: &Error) -> Error {
     Error::Unsupported(format!(
         "putback verification could not run on row {pk:?} (edited value {y:?}): {e}; \
          rolled back"
