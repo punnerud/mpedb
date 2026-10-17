@@ -1017,6 +1017,10 @@ pub fn run_with_package(
                 let index = stack.pop().expect("validated");
                 stack.push(nested_exists(collection, index)?);
             }
+            Op::NestedFirst | Op::NestedLast => {
+                let collection = stack.pop().expect("validated");
+                stack.push(nested_bound(collection, matches!(op, Op::NestedLast))?);
+            }
             Op::PkgGet(index) => {
                 let key = package_key(&proc.consts, index)?;
                 let value = package.get(key).cloned().unwrap_or(Value::Null);
@@ -1261,6 +1265,32 @@ fn nested_exists(collection: PValue, index: PValue) -> Result<PValue> {
     };
     let exists = index >= 1 && index as usize <= list.len();
     Ok(PValue::Scalar(Value::Bool(exists)))
+}
+
+/// `FIRST` and `LAST` of a dense nested table. A NULL collection raises.
+/// An empty table pushes NULL. A stored NULL element does not move either bound.
+fn nested_bound(collection: PValue, last: bool) -> Result<PValue> {
+    let list = match collection {
+        PValue::Scalar(Value::Null) => {
+            return Err(Error::Oracle {
+                code: 6531,
+                message: "Reference to uninitialized collection".into(),
+            })
+        }
+        PValue::List(list) => list,
+        other => {
+            return Err(type_err(format!(
+                "expected a nested table, got {}",
+                tyname(&other)
+            )))
+        }
+    };
+    if list.is_empty() {
+        return Ok(PValue::Scalar(Value::Null));
+    }
+    let index = if last { list.len() } else { 1 };
+    let index = i64::try_from(index).map_err(|_| rt_err("nested table bound exceeds i64"))?;
+    Ok(PValue::Scalar(Value::Int(index)))
 }
 
 /// Implicit `SQL%` attribute. `ISOPEN` is always false. The other three
