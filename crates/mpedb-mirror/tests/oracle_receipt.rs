@@ -4,6 +4,83 @@ use mpedb_mirror::{
     sourcecfg, NetOp, NetOpKind, SourceSpec,
 };
 use mpedb_types::Value;
+// Isolated no-foreign-writer fixture for the common ACK bridge. This does not
+// implement production conflict/echo policy and is never exposed as an adapter.
+struct PostimageTransport<'a> {
+    source: &'a mut OracleSource,
+    tables: &'a [mpedb_mirror::oracle::OracleTable],
+    metadata: &'a mpedb_mirror::OracleBootstrap,
+    ledger: &'a mpedb_mirror::oracle_source::OracleLedgerIdentity,
+    file_incarnation: [u8; 16],
+}
+impl mpedb_mirror::SourceAdapter for PostimageTransport<'_> {
+    fn pull(
+        &mut self,
+        _: &Vec<u8>,
+        _: usize,
+    ) -> mpedb_types::Result<Option<mpedb_mirror::PullBatch>> {
+        Ok(None)
+    }
+    fn head(&mut self) -> mpedb_types::Result<Vec<u8>> {
+        Ok(self.metadata.cursor.clone())
+    }
+    fn zero_cursor(&self) -> Vec<u8> {
+        self.metadata.cursor.clone()
+    }
+    fn read_table_rows(&mut self, _: u32) -> mpedb_types::Result<Vec<Vec<Value>>> {
+        unreachable!()
+    }
+    fn push(&mut self, _: &[NetOp]) -> mpedb_types::Result<Vec<bool>> {
+        unreachable!()
+    }
+    fn ensure_source_state(&mut self, _: &str, _: u64, _: &str) -> mpedb_types::Result<()> {
+        unreachable!()
+    }
+    fn read_source_state(&mut self, _: &str) -> mpedb_types::Result<Option<(u64, String)>> {
+        unreachable!()
+    }
+    fn cas_source_state(&mut self, _: &str, _: u64, _: u64, _: &str) -> mpedb_types::Result<bool> {
+        unreachable!()
+    }
+    fn push_versioned(
+        &mut self,
+        from: Option<&Vec<u8>>,
+        ops: &[NetOp],
+        context: &mpedb_mirror::PushContext,
+    ) -> mpedb_types::Result<mpedb_mirror::PushReply> {
+        assert_eq!(from, Some(&self.metadata.cursor));
+        assert_eq!(context.generations.len(), ops.len());
+        let epoch = context.epoch.unwrap();
+        assert_eq!(epoch.authority, mpedb_mirror::Authority::Source);
+        let mut h = blake3::Hasher::new();
+        h.update(b"native Oracle postimage ACK fixture");
+        h.update(&self.file_incarnation);
+        h.update(&epoch.epoch.to_be_bytes());
+        for (op, generation) in ops.iter().zip(&context.generations) {
+            h.update(&op.table_id.to_be_bytes());
+            h.update(&generation.to_be_bytes());
+            let key = mpedb_types::keycode::encode_key_exact(&op.pk);
+            h.update(&(key.len() as u64).to_be_bytes());
+            h.update(&key);
+        }
+        let request = OracleWriteRequest {
+            mirror_id: &self.metadata.mirror_id,
+            token: *h.finalize().as_bytes(),
+            epoch: epoch.epoch,
+            authority: "source",
+            state_identity: &self.metadata.state_identity,
+            ledger_identity: self.ledger,
+        };
+        let images = self
+            .source
+            .write_batch_receipted(self.tables, ops, &request)?;
+        Ok(mpedb_mirror::PushReply {
+            applied: vec![true; ops.len()],
+            postimages: Some(images),
+        })
+    }
+}
+
 #[test]
 #[ignore = "requires dedicated MPEDB_ORACLE_FENCE test owner and private config"]
 fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches() {
@@ -240,6 +317,40 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
             .len(),
         1
     );
+    let metadata = mpedb_mirror::load_oracle_bootstrap(&db).unwrap();
+    let nonce: Vec<u8> = c.query_row_as("SELECT SYS_GUID() FROM dual", &[]).unwrap();
+    let nonce: [u8; 16] = nonce.try_into().unwrap();
+    let mut s = db.begin().unwrap();
+    s.set_capture(false);
+    s.sys_record_put("mir", b"fixture/file-incarnation", &nonce)
+        .unwrap();
+    s.commit().unwrap();
+    db.query(
+        "UPDATE \"MPEDB_RECEIPT_CASE\" SET \"GENERATED_VALUE\"=$1 WHERE \"ID\"=$2",
+        &[Value::Numeric("0".into()), Value::Numeric("3".into())],
+    )
+    .unwrap();
+    let mut transport = PostimageTransport {
+        source: &mut source,
+        tables: &tables,
+        metadata: &metadata,
+        ledger: &ledger,
+        file_incarnation: nonce,
+    };
+    assert_eq!(
+        mpedb_mirror::push_batch(&db, &mut transport)
+            .unwrap()
+            .upserts,
+        1
+    );
+    assert!(
+        matches!(db.query("SELECT \"GENERATED_VALUE\" FROM \"MPEDB_RECEIPT_CASE\" WHERE \"ID\"=$1",&[Value::Numeric("3".into())]).unwrap(),mpedb::ExecResult::Rows {rows,..} if rows==vec![vec![Value::Numeric("4".into())]])
+    );
+    assert!(!db
+        .sys_record_scan("cdc")
+        .unwrap()
+        .iter()
+        .any(|(k, _)| k.starts_with(b"d/")));
     drop(db);
     std::fs::remove_file(&dest).unwrap();
     c.execute(

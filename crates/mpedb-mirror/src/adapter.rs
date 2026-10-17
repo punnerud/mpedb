@@ -53,6 +53,23 @@ impl PullBatch {
     }
 }
 
+/// Local snapshot that produced a push. Generations are positional and must
+/// be namespaced by a durable FILE incarnation when deriving receipt tokens;
+/// a path or transaction number alone can be reused after reimport.
+#[derive(Clone, Debug)]
+pub struct PushContext {
+    pub epoch: Option<crate::state::Epoch>,
+    pub generations: Vec<u64>,
+}
+/// One result per operation. None preserves legacy adapters' exact-image
+/// assumption; Some supplies actual source postimages (generated columns, etc).
+/// Rejected operations carry no image; applied deletes carry None.
+#[derive(Clone, Debug)]
+pub struct PushReply {
+    pub applied: Vec<bool>,
+    pub postimages: Option<Vec<Option<Vec<Value>>>>,
+}
+
 /// The pull side of a source adapter (§5.4). Push is added in M5.
 pub trait SourceAdapter {
     /// Pull the next batch of net changes strictly after `from`, coalescing up
@@ -102,6 +119,26 @@ pub trait SourceAdapter {
     fn push_checked(&mut self, from: &Cursor, ops: &[NetOp]) -> Result<Vec<bool>> {
         let _ = from;
         self.push(ops)
+    }
+
+    /// Receipt-capable push boundary. `from` selects checked source-wins push;
+    /// None selects local-wins. The default retains existing adapter behavior.
+    /// Adapters using durable receipts must preserve the supplied generation
+    /// identity and return ORIGINAL postimages when replaying committed work.
+    fn push_versioned(
+        &mut self,
+        from: Option<&Cursor>,
+        ops: &[NetOp],
+        _context: &PushContext,
+    ) -> Result<PushReply> {
+        let applied = match from {
+            Some(from) => self.push_checked(from, ops)?,
+            None => self.push(ops)?,
+        };
+        Ok(PushReply {
+            applied,
+            postimages: None,
+        })
     }
 
     // ---- authority-switch fence (DESIGN-MIRROR §7) ----

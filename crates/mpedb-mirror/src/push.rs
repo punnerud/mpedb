@@ -13,7 +13,7 @@ use mpedb::Database;
 use mpedb_core::{DirtyEntry, DirtyOp};
 use mpedb_types::{keycode, Error, Result};
 
-use crate::adapter::{NetOp, NetOpKind, SourceAdapter};
+use crate::adapter::{NetOp, NetOpKind, PushContext, PushReply, SourceAdapter};
 use crate::state::{self, Authority, ConflictKind, Epoch, ParkRecord};
 
 /// What a push did.
@@ -44,7 +44,10 @@ fn now_micros() -> i64 {
 /// Push all pending local changes to the source. No-op when the dirty-set is
 /// empty.
 pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<PushStats> {
-    let schema = db.schema().clone();
+    let schema;
+    let epoch_bytes;
+    let cursor;
+    let cfg_bytes;
 
     // 1. scan the dirty-set + read upsert images at a brief snapshot, then drop
     //    the writer lock before any (slow) source I/O.
@@ -53,16 +56,19 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
     {
         let mut s = db.begin()?;
         s.set_capture(false);
+        schema = s.schema();
+        epoch_bytes = s.sys_record_get(state::MIR_NS, state::KEY_EPOCH)?;
+        cursor = s.sys_record_get(state::MIR_NS, state::KEY_CUR)?;
+        cfg_bytes = s.sys_record_get(state::MIR_NS, state::KEY_CFG)?;
         for (subkey, val) in s.sys_record_scan_range("cdc", b"d/", b"d0")? {
             if subkey.len() < 6 {
                 return Err(Error::Corrupt("short cdc dirty key".into()));
             }
             let de = DirtyEntry::decode(&val)?;
             let table_id = u32::from_be_bytes(subkey[2..6].try_into().unwrap());
-            let tdef = schema
-                .tables
-                .get(table_id as usize)
-                .ok_or_else(|| Error::Corrupt(format!("dirty entry for unknown table {table_id}")))?;
+            let tdef = schema.tables.get(table_id as usize).ok_or_else(|| {
+                Error::Corrupt(format!("dirty entry for unknown table {table_id}"))
+            })?;
             let pk = keycode::decode_key(&de.pk_keycode, &tdef.pk_types())?;
             let kind = match de.op {
                 DirtyOp::Upsert => match s.get_by_pk(table_id, &pk)? {
@@ -89,24 +95,20 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
     //    default after import), write-back is source-wins: detect a concurrent
     //    source write on the same PK and leave that op un-applied (§6, §8). When
     //    mpedb holds authority (S6/S7 drain), local-wins → unconditional push.
-    let source_authoritative = match db.sys_record_get(state::MIR_NS, state::KEY_EPOCH)? {
-        Some(b) => Epoch::decode(&b)?.authority == Authority::Source,
-        None => true,
-    };
-    let applied: Vec<bool> = if source_authoritative {
-        let from = db
-            .sys_record_get(state::MIR_NS, state::KEY_CUR)?
-            .unwrap_or_else(|| adapter.zero_cursor());
-        adapter.push_checked(&from, &ops)?
+    let epoch = epoch_bytes.as_deref().map(Epoch::decode).transpose()?;
+    let source_authoritative = epoch.is_none_or(|e| e.authority == Authority::Source);
+    let from = if source_authoritative {
+        Some(cursor.unwrap_or_else(|| adapter.zero_cursor()))
     } else {
-        // local-wins, but still per-op: a row the source REJECTS (a constraint
-        // mpedb does not mirror, a value outside a narrower source column) parks
-        // alone rather than wedging the whole write-back (CONF#38).
-        adapter.push(&ops)?
+        None
     };
-    if applied.len() != ops.len() {
-        return Err(Error::Corrupt("push_checked returned a mis-sized result".into()));
-    }
+    let context = PushContext {
+        epoch,
+        generations: pending.iter().map(|p| p.last_txn).collect(),
+    };
+    let reply = adapter.push_versioned(from.as_ref(), &ops, &context)?;
+    validate_reply(&schema, &ops, &reply)?;
+    let applied = &reply.applied;
 
     // 3. tally, clear the applied dirty entries, and park the rejected ones —
     //    all in one capture-suppressed txn. An applied entry is cleared ONLY if
@@ -119,20 +121,78 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
     {
         let mut s = db.begin()?;
         s.set_capture(false);
+        if s.sys_record_get(state::MIR_NS, state::KEY_EPOCH)? != epoch_bytes
+            || s.sys_record_get(state::MIR_NS, state::KEY_CFG)? != cfg_bytes
+        {
+            return Err(Error::Unsupported("mirror authority/config changed during push; retain dirty entries and recover before acknowledging".into()));
+        }
+        let current_schema = s.schema();
+        let used = pending
+            .iter()
+            .map(|p| p.table_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for id in used {
+            let old = schema
+                .tables
+                .get(id as usize)
+                .ok_or_else(|| Error::Corrupt("pushed table disappeared".into()))?;
+            let current = current_schema
+                .tables
+                .get(id as usize)
+                .ok_or_else(|| Error::Unsupported("mirror schema changed during push".into()))?;
+            if (mpedb_types::Schema {
+                tables: vec![old.clone()],
+            })
+            .hash()
+                != (mpedb_types::Schema {
+                    tables: vec![current.clone()],
+                })
+                .hash()
+            {
+                return Err(Error::Unsupported(
+                    "mirror carrier schema changed during push; retain dirty entries".into(),
+                ));
+            }
+        }
         for (i, op) in ops.iter().enumerate() {
             let p = &pending[i];
+            let same_generation = s
+                .sys_record_get("cdc", &p.subkey)?
+                .map(|v| DirtyEntry::decode(&v).map(|d| d.last_txn == p.last_txn))
+                .transpose()?
+                .unwrap_or(false);
             if applied[i] {
                 match op.kind {
                     NetOpKind::Upsert(_) => stats.upserts += 1,
                     NetOpKind::Delete => stats.deletes += 1,
                 }
-                if let Some(cur) = s.sys_record_get("cdc", &p.subkey)? {
-                    if DirtyEntry::decode(&cur)?.last_txn == p.last_txn {
-                        s.sys_record_delete("cdc", &p.subkey)?;
+                if same_generation {
+                    if let Some(images) = &reply.postimages {
+                        if let Some(values) = &images[i] {
+                            let current = s.get_by_pk(op.table_id, &op.pk)?;
+                            if let NetOpKind::Upsert(original) = &op.kind {
+                                if !current.as_ref().is_some_and(|v| same_values(v, original)) {
+                                    return Err(Error::Unsupported("mirror row changed without a dirty-generation update; postimage acknowledgement refused".into()));
+                                }
+                            }
+                            if !s.update_by_pk(op.table_id, values)? {
+                                return Err(Error::Corrupt(
+                                    "acknowledged mirror row disappeared".into(),
+                                ));
+                            }
+                        }
                     }
+                    s.sys_record_delete("cdc", &p.subkey)?;
+                    s.sys_record_delete(
+                        state::MIR_NS,
+                        &state::park_key(p.table_id, &p.pk_keycode),
+                    )?;
                 }
             } else {
                 stats.conflicts += 1;
+                if !same_generation {
+                    continue;
+                }
                 let rec = ParkRecord {
                     kind: ConflictKind::PushRejected,
                     wall_us: now,
@@ -149,6 +209,58 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
         s.commit()?;
     }
     Ok(stats)
+}
+
+fn same_values(a: &[mpedb_types::Value], b: &[mpedb_types::Value]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| match (a, b) {
+            (mpedb_types::Value::Float(a), mpedb_types::Value::Float(b)) => {
+                a.to_bits() == b.to_bits()
+            }
+            _ => a == b,
+        })
+}
+
+fn validate_reply(schema: &mpedb_types::Schema, ops: &[NetOp], reply: &PushReply) -> Result<()> {
+    if reply.applied.len() != ops.len()
+        || reply
+            .postimages
+            .as_ref()
+            .is_some_and(|v| v.len() != ops.len())
+    {
+        return Err(Error::Corrupt(
+            "versioned push returned a mis-sized result".into(),
+        ));
+    }
+    if let Some(images) = &reply.postimages {
+        for ((op, &applied), image) in ops.iter().zip(&reply.applied).zip(images) {
+            match (applied, &op.kind, image) {
+                (false, _, None) | (true, NetOpKind::Delete, None) => {}
+                (true, NetOpKind::Upsert(_), Some(values)) => {
+                    let table = schema.tables.get(op.table_id as usize).ok_or_else(|| {
+                        Error::Corrupt("postimage references unknown table".into())
+                    })?;
+                    if values.len() != table.columns.len() {
+                        return Err(Error::Corrupt("push postimage width mismatch".into()));
+                    }
+                    let pk = table
+                        .primary_key
+                        .iter()
+                        .map(|&k| values[k as usize].clone())
+                        .collect::<Vec<_>>();
+                    if keycode::encode_key_exact(&pk) != keycode::encode_key_exact(&op.pk) {
+                        return Err(Error::Corrupt("push postimage changed row identity".into()));
+                    }
+                }
+                _ => {
+                    return Err(Error::Corrupt(
+                        "push postimage does not match its result/operation".into(),
+                    ))
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -189,14 +301,18 @@ mod tests {
         };
 
         // LOCAL mpedb changes (captured — cdc\0tabs was enabled at import)
-        db.query("UPDATE users SET age=$1 WHERE id=$2", &[Value::Int(99), Value::Int(1)])
-            .unwrap();
+        db.query(
+            "UPDATE users SET age=$1 WHERE id=$2",
+            &[Value::Int(99), Value::Int(1)],
+        )
+        .unwrap();
         db.query(
             "INSERT INTO users (id,email,age) VALUES ($1,$2,$3)",
             &[Value::Int(5), Value::Text("e@x".into()), Value::Int(60)],
         )
         .unwrap();
-        db.query("DELETE FROM users WHERE id=$1", &[Value::Int(2)]).unwrap();
+        db.query("DELETE FROM users WHERE id=$1", &[Value::Int(2)])
+            .unwrap();
 
         // adapter over the source, tracking installed so echo tagging works
         let mut adapter =
@@ -266,8 +382,11 @@ mod tests {
             .unwrap();
 
         // LOCAL mpedb writes: id=1 collides with the source write; id=3 does not.
-        db.query("UPDATE users SET age=$1 WHERE id=$2", &[Value::Int(99), Value::Int(1)])
-            .unwrap();
+        db.query(
+            "UPDATE users SET age=$1 WHERE id=$2",
+            &[Value::Int(99), Value::Int(1)],
+        )
+        .unwrap();
         db.query(
             "INSERT INTO users (id,email,age) VALUES ($1,$2,$3)",
             &[Value::Int(3), Value::Text("c@x".into()), Value::Int(50)],
@@ -305,11 +424,18 @@ mod tests {
             .unwrap_or_else(|| adapter.zero_cursor());
         let batch = adapter.pull(&from, 1000).unwrap().unwrap();
         crate::apply::apply_batch(&db, &from, &batch).unwrap();
-        let got = match db.query("SELECT age FROM users WHERE id=$1", &[Value::Int(1)]).unwrap() {
+        let got = match db
+            .query("SELECT age FROM users WHERE id=$1", &[Value::Int(1)])
+            .unwrap()
+        {
             mpedb::ExecResult::Rows { rows, .. } => rows,
             other => panic!("{other:?}"),
         };
-        assert_eq!(got[0][0], Value::Int(100), "mpedb converged to the source value");
+        assert_eq!(
+            got[0][0],
+            Value::Int(100),
+            "mpedb converged to the source value"
+        );
 
         for p in [src_path, mpedb_path] {
             let _ = std::fs::remove_file(p);

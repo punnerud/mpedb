@@ -160,11 +160,25 @@ generated postimages, large Unicode/BLOB images, forged frame lengths, business
 name collisions, tracking-table exclusion during default import and ledger
 recreation. The import verifies tracking ownership before excluding receipts,
 and holds its DDL fence while taking the application snapshot.
+The shared push protocol now supplies `PushContext` from the SAME local
+snapshot as rows, dirty generations, cursor and authority. `PushReply` can return
+actual postimages. Matching generations update those rows and clear dirty/park
+records atomically; newer local updates/deletes are left untouched. Authority,
+configuration, mirrored-table DDL and untracked row changes abort acknowledgement.
+New unrelated tables are allowed. Rejections only park the generation actually
+sent, and later accepted generations clear stale rejection records. Legacy
+adapters retain their default bool-result behavior.
+Deterministic protocol tests cover races, malformed images, NaN snapshots and
+rollback of the entire local ACK when a later row fails. An isolated Oracle
+transport fixture verifies a real generated column through receipted DML and
+this common ACK bridge; it deliberately has no foreign writer and does not
+implement production conflict or echo policy.
+
 Tokens must include a durable local FILE incarnation and dirty generation;
 a path/transaction number or payload hash alone can collide after reimport.
 Receipt images are bounded to 64 MiB per batch. This primitive never garbage
-collects receipts. Wiring stable tokens, per-row rejection, guarded postimages,
-conflict checks and key-level echo suppression into SourceAdapter push remains
+collects receipts. Wiring durable prepared requests, per-row rejection, guarded postimages,
+conflict checks and key-level echo suppression into the production Oracle push remains
 unfinished; adapter write-back stays refused.
 
 The large-value import test also found and fixed a shared storage bug:

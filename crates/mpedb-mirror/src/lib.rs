@@ -47,7 +47,7 @@ mod pg_harness;
 pub use reconcile::{check_source_not_restored, reconcile, verify, ReconcileStats};
 pub use sqlite_adapter::SqliteAdapter;
 
-pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};
+pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, PushContext, PushReply, SourceAdapter};
 pub use apply::{apply_batch, ApplyStats};
 pub use export::{diff_sqlite_data, export_sqlite, load_sqlite_provenance, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
