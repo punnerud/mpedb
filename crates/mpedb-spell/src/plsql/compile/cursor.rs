@@ -14,6 +14,11 @@
 //! `%FOUND` and `%NOTFOUND` are NULL after OPEN and before FETCH. A cursor
 //! that is not open makes `%ISOPEN` false and raises INVALID_CURSOR for
 //! the other three. `%NOTFOUND` is the boolean not of `%FOUND`.
+//! `name cursor%ROWTYPE` is a record. Every field starts NULL, the record
+//! is NULL only when every field is NULL, and FETCH INTO it stores each
+//! cell, including NULL. A missing row leaves the fields unchanged.
+//! `%ROWTYPE` used as a value is a type error. A table `%ROWTYPE` stays
+//! refused: this compiler has no row schema for it.
 use super::*;
 use crate::emit::{line_col, CallKind, SqlCall};
 
@@ -22,6 +27,9 @@ pub(super) struct CursorDecl {
     slot: u16,
     call: u16,
     width: u16,
+    /// Select-list names in order. `None` when any item has no simple name
+    /// or an alias. The cursor still compiles; `%ROWTYPE` is what refuses it.
+    columns: Option<Vec<String>>,
     /// Formal types in declaration order. Empty means `OPEN name;`.
     formals: Vec<Type>,
     /// Parallel to `formals`. `None` means OPEN must supply the argument.
@@ -40,6 +48,16 @@ struct Formal {
     /// Lifted out of the declaration stream so a later OPEN sees current values.
     default_ops: Option<Vec<Op>>,
     slot: u16,
+}
+
+impl CursorDecl {
+    /// Column names when every select item has one and the count matches the
+    /// width `select_width` already accepted.
+    pub(super) fn named_columns(&self) -> Option<&[String]> {
+        self.columns
+            .as_deref()
+            .filter(|names| names.len() == usize::from(self.width))
+    }
 }
 
 impl Parser<'_> {
@@ -94,6 +112,10 @@ impl Parser<'_> {
                 return Err(self.error("a cursor SELECT requires FROM"))
             }
         };
+        // Names are optional. `count(*)` and `1 * 2` stay legal cursors and
+        // simply have no `%ROWTYPE` shape.
+        let columns = select_field_names(&self.tokens[start..end])
+            .filter(|names| names.len() == usize::from(width));
         self.at = end + 1;
         let (rewritten, uses) = self.bind_cursor_query(start, end, &name, &formals)?;
         let (sql, count) = super::sql::normalize_sql(&rewritten, CallKind::Query)
@@ -120,6 +142,7 @@ impl Parser<'_> {
                 slot,
                 call,
                 width,
+                columns,
                 formals: formals.iter().map(|formal| formal.ty).collect(),
                 defaults: formals.iter().map(|formal| formal.default_ops.clone()).collect(),
                 uses,
@@ -393,6 +416,20 @@ impl Parser<'_> {
             let mut targets = Vec::new();
             loop {
                 let name = self.identifier()?;
+                // A scalar local hides a record of the same name. One record
+                // target is the whole row; mixing it with other targets is
+                // not a scalar list.
+                if targets.is_empty() && !self.locals.contains_key(&name) {
+                    if let Some(record) = self.records.get(&name).cloned() {
+                        if self.symbol(",") {
+                            return Err(self.error(
+                                "FETCH INTO a %ROWTYPE record takes one target",
+                            ));
+                        }
+                        self.fetch_record(&cursor, &record)?;
+                        return Ok(true);
+                    }
+                }
                 let target = *self
                     .locals
                     .get(&name)
@@ -483,6 +520,42 @@ impl Parser<'_> {
         Ok(())
     }
 
+    /// Store the current row into the record's field slots. No per-field
+    /// type check: a NULL cell stays NULL, and text is not coerced to NUMBER.
+    /// A missing row jumps over the stores and leaves every field as it was.
+    fn fetch_record(&mut self, cursor: &CursorDecl, record: &super::RecordDecl) -> Result<()> {
+        let Some(columns) = cursor.columns.as_ref() else {
+            return Err(self.error("cursor SELECT item needs an alias"));
+        };
+        if columns.len() != record.fields.len()
+            || columns
+                .iter()
+                .zip(&record.fields)
+                .any(|(column, (field, _))| column != field)
+        {
+            return Err(self.error(
+                "FETCH INTO record fields do not match the cursor SELECT list",
+            ));
+        }
+        self.want_symbol(";")?;
+        self.builder.emit(Op::LoadLocal(cursor.slot))?;
+        self.builder.emit(Op::CursorFetch)?;
+        let none = self.builder.emit_jump(Op::JumpIfFalse(u32::MAX))?;
+        self.builder.emit(Op::LoadLocal(cursor.slot))?;
+        self.builder.emit(Op::CursorRow)?;
+        for (index, (_, slot)) in record.fields.iter().enumerate() {
+            self.builder.emit(Op::Dup)?;
+            self.constant(Value::Int(index as i64))?;
+            self.builder.emit(Op::Index)?;
+            self.builder.emit(Op::StoreLocal(*slot))?;
+        }
+        self.builder.emit(Op::Pop)?;
+        let done = self.builder.emit_jump(Op::Jump(u32::MAX))?;
+        self.builder.patch_to_here(none);
+        self.builder.patch_to_here(done);
+        Ok(())
+    }
+
     fn cursor_name(&mut self) -> Result<CursorDecl> {
         let name = self.identifier()?;
         self.cursors
@@ -493,6 +566,9 @@ impl Parser<'_> {
 
     pub(super) fn cursor_attribute(&mut self, name: &str) -> Result<Option<Type>> {
         let attr = self.identifier()?;
+        if attr == "ROWTYPE" {
+            return Err(self.error("%ROWTYPE is a type, not a value"));
+        }
         let (code, ty) = match attr.as_str() {
             "ISOPEN" => (crate::ir::CURSOR_ATTR_ISOPEN, Type::Boolean),
             "FOUND" => (crate::ir::CURSOR_ATTR_FOUND, Type::Boolean),
@@ -581,6 +657,128 @@ fn select_width(tokens: &[Lexed]) -> std::result::Result<u16, WidthError> {
         return Err(WidthError::MissingFrom);
     }
     Ok(width)
+}
+
+/// Select-list names, or `None` when any item has none. This does not decide
+/// star expansion: [`select_width`] already refused `*` before this runs.
+/// `id`, `t.id`, `id AS part`, `id part`, `a.b c`, and `count(*) AS n` have
+/// names. `count(*)` and `1 * 2` do not. A quoted identifier needs an
+/// unquoted alias. Fail closed on any shape this walk cannot name.
+fn select_field_names(tokens: &[Lexed]) -> Option<Vec<String>> {
+    let mut depth = 0i32;
+    let mut items: Vec<Vec<Token>> = Vec::new();
+    let mut current: Vec<Token> = Vec::new();
+    let mut prefix = true;
+    let mut saw_from = false;
+    for token in tokens {
+        match &token.token {
+            Token::Symbol("(") => {
+                depth += 1;
+                prefix = false;
+                current.push(token.token.clone());
+            }
+            Token::Symbol(")") => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+                current.push(token.token.clone());
+            }
+            Token::Identifier { name, quoted: false } if depth == 0 && name == "FROM" => {
+                items.push(std::mem::take(&mut current));
+                saw_from = true;
+                break;
+            }
+            Token::Identifier { name, quoted: false }
+                if depth == 0
+                    && prefix
+                    && matches!(name.as_str(), "SELECT" | "DISTINCT" | "ALL" | "UNIQUE") => {}
+            Token::Symbol(",") if depth == 0 => {
+                items.push(std::mem::take(&mut current));
+                prefix = false;
+            }
+            other => {
+                prefix = false;
+                current.push(other.clone());
+            }
+        }
+    }
+    if !saw_from || items.is_empty() {
+        return None;
+    }
+    items.into_iter().map(|item| column_name(&item)).collect()
+}
+
+fn column_name(item: &[Token]) -> Option<String> {
+    if item.is_empty() {
+        return None;
+    }
+    if item.len() >= 3 && unquoted(&item[item.len() - 2]) == Some("AS") {
+        return unquoted(item.last()?).map(str::to_string);
+    }
+    if qualified(item) {
+        return unquoted(item.last()?).map(str::to_string);
+    }
+    let alias = unquoted(item.last()?)?;
+    let rest = &item[..item.len() - 1];
+    if rest.is_empty() || unquoted(&rest[0]) == Some("AS") {
+        return None;
+    }
+    if qualified(rest) || literal_item(rest) || closed_item(rest) {
+        Some(alias.to_string())
+    } else {
+        None
+    }
+}
+
+fn unquoted(token: &Token) -> Option<&str> {
+    match token {
+        Token::Identifier { name, quoted: false } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// `ident` or `ident.ident` with every identifier unquoted.
+fn qualified(item: &[Token]) -> bool {
+    if item.is_empty() {
+        return false;
+    }
+    let mut expect_ident = true;
+    for token in item {
+        if expect_ident {
+            if unquoted(token).is_none() {
+                return false;
+            }
+        } else if !matches!(token, Token::Symbol(".")) {
+            return false;
+        }
+        expect_ident = !expect_ident;
+    }
+    !expect_ident
+}
+
+fn literal_item(item: &[Token]) -> bool {
+    matches!(item, [Token::Number(_)] | [Token::String { .. }])
+}
+
+fn closed_item(item: &[Token]) -> bool {
+    if !matches!(item.last(), Some(Token::Symbol(")"))) {
+        return false;
+    }
+    let mut depth = 0i32;
+    for token in item {
+        match token {
+            Token::Symbol("(") => depth += 1,
+            Token::Symbol(")") => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 #[cfg(test)]
@@ -910,11 +1108,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("PL/SQL at "), "{err}");
-        assert!(
-            err.contains("unknown cursor attribute")
-                || err.contains("cursor attributes require an explicit cursor"),
-            "{err}"
-        );
+        assert!(err.contains("%ROWTYPE is a type, not a value"), "{err}");
     }
 
     #[test]
@@ -1428,7 +1622,7 @@ mod tests {
         for (source, needle) in [
             (
                 "CREATE FUNCTION f RETURN BOOLEAN IS BEGIN RETURN SQL%ROWTYPE; END;",
-                "unknown cursor attribute",
+                "%ROWTYPE is a type, not a value",
             ),
             (
                 "CREATE FUNCTION f RETURN BOOLEAN IS BEGIN RETURN SQL%BULK_ROWCOUNT; END;",
@@ -1443,5 +1637,189 @@ mod tests {
             assert!(err.contains("PL/SQL at "), "{err}");
             assert!(err.contains(needle), "{needle}: {err}");
         }
+    }
+
+    #[test]
+    fn cursor_rowtype_assigns_null_fields_and_leaves_a_missing_fetch_unchanged() {
+        let row = vec![vec![Value::Numeric("4".into()), Value::Null]];
+        let decl = "CURSOR c IS SELECT t.id, note AS label FROM t; v c%ROWTYPE;";
+        let (null_record, _, _) = execute(
+            "BOOLEAN",
+            vec![],
+            &format!(
+                "{decl} BEGIN IF v IS NULL AND v.id IS NULL AND v.label IS NULL THEN RETURN TRUE; ELSE RETURN FALSE; END IF; END;"
+            ),
+        );
+        assert_eq!(null_record, Value::Bool(true));
+        let (inited, _, _) = execute(
+            "BOOLEAN",
+            vec![],
+            "CURSOR c IS SELECT id, note FROM t; v c%ROWTYPE := NULL; BEGIN RETURN v IS NULL; END;",
+        );
+        assert_eq!(inited, Value::Bool(true));
+
+        let (label, bridge, _) = execute(
+            "VARCHAR2",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; RETURN v.label; END;"),
+        );
+        assert_eq!(label, Value::Null);
+        assert_eq!(bridge.cursor_opens, 1);
+        assert_eq!(bridge.advances, 1);
+        assert_eq!(bridge.live_streams(), 1);
+        let (id, _, _) = execute(
+            "NUMBER",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; RETURN v.id; END;"),
+        );
+        assert_eq!(id, Value::Numeric("4".into()));
+        let (is_null, _, _) = execute(
+            "BOOLEAN",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; RETURN v IS NULL; END;"),
+        );
+        assert_eq!(is_null, Value::Bool(false));
+        let (is_not, _, _) = execute(
+            "BOOLEAN",
+            row.clone(),
+            &format!("{decl} BEGIN OPEN c; FETCH c INTO v; RETURN v IS NOT NULL; END;"),
+        );
+        assert_eq!(is_not, Value::Bool(true));
+
+        let (kept, bridge, _) = execute(
+            "VARCHAR2",
+            row.clone(),
+            &format!(
+                "{decl} BEGIN OPEN c; FETCH c INTO v; v.label := 'keep'; FETCH c INTO v; RETURN v.label; END;"
+            ),
+        );
+        assert_eq!(kept, Value::Text("keep".into()));
+        assert_eq!(bridge.advances, 2);
+        let (kept_id, _, _) = execute(
+            "NUMBER",
+            row.clone(),
+            &format!(
+                "{decl} BEGIN OPEN c; FETCH c INTO v; v.label := 'keep'; FETCH c INTO v; RETURN v.id; END;"
+            ),
+        );
+        assert_eq!(kept_id, Value::Numeric("4".into()));
+        let (cleared, _, _) = execute(
+            "BOOLEAN",
+            row.clone(),
+            &format!(
+                "{decl} BEGIN OPEN c; FETCH c INTO v; v := NULL; RETURN v IS NULL AND v.id IS NULL AND v.label IS NULL; END;"
+            ),
+        );
+        assert_eq!(cleared, Value::Bool(true));
+
+        let (outer, _, _) = execute(
+            "VARCHAR2",
+            vec![],
+            &format!(
+                "{decl} BEGIN v.label := 'outer'; DECLARE v c%ROWTYPE; BEGIN v.label := 'inner'; END; RETURN v.label; END;"
+            ),
+        );
+        assert_eq!(outer, Value::Text("outer".into()));
+        let (shadow, _, _) = execute(
+            "VARCHAR2",
+            vec![],
+            &format!(
+                "{decl} BEGIN v.label := 'outer'; DECLARE v NUMBER := 4; BEGIN IF v IS NULL THEN RETURN 'shadow'; END IF; END; RETURN v.label; END;"
+            ),
+        );
+        assert_eq!(shadow, Value::Text("outer".into()));
+
+        let named = "CURSOR c IS SELECT t.id, note label, a.b part, count(*) AS n FROM t; v c%ROWTYPE;";
+        let wide = vec![vec![
+            Value::Numeric("4".into()),
+            Value::Null,
+            Value::Text("p".into()),
+            Value::Numeric("8".into()),
+        ]];
+        let (part, _, _) = execute(
+            "VARCHAR2",
+            wide.clone(),
+            &format!("{named} BEGIN OPEN c; FETCH c INTO v; RETURN v.part; END;"),
+        );
+        assert_eq!(part, Value::Text("p".into()));
+        let (count, _, _) = execute(
+            "NUMBER",
+            wide.clone(),
+            &format!("{named} BEGIN OPEN c; FETCH c INTO v; RETURN v.n; END;"),
+        );
+        assert_eq!(count, Value::Numeric("8".into()));
+        let (aliased, _, _) = execute(
+            "VARCHAR2",
+            wide,
+            &format!("{named} BEGIN OPEN c; FETCH c INTO v; RETURN v.label; END;"),
+        );
+        assert_eq!(aliased, Value::Null);
+        let (same_shape, _, _) = execute(
+            "NUMBER",
+            row,
+            "CURSOR a IS SELECT id, note FROM t; CURSOR b IS SELECT t.id, note AS note FROM u; v a%ROWTYPE; BEGIN OPEN b; FETCH b INTO v; RETURN v.id; END;",
+        );
+        assert_eq!(same_shape, Value::Numeric("4".into()));
+
+        compile("CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT count(*) FROM t; n NUMBER; BEGIN OPEN c; FETCH c INTO n; CLOSE c; RETURN 1; END;").unwrap();
+        compile("CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT 1 * 2 FROM t; BEGIN OPEN c; CLOSE c; RETURN 1; END;").unwrap();
+
+        let refuse = |source: &str, needle: &str| {
+            let err = compile(source).unwrap_err().to_string();
+            assert!(err.contains("PL/SQL at "), "{err}");
+            assert!(err.contains(needle), "{needle}: {err}");
+        };
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT count(*) FROM t; v c%ROWTYPE; BEGIN RETURN 1; END;",
+            "cursor SELECT item needs an alias",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT 1 * 2 FROM t; v c%ROWTYPE; BEGIN RETURN 1; END;",
+            "cursor SELECT item needs an alias",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT \"id\" FROM t; v c%ROWTYPE; BEGIN RETURN 1; END;",
+            "cursor SELECT item needs an alias",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS v employees%ROWTYPE; BEGIN RETURN 1; END;",
+            "%ROWTYPE requires an explicit cursor in this scope",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT id, t.id FROM t; v c%ROWTYPE; BEGIN RETURN 1; END;",
+            "duplicate %ROWTYPE field",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN BOOLEAN IS CURSOR c IS SELECT id FROM t; BEGIN RETURN c%ROWTYPE; END;",
+            "%ROWTYPE is a type, not a value",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT id, note FROM t; v c%ROWTYPE; BEGIN RETURN v; END;",
+            "a %ROWTYPE record requires a field",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN VARCHAR2 IS CURSOR c IS SELECT id, note FROM t; v c%ROWTYPE; BEGIN RETURN v.missing; END;",
+            "unknown %ROWTYPE field",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT id FROM t; v CONSTANT c%ROWTYPE; BEGIN RETURN 1; END;",
+            "a %ROWTYPE record cannot be CONSTANT",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT id FROM t; v c%ROWTYPE NOT NULL; BEGIN RETURN 1; END;",
+            "a %ROWTYPE record cannot be NOT NULL",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT id FROM t; v c%ROWTYPE := 1; BEGIN RETURN 1; END;",
+            "a %ROWTYPE record can only be initialized with NULL",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR a IS SELECT id, note FROM t; CURSOR b IS SELECT note, id FROM t; v a%ROWTYPE; BEGIN FETCH b INTO v; RETURN 1; END;",
+            "FETCH INTO record fields do not match the cursor SELECT list",
+        );
+        refuse(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c IS SELECT id, note FROM t; v c%ROWTYPE; n NUMBER; BEGIN FETCH c INTO v, n; RETURN 1; END;",
+            "FETCH INTO a %ROWTYPE record takes one target",
+        );
     }
 }

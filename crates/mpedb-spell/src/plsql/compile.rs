@@ -46,6 +46,13 @@ struct Local {
     not_null: bool,
 }
 
+/// One local slot per cursor column. The record name is not itself a local:
+/// a scalar declared later in an inner block can hide it.
+#[derive(Clone)]
+struct RecordDecl {
+    fields: Vec<(String, u16)>,
+}
+
 struct Parser<'a> {
     source: &'a str,
     routine_name: String,
@@ -64,6 +71,7 @@ struct Parser<'a> {
     in_handler: usize,
     exceptions: HashMap<String, exception::ExceptionRef>,
     cursors: HashMap<String, cursor::CursorDecl>,
+    records: HashMap<String, RecordDecl>,
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
@@ -115,6 +123,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         in_handler: 0,
         exceptions: HashMap::new(),
         cursors: HashMap::new(),
+        records: HashMap::new(),
     };
     if p.is_word("DECLARE") || p.is_word("BEGIN") {
         if scalar_only {
@@ -299,6 +308,9 @@ impl Parser<'_> {
                 continue;
             }
             let constant = self.word("CONSTANT");
+            if self.declare_rowtype(&name, constant)? {
+                continue;
+            }
             let ty = self.data_type(true)?;
             let not_null = self.word("NOT");
             if not_null {
@@ -493,9 +505,133 @@ impl Parser<'_> {
         if !self.declared_here.insert(name.clone()) {
             return Err(self.error("duplicate parameter or variable name"));
         }
+        // A scalar hides an outer record of the same name for this scope.
+        // The caller's saved map puts the record back when the scope ends.
+        self.records.remove(&name);
         let slot = self.builder.alloc_local()?;
         self.locals.insert(name, Local { slot, ty, writable, not_null: false });
         Ok(slot)
+    }
+    /// `name cursor%ROWTYPE`. Every field is stored as NULL. `:= NULL` and
+    /// `DEFAULT NULL` are the same state. CONSTANT, NOT NULL, and any other
+    /// initializer stay refused.
+    fn declare_rowtype(&mut self, name: &str, constant: bool) -> Result<bool> {
+        if !self.looks_like_rowtype() {
+            return Ok(false);
+        }
+        let cursor_name = self.identifier()?;
+        self.want_symbol("%")?;
+        self.want_word("ROWTYPE")?;
+        if constant {
+            return Err(self.error("a %ROWTYPE record cannot be CONSTANT"));
+        }
+        if self.word("NOT") {
+            return Err(self.error("a %ROWTYPE record cannot be NOT NULL"));
+        }
+        if (self.symbol(":=") || self.word("DEFAULT")) && !self.word("NULL") {
+            return Err(self.error(
+                "a %ROWTYPE record can only be initialized with NULL",
+            ));
+        }
+        self.want_symbol(";")?;
+        let cursor = self
+            .cursors
+            .get(&cursor_name)
+            .cloned()
+            .ok_or_else(|| self.error("%ROWTYPE requires an explicit cursor in this scope"))?;
+        let columns = cursor.named_columns().map(|names| names.to_vec()).ok_or_else(|| {
+            self.error("cursor SELECT item needs an alias")
+        })?;
+        let mut seen = HashSet::new();
+        for column in &columns {
+            if !seen.insert(column.clone()) {
+                return Err(self.error("duplicate %ROWTYPE field"));
+            }
+        }
+        if !self.declared_here.insert(name.to_string()) {
+            return Err(self.error("duplicate parameter or variable name"));
+        }
+        self.pending_declarations.remove(name);
+        self.locals.remove(name);
+        let mut fields = Vec::with_capacity(columns.len());
+        for column in columns {
+            self.constant(Value::Null)?;
+            let slot = self.builder.alloc_local()?;
+            self.builder.emit(Op::StoreLocal(slot))?;
+            fields.push((column, slot));
+        }
+        self.records.insert(name.to_string(), RecordDecl { fields });
+        Ok(true)
+    }
+    fn looks_like_rowtype(&self) -> bool {
+        let Some(Token::Identifier { .. }) = self.peek() else {
+            return false;
+        };
+        let percent = matches!(
+            self.tokens.get(self.at + 1).map(|token| &token.token),
+            Some(Token::Symbol("%"))
+        );
+        let rowtype = matches!(
+            self.tokens.get(self.at + 2).map(|token| &token.token),
+            Some(Token::Identifier { name, quoted: false }) if name == "ROWTYPE"
+        );
+        percent && rowtype
+    }
+    fn assign_record(&mut self, record: RecordDecl) -> Result<()> {
+        if self.symbol(".") {
+            let field = self.identifier()?;
+            let slot = self.record_field(&record, &field)?;
+            self.want_symbol(":=")?;
+            self.expression()?;
+            self.builder.emit(Op::StoreLocal(slot))?;
+            return self.want_symbol(";");
+        }
+        self.want_symbol(":=")?;
+        if self.word("NULL") {
+            for (_, slot) in &record.fields {
+                self.constant(Value::Null)?;
+                self.builder.emit(Op::StoreLocal(*slot))?;
+            }
+            return self.want_symbol(";");
+        }
+        Err(self.error("a %ROWTYPE record requires a field"))
+    }
+    fn record_expr(&mut self, record: RecordDecl) -> Result<Option<Type>> {
+        if self.symbol(".") {
+            let field = self.identifier()?;
+            let slot = self.record_field(&record, &field)?;
+            self.builder.emit(Op::LoadLocal(slot))?;
+            // Untyped: the function return check, not the record, decides
+            // NUMBER or VARCHAR2. NULL stays NULL through that check.
+            return Ok(None);
+        }
+        if self.word("IS") {
+            let negated = self.word("NOT");
+            self.want_word("NULL")?;
+            // Oracle: the record is NULL exactly when every field is NULL.
+            // `Op::Eq` treats NULL as equal to NULL, so this is not SQL's
+            // three-valued comparison.
+            self.constant(Value::Bool(true))?;
+            for (_, slot) in &record.fields {
+                self.builder.emit(Op::LoadLocal(*slot))?;
+                self.constant(Value::Null)?;
+                self.builder.emit(Op::Eq)?;
+                self.builder.emit(Op::SqlAnd)?;
+            }
+            if negated {
+                self.builder.emit(Op::SqlNot)?;
+            }
+            return Ok(Some(Type::Boolean));
+        }
+        Err(self.error("a %ROWTYPE record requires a field"))
+    }
+    fn record_field(&self, record: &RecordDecl, field: &str) -> Result<u16> {
+        record
+            .fields
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, slot)| *slot)
+            .ok_or_else(|| self.error(&format!("unknown %ROWTYPE field {field}")))
     }
     fn emit_local_check(&mut self, local: Local) -> Result<()> {
         self.builder.emit(local.ty.check())?;
@@ -560,6 +696,7 @@ impl Parser<'_> {
             let outer_locals = self.locals.clone();
             let outer_exceptions = self.exceptions.clone();
             let outer_cursors = self.cursors.clone();
+            let outer_records = self.records.clone();
             let outer_declared = std::mem::take(&mut self.declared_here);
             let outer_pending = std::mem::take(&mut self.pending_declarations);
             if declarations {
@@ -572,6 +709,7 @@ impl Parser<'_> {
             self.locals = outer_locals;
             self.exceptions = outer_exceptions;
             self.cursors = outer_cursors;
+            self.records = outer_records;
             self.declared_here = outer_declared;
             self.pending_declarations = outer_pending;
             return Ok(());
@@ -654,6 +792,11 @@ impl Parser<'_> {
         if self.cursors.contains_key(&name) {
             return Err(self.error("cannot assign to a cursor"));
         }
+        if !self.locals.contains_key(&name) {
+            if let Some(record) = self.records.get(&name).cloned() {
+                return self.assign_record(record);
+            }
+        }
         let local = *self.locals.get(&name).ok_or_else(|| {
             self.error(&format!(
                 "unknown variable or unimplemented statement {name}"
@@ -677,6 +820,7 @@ impl Parser<'_> {
         self.want_word("IN")?;
         let reverse = self.word("REVERSE");
         let outer_locals = self.locals.clone();
+        let outer_records = self.records.clone();
         let outer_declared = std::mem::take(&mut self.declared_here);
         let outer_pending = std::mem::take(&mut self.pending_declarations);
         // Oracle's index hides outer names even while the bounds are being
@@ -726,6 +870,7 @@ impl Parser<'_> {
         self.builder.patch_to_here(finished);
         self.builder.pop_loop();
         self.locals = outer_locals;
+        self.records = outer_records;
         self.declared_here = outer_declared;
         self.pending_declarations = outer_pending;
         Ok(())
@@ -1015,12 +1160,15 @@ impl Parser<'_> {
         if self.pending_declarations.contains(&name) {
             return Err(self.error("self or forward reference in a declaration initializer"));
         }
-        let local = *self.locals.get(&name).ok_or_else(|| {
-            self.error(&format!(
-                "unknown variable or unsupported expression {name}"
-            ))
-        })?;
-        self.builder.emit(Op::LoadLocal(local.slot))?;
-        Ok(Some(local.ty))
+        if let Some(local) = self.locals.get(&name).copied() {
+            self.builder.emit(Op::LoadLocal(local.slot))?;
+            return Ok(Some(local.ty));
+        }
+        if let Some(record) = self.records.get(&name).cloned() {
+            return self.record_expr(record);
+        }
+        Err(self.error(&format!(
+            "unknown variable or unsupported expression {name}"
+        )))
     }
 }
