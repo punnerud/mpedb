@@ -20,7 +20,8 @@ def database(alias):
 
 
 DATABASES = {alias: database(alias) for alias in ("default", "other")}
-SECRET_KEY = "oracle-upstream-tests-only"
+# Django's unmodified crypto and diffsettings tests expect this test-only key.
+SECRET_KEY = "django_tests_secret_key"
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 USE_TZ = False

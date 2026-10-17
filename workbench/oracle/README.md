@@ -12,6 +12,25 @@ create stored functions. Django's Oracle backend tests include DB-API `callproc`
 These do not establish complete PL/SQL support (packages, cursors, exception
 handling, triggers, and transaction semantics need a later coverage audit).
 
+Measured full Django reference run (5.2 stable, revision recorded in the
+artifacts): 18,193 tests in 1973 seconds, 1512 skipped, 6 expected failures,
+and 6 failure entries. Four failures came from the harness's test-only
+SECRET_KEY; the two affected test methods pass after using upstream's expected
+key. Two HTML tests reflect Ubuntu's security-backported Python 3.12.3 reporting
+an older version than their version-based expectations. A private stock
+[CPython 3.12.15](https://www.python.org/downloads/release/python-31215/) is being
+built on the extra disk to recheck those tests without changing assertions.
+No Oracle-backend failure occurred in that full run, but it is not reported as
+fully green. See `reference/framework-baseline.json` for the measured counts.
+
+The first broad SQLAlchemy 2.0.44 reference run stopped at the upstream
+maxfail=250 default: 777 passed, 34 failed, 217 setup/teardown errors, 9 skipped.
+Some ORM fixtures omit Oracle sequences for generated primary keys and are not
+backend agnostic. The harness now disables early failure stopping, records the
+Python interpreter/platform, and reruns from clean disposable schemas. A
+completed process is not proof that every upstream test was reached if it
+aborted early. These reference failures do not describe MPEdb's implementation.
+
 ## Migration architecture
 
 The required migration path in **both directions** is:

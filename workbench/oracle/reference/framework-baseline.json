@@ -1,0 +1,36 @@
+{
+  "oracle_version": "23.26.3.0.0",
+  "purpose": "Unmodified upstream reference runs against real Oracle; not MPEdb Oracle conformance.",
+  "django": {
+    "revision": "cae7247962de54a94023d28d84f05fc9842e9646",
+    "version": "5.2.19.dev20261009120732",
+    "python": "Ubuntu 3.12.3 with backported HTMLParser security changes",
+    "tests_ran": 18193,
+    "seconds": 1973.124,
+    "failure_entries": 6,
+    "skipped": 1512,
+    "expected_failures": 6,
+    "failure_causes": {
+      "test_only_secret_key": 4,
+      "stdlib_security_backport_version_detection": 2
+    },
+    "secret_key_recheck": {
+      "tests_ran": 2,
+      "result": "passed"
+    },
+    "scope_complete": true,
+    "green": false
+  },
+  "sqlalchemy_initial_broad_run": {
+    "revision": "29e4255f413b9791e117b40ab12c76c9df6313d8",
+    "version": "2.0.44.dev0",
+    "passed": 777,
+    "failed": 34,
+    "errors": 217,
+    "skipped": 9,
+    "seconds": 81.95,
+    "scope_complete": false,
+    "reason": "Upstream maxfail=250 aborted the run; includes Oracle-incompatible auto-increment fixtures.",
+    "follow_up": "Reset disposable schemas, run with maxfail=0. No test assertions or requirement flags modified."
+  }
+}

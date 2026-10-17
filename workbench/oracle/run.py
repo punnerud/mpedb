@@ -5,6 +5,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import platform
 from pathlib import Path
 import signal
 import subprocess
@@ -70,6 +71,9 @@ def main():
         "tests": args.tests or ["ALL"],
         "adaptations": [],
         "timeout_seconds": args.timeout,
+        "python_version": sys.version,
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
         "status": "prepared",
         "versions": {
             name: importlib.metadata.version(name) for name in ("oracledb", args.suite)
@@ -141,7 +145,7 @@ from sqlalchemy.engine import URL
 url = URL.create('oracle+oracledb', username=os.environ['ORACLE_USER'],
     password=os.environ['ORACLE_PASSWORD'],
     query={'dsn': os.environ['ORACLE_DSN']})
-raise SystemExit(pytest.main(['--dburi', url.render_as_string(hide_password=False),
+raise SystemExit(pytest.main(['--maxfail=0', '--dburi', url.render_as_string(hide_password=False),
     '--junitxml=' + os.environ['ORACLE_JUNIT'], *sys.argv[1:]]))
 """
         env["ORACLE_JUNIT"] = str(output / "junit.xml")
