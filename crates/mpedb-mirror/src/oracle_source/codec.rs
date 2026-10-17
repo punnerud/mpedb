@@ -99,6 +99,11 @@ pub(super) fn read_expr(c: &OracleColumn) -> Result<Vec<String>> {
         "DATE" => vec![format!(
             "TO_CHAR({name},'SYYYY-MM-DD\"T\"HH24:MI:SS','NLS_DATE_LANGUAGE=English')"
         )],
+        // Oracle rejects TZR/TZD directly on LOCAL TIME ZONE values. Cast
+        // to a zoned timestamp in our pinned UTC session before formatting.
+        t if t.starts_with("TIMESTAMP") && t.contains("LOCAL TIME ZONE") => vec![format!(
+            "TO_CHAR(CAST({name} AS TIMESTAMP(9) WITH TIME ZONE),'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9 TZH:TZM TZR TZD','NLS_DATE_LANGUAGE=English')"
+        )],
         t if t.starts_with("TIMESTAMP") => vec![format!(
             "TO_CHAR({name},'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9{}','NLS_DATE_LANGUAGE=English')",
             if t.contains("TIME ZONE") {

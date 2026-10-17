@@ -136,12 +136,23 @@ single-writer fixture does not implement a continuous bidirectional controller.
 
 This transport is not a complete mirror push: capture, echo suppression,
 conflict checks, authority fencing, CLI import and the two-database topology
-remain unfinished. Writes currently refuse identity columns, special NUMBERs,
-zoned timestamps, intervals and LONGs. CLOB, NCLOB and BLOB writes use native
+remain unfinished. Writes currently refuse identity columns, special NUMBERs and LONGs. CLOB, NCLOB and BLOB writes use native
 temporary LOB locators; reads use explicit locators and fixed Unicode-safe
 buffers. Native tests cover large Unicode and binary values, empty LOBs distinct
 from NULL, and repeated upserts. Scalar text/RAW binds remain bounded at 4000/2000
 bytes. Snapshot results still materialize complete carrier values in memory.
+Zoned TIMESTAMP and INTERVAL YEAR/DAY carriers now write back with verified
+postimages. Zoned writes reconstruct the instant from the explicit offset and
+restore the region, then compare the full region/offset/TZD carrier. LOCAL TIME
+ZONE reads explicitly cast to a zoned timestamp in the pinned UTC session;
+formatting TZR/TZD directly on that Oracle type previously failed with ORA-01821.
+OCI national-character binds need an explicit database-character-set cast for
+the AT TIME ZONE region. Native tests cover both occurrences of Oslo's repeated
+DST hour, fractional seconds, a fractional-hour fixed offset, LOCAL TIME ZONE,
+NULL, large positive/negative intervals, narrower interval precision, repeated
+upserts, and whole-batch rollback on truncation or inconsistent offset/TZD.
+Historical regions with sub-minute offsets are not proven lossless by this
+minute-offset carrier and remain subject to exact postimage rejection.
 Schema fences and cursor scopes use logical DDL extracted with the documented
 DBMS_METADATA SEGMENT_ATTRIBUTES transform disabled. Original physical DDL is
 retained separately as provenance. Native tests verify that deferred segment

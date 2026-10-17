@@ -369,13 +369,16 @@ fn expression(c: &OracleColumn, n: usize) -> Result<String> {
         t if t.starts_with("TIMESTAMP") && !t.contains("TIME ZONE") => format!(
             "TO_TIMESTAMP({b},'SYYYY-MM-DD\"T\"HH24:MI:SS.FF9','NLS_DATE_LANGUAGE=English')"
         ),
+        t if t.starts_with("TIMESTAMP") && t.contains("TIME ZONE") => temporal::zoned_bind(&b),
+        t if t.starts_with("INTERVAL YEAR") => format!("TO_YMINTERVAL({b})"),
+        t if t.starts_with("INTERVAL DAY") => format!("TO_DSINTERVAL({b})"),
         t if t.starts_with("TIMESTAMP")
             || t.starts_with("INTERVAL")
             || t == "LONG"
             || t == "LONG RAW" =>
         {
             return Err(Error::Unsupported(
-                "Oracle zoned timestamp, interval and LONG writes are not implemented".into(),
+                "Oracle temporal subtype or LONG writes are not implemented".into(),
             ))
         }
         _ => b,
