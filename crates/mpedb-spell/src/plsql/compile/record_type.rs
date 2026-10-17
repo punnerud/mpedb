@@ -136,7 +136,13 @@ impl Parser<'_> {
             );
             slots.push((field.name.clone(), slot));
         }
-        self.records.insert(name.to_string(), RecordDecl { fields: slots });
+        self.records.insert(
+            name.to_string(),
+            RecordDecl {
+                fields: slots,
+                type_name: Some(type_name),
+            },
+        );
         Ok(true)
     }
 
@@ -164,6 +170,42 @@ impl Parser<'_> {
                 .is_some_and(|info| info.not_null)
         }) {
             return Err(self.error("a NOT NULL record field cannot be assigned NULL"));
+        }
+        Ok(())
+    }
+
+    /// `target := source` for two variables of the same record type.
+    /// Each field is copied, including NULL. The variables do not alias.
+    pub(super) fn assign_whole_record(
+        &mut self,
+        target: &super::RecordDecl,
+        source: &super::RecordDecl,
+    ) -> Result<()> {
+        match (&target.type_name, &source.type_name) {
+            (Some(left), Some(right)) if left == right => {}
+            (None, _) | (_, None) => {
+                return Err(self.error("a %ROWTYPE record requires a field"));
+            }
+            _ => {
+                return Err(self.error(
+                    "a record can only be assigned a record of the same type",
+                ));
+            }
+        }
+        if target.fields.len() != source.fields.len() {
+            return Err(self.error("a record can only be assigned a record of the same type"));
+        }
+        for ((target_name, target_slot), (source_name, source_slot)) in
+            target.fields.iter().zip(source.fields.iter())
+        {
+            if target_name != source_name {
+                return Err(self.error(
+                    "a record can only be assigned a record of the same type",
+                ));
+            }
+            self.builder.emit(Op::LoadLocal(*source_slot))?;
+            let actual = self.record_field_info.get(source_slot).map(|info| info.ty);
+            self.store_record_field(*target_slot, actual)?;
         }
         Ok(())
     }
@@ -437,6 +479,53 @@ mod tests {
                 let err = compile(&source).unwrap_err().to_string();
                 assert!(err.contains(expected), "{body}\n{err}");
             }
+        }
+    }
+
+    #[test]
+    fn record_assignment_copies_null_and_does_not_alias() {
+        let copied = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             s pair; r pair; \
+             BEGIN \
+               r.note := 'kept'; \
+               r := s; \
+               s.note := 'kept'; \
+               IF r.note IS NULL THEN r.note := NULL; END IF; \
+               RETURN r.note; \
+             END;",
+        );
+        assert_eq!(call(&copied).unwrap(), Value::Null);
+
+        let id = function(
+            "PLS_INTEGER",
+            "TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             s pair; r pair; \
+             BEGIN s.id := 3; r := s; RETURN r.id; END;",
+        );
+        assert_eq!(call(&id).unwrap(), Value::Int(3));
+
+        let refused = [
+            (
+                "TYPE a IS RECORD (note VARCHAR2(4)); \
+                 TYPE b IS RECORD (note VARCHAR2(4)); \
+                 ra a; rb b; BEGIN ra := rb; RETURN ra.note; END;",
+                "same type",
+            ),
+            (
+                "TYPE pair IS RECORD (note VARCHAR2(4)); r pair; BEGIN r := 1; RETURN r.note; END;",
+                "NULL or one field",
+            ),
+            (
+                "CURSOR c IS SELECT id FROM t; v c%ROWTYPE; w c%ROWTYPE; \
+                 BEGIN w := v; RETURN 'x'; END;",
+                "a %ROWTYPE record requires a field",
+            ),
+        ];
+        for (body, expected) in refused {
+            let err = compile(&function("VARCHAR2", body)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{body}\n{err}");
         }
     }
 }

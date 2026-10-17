@@ -1294,3 +1294,42 @@ fn plsql_record_field_type_starts_null_and_inherits_not_null() {
         .to_string();
     assert!(refused.contains("inherits NOT NULL"), "{refused}");
 }
+
+#[test]
+fn plsql_record_assignment_copies_null() {
+    let (cfg, _guard) = test_config("plsql-record-assign");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_copy RETURN VARCHAR2 IS \
+             TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             s pair; \
+             r pair; \
+             BEGIN \
+               r.note := 'kept'; \
+               r := s; \
+               s.note := 'kept'; \
+               IF r.note IS NULL THEN r.note := NULL; END IF; \
+               RETURN r.note; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_COPY", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    let refused = engine
+        .define(
+            "CREATE FUNCTION bad RETURN VARCHAR2 IS \
+             TYPE a IS RECORD (note VARCHAR2(4)); \
+             TYPE b IS RECORD (note VARCHAR2(4)); \
+             ra a; rb b; \
+             BEGIN ra := rb; RETURN ra.note; END;",
+            Lang::PlSql,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("same type"), "{refused}");
+}

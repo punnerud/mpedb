@@ -59,6 +59,8 @@ struct Local {
 #[derive(Clone)]
 struct RecordDecl {
     fields: Vec<(String, u16)>,
+    /// `Some` for a `TYPE name IS RECORD` variable. `None` for `%ROWTYPE`.
+    type_name: Option<String>,
 }
 
 /// A `TYPE name IS TABLE OF` element type, stored as one local. NULL means
@@ -698,7 +700,7 @@ impl Parser<'_> {
             self.builder.emit(Op::StoreLocal(slot))?;
             fields.push((column, slot));
         }
-        self.records.insert(name.to_string(), RecordDecl { fields });
+        self.records.insert(name.to_string(), RecordDecl { fields, type_name: None });
         Ok(true)
     }
     fn looks_like_rowtype(&self) -> bool {
@@ -732,6 +734,20 @@ impl Parser<'_> {
                 self.builder.emit(Op::StoreLocal(*slot))?;
             }
             return self.want_symbol(";");
+        }
+        if let Some(Token::Identifier { name, .. }) = self.peek() {
+            let source_name = name.clone();
+            let whole = matches!(
+                self.tokens.get(self.at + 1).map(|token| &token.token),
+                Some(Token::Symbol(";"))
+            );
+            if whole {
+                if let Some(source) = self.records.get(&source_name).cloned() {
+                    self.at += 1;
+                    self.assign_whole_record(&record, &source)?;
+                    return self.want_symbol(";");
+                }
+            }
         }
         let user = record
             .fields
