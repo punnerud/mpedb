@@ -1258,3 +1258,39 @@ fn plsql_column_type_does_not_inherit_not_null() {
         "{explicit}"
     );
 }
+
+#[test]
+fn plsql_record_field_type_starts_null_and_inherits_not_null() {
+    let (cfg, _guard) = test_config("plsql-record-field-type");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_note RETURN VARCHAR2 IS \
+             TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 7, note VARCHAR2(4) := 'kept'); \
+             r pair; \
+             n r.note%TYPE; \
+             BEGIN \
+               IF n IS NULL THEN n := NULL; END IF; \
+               RETURN n; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_NOTE", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    let refused = engine
+        .define(
+            "CREATE FUNCTION bad RETURN NUMBER IS \
+             TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 7, note VARCHAR2(4)); \
+             r pair; \
+             n r.id%TYPE; \
+             BEGIN RETURN n; END;",
+            Lang::PlSql,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("inherits NOT NULL"), "{refused}");
+}

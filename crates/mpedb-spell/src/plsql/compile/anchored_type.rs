@@ -1,8 +1,8 @@
-//! `anchor%TYPE`. A scalar anchor inherits datatype, size, and `NOT NULL`,
-//! and does not inherit the value. A `table.column%TYPE` anchor inherits
-//! datatype and size only: Oracle does not copy a column's `NOT NULL`, so
-//! the variable needs no initializer and starts NULL. A record field and a
-//! schema-qualified name stay named refusals.
+//! `anchor%TYPE`. A scalar anchor and a record-field anchor inherit
+//! datatype, size, and `NOT NULL`, and do not inherit the value. A
+//! `table.column%TYPE` anchor inherits datatype and size only: Oracle does
+//! not copy a column's `NOT NULL`, so the variable needs no initializer and
+//! starts NULL. A schema-qualified name and a `%ROWTYPE` field stay refused.
 
 use super::{Parser, Type};
 use crate::ir::Op;
@@ -69,8 +69,16 @@ impl Parser<'_> {
         }
         self.want_symbol("%")?;
         self.want_word("TYPE")?;
-        if self.records.contains_key(&table) || self.record_types.contains_key(&table) {
-            return Err(self.error("record-field %TYPE anchors are not implemented"));
+        if self.pending_declarations.contains(&table) {
+            return Err(self.error("a %TYPE anchor is not declared yet"));
+        }
+        if self.records.contains_key(&table) {
+            return self.declare_record_field_anchor(name, constant, &table, &column);
+        }
+        if self.record_types.contains_key(&table) {
+            return Err(self.error(
+                "a record type name is not a %TYPE anchor; use a record variable",
+            ));
         }
         let Some(anchor) = self.column_anchors.iter().find(|anchor| {
             same_ident(&anchor.table, &table) && same_ident(&anchor.column, &column)
@@ -97,6 +105,30 @@ impl Parser<'_> {
             }
         };
         self.bind_anchored(name, constant, ty, false)?;
+        Ok(true)
+    }
+
+    /// `record.field%TYPE`. The field is a PL/SQL item, so its `NOT NULL`
+    /// is inherited. Its current value, including a default, is not.
+    fn declare_record_field_anchor(
+        &mut self,
+        name: &str,
+        constant: bool,
+        record: &str,
+        field: &str,
+    ) -> Result<bool> {
+        let slot = {
+            let decl = self
+                .records
+                .get(record)
+                .cloned()
+                .ok_or_else(|| self.error("a %TYPE anchor must be a record variable"))?;
+            self.record_field(&decl, field)?
+        };
+        let Some(info) = self.record_field_info.get(&slot).copied() else {
+            return Err(self.error("a %ROWTYPE field %TYPE anchor is not implemented"));
+        };
+        self.bind_anchored(name, constant, info.ty, info.not_null)?;
         Ok(true)
     }
 
@@ -442,15 +474,67 @@ mod tests {
                 "n hr.people.name%TYPE; BEGIN RETURN n; END;",
                 "schema-qualified %TYPE anchors are not implemented",
             ),
-            (
-                "TYPE pair IS RECORD (note VARCHAR2(4)); r pair; n r.note%TYPE; BEGIN RETURN n; END;",
-                "record-field %TYPE anchors are not implemented",
-            ),
         ];
         for (body, expected) in refused {
             let err = compile_with_anchors(&function("VARCHAR2", body), &not_null_columns())
                 .unwrap_err()
                 .to_string();
+            assert!(err.contains(expected), "{body}\n{err}");
+        }
+    }
+
+    #[test]
+    fn record_field_type_inherits_not_null_not_the_value() {
+        let source = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 7, note VARCHAR2(4) := 'kept'); \
+             r pair; \
+             n r.note%TYPE; \
+             BEGIN \
+               IF n IS NULL THEN n := NULL; END IF; \
+               RETURN n; \
+             END;",
+        );
+        assert_eq!(call(&source).unwrap(), Value::Null);
+
+        let overflow = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4)); r pair; n r.note%TYPE; \
+             BEGIN n := 'toolong'; RETURN 'x'; \
+             EXCEPTION WHEN VALUE_ERROR THEN RETURN n; END;",
+        );
+        assert_eq!(call(&overflow).unwrap(), Value::Null);
+
+        let refused = [
+            (
+                "TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 7, note VARCHAR2(4)); \
+                 r pair; n r.id%TYPE; BEGIN RETURN n; END;",
+                "inherits NOT NULL",
+            ),
+            (
+                "TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 7, note VARCHAR2(4)); \
+                 r pair; n r.id%TYPE := NULL; BEGIN RETURN n; END;",
+                "cannot be initialized with literal NULL",
+            ),
+            (
+                "TYPE pair IS RECORD (note VARCHAR2(4)); r pair; n r.missing%TYPE; BEGIN RETURN n; END;",
+                "unknown record field",
+            ),
+            (
+                "TYPE pair IS RECORD (note VARCHAR2(4)); n pair.note%TYPE; BEGIN RETURN n; END;",
+                "a record type name is not a %TYPE anchor",
+            ),
+            (
+                "n r.note%TYPE; TYPE pair IS RECORD (note VARCHAR2(4)); r pair; BEGIN RETURN n; END;",
+                "not declared yet",
+            ),
+            (
+                "CURSOR c IS SELECT id FROM t; v c%ROWTYPE; n v.id%TYPE; BEGIN RETURN n; END;",
+                "a %ROWTYPE field %TYPE anchor is not implemented",
+            ),
+        ];
+        for (body, expected) in refused {
+            let err = compile_err(body);
             assert!(err.contains(expected), "{body}\n{err}");
         }
     }
