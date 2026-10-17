@@ -253,6 +253,16 @@ collects receipts. Wiring durable prepared requests, per-row rejection, guarded 
 conflict checks and key-level echo suppression into the production Oracle push remains
 unfinished; adapter write-back stays refused.
 
+Binary floating-point write-back now binds explicitly as BINARY_DOUBLE instead
+of the public client's default NUMBER bind. Native tests verify NaNs, both
+infinities, finite extrema and subnormal values through repeated writes and
+MPEdb import. Postimage/key comparisons use IEEE bits, and shared verify/reconcile
+use the same transport equality so unchanged NaNs no longer cause false
+divergence or repeated repairs. Binary64 values rounded by BINARY_FLOAT remain
+rejected. The measured Oracle reference normalizes submitted negative zero;
+that sign loss is detected and the entire write is rolled back rather than
+silently accepted. Shared postimage/ACK regression tests remain green.
+
 The large-value import test also found and fixed a shared storage bug:
 `row::encoded_len` omitted NUMERIC's variable-length body. This caused large
 NUMBER/LOB rows to fail extent insertion. A source-independent MPEdb regression

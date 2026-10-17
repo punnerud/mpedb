@@ -212,13 +212,7 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
 }
 
 fn same_values(a: &[mpedb_types::Value], b: &[mpedb_types::Value]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(a, b)| match (a, b) {
-            (mpedb_types::Value::Float(a), mpedb_types::Value::Float(b)) => {
-                a.to_bits() == b.to_bits()
-            }
-            _ => a == b,
-        })
+    crate::adapter::same_carrier_rows(a, b)
 }
 
 fn validate_reply(schema: &mpedb_types::Schema, ops: &[NetOp], reply: &PushReply) -> Result<()> {

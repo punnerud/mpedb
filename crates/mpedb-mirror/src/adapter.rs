@@ -173,6 +173,19 @@ pub trait SourceAdapter {
     ) -> Result<bool>;
 }
 
+pub(crate) fn same_carrier_rows(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_carrier_value(a, b))
+}
+
+/// Equality for lossless transport: NaNs compare by payload bits and signed
+/// zero stays distinct. SQL comparison semantics are intentionally separate.
+pub(crate) fn same_carrier_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        _ => a == b,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

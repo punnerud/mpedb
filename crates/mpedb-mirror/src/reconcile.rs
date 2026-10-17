@@ -79,7 +79,7 @@ pub fn reconcile<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> R
         let mut upserts: Vec<Vec<Value>> = Vec::new();
         let mut deletes: Vec<Vec<Value>> = Vec::new();
         for (key, srow) in &sq {
-            if mp.get(key) != Some(srow) {
+            if !mp.get(key).is_some_and(|row| crate::adapter::same_carrier_rows(row, srow)) {
                 upserts.push(srow.clone());
             }
         }
@@ -128,7 +128,7 @@ pub fn verify<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Resu
         for row in adapter.read_table_rows(tid as u32)? {
             sq.insert(pk_keycode(&row, &pk_idx), row);
         }
-        if mp != sq {
+        if mp.len() != sq.len() || mp.iter().any(|(key, row)| sq.get(key).is_none_or(|other| !crate::adapter::same_carrier_rows(row, other))) {
             return Ok(false);
         }
     }

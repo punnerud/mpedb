@@ -21,7 +21,7 @@ fn same_key(table: &OracleTable, op: &NetOp, values: &[Value]) -> bool {
             .pk
             .iter()
             .zip(&op.pk)
-            .all(|(&k, v)| values.get(k) == Some(v))
+            .all(|(&k, v)| values.get(k).is_some_and(|actual| crate::adapter::same_carrier_value(actual, v)))
 }
 fn frame(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     if out

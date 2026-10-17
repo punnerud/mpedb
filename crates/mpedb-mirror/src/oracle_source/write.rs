@@ -6,9 +6,24 @@ use crate::adapter::{NetOp, NetOpKind};
 use oracle_client::sql_type::{Blob, Clob, Lob, Nclob, ToSql};
 use std::io::Write;
 
+// The public client defaults f64 binds to NUMBER, which cannot represent IEEE
+// NaNs/infinities and can discard negative zero. Use an explicit binary bind.
+struct BinaryDoubleBind(f64);
+impl ToSql for BinaryDoubleBind {
+    fn oratype(
+        &self,
+        _: &oracle_client::Connection,
+    ) -> oracle_client::Result<oracle_client::sql_type::OracleType> {
+        Ok(oracle_client::sql_type::OracleType::BinaryDouble)
+    }
+    fn to_sql(&self, value: &mut oracle_client::SqlValue) -> oracle_client::Result<()> {
+        self.0.to_sql(value)
+    }
+}
+
 enum Bind {
     Text(String),
-    Float(f64),
+    Float(BinaryDoubleBind),
     Int(i64),
     Bytes(Vec<u8>),
     Null(Option<String>),
@@ -151,7 +166,11 @@ impl OracleSource {
                 }
                 NetOpKind::Upsert(values) => {
                     if values.len() != table.columns.len()
-                        || table.pk.iter().zip(&op.pk).any(|(&k, v)| &values[k] != v)
+                        || table
+                            .pk
+                            .iter()
+                            .zip(&op.pk)
+                            .any(|(&k, v)| !crate::adapter::same_carrier_value(&values[k], v))
                     {
                         return Err(Error::Config(
                             "Oracle write image does not match its identity or schema".into(),
@@ -220,7 +239,10 @@ impl OracleSource {
                             "Oracle upsert did not retain the requested identity".into(),
                         )
                     })?;
-                    if let Some((_, c)) = writable.iter().find(|(i, _)| image[*i] != values[*i]) {
+                    if let Some((_, c)) = writable
+                        .iter()
+                        .find(|(i, _)| !crate::adapter::same_carrier_value(&image[*i], &values[*i]))
+                    {
                         return Err(Error::Unsupported(format!("Oracle changed a submitted carrier value in {} at operation {operation_index}; the entire batch was rolled back", c.name)));
                     }
                     images.push(Some(image));
@@ -347,7 +369,7 @@ fn bind(connection: &oracle_client::Connection, c: &OracleColumn, value: &Value)
         {
             Ok(Bind::Text(v.clone()))
         }
-        (Some(ColumnType::Float64), Value::Float(v)) => Ok(Bind::Float(*v)),
+        (Some(ColumnType::Float64), Value::Float(v)) => Ok(Bind::Float(BinaryDoubleBind(*v))),
         (Some(ColumnType::Bool), Value::Bool(v)) => Ok(Bind::Int(i64::from(*v))),
         (Some(ColumnType::Text), Value::Text(v)) if v.len() <= 4000 => Ok(Bind::Text(v.clone())),
         (Some(ColumnType::Blob), Value::Blob(v)) if v.len() <= 2000 => Ok(Bind::Bytes(v.clone())),
