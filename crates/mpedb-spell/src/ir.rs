@@ -303,6 +303,10 @@ pub enum Op {
     /// count raises `VALUE_ERROR`. A negative count raises
     /// `SUBSCRIPT_OUTSIDE_LIMIT`.
     NestedExtend,
+    /// Pop a nested table and a count, drop that many trailing elements, and
+    /// push the new table. A NULL table raises `COLLECTION_IS_NULL`. A NULL
+    /// count raises `VALUE_ERROR`. Past the end raises `SUBSCRIPT_BEYOND_COUNT`.
+    NestedTrim,
     /// Push the session value of package variable `consts[i]` (a text key).
     /// A variable that has never been stored is NULL.
     PkgGet(u16),
@@ -447,6 +451,8 @@ const OP_NESTED_NEXT: u8 = 111;
 const OP_NESTED_LIMIT: u8 = 112;
 // Nested-table EXTEND. Additive: `NestedLimit` stays 112.
 const OP_NESTED_EXTEND: u8 = 113;
+// Nested-table TRIM. Additive: `NestedExtend` stays 113.
+const OP_NESTED_TRIM: u8 = 114;
 
 /// `Op::CursorAttr` selector. Any other byte fails validation.
 pub const CURSOR_ATTR_ISOPEN: u8 = 0;
@@ -831,6 +837,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::NestedNext => b.push(OP_NESTED_NEXT),
         Op::NestedLimit => b.push(OP_NESTED_LIMIT),
         Op::NestedExtend => b.push(OP_NESTED_EXTEND),
+        Op::NestedTrim => b.push(OP_NESTED_TRIM),
         Op::PkgGet(x) => u16arg(OP_PKG_GET, x),
         Op::PkgSet(x) => u16arg(OP_PKG_SET, x),
         Op::CursorRow => b.push(OP_CURSOR_ROW),
@@ -995,6 +1002,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_NESTED_NEXT => Op::NestedNext,
         OP_NESTED_LIMIT => Op::NestedLimit,
         OP_NESTED_EXTEND => Op::NestedExtend,
+        OP_NESTED_TRIM => Op::NestedTrim,
         OP_PKG_GET => Op::PkgGet(u16arg()?),
         OP_PKG_SET => Op::PkgSet(u16arg()?),
         OP_CURSOR_ROW => Op::CursorRow,
@@ -1022,7 +1030,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::NestedFirst | Op::NestedLast => (1, 1),
         Op::NestedPrior | Op::NestedNext => (2, 1),
         Op::NestedLimit => (1, 1),
-        Op::NestedExtend => (2, 1),
+        Op::NestedExtend | Op::NestedTrim => (2, 1),
         Op::PkgGet(_) => (0, 1),
         Op::PkgSet(_) => (1, 0),
         Op::Tuple(n) => (n as usize, 1),
@@ -1650,9 +1658,10 @@ mod tests {
         encode_op(&mut collect, Op::NestedNext);
         encode_op(&mut collect, Op::NestedLimit);
         encode_op(&mut collect, Op::NestedExtend);
+        encode_op(&mut collect, Op::NestedTrim);
         assert_eq!(
             collect,
-            vec![102, 103, 106, 107, 108, 109, 110, 111, 112, 113]
+            vec![102, 103, 106, 107, 108, 109, 110, 111, 112, 113, 114]
         );
         let collect_proc = mk(
             vec![

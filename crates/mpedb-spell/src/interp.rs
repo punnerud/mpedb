@@ -1034,10 +1034,11 @@ pub fn run_with_package(
                 let collection = stack.pop().expect("validated");
                 stack.push(nested_limit(collection)?);
             }
-            Op::NestedExtend => {
+            Op::NestedExtend | Op::NestedTrim => {
                 let collection = stack.pop().expect("validated");
                 let count = stack.pop().expect("validated");
-                stack.push(nested_extend(collection, count)?);
+                let trim = matches!(op, Op::NestedTrim);
+                stack.push(nested_resize(collection, count, trim)?);
             }
             Op::PkgGet(index) => {
                 let key = package_key(&proc.consts, index)?;
@@ -1378,10 +1379,11 @@ fn nested_limit(collection: PValue) -> Result<PValue> {
     }
 }
 
-/// `EXTEND` appends NULL elements. A NULL collection raises. A NULL count
-/// raises `VALUE_ERROR`. A negative count raises `SUBSCRIPT_OUTSIDE_LIMIT`.
-/// Zero leaves the elements unchanged. The new list does not alias the old one.
-fn nested_extend(collection: PValue, count: PValue) -> Result<PValue> {
+/// `EXTEND` appends NULL elements. `TRIM` drops trailing elements.
+/// A NULL collection raises. A NULL count raises `VALUE_ERROR`. A negative
+/// count raises `SUBSCRIPT_OUTSIDE_LIMIT`. `TRIM` past the end raises
+/// `SUBSCRIPT_BEYOND_COUNT`. Zero leaves the elements unchanged.
+fn nested_resize(collection: PValue, count: PValue, trim: bool) -> Result<PValue> {
     let list = match collection {
         PValue::Scalar(Value::Null) => {
             return Err(Error::Oracle {
@@ -1408,11 +1410,20 @@ fn nested_extend(collection: PValue, count: PValue) -> Result<PValue> {
             message: "subscript outside of limit".into(),
         });
     }
-    let extra = usize::try_from(count).map_err(|_| rt_err("EXTEND count exceeds usize"))?;
-    let mut elems = Vec::with_capacity(list.len());
-    elems.extend(list.iter().cloned());
-    for _ in 0..extra {
-        elems.push(PValue::Scalar(Value::Null));
+    let extra = usize::try_from(count).map_err(|_| rt_err("collection resize exceeds usize"))?;
+    if trim && extra > list.len() {
+        return Err(Error::Oracle {
+            code: 6533,
+            message: "Subscript beyond count".into(),
+        });
+    }
+    let keep = if trim { list.len() - extra } else { list.len() };
+    let mut elems = Vec::with_capacity(keep);
+    elems.extend(list.iter().take(keep).cloned());
+    if !trim {
+        for _ in 0..extra {
+            elems.push(PValue::Scalar(Value::Null));
+        }
     }
     Ok(PValue::List(Rc::new(elems)))
 }

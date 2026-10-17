@@ -12,7 +12,9 @@
 //! table raises the same error. An initialized nested table has no maximum,
 //! so its `LIMIT` is NULL. `EXTEND` of an uninitialized table raises the
 //! same error. `EXTEND` appends NULL elements, and a NULL count raises
-//! `VALUE_ERROR`. `INDEX BY` and `VARRAY` stay refused.
+//! `VALUE_ERROR`. `TRIM` of an uninitialized table raises the same error,
+//! and `TRIM` of an empty table raises `SUBSCRIPT_BEYOND_COUNT`. Trimming
+//! the NULL element leaves an empty table. `INDEX BY` and `VARRAY` stay refused.
 
 use super::*;
 use crate::emit::{CallKind, SqlCall};
@@ -96,15 +98,19 @@ impl Parser<'_> {
 
     pub(super) fn nested_statement(&mut self, nested: NestedVar) -> Result<()> {
         if self.symbol(".") {
-            return self.extend_statement(nested);
+            return self.collection_statement(nested);
         }
         self.assign_nested(nested)
     }
 
-    fn extend_statement(&mut self, nested: NestedVar) -> Result<()> {
-        if !self.word("EXTEND") {
+    fn collection_statement(&mut self, nested: NestedVar) -> Result<()> {
+        let op = if self.word("EXTEND") {
+            Op::NestedExtend
+        } else if self.word("TRIM") {
+            Op::NestedTrim
+        } else {
             return Err(self.error("nested table methods are not implemented"));
-        }
+        };
         if self.symbol("(") {
             if !self.symbol(")") {
                 let actual = self.expression()?;
@@ -121,7 +127,7 @@ impl Parser<'_> {
             self.constant(Value::Int(1))?;
         }
         self.builder.emit(Op::LoadLocal(nested.slot))?;
-        self.builder.emit(Op::NestedExtend)?;
+        self.builder.emit(op)?;
         self.builder.emit(Op::StoreLocal(nested.slot))?;
         self.want_symbol(";")
     }
@@ -996,5 +1002,63 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(copy.contains("EXTEND copy form is not implemented"), "{copy}");
+    }
+
+    #[test]
+    fn nested_table_trim_of_null_removes_the_null_element() {
+        let decl = "TYPE nums IS TABLE OF NUMBER; n nums;";
+        let (caught, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} BEGIN n.TRIM; RETURN 1; \
+                 EXCEPTION WHEN COLLECTION_IS_NULL THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(caught, Value::Null);
+
+        let collect = format!("{decl} BEGIN SELECT amount BULK COLLECT INTO n FROM t;");
+        let (empty, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{collect} n.TRIM; RETURN 1; \
+                 EXCEPTION WHEN SUBSCRIPT_BEYOND_COUNT THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(empty, Value::Null);
+        let (trimmed, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{collect} n.TRIM; \
+                 IF n.COUNT = 0 AND n.FIRST IS NULL THEN RETURN NULL; END IF; \
+                 RETURN 1; END;"
+            ),
+            vec![vec![Value::Null]],
+        );
+        assert_eq!(trimmed, Value::Null);
+        let (kept, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{collect} n.TRIM(0); \
+                 IF n.COUNT = 1 AND n(1) IS NULL THEN RETURN NULL; END IF; \
+                 RETURN 1; END;"
+            ),
+            vec![vec![Value::Null]],
+        );
+        assert_eq!(kept, Value::Null);
+
+        let uninit = fail(
+            "PLS_INTEGER",
+            &format!("{decl} BEGIN n.TRIM; RETURN 1; END;"),
+            vec![],
+        );
+        assert!(uninit.contains("ORA-06531"), "{uninit}");
+        let beyond = fail(
+            "PLS_INTEGER",
+            &format!("{collect} n.TRIM; RETURN 1; END;"),
+            vec![],
+        );
+        assert!(beyond.contains("ORA-06533"), "{beyond}");
     }
 }

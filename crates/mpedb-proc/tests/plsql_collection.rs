@@ -102,3 +102,54 @@ fn plsql_nested_table_extend_of_null() {
         ProcValue::Scalar(Value::Null)
     );
 }
+
+#[test]
+fn plsql_nested_table_trim_of_null() {
+    let (cfg, _guard) = test_config("plsql-nested-trim");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query(
+        "CREATE TABLE marks (id INTEGER PRIMARY KEY, score INTEGER)",
+        &[],
+    )
+    .unwrap();
+    db.query("INSERT INTO marks (id, score) VALUES (1, NULL)", &[])
+        .unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_null RETURN PLS_INTEGER IS \
+             TYPE nums IS TABLE OF NUMBER; \
+             n nums; \
+             BEGIN \
+               n.TRIM; \
+               RETURN 1; \
+             EXCEPTION \
+               WHEN COLLECTION_IS_NULL THEN \
+                 RETURN NULL; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_NULL", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_trim RETURN PLS_INTEGER IS \
+             TYPE nums IS TABLE OF NUMBER; \
+             n nums; \
+             BEGIN \
+               SELECT score BULK COLLECT INTO n FROM marks; \
+               n.TRIM; \
+               IF n.COUNT = 0 AND n.FIRST IS NULL THEN RETURN NULL; END IF; \
+               RETURN 1; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_TRIM", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+}
