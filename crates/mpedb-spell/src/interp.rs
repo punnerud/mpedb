@@ -24,6 +24,9 @@
 
 mod sql_logic;
 mod oracle_number;
+mod legacy_oracle_number;
+#[cfg(test)]
+mod oracle_number_tests;
 #[cfg(test)]
 mod tuple_tests;
 
@@ -502,14 +505,27 @@ pub fn run(
                 stack.push(PValue::Tuple(Rc::new(items)));
             }
             Op::MissingReturn => return Err(rt_err("PL/SQL function reached END without RETURN")),
-            Op::SqlNeg => {
+            Op::OracleNumber => {
+                let value = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(oracle_number::number(value)?));
+            }
+            Op::OracleNeg => {
                 let value = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(oracle_number::negate(value)?));
+            }
+            Op::OracleAdd | Op::OracleSub | Op::OracleMul | Op::OracleDiv => {
+                let b = stack.pop().expect("validated");
+                let a = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(oracle_number::binary(op, a, b)?));
+            }
+            Op::SqlNeg => {
+                let value = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(legacy_oracle_number::negate(value)?));
             }
             Op::SqlAdd | Op::SqlSub | Op::SqlMul | Op::SqlDiv => {
                 let b = stack.pop().expect("validated");
                 let a = stack.pop().expect("validated");
-                stack.push(PValue::Scalar(oracle_number::binary(op, a, b)?));
+                stack.push(PValue::Scalar(legacy_oracle_number::binary(op, a, b)?));
             }
             Op::SqlNumber => {
                 let value = stack.pop().expect("validated");

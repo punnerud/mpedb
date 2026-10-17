@@ -72,25 +72,85 @@ fn arithmetic_nulls_zero_division_and_short_circuit_match_sql_rules() {
 }
 
 #[test]
-fn rounding_dependent_arithmetic_is_not_silently_postgresql_or_float() {
-    let error = call(&function("", "NUMBER", "BEGIN RETURN 1 / 3; END;"), &[])
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("rounded recurring decimal"));
-    for expression in [
-        "1e125 * 100",
-        "1e-100 * 1e-100",
-        "99999999999999999999999999999999999999 * 3",
+fn rounded_arithmetic_matches_measured_oracle_values() {
+    for (expression, expected) in [
+        ("1 / 3", "0.3333333333333333333333333333333333333333"),
+        ("2 / 3", "0.6666666666666666666666666666666666666667"),
+        ("-2 / 3", "-0.6666666666666666666666666666666666666667"),
+        ("1 / 7", "0.1428571428571428571428571428571428571429"),
+        ("1e-100 * 1e-100", "0"),
+        ("1e-131", "0"),
+        (
+            "12345678901234567890123456789012345678901",
+            "12345678901234567890123456789012345678900",
+        ),
     ] {
-        assert!(
+        assert_eq!(
             call(
                 &function("", "NUMBER", &format!("BEGIN RETURN {expression}; END;")),
                 &[]
             )
-            .is_err(),
+            .unwrap(),
+            Value::Numeric(expected.into()),
             "{expression}"
         );
     }
+    assert!(call(
+        &function("", "NUMBER", "BEGIN RETURN 1e125 * 100; END;"),
+        &[]
+    )
+    .is_err());
+}
+
+#[test]
+fn division_underflow_raises_while_literal_and_multiplication_underflow_zero() {
+    assert!(matches!(
+        call(
+            &function("", "NUMBER", "BEGIN RETURN 1e-100 / 1e100; END;"),
+            &[]
+        ),
+        Err(mpedb_types::Error::ArithmeticOverflow)
+    ));
+    assert_eq!(
+        call(
+            &function("", "NUMBER", "BEGIN RETURN 1e-100 * 1e-100; END;"),
+            &[]
+        )
+        .unwrap(),
+        Value::Numeric("0".into())
+    );
+    assert_eq!(
+        call(&function("", "NUMBER", "BEGIN RETURN 1e-131; END;"), &[]).unwrap(),
+        Value::Numeric("0".into())
+    );
+}
+
+#[test]
+fn number_rounding_ties_are_away_from_zero_and_trailing_zeros_are_bounded() {
+    let source = function("p NUMBER", "NUMBER", "BEGIN RETURN p; END;");
+    for (input, expected) in [
+        (
+            "1.000000000000000000000000000000000000005",
+            "1.00000000000000000000000000000000000001",
+        ),
+        (
+            "-1.000000000000000000000000000000000000005",
+            "-1.00000000000000000000000000000000000001",
+        ),
+    ] {
+        assert_eq!(
+            call(&source, &[Value::Numeric(input.into())]).unwrap(),
+            Value::Numeric(expected.into())
+        );
+    }
+    assert_eq!(
+        call(
+            &source,
+            &[Value::Numeric(format!("1.{}", "0".repeat(10000)))]
+        )
+        .unwrap(),
+        Value::Numeric("1".into())
+    );
 }
 
 #[test]
@@ -325,8 +385,8 @@ fn end_names_and_client_terminators_preserve_source_identity() {
 }
 
 #[test]
-fn number_range_and_rounding_gaps_raise_instead_of_returning_wrong_values() {
-    for text in ["1e126", "1e-131", "123456789012345678901234567890123456789"] {
+fn number_overflow_and_nonfinite_inputs_raise() {
+    for text in ["1e126", "-1e126"] {
         assert!(call(
             &function("", "NUMBER", &format!("BEGIN RETURN {text}; END;")),
             &[]

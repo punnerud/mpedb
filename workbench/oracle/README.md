@@ -69,26 +69,44 @@ be assigned. A function that reaches END without RETURN raises. Routine END
 names must match, and an optional SQL*Plus slash must occupy its own line.
 Parameter lists follow Oracle's grammar: omit parentheses for zero parameters.
 
-NUMBER values remain exact decimals; integers are normalized to decimals at
-parameter boundaries. Values beyond 38 significant digits or the supported
-Oracle exponent range currently raise instead of simulating Oracle rounding
-or underflow. Floating-point/text-to-NUMBER conversions and NLS settings are
-not implemented. **Defaults, constrained types, SQL
-statements, calls to other routines, packages, exceptions, cursors, and dynamic
-SQL remain unimplemented**, so this is not full PL/SQL compatibility.
+NUMBER values remain exact decimals; integers are normalized at parameter
+boundaries. New routines use Oracle's twenty base-100 groups (39/40 decimal
+digits according to exponent parity), with rounding measured against Oracle
+23.26.3. Arithmetic `+`, `-`, `*`, `/` and unary signs use bounded arbitrary-width
+integer intermediates, SQL NULL propagation, and proper operator precedence.
+Recurring division now works: `1 / 3` retains forty fractional digits. Numeric
+overflow raises; literal conversion and multiplication underflow become zero,
+whereas division underflow on nonzero operands raises as Oracle does.
 
-Arithmetic `+`, `-`, `*`, `/` and unary signs now use bounded arbitrary-width
-integer decimal intermediates, with SQL NULL propagation and proper operator
-precedence. Exact terminating division works (e.g. `5 / 2 = 2.5`); zero division
-raises. The implementation handles valid exponents such as `1e100` without a
-floating-point fallback or i128 overflow. Nonterminating division (`1 / 3`),
-results requiring more than the currently supported 38 significant digits,
-overflow, and underflow are still refused. Oracle guarantees up to 20 base-100
-digits (39 or 40 decimal digits depending on position); this is why copying
-PostgreSQL's 16-place division or guessing a 38-digit rounding rule would be
-incorrect. Rounded arithmetic and full Oracle NUMBER behavior require a real
-reference measurement and remain part of the unfinished scope. See
-[Oracle NUMBER precision](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Data-Types.html).
+The new NUMBER behavior has **distinct IR opcodes**. Previously stored numeric
+routines retain their original limited semantics and hashes; redefining source
+emits the new instructions and produces a new hash. Older builds reject unknown
+opcodes. Existing Python/Rust semantics and stored blobs are unchanged.
+
+The reproducible differential tool compares native compiled/serialized PL/SQL
+with real Oracle SELECT results:
+
+```sh
+# Build with CARGO_TARGET_DIR on the extra disk as for other Rust tests.
+cargo build -p mpedb-spell --example plsql_number_probe
+python workbench/oracle/number_differential.py \
+  --probe /path/to/target/debug/examples/plsql_number_probe \
+  --native-root /mnt/HC_Volume_106406886/mpedb-oracle \
+  --output /mnt/HC_Volume_106406886/mpedb-oracle/number-report.json
+```
+
+The measured seed **20261017** covers **2,016 cases with zero mismatches** for
+arithmetic over valid finite literals plus the boundary corpus. An exploratory
+run that also generated invalid/out-of-range source literals had 96 parsing
+error-code differences: both implementations rejected those expressions, but
+Oracle SQL reported ORA-00923 where the native PL/SQL host path reported numeric
+overflow. Exact Oracle SQL parsing/error compatibility remains unfinished.
+See [Oracle NUMBER precision](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Data-Types.html).
+
+Floating-point/text-to-NUMBER conversions and NLS settings remain unimplemented.
+**Defaults, constrained types, SQL statements, calls to other routines, packages,
+exceptions, cursors, and dynamic SQL remain unimplemented**; measured arithmetic
+agreement is not full PL/SQL compatibility.
 
 The native `ProcEngine` calling convention supplies one argument slot for every
 formal parameter, including OUT placeholders. OUT values start NULL; IN OUT

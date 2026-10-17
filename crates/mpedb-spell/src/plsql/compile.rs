@@ -16,7 +16,7 @@ impl Type {
     fn check(self) -> Op {
         match self {
             Self::Boolean => Op::SqlBool,
-            Self::Number => Op::SqlNumber,
+            Self::Number => Op::OracleNumber,
         }
     }
 }
@@ -526,9 +526,9 @@ impl Parser<'_> {
         let mut ty = self.multiplicative()?;
         loop {
             let op = if self.symbol("+") {
-                Op::SqlAdd
+                Op::OracleAdd
             } else if self.symbol("-") {
-                Op::SqlSub
+                Op::OracleSub
             } else {
                 break;
             };
@@ -544,9 +544,9 @@ impl Parser<'_> {
         let mut ty = self.unary()?;
         loop {
             let op = if self.symbol("*") {
-                Op::SqlMul
+                Op::OracleMul
             } else if self.symbol("/") {
-                Op::SqlDiv
+                Op::OracleDiv
             } else {
                 break;
             };
@@ -576,7 +576,7 @@ impl Parser<'_> {
             self.compatible(Type::Number, ty)?;
         }
         if negate {
-            self.builder.emit(Op::SqlNeg)?;
+            self.builder.emit(Op::OracleNeg)?;
         }
         Ok(if signed { Some(Type::Number) } else { ty })
     }
@@ -603,7 +603,7 @@ impl Parser<'_> {
                 .ok_or_else(|| self.error("unsupported NUMBER literal"))?;
             self.at += 1;
             self.constant(Value::Numeric(value))?;
-            self.builder.emit(Op::SqlNumber)?;
+            self.builder.emit(Op::OracleNumber)?;
             return Ok(Some(Type::Number));
         }
         let name = self.identifier()?;

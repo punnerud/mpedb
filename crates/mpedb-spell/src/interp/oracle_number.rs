@@ -1,13 +1,23 @@
-//! Exact NUMBER arithmetic over bounded Oracle-range operands. This is distinct
-//! from PostgreSQL numeric division and Python/Rust floating-point arithmetic.
-//! Oracle's rounding-dependent cases remain explicit refusals until measured
-//! against a real Oracle reference server.
+//! Oracle NUMBER arithmetic with twenty base-100 groups, rounded using the
+//! real Oracle 23.26.3 reference measurements. No binary float intermediates.
 
-use super::{sql_logic, type_err, Op, PValue};
+use super::{tyname, type_err, Op, PValue};
 use mpedb_types::{Error, Result, Value};
 use num_bigint::BigInt;
 use num_integer::Integer;
-use num_traits::{One, Signed, Zero};
+use num_traits::{Signed, Zero};
+
+pub(super) fn number(value: PValue) -> Result<Value> {
+    match value {
+        PValue::Scalar(Value::Null) => Ok(Value::Null),
+        PValue::Scalar(Value::Int(n)) => Ok(Value::Numeric(n.to_string())),
+        PValue::Scalar(Value::Numeric(text)) => Ok(Value::Numeric(normalize(&text)?)),
+        other => Err(type_err(format!(
+            "PL/SQL NUMBER conversion from {} is not implemented",
+            tyname(&other)
+        ))),
+    }
+}
 
 struct Decimal {
     coefficient: BigInt,
@@ -15,7 +25,7 @@ struct Decimal {
 }
 
 fn decimal(value: PValue) -> Result<Option<Decimal>> {
-    match sql_logic::number(value)? {
+    match number(value)? {
         Value::Null => Ok(None),
         Value::Numeric(text) => {
             // Strip insignificant fractional zeros BEFORE computing powers,
@@ -39,9 +49,14 @@ fn pow10(n: u32) -> BigInt {
     BigInt::from(10).pow(n)
 }
 
-fn value(coefficient: BigInt, scale: u32) -> Result<Value> {
+fn render(coefficient: BigInt, scale: i32) -> String {
+    let coefficient = if scale < 0 {
+        coefficient * pow10((-scale) as u32)
+    } else {
+        coefficient
+    };
     let digits = coefficient.abs().to_string();
-    let scale = scale as usize;
+    let scale = scale.max(0) as usize;
     let unsigned = if scale == 0 {
         digits
     } else if digits.len() <= scale {
@@ -55,9 +70,57 @@ fn value(coefficient: BigInt, scale: u32) -> Result<Value> {
     } else {
         unsigned
     };
-    sql_logic::number(PValue::Scalar(Value::Numeric(
-        mpedb_types::value::canonical_numeric(&text),
-    )))
+    mpedb_types::value::canonical_numeric(&text)
+}
+
+/// Oracle stores twenty base-100 groups: the leading group has one or two
+/// decimal digits according to the exponent parity. Round half away from zero.
+/// Only the retained (at most forty) digits enter BigInt parsing.
+pub(super) fn normalize(input: &str) -> Result<String> {
+    let text = mpedb_types::value::parse_numeric(input)
+        .filter(|s| !matches!(s.as_str(), "NaN" | "Infinity" | "-Infinity"))
+        .ok_or_else(|| type_err("PL/SQL NUMBER requires a finite decimal"))?;
+    let unsigned = text.trim_start_matches('-');
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let whole = whole.trim_start_matches('0');
+    let exponent = if !whole.is_empty() {
+        whole.len() as i32 - 1
+    } else if let Some(first) = fraction.find(|c| c != '0') {
+        -(first as i32) - 1
+    } else {
+        return Ok("0".into());
+    };
+    if exponent < -130 {
+        return Ok("0".into());
+    }
+    if exponent >= 126 {
+        return Err(Error::ArithmeticOverflow);
+    }
+    let digits = format!("{whole}{fraction}");
+    let digits = digits.trim_start_matches('0');
+    let precision = (39 + exponent.rem_euclid(2)) as usize;
+    let retained = precision.min(digits.len());
+    let mut coefficient: BigInt = digits[..retained]
+        .parse()
+        .map_err(|_| type_err("invalid NUMBER digits"))?;
+    if digits.as_bytes().get(retained).is_some_and(|&d| d >= b'5') {
+        coefficient += 1;
+    }
+    let scale = retained as i32 - 1 - exponent;
+    if coefficient.to_string().len() as i32 - scale > 126 {
+        return Err(Error::ArithmeticOverflow);
+    }
+    if text.starts_with('-') {
+        coefficient = -coefficient;
+    }
+    Ok(render(coefficient, scale))
+}
+
+fn value(coefficient: BigInt, scale: u32) -> Result<Value> {
+    Ok(Value::Numeric(normalize(&render(
+        coefficient,
+        scale as i32,
+    ))?))
 }
 
 pub(super) fn negate(input: PValue) -> Result<Value> {
@@ -73,43 +136,65 @@ pub(super) fn binary(op: Op, a: PValue, b: PValue) -> Result<Value> {
         return Ok(Value::Null);
     };
     match op {
-        Op::SqlAdd | Op::SqlSub => {
+        Op::OracleAdd | Op::OracleSub => {
             let scale = a.scale.max(b.scale);
             let a = a.coefficient * pow10(scale - a.scale);
             let b = b.coefficient * pow10(scale - b.scale);
-            value(if op == Op::SqlAdd { a + b } else { a - b }, scale)
+            value(if op == Op::OracleAdd { a + b } else { a - b }, scale)
         }
-        Op::SqlMul => value(a.coefficient * b.coefficient, a.scale + b.scale),
-        Op::SqlDiv => {
+        Op::OracleMul => value(a.coefficient * b.coefficient, a.scale + b.scale),
+        Op::OracleDiv => {
             if b.coefficient.is_zero() {
                 return Err(Error::DivisionByZero);
             }
             let numerator = a.coefficient * pow10(b.scale);
             let denominator = b.coefficient * pow10(a.scale);
-            let gcd = numerator.gcd(&denominator);
-            let mut numerator = numerator / &gcd;
-            let mut denominator = denominator / gcd;
+            let mut numerator = numerator;
+            let mut denominator = denominator;
             if denominator.is_negative() {
                 numerator = -numerator;
                 denominator = -denominator;
             }
-            let mut twos = 0;
-            let mut fives = 0;
-            while denominator.is_even() {
-                denominator /= 2;
-                twos += 1;
+            let negative = numerator.is_negative();
+            numerator = numerator.abs();
+            if numerator.is_zero() {
+                return Ok(Value::Numeric("0".into()));
             }
-            while (&denominator % 5u8).is_zero() {
-                denominator /= 5;
-                fives += 1;
+            let mut exponent =
+                numerator.to_string().len() as i32 - denominator.to_string().len() as i32;
+            let below = if exponent >= 0 {
+                numerator < &denominator * pow10(exponent as u32)
+            } else {
+                &numerator * pow10((-exponent) as u32) < denominator
+            };
+            if below {
+                exponent -= 1;
             }
-            if !denominator.is_one() {
-                return Err(Error::Unsupported("Oracle NUMBER division requires a rounded recurring decimal; reference-verified Oracle rounding is not implemented".into()));
+            if exponent < -130 {
+                // Unlike literal conversion/multiplication, Oracle division
+                // of nonzero operands raises ORA-01426 on underflow.
+                return Err(Error::ArithmeticOverflow);
             }
-            let scale = twos.max(fives);
-            numerator *= BigInt::from(2).pow(scale - twos);
-            numerator *= BigInt::from(5).pow(scale - fives);
-            value(numerator, scale)
+            if exponent >= 126 {
+                return Err(Error::ArithmeticOverflow);
+            }
+            let precision = 39 + exponent.rem_euclid(2);
+            let scale = precision - 1 - exponent;
+            if scale >= 0 {
+                numerator *= pow10(scale as u32);
+            } else {
+                denominator *= pow10((-scale) as u32);
+            }
+            let (mut quotient, remainder) = numerator.div_rem(&denominator);
+            if remainder * 2 >= denominator {
+                quotient += 1;
+            }
+            if negative {
+                quotient = -quotient;
+            }
+            // Already rounded at the base-100 quantum; normalize catches a
+            // carry beyond the NUMBER exponent limit and canonicalizes zeros.
+            Ok(Value::Numeric(normalize(&render(quotient, scale))?))
         }
         _ => unreachable!("NUMBER arithmetic dispatch"),
     }

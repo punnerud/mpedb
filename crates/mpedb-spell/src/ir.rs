@@ -136,6 +136,15 @@ pub enum Op {
     SqlBool,
     /// Normalize a finite NUMBER value; integer inputs become exact decimals.
     SqlNumber,
+    /// Reference-verified base-100 NUMBER rules. Separate from legacy Sql*
+    /// instructions so existing stored hashes never change their meaning.
+    OracleNumber,
+    OracleAdd,
+    OracleSub,
+    OracleMul,
+    OracleDiv,
+    OracleNeg,
+
     /// Exact decimal arithmetic; rounding-dependent results currently refuse.
     SqlAdd,
     SqlSub,
@@ -237,6 +246,13 @@ const OP_SQL_SUB: u8 = 49;
 const OP_SQL_MUL: u8 = 50;
 const OP_SQL_DIV: u8 = 51;
 const OP_SQL_NEG: u8 = 52;
+const OP_ORACLE_NUMBER: u8 = 53;
+const OP_ORACLE_ADD: u8 = 54;
+const OP_ORACLE_SUB: u8 = 55;
+const OP_ORACLE_MUL: u8 = 56;
+const OP_ORACLE_DIV: u8 = 57;
+const OP_ORACLE_NEG: u8 = 58;
+
 
 
 /// A validated procedure: everything the runtime needs, nothing it has to
@@ -477,6 +493,13 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::SqlGe => b.push(OP_SQL_GE),
         Op::SqlBool => b.push(OP_SQL_BOOL),
         Op::SqlNumber => b.push(OP_SQL_NUMBER),
+        Op::OracleNumber => b.push(OP_ORACLE_NUMBER),
+        Op::OracleAdd => b.push(OP_ORACLE_ADD),
+        Op::OracleSub => b.push(OP_ORACLE_SUB),
+        Op::OracleMul => b.push(OP_ORACLE_MUL),
+        Op::OracleDiv => b.push(OP_ORACLE_DIV),
+        Op::OracleNeg => b.push(OP_ORACLE_NEG),
+
         Op::SqlAdd => b.push(OP_SQL_ADD),
         Op::SqlSub => b.push(OP_SQL_SUB),
         Op::SqlMul => b.push(OP_SQL_MUL),
@@ -551,6 +574,13 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_SQL_GE => Op::SqlGe,
         OP_SQL_BOOL => Op::SqlBool,
         OP_SQL_NUMBER => Op::SqlNumber,
+        OP_ORACLE_NUMBER => Op::OracleNumber,
+        OP_ORACLE_ADD => Op::OracleAdd,
+        OP_ORACLE_SUB => Op::OracleSub,
+        OP_ORACLE_MUL => Op::OracleMul,
+        OP_ORACLE_DIV => Op::OracleDiv,
+        OP_ORACLE_NEG => Op::OracleNeg,
+
         OP_SQL_ADD => Op::SqlAdd,
         OP_SQL_SUB => Op::SqlSub,
         OP_SQL_MUL => Op::SqlMul,
@@ -590,7 +620,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg => (1, 1),
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg => (1, 1),
         Op::Add
         | Op::Sub
         | Op::Mul
@@ -609,6 +639,10 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         | Op::SqlSub
         | Op::SqlMul
         | Op::SqlDiv
+        | Op::OracleAdd
+        | Op::OracleSub
+        | Op::OracleMul
+        | Op::OracleDiv
         | Op::SqlAnd
         | Op::SqlOr
         | Op::SqlEq
