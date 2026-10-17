@@ -132,9 +132,18 @@ It discovers identities from both version start and end SCNs, then reads their
 net images at each commit SCN across all selected tables. Tests cover an
 uncommitted transaction, later commit, rollback, historical images, compound-PK
 changes, deletes and resume/budget rejection. XIDs retain transaction provenance.
-Expired undo or an oversized window fails without advancing a cursor. This is
-not yet a live `SourceAdapter`: epoch handling and own-write echo suppression
-still need their source-side state/ledger.
+Expired undo fails without advancing a cursor. `OracleAdapter` now implements
+the SourceAdapter pull boundary over persisted Oracle bootstrap metadata. It
+checks the source incarnation, emits whole commit-SCN batches, reads authority
+at the same SCN, and resumes from the atomically persisted MPEdb cursor after
+reopen. Raw-event overflow bisects the query window; a single commit exceeding
+the caller's limits is refused without truncation. SCNs use named SQL binds
+for statement reuse. Native tests cover compound-PK changes, multi-table commits,
+first inserts into empty tables, stale cursors, epoch mismatches, cold resume and
+DDL fences. The shared apply path now enforces source epochs when provided;
+legacy adapters that supply None retain their existing behavior.
+Oracle mirror push and MPEdb authority cutover remain explicitly refused until
+the durable own-write ledger, postimage handling and checked push are connected.
 
 An importer must establish its initial cursor only after a complete successful
 snapshot. On this native Oracle version, an immediate post-DDL SCN can map to a
@@ -142,8 +151,8 @@ timestamp preceding that DDL and fail with ORA-01466. Tests retry only that
 initial bootstrap; established capture never skips ahead on such an error.
 See [Oracle Flashback documentation](https://docs.oracle.com/en/database/oracle/oracle-database/26/adfns/flashback.html).
 
-Metadata inspection currently precedes snapshot capture; a production import
-must also fence concurrent source DDL.
+Metadata inspection precedes snapshot capture; the snapshot fences each table
+and verifies the inspected logical DDL and object identity before reading rows.
 
 ## Oracle bootstrap and authority foundations
 
@@ -170,9 +179,10 @@ key. Mirror ids use RAW so session collation cannot merge different identities.
 Initialization is idempotent; CAS advances exactly one epoch, verifies its
 actual result and commits atomically. Native tests cover competing connections
 (one winner), stale CAS, old-SCN reads and refusing a disabled ownership marker.
-These APIs are foundations for the adapter; a complete SourceAdapter, durable
-Oracle import, own-write echo suppression and the two-database controller are
-still unfinished.
+Durable Oracle import and the pull adapter use these foundations. Complete
+write-back, own-write echo suppression and the two-database controller remain
+unfinished. Control-table recreation also needs a durable object-generation
+fence before authority cutover can be enabled.
 
 ## Native implementation progress
 

@@ -80,12 +80,12 @@ impl OracleSource {
                     .flatten()
                     .collect::<Vec<_>>()
                     .join(",");
-                // SCNs are typed u64 values, never user SQL. Keeping them as
-                // literals avoids positional duplicate-bind ambiguity here.
-                let sql=format!("SELECT versions_startscn,versions_endscn,versions_xid,versions_operation,{projection} FROM {}.{} VERSIONS BETWEEN SCN {from_scn} AND {to_scn} WHERE (versions_startscn>{from_scn} AND versions_startscn<={to_scn}) OR (versions_endscn>{from_scn} AND versions_endscn<={to_scn})",quote(&table.owner),quote(&table.name));
+                // Bind by name so repeated SCNs resolve unambiguously and
+                // consecutive windows reuse the same SQL statement text.
+                let sql=format!("SELECT versions_startscn,versions_endscn,versions_xid,versions_operation,{projection} FROM {}.{} VERSIONS BETWEEN SCN :from_scn AND :to_scn WHERE (versions_startscn>:from_scn AND versions_startscn<=:to_scn) OR (versions_endscn>:from_scn AND versions_endscn<=:to_scn)",quote(&table.owner),quote(&table.name));
                 let rows = self
                     .connection
-                    .query(&sql, &[])
+                    .query_named(&sql, &[("from_scn", &from_scn), ("to_scn", &to_scn)])
                     .map_err(|e| err("change versions", e))?;
                 for row in rows {
                     count += 1;

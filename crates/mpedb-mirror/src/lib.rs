@@ -17,6 +17,10 @@ pub mod import;
 pub mod oracle;
 pub mod oracle_cursor;
 #[cfg(feature = "oracle-source")]
+pub mod oracle_adapter;
+#[cfg(feature = "oracle-source")]
+pub use oracle_adapter::OracleAdapter;
+#[cfg(feature = "oracle-source")]
 pub mod oracle_import;
 #[cfg(feature = "oracle-source")]
 pub mod oracle_source;

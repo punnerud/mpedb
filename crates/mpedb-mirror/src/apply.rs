@@ -6,8 +6,8 @@
 //! Structure (§5.4):
 //!   1. cursor guard  — `mir\0cur` must equal the cursor the batch started from
 //!      (defends against a second daemon or a stale batch);
-//!   2. epoch guard   — abort if the mirror is frozen (the full epoch CAS lands
-//!      with the switch machinery in M6);
+//!   2. epoch guard   — abort if frozen or a supplied source epoch differs
+//!      from the local authority epoch;
 //!   3. DELETE phase  — delete every tombstone PK and every upserted PK that
 //!      currently exists (so the insert phase is clean and unique-value swaps /
 //!      PK changes dissolve order-free);
@@ -122,13 +122,20 @@ pub fn apply_batch(db: &Database, from: &Cursor, batch: &PullBatch) -> Result<Ap
         _ => {}
     }
 
-    // 2. epoch guard — refuse while frozen (full CAS in M6)
+    // 2. epoch guard — source snapshot and local authority must agree.
     if let Some(bytes) = s.sys_record_get(state::MIR_NS, state::KEY_EPOCH)? {
         let epoch = state::Epoch::decode(&bytes)?;
         if epoch.frozen {
             s.rollback();
             return Err(Error::Frozen { table_id: 0 });
         }
+        if batch.source_epoch.is_some_and(|source| source != epoch.epoch) {
+            s.rollback();
+            return Err(Error::Unsupported("mirror source epoch differs from local authority; recover the authority transition before applying".into()));
+        }
+    } else if batch.source_epoch.is_some() {
+        s.rollback();
+        return Err(Error::Corrupt("source-fenced mirror batch requires local authority metadata".into()));
     }
 
     let mut stats = ApplyStats::default();
@@ -382,8 +389,28 @@ mod tests {
 
         let from = adapter.zero_cursor();
         let batch = adapter.pull(&from, 1000).unwrap().unwrap();
-        // first apply advances the cursor
-        apply_batch(&db, &from, &batch).unwrap();
+        // An epoch mismatch (older or newer) cannot apply rows or advance the
+        // cursor. Legacy adapters without source epochs retain their behavior.
+        let original_cursor = db.sys_record_get(state::MIR_NS, state::KEY_CUR).unwrap();
+        for epoch in [0, 2] {
+            let mut fenced = batch.clone();
+            fenced.source_epoch = Some(epoch);
+            assert!(apply_batch(&db, &from, &fenced).is_err());
+            assert!(rows(&db, "SELECT * FROM t", &[]).is_empty());
+            assert_eq!(db.sys_record_get(state::MIR_NS, state::KEY_CUR).unwrap(), original_cursor);
+        }
+        let epoch_bytes = db.sys_record_get(state::MIR_NS, state::KEY_EPOCH).unwrap().unwrap();
+        let mut s = db.begin().unwrap();
+        s.sys_record_delete(state::MIR_NS, state::KEY_EPOCH).unwrap();
+        s.commit().unwrap();
+        let mut matching = batch.clone();
+        matching.source_epoch = Some(1);
+        assert!(apply_batch(&db, &from, &matching).is_err());
+        let mut s = db.begin().unwrap();
+        s.sys_record_put(state::MIR_NS, state::KEY_EPOCH, &epoch_bytes).unwrap();
+        s.commit().unwrap();
+        // first apply advances the cursor only with a matching source epoch
+        apply_batch(&db, &from, &matching).unwrap();
         // re-applying from the OLD cursor must be rejected (cursor moved)
         assert!(apply_batch(&db, &from, &batch).is_err());
 
