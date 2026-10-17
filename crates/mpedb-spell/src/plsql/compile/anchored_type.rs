@@ -87,7 +87,7 @@ impl Parser<'_> {
         }
     }
 
-    fn type_word_at(&self, index: usize) -> bool {
+    pub(super) fn type_word_at(&self, index: usize) -> bool {
         matches!(
             self.tokens.get(index).map(|token| &token.token),
             Some(Token::Identifier { name, quoted: false }) if name == "TYPE"
@@ -95,7 +95,7 @@ impl Parser<'_> {
     }
 
     /// `table.column%TYPE` and `record.field%TYPE`, including a schema prefix.
-    fn dotted_percent_type(&self) -> bool {
+    pub(super) fn dotted_percent_type(&self) -> bool {
         let mut depth = 0i32;
         let mut index = self.at;
         while let Some(token) = self.tokens.get(index) {

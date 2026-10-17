@@ -27,6 +27,8 @@ impl Parser<'_> {
         let outer_records = self.records.clone();
         let outer_nested_types = self.nested_types.clone();
         let outer_nested_vars = self.nested_vars.clone();
+        let outer_record_types = self.record_types.clone();
+        let outer_record_fields = self.record_field_info.clone();
         let outer_declared = std::mem::take(&mut self.declared_here);
         let outer_pending = std::mem::take(&mut self.pending_declarations);
         // The index hides an outer name while the bounds are evaluated.
@@ -81,6 +83,8 @@ impl Parser<'_> {
         self.records = outer_records;
         self.nested_types = outer_nested_types;
         self.nested_vars = outer_nested_vars;
+        self.record_types = outer_record_types;
+        self.record_field_info = outer_record_fields;
         self.declared_here = outer_declared;
         self.pending_declarations = outer_pending;
         Ok(())

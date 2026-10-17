@@ -1,0 +1,442 @@
+//! `TYPE name IS RECORD (field datatype [NOT NULL] [:= literal], ...)`.
+//! Each variable gets its own slots. A field with no default starts NULL,
+//! and a default on one field does not fill the others. `rec IS NULL` is
+//! true only when every field is NULL. Assigning NULL to the record stores
+//! NULL in every field, and is refused when a field is `NOT NULL`.
+
+use super::{Parser, RecordDecl, Type};
+use crate::ir::Op;
+use crate::plsql::lex::Token;
+use mpedb_types::{Result, Value};
+
+#[derive(Clone)]
+pub(super) struct RecordType {
+    fields: Vec<RecordField>,
+}
+
+#[derive(Clone)]
+struct RecordField {
+    name: String,
+    ty: Type,
+    not_null: bool,
+    /// `None` means the field starts NULL. A stored NULL is an explicit
+    /// `:= NULL`, which is the same initial state.
+    default: Option<Value>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FieldInfo {
+    pub ty: Type,
+    pub not_null: bool,
+}
+
+impl Parser<'_> {
+    pub(super) fn declare_record_body(&mut self, name: String) -> Result<()> {
+        self.want_symbol("(")?;
+        if self.symbol(")") {
+            return Err(self.error("a record type needs a field"));
+        }
+        let mut fields: Vec<RecordField> = Vec::new();
+        loop {
+            let field_name = self.identifier()?;
+            if fields.iter().any(|field| field.name == field_name) {
+                return Err(self.error("duplicate record field"));
+            }
+            let (ty, inherited) = self.record_field_type()?;
+            let mut not_null = inherited;
+            if self.word("NOT") {
+                self.want_word("NULL")?;
+                not_null = true;
+            }
+            let default = if self.symbol(":=") || self.word("DEFAULT") {
+                Some(self.record_literal()?)
+            } else {
+                None
+            };
+            if let Some(value) = &default {
+                self.literal_fits(ty, value)?;
+            }
+            if not_null && matches!(default, None | Some(Value::Null)) {
+                return Err(self.error("a NOT NULL record field requires an initializer"));
+            }
+            fields.push(RecordField {
+                name: field_name,
+                ty,
+                not_null,
+                default,
+            });
+            if self.symbol(")") {
+                break;
+            }
+            self.want_symbol(",")?;
+        }
+        self.want_symbol(";")?;
+        if !self.declared_here.insert(name.clone()) {
+            return Err(self.error("duplicate parameter or variable name"));
+        }
+        self.pending_declarations.remove("TYPE");
+        self.pending_declarations.remove(&name);
+        self.record_types.insert(name, RecordType { fields });
+        Ok(())
+    }
+
+    pub(super) fn declare_record_var(&mut self, name: &str, constant: bool) -> Result<bool> {
+        let type_name = match self.peek() {
+            Some(Token::Identifier {
+                name: type_name,
+                quoted: false,
+            }) => type_name.clone(),
+            _ => return Ok(false),
+        };
+        let Some(shape) = self.record_types.get(&type_name).cloned() else {
+            return Ok(false);
+        };
+        self.at += 1;
+        if constant {
+            return Err(self.error("a record variable cannot be CONSTANT"));
+        }
+        if self.word("NOT") {
+            return Err(self.error("a record variable cannot be NOT NULL"));
+        }
+        let explicit_null = if self.symbol(":=") || self.word("DEFAULT") {
+            if !self.word("NULL") {
+                return Err(self.error(
+                    "a record variable can only be initialized with NULL",
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        if explicit_null {
+            self.refuse_null_fields(&shape)?;
+        }
+        self.want_symbol(";")?;
+        if !self.declared_here.insert(name.to_string()) {
+            return Err(self.error("duplicate parameter or variable name"));
+        }
+        self.pending_declarations.remove(name);
+        self.locals.remove(name);
+        let mut slots = Vec::with_capacity(shape.fields.len());
+        for field in &shape.fields {
+            if explicit_null {
+                self.constant(Value::Null)?;
+                self.builder.emit(field.ty.check())?;
+            } else {
+                self.emit_field_default(field)?;
+            }
+            let slot = self.builder.alloc_local()?;
+            self.builder.emit(Op::StoreLocal(slot))?;
+            self.record_field_info.insert(
+                slot,
+                FieldInfo {
+                    ty: field.ty,
+                    not_null: field.not_null,
+                },
+            );
+            slots.push((field.name.clone(), slot));
+        }
+        self.records.insert(name.to_string(), RecordDecl { fields: slots });
+        Ok(true)
+    }
+
+    pub(super) fn store_record_field(&mut self, slot: u16, actual: Option<Type>) -> Result<()> {
+        if let Some(info) = self.record_field_info.get(&slot).copied() {
+            self.compatible(info.ty, actual)?;
+            if info.not_null && actual.is_none() {
+                return Err(self.error(
+                    "a NOT NULL record field cannot be assigned literal NULL",
+                ));
+            }
+            self.builder.emit(info.ty.check())?;
+            if info.not_null {
+                self.builder.emit(Op::OracleNotNull)?;
+            }
+        }
+        self.builder.emit(Op::StoreLocal(slot))?;
+        Ok(())
+    }
+
+    pub(super) fn refuse_null_record(&self, record: &RecordDecl) -> Result<()> {
+        if record.fields.iter().any(|(_, slot)| {
+            self.record_field_info
+                .get(slot)
+                .is_some_and(|info| info.not_null)
+        }) {
+            return Err(self.error("a NOT NULL record field cannot be assigned NULL"));
+        }
+        Ok(())
+    }
+
+    fn refuse_null_fields(&self, shape: &RecordType) -> Result<()> {
+        if shape.fields.iter().any(|field| field.not_null) {
+            return Err(self.error("a NOT NULL record field cannot be assigned NULL"));
+        }
+        Ok(())
+    }
+
+    fn emit_field_default(&mut self, field: &RecordField) -> Result<()> {
+        let value = match &field.default {
+            None => Value::Null,
+            Some(Value::Int(n))
+                if matches!(field.ty, Type::Number | Type::ConstrainedNumber { .. }) =>
+            {
+                Value::Numeric(n.to_string())
+            }
+            Some(value) => value.clone(),
+        };
+        self.constant(value)?;
+        self.builder.emit(field.ty.check())?;
+        if field.not_null {
+            self.builder.emit(Op::OracleNotNull)?;
+        }
+        Ok(())
+    }
+
+    fn record_field_type(&mut self) -> Result<(Type, bool)> {
+        if self.dotted_percent_type()
+            && matches!(self.peek(), Some(Token::Identifier { .. }))
+            && matches!(
+                self.tokens.get(self.at + 1).map(|token| &token.token),
+                Some(Token::Symbol("."))
+            )
+        {
+            return Err(self.error(
+                "table, view, and record-field %TYPE anchors are not implemented",
+            ));
+        }
+        if self.type_word_at(self.at + 2)
+            && matches!(
+                self.tokens.get(self.at + 1).map(|token| &token.token),
+                Some(Token::Symbol("%"))
+            )
+        {
+            let anchor_name = self.identifier()?;
+            self.want_symbol("%")?;
+            self.want_word("TYPE")?;
+            if self.pending_declarations.contains(&anchor_name) {
+                return Err(self.error("a %TYPE anchor is not declared yet"));
+            }
+            let Some(anchor) = self.locals.get(&anchor_name).copied() else {
+                return Err(self.error(
+                    "a %TYPE anchor must be a scalar variable in this scope",
+                ));
+            };
+            return Ok((anchor.ty, anchor.not_null));
+        }
+        if let Some(Token::Identifier {
+            name,
+            quoted: false,
+        }) = self.peek()
+        {
+            if self.record_types.contains_key(name) {
+                return Err(self.error("nested record fields are not implemented"));
+            }
+        }
+        Ok((self.data_type(true)?, false))
+    }
+
+    fn record_literal(&mut self) -> Result<Value> {
+        if self.word("NULL") {
+            return Ok(Value::Null);
+        }
+        if self.word("TRUE") {
+            return Ok(Value::Bool(true));
+        }
+        if self.word("FALSE") {
+            return Ok(Value::Bool(false));
+        }
+        if let Some(Token::String { value, national }) = self.peek().cloned() {
+            if national {
+                return Err(self.error(
+                    "national character strings require NVARCHAR2 runtime support",
+                ));
+            }
+            self.at += 1;
+            return Ok(Value::Text(value));
+        }
+        if let Some(Token::Number(text)) = self.peek().cloned() {
+            self.at += 1;
+            if text.bytes().all(|byte| byte.is_ascii_digit()) {
+                let number = text.parse::<i64>().map_err(|_| {
+                    self.error("a record field default is outside the supported integer range")
+                })?;
+                return Ok(Value::Int(number));
+            }
+            let numeric = mpedb_types::value::parse_numeric(&text)
+                .ok_or_else(|| self.error("unsupported NUMBER literal"))?;
+            return Ok(Value::Numeric(numeric));
+        }
+        Err(self.error("a record field default must be a literal"))
+    }
+
+    fn literal_fits(&self, ty: Type, value: &Value) -> Result<()> {
+        if matches!(value, Value::Null) {
+            return Ok(());
+        }
+        let ok = match (ty, value) {
+            (Type::Boolean, Value::Bool(_)) => true,
+            (Type::Varchar(_), Value::Text(_)) => true,
+            (Type::PlsInteger, Value::Int(number)) => i32::try_from(*number).is_ok(),
+            (
+                Type::Number | Type::ConstrainedNumber { .. },
+                Value::Int(_) | Value::Numeric(_),
+            ) => true,
+            _ => false,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(self.error("incompatible record field default"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::interp::{self, testutil::MockBridge, Budget, ProcValue};
+    use crate::ir::Proc;
+    use crate::plsql::compile;
+    use mpedb_types::Value;
+
+    fn function(result: &str, body: &str) -> String {
+        format!("CREATE OR REPLACE FUNCTION f RETURN {result} IS {body}")
+    }
+
+    fn call(source: &str) -> Result<Value, String> {
+        let skel = compile(source).map_err(|err| err.to_string())?;
+        let proc = Proc::new(
+            skel.name,
+            skel.argc,
+            skel.nlocals,
+            Vec::new(),
+            skel.consts,
+            skel.instrs,
+        )
+        .map_err(|err| err.to_string())?;
+        let mut bridge = MockBridge::new();
+        match interp::run(
+            &proc,
+            &[],
+            &mut bridge,
+            Budget {
+                instrs: 10_000,
+                db_calls: 8,
+                rows: 100,
+            },
+        )
+        .map_err(|err| err.to_string())?
+        {
+            ProcValue::Scalar(value) => Ok(value),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_field_starts_null_and_a_default_does_not_fill_the_other_field() {
+        let note = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             r pair; \
+             BEGIN \
+               IF r.note IS NULL THEN r.note := NULL; END IF; \
+               RETURN r.note; \
+             END;",
+        );
+        assert_eq!(call(&note).unwrap(), Value::Null);
+        let id = function(
+            "PLS_INTEGER",
+            "TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             r pair; BEGIN RETURN r.id; END;",
+        );
+        assert_eq!(call(&id).unwrap(), Value::Int(7));
+        let whole = function(
+            "BOOLEAN",
+            "TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             r pair; BEGIN RETURN r IS NULL; END;",
+        );
+        assert_eq!(call(&whole).unwrap(), Value::Bool(false));
+        let empty = function(
+            "BOOLEAN",
+            "TYPE pair IS RECORD (id PLS_INTEGER, note VARCHAR2(4)); \
+             r pair; BEGIN RETURN r IS NULL; END;",
+        );
+        assert_eq!(call(&empty).unwrap(), Value::Bool(true));
+        let cleared = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4)); \
+             r pair; BEGIN r.note := 'ok'; r := NULL; RETURN r.note; END;",
+        );
+        assert_eq!(call(&cleared).unwrap(), Value::Null);
+        let other = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4)); \
+             r pair; s pair; BEGIN r.note := 'ok'; RETURN s.note; END;",
+        );
+        assert_eq!(call(&other).unwrap(), Value::Null);
+        let overflow = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4)); r pair; \
+             BEGIN r.note := 'toolong'; RETURN 'x'; \
+             EXCEPTION WHEN VALUE_ERROR THEN RETURN r.note; END;",
+        );
+        assert_eq!(call(&overflow).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn record_type_refuses_not_null_without_a_value_and_nested_anchors() {
+        let refused = [
+            (
+                "TYPE pair IS RECORD (id PLS_INTEGER NOT NULL); r pair; BEGIN RETURN 1; END;",
+                "NOT NULL record field requires an initializer",
+            ),
+            (
+                "TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := NULL); r pair; BEGIN RETURN 1; END;",
+                "NOT NULL record field requires an initializer",
+            ),
+            (
+                "TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 1, note VARCHAR2(4)); \
+                 r pair; BEGIN r := NULL; RETURN r.note; END;",
+                "cannot be assigned NULL",
+            ),
+            (
+                "TYPE pair IS RECORD (note VARCHAR2(4)); \
+                 r pair; BEGIN r.note := NULL; RETURN r.note; END;",
+                "",
+            ),
+            (
+                "a VARCHAR2(4) := 'kept'; \
+                 TYPE pair IS RECORD (note a%TYPE); r pair; BEGIN RETURN r.note; END;",
+                "",
+            ),
+            (
+                "TYPE pair IS RECORD (note employees.last_name%TYPE); r pair; BEGIN RETURN 'x'; END;",
+                "record-field %TYPE anchors are not implemented",
+            ),
+            (
+                "TYPE pair IS RECORD (id PLS_INTEGER); TYPE box IS RECORD (inner pair); BEGIN RETURN 1; END;",
+                "nested record fields are not implemented",
+            ),
+            (
+                "TYPE pair IS RECORD (id PLS_INTEGER, id VARCHAR2(4)); BEGIN RETURN 1; END;",
+                "duplicate record field",
+            ),
+        ];
+        for (body, expected) in refused {
+            let source = function(if body.contains("RETURN r.note") && body.contains("a%TYPE") {
+                "VARCHAR2"
+            } else if body.contains("RETURN 1") || body.contains("RETURN 'x'") {
+                "NUMBER"
+            } else {
+                "VARCHAR2"
+            }, body);
+            // The two successful bodies return NULL. The others fail to compile.
+            if expected.is_empty() {
+                assert_eq!(call(&source).unwrap(), Value::Null, "{body}");
+            } else {
+                let err = compile(&source).unwrap_err().to_string();
+                assert!(err.contains(expected), "{body}\n{err}");
+            }
+        }
+    }
+}

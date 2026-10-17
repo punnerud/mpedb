@@ -13,6 +13,7 @@ mod bulk_collect;
 mod package;
 mod trigger_body;
 mod anchored_type;
+mod record_type;
 pub use trigger_body::{TriggerImage, TriggerImageType};
 
 use super::lex::{self, Lexed, Token};
@@ -99,6 +100,11 @@ struct Parser<'a> {
     records: HashMap<String, RecordDecl>,
     nested_types: HashMap<String, Type>,
     nested_vars: HashMap<String, NestedVar>,
+    /// `TYPE name IS RECORD`. Each variable of the type gets its own slots.
+    record_types: HashMap<String, record_type::RecordType>,
+    /// Slots of user-record fields. `%ROWTYPE` slots stay absent, so those
+    /// assignments remain untyped.
+    record_field_info: HashMap<u16, record_type::FieldInfo>,
     /// Set only while the single `FORALL` statement is compiled. The index
     /// is not an expression; every use is a named refusal.
     forall_index: Option<String>,
@@ -185,6 +191,8 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         records: HashMap::new(),
         nested_types: HashMap::new(),
         nested_vars: HashMap::new(),
+        record_types: HashMap::new(),
+        record_field_info: HashMap::new(),
         forall_index: None,
         forall_subscripts: 0,
         package_name: None,
@@ -420,6 +428,9 @@ impl Parser<'_> {
                 continue;
             }
             if self.declare_anchored_type(&name, constant)? {
+                continue;
+            }
+            if self.declare_record_var(&name, constant)? {
                 continue;
             }
             if self.declare_nested_var(&name, constant)? {
@@ -698,27 +709,39 @@ impl Parser<'_> {
             let field = self.identifier()?;
             let slot = self.record_field(&record, &field)?;
             self.want_symbol(":=")?;
-            self.expression()?;
-            self.builder.emit(Op::StoreLocal(slot))?;
+            let actual = self.expression()?;
+            self.store_record_field(slot, actual)?;
             return self.want_symbol(";");
         }
         self.want_symbol(":=")?;
         if self.word("NULL") {
+            self.refuse_null_record(&record)?;
             for (_, slot) in &record.fields {
                 self.constant(Value::Null)?;
                 self.builder.emit(Op::StoreLocal(*slot))?;
             }
             return self.want_symbol(";");
         }
-        Err(self.error("a %ROWTYPE record requires a field"))
+        let user = record
+            .fields
+            .iter()
+            .any(|(_, slot)| self.record_field_info.contains_key(slot));
+        Err(self.error(if user {
+            "a record can only be assigned NULL or one field"
+        } else {
+            "a %ROWTYPE record requires a field"
+        }))
     }
     fn record_expr(&mut self, record: RecordDecl) -> Result<Option<Type>> {
         if self.symbol(".") {
             let field = self.identifier()?;
             let slot = self.record_field(&record, &field)?;
             self.builder.emit(Op::LoadLocal(slot))?;
-            // Untyped: the function return check, not the record, decides
-            // NUMBER or VARCHAR2. NULL stays NULL through that check.
+            if let Some(info) = self.record_field_info.get(&slot).copied() {
+                return Ok(Some(info.ty));
+            }
+            // `%ROWTYPE` fields stay untyped. NULL stays NULL through the
+            // caller's check.
             return Ok(None);
         }
         if self.word("IS") {
@@ -747,7 +770,16 @@ impl Parser<'_> {
             .iter()
             .find(|(name, _)| name == field)
             .map(|(_, slot)| *slot)
-            .ok_or_else(|| self.error(&format!("unknown %ROWTYPE field {field}")))
+            .ok_or_else(|| {
+                let user = record
+                    .fields
+                    .iter()
+                    .any(|(_, slot)| self.record_field_info.contains_key(slot));
+                self.error(&format!(
+                    "unknown {} field {field}",
+                    if user { "record" } else { "%ROWTYPE" }
+                ))
+            })
     }
     fn emit_local_check(&mut self, local: Local) -> Result<()> {
         self.builder.emit(local.ty.check())?;
@@ -818,6 +850,8 @@ impl Parser<'_> {
             let outer_records = self.records.clone();
             let outer_nested_types = self.nested_types.clone();
             let outer_nested_vars = self.nested_vars.clone();
+            let outer_record_types = self.record_types.clone();
+            let outer_record_fields = self.record_field_info.clone();
             let outer_declared = std::mem::take(&mut self.declared_here);
             let outer_pending = std::mem::take(&mut self.pending_declarations);
             if declarations {
@@ -833,6 +867,8 @@ impl Parser<'_> {
             self.records = outer_records;
             self.nested_types = outer_nested_types;
             self.nested_vars = outer_nested_vars;
+            self.record_types = outer_record_types;
+            self.record_field_info = outer_record_fields;
             self.declared_here = outer_declared;
             self.pending_declarations = outer_pending;
             return Ok(());
@@ -958,6 +994,8 @@ impl Parser<'_> {
         let outer_records = self.records.clone();
         let outer_nested_types = self.nested_types.clone();
         let outer_nested_vars = self.nested_vars.clone();
+        let outer_record_types = self.record_types.clone();
+        let outer_record_fields = self.record_field_info.clone();
         let outer_declared = std::mem::take(&mut self.declared_here);
         let outer_pending = std::mem::take(&mut self.pending_declarations);
         // Oracle's index hides outer names even while the bounds are being
@@ -1010,6 +1048,8 @@ impl Parser<'_> {
         self.records = outer_records;
         self.nested_types = outer_nested_types;
         self.nested_vars = outer_nested_vars;
+        self.record_types = outer_record_types;
+        self.record_field_info = outer_record_fields;
         self.declared_here = outer_declared;
         self.pending_declarations = outer_pending;
         Ok(())

@@ -26,6 +26,9 @@ impl Parser<'_> {
         self.want_word("TYPE")?;
         let name = self.identifier()?;
         self.want_word("IS")?;
+        if self.word("RECORD") {
+            return self.declare_record_body(name);
+        }
         if self.word("VARRAY") {
             return Err(self.error("VARRAY collections are not implemented"));
         }

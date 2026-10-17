@@ -1147,3 +1147,37 @@ fn plsql_anchored_type_keeps_null_and_inherits_not_null() {
         .to_string();
     assert!(refused.contains("inherits NOT NULL"), "{refused}");
 }
+
+#[test]
+fn plsql_record_field_starts_null() {
+    let (cfg, _guard) = test_config("plsql-record");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_rec RETURN VARCHAR2 IS \
+             TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             r pair; \
+             BEGIN \
+               IF r.note IS NULL THEN r.note := NULL; END IF; \
+               RETURN r.note; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_REC", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    let refused = engine
+        .define(
+            "CREATE FUNCTION bad RETURN VARCHAR2 IS \
+             TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 1, note VARCHAR2(4)); \
+             r pair; \
+             BEGIN r := NULL; RETURN r.note; END;",
+            Lang::PlSql,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("cannot be assigned NULL"), "{refused}");
+}

@@ -78,6 +78,8 @@ pub(super) fn compile_trigger_inner(source: &str, columns: &[TriggerImage]) -> R
         records: HashMap::new(),
         nested_types: HashMap::new(),
         nested_vars: HashMap::new(),
+        record_types: HashMap::new(),
+        record_field_info: HashMap::new(),
         forall_index: None,
         forall_subscripts: 0,
         package_name: None,
