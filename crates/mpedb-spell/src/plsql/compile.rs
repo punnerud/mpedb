@@ -4,6 +4,7 @@ mod sql;
 mod exception;
 mod number;
 mod static_sql;
+mod cursor;
 
 use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
@@ -59,6 +60,7 @@ struct Parser<'a> {
     exception_blocks: bool,
     in_handler: usize,
     exceptions: HashMap<String, exception::ExceptionRef>,
+    cursors: HashMap<String, cursor::CursorDecl>,
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
@@ -109,6 +111,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         exception_blocks,
         in_handler: 0,
         exceptions: HashMap::new(),
+        cursors: HashMap::new(),
     };
     p.want_word("CREATE")?;
     if p.word("OR") {
@@ -233,6 +236,10 @@ impl Parser<'_> {
         while !self.is_word("BEGIN") {
             if self.word("PRAGMA") {
                 self.exception_init()?;
+                continue;
+            }
+            if self.word("CURSOR") {
+                self.declare_cursor()?;
                 continue;
             }
             let position = self.tokens.get(self.at).map_or(self.source.len(), |t| t.span.start);
@@ -503,6 +510,7 @@ impl Parser<'_> {
         if declarations || self.is_word("BEGIN") {
             let outer_locals = self.locals.clone();
             let outer_exceptions = self.exceptions.clone();
+            let outer_cursors = self.cursors.clone();
             let outer_declared = std::mem::take(&mut self.declared_here);
             let outer_pending = std::mem::take(&mut self.pending_declarations);
             if declarations {
@@ -514,6 +522,7 @@ impl Parser<'_> {
             self.want_symbol(";")?;
             self.locals = outer_locals;
             self.exceptions = outer_exceptions;
+            self.cursors = outer_cursors;
             self.declared_here = outer_declared;
             self.pending_declarations = outer_pending;
             return Ok(());
@@ -589,7 +598,13 @@ impl Parser<'_> {
             }
             return self.want_symbol(";");
         }
+        if self.cursor_statement()? {
+            return Ok(());
+        }
         let name = self.identifier()?;
+        if self.cursors.contains_key(&name) {
+            return Err(self.error("cannot assign to a cursor"));
+        }
         let local = *self.locals.get(&name).ok_or_else(|| {
             self.error(&format!(
                 "unknown variable or unimplemented statement {name}"
