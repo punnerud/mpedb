@@ -3,7 +3,8 @@
 use crate::oracle::{carrier_tables, OracleTable};
 use mpedb_types::{Error, Result};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OracleIdentity {
     pub database_id: u64,
     pub resetlogs_scn: u64,

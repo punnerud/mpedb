@@ -522,6 +522,18 @@ pub(crate) fn publish_mirror_state(
     source_kind: state::SourceKind,
     maps: &[(u32, state::TableMap)],
 ) -> Result<()> {
+    publish_mirror_state_with(db, schema, source_kind, maps, |_| Ok(()))
+}
+
+/// Publish adapter-specific bootstrap metadata in the SAME commit as the
+/// mirror config and capture flags, so no valid mirror lacks its start cursor.
+pub(crate) fn publish_mirror_state_with(
+    db: &Database,
+    schema: &mpedb_types::Schema,
+    source_kind: state::SourceKind,
+    maps: &[(u32, state::TableMap)],
+    extra: impl FnOnce(&mut WriteSession) -> Result<()>,
+) -> Result<()> {
     let scope: Vec<u32> = (0..schema.tables.len() as u32).collect();
     let cfg = state::MirrorConfig {
         mirror_id: mirror_id_for(db.path()),
@@ -553,6 +565,7 @@ pub(crate) fn publish_mirror_state(
     }
     // cdc\0tabs: ns="cdc", key="tabs" → the exact key the engine reads.
     s.sys_record_put("cdc", b"tabs", &capture.encode())?;
+    extra(&mut s)?;
     s.commit()
 }
 
@@ -598,7 +611,7 @@ fn sqlite_table_maps(
 
 /// A stable 128-bit mirror id from the destination path (placeholder for the
 /// DSN-plus-nonce id of §12; carries no secret).
-fn mirror_id_for(path: &Path) -> [u8; 16] {
+pub(crate) fn mirror_id_for(path: &Path) -> [u8; 16] {
     let h = xxhash_rust::xxh3::xxh3_128(path.to_string_lossy().as_bytes());
     h.to_be_bytes()
 }

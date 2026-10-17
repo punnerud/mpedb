@@ -17,6 +17,8 @@ pub mod import;
 pub mod oracle;
 pub mod oracle_cursor;
 #[cfg(feature = "oracle-source")]
+pub mod oracle_import;
+#[cfg(feature = "oracle-source")]
 pub mod oracle_source;
 pub mod pg;
 pub mod preflight;
@@ -45,6 +47,8 @@ pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};
 pub use apply::{apply_batch, ApplyStats};
 pub use export::{diff_sqlite_data, export_sqlite, load_sqlite_provenance, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
+#[cfg(feature = "oracle-source")]
+pub use oracle_import::{import_oracle, load_bootstrap as load_oracle_bootstrap, OracleBootstrap};
 pub use pg_adapter::PgAdapter;
 pub use pg_export::{export_pg, PgExportOptions, PgExportReport};
 pub use pg_import::import_pg;

@@ -98,6 +98,21 @@ rRETL-transformed Boolean back to Oracle and restores it through rRETL; another
 test verifies rounding rejection, whole-batch rollback, inserts/deletes,
 generated values and stale-schema rejection.
 
+The optional `oracle-source` feature now exposes `import_oracle`. It initializes
+and validates its own authority-state row, excludes that verified control table,
+reads the selected tables at one bootstrap SCN, and imports carriers into a new
+MPEdb file. Source identity, full original/logical DDL, column metadata and the
+initial cursor persist in checksummed 64 KiB JSON chunks (64 MiB metadata limit).
+The start cursor, mirror config, provenance and CDC flags publish in ONE final
+commit; failed bootstrap reads publish none of them. Partial row imports can
+leave an unpublished file, which is refused as an existing destination.
+`load_oracle_bootstrap` verifies metadata and carrier schema without contacting
+Oracle. Native tests cover cold reopen, multiple metadata chunks, data values,
+existing-destination rejection, altered content and truncated chunks. Snapshot
+rows are still materialized in memory; CLI import and full live adapter wiring
+remain unfinished. SQL execution uses MPEdb's strict grouping mode, which does
+not imply full Oracle SQL-dialect compatibility.
+
 This transport is not a complete mirror push: capture, echo suppression,
 conflict checks, authority fencing, CLI import and the two-database topology
 remain unfinished. Writes currently refuse identity columns, special NUMBERs,

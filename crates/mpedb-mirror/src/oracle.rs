@@ -92,7 +92,8 @@ pub(crate) fn carrier_tables(tables: &[OracleTable]) -> mpedb_types::Result<Vec<
         .collect()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OracleColumn {
     pub name: String,
     pub data_type: String,
@@ -164,7 +165,8 @@ impl OracleColumn {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OracleTable {
     pub owner: String,
     pub name: String,
