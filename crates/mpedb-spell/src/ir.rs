@@ -216,6 +216,9 @@ pub enum Op {
     OracleExceptionCode,
     OracleReraise,
     OracleRaise(u16),
+    /// Raise/match a lexical exception identity stored as a 32-byte constant.
+    OracleRaiseUser(u16),
+    OracleMatchUser(u16),
     OracleSqlCode,
     OracleSqlErrm,
     OracleRaiseApplication,
@@ -331,6 +334,8 @@ const OP_ORACLE_SQLERRM: u8 = 88;
 const OP_ORACLE_RAISE_APPLICATION: u8 = 89;
 const OP_ORACLE_NUMBER_CONSTRAINT: u8 = 90;
 const OP_ORACLE_NOT_NULL: u8 = 91;
+const OP_ORACLE_RAISE_USER: u8 = 92;
+const OP_ORACLE_MATCH_USER: u8 = 93;
 
 
 
@@ -374,7 +379,7 @@ impl Proc {
                 return Err(Error::Corrupt("proc: plan takes too many parameters".into()));
             }
         }
-        let max_stack = validate(&instrs, nlocals, consts.len(), &plans)?;
+        let max_stack = validate(&instrs, nlocals, &consts, &plans)?;
         let has_exec = instrs.iter().any(|op| matches!(op, Op::DbExec(_)));
         Ok(Proc {
             name,
@@ -599,6 +604,8 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleExceptionCode => b.push(OP_ORACLE_EXCEPTION_CODE),
         Op::OracleReraise => b.push(OP_ORACLE_RERAISE),
         Op::OracleRaise(code) => u16arg(OP_ORACLE_RAISE, code),
+        Op::OracleRaiseUser(i) => u16arg(OP_ORACLE_RAISE_USER, i),
+        Op::OracleMatchUser(i) => u16arg(OP_ORACLE_MATCH_USER, i),
         Op::OracleSqlCode => b.push(OP_ORACLE_SQLCODE),
         Op::OracleSqlErrm => b.push(OP_ORACLE_SQLERRM),
         Op::OracleRaiseApplication => b.push(OP_ORACLE_RAISE_APPLICATION),
@@ -725,6 +732,8 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_EXCEPTION_CODE => Op::OracleExceptionCode,
         OP_ORACLE_RERAISE => Op::OracleReraise,
         OP_ORACLE_RAISE => Op::OracleRaise(u16arg()?),
+        OP_ORACLE_RAISE_USER => Op::OracleRaiseUser(u16arg()?),
+        OP_ORACLE_MATCH_USER => Op::OracleMatchUser(u16arg()?),
         OP_ORACLE_SQLCODE => Op::OracleSqlCode,
         OP_ORACLE_SQLERRM => Op::OracleSqlErrm,
         OP_ORACLE_RAISE_APPLICATION => Op::OracleRaiseApplication,
@@ -780,8 +789,8 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
 /// table (operand bounds are checked before this is called).
 fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
     match op {
-        Op::OracleTry { .. } | Op::OracleReraise | Op::OracleRaise(_) => (0, 0),
-        Op::OracleExceptionCode | Op::OracleSqlCode | Op::OracleSqlErrm => (0, 1),
+        Op::OracleTry { .. } | Op::OracleReraise | Op::OracleRaise(_) | Op::OracleRaiseUser(_) => (0, 0),
+        Op::OracleExceptionCode | Op::OracleSqlCode | Op::OracleSqlErrm | Op::OracleMatchUser(_) => (0, 1),
         Op::OracleRaiseApplication => (2, 0),
         Op::LoadConst(_) | Op::LoadLocal(_) => (0, 1),
         Op::Tuple(n) => (n as usize, 1),
@@ -854,7 +863,8 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
 ///
 /// Returns the proven maximum stack depth so the interpreter can
 /// preallocate and skip per-instruction underflow checks.
-fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> Result<usize> {
+fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) -> Result<usize> {
+    let nconsts = consts.len();
     if instrs.is_empty() {
         return Err(Error::Corrupt("proc: empty program".into()));
     }
@@ -867,6 +877,11 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
             Op::OracleTry { handler, end, handler_end } => {
                 if end as usize <= pc || handler < end || handler_end <= handler || handler_end as usize > n {
                     return Err(Error::Corrupt("proc: invalid Oracle exception scope".into()));
+                }
+            }
+            Op::OracleRaiseUser(i) | Op::OracleMatchUser(i) => {
+                if !matches!(consts.get(i as usize), Some(Value::Blob(b)) if b.len() == 32 && b.iter().any(|v| *v != 0)) {
+                    return Err(Error::Corrupt("proc: invalid user exception identity".into()));
                 }
             }
             Op::OracleRaise(code) if !matches!(code, 1 | 1403 | 1422 | 1476 | 6502) => {
@@ -966,7 +981,7 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
         }
         max = max.max(after);
         match op {
-            Op::Return | Op::MissingReturn | Op::OracleRaise(_) | Op::OracleReraise | Op::OracleRaiseApplication => {}
+            Op::Return | Op::MissingReturn | Op::OracleRaise(_) | Op::OracleRaiseUser(_) | Op::OracleReraise | Op::OracleRaiseApplication => {}
             Op::OracleTry { handler, .. } => {
                 if depth != 0 { return Err(Error::Corrupt("proc: Oracle exception scope requires an empty stack".into())); }
                 visit(handler as usize, 0, &mut entry, &mut work)?;
@@ -1345,5 +1360,57 @@ mod tests {
         let mut blob = p.encode();
         blob[4] = 0xFF; // version
         assert!(matches!(Proc::decode(&blob), Err(Error::Corrupt(_))));
+    }
+}
+
+#[cfg(test)]
+mod user_exception_tests {
+    use super::*;
+    #[test]
+    fn identities_are_validated_even_on_unreachable_instructions() {
+        for value in [
+            Value::Null,
+            Value::Int(1),
+            Value::Blob(vec![]),
+            Value::Blob(vec![0; 32]),
+            Value::Blob(vec![1; 31]),
+            Value::Blob(vec![1; 33]),
+        ] {
+            for op in [Op::OracleRaiseUser(0), Op::OracleMatchUser(0)] {
+                assert!(Proc::new(
+                    "bad".into(),
+                    0,
+                    0,
+                    vec![],
+                    vec![value.clone()],
+                    vec![Op::LoadConst(0), Op::Return, op]
+                )
+                .is_err());
+            }
+        }
+        for op in [Op::OracleRaiseUser(1), Op::OracleMatchUser(1)] {
+            assert!(Proc::new(
+                "bad".into(),
+                0,
+                0,
+                vec![],
+                vec![Value::Blob(vec![1; 32])],
+                vec![Op::LoadConst(0), Op::Return, op]
+            )
+            .is_err());
+        }
+        let p = Proc::new(
+            "valid".into(),
+            0,
+            0,
+            vec![],
+            vec![Value::Blob(vec![1; 32])],
+            vec![Op::OracleRaiseUser(0)],
+        )
+        .unwrap();
+        assert_eq!(Proc::decode(&p.encode()).unwrap(), p);
+        for i in 0..p.encode().len() {
+            assert!(Proc::decode(&p.encode()[..i]).is_err());
+        }
     }
 }

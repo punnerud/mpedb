@@ -58,6 +58,7 @@ struct Parser<'a> {
     has_out: bool,
     exception_blocks: bool,
     in_handler: usize,
+    exceptions: HashMap<String, exception::ExceptionRef>,
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
@@ -107,6 +108,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         has_out: false,
         exception_blocks,
         in_handler: 0,
+        exceptions: HashMap::new(),
     };
     p.want_word("CREATE")?;
     if p.word("OR") {
@@ -229,7 +231,13 @@ impl Parser<'_> {
             start = matches!(token.token, Token::Symbol(";"));
         }
         while !self.is_word("BEGIN") {
+            let position = self.tokens.get(self.at).map_or(self.source.len(), |t| t.span.start);
             let name = self.identifier()?;
+            if self.word("EXCEPTION") {
+                self.declare_exception(name, position)?;
+                self.want_symbol(";")?;
+                continue;
+            }
             let constant = self.word("CONSTANT");
             let ty = self.data_type(true)?;
             let not_null = self.word("NOT");
@@ -490,6 +498,7 @@ impl Parser<'_> {
         let declarations = self.word("DECLARE");
         if declarations || self.is_word("BEGIN") {
             let outer_locals = self.locals.clone();
+            let outer_exceptions = self.exceptions.clone();
             let outer_declared = std::mem::take(&mut self.declared_here);
             let outer_pending = std::mem::take(&mut self.pending_declarations);
             if declarations {
@@ -500,6 +509,7 @@ impl Parser<'_> {
             self.want_word("END")?;
             self.want_symbol(";")?;
             self.locals = outer_locals;
+            self.exceptions = outer_exceptions;
             self.declared_here = outer_declared;
             self.pending_declarations = outer_pending;
             return Ok(());

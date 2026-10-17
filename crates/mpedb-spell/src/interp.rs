@@ -476,8 +476,12 @@ pub fn run(
                 frames.push(oracle_exception::Frame { start: pc, end: end as usize, handler: handler as usize, handler_end: handler_end as usize });
             }
             Op::OracleExceptionCode => {
-                let Some(oracle_exception::Caught { error: Error::Oracle { code, .. }, .. }) = caught.last() else { return Err(Error::Corrupt("proc: no active Oracle exception".into())); };
-                stack.push(PValue::Scalar(Value::Int(*code as i64)));
+                let code = match caught.last().map(|c| &c.error) {
+                    Some(Error::Oracle { code, .. }) => *code,
+                    Some(Error::OracleUserException { .. }) => 0,
+                    _ => return Err(Error::Corrupt("proc: no active Oracle exception".into())),
+                };
+                stack.push(PValue::Scalar(Value::Int(code as i64)));
             }
             Op::OracleReraise => {
                 return Err(caught.pop().ok_or_else(|| rt_err("RAISE has no active exception"))?.error);
@@ -488,6 +492,12 @@ pub fn run(
                     PValue::Scalar(_) => {},
                     _ => return Err(type_err("NOT NULL requires a scalar value")),
                 }
+            }
+            Op::OracleRaiseUser(i) => return Err(Error::OracleUserException { identity: oracle_exception::user_identity(proc, i) }),
+            Op::OracleMatchUser(i) => {
+                let error = &caught.last().ok_or_else(|| Error::Corrupt("proc: no active Oracle exception".into()))?.error;
+                let matches = matches!(error, Error::OracleUserException { identity } if *identity == oracle_exception::user_identity(proc, i));
+                stack.push(PValue::Scalar(Value::Bool(matches)));
             }
             Op::OracleRaise(code) => return Err(oracle_exception::named(code)),
             Op::OracleSqlCode => stack.push(PValue::Scalar(Value::Numeric(oracle_exception::sqlcode(&caught)?.to_string()))),

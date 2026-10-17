@@ -1011,3 +1011,58 @@ fn integer_numeric_overflow_is_distinct_from_value_error_in_handlers() {
         Value::Text("ORA-01426: numeric overflow".into())
     );
 }
+
+#[test]
+fn user_exceptions_preserve_lexical_identity_and_diagnostic_kind() {
+    for (body, expected) in [
+        ("e EXCEPTION; BEGIN RAISE e; EXCEPTION WHEN DUP_VAL_ON_INDEX THEN RETURN -99; WHEN e THEN RETURN SQLCODE; END;", "1"),
+        ("e EXCEPTION; BEGIN RAISE DUP_VAL_ON_INDEX; EXCEPTION WHEN e THEN RETURN -99; WHEN DUP_VAL_ON_INDEX THEN RETURN SQLCODE; END;", "-1"),
+        ("e EXCEPTION; BEGIN DECLARE e EXCEPTION; BEGIN RAISE e; END; EXCEPTION WHEN e THEN RETURN -99; WHEN OTHERS THEN RETURN SQLCODE; END;", "1"),
+        ("e EXCEPTION; BEGIN BEGIN RAISE e; EXCEPTION WHEN OTHERS THEN DECLARE e EXCEPTION; BEGIN RAISE; EXCEPTION WHEN e THEN RETURN -99; WHEN OTHERS THEN RETURN 2; END; END; END;", "2"),
+        ("e NUMBER:=7; BEGIN DECLARE e EXCEPTION; BEGIN RAISE e; EXCEPTION WHEN e THEN NULL; END; RETURN e; END;", "7"),
+        ("ZERO_DIVIDE EXCEPTION; BEGIN RAISE ZERO_DIVIDE; EXCEPTION WHEN ZERO_DIVIDE THEN RETURN SQLCODE; END;", "1"),
+        ("e EXCEPTION; BEGIN BEGIN RAISE e; EXCEPTION WHEN e THEN RAISE; END; EXCEPTION WHEN e THEN RETURN 9; END;", "9"),
+    ] {
+        assert_eq!(call(&function("", "NUMBER", body), &[]).unwrap(), Value::Numeric(expected.into()), "{body}");
+    }
+    assert_eq!(
+        call(
+            &function(
+                "",
+                "VARCHAR2",
+                "e EXCEPTION; BEGIN RAISE e; EXCEPTION WHEN e THEN RETURN SQLERRM; END;"
+            ),
+            &[]
+        )
+        .unwrap(),
+        Value::Text("User-Defined Exception".into())
+    );
+    let error = call(
+        &function("", "NUMBER", "e EXCEPTION; BEGIN RAISE e; END;"),
+        &[],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        mpedb_types::Error::OracleUserException { .. }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "ORA-06510: PL/SQL: unhandled user-defined exception"
+    );
+}
+
+#[test]
+fn user_exception_names_share_declaration_namespace_and_cannot_be_values() {
+    for body in [
+        "e EXCEPTION; e EXCEPTION; BEGIN RETURN 1; END;",
+        "e NUMBER; e EXCEPTION; BEGIN RETURN 1; END;",
+        "e EXCEPTION; e NUMBER; BEGIN RETURN 1; END;",
+        "e EXCEPTION; BEGIN RETURN e; END;",
+        "e EXCEPTION; BEGIN DECLARE e NUMBER; BEGIN RAISE e; END; RETURN 1; END;",
+        "e EXCEPTION; BEGIN RAISE e; EXCEPTION WHEN e OR e THEN RETURN 1; END;",
+        "BEGIN DECLARE e EXCEPTION; BEGIN NULL; END; RAISE e; END;",
+    ] {
+        assert!(compile(&function("", "NUMBER", body)).is_err(), "{body}");
+    }
+}

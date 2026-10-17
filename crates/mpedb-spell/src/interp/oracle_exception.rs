@@ -30,7 +30,7 @@ pub(super) fn named(code: u16) -> Error {
 }
 pub(super) fn semantic(error: Error, op: Op) -> std::result::Result<Error, Error> {
     let code = match &error {
-        Error::Oracle { .. } => return Ok(error),
+        Error::Oracle { .. } | Error::OracleUserException { .. } => return Ok(error),
         Error::DivisionByZero => 1476,
         Error::PrimaryKeyViolation { .. } | Error::UniqueViolation { .. } => 1,
         Error::NotNullViolation { .. } => 1400,
@@ -77,6 +77,7 @@ pub(super) fn semantic(error: Error, op: Op) -> std::result::Result<Error, Error
 pub(super) fn sqlcode(caught: &[Caught]) -> Result<i64> {
     match caught.last().map(|c| &c.error) {
         None => Ok(0),
+        Some(Error::OracleUserException { .. }) => Ok(1),
         Some(Error::Oracle { code: 1403, .. }) => Ok(100),
         Some(Error::Oracle { code, .. }) => Ok(-i64::from(*code)),
         _ => Err(Error::Corrupt("proc: non-Oracle exception context".into())),
@@ -85,6 +86,7 @@ pub(super) fn sqlcode(caught: &[Caught]) -> Result<i64> {
 pub(super) fn sqlerrm(caught: &[Caught]) -> Result<String> {
     let mut text = match caught.last().map(|c| &c.error) {
         None => "ORA-0000: normal, successful completion".into(),
+        Some(Error::OracleUserException { .. }) => "User-Defined Exception".into(),
         // Legacy handlers retain their original error detail. SQLERRM's new
         // operation renders Oracle's canonical divisor message separately.
         Some(Error::Oracle { code: 1476, .. }) => named(1476).to_string(),
@@ -133,4 +135,12 @@ pub(super) fn application(code: PValue, message: PValue) -> Result<Error> {
         code: code.unsigned_abs() as u32,
         message,
     })
+}
+
+/// Proc validation checks the constant even when its instruction is unreachable.
+pub(super) fn user_identity(proc: &Proc, index: u16) -> [u8; 32] {
+    let Value::Blob(bytes) = &proc.consts[index as usize] else {
+        unreachable!("validated")
+    };
+    bytes.as_slice().try_into().expect("validated identity")
 }

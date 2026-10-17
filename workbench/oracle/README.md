@@ -662,7 +662,17 @@ and UTF-8-safe SQLERRM truncation to 512 bytes. The measured native 23.26.3
 application-error envelope retains 2034 message bytes; uncaught-message parity
 is tested too.
 
-Full exception coverage still needs user-defined declarations/EXCEPTION_INIT,
+Local user-defined `name EXCEPTION;` declarations now have lexical identities,
+separate from Oracle error numbers. Nested declarations with the same name do
+not match one another, and bare re-raise preserves the original identity.
+Handlers report SQLCODE +1 and SQLERRM `User-Defined Exception`; uncaught
+exceptions report ORA-06510. Additive opcodes 92–93 validate a 32-byte identity
+constant, including unreachable instructions. Native black-box tests compare
+seven scope/diagnostic cases, builtin-name shadowing, uncaught errors and cold
+reopen through both the procedure and scalar SQL catalogs. These are local
+declarations; package-wide exception identity remains package integration work.
+
+Full exception coverage still needs EXCEPTION_INIT,
 TRUE error-stack preservation, SQLERRM(error_code), localized/detailed messages
 and complete Oracle classification of database errors. See
 [Oracle error reporting](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/retrieving-error-code-and-error-message.html)

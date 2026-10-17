@@ -86,6 +86,8 @@ pub enum Error {
     /// A native Oracle semantic exception. The positive ORA number is kept
     /// separate from its text so PL/SQL handlers never parse error messages.
     Oracle { code: u32, message: String },
+    /// Lexically identified PL/SQL exception without an Oracle error number.
+    OracleUserException { identity: [u8; 32] },
     PrimaryKeyViolation {
         table: String,
         /// The PK columns, sqlite-spelled (`t.a` / `t.a, t.b`) — sqlite
@@ -241,6 +243,7 @@ impl fmt::Display for Error {
                 write!(f, "CHECK violation: {table}.{column} failed `{expr}`")
             }
             Error::Raise(m) => write!(f, "{m}"),
+            Error::OracleUserException { .. } => write!(f, "ORA-06510: PL/SQL: unhandled user-defined exception"),
             Error::Oracle { code, message } => write!(f, "ORA-{code:05}: {message}"),
             Error::PrimaryKeyViolation { table, pk } => {
                 let _ = table;

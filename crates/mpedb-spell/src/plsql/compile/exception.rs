@@ -11,7 +11,41 @@ pub(super) fn code(name: &str) -> Option<u16> {
         _ => return None,
     })
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ExceptionRef {
+    Builtin(u16),
+    User(u16),
+}
+
 impl Parser<'_> {
+    pub(super) fn declare_exception(&mut self, name: String, position: usize) -> Result<()> {
+        if !self.declared_here.insert(name.clone()) {
+            return Err(self.error("duplicate declaration"));
+        }
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"mpedb.plsql.local-exception.v1\0");
+        hash.update(self.source.as_bytes());
+        hash.update(&(position as u64).to_le_bytes());
+        let index = self
+            .builder
+            .const_idx(Value::Blob(hash.finalize().as_bytes().to_vec()))?;
+        self.pending_declarations.remove(&name);
+        self.locals.remove(&name);
+        self.exceptions.insert(name, ExceptionRef::User(index));
+        Ok(())
+    }
+    fn exception_ref(&self, name: &str) -> Result<ExceptionRef> {
+        if self.locals.contains_key(name) || self.pending_declarations.contains(name) {
+            return Err(
+                self.error("exception name refers to a variable or an incomplete declaration")
+            );
+        }
+        self.exceptions
+            .get(name)
+            .copied()
+            .or_else(|| code(name).map(ExceptionRef::Builtin))
+            .ok_or_else(|| self.error("unknown exception name"))
+    }
     pub(super) fn raise_statement(&mut self) -> Result<()> {
         if self.symbol(";") {
             if self.in_handler == 0 {
@@ -20,13 +54,12 @@ impl Parser<'_> {
             self.builder.emit(Op::OracleReraise)?;
         } else {
             let name = self.identifier()?;
-            if self.locals.contains_key(&name) {
-                return Err(self.error("RAISE target is a variable, not an exception"));
-            }
-            let code =
-                code(&name).ok_or_else(|| self.error("named exception is not implemented"))?;
+            let exception = self.exception_ref(&name)?;
             self.want_symbol(";")?;
-            self.builder.emit(Op::OracleRaise(code))?;
+            self.builder.emit(match exception {
+                ExceptionRef::Builtin(code) => Op::OracleRaise(code),
+                ExceptionRef::User(index) => Op::OracleRaiseUser(index),
+            })?;
         }
         Ok(())
     }
@@ -67,19 +100,22 @@ impl Parser<'_> {
             } else {
                 loop {
                     let name = self.identifier()?;
-                    if self.locals.contains_key(&name) {
-                        return Err(self.error("handler name is a variable, not an exception"));
-                    }
-                    let code = code(&name)
-                        .ok_or_else(|| self.error("named exception handler is not implemented"))?;
-                    if !seen.insert(code) {
+                    let exception = self.exception_ref(&name)?;
+                    if !seen.insert(exception) {
                         return Err(
                             self.error("exception appears in more than one handler alternative")
                         );
                     }
-                    self.builder.emit(Op::OracleExceptionCode)?;
-                    self.constant(Value::Int(code as i64))?;
-                    self.builder.emit(Op::Eq)?;
+                    match exception {
+                        ExceptionRef::Builtin(code) => {
+                            self.builder.emit(Op::OracleExceptionCode)?;
+                            self.constant(Value::Int(code as i64))?;
+                            self.builder.emit(Op::Eq)?;
+                        }
+                        ExceptionRef::User(index) => {
+                            self.builder.emit(Op::OracleMatchUser(index))?;
+                        }
+                    }
                     yes.push(self.builder.emit(Op::JumpIfTrue(0))?);
                     if !self.word("OR") {
                         break;
