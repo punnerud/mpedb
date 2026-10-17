@@ -1097,3 +1097,53 @@ END ledger;
         ProcValue::Scalar(Value::Null)
     );
 }
+
+#[test]
+fn plsql_anchored_type_keeps_null_and_inherits_not_null() {
+    let (cfg, _guard) = test_config("plsql-anchored-type");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_type(v VARCHAR2) RETURN VARCHAR2 IS \
+             a VARCHAR2(4) := 'kept'; \
+             n a%TYPE; \
+             BEGIN \
+               IF v IS NULL THEN \
+                 IF n IS NULL THEN n := NULL; END IF; \
+                 RETURN n; \
+               END IF; \
+               n := v; \
+               RETURN n; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_TYPE", &[Value::Null]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    assert_eq!(
+        engine.call("SEE_TYPE", &[Value::Text("ok".into())]).unwrap(),
+        ProcValue::Scalar(Value::Text("ok".into()))
+    );
+    let err = engine
+        .call("SEE_TYPE", &[Value::Text("toolong".into())])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("character string buffer too small"),
+        "{err}"
+    );
+    let refused = engine
+        .define(
+            "CREATE FUNCTION bad RETURN VARCHAR2 IS \
+             a VARCHAR2(4) NOT NULL := 'kept'; \
+             n a%TYPE; \
+             BEGIN RETURN n; END;",
+            Lang::PlSql,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("inherits NOT NULL"), "{refused}");
+}

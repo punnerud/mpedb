@@ -12,6 +12,7 @@ mod forall;
 mod bulk_collect;
 mod package;
 mod trigger_body;
+mod anchored_type;
 pub use trigger_body::{TriggerImage, TriggerImageType};
 
 use super::lex::{self, Lexed, Token};
@@ -416,6 +417,9 @@ impl Parser<'_> {
             }
             let constant = self.word("CONSTANT");
             if self.declare_rowtype(&name, constant)? {
+                continue;
+            }
+            if self.declare_anchored_type(&name, constant)? {
                 continue;
             }
             if self.declare_nested_var(&name, constant)? {
@@ -1293,6 +1297,9 @@ impl Parser<'_> {
         }
         let name = self.identifier()?;
         if self.symbol("%") {
+            if self.is_word("TYPE") {
+                return Err(self.error("%TYPE is a type, not a value"));
+            }
             return self.cursor_attribute(&name);
         }
         if self.forall_subscripts == 0 && self.forall_index.as_deref() == Some(name.as_str()) {
