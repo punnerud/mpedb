@@ -14,6 +14,7 @@ mod package;
 mod trigger_body;
 mod anchored_type;
 mod record_type;
+pub use anchored_type::ColumnAnchor;
 pub use trigger_body::{TriggerImage, TriggerImageType};
 
 use super::lex::{self, Lexed, Token};
@@ -118,16 +119,25 @@ struct Parser<'a> {
     /// Set only while an Oracle row trigger is compiled. Slots are the
     /// call arguments (`:NEW` columns, then `:OLD` columns), not locals.
     trigger_images: Option<trigger_body::TriggerImages>,
+    /// Catalog columns for `table.column%TYPE`. Empty when the caller has
+    /// no schema. Not saved per block: the catalog is database-global.
+    column_anchors: &'a [anchored_type::ColumnAnchor],
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
-    compile_on_stack(source, false)
+    compile_with_anchors(source, &[])
+}
+
+/// Compile PL/SQL with a snapshot of catalog columns. `table.column%TYPE`
+/// resolves against `anchors` and does not inherit a column `NOT NULL`.
+pub fn compile_with_anchors(source: &str, anchors: &[ColumnAnchor]) -> Result<Skeleton> {
+    compile_on_stack(source, false, anchors)
 }
 
 /// Compile only a scalar SQL function; procedures and OUT signatures belong
 /// to the procedure calling convention and must never enter a scalar catalog.
 pub fn compile_function(source: &str) -> Result<Skeleton> {
-    compile_on_stack(source, true)
+    compile_on_stack(source, true, &[])
 }
 
 /// Compile one Oracle row-trigger body. `columns` is the target table in
@@ -149,7 +159,7 @@ pub fn compile_trigger(source: &str, columns: &[trigger_body::TriggerImage]) -> 
     })
 }
 
-fn compile_on_stack(source: &str, scalar_only: bool) -> Result<Skeleton> {
+fn compile_on_stack(source: &str, scalar_only: bool, anchors: &[ColumnAnchor]) -> Result<Skeleton> {
     // Host-side parsing must not depend on the embedding application's worker
     // stack size. Keep the documented nesting bound while giving the recursive
     // parser a known stack; execution still uses the bounded, validated IR.
@@ -157,7 +167,7 @@ fn compile_on_stack(source: &str, scalar_only: bool) -> Result<Skeleton> {
         let worker = std::thread::Builder::new()
             .name("mpedb-plsql-compile".into())
             .stack_size(8 * 1024 * 1024)
-            .spawn_scoped(scope, || compile_inner(source, scalar_only))
+            .spawn_scoped(scope, || compile_inner(source, scalar_only, anchors))
             .map_err(|_| mpedb_types::Error::OutOfMemory {
                 what: "PL/SQL compiler worker",
             })?;
@@ -167,7 +177,7 @@ fn compile_on_stack(source: &str, scalar_only: bool) -> Result<Skeleton> {
     })
 }
 
-fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
+fn compile_inner(source: &str, scalar_only: bool, anchors: &[ColumnAnchor]) -> Result<Skeleton> {
     let tokens = lex::lex(source)?;
     let exception_blocks = tokens.iter().any(|t| matches!(&t.token, Token::Identifier { name, quoted: false } if name == "EXCEPTION"));
     let mut p = Parser {
@@ -198,6 +208,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         package_name: None,
         package_var: None,
         trigger_images: None,
+        column_anchors: anchors,
     };
     if p.is_word("DECLARE") || p.is_word("BEGIN") {
         if scalar_only {

@@ -1,13 +1,23 @@
-//! Scalar `anchor%TYPE`. The new variable inherits the anchor's datatype,
-//! size, and `NOT NULL` constraint, and does not inherit its value. An
-//! omitted initializer is therefore NULL whenever the anchor allows NULL.
-//! A column or record field (`table.col%TYPE`) stays a named refusal: this
-//! compiler has no schema, and a column anchor would not inherit `NOT NULL`.
+//! `anchor%TYPE`. A scalar anchor inherits datatype, size, and `NOT NULL`,
+//! and does not inherit the value. A `table.column%TYPE` anchor inherits
+//! datatype and size only: Oracle does not copy a column's `NOT NULL`, so
+//! the variable needs no initializer and starts NULL. A record field and a
+//! schema-qualified name stay named refusals.
 
-use super::Parser;
+use super::{Parser, Type};
 use crate::ir::Op;
 use crate::plsql::lex::Token;
-use mpedb_types::{Result, Value};
+use mpedb_types::{ColumnType, Result, Value};
+
+/// One catalog column a PL/SQL `%TYPE` declaration may anchor to.
+/// `nullable` is the column's flag. A column anchor never copies it.
+#[derive(Clone, Debug)]
+pub struct ColumnAnchor {
+    pub table: String,
+    pub column: String,
+    pub ty: ColumnType,
+    pub nullable: bool,
+}
 
 enum AnchoredForm {
     No,
@@ -15,15 +25,15 @@ enum AnchoredForm {
     Dotted,
 }
 
+fn same_ident(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
 impl Parser<'_> {
     pub(super) fn declare_anchored_type(&mut self, name: &str, constant: bool) -> Result<bool> {
         match self.anchored_form() {
             AnchoredForm::No => return Ok(false),
-            AnchoredForm::Dotted => {
-                return Err(self.error(
-                    "table, view, and record-field %TYPE anchors are not implemented",
-                ));
-            }
+            AnchoredForm::Dotted => return self.declare_column_anchor(name, constant),
             AnchoredForm::Scalar => {}
         }
         let anchor_name = self.identifier()?;
@@ -37,7 +47,66 @@ impl Parser<'_> {
                 "a %TYPE anchor must be a scalar variable in this scope",
             ));
         };
-        let inherited = anchor.not_null;
+        self.bind_anchored(name, constant, anchor.ty, anchor.not_null)?;
+        Ok(true)
+    }
+
+    /// `table.column%TYPE`. The column's `NOT NULL` is not inherited.
+    fn declare_column_anchor(&mut self, name: &str, constant: bool) -> Result<bool> {
+        let table = self.identifier()?;
+        self.want_symbol(".")?;
+        let column = self.identifier()?;
+        if self.symbol(".") {
+            loop {
+                self.identifier()?;
+                if !self.symbol(".") {
+                    break;
+                }
+            }
+            self.want_symbol("%")?;
+            self.want_word("TYPE")?;
+            return Err(self.error("schema-qualified %TYPE anchors are not implemented"));
+        }
+        self.want_symbol("%")?;
+        self.want_word("TYPE")?;
+        if self.records.contains_key(&table) || self.record_types.contains_key(&table) {
+            return Err(self.error("record-field %TYPE anchors are not implemented"));
+        }
+        let Some(anchor) = self.column_anchors.iter().find(|anchor| {
+            same_ident(&anchor.table, &table) && same_ident(&anchor.column, &column)
+        }) else {
+            let known_table = self
+                .column_anchors
+                .iter()
+                .any(|anchor| same_ident(&anchor.table, &table));
+            let message = if known_table {
+                format!("no such column {column} in {table}")
+            } else {
+                format!("no such table {table}")
+            };
+            return Err(self.error(&message));
+        };
+        // A column NOT NULL is recorded on the anchor and deliberately
+        // not copied. Reading it keeps that flag from looking unused.
+        let _column_nullable = anchor.nullable;
+        let ty = match anchor.ty {
+            ColumnType::Text => Type::Varchar(0),
+            ColumnType::Int64 => Type::Number,
+            _ => {
+                return Err(self.error("a %TYPE column supports TEXT and INTEGER only"));
+            }
+        };
+        self.bind_anchored(name, constant, ty, false)?;
+        Ok(true)
+    }
+
+    fn bind_anchored(
+        &mut self,
+        name: &str,
+        constant: bool,
+        ty: Type,
+        inherited: bool,
+    ) -> Result<()> {
         let mut not_null = inherited;
         let wrote_not_null = self.word("NOT");
         if wrote_not_null {
@@ -46,7 +115,7 @@ impl Parser<'_> {
         }
         if self.symbol(":=") || self.word("DEFAULT") {
             let actual = self.expression()?;
-            self.compatible(anchor.ty, actual)?;
+            self.compatible(ty, actual)?;
             if not_null && actual.is_none() {
                 return Err(self.error(
                     "a NOT NULL variable cannot be initialized with literal NULL",
@@ -64,16 +133,16 @@ impl Parser<'_> {
         } else {
             self.constant(Value::Null)?;
         }
-        self.builder.emit(anchor.ty.check())?;
+        self.builder.emit(ty.check())?;
         if not_null {
             self.builder.emit(Op::OracleNotNull)?;
         }
         self.pending_declarations.remove(name);
-        let slot = self.add_local(name.to_string(), anchor.ty, !constant)?;
+        let slot = self.add_local(name.to_string(), ty, !constant)?;
         self.locals.get_mut(name).unwrap().not_null = not_null;
         self.builder.emit(Op::StoreLocal(slot))?;
         self.want_symbol(";")?;
-        Ok(true)
+        Ok(())
     }
 
     fn anchored_form(&self) -> AnchoredForm {
@@ -121,8 +190,10 @@ impl Parser<'_> {
 mod tests {
     use crate::interp::{self, testutil::MockBridge, Budget, ProcValue};
     use crate::ir::Proc;
-    use crate::plsql::compile;
-    use mpedb_types::Value;
+    use crate::plsql::{compile, compile_with_anchors};
+    use mpedb_types::{ColumnType, Value};
+
+    use super::ColumnAnchor;
 
     fn function(result: &str, body: &str) -> String {
         format!("CREATE OR REPLACE FUNCTION f RETURN {result} IS {body}")
@@ -240,11 +311,11 @@ mod tests {
             ),
             (
                 "n employees.last_name%TYPE; BEGIN RETURN n; END;",
-                "record-field %TYPE anchors are not implemented",
+                "no such table EMPLOYEES",
             ),
             (
                 "n schema.employees.last_name%TYPE; BEGIN RETURN n; END;",
-                "record-field %TYPE anchors are not implemented",
+                "schema-qualified %TYPE anchors are not implemented",
             ),
             (
                 "TYPE nums IS TABLE OF PLS_INTEGER; n nums; x n%TYPE; BEGIN RETURN x; END;",
@@ -261,6 +332,125 @@ mod tests {
         ];
         for (body, expected) in refused {
             let err = compile_err(body);
+            assert!(err.contains(expected), "{body}\n{err}");
+        }
+    }
+
+    fn not_null_columns() -> Vec<ColumnAnchor> {
+        vec![
+            ColumnAnchor {
+                table: "people".into(),
+                column: "name".into(),
+                ty: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnAnchor {
+                table: "people".into(),
+                column: "id".into(),
+                ty: ColumnType::Int64,
+                nullable: false,
+            },
+            ColumnAnchor {
+                table: "people".into(),
+                column: "payload".into(),
+                ty: ColumnType::Blob,
+                nullable: true,
+            },
+        ]
+    }
+
+    fn call_anchored(source: &str) -> Result<Value, String> {
+        let skel = compile_with_anchors(source, &not_null_columns()).map_err(|err| err.to_string())?;
+        let proc = Proc::new(
+            skel.name,
+            skel.argc,
+            skel.nlocals,
+            Vec::new(),
+            skel.consts,
+            skel.instrs,
+        )
+        .map_err(|err| err.to_string())?;
+        let mut bridge = MockBridge::new();
+        match interp::run(
+            &proc,
+            &[],
+            &mut bridge,
+            Budget {
+                instrs: 10_000,
+                db_calls: 8,
+                rows: 100,
+            },
+        )
+        .map_err(|err| err.to_string())?
+        {
+            ProcValue::Scalar(value) => Ok(value),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn column_type_does_not_inherit_not_null_and_null_stays_null() {
+        let text = function(
+            "VARCHAR2",
+            "n people.name%TYPE; \
+             BEGIN \
+               IF n IS NULL THEN n := NULL; END IF; \
+               RETURN n; \
+             END;",
+        );
+        assert_eq!(call_anchored(&text).unwrap(), Value::Null);
+
+        let cleared = function(
+            "VARCHAR2",
+            "n people.name%TYPE := 'kept'; BEGIN n := NULL; RETURN n; END;",
+        );
+        assert_eq!(call_anchored(&cleared).unwrap(), Value::Null);
+
+        let number = function(
+            "NUMBER",
+            "n people.id%TYPE; BEGIN RETURN n; END;",
+        );
+        assert_eq!(call_anchored(&number).unwrap(), Value::Null);
+
+        let wide = function(
+            "NUMBER",
+            "n people.id%TYPE; BEGIN n := 3000000000; RETURN n; END;",
+        );
+        assert_eq!(
+            call_anchored(&wide).unwrap(),
+            Value::Numeric("3000000000".into())
+        );
+
+        let refused = [
+            (
+                "n people.name%TYPE NOT NULL; BEGIN RETURN n; END;",
+                "a NOT NULL declaration requires an initializer",
+            ),
+            (
+                "n people.missing%TYPE; BEGIN RETURN n; END;",
+                "no such column MISSING in PEOPLE",
+            ),
+            (
+                "n other.name%TYPE; BEGIN RETURN n; END;",
+                "no such table OTHER",
+            ),
+            (
+                "n people.payload%TYPE; BEGIN RETURN n; END;",
+                "a %TYPE column supports TEXT and INTEGER only",
+            ),
+            (
+                "n hr.people.name%TYPE; BEGIN RETURN n; END;",
+                "schema-qualified %TYPE anchors are not implemented",
+            ),
+            (
+                "TYPE pair IS RECORD (note VARCHAR2(4)); r pair; n r.note%TYPE; BEGIN RETURN n; END;",
+                "record-field %TYPE anchors are not implemented",
+            ),
+        ];
+        for (body, expected) in refused {
+            let err = compile_with_anchors(&function("VARCHAR2", body), &not_null_columns())
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(expected), "{body}\n{err}");
         }
     }

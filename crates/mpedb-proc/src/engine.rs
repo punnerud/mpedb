@@ -63,6 +63,22 @@ pub use mpedb::{NS_PROC, NS_PROC_HASH};
 
 const POISON: &str = "proc cache lock poisoned";
 
+/// Snapshot live columns for `table.column%TYPE`. `nullable` is recorded
+/// and ignored: a column `NOT NULL` does not apply to the PL/SQL variable.
+fn plsql_column_anchors(schema: &mpedb_types::Schema) -> Vec<mpedb_spell::plsql::ColumnAnchor> {
+    schema
+        .live_tables()
+        .flat_map(|table| {
+            table.columns.iter().map(|column| mpedb_spell::plsql::ColumnAnchor {
+                table: table.name.clone(),
+                column: column.name.clone(),
+                ty: column.ty,
+                nullable: column.nullable,
+            })
+        })
+        .collect()
+}
+
 /// Source language of a procedure. Both compile to the same IR; semantics
 /// follow the source language where they differ (notably `/` and `%` on
 /// integers), so the same algorithm may hash differently across languages.
@@ -130,7 +146,11 @@ impl<'db> ProcEngine<'db> {
         let skel = match lang {
             Lang::Python => py::compile(source)?,
             Lang::Rust => rs::compile(source)?,
-            Lang::PlSql => mpedb_spell::plsql::compile(source)?,
+            Lang::PlSql => {
+                let schema = self.db.schema();
+                let anchors = plsql_column_anchors(&schema);
+                mpedb_spell::plsql::compile_with_anchors(source, &anchors)?
+            }
         };
         let proc = self.link(&skel, lang)?;
         self.discard_package_state(&proc.name);

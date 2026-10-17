@@ -85,6 +85,7 @@ pub(super) fn compile_trigger_inner(source: &str, columns: &[TriggerImage]) -> R
         package_name: None,
         package_var: None,
         trigger_images: Some(TriggerImages { new_cols, old_cols }),
+        column_anchors: &[],
     };
     if parser.word("DECLARE") {
         parser.declarations()?;

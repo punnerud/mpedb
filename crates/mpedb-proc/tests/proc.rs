@@ -1181,3 +1181,80 @@ fn plsql_record_field_starts_null() {
         .to_string();
     assert!(refused.contains("cannot be assigned NULL"), "{refused}");
 }
+
+#[test]
+fn plsql_column_type_does_not_inherit_not_null() {
+    let (cfg, _guard) = test_config("plsql-column-type");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query(
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        &[],
+    )
+    .unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_balance RETURN NUMBER IS \
+             n accounts.balance%TYPE; \
+             BEGIN \
+               IF n IS NULL THEN n := NULL; END IF; \
+               RETURN n; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_BALANCE", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_name RETURN VARCHAR2 IS \
+             n people.name%TYPE := 'kept'; \
+             BEGIN \
+               n := NULL; \
+               RETURN n; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_NAME", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_wide RETURN NUMBER IS \
+             n accounts.balance%TYPE; \
+             BEGIN n := 3000000000; RETURN n; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_WIDE", &[]).unwrap(),
+        ProcValue::Scalar(Value::Numeric("3000000000".into()))
+    );
+    let missing = engine
+        .define(
+            "CREATE FUNCTION bad RETURN NUMBER IS \
+             n missing.balance%TYPE; \
+             BEGIN RETURN n; END;",
+            Lang::PlSql,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("no such table MISSING"), "{missing}");
+    let explicit = engine
+        .define(
+            "CREATE FUNCTION bad_nn RETURN NUMBER IS \
+             n accounts.balance%TYPE NOT NULL; \
+             BEGIN RETURN n; END;",
+            Lang::PlSql,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        explicit.contains("a NOT NULL declaration requires an initializer"),
+        "{explicit}"
+    );
+}
