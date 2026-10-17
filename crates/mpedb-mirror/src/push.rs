@@ -10,8 +10,10 @@
 //! high-water hazard the review flagged (CONF#0/15).
 
 use mpedb::Database;
+pub(crate) mod known;
 mod outbox;
 mod prepare;
+mod record;
 use mpedb_core::DirtyEntry;
 use mpedb_types::{keycode, Error, Result};
 
@@ -203,7 +205,8 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
             }
         }
         if let Some(tag) = outbox_tag {
-            outbox::clear(&mut s, tag)?;
+            let identity = outbox::clear(&mut s, tag)?;
+            known::record(&mut s, identity, tag, &schema, &ops, &reply.applied)?;
         }
         s.commit()?;
     }

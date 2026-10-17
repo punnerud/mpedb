@@ -279,6 +279,24 @@ controller are connected. The outbox retains the full coalesced dirty set in
 one source transaction; its current 64 MiB/100000-op limit refuses oversized
 requests before RPC rather than splitting key moves or silently truncating.
 
+The shared apply boundary also accepts optional source-attested per-key write
+provenance (`pull_provenanced` / `apply_provenanced_batch`). An ACK persists the
+applied request's explicit key/schema footprints in the SAME local transaction
+as its postimages and outbox removal. Under the apply writer, an effect is an
+echo only if EVERY attested request is locally ACKed or pending for that key and
+FILE. Newer local dirty generations then survive. Unknown/mixed/other-FILE
+requests and trigger side effects outside the explicit footprint remain normal
+source changes. A restored backup without the ACK cannot silently filter later
+source writes just because they carry the same FILE identity. Corrupt knowledge
+or changed carrier schemas stop apply without advancing its cursor.
+
+Fifteen protocol tests cover the outbox and provenance rules, including cold
+reopen, restore, pending receipt recovery, rejected requests and multiple own
+requests coalesced onto one key. ACK footprints currently have no garbage
+collection; a future retention policy must explicitly preserve recovery from
+supported backups. Native Oracle capture does not yet supply this provenance,
+so this shared foundation does not enable production Oracle write-back.
+
 Tokens must include a durable local FILE incarnation and dirty generation;
 a path/transaction number or payload hash alone can collide after reimport.
 Receipt images are bounded to 64 MiB per batch. This primitive never garbage

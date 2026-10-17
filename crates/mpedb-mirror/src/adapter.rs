@@ -47,6 +47,23 @@ pub struct PullBatch {
     pub source_epoch: Option<u64>,
 }
 
+/// Source-attested provenance for ALL writes coalesced into one net op.
+/// A backend must leave provenance absent if ANY foreign/unknown write touched
+/// that identity. Equal values, matching SCNs or a shared transaction alone
+/// never prove that the effect was requested/accounted for by this mirror.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteOrigin {
+    pub file_incarnation: [u8; 16],
+    pub request_ids: Vec<[u8; 32]>,
+}
+/// Optional, position-aligned provenance. Unknown provenance remains a normal
+/// source change; the applier checks local ACK/pending footprints atomically.
+#[derive(Clone, Debug)]
+pub struct ProvenancedPullBatch {
+    pub batch: PullBatch,
+    pub origins: Option<Vec<Option<WriteOrigin>>>,
+}
+
 impl PullBatch {
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
@@ -79,6 +96,18 @@ pub trait SourceAdapter {
     /// to `max_ops` distinct PKs, reading every row image from a single source
     /// snapshot. Returns `None` when the source has no changes past `from`.
     fn pull(&mut self, from: &Cursor, max_ops: usize) -> Result<Option<PullBatch>>;
+
+    /// Provenance-aware pull. Legacy adapters retain their existing behavior.
+    fn pull_provenanced(
+        &mut self,
+        from: &Cursor,
+        max_ops: usize,
+    ) -> Result<Option<ProvenancedPullBatch>> {
+        Ok(self.pull(from, max_ops)?.map(|batch| ProvenancedPullBatch {
+            batch,
+            origins: None,
+        }))
+    }
 
     /// The source's current change-log head — for lag reporting and the switch
     /// drain loop (§7). Comparable to a `PullBatch::end_cursor`.
@@ -129,7 +158,9 @@ pub trait SourceAdapter {
     /// The adapter MUST support idempotent replay by PushContext::request_id:
     /// the source may have committed even when push_versioned returned Err.
     /// This hook and zero_cursor are pure and must perform no source I/O.
-    fn push_outbox_identity(&self) -> Option<[u8; 16]> { None }
+    fn push_outbox_identity(&self) -> Option<[u8; 16]> {
+        None
+    }
 
     /// Receipt-capable push boundary. `from` selects checked source-wins push;
     /// None selects local-wins. The default retains existing adapter behavior.

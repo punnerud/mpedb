@@ -47,8 +47,8 @@ mod pg_harness;
 pub use reconcile::{check_source_not_restored, reconcile, verify, ReconcileStats};
 pub use sqlite_adapter::SqliteAdapter;
 
-pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, PushContext, PushReply, SourceAdapter};
-pub use apply::{apply_batch, ApplyStats};
+pub use adapter::{Cursor, NetOp, NetOpKind, ProvenancedPullBatch, PullBatch, PushContext, PushReply, SourceAdapter, WriteOrigin};
+pub use apply::{apply_batch, apply_provenanced_batch, ApplyStats};
 pub use export::{diff_sqlite_data, export_sqlite, load_sqlite_provenance, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
 #[cfg(feature = "oracle-source")]

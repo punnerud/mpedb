@@ -6,10 +6,6 @@ use mpedb_core::{cdc, row};
 use mpedb_types::{Schema, Value};
 const KEY: &[u8] = b"push/outbox";
 const LIMIT: usize = 64 * 1024 * 1024;
-const CHUNK: usize = 64 * 1024;
-fn chunk_key(n: usize) -> Vec<u8> {
-    format!("push/outbox/{n:08x}").into_bytes()
-}
 fn corrupt(message: &str) -> Error {
     Error::Corrupt(format!("push outbox: {message}"))
 }
@@ -206,31 +202,7 @@ fn decode(bytes: &[u8], identity: [u8; 16], schema: Schema, tag: [u8; 32]) -> Re
     Ok(prepared)
 }
 fn read_bytes(s: &mut WriteSession<'_>) -> Result<Option<([u8; 32], Vec<u8>)>> {
-    let Some(header) = s.sys_record_get(state::MIR_NS, KEY)? else {
-        return Ok(None);
-    };
-    if header.len() != 41 || header[0] != 1 {
-        return Err(corrupt("invalid header"));
-    }
-    let length = u64::from_le_bytes(header[1..9].try_into().unwrap());
-    if length == 0 || length > LIMIT as u64 {
-        return Err(corrupt("invalid request length"));
-    }
-    let mut bytes = Vec::with_capacity(length as usize);
-    for n in 0..(length as usize).div_ceil(CHUNK) {
-        let part = s
-            .sys_record_get(state::MIR_NS, &chunk_key(n))?
-            .ok_or_else(|| corrupt("missing chunk"))?;
-        if part.len() != CHUNK.min(length as usize - bytes.len()) {
-            return Err(corrupt("invalid chunk length"));
-        }
-        bytes.extend_from_slice(&part);
-    }
-    let tag: [u8; 32] = header[9..].try_into().unwrap();
-    if blake3::hash(&bytes).as_bytes() != &tag {
-        return Err(corrupt("request checksum mismatch"));
-    }
-    Ok(Some((tag, bytes)))
+    super::record::read(s, KEY)
 }
 pub(super) fn load(
     s: &mut WriteSession<'_>,
@@ -271,16 +243,9 @@ pub(super) fn store(
         return Err(corrupt("request already exists"));
     }
     let bytes = encode(identity, prepared)?;
-    let tag = *blake3::hash(&bytes).as_bytes();
-    for (n, part) in bytes.chunks(CHUNK).enumerate() {
-        s.sys_record_put(state::MIR_NS, &chunk_key(n), part)?;
-    }
-    let mut header = vec![1];
-    header.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    header.extend_from_slice(&tag);
-    s.sys_record_put(state::MIR_NS, KEY, &header)?;
-    Ok(tag)
+    super::record::store(s, KEY, &bytes)
 }
+
 pub(super) fn validate_tag(s: &mut WriteSession<'_>, tag: [u8; 32]) -> Result<()> {
     let header = s.sys_record_get(state::MIR_NS, KEY)?.ok_or_else(|| {
         Error::Unsupported("durable push was already acknowledged or replaced".into())
@@ -292,14 +257,34 @@ pub(super) fn validate_tag(s: &mut WriteSession<'_>, tag: [u8; 32]) -> Result<()
     }
     Ok(())
 }
-pub(super) fn clear(s: &mut WriteSession<'_>, expected: [u8; 32]) -> Result<()> {
-    let (tag, bytes) = read_bytes(s)?.ok_or_else(|| corrupt("request disappeared before ACK"))?;
-    if tag != expected {
-        return Err(corrupt("request replaced before ACK"));
+pub(super) fn pending_identity(s: &mut WriteSession<'_>) -> Result<([u8; 16], [u8; 32])> {
+    let (tag, bytes) = read_bytes(s)?.ok_or_else(|| corrupt("pending request disappeared"))?;
+    let file = bytes
+        .get(1..17)
+        .ok_or_else(|| corrupt("missing FILE identity"))?
+        .try_into()
+        .map_err(|_| corrupt("invalid FILE identity"))?;
+    Ok((file, tag))
+}
+pub(super) fn pending(s: &mut WriteSession<'_>) -> Result<Option<PreparedPush>> {
+    let Some((_, bytes)) = read_bytes(s)? else {
+        return Ok(None);
+    };
+    let identity: [u8; 16] = bytes
+        .get(1..17)
+        .ok_or_else(|| corrupt("missing FILE identity"))?
+        .try_into()
+        .map_err(|_| corrupt("invalid FILE identity"))?;
+    load(s, Some(identity))
+}
+pub(super) fn clear(s: &mut WriteSession<'_>, expected: [u8; 32]) -> Result<[u8; 16]> {
+    let bytes = super::record::delete(s, KEY, expected)?;
+    if bytes.first() != Some(&1) {
+        return Err(corrupt("invalid request body version"));
     }
-    for n in 0..bytes.len().div_ceil(CHUNK) {
-        s.sys_record_delete(state::MIR_NS, &chunk_key(n))?;
-    }
-    s.sys_record_delete(state::MIR_NS, KEY)?;
-    Ok(())
+    bytes
+        .get(1..17)
+        .ok_or_else(|| corrupt("missing FILE identity"))?
+        .try_into()
+        .map_err(|_| corrupt("invalid FILE identity"))
 }

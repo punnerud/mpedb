@@ -63,6 +63,7 @@ enum Mode {
     UntrackedDelete,
     UntrackedLegacyUpsert,
     RaceNewRequest,
+    Reject,
 }
 struct Adapter<'a> {
     id: Option<[u8; 16]>,
@@ -179,9 +180,11 @@ impl SourceAdapter for Adapter<'_> {
             assert!(push_batch(db, &mut next).is_err());
         }
         Ok(PushReply {
-            applied: vec![true; ops.len()],
+            applied: vec![!matches!(self.mode, Mode::Reject); ops.len()],
             postimages: if matches!(self.mode, Mode::UntrackedLegacyUpsert) {
                 None
+            } else if matches!(self.mode, Mode::Reject) {
+                Some(vec![None; ops.len()])
             } else {
                 Some(images)
             },
@@ -459,4 +462,263 @@ fn a_stale_ack_cannot_remove_a_new_request_prepared_by_another_pusher() {
     assert_eq!(&header[9..], &finish.calls()[0].id);
     assert_eq!(dirty(f.db()), 0);
     assert_eq!(rows(f.db())[0][2], Value::Int(21));
+}
+
+fn source_effect(id: i64, v: i64) -> NetOp {
+    NetOp {
+        table_id: 0,
+        pk: vec![Value::Int(id)],
+        kind: NetOpKind::Upsert(vec![
+            Value::Int(id),
+            Value::Int(v),
+            Value::Int(v + 1),
+            Value::Text("source".into()),
+        ]),
+    }
+}
+fn tagged(
+    ops: Vec<NetOp>,
+    origins: Vec<Option<mpedb_mirror::WriteOrigin>>,
+) -> mpedb_mirror::ProvenancedPullBatch {
+    mpedb_mirror::ProvenancedPullBatch {
+        batch: PullBatch {
+            ops,
+            end_cursor: vec![8],
+            source_epoch: Some(1),
+        },
+        origins: Some(origins),
+    }
+}
+fn own(id: [u8; 32]) -> mpedb_mirror::WriteOrigin {
+    mpedb_mirror::WriteOrigin {
+        file_incarnation: [7; 16],
+        request_ids: vec![id],
+    }
+}
+fn ack_key(id: [u8; 32]) -> Vec<u8> {
+    format!(
+        "push/ack/{}",
+        id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+    .into_bytes()
+}
+#[test]
+fn own_echoes_use_durable_ack_knowledge_and_preserve_newer_local_intent() {
+    let mut f = Fixture::new("acked-echo");
+    let mut adapter = Adapter::new(Mode::Good);
+    push_batch(f.db(), &mut adapter).unwrap();
+    let id = adapter.calls()[0].id;
+    f.reopen();
+    f.db()
+        .query("UPDATE t SET v=20,g=0 WHERE id=1", &[])
+        .unwrap();
+    let incoming = tagged(vec![source_effect(1, 10)], vec![Some(own(id))]);
+    let stats = mpedb_mirror::apply_provenanced_batch(f.db(), &vec![7], &incoming).unwrap();
+    assert_eq!((stats.echoes, stats.upserts, stats.conflicts), (1, 0, 0));
+    assert_eq!(
+        rows(f.db()),
+        vec![vec![Value::Int(1), Value::Int(20), Value::Int(0)]]
+    );
+    assert_eq!(dirty(f.db()), 1);
+    assert_eq!(
+        f.db()
+            .sys_record_get(state::MIR_NS, state::KEY_CUR)
+            .unwrap(),
+        Some(vec![8])
+    );
+    push_batch(f.db(), &mut adapter).unwrap();
+    assert_eq!(dirty(f.db()), 0);
+    assert_eq!(rows(f.db())[0][2], Value::Int(21));
+}
+#[test]
+fn pending_request_provenance_preserves_redirty_until_the_old_ack_is_recovered() {
+    let f = Fixture::new("pending-echo");
+    let mut adapter = Adapter::new(Mode::Fail);
+    assert!(push_batch(f.db(), &mut adapter).is_err());
+    let id = adapter.calls()[0].id;
+    f.db()
+        .query("UPDATE t SET v=20,g=0 WHERE id=1", &[])
+        .unwrap();
+    let incoming = tagged(vec![source_effect(1, 10)], vec![Some(own(id))]);
+    let stats = mpedb_mirror::apply_provenanced_batch(f.db(), &vec![7], &incoming).unwrap();
+    assert_eq!(stats.echoes, 1);
+    assert_eq!(dirty(f.db()), 1);
+    assert_eq!(rows(f.db())[0][1], Value::Int(20));
+    assert!(f
+        .db()
+        .sys_record_get(state::MIR_NS, OUTBOX)
+        .unwrap()
+        .is_some());
+    adapter.mode = Mode::Good;
+    push_batch(f.db(), &mut adapter).unwrap();
+    assert_eq!(adapter.calls()[0].id, adapter.calls()[1].id);
+    assert_eq!(dirty(f.db()), 1);
+    assert_eq!(rows(f.db())[0][1], Value::Int(20));
+    push_batch(f.db(), &mut adapter).unwrap();
+    assert_eq!(dirty(f.db()), 0);
+}
+#[test]
+fn restored_backup_cannot_suppress_source_writes_it_has_never_accounted_for() {
+    let mut f = Fixture::new("restored-echo");
+    let backup = f.path.with_extension("echo-backup");
+    drop(f.db.take());
+    std::fs::copy(&f.path, &backup).unwrap();
+    f.db = Some(mpedb::Database::open_from_file(&f.path).unwrap());
+    let mut adapter = Adapter::new(Mode::Good);
+    push_batch(f.db(), &mut adapter).unwrap();
+    let id = adapter.calls()[0].id;
+    drop(f.db.take());
+    std::fs::copy(&backup, &f.path).unwrap();
+    f.db = Some(mpedb::Database::open_from_file(&f.path).unwrap());
+    f.db()
+        .query("UPDATE t SET v=20,g=0 WHERE id=1", &[])
+        .unwrap();
+    let incoming = tagged(vec![source_effect(1, 10)], vec![Some(own(id))]);
+    let stats = mpedb_mirror::apply_provenanced_batch(f.db(), &vec![7], &incoming).unwrap();
+    assert_eq!((stats.echoes, stats.conflicts, stats.upserts), (0, 1, 1));
+    assert_eq!(dirty(f.db()), 0);
+    assert_eq!(
+        rows(f.db()),
+        vec![vec![Value::Int(1), Value::Int(10), Value::Int(11)]]
+    );
+    std::fs::remove_file(backup).unwrap();
+}
+#[test]
+fn a_known_request_cannot_hide_unrequested_trigger_side_effects() {
+    let f = Fixture::new("side-effect");
+    let mut adapter = Adapter::new(Mode::Good);
+    push_batch(f.db(), &mut adapter).unwrap();
+    f.db()
+        .query("INSERT INTO t VALUES(2,20,0,'local')", &[])
+        .unwrap();
+    let incoming = tagged(
+        vec![source_effect(2, 99)],
+        vec![Some(own(adapter.calls()[0].id))],
+    );
+    let stats = mpedb_mirror::apply_provenanced_batch(f.db(), &vec![7], &incoming).unwrap();
+    assert_eq!((stats.echoes, stats.conflicts, stats.upserts), (0, 1, 1));
+    assert_eq!(dirty(f.db()), 0);
+    assert_eq!(rows(f.db())[1][1], Value::Int(99));
+}
+#[test]
+fn mixed_foreign_unknown_or_cross_file_provenance_stays_a_source_change() {
+    for case in ["unknown", "mixed", "cross-file", "foreign"] {
+        let f = Fixture::new(case);
+        let mut adapter = Adapter::new(Mode::Good);
+        push_batch(f.db(), &mut adapter).unwrap();
+        f.db()
+            .query("UPDATE t SET v=20,g=0 WHERE id=1", &[])
+            .unwrap();
+        let mut origin = own(adapter.calls()[0].id);
+        match case {
+            "unknown" => origin.request_ids = vec![[9; 32]],
+            "mixed" => origin.request_ids.push([9; 32]),
+            "cross-file" => origin.file_incarnation = [8; 16],
+            "foreign" => {}
+            _ => unreachable!(),
+        }
+        let incoming = tagged(
+            vec![source_effect(1, 10)],
+            vec![if case == "foreign" {
+                None
+            } else {
+                Some(origin)
+            }],
+        );
+        let stats = mpedb_mirror::apply_provenanced_batch(f.db(), &vec![7], &incoming).unwrap();
+        assert_eq!(
+            (stats.echoes, stats.conflicts, stats.upserts),
+            (0, 1, 1),
+            "{case}"
+        );
+        assert_eq!(dirty(f.db()), 0);
+    }
+}
+#[test]
+fn malformed_provenance_and_corrupt_ack_knowledge_cannot_advance_the_cursor() {
+    for case in [
+        "width",
+        "zero-file",
+        "empty",
+        "zero-id",
+        "duplicate",
+        "checksum",
+    ] {
+        let f = Fixture::new(case);
+        let mut adapter = Adapter::new(Mode::Good);
+        push_batch(f.db(), &mut adapter).unwrap();
+        f.db()
+            .query("UPDATE t SET v=20,g=0 WHERE id=1", &[])
+            .unwrap();
+        let id = adapter.calls()[0].id;
+        let mut origin = own(id);
+        match case {
+            "zero-file" => origin.file_incarnation = [0; 16],
+            "empty" => origin.request_ids.clear(),
+            "zero-id" => origin.request_ids = vec![[0; 32]],
+            "duplicate" => origin.request_ids.push(id),
+            "checksum" => {
+                let mut key = ack_key(id);
+                key.extend_from_slice(b"/00000000");
+                let mut bytes = f.db().sys_record_get(state::MIR_NS, &key).unwrap().unwrap();
+                bytes[0] ^= 1;
+                put(f.db(), &key, &bytes);
+            }
+            _ => {}
+        }
+        let mut incoming = tagged(vec![source_effect(1, 10)], vec![Some(origin)]);
+        if case == "width" {
+            incoming.origins = Some(Vec::new());
+        }
+        assert!(
+            mpedb_mirror::apply_provenanced_batch(f.db(), &vec![7], &incoming).is_err(),
+            "{case}"
+        );
+        assert_eq!(
+            f.db()
+                .sys_record_get(state::MIR_NS, state::KEY_CUR)
+                .unwrap(),
+            None,
+            "{case}"
+        );
+        assert_eq!(rows(f.db())[0][1], Value::Int(20));
+        assert_eq!(dirty(f.db()), 1);
+    }
+}
+
+#[test]
+fn rejected_operations_do_not_become_known_source_effects() {
+    let f = Fixture::new("rejected-footprint");
+    let mut adapter = Adapter::new(Mode::Reject);
+    let stats = push_batch(f.db(), &mut adapter).unwrap();
+    assert_eq!(stats.conflicts, 1);
+    let incoming = tagged(
+        vec![source_effect(1, 99)],
+        vec![Some(own(adapter.calls()[0].id))],
+    );
+    let stats = mpedb_mirror::apply_provenanced_batch(f.db(), &vec![7], &incoming).unwrap();
+    assert_eq!((stats.echoes, stats.conflicts, stats.upserts), (0, 1, 1));
+    assert_eq!(rows(f.db())[0][1], Value::Int(99));
+}
+#[test]
+fn coalesced_effects_require_every_own_request_to_be_accounted_for() {
+    let f = Fixture::new("multiple-own");
+    let mut adapter = Adapter::new(Mode::Good);
+    push_batch(f.db(), &mut adapter).unwrap();
+    f.db()
+        .query("UPDATE t SET v=20,g=0 WHERE id=1", &[])
+        .unwrap();
+    push_batch(f.db(), &mut adapter).unwrap();
+    f.db()
+        .query("UPDATE t SET v=30,g=0 WHERE id=1", &[])
+        .unwrap();
+    let origin = mpedb_mirror::WriteOrigin {
+        file_incarnation: [7; 16],
+        request_ids: adapter.calls().iter().map(|call| call.id).collect(),
+    };
+    let incoming = tagged(vec![source_effect(1, 20)], vec![Some(origin)]);
+    let stats = mpedb_mirror::apply_provenanced_batch(f.db(), &vec![7], &incoming).unwrap();
+    assert_eq!(stats.echoes, 1);
+    assert_eq!(rows(f.db())[0][1], Value::Int(30));
+    assert_eq!(dirty(f.db()), 1);
 }

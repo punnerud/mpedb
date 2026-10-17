@@ -12,7 +12,6 @@ use mpedb_core::CaptureConfig;
 use mpedb_types::{Error, Result, TableSet};
 
 use crate::adapter::{Cursor, SourceAdapter};
-use crate::apply::apply_batch;
 use crate::push::push_batch;
 use crate::reconcile::verify;
 use crate::state::{self, Authority, MirrorState};
@@ -81,9 +80,9 @@ pub fn drain_pull<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
     let mut applied = 0u64;
     loop {
         let from = read_cur(db, adapter)?;
-        match adapter.pull(&from, PULL_BATCH)? {
+        match adapter.pull_provenanced(&from, PULL_BATCH)? {
             Some(batch) => {
-                let s = apply_batch(db, &from, &batch)?;
+                let s = crate::apply::apply_provenanced_batch(db, &from, &batch)?;
                 applied += s.upserts + s.deletes;
             }
             None => break,

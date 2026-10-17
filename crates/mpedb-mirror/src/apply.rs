@@ -39,6 +39,9 @@ pub struct ApplyStats {
     pub parked: u64,
     /// Divergences resolved (a pulled PK also had a local unpushed change).
     pub conflicts: u64,
+    /// Source-proven own effects already represented by a durable local ACK
+    /// or immutable pending request. These preserve newer local dirty intent.
+    pub echoes: u64,
 }
 
 fn now_micros() -> i64 {
@@ -69,7 +72,11 @@ fn park(s: &mut WriteSession, kind: ConflictKind, op: &NetOp, now: i64) -> Resul
         table_id: op.table_id,
         pk_keycode: kc.clone(),
     };
-    s.sys_record_put(state::MIR_NS, &state::park_key(op.table_id, &kc), &rec.encode())
+    s.sys_record_put(
+        state::MIR_NS,
+        &state::park_key(op.table_id, &kc),
+        &rec.encode(),
+    )
 }
 
 /// Roll back a FAILED per-row op — or refuse to, and say so (#162).
@@ -108,6 +115,42 @@ pub(crate) fn undo_or_abort(
 /// Apply `batch` (pulled starting from cursor `from`) to `db`. Advances
 /// `mir\0cur` to `batch.end_cursor` atomically with the row writes.
 pub fn apply_batch(db: &Database, from: &Cursor, batch: &PullBatch) -> Result<ApplyStats> {
+    apply_inner(db, from, batch, None)
+}
+/// Apply source provenance at the SAME local writer snapshot as row/cursor/
+/// dirty decisions. Capture-time filtering could race an ACK or lose knowledge
+/// after restoring an older backup, and must not replace this check.
+pub fn apply_provenanced_batch(
+    db: &Database,
+    from: &Cursor,
+    incoming: &crate::adapter::ProvenancedPullBatch,
+) -> Result<ApplyStats> {
+    if let Some(origins) = &incoming.origins {
+        if origins.len() != incoming.batch.ops.len() {
+            return Err(Error::Corrupt(
+                "source provenance/result count mismatch".into(),
+            ));
+        }
+        for origin in origins.iter().flatten() {
+            if origin.file_incarnation == [0; 16]
+                || origin.request_ids.is_empty()
+                || origin.request_ids.len() > 100_000
+                || origin.request_ids.contains(&[0; 32])
+                || origin.request_ids.iter().collect::<std::collections::BTreeSet<_>>().len()
+                    != origin.request_ids.len()
+            {
+                return Err(Error::Corrupt("invalid source write provenance".into()));
+            }
+        }
+    }
+    apply_inner(db, from, &incoming.batch, incoming.origins.as_deref())
+}
+fn apply_inner(
+    db: &Database,
+    from: &Cursor,
+    batch: &PullBatch,
+    origins: Option<&[Option<crate::adapter::WriteOrigin>]>,
+) -> Result<ApplyStats> {
     let mut s = db.begin()?;
     s.set_capture(false); // replication plane: do not self-capture (§3.8)
 
@@ -129,13 +172,18 @@ pub fn apply_batch(db: &Database, from: &Cursor, batch: &PullBatch) -> Result<Ap
             s.rollback();
             return Err(Error::Frozen { table_id: 0 });
         }
-        if batch.source_epoch.is_some_and(|source| source != epoch.epoch) {
+        if batch
+            .source_epoch
+            .is_some_and(|source| source != epoch.epoch)
+        {
             s.rollback();
             return Err(Error::Unsupported("mirror source epoch differs from local authority; recover the authority transition before applying".into()));
         }
     } else if batch.source_epoch.is_some() {
         s.rollback();
-        return Err(Error::Corrupt("source-fenced mirror batch requires local authority metadata".into()));
+        return Err(Error::Corrupt(
+            "source-fenced mirror batch requires local authority metadata".into(),
+        ));
     }
 
     let mut stats = ApplyStats::default();
@@ -147,12 +195,21 @@ pub fn apply_batch(db: &Database, from: &Cursor, batch: &PullBatch) -> Result<Ap
     //    not pushed back. Delete tombstones and existing upsert PKs (capturing
     //    the old row so a parked insert can restore the local value, §5.4 /
     //    CONF#18), which also dissolves unique swaps order-free.
+    let mut knowledge = crate::push::known::KnownRequests::default();
     let mut upserts: Vec<(usize, Option<Vec<Value>>)> = Vec::new(); // (op idx, old row)
     for (i, op) in batch.ops.iter().enumerate() {
+        if let Some(origin) = origins.and_then(|proofs| proofs[i].as_ref()) {
+            if knowledge.accounts_for(&mut s, origin, op)? {
+                stats.echoes += 1;
+                continue;
+            }
+        }
         let kc = keycode::encode_key(&op.pk);
 
         // manual-policy skip: leave this PK at its local value, don't touch it
-        if s.sys_record_get(state::MIR_NS, &state::skip_key(op.table_id, &kc))?.is_some() {
+        if s.sys_record_get(state::MIR_NS, &state::skip_key(op.table_id, &kc))?
+            .is_some()
+        {
             continue;
         }
 
@@ -261,14 +318,15 @@ mod tests {
         assert_eq!(rows(&db, "SELECT id FROM users", &[]).len(), 2);
 
         // now start tracking and make concurrent source changes
-        let mut adapter = SqliteAdapter::new(Connection::open(&src_path).unwrap(), None, &[]).unwrap();
+        let mut adapter =
+            SqliteAdapter::new(Connection::open(&src_path).unwrap(), None, &[]).unwrap();
         adapter.install_triggers().unwrap();
         adapter
             .conn()
             .execute_batch(
                 "UPDATE users SET age=31 WHERE id=1;   -- change
                  INSERT INTO users VALUES (3,'c@x',50); -- new row
-                 DELETE FROM users WHERE id=2;",        // gone
+                 DELETE FROM users WHERE id=2;", // gone
             )
             .unwrap();
 
@@ -287,7 +345,14 @@ mod tests {
                 _ => panic!(),
             })
             .collect();
-        assert_eq!({ let mut v = ids.clone(); v.sort(); v }, vec![1, 3]);
+        assert_eq!(
+            {
+                let mut v = ids.clone();
+                v.sort();
+                v
+            },
+            vec![1, 3]
+        );
         let age1 = rows(&db, "SELECT age FROM users WHERE id=$1", &[Value::Int(1)]);
         assert_eq!(age1[0][0], Value::Int(31));
 
@@ -319,8 +384,11 @@ mod tests {
         };
 
         // a LOCAL mpedb row takes the unique email 'x'
-        db.query("INSERT INTO t (id,email) VALUES ($1,$2)", &[Value::Int(10), Value::Text("x".into())])
-            .unwrap();
+        db.query(
+            "INSERT INTO t (id,email) VALUES ($1,$2)",
+            &[Value::Int(10), Value::Text("x".into())],
+        )
+        .unwrap();
 
         // the source adds a DIFFERENT PK with the same email (conflicts) plus a
         // clean row — both arrive in one pull batch
@@ -383,9 +451,13 @@ mod tests {
                 .unwrap()
                 .0
         };
-        let mut adapter = SqliteAdapter::new(Connection::open(&src_path).unwrap(), None, &[]).unwrap();
+        let mut adapter =
+            SqliteAdapter::new(Connection::open(&src_path).unwrap(), None, &[]).unwrap();
         adapter.install_triggers().unwrap();
-        adapter.conn().execute_batch("INSERT INTO t VALUES (1,1);").unwrap();
+        adapter
+            .conn()
+            .execute_batch("INSERT INTO t VALUES (1,1);")
+            .unwrap();
 
         let from = adapter.zero_cursor();
         let batch = adapter.pull(&from, 1000).unwrap().unwrap();
@@ -397,17 +469,25 @@ mod tests {
             fenced.source_epoch = Some(epoch);
             assert!(apply_batch(&db, &from, &fenced).is_err());
             assert!(rows(&db, "SELECT * FROM t", &[]).is_empty());
-            assert_eq!(db.sys_record_get(state::MIR_NS, state::KEY_CUR).unwrap(), original_cursor);
+            assert_eq!(
+                db.sys_record_get(state::MIR_NS, state::KEY_CUR).unwrap(),
+                original_cursor
+            );
         }
-        let epoch_bytes = db.sys_record_get(state::MIR_NS, state::KEY_EPOCH).unwrap().unwrap();
+        let epoch_bytes = db
+            .sys_record_get(state::MIR_NS, state::KEY_EPOCH)
+            .unwrap()
+            .unwrap();
         let mut s = db.begin().unwrap();
-        s.sys_record_delete(state::MIR_NS, state::KEY_EPOCH).unwrap();
+        s.sys_record_delete(state::MIR_NS, state::KEY_EPOCH)
+            .unwrap();
         s.commit().unwrap();
         let mut matching = batch.clone();
         matching.source_epoch = Some(1);
         assert!(apply_batch(&db, &from, &matching).is_err());
         let mut s = db.begin().unwrap();
-        s.sys_record_put(state::MIR_NS, state::KEY_EPOCH, &epoch_bytes).unwrap();
+        s.sys_record_put(state::MIR_NS, state::KEY_EPOCH, &epoch_bytes)
+            .unwrap();
         s.commit().unwrap();
         // first apply advances the cursor only with a matching source epoch
         apply_batch(&db, &from, &matching).unwrap();
