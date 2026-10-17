@@ -246,6 +246,30 @@ continuous mirroring. Native tests cover foreign commits, compound-key moves,
 whole-batch rejection, busy writers, budgets, cursor realms and old-epoch
 receipt recovery. Production outbox/echo/controller wiring remains unfinished.
 
+The shared push path now has an opt-in durable local outbox for receipt-capable
+adapters (`push_outbox_identity`). It captures typed rows, dirty generations,
+source cursor, epoch/config and scoped table hashes in the SAME local writer
+snapshot, publishes checksummed 64 KiB chunks before RPC, and retains that exact
+request after errors/cold reopen. A fresh OS-random nonce is persisted with the
+FILE incarnation: restoring an older backup cannot reuse a new request id just
+because its transaction counters and values repeat. The request is removed in
+the same transaction as the local postimage/dirty/park ACK, with an additional
+request-id guard against a stale concurrent pusher clearing a newer request.
+Local uncaptured row changes/resurrections also refuse ACK, including legacy
+adapters without returned postimages. Durability follows the database's chosen
+commit/WAL policy; this does not give `durability=none` a power-loss guarantee.
+
+Seven protocol tests cover cold replay with newer local intent, backup restore,
+corrupt/missing/oversized records, wrong FILE/epoch/config/schema, malformed
+postimages, changed chunks during RPC and concurrent ACK/new-request races.
+The native Oracle receipt fixture also loses a committed reply, cold-reopens,
+changes the local row again and verifies that retry recovers the OLD request
+before sending the new generation; its Unicode payload spans metadata chunks.
+Oracle production push remains gated until provenance/echo filtering and the
+controller are connected. The outbox retains the full coalesced dirty set in
+one source transaction; its current 64 MiB/100000-op limit refuses oversized
+requests before RPC rather than splitting key moves or silently truncating.
+
 Tokens must include a durable local FILE incarnation and dirty generation;
 a path/transaction number or payload hash alone can collide after reimport.
 Receipt images are bounded to 64 MiB per batch. This primitive never garbage

@@ -60,6 +60,9 @@ impl PullBatch {
 pub struct PushContext {
     pub epoch: Option<crate::state::Epoch>,
     pub generations: Vec<u64>,
+    /// Immutable, FILE-namespaced durable request id. A retry uses the same
+    /// snapshot even when newer local generations exist. None is legacy push.
+    pub request_id: Option<[u8; 32]>,
 }
 /// One result per operation. None preserves legacy adapters' exact-image
 /// assumption; Some supplies actual source postimages (generated columns, etc).
@@ -120,6 +123,13 @@ pub trait SourceAdapter {
         let _ = from;
         self.push(ops)
     }
+
+    /// Opt into durable local request preparation. This must be a nonzero,
+    /// persisted per-FILE incarnation, not a path/hash/transaction number.
+    /// The adapter MUST support idempotent replay by PushContext::request_id:
+    /// the source may have committed even when push_versioned returned Err.
+    /// This hook and zero_cursor are pure and must perform no source I/O.
+    fn push_outbox_identity(&self) -> Option<[u8; 16]> { None }
 
     /// Receipt-capable push boundary. `from` selects checked source-wins push;
     /// None selects local-wins. The default retains existing adapter behavior.

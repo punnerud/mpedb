@@ -10,7 +10,9 @@
 //! high-water hazard the review flagged (CONF#0/15).
 
 use mpedb::Database;
-use mpedb_core::{DirtyEntry, DirtyOp};
+mod outbox;
+mod prepare;
+use mpedb_core::DirtyEntry;
 use mpedb_types::{keycode, Error, Result};
 
 use crate::adapter::{NetOp, NetOpKind, PushContext, PushReply, SourceAdapter};
@@ -34,6 +36,22 @@ struct Pending {
     pk_keycode: Vec<u8>,
 }
 
+struct PreparedPush {
+    schema: mpedb_types::Schema,
+    epoch_bytes: Option<Vec<u8>>,
+    cursor: Option<Vec<u8>>,
+    cfg_bytes: Option<Vec<u8>>,
+    ops: Vec<NetOp>,
+    pending: Vec<Pending>,
+    outbox_tag: Option<[u8; 32]>,
+}
+fn table_hash(table: &mpedb_types::TableDef) -> [u8; 32] {
+    mpedb_types::Schema {
+        tables: vec![table.clone()],
+    }
+    .hash()
+}
+
 fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -44,49 +62,15 @@ fn now_micros() -> i64 {
 /// Push all pending local changes to the source. No-op when the dirty-set is
 /// empty.
 pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<PushStats> {
-    let schema;
-    let epoch_bytes;
-    let cursor;
-    let cfg_bytes;
-
-    // 1. scan the dirty-set + read upsert images at a brief snapshot, then drop
-    //    the writer lock before any (slow) source I/O.
-    let mut ops: Vec<NetOp> = Vec::new();
-    let mut pending: Vec<Pending> = Vec::new();
-    {
-        let mut s = db.begin()?;
-        s.set_capture(false);
-        schema = s.schema();
-        epoch_bytes = s.sys_record_get(state::MIR_NS, state::KEY_EPOCH)?;
-        cursor = s.sys_record_get(state::MIR_NS, state::KEY_CUR)?;
-        cfg_bytes = s.sys_record_get(state::MIR_NS, state::KEY_CFG)?;
-        for (subkey, val) in s.sys_record_scan_range("cdc", b"d/", b"d0")? {
-            if subkey.len() < 6 {
-                return Err(Error::Corrupt("short cdc dirty key".into()));
-            }
-            let de = DirtyEntry::decode(&val)?;
-            let table_id = u32::from_be_bytes(subkey[2..6].try_into().unwrap());
-            let tdef = schema.tables.get(table_id as usize).ok_or_else(|| {
-                Error::Corrupt(format!("dirty entry for unknown table {table_id}"))
-            })?;
-            let pk = keycode::decode_key(&de.pk_keycode, &tdef.pk_types())?;
-            let kind = match de.op {
-                DirtyOp::Upsert => match s.get_by_pk(table_id, &pk)? {
-                    Some(row) => NetOpKind::Upsert(row),
-                    None => NetOpKind::Delete, // dirtied upsert but row is gone now
-                },
-                DirtyOp::Delete => NetOpKind::Delete,
-            };
-            ops.push(NetOp { table_id, pk, kind });
-            pending.push(Pending {
-                subkey,
-                last_txn: de.last_txn,
-                table_id,
-                pk_keycode: de.pk_keycode,
-            });
-        }
-        s.rollback(); // read-only; releases the lock
-    }
+    let PreparedPush {
+        schema,
+        epoch_bytes,
+        cursor,
+        cfg_bytes,
+        ops,
+        pending,
+        outbox_tag,
+    } = prepare::prepare(db, adapter)?;
     if ops.is_empty() {
         return Ok(PushStats::default());
     }
@@ -105,6 +89,7 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
     let context = PushContext {
         epoch,
         generations: pending.iter().map(|p| p.last_txn).collect(),
+        request_id: outbox_tag,
     };
     let reply = adapter.push_versioned(from.as_ref(), &ops, &context)?;
     validate_reply(&schema, &ops, &reply)?;
@@ -125,6 +110,9 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
             || s.sys_record_get(state::MIR_NS, state::KEY_CFG)? != cfg_bytes
         {
             return Err(Error::Unsupported("mirror authority/config changed during push; retain dirty entries and recover before acknowledging".into()));
+        }
+        if let Some(tag) = outbox_tag {
+            outbox::validate_tag(&mut s, tag)?;
         }
         let current_schema = s.schema();
         let used = pending
@@ -167,14 +155,22 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
                     NetOpKind::Delete => stats.deletes += 1,
                 }
                 if same_generation {
+                    let current = s.get_by_pk(op.table_id, &op.pk)?;
+                    match &op.kind {
+                        NetOpKind::Upsert(original)
+                            if !current
+                                .as_ref()
+                                .is_some_and(|row| same_values(row, original)) =>
+                        {
+                            return Err(Error::Unsupported("mirror row changed without a dirty-generation update; acknowledgement refused".into()));
+                        }
+                        NetOpKind::Delete if current.is_some() => {
+                            return Err(Error::Unsupported("mirror deleted row reappeared without a dirty-generation update; acknowledgement refused".into()));
+                        }
+                        _ => {}
+                    }
                     if let Some(images) = &reply.postimages {
                         if let Some(values) = &images[i] {
-                            let current = s.get_by_pk(op.table_id, &op.pk)?;
-                            if let NetOpKind::Upsert(original) = &op.kind {
-                                if !current.as_ref().is_some_and(|v| same_values(v, original)) {
-                                    return Err(Error::Unsupported("mirror row changed without a dirty-generation update; postimage acknowledgement refused".into()));
-                                }
-                            }
                             if !s.update_by_pk(op.table_id, values)? {
                                 return Err(Error::Corrupt(
                                     "acknowledged mirror row disappeared".into(),
@@ -205,6 +201,9 @@ pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> 
                     &rec.encode(),
                 )?;
             }
+        }
+        if let Some(tag) = outbox_tag {
+            outbox::clear(&mut s, tag)?;
         }
         s.commit()?;
     }

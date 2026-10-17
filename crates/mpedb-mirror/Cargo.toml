@@ -17,6 +17,8 @@ xxhash-rust = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
+# Fresh persisted request nonces prevent id reuse after restoring an old backup.
+getrandom = "0.4"
 # Source adapters: sqlite via rusqlite (bundled 3.45, proven in mpedb-bench),
 # PostgreSQL via the sync postgres client.
 rusqlite = { version = "0.31", features = ["bundled"] }

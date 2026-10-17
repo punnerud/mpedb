@@ -12,6 +12,7 @@ struct PostimageTransport<'a> {
     metadata: &'a mpedb_mirror::OracleBootstrap,
     ledger: &'a mpedb_mirror::oracle_source::OracleLedgerIdentity,
     file_incarnation: [u8; 16],
+    lose_reply_once: bool,
 }
 impl mpedb_mirror::SourceAdapter for PostimageTransport<'_> {
     fn pull(
@@ -42,6 +43,9 @@ impl mpedb_mirror::SourceAdapter for PostimageTransport<'_> {
     fn cas_source_state(&mut self, _: &str, _: u64, _: u64, _: &str) -> mpedb_types::Result<bool> {
         unreachable!()
     }
+    fn push_outbox_identity(&self) -> Option<[u8; 16]> {
+        Some(self.file_incarnation)
+    }
     fn push_versioned(
         &mut self,
         from: Option<&Vec<u8>>,
@@ -52,20 +56,11 @@ impl mpedb_mirror::SourceAdapter for PostimageTransport<'_> {
         assert_eq!(context.generations.len(), ops.len());
         let epoch = context.epoch.unwrap();
         assert_eq!(epoch.authority, mpedb_mirror::Authority::Source);
-        let mut h = blake3::Hasher::new();
-        h.update(b"native Oracle postimage ACK fixture");
-        h.update(&self.file_incarnation);
-        h.update(&epoch.epoch.to_be_bytes());
-        for (op, generation) in ops.iter().zip(&context.generations) {
-            h.update(&op.table_id.to_be_bytes());
-            h.update(&generation.to_be_bytes());
-            let key = mpedb_types::keycode::encode_key_exact(&op.pk);
-            h.update(&(key.len() as u64).to_be_bytes());
-            h.update(&key);
-        }
         let request = OracleWriteRequest {
             mirror_id: &self.metadata.mirror_id,
-            token: *h.finalize().as_bytes(),
+            token: context
+                .request_id
+                .expect("durable request must precede Oracle I/O"),
             epoch: epoch.epoch,
             authority: "source",
             state_identity: &self.metadata.state_identity,
@@ -74,6 +69,12 @@ impl mpedb_mirror::SourceAdapter for PostimageTransport<'_> {
         let images = self
             .source
             .write_batch_receipted(self.tables, ops, &request)?;
+        if self.lose_reply_once {
+            self.lose_reply_once = false;
+            return Err(mpedb_types::Error::Unsupported(
+                "injected lost Oracle commit response".into(),
+            ));
+        }
         Ok(mpedb_mirror::PushReply {
             applied: vec![true; ops.len()],
             postimages: Some(images),
@@ -362,23 +363,68 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
     let metadata = mpedb_mirror::load_oracle_bootstrap(&db).unwrap();
     let nonce = mpedb_mirror::oracle_import::load_file_incarnation(&db).unwrap();
     db.query(
-        "UPDATE \"MPEDB_RECEIPT_CASE\" SET \"GENERATED_VALUE\"=$1 WHERE \"ID\"=$2",
-        &[Value::Numeric("0".into()), Value::Numeric("3".into())],
+        "UPDATE \"MPEDB_RECEIPT_CASE\" SET \"GENERATED_VALUE\"=$1, \"TEXT_VALUE\"=$3 WHERE \"ID\"=$2",
+        &[Value::Numeric("0".into()), Value::Numeric("3".into()), Value::Text("ø🙂漢".repeat(12000))],
     )
     .unwrap();
-    let mut transport = PostimageTransport {
-        source: &mut source,
-        tables: &tables,
-        metadata: &metadata,
-        ledger: &ledger,
-        file_incarnation: nonce,
-    };
-    assert_eq!(
-        mpedb_mirror::push_batch(&db, &mut transport)
-            .unwrap()
-            .upserts,
-        1
-    );
+    {
+        let mut transport = PostimageTransport {
+            source: &mut source,
+            tables: &tables,
+            metadata: &metadata,
+            ledger: &ledger,
+            file_incarnation: nonce,
+            lose_reply_once: true,
+        };
+        assert!(mpedb_mirror::push_batch(&db, &mut transport)
+            .unwrap_err()
+            .to_string()
+            .contains("lost Oracle commit response"));
+    }
+    assert!(db
+        .sys_record_get(mpedb_mirror::state::MIR_NS, b"push/outbox")
+        .unwrap()
+        .is_some());
+    assert!(db
+        .sys_record_get(mpedb_mirror::state::MIR_NS, b"push/outbox/00000001")
+        .unwrap()
+        .is_some());
+    drop(db);
+    drop(source);
+    let db = mpedb::Database::open_from_file(&dest).unwrap();
+    let mut source = OracleSource::connect(&spec).unwrap();
+    // A newer local generation must survive recovery of the OLD committed
+    // request, and receive its own request id on the following push.
+    db.query(
+        "UPDATE MPEDB_RECEIPT_CASE SET AMOUNT=$1 WHERE ID=$2",
+        &[Value::Numeric("6.6".into()), Value::Numeric("3".into())],
+    )
+    .unwrap();
+    {
+        let mut transport = PostimageTransport {
+            source: &mut source,
+            tables: &tables,
+            metadata: &metadata,
+            ledger: &ledger,
+            file_incarnation: nonce,
+            lose_reply_once: false,
+        };
+        assert_eq!(
+            mpedb_mirror::push_batch(&db, &mut transport)
+                .unwrap()
+                .upserts,
+            1
+        );
+        assert!(
+            matches!(db.query("SELECT AMOUNT,GENERATED_VALUE FROM MPEDB_RECEIPT_CASE WHERE ID=$1", &[Value::Numeric("3".into())]).unwrap(),mpedb::ExecResult::Rows {rows,..} if rows==vec![vec![Value::Numeric("6.6".into()),Value::Numeric("0".into())]])
+        );
+        assert_eq!(
+            mpedb_mirror::push_batch(&db, &mut transport)
+                .unwrap()
+                .upserts,
+            1
+        );
+    }
     assert!(
         matches!(db.query("SELECT \"GENERATED_VALUE\" FROM \"MPEDB_RECEIPT_CASE\" WHERE \"ID\"=$1",&[Value::Numeric("3".into())]).unwrap(),mpedb::ExecResult::Rows {rows,..} if rows==vec![vec![Value::Numeric("4".into())]])
     );
