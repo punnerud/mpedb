@@ -44,9 +44,11 @@
 //! rows. `CursorAttr` reads `%ISOPEN`, `%FOUND`, `%NOTFOUND`, or
 //! `%ROWCOUNT`. `%FOUND` and `%NOTFOUND` are NULL until FETCH; a cursor
 //! that is not open makes `%ISOPEN` false and raises INVALID_CURSOR for
-//! the other three. `CursorRow` pushes the current row as a tuple. Handles
-//! are runtime
-//! values with slot+generation identity; the runtime bounds live cursors
+//! the other three. `SqlAttr` is the implicit `SQL%` cursor: no handle,
+//! `%ISOPEN` always false, and the other three NULL until a SELECT INTO
+//! or DML runs. An explicit cursor does not update it. `CursorRow` pushes
+//! the current row as a tuple. Handles are runtime values with
+//! slot+generation identity; the runtime bounds live cursors
 //! (see `interp::MAX_CURSORS`) and rejects stale handles. **v1 rule:**
 //! cursors are allowed only in read-only procedures — a program containing
 //! both `CursorOpen` and `DbExec` fails validation, so the question of a
@@ -259,6 +261,10 @@ pub enum Op {
     /// Pop a cursor handle or NULL and push `%ISOPEN` (0), `%FOUND` (1),
     /// `%NOTFOUND` (2), or `%ROWCOUNT` (3).
     CursorAttr(u8),
+    /// Push one implicit `SQL%` attribute. Same selectors as `CursorAttr`,
+    /// and no handle: `%ISOPEN` is always false, and the other three stay
+    /// NULL until a SELECT INTO or DML has run.
+    SqlAttr(u8),
     /// Pop a cursor handle, push its current row as a tuple.
     CursorRow,
     /// Pop the return value and finish the procedure.
@@ -373,6 +379,8 @@ const OP_CURSOR_CLOSE: u8 = 97;
 const OP_CURSOR_ATTR: u8 = 98;
 // Scalar RETURNING INTO. Additive: `DbExec` still pushes an affected count.
 const OP_DB_RETURNING: u8 = 99;
+// Implicit SQL% attributes. Additive: `CursorAttr` still pops a handle.
+const OP_SQL_ATTR: u8 = 100;
 
 /// `Op::CursorAttr` selector. Any other byte fails validation.
 pub const CURSOR_ATTR_ISOPEN: u8 = 0;
@@ -711,6 +719,10 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
             b.push(OP_CURSOR_ATTR);
             b.push(code);
         }
+        Op::SqlAttr(code) => {
+            b.push(OP_SQL_ATTR);
+            b.push(code);
+        }
         Op::CursorRow => b.push(OP_CURSOR_ROW),
         Op::Return => b.push(OP_RETURN),
     }
@@ -853,6 +865,11 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
             *pos += 1;
             Op::CursorAttr(code)
         }
+        OP_SQL_ATTR => {
+            let code = *buf.get(*pos).ok_or_else(err)?;
+            *pos += 1;
+            Op::SqlAttr(code)
+        }
         OP_CURSOR_ROW => Op::CursorRow,
         OP_RETURN => Op::Return,
         other => return Err(Error::Corrupt(format!("proc: invalid opcode {other}"))),
@@ -866,7 +883,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::OracleTry { .. } | Op::OracleReraise | Op::OracleRaise(_) | Op::OracleRaiseUser(_) | Op::OracleRaiseBound(_) => (0, 0),
         Op::OracleExceptionCode | Op::OracleSqlCode | Op::OracleSqlErrm | Op::OracleMatchUser(_) => (0, 1),
         Op::OracleRaiseApplication => (2, 0),
-        Op::LoadConst(_) | Op::LoadLocal(_) => (0, 1),
+        Op::LoadConst(_) | Op::LoadLocal(_) | Op::SqlAttr(_) => (0, 1),
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
@@ -1000,7 +1017,7 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
                     "proc: RETURNING over a non-Exec plan".into(),
                 ));
             }
-            Op::CursorAttr(code) if code > CURSOR_ATTR_ROWCOUNT => {
+            Op::CursorAttr(code) | Op::SqlAttr(code) if code > CURSOR_ATTR_ROWCOUNT => {
                 return Err(Error::Corrupt("proc: invalid cursor attribute".into()));
             }
             Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) if t as usize >= n => {
@@ -1431,6 +1448,23 @@ mod tests {
             vec![],
         )
         .is_ok());
+        let mut implicit = Vec::new();
+        encode_op(&mut implicit, Op::SqlAttr(CURSOR_ATTR_ROWCOUNT));
+        assert_eq!(implicit, vec![100, CURSOR_ATTR_ROWCOUNT]);
+        assert!(decode_op(&implicit[..1], &mut 0).is_err());
+        assert!(mk(vec![Op::SqlAttr(4), Op::Return], vec![], vec![]).is_err());
+        let implicit_proc = mk(
+            vec![Op::SqlAttr(CURSOR_ATTR_ISOPEN), Op::Return],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert!(!implicit_proc.has_exec());
+        assert!(!implicit_proc.has_db_ops());
+        assert_eq!(
+            Proc::decode(&implicit_proc.encode()).unwrap().instrs,
+            implicit_proc.instrs
+        );
         let fetched = mk(
             vec![
                 Op::CursorOpen(0),

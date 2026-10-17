@@ -372,9 +372,6 @@ impl Parser<'_> {
     }
 
     pub(super) fn cursor_attribute(&mut self, name: &str) -> Result<Option<Type>> {
-        let cursor = self.cursors.get(name).cloned().ok_or_else(|| {
-            self.error("cursor attributes require an explicit cursor")
-        })?;
         let attr = self.identifier()?;
         let (code, ty) = match attr.as_str() {
             "ISOPEN" => (crate::ir::CURSOR_ATTR_ISOPEN, Type::Boolean),
@@ -383,6 +380,15 @@ impl Parser<'_> {
             "ROWCOUNT" => (crate::ir::CURSOR_ATTR_ROWCOUNT, Type::PlsInteger),
             _ => return Err(self.error(&format!("unknown cursor attribute {attr}"))),
         };
+        // Oracle reserves SQL for the implicit cursor, even when a cursor
+        // declaration uses that name.
+        if name == "SQL" {
+            self.builder.emit(Op::SqlAttr(code))?;
+            return Ok(Some(ty));
+        }
+        let cursor = self.cursors.get(name).cloned().ok_or_else(|| {
+            self.error("cursor attributes require an explicit cursor")
+        })?;
         self.builder.emit(Op::LoadLocal(cursor.slot))?;
         self.builder.emit(Op::CursorAttr(code))?;
         Ok(Some(ty))
@@ -512,6 +518,63 @@ mod tests {
             },
         )
         .unwrap()
+        {
+            ProcValue::Scalar(value) => value,
+            other => panic!("{other:?}"),
+        };
+        (value, bridge, proc)
+    }
+
+    /// Like [`execute`], but the body may be DML or SELECT INTO and need not
+    /// open a cursor. `affected` is the canned `DbExec` count. `returning`
+    /// is the canned `DbReturning` row list.
+    fn scene(
+        returns: &str,
+        body: &str,
+        rows: Vec<Vec<Value>>,
+        affected: u64,
+        returning: Option<Vec<Vec<Value>>>,
+    ) -> (Value, MockBridge, Proc) {
+        let source = format!("CREATE FUNCTION f RETURN {returns} IS {body}");
+        let skel = compile(&source).unwrap_or_else(|err| panic!("{err}"));
+        let plans = skel
+            .calls
+            .iter()
+            .map(|call| PlanRef {
+                hash: PlanHash([0; 32]),
+                kind: if call.kind == CallKind::Exec {
+                    PlanKind::Exec
+                } else {
+                    PlanKind::Query
+                },
+                argc: call.argc,
+            })
+            .collect();
+        let proc = Proc::new(
+            skel.name,
+            skel.argc,
+            skel.nlocals,
+            plans,
+            skel.consts,
+            skel.instrs,
+        )
+        .unwrap();
+        let proc = Proc::decode(&proc.encode()).unwrap();
+        let mut bridge = MockBridge::new();
+        bridge.rows = rows;
+        bridge.affected = affected;
+        bridge.returning_rows = returning;
+        let value = match interp::run(
+            &proc,
+            &[],
+            &mut bridge,
+            Budget {
+                instrs: 10_000,
+                db_calls: 8,
+                rows: 100,
+            },
+        )
+        .unwrap_or_else(|err| panic!("{err}"))
         {
             ProcValue::Scalar(value) => value,
             other => panic!("{other:?}"),
@@ -721,18 +784,17 @@ mod tests {
             assert_eq!(text, Value::Text(invalid.into()), "{attr}");
         }
 
-        for source in [
+        let err = compile(
             "CREATE FUNCTION f RETURN BOOLEAN IS CURSOR c IS SELECT amount FROM dual; BEGIN RETURN c%ROWTYPE; END;",
-            "CREATE FUNCTION f RETURN BOOLEAN IS CURSOR c IS SELECT amount FROM dual; BEGIN RETURN SQL%FOUND; END;",
-        ] {
-            let err = compile(source).unwrap_err().to_string();
-            assert!(err.contains("PL/SQL at "), "{err}");
-            assert!(
-                err.contains("unknown cursor attribute")
-                    || err.contains("cursor attributes require an explicit cursor"),
-                "{err}"
-            );
-        }
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("PL/SQL at "), "{err}");
+        assert!(
+            err.contains("unknown cursor attribute")
+                || err.contains("cursor attributes require an explicit cursor"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -888,6 +950,270 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("PL/SQL at "), "{needle}: {err}");
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn implicit_sql_attributes_follow_oracle_null_logic() {
+        let (found, _, proc) = scene("BOOLEAN", "BEGIN RETURN SQL%FOUND; END;", vec![], 0, None);
+        assert!(proc.instrs.contains(&Op::SqlAttr(crate::ir::CURSOR_ATTR_FOUND)));
+        assert!(!proc.instrs.iter().any(|op| matches!(op, Op::CursorAttr(_))));
+        assert!(!proc.has_exec());
+        assert_eq!(found, Value::Null);
+        let (notfound, _, _) = scene("BOOLEAN", "BEGIN RETURN SQL%NOTFOUND; END;", vec![], 0, None);
+        assert_eq!(notfound, Value::Null);
+        let (count, _, _) = scene("PLS_INTEGER", "BEGIN RETURN SQL%ROWCOUNT; END;", vec![], 0, None);
+        assert_eq!(count, Value::Null);
+        let (open, _, proc) = scene("BOOLEAN", "BEGIN RETURN SQL%ISOPEN; END;", vec![], 0, None);
+        assert!(proc.instrs.contains(&Op::SqlAttr(crate::ir::CURSOR_ATTR_ISOPEN)));
+        assert_eq!(open, Value::Bool(false));
+
+        let (found, _, _) = scene(
+            "BOOLEAN",
+            "BEGIN UPDATE t SET amount = 1; RETURN SQL%FOUND; END;",
+            vec![],
+            4,
+            None,
+        );
+        assert_eq!(found, Value::Bool(true));
+        let (notfound, _, _) = scene(
+            "BOOLEAN",
+            "BEGIN UPDATE t SET amount = 1; RETURN SQL%NOTFOUND; END;",
+            vec![],
+            4,
+            None,
+        );
+        assert_eq!(notfound, Value::Bool(false));
+        let (count, _, _) = scene(
+            "PLS_INTEGER",
+            "BEGIN UPDATE t SET amount = 1; RETURN SQL%ROWCOUNT; END;",
+            vec![],
+            4,
+            None,
+        );
+        assert_eq!(count, Value::Int(4));
+        let (open, _, _) = scene(
+            "BOOLEAN",
+            "BEGIN UPDATE t SET amount = 1; RETURN SQL%ISOPEN; END;",
+            vec![],
+            4,
+            None,
+        );
+        assert_eq!(open, Value::Bool(false));
+
+        let (found, _, _) = scene(
+            "BOOLEAN",
+            "BEGIN UPDATE t SET amount = 1; RETURN SQL%FOUND; END;",
+            vec![],
+            0,
+            None,
+        );
+        assert_eq!(found, Value::Bool(false));
+        let (notfound, _, _) = scene(
+            "BOOLEAN",
+            "BEGIN UPDATE t SET amount = 1; RETURN SQL%NOTFOUND; END;",
+            vec![],
+            0,
+            None,
+        );
+        assert_eq!(notfound, Value::Bool(true));
+        let (count, _, _) = scene(
+            "PLS_INTEGER",
+            "BEGIN UPDATE t SET amount = 1; RETURN SQL%ROWCOUNT; END;",
+            vec![],
+            0,
+            None,
+        );
+        assert_eq!(count, Value::Int(0));
+
+        let null_row = vec![vec![Value::Null]];
+        let (assigned, _, _) = scene(
+            "NUMBER",
+            "v NUMBER := 7; BEGIN SELECT amount INTO v FROM dual; RETURN v; END;",
+            null_row.clone(),
+            0,
+            None,
+        );
+        assert_eq!(assigned, Value::Null);
+        let (found, _, _) = scene(
+            "BOOLEAN",
+            "v NUMBER := 7; BEGIN SELECT amount INTO v FROM dual; RETURN SQL%FOUND; END;",
+            null_row.clone(),
+            0,
+            None,
+        );
+        assert_eq!(found, Value::Bool(true));
+        let (notfound, _, _) = scene(
+            "BOOLEAN",
+            "v NUMBER := 7; BEGIN SELECT amount INTO v FROM dual; RETURN SQL%NOTFOUND; END;",
+            null_row.clone(),
+            0,
+            None,
+        );
+        assert_eq!(notfound, Value::Bool(false));
+        let (count, _, _) = scene(
+            "PLS_INTEGER",
+            "v NUMBER := 7; BEGIN SELECT amount INTO v FROM dual; RETURN SQL%ROWCOUNT; END;",
+            null_row,
+            0,
+            None,
+        );
+        assert_eq!(count, Value::Int(1));
+
+        let miss = "v NUMBER := 7; BEGIN BEGIN SELECT amount INTO v FROM dual; RETURN 0; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN v; END; END;";
+        let (kept, _, _) = scene("NUMBER", miss, vec![], 0, None);
+        assert_eq!(kept, Value::Numeric("7".into()));
+        let miss_found = "v NUMBER := 7; BEGIN BEGIN SELECT amount INTO v FROM dual; RETURN TRUE; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN SQL%FOUND; END; END;";
+        let (found, _, _) = scene("BOOLEAN", miss_found, vec![], 0, None);
+        assert_eq!(found, Value::Bool(false));
+        let miss_not = "v NUMBER := 7; BEGIN BEGIN SELECT amount INTO v FROM dual; RETURN FALSE; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN SQL%NOTFOUND; END; END;";
+        let (notfound, _, _) = scene("BOOLEAN", miss_not, vec![], 0, None);
+        assert_eq!(notfound, Value::Bool(true));
+        let miss_count = "v NUMBER := 7; BEGIN BEGIN SELECT amount INTO v FROM dual; RETURN -1; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN SQL%ROWCOUNT; END; END;";
+        let (count, _, _) = scene("PLS_INTEGER", miss_count, vec![], 0, None);
+        assert_eq!(count, Value::Int(0));
+
+        let many = vec![vec![Value::Numeric("4".into())], vec![Value::Numeric("9".into())]];
+        let too_many = "v NUMBER := 7; BEGIN BEGIN SELECT amount INTO v FROM dual; RETURN 0; EXCEPTION WHEN TOO_MANY_ROWS THEN RETURN v; END; END;";
+        let (kept, _, _) = scene("NUMBER", too_many, many.clone(), 0, None);
+        assert_eq!(kept, Value::Numeric("7".into()));
+        let too_many_found = "v NUMBER := 7; BEGIN BEGIN SELECT amount INTO v FROM dual; RETURN FALSE; EXCEPTION WHEN TOO_MANY_ROWS THEN RETURN SQL%FOUND; END; END;";
+        let (found, _, _) = scene("BOOLEAN", too_many_found, many.clone(), 0, None);
+        assert_eq!(found, Value::Bool(true));
+        let too_many_not = "v NUMBER := 7; BEGIN BEGIN SELECT amount INTO v FROM dual; RETURN TRUE; EXCEPTION WHEN TOO_MANY_ROWS THEN RETURN SQL%NOTFOUND; END; END;";
+        let (notfound, _, _) = scene("BOOLEAN", too_many_not, many.clone(), 0, None);
+        assert_eq!(notfound, Value::Bool(false));
+        let too_many_count = "v NUMBER := 7; BEGIN BEGIN SELECT amount INTO v FROM dual; RETURN -1; EXCEPTION WHEN TOO_MANY_ROWS THEN RETURN SQL%ROWCOUNT; END; END;";
+        let (count, _, _) = scene("PLS_INTEGER", too_many_count, many, 0, None);
+        assert_eq!(count, Value::Int(1));
+
+        let replaced = "v NUMBER := 7; BEGIN SELECT amount INTO v FROM dual; UPDATE t SET amount = 1; RETURN SQL%ROWCOUNT; END;";
+        let (count, _, _) = scene(
+            "PLS_INTEGER",
+            replaced,
+            vec![vec![Value::Null]],
+            0,
+            None,
+        );
+        assert_eq!(count, Value::Int(0));
+        let replaced_not = "v NUMBER := 7; BEGIN SELECT amount INTO v FROM dual; UPDATE t SET amount = 1; RETURN SQL%NOTFOUND; END;";
+        let (notfound, _, _) = scene(
+            "BOOLEAN",
+            replaced_not,
+            vec![vec![Value::Null]],
+            0,
+            None,
+        );
+        assert_eq!(notfound, Value::Bool(true));
+
+        let row = vec![vec![Value::Numeric("4".into())]];
+        let opened = "CURSOR c IS SELECT amount FROM dual; v NUMBER; BEGIN SELECT amount INTO v FROM dual; OPEN c; RETURN SQL%FOUND; END;";
+        let (found, bridge, _) = scene("BOOLEAN", opened, row.clone(), 0, None);
+        assert_eq!(found, Value::Bool(true));
+        assert_eq!(bridge.cursor_opens, 1);
+        assert_eq!(bridge.advances, 0);
+        let opened_count = "CURSOR c IS SELECT amount FROM dual; v NUMBER; BEGIN SELECT amount INTO v FROM dual; OPEN c; RETURN SQL%ROWCOUNT; END;";
+        let (count, _, _) = scene("PLS_INTEGER", opened_count, row.clone(), 0, None);
+        assert_eq!(count, Value::Int(1));
+        let cursor_count = "CURSOR c IS SELECT amount FROM dual; v NUMBER; BEGIN SELECT amount INTO v FROM dual; OPEN c; RETURN c%ROWCOUNT; END;";
+        let (count, _, _) = scene("PLS_INTEGER", cursor_count, row.clone(), 0, None);
+        assert_eq!(count, Value::Int(0));
+        let implicit_open = "CURSOR c IS SELECT amount FROM dual; v NUMBER; BEGIN SELECT amount INTO v FROM dual; OPEN c; RETURN SQL%ISOPEN; END;";
+        let (open, _, _) = scene("BOOLEAN", implicit_open, row.clone(), 0, None);
+        assert_eq!(open, Value::Bool(false));
+        let explicit_open = "CURSOR c IS SELECT amount FROM dual; v NUMBER; BEGIN SELECT amount INTO v FROM dual; OPEN c; RETURN c%ISOPEN; END;";
+        let (open, _, _) = scene("BOOLEAN", explicit_open, row.clone(), 0, None);
+        assert_eq!(open, Value::Bool(true));
+        let after_fetch = "CURSOR c IS SELECT amount FROM dual; v NUMBER; BEGIN SELECT amount INTO v FROM dual; OPEN c; FETCH c INTO v; FETCH c INTO v; RETURN SQL%FOUND; END;";
+        let (found, bridge, _) = scene("BOOLEAN", after_fetch, row.clone(), 0, None);
+        assert_eq!(found, Value::Bool(true));
+        assert_eq!(bridge.advances, 2);
+        let after_count = "CURSOR c IS SELECT amount FROM dual; v NUMBER; BEGIN SELECT amount INTO v FROM dual; OPEN c; FETCH c INTO v; FETCH c INTO v; RETURN SQL%ROWCOUNT; END;";
+        let (count, _, _) = scene("PLS_INTEGER", after_count, row.clone(), 0, None);
+        assert_eq!(count, Value::Int(1));
+        let cursor_found = "CURSOR c IS SELECT amount FROM dual; v NUMBER; BEGIN SELECT amount INTO v FROM dual; OPEN c; FETCH c INTO v; FETCH c INTO v; RETURN c%FOUND; END;";
+        let (found, bridge, _) = scene("BOOLEAN", cursor_found, row, 0, None);
+        assert_eq!(found, Value::Bool(false));
+        assert_eq!(bridge.advances, 2);
+
+        let named = "CURSOR sql IS SELECT amount FROM dual; BEGIN OPEN sql; RETURN SQL%ISOPEN; END;";
+        let (open, bridge, proc) = scene("BOOLEAN", named, vec![], 0, None);
+        assert_eq!(open, Value::Bool(false));
+        assert_eq!(bridge.cursor_opens, 1);
+        assert!(proc.instrs.contains(&Op::SqlAttr(crate::ir::CURSOR_ATTR_ISOPEN)));
+        assert!(proc.instrs.iter().any(|op| matches!(op, Op::CursorOpen(_))));
+
+        let returning_null = "v NUMBER := 7; incoming VARCHAR2(20); BEGIN EXECUTE IMMEDIATE 'UPDATE t SET note = :1 WHERE id = :2 RETURNING note INTO :3' USING incoming, 1, OUT v; RETURN v; END;";
+        let (assigned, bridge, _) = scene(
+            "NUMBER",
+            returning_null,
+            vec![],
+            0,
+            Some(vec![vec![Value::Null]]),
+        );
+        assert_eq!(assigned, Value::Null);
+        assert_eq!(bridge.execs, 1);
+        assert_eq!(bridge.exec_params, vec![vec![Value::Null, Value::Int(1)]]);
+        let returning_count = "v NUMBER := 7; incoming VARCHAR2(20); BEGIN EXECUTE IMMEDIATE 'UPDATE t SET note = :1 WHERE id = :2 RETURNING note INTO :3' USING incoming, 1, OUT v; RETURN SQL%ROWCOUNT; END;";
+        let (count, _, _) = scene(
+            "PLS_INTEGER",
+            returning_count,
+            vec![],
+            0,
+            Some(vec![vec![Value::Null]]),
+        );
+        assert_eq!(count, Value::Int(1));
+        let returning_found = "v NUMBER := 7; incoming VARCHAR2(20); BEGIN EXECUTE IMMEDIATE 'UPDATE t SET note = :1 WHERE id = :2 RETURNING note INTO :3' USING incoming, 1, OUT v; RETURN SQL%FOUND; END;";
+        let (found, _, _) = scene(
+            "BOOLEAN",
+            returning_found,
+            vec![],
+            0,
+            Some(vec![vec![Value::Null]]),
+        );
+        assert_eq!(found, Value::Bool(true));
+
+        let returning_miss = "v NUMBER := 7; BEGIN BEGIN EXECUTE IMMEDIATE 'UPDATE t SET amount = 9 WHERE id = :1 RETURNING amount INTO :2' USING 99, OUT v; RETURN 0; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN v; END; END;";
+        let (kept, _, _) = scene("NUMBER", returning_miss, vec![], 0, Some(vec![]));
+        assert_eq!(kept, Value::Numeric("7".into()));
+        let returning_miss_count = "v NUMBER := 7; BEGIN BEGIN EXECUTE IMMEDIATE 'UPDATE t SET amount = 9 WHERE id = :1 RETURNING amount INTO :2' USING 99, OUT v; RETURN -1; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN SQL%ROWCOUNT; END; END;";
+        let (count, _, _) = scene("PLS_INTEGER", returning_miss_count, vec![], 0, Some(vec![]));
+        assert_eq!(count, Value::Int(0));
+        let returning_miss_not = "v NUMBER := 7; BEGIN BEGIN EXECUTE IMMEDIATE 'UPDATE t SET amount = 9 WHERE id = :1 RETURNING amount INTO :2' USING 99, OUT v; RETURN FALSE; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN SQL%NOTFOUND; END; END;";
+        let (notfound, _, _) = scene("BOOLEAN", returning_miss_not, vec![], 0, Some(vec![]));
+        assert_eq!(notfound, Value::Bool(true));
+
+        let many_rows = Some(vec![
+            vec![Value::Numeric("4".into())],
+            vec![Value::Numeric("9".into())],
+        ]);
+        let returning_many = "v NUMBER := 7; BEGIN BEGIN EXECUTE IMMEDIATE 'UPDATE t SET amount = amount + 1 RETURNING amount INTO :1' USING OUT v; RETURN 0; EXCEPTION WHEN TOO_MANY_ROWS THEN RETURN v; END; END;";
+        let (kept, _, _) = scene("NUMBER", returning_many, vec![], 0, many_rows.clone());
+        assert_eq!(kept, Value::Numeric("7".into()));
+        let returning_many_count = "v NUMBER := 7; BEGIN BEGIN EXECUTE IMMEDIATE 'UPDATE t SET amount = amount + 1 RETURNING amount INTO :1' USING OUT v; RETURN -1; EXCEPTION WHEN TOO_MANY_ROWS THEN RETURN SQL%ROWCOUNT; END; END;";
+        let (count, _, _) = scene("PLS_INTEGER", returning_many_count, vec![], 0, many_rows.clone());
+        assert_eq!(count, Value::Int(1));
+        let returning_many_found = "v NUMBER := 7; BEGIN BEGIN EXECUTE IMMEDIATE 'UPDATE t SET amount = amount + 1 RETURNING amount INTO :1' USING OUT v; RETURN FALSE; EXCEPTION WHEN TOO_MANY_ROWS THEN RETURN SQL%FOUND; END; END;";
+        let (found, _, _) = scene("BOOLEAN", returning_many_found, vec![], 0, many_rows);
+        assert_eq!(found, Value::Bool(true));
+
+        for (source, needle) in [
+            (
+                "CREATE FUNCTION f RETURN BOOLEAN IS BEGIN RETURN SQL%ROWTYPE; END;",
+                "unknown cursor attribute",
+            ),
+            (
+                "CREATE FUNCTION f RETURN BOOLEAN IS BEGIN RETURN SQL%BULK_ROWCOUNT; END;",
+                "unknown cursor attribute",
+            ),
+            (
+                "CREATE FUNCTION f RETURN BOOLEAN IS BEGIN RETURN missing%FOUND; END;",
+                "cursor attributes require an explicit cursor",
+            ),
+        ] {
+            let err = compile(source).unwrap_err().to_string();
+            assert!(err.contains("PL/SQL at "), "{err}");
             assert!(err.contains(needle), "{needle}: {err}");
         }
     }

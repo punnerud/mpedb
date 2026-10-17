@@ -509,6 +509,10 @@ pub fn run(
     let mut dbargs: Vec<Value> = Vec::new();
     // Grown on demand, bounded by MAX_CURSORS.
     let mut cursors: Vec<CurSlot> = Vec::new();
+    // Implicit SQL% cursor. None until a SELECT INTO or DML completes.
+    // Explicit OPEN/FETCH/CLOSE do not write it, and a caught error leaves
+    // it in place so the handler can read the statement that raised.
+    let mut implicit_sql: Option<(bool, i64)> = None;
     let mut instrs_left = budget.instrs;
     let mut db_left = budget.db_calls;
     let mut rows_left = budget.rows;
@@ -622,14 +626,22 @@ pub fn run(
                     return Err(type_err("PL/SQL INTO requires a query row set"));
                 };
                 match rows.len() {
-                    0 => return Err(Error::Oracle { code: 1403, message: "no data found".into() }),
+                    0 => {
+                        implicit_sql = Some((false, 0));
+                        return Err(Error::Oracle { code: 1403, message: "no data found".into() });
+                    }
                     1 => {
                         if !matches!(&rows[0], PValue::Tuple(_)) {
                             return Err(type_err("PL/SQL INTO requires a query row tuple"));
                         }
+                        implicit_sql = Some((true, 1));
                         stack.push(rows[0].clone());
                     }
-                    _ => return Err(Error::Oracle { code: 1422, message: "exact fetch returns more than requested number of rows".into() }),
+                    _ => {
+                        // A scalar INTO stops once a second row proves too many.
+                        implicit_sql = Some((true, 1));
+                        return Err(Error::Oracle { code: 1422, message: "exact fetch returns more than requested number of rows".into() });
+                    }
                 }
             }
             Op::OracleNumberConstraint { precision, scale } => {
@@ -846,10 +858,25 @@ pub fn run(
                         let n = bridge.exec(plan, &dbargs)?;
                         let n = i64::try_from(n)
                             .map_err(|_| rt_err("affected-row count exceeds i64"))?;
+                        implicit_sql = Some((n > 0, n));
                         stack.push(PValue::Scalar(Value::Int(n)));
                     }
                     Op::DbReturning(_) => {
-                        let rows = bridge.exec_returning(plan, &dbargs)?;
+                        // The production bridge raises 1403/1422 before this
+                        // loop sees the rows. OracleSelectOne covers the mock,
+                        // which returns the row list instead.
+                        let rows = match bridge.exec_returning(plan, &dbargs) {
+                            Ok(rows) => rows,
+                            Err(error @ Error::Oracle { code: 1403, .. }) => {
+                                implicit_sql = Some((false, 0));
+                                return Err(error);
+                            }
+                            Err(error @ Error::Oracle { code: 1422, .. }) => {
+                                implicit_sql = Some((true, 1));
+                                return Err(error);
+                            }
+                            Err(error) => return Err(error),
+                        };
                         let list: Vec<PValue> = rows
                             .into_iter()
                             .map(|row| {
@@ -949,6 +976,9 @@ pub fn run(
                 let value = stack.pop().expect("validated");
                 stack.push(cursor_attr(&cursors, value, which)?);
             }
+            Op::SqlAttr(which) => {
+                stack.push(implicit_sql_attr(implicit_sql, which)?);
+            }
             Op::CursorRow => {
                 let slot = pop_cursor(&mut stack, &cursors)?;
                 match &cursors[slot].row {
@@ -990,6 +1020,21 @@ fn release_cursor(slot: &mut CurSlot) {
     slot.fetched = false;
     slot.rowcount = 0;
     slot.gen = slot.gen.wrapping_add(1);
+}
+
+/// Implicit `SQL%` attribute. `ISOPEN` is always false. The other three
+/// are NULL until a SELECT INTO or DML has recorded `(found, rowcount)`.
+fn implicit_sql_attr(state: Option<(bool, i64)>, which: u8) -> Result<PValue> {
+    let value = match which {
+        crate::ir::CURSOR_ATTR_ISOPEN => Value::Bool(false),
+        crate::ir::CURSOR_ATTR_FOUND => state.map_or(Value::Null, |(found, _)| Value::Bool(found)),
+        crate::ir::CURSOR_ATTR_NOTFOUND => {
+            state.map_or(Value::Null, |(found, _)| Value::Bool(!found))
+        }
+        crate::ir::CURSOR_ATTR_ROWCOUNT => state.map_or(Value::Null, |(_, count)| Value::Int(count)),
+        _ => return Err(Error::Corrupt("proc: invalid cursor attribute".into())),
+    };
+    Ok(PValue::Scalar(value))
 }
 
 /// Explicit cursor attribute. A NULL handle is a cursor that was never

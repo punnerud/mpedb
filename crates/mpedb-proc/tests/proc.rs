@@ -872,6 +872,95 @@ fn plsql_dynamic_returning_assigns_null_and_rolls_back_the_statement() {
 }
 
 #[test]
+fn plsql_sql_attributes_see_a_missing_returning_row() {
+    let (cfg, _guard) = test_config("plsql-sql-attr");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query(
+        "CREATE TABLE native_ledger (id INTEGER PRIMARY KEY, amount INTEGER, note TEXT)",
+        &[],
+    )
+    .unwrap();
+    db.query(
+        "INSERT INTO native_ledger VALUES (1, 7, 'seed'), (2, 8, NULL)",
+        &[],
+    )
+    .unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION miss_rowcount(p PLS_INTEGER) RETURN PLS_INTEGER IS v NUMBER := 7; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = 5 WHERE id = 1'; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = 9 WHERE id = :1 RETURNING amount INTO :2' USING p, OUT v; RETURN -1; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN SQL%ROWCOUNT; END; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("MISS_ROWCOUNT", &[Value::Int(99)]).unwrap(),
+        ProcValue::Scalar(Value::Int(0))
+    );
+    assert!(matches!(
+        db.query("SELECT amount FROM native_ledger WHERE id = 1", &[]).unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![vec![Value::Int(5)]]
+    ));
+    engine
+        .define(
+            "CREATE FUNCTION miss_notfound(p PLS_INTEGER) RETURN PLS_INTEGER IS v NUMBER := 7; BEGIN BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = 9 WHERE id = :1 RETURNING amount INTO :2' USING p, OUT v; RETURN 0; EXCEPTION WHEN NO_DATA_FOUND THEN IF SQL%NOTFOUND AND NOT SQL%FOUND AND NOT SQL%ISOPEN AND v = 7 THEN RETURN 1; ELSE RETURN 0; END IF; END; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("MISS_NOTFOUND", &[Value::Int(99)]).unwrap(),
+        ProcValue::Scalar(Value::Int(1))
+    );
+    engine
+        .define(
+            "CREATE FUNCTION many_rowcount RETURN PLS_INTEGER IS v NUMBER := 7; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = 4'; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = amount + 1 WHERE id < 3 RETURNING amount INTO :1' USING OUT v; RETURN -1; EXCEPTION WHEN TOO_MANY_ROWS THEN RETURN SQL%ROWCOUNT; END; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("MANY_ROWCOUNT", &[]).unwrap(),
+        ProcValue::Scalar(Value::Int(1))
+    );
+    assert!(matches!(
+        db.query("SELECT id, amount FROM native_ledger ORDER BY id", &[]).unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![
+            vec![Value::Int(1), Value::Int(4)],
+            vec![Value::Int(2), Value::Int(4)],
+        ]
+    ));
+    engine
+        .define(
+            "CREATE FUNCTION many_found RETURN PLS_INTEGER IS v NUMBER := 7; BEGIN BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = amount + 1 WHERE id < 3 RETURNING amount INTO :1' USING OUT v; RETURN 0; EXCEPTION WHEN TOO_MANY_ROWS THEN IF SQL%FOUND AND NOT SQL%NOTFOUND AND NOT SQL%ISOPEN AND v = 7 THEN RETURN 1; ELSE RETURN 0; END IF; END; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("MANY_FOUND", &[]).unwrap(),
+        ProcValue::Scalar(Value::Int(1))
+    );
+    assert!(matches!(
+        db.query("SELECT id, amount FROM native_ledger ORDER BY id", &[]).unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![
+            vec![Value::Int(1), Value::Int(4)],
+            vec![Value::Int(2), Value::Int(4)],
+        ]
+    ));
+    engine
+        .define(
+            "CREATE FUNCTION hit_rowcount(p PLS_INTEGER) RETURN PLS_INTEGER IS v NUMBER := 1; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = 6 WHERE id = :1 RETURNING amount INTO :2' USING p, OUT v; RETURN SQL%ROWCOUNT; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("HIT_ROWCOUNT", &[Value::Int(2)]).unwrap(),
+        ProcValue::Scalar(Value::Int(1))
+    );
+    assert!(matches!(
+        db.query("SELECT amount FROM native_ledger WHERE id = 2", &[]).unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![vec![Value::Int(6)]]
+    ));
+}
+
+#[test]
 fn plsql_others_cannot_hide_engine_budgets_or_unsupported_execution() {
     let (cfg,_guard)=test_config("plsql-handler-budget");
     let db=Database::open_with_config(cfg).unwrap();seed_accounts(&db,&[(1,50)]);
