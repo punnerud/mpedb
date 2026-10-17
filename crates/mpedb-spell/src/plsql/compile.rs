@@ -4,7 +4,7 @@ use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
 use crate::ir::Op;
 use mpedb_types::{Result, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Type {
@@ -34,6 +34,8 @@ struct Parser<'a> {
     at: usize,
     builder: FuncBuilder,
     locals: HashMap<String, Local>,
+    declared_here: HashSet<String>,
+    pending_declarations: HashSet<String>,
     returns: Option<Type>,
     depth: usize,
     parameters: Vec<u16>,
@@ -57,6 +59,8 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         at: 0,
         builder: FuncBuilder::new(),
         locals: HashMap::new(),
+        declared_here: HashSet::new(),
+        pending_declarations: HashSet::new(),
         returns: None,
         depth: 0,
         parameters: Vec::new(),
@@ -124,27 +128,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
     if !(p.word("IS") || p.word("AS")) {
         return Err(p.error("expected IS or AS before routine body"));
     }
-    while !p.is_word("BEGIN") {
-        let name = p.identifier()?;
-        let constant = p.word("CONSTANT");
-        let ty = p.data_type()?;
-        if p.word("NOT") {
-            return Err(p.error("NOT NULL variable constraints are not implemented"));
-        }
-        if p.symbol(":=") || p.word("DEFAULT") {
-            let actual = p.expression()?;
-            p.compatible(ty, actual)?;
-        } else {
-            if constant {
-                return Err(p.error("a CONSTANT declaration requires an initializer"));
-            }
-            p.constant(Value::Null)?;
-        }
-        p.builder.emit(ty.check())?;
-        let slot = p.add_local(name, ty, !constant)?;
-        p.builder.emit(Op::StoreLocal(slot))?;
-        p.want_symbol(";")?;
-    }
+    p.declarations()?;
     p.want_word("BEGIN")?;
     p.statements()?;
     p.want_word("END")?;
@@ -183,6 +167,48 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
 }
 
 impl Parser<'_> {
+    fn declarations(&mut self) -> Result<()> {
+        // All names in a declaration section hide outer names, including
+        // declarations not initialized yet. A self/forward reference must
+        // therefore fail instead of accidentally binding an outer variable.
+        let mut start = true;
+        for token in &self.tokens[self.at..] {
+            if matches!(&token.token, Token::Identifier { name, quoted: false } if name == "BEGIN")
+            {
+                break;
+            }
+            if start {
+                if let Token::Identifier { name, .. } = &token.token {
+                    self.pending_declarations.insert(name.clone());
+                }
+            }
+            start = matches!(token.token, Token::Symbol(";"));
+        }
+        while !self.is_word("BEGIN") {
+            let name = self.identifier()?;
+            let constant = self.word("CONSTANT");
+            let ty = self.data_type()?;
+            if self.word("NOT") {
+                return Err(self.error("NOT NULL variable constraints are not implemented"));
+            }
+            if self.symbol(":=") || self.word("DEFAULT") {
+                let actual = self.expression()?;
+                self.compatible(ty, actual)?;
+            } else {
+                if constant {
+                    return Err(self.error("a CONSTANT declaration requires an initializer"));
+                }
+                self.constant(Value::Null)?;
+            }
+            self.builder.emit(ty.check())?;
+            self.pending_declarations.remove(&name);
+            let slot = self.add_local(name, ty, !constant)?;
+            self.builder.emit(Op::StoreLocal(slot))?;
+            self.want_symbol(";")?;
+        }
+        Ok(())
+    }
+
     fn emit_parameters(&mut self, with_return: bool) -> Result<()> {
         let count = self.parameters.len() + usize::from(with_return);
         if count > crate::ir::MAX_STACK {
@@ -300,7 +326,7 @@ impl Parser<'_> {
         }
     }
     fn add_local(&mut self, name: String, ty: Type, writable: bool) -> Result<u16> {
-        if self.locals.contains_key(&name) {
+        if !self.declared_here.insert(name.clone()) {
             return Err(self.error("duplicate parameter or variable name"));
         }
         let slot = self.builder.alloc_local()?;
@@ -340,6 +366,23 @@ impl Parser<'_> {
         Ok(())
     }
     fn statement(&mut self) -> Result<()> {
+        let declarations = self.word("DECLARE");
+        if declarations || self.is_word("BEGIN") {
+            let outer_locals = self.locals.clone();
+            let outer_declared = std::mem::take(&mut self.declared_here);
+            let outer_pending = std::mem::take(&mut self.pending_declarations);
+            if declarations {
+                self.declarations()?;
+            }
+            self.want_word("BEGIN")?;
+            self.statements()?;
+            self.want_word("END")?;
+            self.want_symbol(";")?;
+            self.locals = outer_locals;
+            self.declared_here = outer_declared;
+            self.pending_declarations = outer_pending;
+            return Ok(());
+        }
         if self.word("NULL") {
             return self.want_symbol(";");
         }
@@ -611,6 +654,9 @@ impl Parser<'_> {
             return Ok(Some(Type::Number));
         }
         let name = self.identifier()?;
+        if self.pending_declarations.contains(&name) {
+            return Err(self.error("self or forward reference in a declaration initializer"));
+        }
         let local = *self.locals.get(&name).ok_or_else(|| {
             self.error(&format!(
                 "unknown variable or unsupported expression {name}"

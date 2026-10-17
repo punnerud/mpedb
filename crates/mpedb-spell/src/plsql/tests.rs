@@ -264,6 +264,49 @@ fn boolean_logic_preserves_unknown_through_actual_frontend() {
 }
 
 #[test]
+fn nested_blocks_shadow_and_restore_names_without_losing_outer_assignments() {
+    let source = function("p NUMBER", "NUMBER", "x NUMBER := 7; y NUMBER := 0; BEGIN DECLARE x NUMBER := 3; BEGIN BEGIN x := x + 1; END; y := x; END; RETURN x + y + p; END;");
+    assert_eq!(
+        call(&source, &[Value::Int(2)]).unwrap(),
+        Value::Numeric("13".into())
+    );
+    let source = function(
+        "p NUMBER",
+        "NUMBER",
+        "BEGIN DECLARE p NUMBER := 2; BEGIN RETURN p; END; END;",
+    );
+    assert_eq!(
+        call(&source, &[Value::Int(9)]).unwrap(),
+        Value::Numeric("2".into())
+    );
+    let source = "CREATE PROCEDURE p(x OUT NUMBER) IS BEGIN DECLARE x NUMBER := 4; BEGIN x := 5; END; x := 7; END;";
+    assert_eq!(
+        call_result(source, &[Value::Null]).unwrap(),
+        tuple(vec![Value::Numeric("7".into())])
+    );
+}
+
+#[test]
+fn block_locals_reinitialize_on_each_loop_entry_and_exit_targets_outer_loop() {
+    let source = function("", "NUMBER", "n NUMBER := 0; total NUMBER := 0; BEGIN WHILE n < 4 LOOP DECLARE x NUMBER DEFAULT 1; BEGIN n := n + 1; x := x + 1; CONTINUE WHEN n = 2; total := total + x; EXIT WHEN n = 3; END; END LOOP; RETURN total; END;");
+    assert_eq!(call(&source, &[]).unwrap(), Value::Numeric("4".into()));
+}
+
+#[test]
+fn block_scopes_reject_leaks_duplicates_and_incomplete_initializer_references() {
+    for body in [
+        "BEGIN DECLARE x NUMBER := 1; BEGIN NULL; END; RETURN x; END;",
+        "BEGIN DECLARE x NUMBER; x NUMBER; BEGIN NULL; END; RETURN 1; END;",
+        "x NUMBER := 7; BEGIN DECLARE x NUMBER := x + 1; BEGIN RETURN x; END; END;",
+        "x NUMBER := 7; BEGIN DECLARE y NUMBER := x; x NUMBER := 3; BEGIN RETURN y; END; END;",
+        "BEGIN DECLARE x NUMBER := y; y NUMBER := 3; BEGIN RETURN x; END; END;",
+        "BEGIN DECLARE c CONSTANT NUMBER := 1; BEGIN c := 2; END; RETURN 1; END;",
+    ] {
+        assert!(compile(&function("", "NUMBER", body)).is_err(), "{body}");
+    }
+}
+
+#[test]
 fn constants_initialize_in_order_and_remain_read_only() {
     let source = function(
         "p NUMBER",

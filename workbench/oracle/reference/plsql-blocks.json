@@ -1,0 +1,30 @@
+{
+  "oracle_version": "23.26.3.0.0",
+  "method": "Anonymous PL/SQL blocks executed against the real Oracle reference server.",
+  "results": {
+    "shadow": {
+      "source": "DECLARE x NUMBER := 7; BEGIN DECLARE x NUMBER := x + 1; BEGIN :out := x; END; END;",
+      "error": "ORA-06550: line 1, column 50:\nPLS-00320: the declaration of the type of this expression is incomplete or malformed\nORA-06550: line 0, column 0:\nPL/SQL: Compilation unit analysis terminated\nHelp: https://docs.oracle.com/error-help/db/ora-06550/"
+    },
+    "nested": {
+      "source": "DECLARE x NUMBER := 7; BEGIN DECLARE x NUMBER := 3; BEGIN x := x + 1; :out := x; END; :out := :out + x; END;",
+      "value": 11
+    },
+    "forward": {
+      "source": "DECLARE x NUMBER := y; y NUMBER := 3; BEGIN :out := x; END;",
+      "error": "ORA-06550: line 1, column 21:\nPLS-00320: the declaration of the type of this expression is incomplete or malformed\nORA-06550: line 0, column 0:\nPL/SQL: Compilation unit analysis terminated\nHelp: https://docs.oracle.com/error-help/db/ora-06550/"
+    },
+    "self": {
+      "source": "DECLARE x NUMBER := x + 1; BEGIN :out := x; END;",
+      "error": "ORA-06550: line 1, column 21:\nPLS-00320: the declaration of the type of this expression is incomplete or malformed\nORA-06550: line 0, column 0:\nPL/SQL: Compilation unit analysis terminated\nHelp: https://docs.oracle.com/error-help/db/ora-06550/"
+    },
+    "bare": {
+      "source": "DECLARE x NUMBER := 7; BEGIN BEGIN x := x + 1; END; :out := x; END;",
+      "value": 8
+    },
+    "shadow_parameter": {
+      "source": "DECLARE PROCEDURE p(x NUMBER) IS x NUMBER := 2; BEGIN :out := x; END; BEGIN p(7); END;",
+      "error": "ORA-06550: line 1, column 9:\nPLS-00410: duplicate fields in RECORD,TABLE or argument list are not permitted\nORA-06550: line 1, column 9:\nPL/SQL: Item ignored\nORA-06550: line 1, column 77:\nPLS-00313: 'P' not declared in this scope\nORA-06550: line 1, column 77:\nPL/SQL: Statement ignored\nHelp: https://docs.oracle.com/error-help/db/ora-06550/"
+    }
+  }
+}
