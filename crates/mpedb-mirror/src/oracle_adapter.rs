@@ -6,7 +6,7 @@ use crate::{
     oracle::{carrier_tables, OracleTable},
     oracle_cursor::{OracleIdentity, OraclePosition},
     oracle_import::load_bootstrap,
-    oracle_source::OracleSource,
+    oracle_source::{OracleSource, OracleStateIdentity},
 };
 use mpedb::Database;
 use mpedb_types::{Error, Result, Value};
@@ -14,6 +14,7 @@ use mpedb_types::{Error, Result, Value};
 pub struct OracleAdapter {
     source: OracleSource,
     identity: OracleIdentity,
+    state_identity: OracleStateIdentity,
     tables: Vec<OracleTable>,
     initial: Cursor,
     mirror_id: String,
@@ -31,6 +32,7 @@ impl OracleAdapter {
         let mut adapter = Self {
             source,
             identity: metadata.identity,
+            state_identity: metadata.state_identity,
             tables,
             initial: metadata.cursor,
             mirror_id: metadata.mirror_id,
@@ -60,6 +62,11 @@ impl OracleAdapter {
         Ok(self)
     }
     fn check_identity(&self) -> Result<()> {
+        if self.source.source_state_identity()? != self.state_identity {
+            return Err(Error::Unsupported(
+                "Oracle control table was recreated or truncated; reimport is required".into(),
+            ));
+        }
         if self.source.identity()? != self.identity {
             return Err(Error::Unsupported(
                 "Oracle source incarnation or application identity changed; reimport is required"
@@ -147,7 +154,9 @@ impl SourceAdapter for OracleAdapter {
     }
     fn head(&mut self) -> Result<Cursor> {
         self.check_identity()?;
-        self.cursor(self.source.current_scn()?)
+        let scn = self.source.current_scn()?;
+        self.check_identity()?;
+        self.cursor(scn)
     }
     fn zero_cursor(&self) -> Cursor {
         self.initial.clone()
@@ -164,6 +173,7 @@ impl SourceAdapter for OracleAdapter {
                 "Oracle identity changed during reconcile".into(),
             ));
         }
+        self.check_identity()?;
         Ok(snapshot.rows.into_iter().next().unwrap_or_default())
     }
     fn push(&mut self, _ops: &[NetOp]) -> Result<Vec<bool>> {
@@ -177,12 +187,23 @@ impl SourceAdapter for OracleAdapter {
     fn ensure_source_state(&mut self, id: &str, epoch: u64, authority: &str) -> Result<()> {
         self.same_mirror(id)?;
         self.check_identity()?;
-        self.source.ensure_source_state(id, epoch, authority)
+        let _ = epoch; // An established adapter must never reseed lost history.
+        if !matches!(authority, "source" | "mpedb") {
+            return Err(Error::Config("invalid Oracle authority".into()));
+        }
+        if self.source.read_source_state(id)?.is_none() {
+            return Err(Error::Corrupt(
+                "Oracle authority row was lost; reimport is required".into(),
+            ));
+        }
+        self.check_identity()
     }
     fn read_source_state(&mut self, id: &str) -> Result<Option<(u64, String)>> {
         self.same_mirror(id)?;
         self.check_identity()?;
-        self.source.read_source_state(id)
+        let state = self.source.read_source_state(id)?;
+        self.check_identity()?;
+        Ok(state)
     }
     fn cas_source_state(
         &mut self,
@@ -198,6 +219,7 @@ impl SourceAdapter for OracleAdapter {
                 "Oracle authority cutover requires mirror write-back support".into(),
             ));
         }
-        self.source.cas_source_state(id, expected, next, authority)
+        self.source
+            .cas_source_state_fenced(id, expected, next, authority, &self.state_identity)
     }
 }

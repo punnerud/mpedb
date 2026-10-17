@@ -10,6 +10,7 @@ mod snapshot;
 mod state;
 pub use capture::OracleChangeBatch;
 pub use snapshot::OracleSnapshot;
+pub use state::OracleStateIdentity;
 mod write;
 use codec::{decode_row, read_expr};
 

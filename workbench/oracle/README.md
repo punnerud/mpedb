@@ -181,8 +181,14 @@ actual result and commits atomically. Native tests cover competing connections
 (one winner), stale CAS, old-SCN reads and refusing a disabled ownership marker.
 Durable Oracle import and the pull adapter use these foundations. Complete
 write-back, own-write echo suppression and the two-database controller remain
-unfinished. Control-table recreation also needs a durable object-generation
-fence before authority cutover can be enabled.
+unfinished. Bootstrap metadata version 2 also binds the control table's
+OBJECT_ID and DATA_OBJECT_ID. Adapter reconnect, capture and authority CAS
+refuse a recreated or truncated control table even when its row was reseeded
+with the same epoch. CAS checks generation under its DDL lock, before UPDATE;
+established adapters never recreate missing authority rows. A dedicated test
+owner verifies TRUNCATE and DROP/CREATE without touching shared tracking state.
+Older development bootstrap files require reimport. A per-row incarnation token
+is still needed to detect DELETE/reinsert of an authority row in the same table.
 
 ## Native implementation progress
 

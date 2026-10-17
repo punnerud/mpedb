@@ -4,7 +4,7 @@ use crate::{
     import::{self, ImportOptions, ImportReport, TableImportStat},
     oracle::{self, OracleTable},
     oracle_cursor::{OracleIdentity, OraclePosition},
-    oracle_source::OracleSource,
+    oracle_source::{OracleSource, OracleStateIdentity},
     state,
 };
 use mpedb::Database;
@@ -24,10 +24,13 @@ pub struct OracleBootstrap {
     pub cursor: Vec<u8>,
     pub mirror_id: String,
     pub epoch: u64,
+    pub state_identity: OracleStateIdentity,
 }
 impl OracleBootstrap {
     fn validate(&self) -> Result<()> {
-        if self.version != 1
+        if self.version != 2
+            || self.state_identity.object_id == 0
+            || self.state_identity.data_object_id == 0
             || self.epoch != 1
             || self.tables.is_empty()
             || self.mirror_id.len() != 32
@@ -132,12 +135,15 @@ pub fn import_oracle(
         ));
     }
     let metadata = OracleBootstrap {
-        version: 1,
+        version: 2,
         cursor: snapshot.position()?.encode(),
         identity: snapshot.identity,
         tables: snapshot.tables,
         mirror_id,
         epoch: 1,
+        state_identity: snapshot.source_state_identity.ok_or_else(|| {
+            Error::Corrupt("Oracle bootstrap has no control-table identity".into())
+        })?,
     };
     metadata.validate()?;
     let bytes = serde_json::to_vec(&metadata)

@@ -10,6 +10,7 @@ pub struct OracleSnapshot {
     pub tables: Vec<OracleTable>,
     pub rows: Vec<Vec<Vec<Value>>>,
     pub source_state: Option<(u64, String)>,
+    pub source_state_identity: Option<OracleStateIdentity>,
 }
 impl OracleSnapshot {
     pub fn position(&self) -> Result<OraclePosition> {
@@ -71,6 +72,9 @@ impl OracleSource {
                 tables: tables.into_iter().cloned().collect(),
                 rows,
                 source_state,
+                source_state_identity: mirror_id
+                    .map(|_| self.source_state_identity())
+                    .transpose()?,
             };
             snapshot.position()?; // validate the complete resume domain before publication
             Ok(snapshot)

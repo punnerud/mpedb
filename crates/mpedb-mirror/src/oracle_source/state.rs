@@ -3,6 +3,14 @@
 use super::*;
 const TABLE: &str = "MPEDB_MIRROR_STATE";
 const MARKER: &str = "MPEDB_MIRROR_STATE_V1";
+/// Identity of the control table and its physical generation. DROP/CREATE and
+/// TRUNCATE must not turn an established epoch fence into a new initial row.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OracleStateIdentity {
+    pub object_id: u64,
+    pub data_object_id: u64,
+}
 fn input(id: &str, authority: &str) -> Result<()> {
     if id.is_empty() || id.len() > 128 || !matches!(authority, "source" | "mpedb") {
         return Err(Error::Config(
@@ -12,6 +20,21 @@ fn input(id: &str, authority: &str) -> Result<()> {
     Ok(())
 }
 impl OracleSource {
+    /// Read public dictionary identity. Callers compare it before and after
+    /// capture; bootstrap obtains it while holding the state table's DDL fence.
+    pub fn source_state_identity(&self) -> Result<OracleStateIdentity> {
+        let identity: (u64, Option<u64>) = self.connection.query_row_as(
+            "SELECT object_id,data_object_id FROM all_objects WHERE owner=:1 AND object_name=:2 AND object_type='TABLE' AND subobject_name IS NULL",
+            &[&self.owner, &TABLE],
+        ).map_err(|e| err("source state object identity", e))?;
+        let data_object_id = identity.1.ok_or_else(|| {
+            Error::Corrupt("Oracle control table has no initialized data segment".into())
+        })?;
+        Ok(OracleStateIdentity {
+            object_id: identity.0,
+            data_object_id,
+        })
+    }
     fn state_target(&self) -> String {
         format!("{}.{}", quote(&self.owner), quote(TABLE))
     }
@@ -169,6 +192,28 @@ impl OracleSource {
         next: u64,
         authority: &str,
     ) -> Result<bool> {
+        self.cas_source_state_inner(id, expected, next, authority, None)
+    }
+    /// Epoch CAS fenced against the imported control-table generation. The
+    /// identity check runs UNDER the DDL fence, before changing the row.
+    pub fn cas_source_state_fenced(
+        &mut self,
+        id: &str,
+        expected: u64,
+        next: u64,
+        authority: &str,
+        identity: &OracleStateIdentity,
+    ) -> Result<bool> {
+        self.cas_source_state_inner(id, expected, next, authority, Some(identity))
+    }
+    fn cas_source_state_inner(
+        &mut self,
+        id: &str,
+        expected: u64,
+        next: u64,
+        authority: &str,
+        identity: Option<&OracleStateIdentity>,
+    ) -> Result<bool> {
         input(id, authority)?;
         if expected.checked_add(1) != Some(next) {
             return Err(Error::Config(
@@ -177,6 +222,13 @@ impl OracleSource {
         }
         let result = (|| {
             self.lock_state()?;
+            if let Some(identity) = identity {
+                if self.source_state_identity()? != *identity {
+                    return Err(Error::Unsupported(
+                        "Oracle control table was recreated or truncated; epoch CAS refused".into(),
+                    ));
+                }
+            }
             let key = id.as_bytes().to_vec();
             let statement = self
                 .connection
