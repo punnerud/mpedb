@@ -233,6 +233,16 @@ fn normalize_dml(source: &str) -> Result<(String, usize)> {
 }
 
 pub(super) fn normalize_sql(source: &str, kind: CallKind) -> Result<(String, usize)> {
+    normalize_sql_allow(source, kind, false)
+}
+
+/// `allow_returning` copies a top-level `RETURNING` list through. The default
+/// path still refuses it, so cursor text cannot grow a clause by accident.
+pub(super) fn normalize_sql_allow(
+    source: &str,
+    kind: CallKind,
+    allow_returning: bool,
+) -> Result<(String, usize)> {
     let tokens = lex::lex(source)?;
     if !matches!(tokens.first().map(|t|&t.token),Some(Token::Identifier{name,quoted:false}) if match kind { CallKind::Query=>name=="SELECT", CallKind::Exec=>matches!(name.as_str(),"INSERT"|"UPDATE"|"DELETE"), CallKind::Rows=>false })
     {
@@ -276,7 +286,7 @@ pub(super) fn normalize_sql(source: &str, kind: CallKind) -> Result<(String, usi
             Token::Identifier {
                 ref name,
                 quoted: false,
-            } if name == "RETURNING" => {
+            } if name == "RETURNING" && !allow_returning => {
                 return Err(mpedb_types::Error::Unsupported(
                     "dynamic DML RETURNING is not implemented".into(),
                 ))
@@ -311,8 +321,9 @@ fn note_returning_expr(phase: u8, open: &mut bool, returning: &mut usize) {
 }
 
 /// DML preparer for `EXECUTE IMMEDIATE` only. [`normalize_sql`] keeps refusing
-/// `RETURNING`, so static SQL and cursor text stay on the old contract.
-/// A `RETURNING` inside parentheses is part of the statement, not the clause.
+/// `RETURNING`. Static `RETURNING INTO` uses [`normalize_sql_allow`]; cursor
+/// text stays on the refusing path. A `RETURNING` inside parentheses is part
+/// of the statement, not the clause.
 fn prepare_dynamic_dml(source: &str) -> Result<DynamicDml> {
     let tokens = lex::lex(source)?;
     if !matches!(

@@ -1,6 +1,8 @@
 //! Static SELECT INTO and DML use the same shared plans as dynamic SQL.
-//! Until schema-aware escaped-identifier resolution exists, PL/SQL inputs must
-//! use routine.variable qualification. Ambiguous bare locals are refused.
+//! `RETURNING INTO` assigns the returned cells, including NULL, and a missing
+//! row raises `NO_DATA_FOUND` without changing the target. Until schema-aware
+//! escaped-identifier resolution exists, PL/SQL inputs must use
+//! routine.variable qualification. Ambiguous bare locals are refused.
 use super::*;
 use crate::emit::CallKind;
 enum StaticInput {
@@ -13,6 +15,8 @@ impl Parser<'_> {
         let query = self.is_word("SELECT");
         let mut depth = 0i32;
         let mut into_at = None;
+        let mut returning_at = None;
+        let mut returning_into_at = None;
         let mut end = start;
         loop {
             let token = self
@@ -33,6 +37,29 @@ impl Parser<'_> {
                     quoted: false,
                 } if name == "INTO" && depth == 0 && query && into_at.replace(end).is_some() => {
                     return Err(self.error("multiple static SELECT INTO clauses"));
+                }
+                // A failed guard still stores the first clause. The arm runs
+                // only when a second one replaces it.
+                Token::Identifier {
+                    name,
+                    quoted: false,
+                } if name == "RETURNING"
+                    && depth == 0
+                    && !query
+                    && returning_at.replace(end).is_some() =>
+                {
+                    return Err(self.error("multiple static RETURNING clauses"));
+                }
+                Token::Identifier {
+                    name,
+                    quoted: false,
+                } if name == "INTO"
+                    && depth == 0
+                    && !query
+                    && returning_at.is_some()
+                    && returning_into_at.replace(end).is_some() =>
+                {
+                    return Err(self.error("multiple static RETURNING INTO clauses"));
                 }
                 _ => {}
             }
@@ -66,6 +93,39 @@ impl Parser<'_> {
                 &self.source[source_start..self.tokens[index].span.start],
                 &self.source[self.tokens[self.at].span.start..source_end]
             )
+        } else if let Some(ret) = returning_at {
+            let into_index = returning_into_at
+                .ok_or_else(|| self.error("static RETURNING requires INTO targets"))?;
+            let width = returning_width(&self.tokens[ret + 1..into_index])
+                .map_err(|message| self.error(message))?;
+            self.at = into_index + 1;
+            loop {
+                let name = self.identifier()?;
+                let target = *self
+                    .locals
+                    .get(&name)
+                    .ok_or_else(|| self.error("unknown INTO target"))?;
+                if !target.writable {
+                    return Err(self.error("INTO target is constant or an IN parameter"));
+                }
+                into.push(target);
+                if !self.symbol(",") {
+                    break;
+                }
+            }
+            if self.at != end {
+                return Err(self.error(
+                    "static RETURNING INTO requires simple local targets",
+                ));
+            }
+            if into.len() != width {
+                return Err(self.error(
+                    "RETURNING INTO target count does not match the RETURNING list",
+                ));
+            }
+            self.source[source_start..self.tokens[into_index].span.start]
+                .trim_end()
+                .to_string()
         } else {
             self.source[source_start..source_end].to_string()
         };
@@ -76,7 +136,11 @@ impl Parser<'_> {
         } else {
             CallKind::Exec
         };
-        let (sql, count) = super::sql::normalize_sql(&source, kind)?;
+        let (sql, count) = if returning_at.is_some() {
+            super::sql::normalize_sql_allow(&source, kind, true)?
+        } else {
+            super::sql::normalize_sql(&source, kind)?
+        };
         if count != bindings.len() {
             return Err(self.error("static SQL bind count mismatch"));
         }
@@ -180,6 +244,41 @@ impl Parser<'_> {
         Ok((output, bindings))
     }
 }
+
+/// Expressions in a static `RETURNING` list. A comma at depth 0 separates
+/// them. An empty slot is not an expression.
+fn returning_width(tokens: &[lex::Lexed]) -> std::result::Result<usize, &'static str> {
+    let mut width = 0usize;
+    let mut depth = 0i32;
+    let mut saw = false;
+    for token in tokens {
+        match &token.token {
+            Token::Symbol("(") => {
+                depth += 1;
+                saw = true;
+            }
+            Token::Symbol(")") => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("unmatched parenthesis in static SQL");
+                }
+                saw = true;
+            }
+            Token::Symbol(",") if depth == 0 => {
+                if !saw {
+                    return Err("RETURNING requires an expression");
+                }
+                width += 1;
+                saw = false;
+            }
+            _ => saw = true,
+        }
+    }
+    if !saw {
+        return Err("RETURNING requires an expression");
+    }
+    Ok(width + 1)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,10 +312,63 @@ mod tests {
             "INSERT INTO ledger VALUES(:p);",
             "INSERT INTO ledger VALUES(f.missing);",
             "SELECT f.p INTO n FROM ledger f;",
-            "UPDATE ledger SET amount=f.p RETURNING amount INTO n;",
             "SELECT t.amount INTO n FROM ledger t ORDER BY 1;",
         ] {
             assert!(compile(&format!("CREATE FUNCTION f(p NUMBER) RETURN NUMBER IS n NUMBER; BEGIN {statement} RETURN n; END;")).is_err(), "{statement}");
         }
+    }
+    #[test]
+    fn static_returning_into_keeps_the_returned_list_and_drops_the_targets() {
+        let s = compile("CREATE FUNCTION f(p NUMBER) RETURN NUMBER IS n NUMBER; m NUMBER; BEGIN UPDATE ledger SET amount=f.p RETURNING (amount), id INTO n, m; RETURN n; END;").unwrap();
+        assert_eq!(s.calls.len(), 1);
+        assert_eq!(s.calls[0].kind, CallKind::Exec);
+        assert_eq!(s.calls[0].argc, 1);
+        assert_eq!(s.calls[0].expected_columns, None);
+        assert_eq!(s.calls[0].sql, "UPDATE ledger SET amount=$1 RETURNING (amount), id");
+        assert!(!s.calls[0].sql.contains("INTO"));
+        assert!(s.instrs.iter().any(|op| matches!(op, Op::DbReturning(_))));
+        assert!(!s.instrs.iter().any(|op| matches!(op, Op::DbExec(_))));
+        let insert = compile("CREATE PROCEDURE f(p NUMBER) IS n NUMBER; BEGIN INSERT INTO ledger VALUES(f.p) RETURNING id INTO n; END;").unwrap();
+        assert_eq!(insert.calls[0].sql, "INSERT INTO ledger VALUES($1) RETURNING id");
+        assert_eq!(insert.calls[0].argc, 1);
+        for (statement, needle) in [
+            (
+                "UPDATE ledger SET amount=f.p RETURNING INTO n;",
+                "RETURNING requires an expression",
+            ),
+            (
+                "UPDATE ledger SET amount=f.p RETURNING amount;",
+                "static RETURNING requires INTO targets",
+            ),
+            (
+                "UPDATE ledger SET amount=f.p RETURNING amount, id INTO n;",
+                "target count does not match",
+            ),
+            (
+                "UPDATE ledger SET amount=f.p RETURNING amount INTO p;",
+                "IN parameter",
+            ),
+            (
+                "UPDATE ledger SET amount=f.p RETURNING amount INTO n RETURNING id INTO m;",
+                "multiple static RETURNING clauses",
+            ),
+            (
+                "UPDATE ledger SET amount=f.p RETURNING amount INTO n.member;",
+                "simple local targets",
+            ),
+        ] {
+            let err = compile(&format!(
+                "CREATE FUNCTION f(p NUMBER) RETURN NUMBER IS n NUMBER; m NUMBER; BEGIN {statement} RETURN n; END;"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("PL/SQL at "), "{needle}: {err}");
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        let constant = compile("CREATE FUNCTION f(p NUMBER) RETURN NUMBER IS n CONSTANT NUMBER := 1; BEGIN UPDATE ledger SET amount=f.p RETURNING amount INTO n; RETURN n; END;")
+            .unwrap_err()
+            .to_string();
+        assert!(constant.contains("PL/SQL at "), "{constant}");
+        assert!(constant.contains("constant or an IN parameter"), "{constant}");
     }
 }

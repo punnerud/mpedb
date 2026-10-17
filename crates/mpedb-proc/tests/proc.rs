@@ -872,6 +872,81 @@ fn plsql_dynamic_returning_assigns_null_and_rolls_back_the_statement() {
 }
 
 #[test]
+fn plsql_static_returning_assigns_null_and_rolls_back_the_statement() {
+    let (cfg, _guard) = test_config("plsql-static-returning");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query(
+        "CREATE TABLE native_ledger (id INTEGER PRIMARY KEY, amount INTEGER, note TEXT)",
+        &[],
+    )
+    .unwrap();
+    db.query(
+        "INSERT INTO native_ledger VALUES (1, 7, 'seed'), (2, 8, NULL)",
+        &[],
+    )
+    .unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION take_note(p_id PLS_INTEGER) RETURN VARCHAR2 IS v VARCHAR2(20) := 'old'; incoming VARCHAR2(20); BEGIN UPDATE native_ledger SET note = take_note.incoming WHERE id = take_note.p_id RETURNING note INTO v; IF SQL%FOUND AND NOT SQL%NOTFOUND AND SQL%ROWCOUNT = 1 THEN RETURN v; ELSE RETURN 'bad'; END IF; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("TAKE_NOTE", &[Value::Int(1)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    assert!(matches!(
+        db.query("SELECT note FROM native_ledger WHERE id = 1", &[]).unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![vec![Value::Null]]
+    ));
+    engine
+        .define(
+            "CREATE FUNCTION take_amount(p_id PLS_INTEGER, p_amt PLS_INTEGER) RETURN NUMBER IS v NUMBER := 1; BEGIN UPDATE native_ledger SET amount = take_amount.p_amt WHERE id = take_amount.p_id RETURNING amount INTO v; RETURN v; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .call("TAKE_AMOUNT", &[Value::Int(1), Value::Int(4)])
+            .unwrap(),
+        ProcValue::Scalar(Value::Numeric("4".into()))
+    );
+    engine
+        .define(
+            "CREATE FUNCTION miss_keeps(p PLS_INTEGER) RETURN NUMBER IS v NUMBER := 7; one PLS_INTEGER := 1; five PLS_INTEGER := 5; nine PLS_INTEGER := 9; BEGIN UPDATE native_ledger SET amount = miss_keeps.five WHERE id = miss_keeps.one; BEGIN UPDATE native_ledger SET amount = miss_keeps.nine WHERE id = miss_keeps.p RETURNING amount INTO v; RETURN 0; EXCEPTION WHEN NO_DATA_FOUND THEN IF SQL%NOTFOUND AND SQL%ROWCOUNT = 0 THEN RETURN v; ELSE RETURN -1; END IF; END; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("MISS_KEEPS", &[Value::Int(99)]).unwrap(),
+        ProcValue::Scalar(Value::Numeric("7".into()))
+    );
+    assert!(matches!(
+        db.query("SELECT amount FROM native_ledger WHERE id = 1", &[]).unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![vec![Value::Int(5)]]
+    ));
+    engine
+        .define(
+            "CREATE FUNCTION many_keeps RETURN NUMBER IS v NUMBER := 7; next_id PLS_INTEGER := 3; next_amt PLS_INTEGER := 3; lim PLS_INTEGER := 3; one PLS_INTEGER := 1; BEGIN INSERT INTO native_ledger VALUES (many_keeps.next_id, many_keeps.next_amt, 'keep'); BEGIN UPDATE native_ledger SET amount = amount + many_keeps.one WHERE id < many_keeps.lim RETURNING amount INTO v; RETURN 0; EXCEPTION WHEN TOO_MANY_ROWS THEN IF SQL%FOUND AND NOT SQL%NOTFOUND AND SQL%ROWCOUNT = 1 THEN RETURN v; ELSE RETURN -1; END IF; END; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("MANY_KEEPS", &[]).unwrap(),
+        ProcValue::Scalar(Value::Numeric("7".into()))
+    );
+    assert!(matches!(
+        db.query("SELECT id, amount, note FROM native_ledger ORDER BY id", &[]).unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![
+            vec![Value::Int(1), Value::Int(5), Value::Null],
+            vec![Value::Int(2), Value::Int(8), Value::Null],
+            vec![Value::Int(3), Value::Int(3), Value::Text("keep".into())],
+        ]
+    ));
+}
+
+#[test]
 fn plsql_sql_attributes_see_a_missing_returning_row() {
     let (cfg, _guard) = test_config("plsql-sql-attr");
     let db = Database::open_with_config(cfg).unwrap();
