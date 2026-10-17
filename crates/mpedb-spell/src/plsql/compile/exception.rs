@@ -1,7 +1,7 @@
 //! Native block handlers; declarations execute outside their own protected body.
 use super::*;
 
-pub(super) fn code(name: &str) -> Option<u16> {
+pub(super) fn code(name: &str) -> Option<u32> {
     Some(match name {
         "DUP_VAL_ON_INDEX" => 1,
         "NO_DATA_FOUND" => 1403,
@@ -13,7 +13,7 @@ pub(super) fn code(name: &str) -> Option<u16> {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ExceptionRef {
-    Builtin(u16),
+    Code(u32),
     User(u16),
 }
 
@@ -34,6 +34,34 @@ impl Parser<'_> {
         self.exceptions.insert(name, ExceptionRef::User(index));
         Ok(())
     }
+    pub(super) fn exception_init(&mut self) -> Result<()> {
+        self.want_word("EXCEPTION_INIT")?;
+        self.want_symbol("(")?;
+        let name = self.identifier()?;
+        if !self.declared_here.contains(&name)
+            || self.locals.contains_key(&name)
+            || !self.exceptions.contains_key(&name)
+            || self.pending_declarations.contains(&name)
+        {
+            return Err(self.error("EXCEPTION_INIT requires a previously declared exception in the same declarative part"));
+        }
+        self.want_symbol(",")?;
+        let negative = self.symbol("-");
+        if !negative {
+            self.symbol("+");
+        }
+        let Some(Token::Number(text)) = self.peek() else {
+            return Err(self.error("EXCEPTION_INIT requires a numeric literal"));
+        };
+        let text = format!("{}{text}", if negative { "-" } else { "" });
+        let code = crate::interp::oracle_exception_init_code(&text)
+            .map_err(|_| self.error("illegal Oracle EXCEPTION_INIT error number"))?;
+        self.at += 1;
+        self.want_symbol(")")?;
+        self.want_symbol(";")?;
+        self.exceptions.insert(name, ExceptionRef::Code(code));
+        Ok(())
+    }
     fn exception_ref(&self, name: &str) -> Result<ExceptionRef> {
         if self.locals.contains_key(name) || self.pending_declarations.contains(name) {
             return Err(
@@ -43,7 +71,7 @@ impl Parser<'_> {
         self.exceptions
             .get(name)
             .copied()
-            .or_else(|| code(name).map(ExceptionRef::Builtin))
+            .or_else(|| code(name).map(ExceptionRef::Code))
             .ok_or_else(|| self.error("unknown exception name"))
     }
     pub(super) fn raise_statement(&mut self) -> Result<()> {
@@ -57,7 +85,10 @@ impl Parser<'_> {
             let exception = self.exception_ref(&name)?;
             self.want_symbol(";")?;
             self.builder.emit(match exception {
-                ExceptionRef::Builtin(code) => Op::OracleRaise(code),
+                ExceptionRef::Code(code) if !self.exceptions.contains_key(&name) => {
+                    Op::OracleRaise(code as u16)
+                }
+                ExceptionRef::Code(code) => Op::OracleRaiseBound(code),
                 ExceptionRef::User(index) => Op::OracleRaiseUser(index),
             })?;
         }
@@ -92,6 +123,7 @@ impl Parser<'_> {
                 return Err(self.error("WHEN OTHERS must be last"));
             }
             let mut yes = Vec::new();
+            let mut alternatives = HashSet::new();
             others = self.word("OTHERS");
             if others {
                 if self.is_word("OR") {
@@ -101,13 +133,14 @@ impl Parser<'_> {
                 loop {
                     let name = self.identifier()?;
                     let exception = self.exception_ref(&name)?;
-                    if !seen.insert(exception) {
+                    if seen.contains(&exception) {
                         return Err(
                             self.error("exception appears in more than one handler alternative")
                         );
                     }
+                    alternatives.insert(exception);
                     match exception {
-                        ExceptionRef::Builtin(code) => {
+                        ExceptionRef::Code(code) => {
                             self.builder.emit(Op::OracleExceptionCode)?;
                             self.constant(Value::Int(code as i64))?;
                             self.builder.emit(Op::Eq)?;
@@ -122,6 +155,7 @@ impl Parser<'_> {
                     }
                 }
             }
+            seen.extend(alternatives);
             self.want_word("THEN")?;
             let next = if others {
                 None

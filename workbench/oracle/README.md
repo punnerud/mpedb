@@ -672,7 +672,27 @@ seven scope/diagnostic cases, builtin-name shadowing, uncaught errors and cold
 reopen through both the procedure and scalar SQL catalogs. These are local
 declarations; package-wide exception identity remains package integration work.
 
-Full exception coverage still needs EXCEPTION_INIT,
+`PRAGMA EXCEPTION_INIT(name, numeric_literal)` binds a previously declared local
+exception in the same declarative part. Later pragmas replace earlier bindings;
+100 maps to NO_DATA_FOUND, while negative codes retain their Oracle identity.
+Decimal literals round exactly as BINARY_INTEGER; binary float/double suffixes
+use their explicit IEEE representation. Native 23.26.3 accepts -1000000
+inclusively, unlike the strict wording of the current
+[EXCEPTION_INIT documentation](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/EXCEPTION_INIT-pragma.html).
+The measured boundary is tested, as are illegal -1403, out-of-range codes,
+SQL-generated unique/no-data errors, arithmetic errors, application errors,
+scope shadowing and cold reopen. Aliases with the same number can share one
+WHEN/OR branch, but cannot occupy separate handlers. Repeated alternatives in
+one branch are legal, correcting an earlier overly strict compiler test.
+
+Additive opcode 94 carries a validated u32 code without changing old IR. Codes
+above 65535 retain their number inside handlers; unhandled entry-boundary
+errors become ORA-06515. Native SQLERRM text is tested for representative
+constraint/arithmetic/application codes and the large-code envelope. The full
+localized message catalog is not implemented: explicit raises of other codes
+retain numeric dispatch but report that their message entry is unavailable.
+
+Full exception coverage still needs
 TRUE error-stack preservation, SQLERRM(error_code), localized/detailed messages
 and complete Oracle classification of database errors. See
 [Oracle error reporting](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/retrieving-error-code-and-error-message.html)

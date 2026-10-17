@@ -832,7 +832,6 @@ fn malformed_handlers_and_raise_outside_a_handler_refuse() {
         "BEGIN RAISE; END;",
         "BEGIN NULL; EXCEPTION END;",
         "BEGIN NULL; EXCEPTION WHEN OTHERS THEN NULL; WHEN ZERO_DIVIDE THEN NULL; END;",
-        "BEGIN NULL; EXCEPTION WHEN ZERO_DIVIDE OR ZERO_DIVIDE THEN NULL; END;",
         "BEGIN NULL; EXCEPTION WHEN OTHERS OR ZERO_DIVIDE THEN NULL; END;",
         "BEGIN NULL; EXCEPTION WHEN unknown_exception THEN NULL; END;",
     ] {assert!(compile(&function("","NUMBER",body)).is_err(),"{body}");}
@@ -1060,9 +1059,72 @@ fn user_exception_names_share_declaration_namespace_and_cannot_be_values() {
         "e EXCEPTION; e NUMBER; BEGIN RETURN 1; END;",
         "e EXCEPTION; BEGIN RETURN e; END;",
         "e EXCEPTION; BEGIN DECLARE e NUMBER; BEGIN RAISE e; END; RETURN 1; END;",
-        "e EXCEPTION; BEGIN RAISE e; EXCEPTION WHEN e OR e THEN RETURN 1; END;",
         "BEGIN DECLARE e EXCEPTION; BEGIN NULL; END; RAISE e; END;",
     ] {
         assert!(compile(&function("", "NUMBER", body)).is_err(), "{body}");
     }
+}
+
+#[test]
+fn exception_init_codes_aliases_and_entry_boundaries() {
+    assert_eq!(crate::interp::oracle_exception_init_code("-1.499999999f").unwrap(), 2);
+    assert_eq!(crate::interp::oracle_exception_init_code("-1.499999999d").unwrap(), 1);
+    assert_eq!(crate::interp::oracle_exception_init_code("-1.499999999").unwrap(), 1);
+    for (body,expected) in [
+        ("e EXCEPTION;PRAGMA EXCEPTION_INIT(e,-20001);BEGIN RAISE_APPLICATION_ERROR(-20001,'x');EXCEPTION WHEN e THEN RETURN SQLCODE;END;","-20001"),
+        ("e EXCEPTION;PRAGMA EXCEPTION_INIT(e,100);BEGIN RAISE NO_DATA_FOUND;EXCEPTION WHEN e THEN RETURN SQLCODE;END;","100"),
+        ("e EXCEPTION;PRAGMA EXCEPTION_INIT(e,-1476);n NUMBER;BEGIN n:=1/0;RETURN 0;EXCEPTION WHEN e THEN RETURN SQLCODE;END;","-1476"),
+        ("e EXCEPTION;f EXCEPTION;PRAGMA EXCEPTION_INIT(e,-20001);PRAGMA EXCEPTION_INIT(f,-20001);BEGIN RAISE e;EXCEPTION WHEN e OR f THEN RETURN SQLCODE;END;","-20001"),
+        ("e EXCEPTION;PRAGMA EXCEPTION_INIT(e,-1);BEGIN RAISE e;EXCEPTION WHEN e OR DUP_VAL_ON_INDEX THEN RETURN SQLCODE;END;","-1"),
+        ("e EXCEPTION;PRAGMA EXCEPTION_INIT(e,-20001);PRAGMA EXCEPTION_INIT(e,-20002);BEGIN RAISE e;EXCEPTION WHEN e THEN RETURN SQLCODE;END;","-20002"),
+        ("e EXCEPTION;BEGIN RAISE e;EXCEPTION WHEN e OR e THEN RETURN SQLCODE;END;","1"),
+    ] { assert_eq!(call(&function("","NUMBER",body),&[]).unwrap(),Value::Numeric(expected.into()),"{body}"); }
+    for token in [
+        "-1", "-1.0", "-1e0", "-1f", "-1d", "-0.9", "-1.5", "-999999", "-1000000", "+100",
+    ] {
+        let code = crate::interp::oracle_exception_init_code(token).unwrap();
+        let expected = if code == 1403 { 100 } else { -i64::from(code) };
+        let body=format!("e EXCEPTION;PRAGMA EXCEPTION_INIT(e,{token});BEGIN RAISE e;EXCEPTION WHEN e THEN RETURN SQLCODE;END;");
+        assert_eq!(
+            call(&function("", "NUMBER", &body), &[]).unwrap(),
+            Value::Numeric(expected.to_string())
+        );
+    }
+    for code in [65536, 1000000] {
+        let body = format!("e EXCEPTION;PRAGMA EXCEPTION_INIT(e,-{code});BEGIN RAISE e;END;");
+        let error = call(&function("", "NUMBER", &body), &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            mpedb_types::Error::Oracle { code: 6515, .. }
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!("ORA-06515: PL/SQL: unhandled exception {code}")
+        );
+    }
+}
+
+#[test]
+fn exception_init_rejects_invalid_codes_scope_and_separate_alias_handlers() {
+    for token in [
+        "0", "1", "-1403", "-1000001", "-1e100", "(-1)", "-20000-1", "100.5",
+    ] {
+        assert!(
+            compile(&function(
+                "",
+                "NUMBER",
+                &format!("e EXCEPTION;PRAGMA EXCEPTION_INIT(e,{token});BEGIN RETURN 0;END;")
+            ))
+            .is_err(),
+            "{token}"
+        );
+    }
+    for body in [
+        "PRAGMA EXCEPTION_INIT(e,-1);e EXCEPTION;BEGIN RETURN 0;END;",
+        "e NUMBER;PRAGMA EXCEPTION_INIT(e,-1);BEGIN RETURN 0;END;",
+        "PRAGMA EXCEPTION_INIT(NO_DATA_FOUND,100);BEGIN RETURN 0;END;",
+        "e EXCEPTION;BEGIN DECLARE PRAGMA EXCEPTION_INIT(e,-1);BEGIN RETURN 0;END;END;",
+        "e EXCEPTION;f EXCEPTION;PRAGMA EXCEPTION_INIT(e,-1);PRAGMA EXCEPTION_INIT(f,-1);BEGIN RAISE e;EXCEPTION WHEN e THEN RETURN 1;WHEN f THEN RETURN 2;END;",
+        "e EXCEPTION;PRAGMA EXCEPTION_INIT(e,-1);BEGIN RAISE e;EXCEPTION WHEN e THEN RETURN 1;WHEN DUP_VAL_ON_INDEX THEN RETURN 2;END;",
+    ] {assert!(compile(&function("","NUMBER",body)).is_err(),"{body}");}
 }

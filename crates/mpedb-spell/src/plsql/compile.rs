@@ -231,6 +231,10 @@ impl Parser<'_> {
             start = matches!(token.token, Token::Symbol(";"));
         }
         while !self.is_word("BEGIN") {
+            if self.word("PRAGMA") {
+                self.exception_init()?;
+                continue;
+            }
             let position = self.tokens.get(self.at).map_or(self.source.len(), |t| t.span.start);
             let name = self.identifier()?;
             if self.word("EXCEPTION") {

@@ -90,6 +90,9 @@ pub(super) fn sqlerrm(caught: &[Caught]) -> Result<String> {
         // Legacy handlers retain their original error detail. SQLERRM's new
         // operation renders Oracle's canonical divisor message separately.
         Some(Error::Oracle { code: 1476, .. }) => named(1476).to_string(),
+        Some(Error::Oracle { code, .. }) if *code > 65535 => {
+            format!(" {code}: non-ORACLE exception ")
+        }
         Some(e @ Error::Oracle { .. }) => e.to_string(),
         _ => return Err(Error::Corrupt("proc: non-Oracle exception context".into())),
     };
@@ -143,4 +146,38 @@ pub(super) fn user_identity(proc: &Proc, index: u16) -> [u8; 32] {
         unreachable!("validated")
     };
     bytes.as_slice().try_into().expect("validated identity")
+}
+
+/// Locally caught large exception codes retain SQLCODE; only an unhandled
+/// exception crossing the PL/SQL entry boundary is converted to ORA-06515.
+pub(super) fn entry_boundary(error: Error) -> Error {
+    match error {
+        Error::Oracle { code, .. } if code > 65535 => Error::Oracle {
+            code: 6515,
+            message: format!("PL/SQL: unhandled exception {code}"),
+        },
+        other => other,
+    }
+}
+
+pub(super) fn bound(code: u32) -> Error {
+    // Text measured through public Oracle 23.26.3 PL/SQL. A complete localized
+    // Oracle message catalog is separate work; unknown entries say so.
+    let message = match code {
+        1 => "unique constraint (.) violated on table . columns ()",
+        1400 => "cannot insert NULL into ()",
+        1403 => "no data found",
+        1422 => "exact fetch returns more than requested number of rows",
+        1426 => "numeric overflow",
+        1476 => "divisor is equal to zero",
+        2290 => "check constraint (.) violated",
+        6502 => "PL/SQL: numeric or value error",
+        65535 => "Oracle Database client does not support error number exceeding 65535.",
+        20000..=20999 => "",
+        _ => "PL/SQL exception (Oracle message catalog entry unavailable)",
+    };
+    Error::Oracle {
+        code,
+        message: message.into(),
+    }
 }

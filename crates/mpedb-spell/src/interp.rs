@@ -32,6 +32,43 @@ pub(crate) fn validate_oracle_number_literal(text: &str) -> Result<()> {
     oracle_number::normalize(text).map(|_| ())
 }
 
+/// Oracle rounds EXCEPTION_INIT numeric literals as BINARY_INTEGER. Decimal
+/// literals keep the same exact path as PL/SQL assignments, never f64.
+pub(crate) fn oracle_exception_init_code(text: &str) -> Result<u32> {
+    let code = if text.ends_with(['f', 'F', 'd', 'D']) {
+        let suffix = text.as_bytes()[text.len() - 1];
+        let digits = &text[..text.len() - 1];
+        let n = if matches!(suffix, b'f' | b'F') {
+            digits
+                .parse::<f32>()
+                .map(f64::from)
+                .map_err(|_| Error::ArithmeticOverflow)?
+        } else {
+            digits
+                .parse::<f64>()
+                .map_err(|_| Error::ArithmeticOverflow)?
+        };
+        let rounded = n.round();
+        if !rounded.is_finite() || !(-1_000_000.0..=100.0).contains(&rounded) {
+            return Err(Error::ArithmeticOverflow);
+        }
+        rounded as i64
+    } else {
+        let Value::Int(n) = oracle_number::integer(PValue::Scalar(Value::Numeric(text.into())))?
+        else {
+            unreachable!("numeric literal")
+        };
+        n
+    };
+    match code {
+        100 => Ok(1403),
+        -1_000_000..=-1 if code != -1403 => Ok(code.unsigned_abs() as u32),
+        _ => Err(Error::Unsupported(
+            "illegal Oracle EXCEPTION_INIT error number".into(),
+        )),
+    }
+}
+
 mod oracle_text;
 mod legacy_oracle_number;
 #[cfg(test)]
@@ -499,6 +536,7 @@ pub fn run(
                 let matches = matches!(error, Error::OracleUserException { identity } if *identity == oracle_exception::user_identity(proc, i));
                 stack.push(PValue::Scalar(Value::Bool(matches)));
             }
+            Op::OracleRaiseBound(code) => return Err(oracle_exception::bound(code)),
             Op::OracleRaise(code) => return Err(oracle_exception::named(code)),
             Op::OracleSqlCode => stack.push(PValue::Scalar(Value::Numeric(oracle_exception::sqlcode(&caught)?.to_string()))),
             Op::OracleSqlErrm => stack.push(PValue::Scalar(Value::Text(oracle_exception::sqlerrm(&caught)?))),
@@ -864,7 +902,7 @@ pub fn run(
             Ok(Some(value)) => return Ok(value),
             Ok(None) => {},
             Err(error) => {
-                let Some(frame) = frames.pop() else { return Err(error); };
+                let Some(frame) = frames.pop() else { return Err(oracle_exception::entry_boundary(error)); };
                 let error = oracle_exception::semantic(error, op)?;
                 stack.clear(); // validator requires an empty stack at Try entry
                 pc = frame.handler;

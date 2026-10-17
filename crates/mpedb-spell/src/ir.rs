@@ -218,6 +218,8 @@ pub enum Op {
     OracleRaise(u16),
     /// Raise/match a lexical exception identity stored as a 32-byte constant.
     OracleRaiseUser(u16),
+    /// A code bound by EXCEPTION_INIT; the old u16 opcode stays unchanged.
+    OracleRaiseBound(u32),
     OracleMatchUser(u16),
     OracleSqlCode,
     OracleSqlErrm,
@@ -336,6 +338,7 @@ const OP_ORACLE_NUMBER_CONSTRAINT: u8 = 90;
 const OP_ORACLE_NOT_NULL: u8 = 91;
 const OP_ORACLE_RAISE_USER: u8 = 92;
 const OP_ORACLE_MATCH_USER: u8 = 93;
+const OP_ORACLE_RAISE_BOUND: u8 = 94;
 
 
 
@@ -604,6 +607,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleExceptionCode => b.push(OP_ORACLE_EXCEPTION_CODE),
         Op::OracleReraise => b.push(OP_ORACLE_RERAISE),
         Op::OracleRaise(code) => u16arg(OP_ORACLE_RAISE, code),
+        Op::OracleRaiseBound(code) => { b.push(OP_ORACLE_RAISE_BOUND); b.extend_from_slice(&code.to_le_bytes()); },
         Op::OracleRaiseUser(i) => u16arg(OP_ORACLE_RAISE_USER, i),
         Op::OracleMatchUser(i) => u16arg(OP_ORACLE_MATCH_USER, i),
         Op::OracleSqlCode => b.push(OP_ORACLE_SQLCODE),
@@ -732,6 +736,11 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_EXCEPTION_CODE => Op::OracleExceptionCode,
         OP_ORACLE_RERAISE => Op::OracleReraise,
         OP_ORACLE_RAISE => Op::OracleRaise(u16arg()?),
+        OP_ORACLE_RAISE_BOUND => {
+            let raw = buf.get(*pos..*pos + 4).ok_or_else(err)?;
+            *pos += 4;
+            Op::OracleRaiseBound(u32::from_le_bytes(raw.try_into().unwrap()))
+        },
         OP_ORACLE_RAISE_USER => Op::OracleRaiseUser(u16arg()?),
         OP_ORACLE_MATCH_USER => Op::OracleMatchUser(u16arg()?),
         OP_ORACLE_SQLCODE => Op::OracleSqlCode,
@@ -789,7 +798,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
 /// table (operand bounds are checked before this is called).
 fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
     match op {
-        Op::OracleTry { .. } | Op::OracleReraise | Op::OracleRaise(_) | Op::OracleRaiseUser(_) => (0, 0),
+        Op::OracleTry { .. } | Op::OracleReraise | Op::OracleRaise(_) | Op::OracleRaiseUser(_) | Op::OracleRaiseBound(_) => (0, 0),
         Op::OracleExceptionCode | Op::OracleSqlCode | Op::OracleSqlErrm | Op::OracleMatchUser(_) => (0, 1),
         Op::OracleRaiseApplication => (2, 0),
         Op::LoadConst(_) | Op::LoadLocal(_) => (0, 1),
@@ -883,6 +892,9 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
                 if !matches!(consts.get(i as usize), Some(Value::Blob(b)) if b.len() == 32 && b.iter().any(|v| *v != 0)) {
                     return Err(Error::Corrupt("proc: invalid user exception identity".into()));
                 }
+            }
+            Op::OracleRaiseBound(code) if !(1..=1_000_000).contains(&code) => {
+                return Err(Error::Corrupt("proc: invalid EXCEPTION_INIT code".into()));
             }
             Op::OracleRaise(code) if !matches!(code, 1 | 1403 | 1422 | 1476 | 6502) => {
                 return Err(Error::Corrupt("proc: unknown named Oracle exception".into()));
@@ -981,7 +993,7 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
         }
         max = max.max(after);
         match op {
-            Op::Return | Op::MissingReturn | Op::OracleRaise(_) | Op::OracleRaiseUser(_) | Op::OracleReraise | Op::OracleRaiseApplication => {}
+            Op::Return | Op::MissingReturn | Op::OracleRaise(_) | Op::OracleRaiseUser(_) | Op::OracleRaiseBound(_) | Op::OracleReraise | Op::OracleRaiseApplication => {}
             Op::OracleTry { handler, .. } => {
                 if depth != 0 { return Err(Error::Corrupt("proc: Oracle exception scope requires an empty stack".into())); }
                 visit(handler as usize, 0, &mut entry, &mut work)?;
@@ -1411,6 +1423,40 @@ mod user_exception_tests {
         assert_eq!(Proc::decode(&p.encode()).unwrap(), p);
         for i in 0..p.encode().len() {
             assert!(Proc::decode(&p.encode()[..i]).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod bound_exception_tests {
+    use super::*;
+    #[test]
+    fn bound_codes_keep_wide_operands_and_reject_invalid_ir() {
+        for code in [1, 1403, 65535, 65536, 1000000] {
+            let p = Proc::new(
+                "bound".into(),
+                0,
+                0,
+                vec![],
+                vec![],
+                vec![Op::OracleRaiseBound(code)],
+            )
+            .unwrap();
+            assert_eq!(Proc::decode(&p.encode()).unwrap(), p);
+            for len in 0..5 {
+                assert!(decode_op(&[94, 0, 0, 1, 0][..len], &mut 0).is_err());
+            }
+        }
+        for code in [0, 1000001, u32::MAX] {
+            assert!(Proc::new(
+                "bad".into(),
+                0,
+                0,
+                vec![],
+                vec![],
+                vec![Op::OracleRaiseBound(code)]
+            )
+            .is_err());
         }
     }
 }
