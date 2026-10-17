@@ -259,7 +259,9 @@ infinities, finite extrema and subnormal values through repeated writes and
 MPEdb import. Postimage/key comparisons use IEEE bits, and shared verify/reconcile
 use the same transport equality so unchanged NaNs no longer cause false
 divergence or repeated repairs. Binary64 values rounded by BINARY_FLOAT remain
-rejected. The measured Oracle reference normalizes submitted negative zero;
+rejected. The native fixture also persists NaN images in the receipt BLOB,
+reconnects, and recovers/replays the original images after an intervening foreign
+update without reapplying DML. The measured Oracle reference normalizes submitted negative zero;
 that sign loss is detected and the entire write is rolled back rather than
 silently accepted. Shared postimage/ACK regression tests remain green.
 

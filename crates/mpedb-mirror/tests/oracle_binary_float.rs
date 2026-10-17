@@ -136,6 +136,66 @@ fn native_oracle_binary_floats_roundtrip_specials_and_reject_signed_zero_loss() 
         kind: NetOpKind::Upsert(negative),
     };
     assert!(source.write_batch(&tables, &[op]).is_err(), "Oracle's negative-zero normalization must be detected rather than silently losing the submitted sign");
+    // The durable receipt codec must retain IEEE images too, including after
+    // reconnect and an intervening source update.
+    let receipt_id = "native-binary-float-receipt";
+    source.ensure_source_state(receipt_id, 1, "source").unwrap();
+    let state = source.source_state_identity(receipt_id).unwrap();
+    let ledger = source.prepare_write_ledger().unwrap();
+    let request = mpedb_mirror::oracle_source::OracleWriteRequest {
+        mirror_id: receipt_id,
+        token: [42; 32],
+        epoch: 1,
+        authority: "source",
+        state_identity: &state,
+        ledger_identity: &ledger,
+    };
+    source
+        .write_batch_receipted(&tables, &ops[..1], &request)
+        .unwrap();
+    c.execute(
+        "UPDATE MPEDB_BINARY_FLOAT_CASE SET single_value=1,double_value=2 WHERE id=1",
+        &[],
+    )
+    .unwrap();
+    c.commit().unwrap();
+    drop(source);
+    let mut source = OracleSource::connect(&spec).unwrap();
+    let recovered = source
+        .recover_write_receipt(&tables, &ops[..1], &request)
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect::<Vec<_>>();
+    assert!(same_rows(&recovered, &original[..1]));
+    let replay = source
+        .write_batch_receipted(&tables, &ops[..1], &request)
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect::<Vec<_>>();
+    assert!(same_rows(&replay, &original[..1]));
+    assert_eq!(
+        c.query_row_as::<u64>(
+            "SELECT double_value FROM MPEDB_BINARY_FLOAT_CASE WHERE id=1",
+            &[]
+        )
+        .unwrap(),
+        2
+    );
+    c.execute("UPDATE MPEDB_BINARY_FLOAT_CASE SET single_value=BINARY_FLOAT_NAN,double_value=BINARY_DOUBLE_NAN WHERE id=1", &[]).unwrap();
+    c.execute(
+        "DELETE FROM MPEDB_WRITE_RECEIPTS WHERE mirror_id=:1",
+        &[&receipt_id.as_bytes()],
+    )
+    .unwrap();
+    c.execute(
+        "DELETE FROM MPEDB_MIRROR_STATE WHERE mirror_id=:1",
+        &[&receipt_id.as_bytes()],
+    )
+    .unwrap();
+    c.commit().unwrap();
     let dest = mpedb_testkit::scratch_base()
         .join(format!("oracle-binary-float-{}.mpedb", std::process::id()));
     let (db, _) = mpedb_mirror::import_oracle(
