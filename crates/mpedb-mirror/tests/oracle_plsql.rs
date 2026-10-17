@@ -158,3 +158,130 @@ fn native_oracle_application_dynamic_dml_runs_inside_mpedb_with_exact_binds() {
     c.execute("DROP PROCEDURE MPEDB_SQL_HANDLE", &[]).unwrap();
     c.execute("DROP TABLE MPEDB_SQL_LEDGER PURGE", &[]).unwrap();
 }
+
+#[test]
+#[ignore = "requires MPEDB_ORACLE_SOURCE_CONFIG and Oracle client libraries"]
+fn native_oracle_error_reporting_and_application_error_limits_match_mpedb() {
+    let path = std::env::var("MPEDB_ORACLE_SOURCE_CONFIG").unwrap();
+    let spec = sourcecfg::load(std::path::Path::new(&path)).unwrap();
+    let SourceSpec::Oracle {
+        connect_string,
+        username,
+        password,
+    } = &spec
+    else {
+        panic!("Oracle required")
+    };
+    let c = oracle_client::Connection::connect(username, password, connect_string).unwrap();
+    let definitions=[
+        ("MPEDB_ERR_CODE","CREATE OR REPLACE FUNCTION MPEDB_ERR_CODE(p PLS_INTEGER) RETURN NUMBER IS BEGIN IF p=0 THEN RETURN SQLCODE; ELSIF p=1 THEN RAISE NO_DATA_FOUND; ELSE RAISE_APPLICATION_ERROR(-20001,'ø'); END IF; EXCEPTION WHEN OTHERS THEN RETURN SQLCODE(); END;"),
+        ("MPEDB_ERR_TEXT","CREATE OR REPLACE FUNCTION MPEDB_ERR_TEXT(p PLS_INTEGER) RETURN VARCHAR2 IS n NUMBER; BEGIN IF p=0 THEN RETURN SQLERRM(); ELSIF p=1 THEN RAISE NO_DATA_FOUND; ELSE n:=1/0; END IF; RETURN SQLERRM; EXCEPTION WHEN OTHERS THEN RETURN SQLERRM; END;"),
+        ("MPEDB_ERR_LONG","CREATE OR REPLACE FUNCTION MPEDB_ERR_LONG(p VARCHAR2) RETURN VARCHAR2 IS BEGIN RAISE_APPLICATION_ERROR(-20001,p); EXCEPTION WHEN OTHERS THEN RETURN SQLERRM; END;"),
+        ("MPEDB_ERR_RANGE","CREATE OR REPLACE FUNCTION MPEDB_ERR_RANGE(p NUMBER) RETURN NUMBER IS BEGIN RAISE_APPLICATION_ERROR(p,'test',FALSE); EXCEPTION WHEN OTHERS THEN RETURN SQLCODE; END;"),
+        ("MPEDB_ERR_RESTORE","CREATE OR REPLACE FUNCTION MPEDB_ERR_RESTORE RETURN NUMBER IS n NUMBER:=0; BEGIN RAISE ZERO_DIVIDE; EXCEPTION WHEN ZERO_DIVIDE THEN BEGIN RAISE NO_DATA_FOUND; EXCEPTION WHEN NO_DATA_FOUND THEN n:=SQLCODE; END; RETURN n+SQLCODE; END;"),
+        ("MPEDB_ERR_UNHANDLED","CREATE OR REPLACE FUNCTION MPEDB_ERR_UNHANDLED(p VARCHAR2) RETURN NUMBER IS BEGIN RAISE_APPLICATION_ERROR(-20001,p); RETURN 0; END;"),
+    ];
+    for (_, sql) in &definitions {
+        c.execute(sql, &[]).unwrap();
+    }
+    let source = OracleSource::connect(&spec).unwrap();
+    let path =
+        mpedb_testkit::scratch_base().join(format!("oracle-errors-{}.mpedb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let cfg=mpedb_types::Config::from_toml_str(&format!("[database]\npath=\"{}\"\nsize_mb=32\ndurability=\"none\"\n[[table]]\nname=\"carrier\"\nprimary_key=[\"id\"]\n[[table.column]]\nname=\"id\"\ntype=\"int64\"\n",mpedb_testkit::toml_path(&path))).unwrap();
+    let db = mpedb::Database::open_with_config(cfg).unwrap();
+    let engine = mpedb_proc::ProcEngine::new(&db);
+    for routine in source
+        .routines()
+        .unwrap()
+        .into_iter()
+        .filter(|r| definitions.iter().any(|(name, _)| *name == r.name))
+    {
+        engine
+            .define(&routine.create_source(), mpedb_proc::Lang::PlSql)
+            .unwrap();
+    }
+    for mode in 0i64..3 {
+        let n: String = c
+            .query_row_as(
+                "SELECT TO_CHAR(MPEDB_ERR_CODE(:1),'TM9') FROM dual",
+                &[&mode],
+            )
+            .unwrap();
+        assert_eq!(
+            engine.call("MPEDB_ERR_CODE", &[Value::Int(mode)]).unwrap(),
+            mpedb_proc::ProcValue::Scalar(Value::Numeric(n))
+        );
+        let text: String = c
+            .query_row_as("SELECT MPEDB_ERR_TEXT(:1) FROM dual", &[&mode])
+            .unwrap();
+        assert_eq!(
+            engine.call("MPEDB_ERR_TEXT", &[Value::Int(mode)]).unwrap(),
+            mpedb_proc::ProcValue::Scalar(Value::Text(text))
+        );
+    }
+    for text in [
+        "x".repeat(2500),
+        "ø".repeat(1500),
+        "🙂".repeat(700),
+        format!("a{}", "ø".repeat(1500)),
+    ] {
+        let native: String = c
+            .query_row_as("SELECT MPEDB_ERR_LONG(:1) FROM dual", &[&text])
+            .unwrap();
+        assert_eq!(
+            engine.call("MPEDB_ERR_LONG", &[Value::Text(text)]).unwrap(),
+            mpedb_proc::ProcValue::Scalar(Value::Text(native))
+        );
+    }
+    for value in [
+        Some("-20000"),
+        Some("-20999"),
+        Some("-20000.5"),
+        Some("-19999"),
+        Some("-21000"),
+        None,
+    ] {
+        let native: String = c
+            .query_row_as(
+                "SELECT TO_CHAR(MPEDB_ERR_RANGE(:1),'TM9') FROM dual",
+                &[&value],
+            )
+            .unwrap();
+        let value = value.map_or(Value::Null, |v| Value::Numeric(v.into()));
+        assert_eq!(
+            engine.call("MPEDB_ERR_RANGE", &[value]).unwrap(),
+            mpedb_proc::ProcValue::Scalar(Value::Numeric(native))
+        );
+    }
+    let native: String = c
+        .query_row_as("SELECT TO_CHAR(MPEDB_ERR_RESTORE,'TM9') FROM dual", &[])
+        .unwrap();
+    assert_eq!(
+        engine.call("MPEDB_ERR_RESTORE", &[]).unwrap(),
+        mpedb_proc::ProcValue::Scalar(Value::Numeric(native))
+    );
+    let long = "x".repeat(2500);
+    let native = c
+        .execute(
+            "DECLARE n NUMBER; BEGIN n:=MPEDB_ERR_UNHANDLED(:1); END;",
+            &[&long],
+        )
+        .unwrap_err()
+        .to_string();
+    let line = native
+        .lines()
+        .find(|line| line.contains("ORA-20001: "))
+        .unwrap();
+    let body = line.split_once("ORA-20001: ").unwrap().1;
+    let error = engine
+        .call("MPEDB_ERR_UNHANDLED", &[Value::Text(long)])
+        .unwrap_err();
+    assert!(matches!(error,mpedb_types::Error::Oracle{code:20001,ref message} if message==body));
+    drop(engine);
+    drop(db);
+    let _ = std::fs::remove_file(path);
+    for (name, _) in definitions {
+        c.execute(&format!("DROP FUNCTION {name}"), &[]).unwrap();
+    }
+}

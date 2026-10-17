@@ -211,6 +211,9 @@ pub enum Op {
     OracleExceptionCode,
     OracleReraise,
     OracleRaise(u16),
+    OracleSqlCode,
+    OracleSqlErrm,
+    OracleRaiseApplication,
     /// Pop `plans[p].argc` scalar args, run the DML plan, push the affected
     /// row count as an int.
     DbExec(u16),
@@ -318,6 +321,9 @@ const OP_ORACLE_TRY: u8 = 83;
 const OP_ORACLE_EXCEPTION_CODE: u8 = 84;
 const OP_ORACLE_RERAISE: u8 = 85;
 const OP_ORACLE_RAISE: u8 = 86;
+const OP_ORACLE_SQLCODE: u8 = 87;
+const OP_ORACLE_SQLERRM: u8 = 88;
+const OP_ORACLE_RAISE_APPLICATION: u8 = 89;
 
 
 
@@ -581,6 +587,9 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleExceptionCode => b.push(OP_ORACLE_EXCEPTION_CODE),
         Op::OracleReraise => b.push(OP_ORACLE_RERAISE),
         Op::OracleRaise(code) => u16arg(OP_ORACLE_RAISE, code),
+        Op::OracleSqlCode => b.push(OP_ORACLE_SQLCODE),
+        Op::OracleSqlErrm => b.push(OP_ORACLE_SQLERRM),
+        Op::OracleRaiseApplication => b.push(OP_ORACLE_RAISE_APPLICATION),
         Op::OracleNeg => b.push(OP_ORACLE_NEG),
         Op::OracleVarchar(limit) => u16arg(OP_ORACLE_VARCHAR, limit),
         Op::OracleLoopBound => b.push(OP_ORACLE_LOOP_BOUND),
@@ -698,6 +707,9 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_EXCEPTION_CODE => Op::OracleExceptionCode,
         OP_ORACLE_RERAISE => Op::OracleReraise,
         OP_ORACLE_RAISE => Op::OracleRaise(u16arg()?),
+        OP_ORACLE_SQLCODE => Op::OracleSqlCode,
+        OP_ORACLE_SQLERRM => Op::OracleSqlErrm,
+        OP_ORACLE_RAISE_APPLICATION => Op::OracleRaiseApplication,
         OP_ORACLE_NEG => Op::OracleNeg,
         OP_ORACLE_VARCHAR => Op::OracleVarchar(u16arg()?),
         OP_ORACLE_LOOP_BOUND => Op::OracleLoopBound,
@@ -750,7 +762,8 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
 fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
     match op {
         Op::OracleTry { .. } | Op::OracleReraise | Op::OracleRaise(_) => (0, 0),
-        Op::OracleExceptionCode => (0, 1),
+        Op::OracleExceptionCode | Op::OracleSqlCode | Op::OracleSqlErrm => (0, 1),
+        Op::OracleRaiseApplication => (2, 0),
         Op::LoadConst(_) | Op::LoadLocal(_) => (0, 1),
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
@@ -930,7 +943,7 @@ fn validate(instrs: &[Op], nlocals: u16, nconsts: usize, plans: &[PlanRef]) -> R
         }
         max = max.max(after);
         match op {
-            Op::Return | Op::MissingReturn | Op::OracleRaise(_) | Op::OracleReraise => {}
+            Op::Return | Op::MissingReturn | Op::OracleRaise(_) | Op::OracleReraise | Op::OracleRaiseApplication => {}
             Op::OracleTry { handler, .. } => {
                 if depth != 0 { return Err(Error::Corrupt("proc: Oracle exception scope requires an empty stack".into())); }
                 visit(handler as usize, 0, &mut entry, &mut work)?;
@@ -1153,6 +1166,19 @@ mod tests {
             Op::OracleTry { handler: 1, end: 1, handler_end: u32::MAX }] {
             assert!(Proc::new("range".into(), 0, 0, vec![], vec![], vec![op]).is_err());
         }
+    }
+
+    #[test]
+    fn oracle_reporting_and_application_raise_keep_additive_wire_tags() {
+        for (op, tag) in [(Op::OracleSqlCode, 87), (Op::OracleSqlErrm, 88), (Op::OracleRaiseApplication, 89)] {
+            let mut bytes = Vec::new(); encode_op(&mut bytes, op);
+            assert_eq!(bytes, vec![tag]);
+            assert_eq!(decode_op(&bytes, &mut 0).unwrap(), op);
+        }
+        let s = crate::plsql::compile("CREATE FUNCTION app_error RETURN VARCHAR2 IS BEGIN RAISE_APPLICATION_ERROR(-20001,'ø'); EXCEPTION WHEN OTHERS THEN RETURN SQLERRM; END;").unwrap();
+        let p = Proc::new(s.name, s.argc, s.nlocals, vec![], s.consts, s.instrs).unwrap();
+        assert_eq!(Proc::decode(&p.encode()).unwrap(), p);
+        assert!(Proc::new("underflow".into(), 0, 0, vec![], vec![], vec![Op::OracleRaiseApplication]).is_err());
     }
 
     /// Cursor ops: encode/decode roundtrip, full decode fuzz (truncation at

@@ -443,6 +443,7 @@ impl Parser<'_> {
         Ok(())
     }
     fn statement(&mut self) -> Result<()> {
+        if self.is_word("RAISE_APPLICATION_ERROR") && !self.locals.contains_key("RAISE_APPLICATION_ERROR") { self.at += 1; return self.raise_application(); }
         if self.word("RAISE") { return self.raise_statement(); }
         if self.word("EXECUTE") { return self.execute_immediate(); }
         let declarations = self.word("DECLARE");
@@ -823,6 +824,16 @@ impl Parser<'_> {
         })
     }
     fn atom(&mut self) -> Result<Option<Type>> {
+        for (name, op, ty) in [("SQLCODE", Op::OracleSqlCode, Type::Number), ("SQLERRM", Op::OracleSqlErrm, Type::Varchar(0))] {
+            if self.is_word(name) && !self.locals.contains_key(name) {
+                self.at += 1;
+                if self.symbol("(") && !self.symbol(")") {
+                    return Err(self.error("explicit SQLERRM error-code arguments are not implemented"));
+                }
+                self.builder.emit(op)?;
+                return Ok(Some(ty));
+            }
+        }
         if self.word("NULL") {
             self.constant(Value::Null)?;
             return Ok(None);

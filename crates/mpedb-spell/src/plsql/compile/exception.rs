@@ -117,3 +117,23 @@ impl Parser<'_> {
         Ok(())
     }
 }
+
+impl Parser<'_> {
+    pub(super) fn raise_application(&mut self) -> Result<()> {
+        self.want_symbol("(")?;
+        let actual = self.expression()?;
+        self.compatible(Type::Number, actual)?;
+        self.builder.emit(Op::OraclePlSqlInteger)?;
+        self.want_symbol(",")?;
+        let actual = self.expression()?;
+        self.compatible(Type::Varchar(0), actual)?;
+        self.builder.emit(Op::OracleVarchar(0))?;
+        if self.symbol(",") && !self.word("FALSE") {
+            return Err(self.error("RAISE_APPLICATION_ERROR error-stack preservation is not implemented; only FALSE is supported"));
+        }
+        self.want_symbol(")")?;
+        self.want_symbol(";")?;
+        self.builder.emit(Op::OracleRaiseApplication)?;
+        Ok(())
+    }
+}

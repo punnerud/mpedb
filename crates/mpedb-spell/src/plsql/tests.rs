@@ -837,3 +837,39 @@ fn malformed_handlers_and_raise_outside_a_handler_refuse() {
         "BEGIN NULL; EXCEPTION WHEN unknown_exception THEN NULL; END;",
     ] {assert!(compile(&function("","NUMBER",body)).is_err(),"{body}");}
 }
+
+#[test]
+fn sqlcode_and_sqlerrm_follow_handler_scope_and_no_data_found_sign() {
+    for (body,expected) in [
+        ("BEGIN RETURN SQLCODE; END;","0"),
+        ("BEGIN RAISE NO_DATA_FOUND; EXCEPTION WHEN OTHERS THEN RETURN SQLCODE(); END;","100"),
+        ("BEGIN RAISE TOO_MANY_ROWS; EXCEPTION WHEN OTHERS THEN RETURN SQLCODE; END;","-1422"),
+        ("n NUMBER:=0; BEGIN RAISE ZERO_DIVIDE; EXCEPTION WHEN ZERO_DIVIDE THEN BEGIN RAISE NO_DATA_FOUND; EXCEPTION WHEN NO_DATA_FOUND THEN n:=SQLCODE; END; RETURN n+SQLCODE; END;","-1376"),
+        ("BEGIN BEGIN RAISE ZERO_DIVIDE; EXCEPTION WHEN OTHERS THEN NULL; END; RETURN SQLCODE; END;","0"),
+    ] {assert_eq!(call(&function("","NUMBER",body),&[]).unwrap(),Value::Numeric(expected.into()),"{body}");}
+    for (body,expected) in [
+        ("BEGIN RETURN SQLERRM(); END;","ORA-0000: normal, successful completion"),
+        ("BEGIN RAISE NO_DATA_FOUND; EXCEPTION WHEN OTHERS THEN RETURN SQLERRM; END;","ORA-01403: no data found"),
+        ("n NUMBER; BEGIN n:=1/0; RETURN ''; EXCEPTION WHEN ZERO_DIVIDE THEN RETURN SQLERRM; END;","ORA-01476: divisor is equal to zero"),
+    ] {assert_eq!(call(&function("","VARCHAR2",body),&[]).unwrap(),Value::Text(expected.into()),"{body}");}
+}
+
+#[test]
+fn application_errors_preserve_codes_messages_rounding_and_utf8_limits() {
+    for (code,expected) in [("-20000","-20000"),("-20999","-20999"),("-20000.5","-20001"),("-19999","-21000"),("NULL","-21000")] {
+        let body=format!("BEGIN RAISE_APPLICATION_ERROR({code},'ø',FALSE); EXCEPTION WHEN OTHERS THEN RETURN SQLCODE; END;");
+        assert_eq!(call(&function("","NUMBER",&body),&[]).unwrap(),Value::Numeric(expected.into()));
+    }
+    let body="BEGIN RAISE_APPLICATION_ERROR(-20001,'ø'); EXCEPTION WHEN OTHERS THEN RETURN SQLERRM; END;";
+    assert_eq!(call(&function("","VARCHAR2",body),&[]).unwrap(),Value::Text("ORA-20001: ø".into()));
+    let body="BEGIN RAISE_APPLICATION_ERROR(-19999,'ignored'); EXCEPTION WHEN OTHERS THEN RETURN SQLERRM; END;";
+    assert_eq!(call(&function("","VARCHAR2",body),&[]).unwrap(),Value::Text("ORA-21000: error number argument to raise_application_error of -19999 is out of range".into()));
+    let long="ø".repeat(1500);
+    let body=format!("BEGIN RAISE_APPLICATION_ERROR(-20001,'{long}'); EXCEPTION WHEN OTHERS THEN RETURN SQLERRM; END;");
+    let Value::Text(text)=call(&function("","VARCHAR2",&body),&[]).unwrap() else{panic!("text required")};
+    assert_eq!(text.len(),511);assert!(text.starts_with("ORA-20001: "));
+    let body=format!("BEGIN RAISE_APPLICATION_ERROR(-20001,'{long}'); END;");
+    let error=call(&function("","NUMBER",&body),&[]).unwrap_err();
+    assert!(matches!(error,mpedb_types::Error::Oracle{code:20001,ref message} if message.len()==2034));
+    assert!(compile(&function("","NUMBER","BEGIN RAISE_APPLICATION_ERROR(-20001,'x',TRUE); END;")).is_err());
+}

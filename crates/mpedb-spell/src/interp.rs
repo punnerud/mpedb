@@ -482,6 +482,13 @@ pub fn run(
                 return Err(caught.pop().ok_or_else(|| rt_err("RAISE has no active exception"))?.error);
             }
             Op::OracleRaise(code) => return Err(oracle_exception::named(code)),
+            Op::OracleSqlCode => stack.push(PValue::Scalar(Value::Numeric(oracle_exception::sqlcode(&caught)?.to_string()))),
+            Op::OracleSqlErrm => stack.push(PValue::Scalar(Value::Text(oracle_exception::sqlerrm(&caught)?))),
+            Op::OracleRaiseApplication => {
+                let message = stack.pop().expect("validated");
+                let code = stack.pop().expect("validated");
+                return Err(oracle_exception::application(code, message)?);
+            }
             Op::LoadConst(i) => stack.push(PValue::Scalar(proc.consts[i as usize].clone())),
             Op::LoadLocal(i) => match &locals[i as usize] {
                 Some(v) => stack.push(v.clone()),

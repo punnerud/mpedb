@@ -67,3 +67,64 @@ pub(super) fn semantic(error: Error, op: Op) -> std::result::Result<Error, Error
         message: error.to_string(),
     })
 }
+
+pub(super) fn sqlcode(caught: &[Caught]) -> Result<i64> {
+    match caught.last().map(|c| &c.error) {
+        None => Ok(0),
+        Some(Error::Oracle { code: 1403, .. }) => Ok(100),
+        Some(Error::Oracle { code, .. }) => Ok(-i64::from(*code)),
+        _ => Err(Error::Corrupt("proc: non-Oracle exception context".into())),
+    }
+}
+pub(super) fn sqlerrm(caught: &[Caught]) -> Result<String> {
+    let mut text = match caught.last().map(|c| &c.error) {
+        None => "ORA-0000: normal, successful completion".into(),
+        // Legacy handlers retain their original error detail. SQLERRM's new
+        // operation renders Oracle's canonical divisor message separately.
+        Some(Error::Oracle { code: 1476, .. }) => named(1476).to_string(),
+        Some(e @ Error::Oracle { .. }) => e.to_string(),
+        _ => return Err(Error::Corrupt("proc: non-Oracle exception context".into())),
+    };
+    let mut end = text.len().min(512);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    Ok(text)
+}
+
+pub(super) fn application(code: PValue, message: PValue) -> Result<Error> {
+    let code = match code {
+        PValue::Scalar(Value::Int(n)) => n,
+        PValue::Scalar(Value::Null) => 0,
+        _ => return Err(type_err("RAISE_APPLICATION_ERROR requires an integer code")),
+    };
+    if !(-20999..=-20000).contains(&code) {
+        return Ok(Error::Oracle {
+            code: 21000,
+            message: format!(
+                "error number argument to raise_application_error of {code} is out of range"
+            ),
+        });
+    }
+    let mut message = match message {
+        PValue::Scalar(Value::Text(text)) => text,
+        PValue::Scalar(Value::Null) => String::new(),
+        _ => {
+            return Err(type_err(
+                "RAISE_APPLICATION_ERROR requires a character message",
+            ))
+        }
+    };
+    // Native 23.26.3 reference: the English error envelope retains at most
+    // 2034 message bytes (2045 including ORA prefix), at a UTF-8 boundary.
+    let mut end = message.len().min(2034);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    Ok(Error::Oracle {
+        code: code.unsigned_abs() as u32,
+        message,
+    })
+}

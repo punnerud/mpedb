@@ -299,9 +299,20 @@ For procedures with handlers, SQL statements execute under complete engine
 savepoints. A caught multi-row INSERT failure removes every inserted row while
 preserving preceding successful DML. Native Oracle tests compare that behavior,
 NO_DATA_FOUND fallback, and an exception-bearing Boolean function transported
-through rRETL apply/revert and source write-back. Full exception coverage still
-needs user-defined declarations, RAISE_APPLICATION_ERROR, SQLCODE/SQLERRM and
-complete Oracle classification of database errors.
+through rRETL apply/revert and source write-back. Native `SQLCODE`, no-argument `SQLERRM` and
+`RAISE_APPLICATION_ERROR(code, message[, FALSE])` are also implemented with
+additive opcodes 87–89. Native reference tests cover +100 for NO_DATA_FOUND,
+negative codes for other errors, restoration of enclosing handler context,
+BINARY_INTEGER rounding of application codes, NULL/invalid-code ORA-21000,
+and UTF-8-safe SQLERRM truncation to 512 bytes. The measured native 23.26.3
+application-error envelope retains 2034 message bytes; uncaught-message parity
+is tested too.
+
+Full exception coverage still needs user-defined declarations/EXCEPTION_INIT,
+TRUE error-stack preservation, SQLERRM(error_code), localized/detailed messages
+and complete Oracle classification of database errors. See
+[Oracle error reporting](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/retrieving-error-code-and-error-message.html)
+and [raising exceptions](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/raising-exceptions-explicitly.html).
 
 **Parameter defaults, NUMBER precision/scale constraints, static SQL statements,
 calls to other routines, packages and cursors remain unimplemented**;
