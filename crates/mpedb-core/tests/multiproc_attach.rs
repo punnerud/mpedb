@@ -42,7 +42,23 @@ fn db_path(name: &str) -> PathBuf {
     let p = mpedb_testkit::scratch_base().join(format!("mpedb-mp-{name}.mpedb"));
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}-lock", p.display()));
+    let _ = std::fs::remove_file(pending_ready(&p));
     p
+}
+
+fn pending_ready(path: &Path) -> PathBuf {
+    path.with_extension("pending-ready")
+}
+
+fn await_pending_writes(child: &mut std::process::Child, path: &Path) {
+    assert!(
+        until(Duration::from_secs(20), || pending_ready(path).is_file()),
+        "child never completed its uncommitted writes"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "child exited before the hard kill"
+    );
 }
 
 /// The child's durability, read from the env the PARENT set on its `Command`.
@@ -139,7 +155,9 @@ fn a_second_process_writes_and_an_attached_reader_sees_it() {
 
     // The parent stays attached across the child's whole life: this must be
     // mapping coherence, not a re-open picking up a changed file.
-    let out = spawn("mp_child_writes_ten", &path).wait_with_output().unwrap();
+    let out = spawn("mp_child_writes_ten", &path)
+        .wait_with_output()
+        .unwrap();
     assert!(out.status.success(), "child failed: {out:?}");
 
     assert!(
@@ -254,6 +272,7 @@ fn a_writer_killed_mid_transaction_leaves_no_partial_state() {
             .is_some()),
         "child never got started"
     );
+    await_pending_writes(&mut child, &path);
     child.kill().unwrap();
     let _ = child.wait();
 
@@ -261,7 +280,10 @@ fn a_writer_killed_mid_transaction_leaves_no_partial_state() {
     let w = until(Duration::from_secs(10), || {
         eng.try_begin_write().map(|w| w.is_some()).unwrap_or(false)
     });
-    assert!(w, "lock never became acquirable after the holder was killed");
+    assert!(
+        w,
+        "lock never became acquirable after the holder was killed"
+    );
 
     let r = eng.begin_read().unwrap();
     assert!(
@@ -276,6 +298,7 @@ fn a_writer_killed_mid_transaction_leaves_no_partial_state() {
     }
     drop(r);
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(pending_ready(&path));
 }
 
 // -------------------------------------------- 5. durability across a hard kill
@@ -295,10 +318,13 @@ fn a_writer_killed_mid_transaction_leaves_no_partial_state() {
 fn durable_kill_leaves_a_prefix(mode: &str) {
     let path = db_path(&format!("durable-{mode}"));
 
+    // Attach before starting the writer. Opening a commit-durable database
+    // while the child holds its write transaction can wait for that writer,
+    // letting the child's bounded sleep expire and its transaction roll back
+    // before the parent gets a chance to perform the intended hard kill.
+    let watch = open_dur(&path, mode);
     let mut child = spawn_dur("mp_child_dies_holding_writes", &path, mode);
     {
-        // A separate attach, only to watch for the child's committed marker.
-        let watch = open_dur(&path, mode);
         assert!(
             until(Duration::from_secs(20), || watch
                 .begin_read()
@@ -309,6 +335,8 @@ fn durable_kill_leaves_a_prefix(mode: &str) {
             "[{mode}] child never committed its marker"
         );
     }
+    drop(watch);
+    await_pending_writes(&mut child, &path);
     child.kill().unwrap();
     let _ = child.wait();
 
@@ -324,6 +352,7 @@ fn durable_kill_leaves_a_prefix(mode: &str) {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(pending_ready(&path));
 }
 
 #[test]
@@ -347,7 +376,8 @@ fn mp_child_writes_ten() {
     let eng = open_dur(&path, &child_durability());
     for id in 0..10i64 {
         let mut w = eng.begin_write().unwrap();
-        w.insert_row(0, &[Value::Int(id), Value::Int(id * 7)]).unwrap();
+        w.insert_row(0, &[Value::Int(id), Value::Int(id * 7)])
+            .unwrap();
         w.commit().unwrap();
     }
 }
@@ -375,7 +405,8 @@ fn mp_child_pins_a_snapshot() {
     let eng = open_dur(&path, &child_durability());
     {
         let mut w = eng.begin_write().unwrap();
-        w.insert_row(0, &[Value::Int(500), Value::Int(500)]).unwrap();
+        w.insert_row(0, &[Value::Int(500), Value::Int(500)])
+            .unwrap();
         w.commit().unwrap();
     }
     let r = eng.begin_read().unwrap();
@@ -420,13 +451,17 @@ fn mp_child_dies_holding_writes() {
     let eng = open_dur(&path, &child_durability());
     {
         let mut w = eng.begin_write().unwrap();
-        w.insert_row(0, &[Value::Int(777), Value::Int(777)]).unwrap();
+        w.insert_row(0, &[Value::Int(777), Value::Int(777)])
+            .unwrap();
         w.commit().unwrap();
     }
     let mut w = eng.begin_write().unwrap();
     for id in 1000..1010i64 {
         w.insert_row(0, &[Value::Int(id), Value::Int(id)]).unwrap();
     }
+    // Tell the parent that the writes it must prove absent actually happened,
+    // while the write transaction is still held and uncommitted.
+    std::fs::write(pending_ready(&path), b"ready").unwrap();
     // Never committed: die here.
     std::thread::sleep(Duration::from_secs(60));
     drop(w);
