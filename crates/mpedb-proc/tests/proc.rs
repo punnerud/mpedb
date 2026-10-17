@@ -795,6 +795,83 @@ fn plsql_caught_statement_failure_rolls_back_only_that_statement() {
 }
 
 #[test]
+fn plsql_dynamic_returning_assigns_null_and_rolls_back_the_statement() {
+    let (cfg, _guard) = test_config("plsql-dynamic-returning");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query(
+        "CREATE TABLE native_ledger (id INTEGER PRIMARY KEY, amount INTEGER, note TEXT)",
+        &[],
+    )
+    .unwrap();
+    db.query(
+        "INSERT INTO native_ledger VALUES (1, 7, 'seed'), (2, 8, NULL)",
+        &[],
+    )
+    .unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION take_note(p_id PLS_INTEGER) RETURN VARCHAR2 IS v VARCHAR2(20) := 'old'; incoming VARCHAR2(20); BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET note = :1 WHERE id = :2 RETURNING note INTO :3' USING incoming, p_id, OUT v; RETURN v; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("TAKE_NOTE", &[Value::Int(1)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    assert!(matches!(
+        db.query("SELECT note FROM native_ledger WHERE id = 1", &[]).unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![vec![Value::Null]]
+    ));
+    engine
+        .define(
+            "CREATE FUNCTION take_amount(p_id PLS_INTEGER) RETURN NUMBER IS v NUMBER := 1; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = :1 WHERE id = :2 RETURNING amount INTO :3' USING 4, p_id, OUT v; RETURN v; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("TAKE_AMOUNT", &[Value::Int(1)]).unwrap(),
+        ProcValue::Scalar(Value::Numeric("4".into()))
+    );
+    engine
+        .define(
+            "CREATE FUNCTION miss_keeps(p PLS_INTEGER) RETURN NUMBER IS v NUMBER := 7; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = 5 WHERE id = 1'; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = 9 WHERE id = :1 RETURNING amount INTO :2' USING p, OUT v; RETURN 0; EXCEPTION WHEN NO_DATA_FOUND THEN RETURN v; END; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("MISS_KEEPS", &[Value::Int(99)]).unwrap(),
+        ProcValue::Scalar(Value::Numeric("7".into()))
+    );
+    assert!(matches!(
+        db.query("SELECT amount FROM native_ledger WHERE id = 1", &[]).unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![vec![Value::Int(5)]]
+    ));
+    engine
+        .define(
+            "CREATE FUNCTION many_keeps RETURN NUMBER IS v NUMBER := 7; BEGIN EXECUTE IMMEDIATE 'INSERT INTO native_ledger VALUES (3, 3, ''keep'')'; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount = amount + 1 WHERE id < 3 RETURNING amount INTO :1' USING OUT v; RETURN 0; EXCEPTION WHEN TOO_MANY_ROWS THEN RETURN v; END; END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("MANY_KEEPS", &[]).unwrap(),
+        ProcValue::Scalar(Value::Numeric("7".into()))
+    );
+    assert!(matches!(
+        db.query(
+            "SELECT id, amount FROM native_ledger ORDER BY id",
+            &[],
+        )
+        .unwrap(),
+        ExecResult::Rows { rows, .. } if rows == vec![
+            vec![Value::Int(1), Value::Int(5)],
+            vec![Value::Int(2), Value::Int(8)],
+            vec![Value::Int(3), Value::Int(3)],
+        ]
+    ));
+}
+
+#[test]
 fn plsql_others_cannot_hide_engine_budgets_or_unsupported_execution() {
     let (cfg,_guard)=test_config("plsql-handler-budget");
     let db=Database::open_with_config(cfg).unwrap();seed_accounts(&db,&[(1,50)]);

@@ -37,7 +37,7 @@
 //!
 //! # Transactions
 //!
-//! A proc containing any `DbExec` runs **entirely inside one
+//! A proc containing any `DbExec` or `DbReturning` runs **entirely inside one
 //! [`WriteSession`]**: it sees its own writes, commits atomically at a
 //! successful return, and rolls back on *any* error — type errors, budget
 //! exhaustion, constraint violations, a poisoned session. A proc with only
@@ -544,6 +544,28 @@ impl DbBridge for SessionBridge<'_, '_> {
             ExecResult::Affected(n) => Ok(n),
             _ => Err(Error::Corrupt(
                 "proc: exec-kind plan did not report an affected count".into(),
+            )),
+        }
+    }
+
+    fn exec_returning(&mut self, plan: &PlanRef, params: &[Value]) -> Result<Vec<Vec<Value>>> {
+        let result = if self.statement_atomic {
+            self.session.execute_atomic_one_row(&plan.hash, params)?
+        } else {
+            self.session.execute(&plan.hash, params)?
+        };
+        match result {
+            ExecResult::Rows { rows, .. } if rows.len() == 1 => Ok(rows),
+            ExecResult::Rows { rows, .. } if rows.is_empty() => Err(Error::Oracle {
+                code: 1403,
+                message: "no data found".into(),
+            }),
+            ExecResult::Rows { .. } => Err(Error::Oracle {
+                code: 1422,
+                message: "exact fetch returns more than requested number of rows".into(),
+            }),
+            _ => Err(Error::Corrupt(
+                "proc: RETURNING did not produce rows".into(),
             )),
         }
     }

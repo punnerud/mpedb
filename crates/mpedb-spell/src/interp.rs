@@ -213,6 +213,13 @@ fn to_proc_value(v: PValue) -> Result<ProcValue> {
 pub trait DbBridge {
     fn query(&mut self, plan: &PlanRef, params: &[Value]) -> Result<Vec<Vec<Value>>>;
     fn exec(&mut self, plan: &PlanRef, params: &[Value]) -> Result<u64>;
+    /// `DbReturning`: the RETURNING rows of one DML statement. The default
+    /// refuses, so a bridge that only counts affected rows cannot drop the cells.
+    fn exec_returning(&mut self, _plan: &PlanRef, _params: &[Value]) -> Result<Vec<Vec<Value>>> {
+        Err(Error::Unsupported(
+            "RETURNING binds are not available on this bridge".into(),
+        ))
+    }
     fn cursor_open(&mut self, plan: &PlanRef, params: &[Value]) -> Result<u32>;
     fn cursor_advance(&mut self, stream: u32) -> Result<Option<Vec<Value>>>;
     fn cursor_close(&mut self, stream: u32) -> Result<()>;
@@ -800,7 +807,7 @@ pub fn run(
                     pc = t as usize;
                 }
             }
-            Op::DbQuery(p) | Op::DbExec(p) | Op::CursorOpen(p) => {
+            Op::DbQuery(p) | Op::DbExec(p) | Op::DbReturning(p) | Op::CursorOpen(p) => {
                 if db_left == 0 {
                     return Err(budget_db_err(budget.db_calls));
                 }
@@ -840,6 +847,18 @@ pub fn run(
                         let n = i64::try_from(n)
                             .map_err(|_| rt_err("affected-row count exceeds i64"))?;
                         stack.push(PValue::Scalar(Value::Int(n)));
+                    }
+                    Op::DbReturning(_) => {
+                        let rows = bridge.exec_returning(plan, &dbargs)?;
+                        let list: Vec<PValue> = rows
+                            .into_iter()
+                            .map(|row| {
+                                PValue::Tuple(Rc::new(
+                                    row.into_iter().map(PValue::Scalar).collect(),
+                                ))
+                            })
+                            .collect();
+                        stack.push(PValue::List(Rc::new(list)));
                     }
                     _ => {
                         // CursorOpen: claim a free slot (bounded), open the
@@ -1049,6 +1068,11 @@ pub mod testutil {
         pub cursor_opens: usize,
         /// Parameters each `cursor_open` actually received, in call order.
         pub cursor_params: Vec<Vec<Value>>,
+        /// Rows a `DbReturning` call returns. `None` means this mock was not
+        /// given RETURNING rows; `Some` empty is a no-row RETURNING result.
+        pub returning_rows: Option<Vec<Vec<Value>>>,
+        /// Parameters each `exec_returning` received, in call order.
+        pub exec_params: Vec<Vec<Value>>,
         /// Rows `cursor_advance` actually pulled, including a not-found pull.
         pub advances: usize,
         /// Streams `cursor_close` released.
@@ -1066,6 +1090,8 @@ pub mod testutil {
                 execs: 0,
                 cursor_opens: 0,
                 cursor_params: Vec::new(),
+                returning_rows: None,
+                exec_params: Vec::new(),
                 advances: 0,
                 closes: 0,
                 streams: Vec::new(),
@@ -1087,6 +1113,13 @@ pub mod testutil {
         fn exec(&mut self, _plan: &PlanRef, _params: &[Value]) -> Result<u64> {
             self.execs += 1;
             Ok(self.affected)
+        }
+        fn exec_returning(&mut self, _plan: &PlanRef, params: &[Value]) -> Result<Vec<Vec<Value>>> {
+            self.execs += 1;
+            self.exec_params.push(params.to_vec());
+            self.returning_rows
+                .clone()
+                .ok_or_else(|| rt_err("mock: RETURNING rows were not provided"))
         }
         fn cursor_open(&mut self, _plan: &PlanRef, params: &[Value]) -> Result<u32> {
             self.cursor_opens += 1;

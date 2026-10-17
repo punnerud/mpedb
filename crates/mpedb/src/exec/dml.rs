@@ -1076,6 +1076,27 @@ impl mpedb_spell::interp::DbBridge for CtxBridge<'_> {
         }
     }
 
+    fn exec_returning(
+        &mut self,
+        plan: &mpedb_spell::ir::PlanRef,
+        params: &[Value],
+    ) -> Result<Vec<Vec<Value>>> {
+        match self.run_plan(plan, params)? {
+            ExecResult::Rows { rows, .. } if rows.len() == 1 => Ok(rows),
+            ExecResult::Rows { rows, .. } if rows.is_empty() => Err(Error::Oracle {
+                code: 1403,
+                message: "no data found".into(),
+            }),
+            ExecResult::Rows { .. } => Err(Error::Oracle {
+                code: 1422,
+                message: "exact fetch returns more than requested number of rows".into(),
+            }),
+            other => Err(internal(&format!(
+                "trigger procedure RETURNING returned {other:?} (validator bug)"
+            ))),
+        }
+    }
+
     fn cursor_open(
         &mut self,
         plan: &mpedb_spell::ir::PlanRef,

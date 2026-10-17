@@ -236,6 +236,11 @@ pub enum Op {
     /// Pop `plans[p].argc` scalar args, run the DML plan, push the affected
     /// row count as an int.
     DbExec(u16),
+    /// Pop `plans[p].argc` scalar args, run the DML plan, and push its
+    /// RETURNING rows as a list of tuples. Scalar INTO is one row; zero
+    /// rows and many rows stay Oracle exceptions. Distinct from `DbExec`
+    /// so an affected-count call never starts returning cells.
+    DbReturning(u16),
     /// Pop `plans[p].argc` scalar args, open a streaming scan over the
     /// `Query`-kind plan `plans[p]`, push a cursor handle (module docs).
     CursorOpen(u16),
@@ -366,6 +371,8 @@ const OP_CURSOR_FETCH: u8 = 96;
 const OP_CURSOR_CLOSE: u8 = 97;
 // Explicit cursor attributes. Additive, so FETCH (96) and CLOSE (97) stay put.
 const OP_CURSOR_ATTR: u8 = 98;
+// Scalar RETURNING INTO. Additive: `DbExec` still pushes an affected count.
+const OP_DB_RETURNING: u8 = 99;
 
 /// `Op::CursorAttr` selector. Any other byte fails validation.
 pub const CURSOR_ATTR_ISOPEN: u8 = 0;
@@ -389,8 +396,8 @@ pub struct Proc {
     pub instrs: Vec<Op>,
     /// Proven maximum operand-stack depth (validation artifact).
     max_stack: usize,
-    /// Whether any instruction is `DbExec` — decides transactional routing.
-    /// Recomputed from the instructions, never stored.
+    /// Whether any instruction is `DbExec` or `DbReturning` — decides
+    /// transactional routing. Recomputed from the instructions, never stored.
     has_exec: bool,
 }
 
@@ -416,7 +423,9 @@ impl Proc {
             }
         }
         let max_stack = validate(&instrs, nlocals, &consts, &plans)?;
-        let has_exec = instrs.iter().any(|op| matches!(op, Op::DbExec(_)));
+        let has_exec = instrs
+            .iter()
+            .any(|op| matches!(op, Op::DbExec(_) | Op::DbReturning(_)));
         Ok(Proc {
             name,
             argc,
@@ -433,8 +442,9 @@ impl Proc {
         self.max_stack
     }
 
-    /// True if the proc contains any `DbExec`: it must run inside a single
-    /// write transaction. False: it may run lock-free on read snapshots.
+    /// True if the proc contains any `DbExec` or `DbReturning`: it must run
+    /// inside a single write transaction. False: it may run lock-free on
+    /// read snapshots.
     pub fn has_exec(&self) -> bool {
         self.has_exec
     }
@@ -445,7 +455,12 @@ impl Proc {
     pub fn has_db_ops(&self) -> bool {
         self.instrs
             .iter()
-            .any(|op| matches!(op, Op::DbQuery(_) | Op::DbExec(_) | Op::CursorOpen(_)))
+            .any(|op| {
+                matches!(
+                    op,
+                    Op::DbQuery(_) | Op::DbExec(_) | Op::DbReturning(_) | Op::CursorOpen(_)
+                )
+            })
             || !self.plans.is_empty()
     }
 
@@ -587,6 +602,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::StoreLocal(x) => u16arg(OP_STORE_LOCAL, x),
         Op::DbQuery(x) => u16arg(OP_DB_QUERY, x),
         Op::DbExec(x) => u16arg(OP_DB_EXEC, x),
+        Op::DbReturning(x) => u16arg(OP_DB_RETURNING, x),
         Op::CursorOpen(x) => u16arg(OP_CURSOR_OPEN, x),
         Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) => {
             b.push(match op {
@@ -716,6 +732,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_STORE_LOCAL => Op::StoreLocal(u16arg()?),
         OP_DB_QUERY => Op::DbQuery(u16arg()?),
         OP_DB_EXEC => Op::DbExec(u16arg()?),
+        OP_DB_RETURNING => Op::DbReturning(u16arg()?),
         OP_CURSOR_OPEN => Op::CursorOpen(u16arg()?),
         OP_JUMP | OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE | OP_JUMP_IF_SQL_FALSE | OP_JUMP_IF_SQL_TRUE => {
             let raw = buf.get(*pos..*pos + 4).ok_or_else(err)?;
@@ -900,7 +917,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         | Op::Index => (2, 1),
         Op::Jump(_) | Op::MissingReturn => (0, 0),
         Op::JumpIfFalse(_) | Op::JumpIfTrue(_) | Op::JumpIfSqlFalse(_) | Op::JumpIfSqlTrue(_) => (1, 0),
-        Op::DbQuery(p) | Op::DbExec(p) | Op::CursorOpen(p) => {
+        Op::DbQuery(p) | Op::DbExec(p) | Op::DbReturning(p) | Op::CursorOpen(p) => {
             (plans[p as usize].argc as usize, 1)
         }
         Op::CursorAdvance | Op::CursorFetch | Op::CursorRow | Op::CursorAttr(_) => (1, 1),
@@ -967,7 +984,7 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
                     return Err(Error::Corrupt("proc: const index out of range".into()));
                 }
             }
-            Op::DbQuery(p) | Op::DbExec(p) | Op::CursorOpen(p)
+            Op::DbQuery(p) | Op::DbExec(p) | Op::DbReturning(p) | Op::CursorOpen(p)
                 if p as usize >= plans.len() =>
             {
                 return Err(Error::Corrupt("proc: plan index out of range".into()));
@@ -976,6 +993,11 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
             Op::CursorOpen(p) if plans[p as usize].kind != PlanKind::Query => {
                 return Err(Error::Corrupt(
                     "proc: cursor over a non-Query plan".into(),
+                ));
+            }
+            Op::DbReturning(p) if plans[p as usize].kind != PlanKind::Exec => {
+                return Err(Error::Corrupt(
+                    "proc: RETURNING over a non-Exec plan".into(),
                 ));
             }
             Op::CursorAttr(code) if code > CURSOR_ATTR_ROWCOUNT => {
@@ -988,7 +1010,7 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
         }
         match op {
             Op::CursorOpen(_) => any_cursor = true,
-            Op::DbExec(_) => any_exec = true,
+            Op::DbExec(_) | Op::DbReturning(_) => any_exec = true,
             _ => {}
         }
     }

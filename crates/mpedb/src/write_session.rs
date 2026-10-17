@@ -27,6 +27,69 @@ impl WriteSession<'_> {
             }
         }
     }
+    /// Scalar PL/SQL `RETURNING INTO`. Zero rows and many rows become Oracle
+    /// errors before the savepoint is released, so a caught `NO_DATA_FOUND`
+    /// or `TOO_MANY_ROWS` undoes this statement and keeps earlier ones.
+    /// An affected-count result is returned unchanged. [`Self::execute_atomic`]
+    /// stays the path for every other statement.
+    pub fn execute_atomic_one_row(
+        &mut self,
+        hash: &PlanHash,
+        params: &[Value],
+    ) -> Result<ExecResult> {
+        if self.poisoned {
+            return Err(poisoned_err());
+        }
+        let plan = self.plan_by_hash(hash)?;
+        if !plan.footprint.read_only
+            && !matches!(
+                plan.stmt,
+                PlanStmt::Insert { .. } | PlanStmt::Update { .. } | PlanStmt::Delete { .. }
+            )
+        {
+            return Err(Error::Unsupported(
+                "atomic execution requires SELECT or DML".into(),
+            ));
+        }
+        let snapshot = self.txn.savepoint_full()?;
+        let value = match self.execute(hash, params) {
+            Ok(ExecResult::Rows { rows, .. }) if rows.len() != 1 => Err(if rows.is_empty() {
+                Error::Oracle {
+                    code: 1403,
+                    message: "no data found".into(),
+                }
+            } else {
+                Error::Oracle {
+                    code: 1422,
+                    message: "exact fetch returns more than requested number of rows".into(),
+                }
+            }),
+            Ok(value) => Ok(value),
+            Err(original) => Err(original),
+        };
+        match value {
+            Ok(value) => {
+                self.txn
+                    .release_savepoint_full(&snapshot)
+                    .inspect_err(|_| {
+                        self.poisoned = true;
+                    })?;
+                Ok(value)
+            }
+            Err(original) => {
+                if let Err(error) = self
+                    .txn
+                    .rollback_to_full(&snapshot)
+                    .and_then(|()| self.txn.release_savepoint_full(&snapshot))
+                {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+                self.poisoned = false;
+                Err(original)
+            }
+        }
+    }
     /// DDL in this transaction can change both triggers and foreign keys
     /// before schema_gen advances. Do not reuse the committed rules cache.
     pub(super) fn write_rules(&mut self) -> Result<Arc<trigger::WriteRules>> {
