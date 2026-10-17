@@ -1008,6 +1008,10 @@ pub fn run_with_package(
                 let index = stack.pop().expect("validated");
                 stack.push(nested_index(collection, index)?);
             }
+            Op::NestedCount => {
+                let collection = stack.pop().expect("validated");
+                stack.push(nested_count(collection)?);
+            }
             Op::PkgGet(index) => {
                 let key = package_key(&proc.consts, index)?;
                 let value = package.get(key).cloned().unwrap_or(Value::Null);
@@ -1209,6 +1213,27 @@ fn nested_index(collection: PValue, index: PValue) -> Result<PValue> {
         });
     }
     Ok(list[(index as usize) - 1].clone())
+}
+
+/// `COUNT` of a nested table. A NULL element is still an element.
+fn nested_count(collection: PValue) -> Result<PValue> {
+    let len = match collection {
+        PValue::Scalar(Value::Null) => {
+            return Err(Error::Oracle {
+                code: 6531,
+                message: "Reference to uninitialized collection".into(),
+            })
+        }
+        PValue::List(list) => list.len(),
+        other => {
+            return Err(type_err(format!(
+                "expected a nested table, got {}",
+                tyname(&other)
+            )))
+        }
+    };
+    let count = i64::try_from(len).map_err(|_| rt_err("nested table COUNT exceeds i64"))?;
+    Ok(PValue::Scalar(Value::Int(count)))
 }
 
 /// Implicit `SQL%` attribute. `ISOPEN` is always false. The other three

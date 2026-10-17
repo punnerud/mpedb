@@ -1649,3 +1649,53 @@ fn plsql_package_constant_starts_null() {
         .to_string();
     assert!(refused.contains("cannot assign to a package constant"), "{refused}");
 }
+
+#[test]
+fn plsql_nested_table_count_of_null() {
+    let (cfg, _guard) = test_config("plsql-nested-count");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query(
+        "CREATE TABLE marks (id INTEGER PRIMARY KEY, score INTEGER)",
+        &[],
+    )
+    .unwrap();
+    db.query("INSERT INTO marks (id, score) VALUES (1, 4)", &[])
+        .unwrap();
+    db.query("INSERT INTO marks (id, score) VALUES (2, NULL)", &[])
+        .unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_null RETURN PLS_INTEGER IS \
+             TYPE nums IS TABLE OF NUMBER; \
+             n nums; \
+             BEGIN \
+               RETURN n.COUNT; \
+             EXCEPTION \
+               WHEN COLLECTION_IS_NULL THEN \
+                 RETURN NULL; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_NULL", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_count RETURN PLS_INTEGER IS \
+             TYPE nums IS TABLE OF NUMBER; \
+             n nums; \
+             BEGIN \
+               SELECT score BULK COLLECT INTO n FROM marks; \
+               RETURN n.COUNT; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_COUNT", &[]).unwrap(),
+        ProcValue::Scalar(Value::Int(2))
+    );
+}

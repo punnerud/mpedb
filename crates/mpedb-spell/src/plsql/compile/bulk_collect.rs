@@ -1,7 +1,9 @@
 //! `SELECT … BULK COLLECT INTO` a local `TABLE OF` scalar.
 //! An uninitialized nested table is NULL. Zero fetched rows leave an empty
 //! table, so `IS NULL` is false and `SQL%ROWCOUNT` is 0. A NULL column stays
-//! NULL. `INDEX BY` and `VARRAY` stay refused.
+//! NULL. `COUNT` of an uninitialized table raises `COLLECTION_IS_NULL`.
+//! An empty table's `COUNT` is 0, and a NULL element still counts.
+//! `INDEX BY` and `VARRAY` stay refused.
 
 use super::*;
 use crate::emit::{CallKind, SqlCall};
@@ -95,6 +97,14 @@ impl Parser<'_> {
 
     pub(super) fn nested_expr(&mut self, nested: NestedVar) -> Result<Option<Type>> {
         if self.symbol(".") {
+            if self.word("COUNT") {
+                if self.symbol("(") {
+                    self.want_symbol(")")?;
+                }
+                self.builder.emit(Op::LoadLocal(nested.slot))?;
+                self.builder.emit(Op::NestedCount)?;
+                return Ok(Some(Type::PlsInteger));
+            }
             return Err(self.error("nested table methods are not implemented"));
         }
         if self.symbol("(") {
@@ -517,5 +527,56 @@ mod tests {
             "CREATE FUNCTION f RETURN NUMBER IS TYPE nums IS TABLE OF NUMBER; n nums := 1; BEGIN RETURN 1; END;",
             "a nested table can only be initialized with NULL",
         );
+    }
+
+    #[test]
+    fn nested_table_count_of_null_raises_and_a_null_element_still_counts() {
+        let decl = "TYPE nums IS TABLE OF NUMBER; n nums;";
+        let (caught, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} BEGIN RETURN n.COUNT; \
+                 EXCEPTION WHEN COLLECTION_IS_NULL THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(caught, Value::Null);
+        let (assigned, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} BEGIN n := NULL; RETURN n.COUNT(); \
+                 EXCEPTION WHEN COLLECTION_IS_NULL THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(assigned, Value::Null);
+
+        let collect = format!("{decl} BEGIN SELECT amount BULK COLLECT INTO n FROM t;");
+        let rows = vec![vec![Value::Numeric("4".into())], vec![Value::Null]];
+        let (count, _, _) = scene(
+            "PLS_INTEGER",
+            &format!("{collect} RETURN n.COUNT; END;"),
+            rows,
+        );
+        assert_eq!(count, Value::Int(2));
+        let (empty, _, _) = scene(
+            "PLS_INTEGER",
+            &format!("{collect} RETURN n.COUNT; END;"),
+            vec![],
+        );
+        assert_eq!(empty, Value::Int(0));
+
+        let uninit = fail(
+            "PLS_INTEGER",
+            &format!("{decl} BEGIN RETURN n.COUNT; END;"),
+            vec![],
+        );
+        assert!(uninit.contains("ORA-06531"), "{uninit}");
+        let err = compile(
+            "CREATE FUNCTION f RETURN NUMBER IS TYPE nums IS TABLE OF NUMBER; n nums; BEGIN RETURN n.DELETE; END;",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nested table methods are not implemented"), "{err}");
     }
 }
