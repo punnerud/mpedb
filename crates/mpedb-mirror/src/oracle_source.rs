@@ -12,6 +12,9 @@ pub use capture::OracleChangeBatch;
 pub use snapshot::OracleSnapshot;
 pub use state::OracleStateIdentity;
 mod write;
+mod receipt;
+mod receipt_codec;
+pub use receipt::{OracleLedgerIdentity, OracleWriteRequest};
 use codec::{decode_row, read_expr};
 
 use crate::oracle::{quote, OracleColumn, OracleRoutine, OracleTable};

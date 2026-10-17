@@ -42,167 +42,192 @@ impl OracleSource {
         tables: &[OracleTable],
         ops: &[NetOp],
     ) -> Result<Vec<Option<Vec<Value>>>> {
-        let result = (|| {
-            let tables = crate::oracle::carrier_tables(tables)?;
-            // Fence source DDL for the entire batch. A recreated/altered table
-            // requires a new carrier import; never use stale type metadata.
-            let used = ops
-                .iter()
-                .map(|op| op.table_id)
-                .collect::<std::collections::BTreeSet<_>>();
-            for id in used {
-                let table = tables.get(id as usize).ok_or_else(|| {
-                    Error::Config("Oracle write references an unknown carrier table".into())
-                })?;
-                self.lock_schema(table)?;
-            }
-            let mut images = Vec::with_capacity(ops.len());
-            for (operation_index, op) in ops.iter().enumerate() {
-                let table = tables.get(op.table_id as usize).ok_or_else(|| {
-                    Error::Config("Oracle write references an unknown carrier table".into())
-                })?;
-                if table.owner != self.owner {
-                    return Err(Error::Unsupported(
-                        "Oracle write requires the connected application owner".into(),
-                    ));
-                }
-                crate::oracle::build_schema(std::slice::from_ref(table))?;
-                if table.columns.iter().any(|c| c.identity) {
-                    return Err(Error::Unsupported(
-                        "Oracle identity write policy is not implemented".into(),
-                    ));
-                }
-                if op.pk.len() != table.pk.len() || op.pk.contains(&Value::Null) {
-                    return Err(Error::Config(
-                        "Oracle write has an invalid row identity".into(),
-                    ));
-                }
-                let target = format!("{}.{}", quote(&table.owner), quote(&table.name));
-                let keys = table
-                    .pk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &k)| {
-                        Ok(format!(
-                            "{}={}",
-                            quote(&table.columns[k].name),
-                            expression(&table.columns[k], i + 1)?
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .join(" AND ");
-                match &op.kind {
-                    NetOpKind::Delete => {
-                        let owned = table
-                            .pk
-                            .iter()
-                            .zip(&op.pk)
-                            .map(|(&k, v)| bind(&self.connection, &table.columns[k], v))
-                            .collect::<Result<Vec<_>>>()?;
-                        let refs = owned.iter().map(Bind::sql).collect::<Vec<_>>();
-                        self.connection
-                            .execute(&format!("DELETE FROM {target} WHERE {keys}"), &refs)
-                            .map_err(|e| err("delete", e))?;
-                        let image = self.read_key(table, &op.pk, None)?;
-                        if image.is_some() {
-                            return Err(Error::Unsupported(
-                                "Oracle delete did not remove the requested identity".into(),
-                            ));
-                        }
-                        images.push(None);
-                    }
-                    NetOpKind::Upsert(values) => {
-                        if values.len() != table.columns.len()
-                            || table.pk.iter().zip(&op.pk).any(|(&k, v)| &values[k] != v)
-                        {
-                            return Err(Error::Config(
-                                "Oracle write image does not match its identity or schema".into(),
-                            ));
-                        }
-                        let writable = table
-                            .columns
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, c)| !c.generated)
-                            .collect::<Vec<_>>();
-                        let owned = writable
-                            .iter()
-                            .map(|(i, c)| bind(&self.connection, c, &values[*i]))
-                            .collect::<Result<Vec<_>>>()?;
-                        let projection = writable
-                            .iter()
-                            .enumerate()
-                            .map(|(n, (_, c))| {
-                                Ok(format!("{} AS {}", expression(c, n + 1)?, quote(&c.name)))
-                            })
-                            .collect::<Result<Vec<_>>>()?
-                            .join(",");
-                        let on = table
-                            .pk
-                            .iter()
-                            .map(|&k| {
-                                let q = quote(&table.columns[k].name);
-                                format!("d.{q}=s.{q}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" AND ");
-                        let updates = writable
-                            .iter()
-                            .filter(|(i, _)| !table.pk.contains(i))
-                            .map(|(_, c)| {
-                                let q = quote(&c.name);
-                                format!("d.{q}=s.{q}")
-                            })
-                            .collect::<Vec<_>>();
-                        let update = if updates.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(","))
-                        };
-                        let names = writable
-                            .iter()
-                            .map(|(_, c)| quote(&c.name))
-                            .collect::<Vec<_>>();
-                        let source = names
-                            .iter()
-                            .map(|n| format!("s.{n}"))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let sql=format!("MERGE INTO {target} d USING (SELECT {projection} FROM dual) s ON ({on}){update} WHEN NOT MATCHED THEN INSERT ({}) VALUES ({source})",names.join(","));
-                        let refs = owned.iter().map(Bind::sql).collect::<Vec<_>>();
-                        self.connection
-                            .statement(&sql)
-                            .lob_locator()
-                            .build()
-                            .map_err(|e| err("upsert prepare", e))?
-                            .execute(&refs)
-                            .map_err(|e| err("upsert", e))?;
-                        let image = self.read_key(table, &op.pk, None)?.ok_or_else(|| {
-                            Error::Unsupported(
-                                "Oracle upsert did not retain the requested identity".into(),
-                            )
-                        })?;
-                        if let Some((_, c)) = writable.iter().find(|(i, _)| image[*i] != values[*i])
-                        {
-                            return Err(Error::Unsupported(format!("Oracle changed a submitted carrier value in {} at operation {operation_index}; the entire batch was rolled back", c.name)));
-                        }
-                        images.push(Some(image));
-                    }
-                }
-            }
+        let result = self.write_uncommitted(tables, ops).and_then(|images| {
             self.connection
                 .commit()
                 .map_err(|e| err("write commit", e))?;
             Ok(images)
-        })();
+        });
         if result.is_err() {
-            // Rollback failure is material: the caller cannot assume source
-            // state and must reconnect/reconcile before retrying.
             self.connection
                 .rollback()
                 .map_err(|e| err("write rollback", e))?;
         }
         result
+    }
+
+    /// Caller owns commit/rollback. Used to publish a durable write receipt
+    /// in the very same source transaction as the verified data changes.
+    pub(super) fn write_uncommitted(
+        &mut self,
+        tables: &[OracleTable],
+        ops: &[NetOp],
+    ) -> Result<Vec<Option<Vec<Value>>>> {
+        let tables = self.lock_write_tables(tables, ops)?;
+        self.write_locked(&tables, ops)
+    }
+
+    pub(super) fn lock_write_tables<'a>(
+        &self,
+        tables: &'a [OracleTable],
+        ops: &[NetOp],
+    ) -> Result<Vec<&'a OracleTable>> {
+        let tables = crate::oracle::carrier_tables(tables)?;
+        // Fence source DDL for the entire batch. A recreated/altered table
+        // requires a new carrier import; never use stale type metadata.
+        let used = ops
+            .iter()
+            .map(|op| op.table_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for id in used {
+            let table = tables.get(id as usize).ok_or_else(|| {
+                Error::Config("Oracle write references an unknown carrier table".into())
+            })?;
+            self.lock_schema(table)?;
+        }
+        Ok(tables)
+    }
+
+    /// All referenced tables must already be fenced by lock_write_tables.
+    pub(super) fn write_locked(
+        &mut self,
+        tables: &[&OracleTable],
+        ops: &[NetOp],
+    ) -> Result<Vec<Option<Vec<Value>>>> {
+        let mut images = Vec::with_capacity(ops.len());
+        for (operation_index, op) in ops.iter().enumerate() {
+            let table = tables.get(op.table_id as usize).ok_or_else(|| {
+                Error::Config("Oracle write references an unknown carrier table".into())
+            })?;
+            if table.owner != self.owner {
+                return Err(Error::Unsupported(
+                    "Oracle write requires the connected application owner".into(),
+                ));
+            }
+            crate::oracle::build_schema(std::slice::from_ref(table))?;
+            if table.columns.iter().any(|c| c.identity) {
+                return Err(Error::Unsupported(
+                    "Oracle identity write policy is not implemented".into(),
+                ));
+            }
+            if op.pk.len() != table.pk.len() || op.pk.contains(&Value::Null) {
+                return Err(Error::Config(
+                    "Oracle write has an invalid row identity".into(),
+                ));
+            }
+            let target = format!("{}.{}", quote(&table.owner), quote(&table.name));
+            let keys = table
+                .pk
+                .iter()
+                .enumerate()
+                .map(|(i, &k)| {
+                    Ok(format!(
+                        "{}={}",
+                        quote(&table.columns[k].name),
+                        expression(&table.columns[k], i + 1)?
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join(" AND ");
+            match &op.kind {
+                NetOpKind::Delete => {
+                    let owned = table
+                        .pk
+                        .iter()
+                        .zip(&op.pk)
+                        .map(|(&k, v)| bind(&self.connection, &table.columns[k], v))
+                        .collect::<Result<Vec<_>>>()?;
+                    let refs = owned.iter().map(Bind::sql).collect::<Vec<_>>();
+                    self.connection
+                        .execute(&format!("DELETE FROM {target} WHERE {keys}"), &refs)
+                        .map_err(|e| err("delete", e))?;
+                    let image = self.read_key(table, &op.pk, None)?;
+                    if image.is_some() {
+                        return Err(Error::Unsupported(
+                            "Oracle delete did not remove the requested identity".into(),
+                        ));
+                    }
+                    images.push(None);
+                }
+                NetOpKind::Upsert(values) => {
+                    if values.len() != table.columns.len()
+                        || table.pk.iter().zip(&op.pk).any(|(&k, v)| &values[k] != v)
+                    {
+                        return Err(Error::Config(
+                            "Oracle write image does not match its identity or schema".into(),
+                        ));
+                    }
+                    let writable = table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| !c.generated)
+                        .collect::<Vec<_>>();
+                    let owned = writable
+                        .iter()
+                        .map(|(i, c)| bind(&self.connection, c, &values[*i]))
+                        .collect::<Result<Vec<_>>>()?;
+                    let projection = writable
+                        .iter()
+                        .enumerate()
+                        .map(|(n, (_, c))| {
+                            Ok(format!("{} AS {}", expression(c, n + 1)?, quote(&c.name)))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .join(",");
+                    let on = table
+                        .pk
+                        .iter()
+                        .map(|&k| {
+                            let q = quote(&table.columns[k].name);
+                            format!("d.{q}=s.{q}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    let updates = writable
+                        .iter()
+                        .filter(|(i, _)| !table.pk.contains(i))
+                        .map(|(_, c)| {
+                            let q = quote(&c.name);
+                            format!("d.{q}=s.{q}")
+                        })
+                        .collect::<Vec<_>>();
+                    let update = if updates.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(","))
+                    };
+                    let names = writable
+                        .iter()
+                        .map(|(_, c)| quote(&c.name))
+                        .collect::<Vec<_>>();
+                    let source = names
+                        .iter()
+                        .map(|n| format!("s.{n}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let sql=format!("MERGE INTO {target} d USING (SELECT {projection} FROM dual) s ON ({on}){update} WHEN NOT MATCHED THEN INSERT ({}) VALUES ({source})",names.join(","));
+                    let refs = owned.iter().map(Bind::sql).collect::<Vec<_>>();
+                    self.connection
+                        .statement(&sql)
+                        .lob_locator()
+                        .build()
+                        .map_err(|e| err("upsert prepare", e))?
+                        .execute(&refs)
+                        .map_err(|e| err("upsert", e))?;
+                    let image = self.read_key(table, &op.pk, None)?.ok_or_else(|| {
+                        Error::Unsupported(
+                            "Oracle upsert did not retain the requested identity".into(),
+                        )
+                    })?;
+                    if let Some((_, c)) = writable.iter().find(|(i, _)| image[*i] != values[*i]) {
+                        return Err(Error::Unsupported(format!("Oracle changed a submitted carrier value in {} at operation {operation_index}; the entire batch was rolled back", c.name)));
+                    }
+                    images.push(Some(image));
+                }
+            }
+        }
+        Ok(images)
     }
 
     pub(super) fn read_key(

@@ -145,6 +145,31 @@ legacy adapters that supply None retain their existing behavior.
 Oracle mirror push and MPEdb authority cutover remain explicitly refused until
 the durable own-write ledger, postimage handling and checked push are connected.
 
+`OracleSource::prepare_write_ledger` and `write_batch_receipted` now provide the
+low-level durable write primitive. Application writes and a BLAKE3-checked BLOB
+of their actual MPEdb-carrier postimages commit in ONE Oracle transaction. A
+committed token replay returns those original images without executing DML,
+even after reconnect and intervening foreign changes. Changed payloads, stale
+application/ledger DDL, authority changes and corrupt receipts are refused.
+Requests serialize on the authority row; failed whole batches leave neither
+partial data changes nor a receipt. Native tests cover concurrent retries,
+generated postimages, large Unicode/BLOB images, forged frame lengths, business
+name collisions, tracking-table exclusion during default import and ledger
+recreation. The import verifies tracking ownership before excluding receipts,
+and holds its DDL fence while taking the application snapshot.
+Tokens must include a durable local FILE incarnation and dirty generation;
+a path/transaction number or payload hash alone can collide after reimport.
+Receipt images are bounded to 64 MiB per batch. This primitive never garbage
+collects receipts. Wiring stable tokens, per-row rejection, guarded postimages,
+conflict checks and key-level echo suppression into SourceAdapter push remains
+unfinished; adapter write-back stays refused.
+
+The large-value import test also found and fixed a shared storage bug:
+`row::encoded_len` omitted NUMERIC's variable-length body. This caused large
+NUMBER/LOB rows to fail extent insertion. A source-independent MPEdb regression
+covers rigid and ANY numerics, large Unicode and binary values, verification and
+cold reopen with internal extents, external extents and overflow storage.
+
 An importer must establish its initial cursor only after a complete successful
 snapshot. On this native Oracle version, an immediate post-DDL SCN can map to a
 timestamp preceding that DDL and fail with ORA-01466. Tests retry only that

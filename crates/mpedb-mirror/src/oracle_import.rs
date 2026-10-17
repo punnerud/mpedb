@@ -123,13 +123,23 @@ pub fn import_oracle(
     source.ensure_source_state(&mirror_id, 1, "source")?;
     let mut exclude = opts.exclude.clone();
     exclude.push("MPEDB_MIRROR_STATE".into());
-    let tables = source.introspect(opts.include.as_deref(), &exclude)?;
+    let mut ledger = source.existing_write_ledger()?;
+    if ledger.is_some() {
+        exclude.push("MPEDB_WRITE_RECEIPTS".into());
+    }
+    let mut tables = source.introspect(opts.include.as_deref(), &exclude)?;
+    if tables.iter().any(|t| t.name == "MPEDB_WRITE_RECEIPTS") {
+        // A concurrent controller may have installed tracking after the first
+        // lookup. Verify ownership before removing it from application scope.
+        ledger = Some(source.prepare_write_ledger()?);
+        tables.retain(|t| t.name != "MPEDB_WRITE_RECEIPTS");
+    }
     if tables.is_empty() {
         return Err(Error::Config(
             "no mirrorable Oracle tables in source".into(),
         ));
     }
-    let snapshot = source.snapshot_for_mirror(&tables, &mirror_id)?;
+    let snapshot = source.snapshot_for_mirror_with_ledger(&tables, &mirror_id, ledger.as_ref())?;
     if snapshot.source_state != Some((1, "source".into())) {
         return Err(Error::Config(
             "Oracle import requires an initial source-authoritative epoch".into(),

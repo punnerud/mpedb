@@ -21,7 +21,7 @@ impl OracleSource {
     /// Read all selected tables at ONE SCN while fencing source DDL. A failed
     /// bootstrap publishes no cursor; callers may retry the entire bootstrap.
     pub fn snapshot(&mut self, tables: &[OracleTable]) -> Result<OracleSnapshot> {
-        self.snapshot_inner(tables, None)
+        self.snapshot_inner(tables, None, None)
     }
     /// Bootstrap a mirror after its authority row was initialized. Its epoch
     /// is read at the same SCN as the application rows, never from current data.
@@ -30,18 +30,30 @@ impl OracleSource {
         tables: &[OracleTable],
         mirror_id: &str,
     ) -> Result<OracleSnapshot> {
-        self.snapshot_inner(tables, Some(mirror_id))
+        self.snapshot_inner(tables, Some(mirror_id), None)
+    }
+    pub(crate) fn snapshot_for_mirror_with_ledger(
+        &mut self,
+        tables: &[OracleTable],
+        mirror_id: &str,
+        ledger: Option<&OracleLedgerIdentity>,
+    ) -> Result<OracleSnapshot> {
+        self.snapshot_inner(tables, Some(mirror_id), ledger)
     }
     fn snapshot_inner(
         &mut self,
         tables: &[OracleTable],
         mirror_id: Option<&str>,
+        ledger: Option<&OracleLedgerIdentity>,
     ) -> Result<OracleSnapshot> {
         let result = (|| {
             let tables = crate::oracle::carrier_tables(tables)?;
             let identity = self.identity()?;
             if mirror_id.is_some() {
                 self.lock_state()?;
+            }
+            if let Some(ledger) = ledger {
+                self.lock_write_ledger(ledger)?;
             }
             for table in &tables {
                 self.lock_schema(table)?;
