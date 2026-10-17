@@ -61,51 +61,39 @@ impl OracleAdapter {
         self.max_events = max_events;
         Ok(self)
     }
-    fn check_identity(&self) -> Result<()> {
-        if self.source.source_state_identity(&self.mirror_id)? != self.state_identity {
-            return Err(Error::Unsupported(
-                "Oracle control table or authority row incarnation changed; reimport is required"
-                    .into(),
-            ));
-        }
-        if self.source.identity()? != self.identity {
-            return Err(Error::Unsupported(
-                "Oracle source incarnation or application identity changed; reimport is required"
-                    .into(),
-            ));
-        }
-        Ok(())
+    /// Pull through ONE captured head, so draining finishes even when Oracle
+    /// background/unrelated commits keep moving the global SCN. The boundary
+    /// has the same validated resume realm as the import and cannot be future.
+    pub fn pull_through(
+        &mut self,
+        from: &Cursor,
+        through: &Cursor,
+        max_ops: usize,
+    ) -> Result<Option<PullBatch>> {
+        self.pull_window(from, Some(through), max_ops)
     }
-    fn position(&self, cursor: &Cursor) -> Result<u64> {
-        let scn = OraclePosition::decode(cursor, &self.identity, &self.tables)?.scn();
-        let initial = OraclePosition::decode(&self.initial, &self.identity, &self.tables)?.scn();
-        if scn < initial {
-            return Err(Error::Config(
-                "Oracle cursor precedes its imported snapshot".into(),
-            ));
-        }
-        Ok(scn)
-    }
-    fn cursor(&self, scn: u64) -> Result<Cursor> {
-        Ok(OraclePosition::new(&self.identity, &self.tables, scn)?.encode())
-    }
-    fn same_mirror(&self, id: &str) -> Result<()> {
-        if id != self.mirror_id {
-            return Err(Error::Config(
-                "Oracle adapter authority request names another mirror".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-impl SourceAdapter for OracleAdapter {
-    fn pull(&mut self, from: &Cursor, max_ops: usize) -> Result<Option<PullBatch>> {
+    fn pull_window(
+        &mut self,
+        from: &Cursor,
+        through: Option<&Cursor>,
+        max_ops: usize,
+    ) -> Result<Option<PullBatch>> {
         if max_ops == 0 {
             return Err(Error::Config("Oracle pull max_ops must be positive".into()));
         }
         self.check_identity()?;
         let from_scn = self.position(from)?;
-        let head = self.source.current_scn()?;
+        let head = if let Some(cursor) = through {
+            let scn = self.position(cursor)?;
+            if scn > self.source.current_scn()? {
+                return Err(Error::Config(
+                    "Oracle pull boundary is ahead of the source".into(),
+                ));
+            }
+            scn
+        } else {
+            self.source.current_scn()?
+        };
         if from_scn > head {
             return Err(Error::Config(
                 "Oracle resume cursor is ahead of the source".into(),
@@ -152,6 +140,47 @@ impl SourceAdapter for OracleAdapter {
             end_cursor: self.cursor(scn)?,
             source_epoch: Some(epoch),
         }))
+    }
+    fn check_identity(&self) -> Result<()> {
+        if self.source.source_state_identity(&self.mirror_id)? != self.state_identity {
+            return Err(Error::Unsupported(
+                "Oracle control table or authority row incarnation changed; reimport is required"
+                    .into(),
+            ));
+        }
+        if self.source.identity()? != self.identity {
+            return Err(Error::Unsupported(
+                "Oracle source incarnation or application identity changed; reimport is required"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+    fn position(&self, cursor: &Cursor) -> Result<u64> {
+        let scn = OraclePosition::decode(cursor, &self.identity, &self.tables)?.scn();
+        let initial = OraclePosition::decode(&self.initial, &self.identity, &self.tables)?.scn();
+        if scn < initial {
+            return Err(Error::Config(
+                "Oracle cursor precedes its imported snapshot".into(),
+            ));
+        }
+        Ok(scn)
+    }
+    fn cursor(&self, scn: u64) -> Result<Cursor> {
+        Ok(OraclePosition::new(&self.identity, &self.tables, scn)?.encode())
+    }
+    fn same_mirror(&self, id: &str) -> Result<()> {
+        if id != self.mirror_id {
+            return Err(Error::Config(
+                "Oracle adapter authority request names another mirror".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+impl SourceAdapter for OracleAdapter {
+    fn pull(&mut self, from: &Cursor, max_ops: usize) -> Result<Option<PullBatch>> {
+        self.pull_window(from, None, max_ops)
     }
     fn head(&mut self) -> Result<Cursor> {
         self.check_identity()?;

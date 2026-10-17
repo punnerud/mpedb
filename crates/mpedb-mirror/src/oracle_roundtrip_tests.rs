@@ -49,27 +49,15 @@ fn flip(db: &Database) -> i64 {
         .run_id
 }
 fn drain_oracle(db: &Database, adapter: &mut OracleAdapter) {
-    let metadata = load_oracle_bootstrap(db).unwrap();
-    let decode = |cursor: &[u8]| {
-        crate::oracle_cursor::OraclePosition::decode(cursor, &metadata.identity, &metadata.tables)
-            .unwrap()
-            .scn()
-    };
-    // Oracle's head can keep moving due to unrelated/background commits.
-    // Drain to one captured boundary instead of waiting for global quiescence.
-    let head = decode(&adapter.head().unwrap());
+    let through = adapter.head().unwrap();
     for _ in 0..32 {
         let from = db
             .sys_record_get(state::MIR_NS, state::KEY_CUR)
             .unwrap()
             .unwrap();
-        if decode(&from) >= head {
+        let Some(batch) = adapter.pull_through(&from, &through, 64).unwrap() else {
             return;
-        }
-        let batch = adapter
-            .pull(&from, 64)
-            .unwrap()
-            .expect("captured source boundary remains reachable");
+        };
         apply_batch(db, &from, &batch).unwrap();
     }
     panic!("Oracle source did not reach its captured boundary");

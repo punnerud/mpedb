@@ -3,6 +3,9 @@
 //! read; pull/push/switch land in later milestones.
 
 use std::path::PathBuf;
+#[cfg(feature = "oracle-source")]
+#[path = "mirror/oracle.rs"]
+mod oracle_cli;
 
 use mpedb::Database;
 use mpedb_core::Engine;
@@ -111,7 +114,7 @@ fn open_source(
             a.install_triggers()?;
             Box::new(a)
         }
-        SourceSpec::Oracle { .. } => return Err(Failure::Runtime("Oracle live capture is not linked yet".into())),
+        SourceSpec::Oracle { .. } => return Err(Failure::Runtime("This Oracle command is not enabled; oracle-source builds support import and bounded pull, while production push/cutover remain unavailable".into())),
     };
     match recover(&db, adapter.as_mut())? {
         Recovered::Steady => {}
@@ -126,7 +129,7 @@ mpedb mirror <subcommand>
   import  (--source <sqlite-file> | --source-config <file>) --dest <new-mpedb-file>
           [--include t1,t2] [--exclude t3] [--size_mb N] [--durability none|commit|wal]
           [--adapt exact|lossy]
-      Import a sqlite or PostgreSQL database into a NEW .mpedb mirror file.
+      Import sqlite, PostgreSQL, or Oracle (feature oracle-source) into a NEW mirror.
       sqlite's declared types are affinities, not constraints, so a column may
       hold off-type values. By DEFAULT one of those fails the import (loudly,
       while you are watching). --adapt exact coerces only what parses WHOLLY and
@@ -311,6 +314,11 @@ fn cmd_unfreeze(argv: &[String]) -> CliResult {
 
 fn cmd_pull(argv: &[String]) -> CliResult {
     let p = args::parse(argv, &["source", "db", "source-config"], &[])?;
+    #[cfg(feature = "oracle-source")]
+    if let Some(n) = oracle_cli::pull(p.require("db")?, &p)? {
+        println!("pulled + applied {n} Oracle row change(s) through captured head");
+        return Ok(());
+    }
     let (db, mut a) = open_source(p.require("db")?, &p)?;
     let n = drain_pull(&db, a.as_mut())?;
     println!("pulled + applied {n} row change(s)");
@@ -460,7 +468,12 @@ fn cmd_import(argv: &[String]) -> CliResult {
             let mut client = PgAdapter::connect(dsn, opts.include.as_deref(), &opts.exclude)?;
             import_pg(client.client(), &dest, &opts)?
         }
-        SourceSpec::Oracle { .. } => return Err(Failure::Runtime("Oracle import is not linked yet; the oracle-source library feature provides snapshot introspection".into())),
+        SourceSpec::Oracle { .. } => {
+            #[cfg(feature = "oracle-source")]
+            { oracle_cli::import(&spec, &dest, &opts)? }
+            #[cfg(not(feature = "oracle-source"))]
+            { return Err(Failure::Runtime("Oracle import requires a build with --features oracle-source".into())); }
+        },
     };
 
     // Record WHERE the credentials live (never the DSN itself — §12), so every

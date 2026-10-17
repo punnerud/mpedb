@@ -63,10 +63,11 @@ Live synchronization must preserve source commit boundaries, resume cursors,
 echo suppression, per-row rejection/conflict handling, and epoch-fenced authority
 switches. The current mirror engine permits one authoritative source per MPEdb
 file; connecting both source systems and rRETL therefore requires an explicit
-composition of mirror instances and maps. That composition, the Oracle source
-adapter, Oracle SQL execution, and full PL/SQL execution are **not implemented
-or verified by this test setup**. Existing PostgreSQL mirror support alone does
-not prove the requested topology works.
+composition of mirror instances and maps. The Oracle pull adapter and an
+isolated two-engine rRETL roundtrip are verified below. The continuous
+composition/controller, complete Oracle SQL dialect and full PL/SQL execution
+remain unfinished. Existing PostgreSQL support alone does not establish those
+remaining capabilities.
 
 PL/SQL coverage remains part of the end goal, including procedures/functions,
 IN/OUT/IN OUT parameters, packages, exceptions, cursors, dynamic SQL, triggers,
@@ -122,9 +123,30 @@ existing-destination rejection, altered content and truncated chunks. A native
 6000-row fixture exceeds the byte budget, includes an empty table, and verifies
 that capacity failure leaves no published destination or staging directory.
 Individual row/LOB carrier values are still materialized in memory; the import
-no longer retains the entire snapshot. CLI import and full live adapter wiring
-remain unfinished. SQL execution uses MPEdb's strict grouping mode, which does
+no longer retains the entire snapshot. CLI import and bounded pull are exposed
+by the opt-in CLI feature described below; production write-back/controller
+wiring remains unfinished. SQL execution uses MPEdb's strict grouping mode, which does
 not imply full Oracle SQL-dialect compatibility.
+
+The CLI exposes Oracle import and bounded pull when built with `oracle-source`
+and the public OCI client available to the linker/runtime:
+
+```sh
+cargo build -p mpedb-cli --features oracle-source
+# oracle.toml is a private 0600 SourceSpec file; credentials never go in argv.
+target/debug/mpedb mirror import --source-config oracle.toml --dest app.mpedb
+target/debug/mpedb mirror pull --db app.mpedb
+target/debug/mpedb mirror status --db app.mpedb
+```
+
+Import records only the config file's path. Pull captures ONE source head and
+uses `OracleAdapter::pull_through`, so background/unrelated commits cannot keep
+the command draining indefinitely. It cold-resumes the persisted cursor, checks
+matching source authority, and refuses epoch mismatches instead of attempting
+an unsupported automatic Oracle cutover recovery. Native subprocess tests cover
+import, key moves, empty drains, status, secret redaction and epoch rejection;
+the default CLI still builds without Oracle/OCI. Push, switch and the remaining
+Oracle both-sides CLI commands stay explicitly unavailable.
 
 A native component test now runs both real engines: Oracle import → MPEdb
 PL/SQL Boolean lens/rRETL → PostgreSQL, then PostgreSQL changes → a second
@@ -134,9 +156,9 @@ carriers and a subsequent Oracle update sent forward again. Every representation
 change executes in MPEdb; the adapters only transport carriers. This isolated
 single-writer fixture does not implement a continuous bidirectional controller.
 
-This transport is not a complete mirror push: capture, echo suppression,
-conflict checks, authority fencing, CLI import and the two-database topology
-remain unfinished. Writes currently refuse identity columns, special NUMBERs and LONGs. CLOB, NCLOB and BLOB writes use native
+Production mirror push still requires durable local outbox wiring, key-level
+echo suppression and conflict policy; continuous two-database topology/controller
+wiring remains unfinished. Writes currently refuse identity columns, special NUMBERs and LONGs. CLOB, NCLOB and BLOB writes use native
 temporary LOB locators; reads use explicit locators and fixed Unicode-safe
 buffers. Native tests cover large Unicode and binary values, empty LOBs distinct
 from NULL, and repeated upserts. Scalar text/RAW binds remain bounded at 4000/2000

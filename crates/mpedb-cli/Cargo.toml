@@ -9,7 +9,13 @@ description = "mpedb command-line tool: REPL, bench, multi-process stress tests"
 name = "mpedb"
 path = "src/main.rs"
 
+[features]
+default = []
+oracle-source = ["mpedb-mirror/oracle-source", "dep:oracle-client"]
+
 [dependencies]
+# Public OCI client also used by the opt-in native CLI integration fixture.
+oracle-client = { package = "oracle", version = "0.6.3", optional = true }
 mpedb-sqlitefmt = { path = "../mpedb-sqlitefmt" }
 mpedb = { workspace = true, features = ["sqlite-checkpoint"] }
 mpedb-core = { workspace = true }
