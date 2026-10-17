@@ -95,6 +95,21 @@ conflict checks, authority fencing, CLI import and the two-database topology
 remain unfinished. Writes currently refuse identity columns, special NUMBERs,
 zoned timestamps, intervals and LONGs, and accept only small LOB binds (4000
 text bytes / 2000 binary bytes). Larger LOBs need streaming OCI bindings.
+The native source boundary also captures bounded Flashback Versions windows.
+It discovers identities from both version start and end SCNs, then reads their
+net images at each commit SCN across all selected tables. Tests cover an
+uncommitted transaction, later commit, rollback, historical images, compound-PK
+changes, deletes and resume/budget rejection. XIDs retain transaction provenance.
+Expired undo or an oversized window fails without advancing a cursor. This is
+not yet a live `SourceAdapter`: epoch handling and own-write echo suppression
+still need their source-side state/ledger.
+
+An importer must establish its initial cursor only after a complete successful
+snapshot. On this native Oracle version, an immediate post-DDL SCN can map to a
+timestamp preceding that DDL and fail with ORA-01466. Tests retry only that
+initial bootstrap; established capture never skips ahead on such an error.
+See [Oracle Flashback documentation](https://docs.oracle.com/en/database/oracle/oracle-database/26/adfns/flashback.html).
+
 Metadata inspection currently precedes snapshot capture; a production import
 must also fence concurrent source DDL.
 

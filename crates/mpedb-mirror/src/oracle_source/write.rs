@@ -31,7 +31,7 @@ impl OracleSource {
     /// rolls the WHOLE batch back. Generated columns are read back rather than
     /// written. This low-level API does not advance a synchronization cursor.
     pub fn write_batch(
-        &self,
+        &mut self,
         tables: &[OracleTable],
         ops: &[NetOp],
     ) -> Result<Vec<Option<Vec<Value>>>> {
@@ -46,31 +46,7 @@ impl OracleSource {
                 let table = tables.get(id as usize).ok_or_else(|| {
                     Error::Config("Oracle write references an unknown carrier table".into())
                 })?;
-                if table.owner != self.owner {
-                    return Err(Error::Unsupported(
-                        "Oracle write requires the connected application owner".into(),
-                    ));
-                }
-                let target = format!("{}.{}", quote(&table.owner), quote(&table.name));
-                self.connection
-                    .execute(
-                        &format!("LOCK TABLE {target} IN ROW EXCLUSIVE MODE NOWAIT"),
-                        &[],
-                    )
-                    .map_err(|e| err("write schema fence", e))?;
-                let object_id: u64 = self.connection.query_row_as("SELECT object_id FROM all_objects WHERE owner=:1 AND object_name=:2 AND object_type='TABLE' AND subobject_name IS NULL", &[&table.owner, &table.name]).map_err(|e| err("write object identity", e))?;
-                let ddl: String = self
-                    .connection
-                    .query_row_as(
-                        "SELECT DBMS_METADATA.GET_DDL('TABLE',:1,:2) FROM dual",
-                        &[&table.name, &table.owner],
-                    )
-                    .map_err(|e| err("write schema verification", e))?;
-                if object_id != table.object_id || ddl != table.ddl_source {
-                    return Err(Error::Unsupported(
-                        "Oracle source schema changed; reimport before writing".into(),
-                    ));
-                }
+                self.lock_schema(table)?;
             }
             let mut images = Vec::with_capacity(ops.len());
             for op in ops {
@@ -119,7 +95,7 @@ impl OracleSource {
                         self.connection
                             .execute(&format!("DELETE FROM {target} WHERE {keys}"), &refs)
                             .map_err(|e| err("delete", e))?;
-                        let image = self.read_current_key(table, &op.pk)?;
+                        let image = self.read_key(table, &op.pk, None)?;
                         if image.is_some() {
                             return Err(Error::Unsupported(
                                 "Oracle delete did not remove the requested identity".into(),
@@ -189,7 +165,7 @@ impl OracleSource {
                         self.connection
                             .execute(&sql, &refs)
                             .map_err(|e| err("upsert", e))?;
-                        let image = self.read_current_key(table, &op.pk)?.ok_or_else(|| {
+                        let image = self.read_key(table, &op.pk, None)?.ok_or_else(|| {
                             Error::Unsupported(
                                 "Oracle upsert did not retain the requested identity".into(),
                             )
@@ -216,7 +192,12 @@ impl OracleSource {
         result
     }
 
-    fn read_current_key(&self, table: &OracleTable, pk: &[Value]) -> Result<Option<Vec<Value>>> {
+    pub(super) fn read_key(
+        &self,
+        table: &OracleTable,
+        pk: &[Value],
+        scn: Option<u64>,
+    ) -> Result<Option<Vec<Value>>> {
         let owned = table
             .pk
             .iter()
@@ -246,8 +227,9 @@ impl OracleSource {
             .flatten()
             .collect::<Vec<_>>()
             .join(",");
+        let snapshot = scn.map_or_else(String::new, |s| format!(" AS OF SCN {s}"));
         let sql = format!(
-            "SELECT {projection} FROM {}.{} WHERE {keys}",
+            "SELECT {projection} FROM {}.{}{snapshot} WHERE {keys}",
             quote(&table.owner),
             quote(&table.name)
         );

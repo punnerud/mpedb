@@ -1,6 +1,7 @@
 #![cfg(feature = "oracle-source")]
 use mpedb_mirror::{oracle, oracle_source::OracleSource, sourcecfg, SourceSpec};
 use mpedb_types::Value;
+mod oracle_support;
 
 #[test]
 #[ignore = "requires MPEDB_ORACLE_SOURCE_CONFIG and Oracle client libraries"]
@@ -30,7 +31,7 @@ fn native_oracle_snapshot_preserves_metadata_values_and_one_scn() {
         .unwrap(),
         0
     );
-    let source = OracleSource::connect(&spec).unwrap();
+    let mut source = OracleSource::connect(&spec).unwrap();
     let tables = source
         .introspect(Some(&["MPEDB_SNAPSHOT_CASE".into()]), &[])
         .unwrap();
@@ -52,8 +53,8 @@ fn native_oracle_snapshot_preserves_metadata_values_and_one_scn() {
         .contains('ø'));
     assert!(table.columns[9].generated);
     let schema = oracle::build_schema(&tables).unwrap();
-    let scn = source.current_scn().unwrap();
-    let before = source.read_snapshot(table, scn).unwrap();
+    let (scn, mut initial) = oracle_support::initial_snapshot(&source, &tables);
+    let before = initial.remove(0);
     assert_eq!(before.len(), 1);
     let row = &before[0];
     assert_eq!(row[0], Value::Numeric("1".into()));
@@ -209,14 +210,13 @@ fn native_oracle_write_batch_rejects_rounding_and_rolls_back_every_row() {
     )
     .unwrap();
     c.commit().unwrap();
-    let source = OracleSource::connect(&spec).unwrap();
+    let mut source = OracleSource::connect(&spec).unwrap();
     let tables = source
         .introspect(Some(&["MPEDB_WRITE_CASE".into()]), &[])
         .unwrap();
     let table = &tables[0];
-    let before = source
-        .read_snapshot(table, source.current_scn().unwrap())
-        .unwrap();
+    let (_, mut initial) = oracle_support::initial_snapshot(&source, &tables);
+    let before = initial.remove(0);
     let upsert = |row: Vec<Value>| NetOp {
         table_id: 0,
         pk: vec![row[0].clone()],

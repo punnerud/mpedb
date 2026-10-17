@@ -2,7 +2,10 @@
 //! and rows at one explicit SCN. No Oracle engine implementation is inspected.
 //! Capture/push and CLI import are separate unfinished stages; this module does
 //! not implement SourceAdapter or publish a fake live-sync cursor.
+mod capture;
 mod codec;
+mod schema;
+pub use capture::OracleChangeBatch;
 mod write;
 use codec::{decode_row, read_expr};
 
