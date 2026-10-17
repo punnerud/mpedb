@@ -77,7 +77,6 @@ struct NestedVar {
 /// `PACKAGE.NAME`.
 #[derive(Clone)]
 struct PackageVar {
-    name: String,
     key_const: u16,
     ty: Type,
 }
@@ -117,7 +116,7 @@ struct Parser<'a> {
     /// Set while a package body is compiled. The stored routine name is
     /// `PACKAGE.ROUTINE`; `routine_name` stays the unqualified name.
     package_name: Option<String>,
-    package_var: Option<PackageVar>,
+    package_vars: HashMap<String, PackageVar>,
     /// Set only while an Oracle row trigger is compiled. Slots are the
     /// call arguments (`:NEW` columns, then `:OLD` columns), not locals.
     trigger_images: Option<trigger_body::TriggerImages>,
@@ -208,7 +207,7 @@ fn compile_inner(source: &str, scalar_only: bool, anchors: &[ColumnAnchor]) -> R
         forall_index: None,
         forall_subscripts: 0,
         package_name: None,
-        package_var: None,
+        package_vars: HashMap::new(),
         trigger_images: None,
         column_anchors: anchors,
     };
@@ -255,11 +254,7 @@ impl Parser<'_> {
             return Err(self.error("quoted package names are not implemented"));
         }
         let name = self.identifier()?;
-        if self
-            .package_var
-            .as_ref()
-            .is_some_and(|package| package.name == name)
-        {
+        if self.package_vars.contains_key(&name) {
             return Err(self.error("duplicate package variable and subprogram name"));
         }
         self.routine_name = name.clone();
@@ -989,10 +984,8 @@ impl Parser<'_> {
             if let Some(nested) = self.nested_vars.get(&name).copied() {
                 return self.assign_nested(nested);
             }
-            if let Some(package) = self.package_var.clone() {
-                if package.name == name {
-                    return self.assign_package(package);
-                }
+            if let Some(package) = self.package_vars.get(&name).cloned() {
+                return self.assign_package(package);
             }
         }
         let local = *self.locals.get(&name).ok_or_else(|| {
@@ -1385,10 +1378,8 @@ impl Parser<'_> {
         if let Some(nested) = self.nested_vars.get(&name).copied() {
             return self.nested_expr(nested);
         }
-        if let Some(package) = self.package_var.clone() {
-            if package.name == name {
-                return self.package_expr(package);
-            }
+        if let Some(package) = self.package_vars.get(&name).cloned() {
+            return self.package_expr(package);
         }
         Err(self.error(&format!(
             "unknown variable or unsupported expression {name}"

@@ -83,7 +83,7 @@ pub(super) fn compile_trigger_inner(source: &str, columns: &[TriggerImage]) -> R
         forall_index: None,
         forall_subscripts: 0,
         package_name: None,
-        package_var: None,
+        package_vars: HashMap::new(),
         trigger_images: Some(TriggerImages { new_cols, old_cols }),
         column_anchors: &[],
     };

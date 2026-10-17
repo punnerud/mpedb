@@ -1,6 +1,7 @@
-//! A package-body variable is session state. It starts NULL. Assigning NULL
-//! stores NULL. The value survives the next call on the same package state,
-//! including when that call raises. A new state starts NULL again.
+//! Package-body variables are session state. Each starts NULL. Assigning
+//! NULL stores NULL and leaves the other variables alone. The value survives
+//! the next call on the same package state, including when that call raises.
+//! A new state starts NULL again.
 //! The optional initialization section runs once per session, before the
 //! subprogram, and can store NULL. A package specification is refused.
 
@@ -20,32 +21,35 @@ impl Parser<'_> {
                 "a package body requires one variable before its subprogram",
             ));
         }
-        let var_name = self.plain_name()?;
-        if self.word("CONSTANT") {
-            return Err(self.error("package constants are not implemented"));
+        let mut vars = HashMap::new();
+        while !self.is_word("FUNCTION") && !self.is_word("PROCEDURE") {
+            if self.is_word("BEGIN") {
+                return Err(self.error(
+                    "a package body requires its subprogram before initialization",
+                ));
+            }
+            let var_name = self.plain_name()?;
+            if self.word("CONSTANT") {
+                return Err(self.error("package constants are not implemented"));
+            }
+            let ty = self.data_type(true)?;
+            if self.word("NOT") {
+                return Err(self.error("a package variable cannot be NOT NULL"));
+            }
+            // `:=` / `DEFAULT` is consumed even when the initializer is NULL.
+            if (self.symbol(":=") || self.word("DEFAULT")) && !self.word("NULL") {
+                return Err(self.error("a package variable can only be initialized with NULL"));
+            }
+            self.want_symbol(";")?;
+            if vars.contains_key(&var_name) {
+                return Err(self.error("duplicate package variable"));
+            }
+            let key_const = self
+                .builder
+                .const_idx(Value::Text(format!("{package}.{var_name}")))?;
+            vars.insert(var_name, PackageVar { key_const, ty });
         }
-        let ty = self.data_type(true)?;
-        if self.word("NOT") {
-            return Err(self.error("a package variable cannot be NOT NULL"));
-        }
-        // `:=` / `DEFAULT` is consumed even when the initializer is NULL.
-        if (self.symbol(":=") || self.word("DEFAULT")) && !self.word("NULL") {
-            return Err(self.error("a package variable can only be initialized with NULL"));
-        }
-        self.want_symbol(";")?;
-        if !self.is_word("FUNCTION") && !self.is_word("PROCEDURE") {
-            return Err(self.error(
-                "a package body supports one variable and one subprogram",
-            ));
-        }
-        let key_const = self
-            .builder
-            .const_idx(Value::Text(format!("{package}.{var_name}")))?;
-        self.package_var = Some(PackageVar {
-            name: var_name,
-            key_const,
-            ty,
-        });
+        self.package_vars = vars;
         self.package_name = Some(package.clone());
         let mut skel = self.compile_routine(source, false, true)?;
         if self.word("BEGIN") {
@@ -226,8 +230,8 @@ END ledger;
                 "a package body requires one variable before its subprogram",
             ),
             (
-                "CREATE PACKAGE BODY ledger AS n PLS_INTEGER; m PLS_INTEGER; FUNCTION touch RETURN PLS_INTEGER IS BEGIN RETURN 1; END; END;",
-                "a package body supports one variable and one subprogram",
+                "CREATE PACKAGE BODY ledger AS n PLS_INTEGER; n PLS_INTEGER; FUNCTION touch RETURN PLS_INTEGER IS BEGIN RETURN 1; END; END;",
+                "duplicate package variable",
             ),
             (
                 "CREATE PACKAGE BODY ledger AS n CONSTANT PLS_INTEGER := NULL; FUNCTION touch RETURN PLS_INTEGER IS BEGIN RETURN 1; END; END;",
@@ -309,5 +313,34 @@ END;
         assert_eq!(session.get("LEDGER.N"), Some(&Value::Null));
         let again = call(&proc, &mut session, Value::Null).unwrap_err();
         assert!(again.contains("ORA-01403"), "{again}");
+    }
+
+    #[test]
+    fn package_variables_start_null_and_one_null_leaves_the_other() {
+        let source = r#"
+CREATE PACKAGE BODY ledger AS
+  n PLS_INTEGER;
+  m PLS_INTEGER;
+  FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS
+    seen PLS_INTEGER;
+  BEGIN
+    seen := n;
+    IF v IS NULL THEN
+      n := NULL;
+      RETURN m;
+    END IF;
+    n := v;
+    m := v;
+    RETURN seen;
+  END;
+END;
+"#;
+        let proc = compiled(source);
+        let mut session = HashMap::new();
+        assert_eq!(call(&proc, &mut session, Value::Int(4)).unwrap(), Value::Null);
+        assert_eq!(call(&proc, &mut session, Value::Null).unwrap(), Value::Int(4));
+        assert_eq!(session.get("LEDGER.N"), Some(&Value::Null));
+        assert_eq!(session.get("LEDGER.M"), Some(&Value::Int(4)));
+        assert_eq!(call(&proc, &mut session, Value::Int(1)).unwrap(), Value::Null);
     }
 }

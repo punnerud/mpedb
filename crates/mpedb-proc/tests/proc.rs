@@ -1413,3 +1413,43 @@ fn plsql_package_init_runs_once_and_stores_null() {
         ProcValue::Scalar(Value::Null)
     );
 }
+
+#[test]
+fn plsql_package_variables_keep_null_apart() {
+    let (cfg, _guard) = test_config("plsql-package-vars");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE PACKAGE BODY ledger AS \
+             n PLS_INTEGER; \
+             m PLS_INTEGER; \
+             FUNCTION touch(v PLS_INTEGER) RETURN PLS_INTEGER IS \
+               seen PLS_INTEGER; \
+             BEGIN \
+               seen := n; \
+               IF v IS NULL THEN \
+                 n := NULL; \
+                 RETURN m; \
+               END IF; \
+               n := v; \
+               m := v; \
+               RETURN seen; \
+             END; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(4)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Null]).unwrap(),
+        ProcValue::Scalar(Value::Int(4))
+    );
+    assert_eq!(
+        engine.call("LEDGER.TOUCH", &[Value::Int(1)]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+}
