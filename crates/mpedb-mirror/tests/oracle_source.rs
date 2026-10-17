@@ -309,11 +309,19 @@ fn native_oracle_lob_writes_preserve_large_empty_and_null_values() {
     };
     let c = oracle_client::Connection::connect(username, password, connect_string).unwrap();
     c.execute("BEGIN EXECUTE IMMEDIATE 'DROP TABLE MPEDB_LOB_WRITE_CASE PURGE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;", &[]).unwrap();
-    c.execute("CREATE TABLE MPEDB_LOB_WRITE_CASE (id NUMBER PRIMARY KEY, text_value CLOB, national_value NCLOB, binary_value BLOB) SEGMENT CREATION IMMEDIATE", &[]).unwrap();
+    c.execute("CREATE TABLE MPEDB_LOB_WRITE_CASE (id NUMBER PRIMARY KEY, text_value CLOB, national_value NCLOB, binary_value BLOB)", &[]).unwrap();
     let mut source = OracleSource::connect(&spec).unwrap();
     let tables = source
         .introspect(Some(&["MPEDB_LOB_WRITE_CASE".into()]), &[])
         .unwrap();
+    let identity = source.identity().unwrap();
+    let position = mpedb_mirror::oracle_cursor::OraclePosition::new(
+        &identity,
+        &tables,
+        source.current_scn().unwrap(),
+    )
+    .unwrap()
+    .encode();
     let large = "ø🙂漢字".repeat(10000);
     let binary = (0..131073).map(|i| (i % 256) as u8).collect::<Vec<_>>();
     let cases = vec![
@@ -348,6 +356,12 @@ fn native_oracle_lob_writes_preserve_large_empty_and_null_values() {
         source.write_batch(&tables, &ops).unwrap(),
         cases.iter().cloned().map(Some).collect::<Vec<_>>()
     );
+    let allocated = source
+        .introspect(Some(&["MPEDB_LOB_WRITE_CASE".into()]), &[])
+        .unwrap();
+    assert_ne!(allocated[0].ddl_source, tables[0].ddl_source);
+    assert_eq!(allocated[0].schema_ddl, tables[0].schema_ddl);
+    mpedb_mirror::oracle_cursor::OraclePosition::decode(&position, &identity, &allocated).unwrap();
     for row in cases {
         let op = NetOp {
             table_id: 0,
@@ -357,6 +371,31 @@ fn native_oracle_lob_writes_preserve_large_empty_and_null_values() {
         assert_eq!(source.write_batch(&tables, &[op]).unwrap(), vec![Some(row)]);
     }
     assert_eq!(c.query_row_as::<i64>("SELECT COUNT(*) FROM MPEDB_LOB_WRITE_CASE WHERE id=2 AND text_value IS NOT NULL AND national_value IS NOT NULL AND binary_value IS NOT NULL AND DBMS_LOB.GETLENGTH(text_value)=0 AND DBMS_LOB.GETLENGTH(national_value)=0 AND DBMS_LOB.GETLENGTH(binary_value)=0", &[]).unwrap(), 1);
+    c.execute(
+        "ALTER TABLE MPEDB_LOB_WRITE_CASE ADD CONSTRAINT MPEDB_LOB_ID_POSITIVE CHECK(id>0)",
+        &[],
+    )
+    .unwrap();
+    let changed = source
+        .introspect(Some(&["MPEDB_LOB_WRITE_CASE".into()]), &[])
+        .unwrap();
+    assert_ne!(changed[0].schema_ddl, tables[0].schema_ddl);
+    assert!(
+        mpedb_mirror::oracle_cursor::OraclePosition::decode(&position, &identity, &changed)
+            .is_err()
+    );
+    assert!(source
+        .write_batch(
+            &tables,
+            &[NetOp {
+                table_id: 0,
+                pk: vec![Value::Numeric("3".into())],
+                kind: NetOpKind::Delete
+            }]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("source schema changed"));
     c.execute("DROP TABLE MPEDB_LOB_WRITE_CASE PURGE", &[])
         .unwrap();
 }

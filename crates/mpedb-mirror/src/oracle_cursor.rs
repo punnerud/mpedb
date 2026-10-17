@@ -78,7 +78,7 @@ fn realm(identity: &OracleIdentity, tables: &[OracleTable]) -> Result<[u8; 32]> 
     }
     let ordered = carrier_tables(tables)?;
     let mut h = blake3::Hasher::new();
-    h.update(b"MPEdb Oracle cursor realm v1\0");
+    h.update(b"MPEdb Oracle cursor realm v2\0");
     h.update(&identity.database_id.to_be_bytes());
     h.update(&identity.resetlogs_scn.to_be_bytes());
     h.update(&identity.container_guid);
@@ -96,7 +96,7 @@ fn realm(identity: &OracleIdentity, tables: &[OracleTable]) -> Result<[u8; 32]> 
         }
         frame(&mut h, table.name.as_bytes());
         h.update(&table.object_id.to_be_bytes());
-        frame(&mut h, table.ddl_source.as_bytes());
+        frame(&mut h, table.schema_ddl.as_bytes());
     }
     Ok(*h.finalize().as_bytes())
 }

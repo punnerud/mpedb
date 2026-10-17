@@ -172,6 +172,9 @@ pub struct OracleTable {
     /// Original application table DDL from Oracle's public metadata API.
     /// Retained separately; never executed as PostgreSQL DDL.
     pub ddl_source: String,
+    /// Logical DDL with physical segment attributes omitted by DBMS_METADATA.
+    /// Used for schema fences and cursor scope, never reconstructed from SQL text.
+    pub schema_ddl: String,
     pub columns: Vec<OracleColumn>,
     /// Column indices in the primary key's declared order.
     pub pk: Vec<usize>,
@@ -275,6 +278,7 @@ mod tests {
             name: "T".into(),
             object_id: 1,
             ddl_source: String::new(),
+            schema_ddl: String::new(),
             columns: vec![column("NUMBER")],
             pk: vec![0],
             pk_validated: true,

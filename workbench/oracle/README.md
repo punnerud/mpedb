@@ -106,9 +106,12 @@ temporary LOB locators; reads use explicit locators and fixed Unicode-safe
 buffers. Native tests cover large Unicode and binary values, empty LOBs distinct
 from NULL, and repeated upserts. Scalar text/RAW binds remain bounded at 4000/2000
 bytes. Snapshot results still materialize complete carrier values in memory.
-A separate known issue remains: deferred segment allocation changes the physical
-DDL text and currently trips the schema fence after the first insert; the LOB
-fixture uses SEGMENT CREATION IMMEDIATE to isolate this from LOB correctness.
+Schema fences and cursor scopes use logical DDL extracted with the documented
+DBMS_METADATA SEGMENT_ATTRIBUTES transform disabled. Original physical DDL is
+retained separately as provenance. Native tests verify that deferred segment
+allocation leaves the fence and cursor valid, while column and CHECK-constraint
+changes invalidate stale metadata. Cursor realm hashing uses its v2 domain;
+previous development cursors require a fresh bootstrap.
 The native source boundary also captures bounded Flashback Versions windows.
 It discovers identities from both version start and end SCNs, then reads their
 net images at each commit SCN across all selected tables. Tests cover an

@@ -154,7 +154,7 @@ fn native_oracle_capture_keeps_commits_historical_images_and_compound_key_change
         from
     );
     let mut changed_scope = tables.clone();
-    changed_scope[0].ddl_source.push_str(" -- schema change");
+    changed_scope[0].schema_ddl.push_str(" -- schema change");
     assert!(mpedb_mirror::oracle_cursor::OraclePosition::decode(
         &position.encode(),
         &identity,

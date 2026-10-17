@@ -154,18 +154,14 @@ impl OracleSource {
                 pk_validated &=
                     get::<String>(&row, 1)? == "ENABLED" && get::<String>(&row, 2)? == "VALIDATED";
             }
-            let ddl_source = self
-                .connection
-                .query_row_as(
-                    "SELECT DBMS_METADATA.GET_DDL('TABLE',:1,:2) FROM dual",
-                    &[&name, &self.owner],
-                )
-                .map_err(|e| err("application table DDL", e))?;
+            let ddl_source = self.table_ddl(&name, false)?;
+            let schema_ddl = self.table_ddl(&name, true)?;
             tables.push(OracleTable {
                 owner: self.owner.clone(),
                 name,
                 object_id: get(&row, 1)?,
                 ddl_source,
+                schema_ddl,
                 columns,
                 pk_validated: pk_validated && !pk.is_empty(),
                 pk,
