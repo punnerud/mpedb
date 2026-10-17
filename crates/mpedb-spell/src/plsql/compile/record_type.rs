@@ -1,8 +1,10 @@
 //! `TYPE name IS RECORD (field datatype [NOT NULL] [:= literal], ...)`.
-//! Each variable gets its own slots. A field with no default starts NULL,
-//! and a default on one field does not fill the others. `rec IS NULL` is
-//! true only when every field is NULL. Assigning NULL to the record stores
-//! NULL in every field, and is refused when a field is `NOT NULL`.
+//! A field may name another record type. Each variable gets its own slots,
+//! including every nested leaf. A field with no default starts NULL, and a
+//! default on one field does not fill the others. `rec IS NULL` is true only
+//! when every leaf is NULL. Assigning NULL to the record stores NULL in
+//! every leaf, and is refused when any leaf is `NOT NULL`. A nested field
+//! cannot itself be `NOT NULL` or carry an initializer: the inner type does.
 
 use super::{Parser, RecordDecl, Type};
 use crate::ir::Op;
@@ -17,6 +19,17 @@ pub(super) struct RecordType {
 #[derive(Clone)]
 struct RecordField {
     name: String,
+    kind: FieldKind,
+}
+
+#[derive(Clone)]
+enum FieldKind {
+    Scalar(ScalarField),
+    Nested { type_name: String, shape: RecordType },
+}
+
+#[derive(Clone)]
+struct ScalarField {
     ty: Type,
     not_null: bool,
     /// `None` means the field starts NULL. A stored NULL is an explicit
@@ -28,6 +41,13 @@ struct RecordField {
 pub(super) struct FieldInfo {
     pub ty: Type,
     pub not_null: bool,
+}
+
+fn shape_has_not_null(shape: &RecordType) -> bool {
+    shape.fields.iter().any(|field| match &field.kind {
+        FieldKind::Scalar(scalar) => scalar.not_null,
+        FieldKind::Nested { shape, .. } => shape_has_not_null(shape),
+    })
 }
 
 impl Parser<'_> {
@@ -42,28 +62,40 @@ impl Parser<'_> {
             if fields.iter().any(|field| field.name == field_name) {
                 return Err(self.error("duplicate record field"));
             }
-            let (ty, inherited) = self.record_field_type()?;
-            let mut not_null = inherited;
-            if self.word("NOT") {
-                self.want_word("NULL")?;
-                not_null = true;
-            }
-            let default = if self.symbol(":=") || self.word("DEFAULT") {
-                Some(self.record_literal()?)
-            } else {
-                None
+            let kind = match self.record_field_kind()? {
+                FieldKind::Nested { type_name, shape } => {
+                    if self.word("NOT") {
+                        return Err(self.error("a nested record field cannot be NOT NULL"));
+                    }
+                    if self.symbol(":=") || self.word("DEFAULT") {
+                        return Err(self.error(
+                            "a nested record field cannot have an initializer",
+                        ));
+                    }
+                    FieldKind::Nested { type_name, shape }
+                }
+                FieldKind::Scalar(mut scalar) => {
+                    if self.word("NOT") {
+                        self.want_word("NULL")?;
+                        scalar.not_null = true;
+                    }
+                    if self.symbol(":=") || self.word("DEFAULT") {
+                        scalar.default = Some(self.record_literal()?);
+                    }
+                    if let Some(value) = &scalar.default {
+                        self.literal_fits(scalar.ty, value)?;
+                    }
+                    if scalar.not_null && matches!(scalar.default, None | Some(Value::Null)) {
+                        return Err(self.error(
+                            "a NOT NULL record field requires an initializer",
+                        ));
+                    }
+                    FieldKind::Scalar(scalar)
+                }
             };
-            if let Some(value) = &default {
-                self.literal_fits(ty, value)?;
-            }
-            if not_null && matches!(default, None | Some(Value::Null)) {
-                return Err(self.error("a NOT NULL record field requires an initializer"));
-            }
             fields.push(RecordField {
                 name: field_name,
-                ty,
-                not_null,
-                default,
+                kind,
             });
             if self.symbol(")") {
                 break;
@@ -117,33 +149,55 @@ impl Parser<'_> {
         }
         self.pending_declarations.remove(name);
         self.locals.remove(name);
-        let mut slots = Vec::with_capacity(shape.fields.len());
-        for field in &shape.fields {
-            if explicit_null {
-                self.constant(Value::Null)?;
-                self.builder.emit(field.ty.check())?;
-            } else {
-                self.emit_field_default(field)?;
-            }
-            let slot = self.builder.alloc_local()?;
-            self.builder.emit(Op::StoreLocal(slot))?;
-            self.record_field_info.insert(
-                slot,
-                FieldInfo {
-                    ty: field.ty,
-                    not_null: field.not_null,
-                },
-            );
-            slots.push((field.name.clone(), slot));
-        }
-        self.records.insert(
-            name.to_string(),
-            RecordDecl {
-                fields: slots,
-                type_name: Some(type_name),
-            },
-        );
+        let decl = self.lay_out(Some(type_name), &shape, explicit_null)?;
+        self.records.insert(name.to_string(), decl);
         Ok(true)
+    }
+
+    /// One slot per scalar leaf. A nested field gets the inner type's slots,
+    /// with that type's defaults. `explicit_null` stores NULL in every leaf.
+    fn lay_out(
+        &mut self,
+        type_name: Option<String>,
+        shape: &RecordType,
+        explicit_null: bool,
+    ) -> Result<RecordDecl> {
+        let mut fields = Vec::new();
+        let mut nested = Vec::new();
+        for field in &shape.fields {
+            match &field.kind {
+                FieldKind::Scalar(scalar) => {
+                    if explicit_null {
+                        self.constant(Value::Null)?;
+                        self.builder.emit(scalar.ty.check())?;
+                    } else {
+                        self.emit_scalar_default(scalar)?;
+                    }
+                    let slot = self.builder.alloc_local()?;
+                    self.builder.emit(Op::StoreLocal(slot))?;
+                    self.record_field_info.insert(
+                        slot,
+                        FieldInfo {
+                            ty: scalar.ty,
+                            not_null: scalar.not_null,
+                        },
+                    );
+                    fields.push((field.name.clone(), slot));
+                }
+                FieldKind::Nested {
+                    type_name: inner_name,
+                    shape: inner,
+                } => {
+                    let child = self.lay_out(Some(inner_name.clone()), inner, explicit_null)?;
+                    nested.push((field.name.clone(), child));
+                }
+            }
+        }
+        Ok(RecordDecl {
+            fields,
+            type_name,
+            nested,
+        })
     }
 
     pub(super) fn store_record_field(&mut self, slot: u16, actual: Option<Type>) -> Result<()> {
@@ -164,12 +218,51 @@ impl Parser<'_> {
     }
 
     pub(super) fn refuse_null_record(&self, record: &RecordDecl) -> Result<()> {
-        if record.fields.iter().any(|(_, slot)| {
+        if self.record_has_not_null(record) {
+            return Err(self.error("a NOT NULL record field cannot be assigned NULL"));
+        }
+        Ok(())
+    }
+
+    fn record_has_not_null(&self, record: &RecordDecl) -> bool {
+        record.fields.iter().any(|(_, slot)| {
             self.record_field_info
                 .get(slot)
                 .is_some_and(|info| info.not_null)
-        }) {
-            return Err(self.error("a NOT NULL record field cannot be assigned NULL"));
+        }) || record
+            .nested
+            .iter()
+            .any(|(_, child)| self.record_has_not_null(child))
+    }
+
+    /// `target := NULL` stores NULL in every scalar leaf, including leaves
+    /// inside a nested record.
+    pub(super) fn store_null_leaves(&mut self, record: &RecordDecl) -> Result<()> {
+        for (_, slot) in &record.fields {
+            self.constant(Value::Null)?;
+            self.builder.emit(Op::StoreLocal(*slot))?;
+        }
+        for (_, child) in &record.nested {
+            self.store_null_leaves(child)?;
+        }
+        Ok(())
+    }
+
+    /// The record is NULL exactly when every scalar leaf is NULL.
+    pub(super) fn emit_record_null_test(&mut self, record: &RecordDecl) -> Result<()> {
+        self.constant(Value::Bool(true))?;
+        self.and_null_leaves(record)
+    }
+
+    fn and_null_leaves(&mut self, record: &RecordDecl) -> Result<()> {
+        for (_, slot) in &record.fields {
+            self.builder.emit(Op::LoadLocal(*slot))?;
+            self.constant(Value::Null)?;
+            self.builder.emit(Op::Eq)?;
+            self.builder.emit(Op::SqlAnd)?;
+        }
+        for (_, child) in &record.nested {
+            self.and_null_leaves(child)?;
         }
         Ok(())
     }
@@ -207,17 +300,30 @@ impl Parser<'_> {
             let actual = self.record_field_info.get(source_slot).map(|info| info.ty);
             self.store_record_field(*target_slot, actual)?;
         }
+        if target.nested.len() != source.nested.len() {
+            return Err(self.error("a record can only be assigned a record of the same type"));
+        }
+        for ((target_name, target_child), (source_name, source_child)) in
+            target.nested.iter().zip(source.nested.iter())
+        {
+            if target_name != source_name {
+                return Err(self.error(
+                    "a record can only be assigned a record of the same type",
+                ));
+            }
+            self.assign_whole_record(target_child, source_child)?;
+        }
         Ok(())
     }
 
     fn refuse_null_fields(&self, shape: &RecordType) -> Result<()> {
-        if shape.fields.iter().any(|field| field.not_null) {
+        if shape_has_not_null(shape) {
             return Err(self.error("a NOT NULL record field cannot be assigned NULL"));
         }
         Ok(())
     }
 
-    fn emit_field_default(&mut self, field: &RecordField) -> Result<()> {
+    fn emit_scalar_default(&mut self, field: &ScalarField) -> Result<()> {
         let value = match &field.default {
             None => Value::Null,
             Some(Value::Int(n))
@@ -235,7 +341,7 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn record_field_type(&mut self) -> Result<(Type, bool)> {
+    fn record_field_kind(&mut self) -> Result<FieldKind> {
         if self.dotted_percent_type()
             && matches!(self.peek(), Some(Token::Identifier { .. }))
             && matches!(
@@ -243,7 +349,12 @@ impl Parser<'_> {
                 Some(Token::Symbol("."))
             )
         {
-            return self.resolve_dotted_type();
+            let (ty, inherited) = self.resolve_dotted_type()?;
+            return Ok(FieldKind::Scalar(ScalarField {
+                ty,
+                not_null: inherited,
+                default: None,
+            }));
         }
         if self.type_word_at(self.at + 2)
             && matches!(
@@ -262,7 +373,11 @@ impl Parser<'_> {
                     "a %TYPE anchor must be a scalar variable in this scope",
                 ));
             };
-            return Ok((anchor.ty, anchor.not_null));
+            return Ok(FieldKind::Scalar(ScalarField {
+                ty: anchor.ty,
+                not_null: anchor.not_null,
+                default: None,
+            }));
         }
         if let Some(Token::Identifier {
             name,
@@ -270,10 +385,21 @@ impl Parser<'_> {
         }) = self.peek()
         {
             if self.record_types.contains_key(name) {
-                return Err(self.error("nested record fields are not implemented"));
+                let type_name = name.clone();
+                self.at += 1;
+                let shape = self
+                    .record_types
+                    .get(&type_name)
+                    .cloned()
+                    .ok_or_else(|| self.error("a nested record field is not declared"))?;
+                return Ok(FieldKind::Nested { type_name, shape });
             }
         }
-        Ok((self.data_type(true)?, false))
+        Ok(FieldKind::Scalar(ScalarField {
+            ty: self.data_type(true)?,
+            not_null: false,
+            default: None,
+        }))
     }
 
     fn record_literal(&mut self) -> Result<Value> {
@@ -454,8 +580,22 @@ mod tests {
                 "no such table EMPLOYEES",
             ),
             (
-                "TYPE pair IS RECORD (id PLS_INTEGER); TYPE box IS RECORD (inner pair); BEGIN RETURN 1; END;",
-                "nested record fields are not implemented",
+                "TYPE pair IS RECORD (id PLS_INTEGER); TYPE box IS RECORD (inner pair NOT NULL); BEGIN RETURN 1; END;",
+                "a nested record field cannot be NOT NULL",
+            ),
+            (
+                "TYPE pair IS RECORD (id PLS_INTEGER); TYPE box IS RECORD (inner pair := 1); BEGIN RETURN 1; END;",
+                "a nested record field cannot have an initializer",
+            ),
+            (
+                "TYPE box IS RECORD (inner box); BEGIN RETURN 1; END;",
+                "other types require typed runtime support",
+            ),
+            (
+                "TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 1); \
+                 TYPE box IS RECORD (inner pair); \
+                 b box; BEGIN b.inner := NULL; RETURN 1; END;",
+                "cannot be assigned NULL",
             ),
             (
                 "TYPE pair IS RECORD (id PLS_INTEGER, id VARCHAR2(4)); BEGIN RETURN 1; END;",
@@ -555,5 +695,148 @@ mod tests {
             err.contains("NOT NULL record field requires an initializer"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn nested_record_field_starts_null_and_a_default_does_not_fill_it() {
+        let note = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; \
+             BEGIN \
+               IF b.inner.note IS NOT NULL THEN RETURN 'filled'; END IF; \
+               IF b.inner IS NULL THEN RETURN 'whole'; END IF; \
+               b.inner.note := NULL; \
+               RETURN b.inner.note; \
+             END;",
+        );
+        assert_eq!(call(&note).unwrap(), Value::Null);
+
+        let empty = function(
+            "BOOLEAN",
+            "TYPE pair IS RECORD (id PLS_INTEGER, note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; BEGIN RETURN b.inner IS NULL; END;",
+        );
+        assert_eq!(call(&empty).unwrap(), Value::Bool(true));
+
+        let cleared = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; \
+             BEGIN b.inner.note := 'kept'; b := NULL; RETURN b.inner.note; END;",
+        );
+        assert_eq!(call(&cleared).unwrap(), Value::Null);
+
+        let cleared_inner = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; \
+             BEGIN b.inner.note := 'kept'; b.inner := NULL; RETURN b.inner.note; END;",
+        );
+        assert_eq!(call(&cleared_inner).unwrap(), Value::Null);
+
+        let other = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; c box; \
+             BEGIN b.inner.note := 'ok'; RETURN c.inner.note; END;",
+        );
+        assert_eq!(call(&other).unwrap(), Value::Null);
+
+        let copied = function(
+            "PLS_INTEGER",
+            "TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             c box; b box; \
+             BEGIN \
+               c.inner.note := NULL; \
+               c.inner.id := 3; \
+               b.inner.note := 'kept'; \
+               b := c; \
+               c.inner.id := 9; \
+               RETURN b.inner.id; \
+             END;",
+        );
+        assert_eq!(call(&copied).unwrap(), Value::Int(3));
+
+        let copied_note = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             c box; b box; \
+             BEGIN \
+               b.inner.note := 'kept'; \
+               b := c; \
+               c.inner.note := 'kept'; \
+               IF b.inner.note IS NULL THEN b.inner.note := NULL; END IF; \
+               RETURN b.inner.note; \
+             END;",
+        );
+        assert_eq!(call(&copied_note).unwrap(), Value::Null);
+
+        let inner_assign = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             r pair; b box; \
+             BEGIN \
+               r.note := NULL; \
+               b.inner.note := 'kept'; \
+               b.inner := r; \
+               r.note := 'kept'; \
+               IF b.inner.note IS NULL THEN RETURN b.inner.note; END IF; \
+               RETURN 'filled'; \
+             END;",
+        );
+        assert_eq!(call(&inner_assign).unwrap(), Value::Null);
+
+        let deep = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             TYPE wrap IS RECORD (held box); \
+             w wrap; \
+             BEGIN \
+               IF w.held.inner.note IS NULL THEN w.held.inner.note := NULL; END IF; \
+               RETURN w.held.inner.note; \
+             END;",
+        );
+        assert_eq!(call(&deep).unwrap(), Value::Null);
+
+        let overflow = function(
+            "VARCHAR2",
+            "TYPE pair IS RECORD (note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; \
+             BEGIN b.inner.note := 'toolong'; RETURN 'x'; \
+             EXCEPTION WHEN VALUE_ERROR THEN RETURN b.inner.note; END;",
+        );
+        assert_eq!(call(&overflow).unwrap(), Value::Null);
+
+        let refused = [
+            (
+                "TYPE pair IS RECORD (note VARCHAR2(4)); \
+                 TYPE box IS RECORD (inner pair); \
+                 TYPE case IS RECORD (inner pair); \
+                 b box; c case; BEGIN b := c; RETURN b.inner.note; END;",
+                "same type",
+            ),
+            (
+                "TYPE pair IS RECORD (note VARCHAR2(4)); \
+                 TYPE other IS RECORD (note VARCHAR2(4)); \
+                 TYPE box IS RECORD (inner pair); \
+                 r other; b box; BEGIN b.inner := r; RETURN b.inner.note; END;",
+                "same type",
+            ),
+        ];
+        for (body, expected) in refused {
+            let err = compile(&function("VARCHAR2", body)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{body}\n{err}");
+        }
     }
 }

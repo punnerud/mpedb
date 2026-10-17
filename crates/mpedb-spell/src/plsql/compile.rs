@@ -54,13 +54,16 @@ struct Local {
     not_null: bool,
 }
 
-/// One local slot per cursor column. The record name is not itself a local:
-/// a scalar declared later in an inner block can hide it.
+/// One local slot per scalar field. Nested record fields live in `nested`,
+/// each with its own slots. The record name is not itself a local: a scalar
+/// declared later in an inner block can hide it.
 #[derive(Clone)]
 struct RecordDecl {
     fields: Vec<(String, u16)>,
     /// `Some` for a `TYPE name IS RECORD` variable. `None` for `%ROWTYPE`.
     type_name: Option<String>,
+    /// Nested record fields, in declaration order. A `%ROWTYPE` record has none.
+    nested: Vec<(String, RecordDecl)>,
 }
 
 /// A `TYPE name IS TABLE OF` element type, stored as one local. NULL means
@@ -695,7 +698,14 @@ impl Parser<'_> {
             self.builder.emit(Op::StoreLocal(slot))?;
             fields.push((column, slot));
         }
-        self.records.insert(name.to_string(), RecordDecl { fields, type_name: None });
+        self.records.insert(
+            name.to_string(),
+            RecordDecl {
+                fields,
+                type_name: None,
+                nested: Vec::new(),
+            },
+        );
         Ok(true)
     }
     fn looks_like_rowtype(&self) -> bool {
@@ -715,6 +725,9 @@ impl Parser<'_> {
     fn assign_record(&mut self, record: RecordDecl) -> Result<()> {
         if self.symbol(".") {
             let field = self.identifier()?;
+            if let Some((_, child)) = record.nested.iter().find(|(name, _)| name == &field) {
+                return self.assign_record(child.clone());
+            }
             let slot = self.record_field(&record, &field)?;
             self.want_symbol(":=")?;
             let actual = self.expression()?;
@@ -724,10 +737,7 @@ impl Parser<'_> {
         self.want_symbol(":=")?;
         if self.word("NULL") {
             self.refuse_null_record(&record)?;
-            for (_, slot) in &record.fields {
-                self.constant(Value::Null)?;
-                self.builder.emit(Op::StoreLocal(*slot))?;
-            }
+            self.store_null_leaves(&record)?;
             return self.want_symbol(";");
         }
         if let Some(Token::Identifier { name, .. }) = self.peek() {
@@ -744,11 +754,7 @@ impl Parser<'_> {
                 }
             }
         }
-        let user = record
-            .fields
-            .iter()
-            .any(|(_, slot)| self.record_field_info.contains_key(slot));
-        Err(self.error(if user {
+        Err(self.error(if self.user_record(&record) {
             "a record can only be assigned NULL or one field"
         } else {
             "a %ROWTYPE record requires a field"
@@ -757,6 +763,9 @@ impl Parser<'_> {
     fn record_expr(&mut self, record: RecordDecl) -> Result<Option<Type>> {
         if self.symbol(".") {
             let field = self.identifier()?;
+            if let Some((_, child)) = record.nested.iter().find(|(name, _)| name == &field) {
+                return self.record_expr(child.clone());
+            }
             let slot = self.record_field(&record, &field)?;
             self.builder.emit(Op::LoadLocal(slot))?;
             if let Some(info) = self.record_field_info.get(&slot).copied() {
@@ -769,22 +778,24 @@ impl Parser<'_> {
         if self.word("IS") {
             let negated = self.word("NOT");
             self.want_word("NULL")?;
-            // Oracle: the record is NULL exactly when every field is NULL.
+            // Oracle: the record is NULL exactly when every leaf is NULL.
+            // A nested record is NULL when every field inside it is NULL.
             // `Op::Eq` treats NULL as equal to NULL, so this is not SQL's
             // three-valued comparison.
-            self.constant(Value::Bool(true))?;
-            for (_, slot) in &record.fields {
-                self.builder.emit(Op::LoadLocal(*slot))?;
-                self.constant(Value::Null)?;
-                self.builder.emit(Op::Eq)?;
-                self.builder.emit(Op::SqlAnd)?;
-            }
+            self.emit_record_null_test(&record)?;
             if negated {
                 self.builder.emit(Op::SqlNot)?;
             }
             return Ok(Some(Type::Boolean));
         }
         Err(self.error("a %ROWTYPE record requires a field"))
+    }
+    fn user_record(&self, record: &RecordDecl) -> bool {
+        record.type_name.is_some()
+            || record
+                .fields
+                .iter()
+                .any(|(_, slot)| self.record_field_info.contains_key(slot))
     }
     fn record_field(&self, record: &RecordDecl, field: &str) -> Result<u16> {
         record
@@ -793,13 +804,13 @@ impl Parser<'_> {
             .find(|(name, _)| name == field)
             .map(|(_, slot)| *slot)
             .ok_or_else(|| {
-                let user = record
-                    .fields
-                    .iter()
-                    .any(|(_, slot)| self.record_field_info.contains_key(slot));
                 self.error(&format!(
                     "unknown {} field {field}",
-                    if user { "record" } else { "%ROWTYPE" }
+                    if self.user_record(record) {
+                        "record"
+                    } else {
+                        "%ROWTYPE"
+                    }
                 ))
             })
     }

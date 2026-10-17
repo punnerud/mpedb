@@ -1453,3 +1453,76 @@ fn plsql_package_variables_keep_null_apart() {
         ProcValue::Scalar(Value::Null)
     );
 }
+
+#[test]
+fn plsql_nested_record_field_starts_null() {
+    let (cfg, _guard) = test_config("plsql-nested-record");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_note RETURN VARCHAR2 IS \
+             TYPE pair IS RECORD (id PLS_INTEGER := 7, note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; \
+             BEGIN \
+               IF b.inner.note IS NOT NULL THEN RETURN 'filled'; END IF; \
+               IF b.inner IS NULL THEN RETURN 'whole'; END IF; \
+               b.inner.note := NULL; \
+               RETURN b.inner.note; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_NOTE", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_empty RETURN VARCHAR2 IS \
+             TYPE pair IS RECORD (id PLS_INTEGER, note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; \
+             BEGIN \
+               IF b.inner IS NULL THEN RETURN 'yes'; END IF; \
+               RETURN 'no'; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_EMPTY", &[]).unwrap(),
+        ProcValue::Scalar(Value::Text("yes".into()))
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_clear RETURN VARCHAR2 IS \
+             TYPE pair IS RECORD (note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; \
+             BEGIN \
+               b.inner.note := 'kept'; \
+               b := NULL; \
+               RETURN b.inner.note; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_CLEAR", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    let refused = engine
+        .define(
+            "CREATE FUNCTION bad RETURN VARCHAR2 IS \
+             TYPE pair IS RECORD (id PLS_INTEGER NOT NULL := 1, note VARCHAR2(4)); \
+             TYPE box IS RECORD (inner pair); \
+             b box; \
+             BEGIN b.inner.note := 'kept'; b := NULL; RETURN b.inner.note; END;",
+            Lang::PlSql,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("cannot be assigned NULL"), "{refused}");
+}
