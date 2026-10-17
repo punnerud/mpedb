@@ -994,7 +994,7 @@ impl Parser<'_> {
                 return self.assign_record(record);
             }
             if let Some(nested) = self.nested_vars.get(&name).copied() {
-                return self.assign_nested(nested);
+                return self.nested_statement(nested);
             }
             if let Some(package) = self.package_vars.get(&name).cloned() {
                 return self.assign_package(package);

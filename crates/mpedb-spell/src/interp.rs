@@ -1034,6 +1034,11 @@ pub fn run_with_package(
                 let collection = stack.pop().expect("validated");
                 stack.push(nested_limit(collection)?);
             }
+            Op::NestedExtend => {
+                let collection = stack.pop().expect("validated");
+                let count = stack.pop().expect("validated");
+                stack.push(nested_extend(collection, count)?);
+            }
             Op::PkgGet(index) => {
                 let key = package_key(&proc.consts, index)?;
                 let value = package.get(key).cloned().unwrap_or(Value::Null);
@@ -1371,6 +1376,45 @@ fn nested_limit(collection: PValue) -> Result<PValue> {
             tyname(&other)
         ))),
     }
+}
+
+/// `EXTEND` appends NULL elements. A NULL collection raises. A NULL count
+/// raises `VALUE_ERROR`. A negative count raises `SUBSCRIPT_OUTSIDE_LIMIT`.
+/// Zero leaves the elements unchanged. The new list does not alias the old one.
+fn nested_extend(collection: PValue, count: PValue) -> Result<PValue> {
+    let list = match collection {
+        PValue::Scalar(Value::Null) => {
+            return Err(Error::Oracle {
+                code: 6531,
+                message: "Reference to uninitialized collection".into(),
+            })
+        }
+        PValue::List(list) => list,
+        other => {
+            return Err(type_err(format!(
+                "expected a nested table, got {}",
+                tyname(&other)
+            )))
+        }
+    };
+    let count = match count {
+        PValue::Scalar(Value::Null) => return Err(oracle_exception::named(6502)),
+        PValue::Scalar(Value::Int(count)) => count,
+        _ => return Err(oracle_exception::named(6502)),
+    };
+    if count < 0 {
+        return Err(Error::Oracle {
+            code: 6532,
+            message: "subscript outside of limit".into(),
+        });
+    }
+    let extra = usize::try_from(count).map_err(|_| rt_err("EXTEND count exceeds usize"))?;
+    let mut elems = Vec::with_capacity(list.len());
+    elems.extend(list.iter().cloned());
+    for _ in 0..extra {
+        elems.push(PValue::Scalar(Value::Null));
+    }
+    Ok(PValue::List(Rc::new(elems)))
 }
 
 /// Implicit `SQL%` attribute. `ISOPEN` is always false. The other three

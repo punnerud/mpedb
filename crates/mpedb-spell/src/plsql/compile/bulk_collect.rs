@@ -10,7 +10,9 @@
 //! the same error. A NULL index, an empty table, or a missing neighbor is
 //! NULL, and a NULL element is still a step. `LIMIT` of an uninitialized
 //! table raises the same error. An initialized nested table has no maximum,
-//! so its `LIMIT` is NULL. `INDEX BY` and `VARRAY` stay refused.
+//! so its `LIMIT` is NULL. `EXTEND` of an uninitialized table raises the
+//! same error. `EXTEND` appends NULL elements, and a NULL count raises
+//! `VALUE_ERROR`. `INDEX BY` and `VARRAY` stay refused.
 
 use super::*;
 use crate::emit::{CallKind, SqlCall};
@@ -90,6 +92,38 @@ impl Parser<'_> {
         self.builder.emit(Op::StoreLocal(slot))?;
         self.nested_vars.insert(name.to_string(), NestedVar { slot, elem });
         Ok(true)
+    }
+
+    pub(super) fn nested_statement(&mut self, nested: NestedVar) -> Result<()> {
+        if self.symbol(".") {
+            return self.extend_statement(nested);
+        }
+        self.assign_nested(nested)
+    }
+
+    fn extend_statement(&mut self, nested: NestedVar) -> Result<()> {
+        if !self.word("EXTEND") {
+            return Err(self.error("nested table methods are not implemented"));
+        }
+        if self.symbol("(") {
+            if !self.symbol(")") {
+                let actual = self.expression()?;
+                self.compatible(Type::PlsInteger, actual)?;
+                self.builder.emit(Op::OraclePlSqlInteger)?;
+                if self.symbol(",") {
+                    return Err(self.error("EXTEND copy form is not implemented"));
+                }
+                self.want_symbol(")")?;
+            } else {
+                self.constant(Value::Int(1))?;
+            }
+        } else {
+            self.constant(Value::Int(1))?;
+        }
+        self.builder.emit(Op::LoadLocal(nested.slot))?;
+        self.builder.emit(Op::NestedExtend)?;
+        self.builder.emit(Op::StoreLocal(nested.slot))?;
+        self.want_symbol(";")
     }
 
     pub(super) fn assign_nested(&mut self, nested: NestedVar) -> Result<()> {
@@ -874,5 +908,93 @@ mod tests {
             vec![],
         );
         assert!(uninit.contains("ORA-06531"), "{uninit}");
+    }
+
+    #[test]
+    fn nested_table_extend_of_null_appends_null_elements() {
+        let decl = "TYPE nums IS TABLE OF NUMBER; n nums;";
+        let (caught, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} BEGIN n.EXTEND; RETURN 1; \
+                 EXCEPTION WHEN COLLECTION_IS_NULL THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(caught, Value::Null);
+        let (assigned, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} BEGIN n := NULL; n.EXTEND(); RETURN 1; \
+                 EXCEPTION WHEN COLLECTION_IS_NULL THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(assigned, Value::Null);
+
+        let collect = format!("{decl} BEGIN SELECT amount BULK COLLECT INTO n FROM t;");
+        let (empty, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{collect} n.EXTEND; \
+                 IF n.COUNT = 1 AND n(1) IS NULL THEN RETURN NULL; END IF; \
+                 RETURN 1; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(empty, Value::Null);
+        let (zero, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{collect} n.EXTEND(0); \
+                 IF n.COUNT = 0 AND n.FIRST IS NULL THEN RETURN NULL; END IF; \
+                 RETURN 1; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(zero, Value::Null);
+
+        let rows = vec![vec![Value::Numeric("4".into())], vec![Value::Null]];
+        let (appended, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{collect} n.EXTEND(2); \
+                 IF n.COUNT = 4 AND n(2) IS NULL AND n(3) IS NULL AND n(4) IS NULL THEN \
+                   RETURN NULL; \
+                 END IF; \
+                 RETURN 1; END;"
+            ),
+            rows,
+        );
+        assert_eq!(appended, Value::Null);
+        let (null_count, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} v NUMBER; BEGIN SELECT amount BULK COLLECT INTO n FROM t; \
+                 n.EXTEND(v); RETURN 1; \
+                 EXCEPTION WHEN VALUE_ERROR THEN RETURN NULL; END;"
+            ),
+            vec![vec![Value::Numeric("4".into())]],
+        );
+        assert_eq!(null_count, Value::Null);
+
+        let uninit = fail(
+            "PLS_INTEGER",
+            &format!("{decl} BEGIN n.EXTEND; RETURN 1; END;"),
+            vec![],
+        );
+        assert!(uninit.contains("ORA-06531"), "{uninit}");
+        let negative = fail(
+            "PLS_INTEGER",
+            &format!("{collect} n.EXTEND(-1); RETURN 1; END;"),
+            vec![vec![Value::Numeric("4".into())]],
+        );
+        assert!(negative.contains("ORA-06532"), "{negative}");
+        let copy = compile(
+            "CREATE FUNCTION f RETURN NUMBER IS TYPE nums IS TABLE OF NUMBER; n nums; BEGIN n.EXTEND(1, 1); RETURN 1; END;",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(copy.contains("EXTEND copy form is not implemented"), "{copy}");
     }
 }
