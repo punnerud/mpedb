@@ -8,7 +8,9 @@
 //! empty table's `FIRST` and `LAST` are NULL, and a NULL element does not
 //! move either bound. `PRIOR` and `NEXT` of an uninitialized table raise
 //! the same error. A NULL index, an empty table, or a missing neighbor is
-//! NULL, and a NULL element is still a step. `INDEX BY` and `VARRAY` stay refused.
+//! NULL, and a NULL element is still a step. `LIMIT` of an uninitialized
+//! table raises the same error. An initialized nested table has no maximum,
+//! so its `LIMIT` is NULL. `INDEX BY` and `VARRAY` stay refused.
 
 use super::*;
 use crate::emit::{CallKind, SqlCall};
@@ -150,6 +152,14 @@ impl Parser<'_> {
                 self.want_symbol(")")?;
                 self.builder.emit(Op::LoadLocal(nested.slot))?;
                 self.builder.emit(if next { Op::NestedNext } else { Op::NestedPrior })?;
+                return Ok(Some(Type::PlsInteger));
+            }
+            if self.word("LIMIT") {
+                if self.symbol("(") {
+                    self.want_symbol(")")?;
+                }
+                self.builder.emit(Op::LoadLocal(nested.slot))?;
+                self.builder.emit(Op::NestedLimit)?;
                 return Ok(Some(Type::PlsInteger));
             }
             return Err(self.error("nested table methods are not implemented"));
@@ -810,6 +820,57 @@ mod tests {
         let uninit = fail(
             "PLS_INTEGER",
             &format!("{decl} BEGIN RETURN n.NEXT(1); END;"),
+            vec![],
+        );
+        assert!(uninit.contains("ORA-06531"), "{uninit}");
+    }
+
+    #[test]
+    fn nested_table_limit_of_null_raises_and_an_initialized_table_is_unbounded() {
+        let decl = "TYPE nums IS TABLE OF NUMBER; n nums;";
+        let (caught, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} BEGIN RETURN n.LIMIT; \
+                 EXCEPTION WHEN COLLECTION_IS_NULL THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(caught, Value::Null);
+        let (assigned, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} BEGIN n := NULL; RETURN n.LIMIT(); \
+                 EXCEPTION WHEN COLLECTION_IS_NULL THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(assigned, Value::Null);
+
+        let collect = format!("{decl} BEGIN SELECT amount BULK COLLECT INTO n FROM t;");
+        let (empty, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{collect} IF n.LIMIT IS NULL AND n.COUNT = 0 THEN RETURN NULL; END IF; \
+                 RETURN 1; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(empty, Value::Null);
+        let rows = vec![vec![Value::Numeric("4".into())], vec![Value::Null]];
+        let (bounded, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{collect} IF n.LIMIT IS NULL AND n.COUNT = 2 THEN RETURN NULL; END IF; \
+                 RETURN 1; END;"
+            ),
+            rows,
+        );
+        assert_eq!(bounded, Value::Null);
+
+        let uninit = fail(
+            "PLS_INTEGER",
+            &format!("{decl} BEGIN RETURN n.LIMIT; END;"),
             vec![],
         );
         assert!(uninit.contains("ORA-06531"), "{uninit}");

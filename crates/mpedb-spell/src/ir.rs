@@ -295,6 +295,9 @@ pub enum Op {
     NestedPrior,
     /// Pop a nested table and an index and push `NEXT`. Same NULL rules as `PRIOR`.
     NestedNext,
+    /// Pop a nested table and push `LIMIT`. NULL raises `COLLECTION_IS_NULL`.
+    /// A nested table has no maximum, so an initialized table pushes NULL.
+    NestedLimit,
     /// Push the session value of package variable `consts[i]` (a text key).
     /// A variable that has never been stored is NULL.
     PkgGet(u16),
@@ -435,6 +438,8 @@ const OP_NESTED_LAST: u8 = 109;
 // Nested-table PRIOR and NEXT. Additive: `NestedFirst`/`NestedLast` stay 108/109.
 const OP_NESTED_PRIOR: u8 = 110;
 const OP_NESTED_NEXT: u8 = 111;
+// Nested-table LIMIT. Additive: `NestedPrior`/`NestedNext` stay 110/111.
+const OP_NESTED_LIMIT: u8 = 112;
 
 /// `Op::CursorAttr` selector. Any other byte fails validation.
 pub const CURSOR_ATTR_ISOPEN: u8 = 0;
@@ -817,6 +822,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::NestedLast => b.push(OP_NESTED_LAST),
         Op::NestedPrior => b.push(OP_NESTED_PRIOR),
         Op::NestedNext => b.push(OP_NESTED_NEXT),
+        Op::NestedLimit => b.push(OP_NESTED_LIMIT),
         Op::PkgGet(x) => u16arg(OP_PKG_GET, x),
         Op::PkgSet(x) => u16arg(OP_PKG_SET, x),
         Op::CursorRow => b.push(OP_CURSOR_ROW),
@@ -979,6 +985,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_NESTED_LAST => Op::NestedLast,
         OP_NESTED_PRIOR => Op::NestedPrior,
         OP_NESTED_NEXT => Op::NestedNext,
+        OP_NESTED_LIMIT => Op::NestedLimit,
         OP_PKG_GET => Op::PkgGet(u16arg()?),
         OP_PKG_SET => Op::PkgSet(u16arg()?),
         OP_CURSOR_ROW => Op::CursorRow,
@@ -1005,6 +1012,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::NestedExists => (2, 1),
         Op::NestedFirst | Op::NestedLast => (1, 1),
         Op::NestedPrior | Op::NestedNext => (2, 1),
+        Op::NestedLimit => (1, 1),
         Op::PkgGet(_) => (0, 1),
         Op::PkgSet(_) => (1, 0),
         Op::Tuple(n) => (n as usize, 1),
@@ -1630,7 +1638,8 @@ mod tests {
         encode_op(&mut collect, Op::NestedLast);
         encode_op(&mut collect, Op::NestedPrior);
         encode_op(&mut collect, Op::NestedNext);
-        assert_eq!(collect, vec![102, 103, 106, 107, 108, 109, 110, 111]);
+        encode_op(&mut collect, Op::NestedLimit);
+        assert_eq!(collect, vec![102, 103, 106, 107, 108, 109, 110, 111, 112]);
         let collect_proc = mk(
             vec![
                 Op::LoadConst(0),

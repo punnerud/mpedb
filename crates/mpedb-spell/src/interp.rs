@@ -1030,6 +1030,10 @@ pub fn run_with_package(
                     matches!(op, Op::NestedNext),
                 )?);
             }
+            Op::NestedLimit => {
+                let collection = stack.pop().expect("validated");
+                stack.push(nested_limit(collection)?);
+            }
             Op::PkgGet(index) => {
                 let key = package_key(&proc.consts, index)?;
                 let value = package.get(key).cloned().unwrap_or(Value::Null);
@@ -1350,6 +1354,23 @@ fn nested_neighbor(collection: PValue, index: PValue, next: bool) -> Result<PVal
         Some(neighbor) => Value::Int(neighbor),
         None => Value::Null,
     }))
+}
+
+/// `LIMIT` of a nested table. A NULL collection raises. An initialized
+/// nested table has no maximum, so this pushes NULL. A stored NULL element
+/// does not change that.
+fn nested_limit(collection: PValue) -> Result<PValue> {
+    match collection {
+        PValue::Scalar(Value::Null) => Err(Error::Oracle {
+            code: 6531,
+            message: "Reference to uninitialized collection".into(),
+        }),
+        PValue::List(_) => Ok(PValue::Scalar(Value::Null)),
+        other => Err(type_err(format!(
+            "expected a nested table, got {}",
+            tyname(&other)
+        ))),
+    }
 }
 
 /// Implicit `SQL%` attribute. `ISOPEN` is always false. The other three
