@@ -1,10 +1,12 @@
 //! MySQL-protocol [`SourceAdapter`].
 //!
 //! Pull reads the trigger log, coalesces to one net op per primary key, and
-//! re-reads that key's current image from the same transaction. Push applies
-//! each op in its own savepoint and stamps `origin = 'mpedb'` on the log rows
-//! that op just produced, so the next pull does not echo them. Sync stays on
-//! whatever authority the mirror file already has; this adapter does not switch.
+//! re-reads that key's current image from the same transaction. Push sets the
+//! connection-local `@mpedb_origin` so the trigger records this session's
+//! writes, and a later pull drops those rows. A checked push locks the source
+//! row before it reads the log, so a source commit that landed inside this
+//! transaction is left in place. Sync stays on whatever authority the mirror
+//! file already has; this adapter does not switch.
 
 use std::collections::BTreeMap;
 
@@ -116,9 +118,7 @@ impl SourceAdapter for MysqlAdapter {
             return Ok(Vec::new());
         }
         let metas = metas_for(&self.tables, ops)?;
-        self.conn
-            .query_drop("START TRANSACTION")
-            .map_err(|e| Error::Config(format!("mysql push: {e}")))?;
+        begin_push(&mut self.conn)?;
         let applied = push_in_txn(&mut self.conn, &metas, None, ops);
         finish_txn(&mut self.conn, applied)
     }
@@ -129,9 +129,7 @@ impl SourceAdapter for MysqlAdapter {
         }
         let cursor = Self::decode_cursor(from)?;
         let metas = metas_for(&self.tables, ops)?;
-        self.conn
-            .query_drop("START TRANSACTION")
-            .map_err(|e| Error::Config(format!("mysql push: {e}")))?;
+        begin_push(&mut self.conn)?;
         let applied = push_in_txn(&mut self.conn, &metas, Some(&cursor), ops);
         finish_txn(&mut self.conn, applied)
     }
@@ -200,15 +198,46 @@ impl SourceAdapter for MysqlAdapter {
     }
 }
 
+fn begin_push(conn: &mut mysql::Conn) -> Result<()> {
+    // READ COMMITTED so the changelog check sees a commit that landed after
+    // START TRANSACTION. SET TRANSACTION applies to the next transaction only,
+    // and the pull path still opens its own consistent snapshot.
+    conn.query_drop("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .map_err(|e| Error::Config(format!("mysql push isolation: {e}")))?;
+    conn.query_drop("START TRANSACTION")
+        .map_err(|e| Error::Config(format!("mysql push: {e}")))?;
+    if let Err(e) = conn.query_drop(format!("SET @mpedb_origin = '{SELF_ORIGIN}'")) {
+        let _ = conn.query_drop("ROLLBACK");
+        let _ = conn.query_drop("SET @mpedb_origin = NULL");
+        return Err(Error::Config(format!("mysql push origin: {e}")));
+    }
+    Ok(())
+}
+
 fn finish_txn(conn: &mut mysql::Conn, applied: Result<Vec<bool>>) -> Result<Vec<bool>> {
-    match applied {
+    let outcome = match applied {
+        Ok(flags) => match conn.query_drop("COMMIT") {
+            Ok(()) => Ok(flags),
+            Err(e) => {
+                let _ = conn.query_drop("ROLLBACK");
+                Err(Error::Config(format!("mysql push commit: {e}")))
+            }
+        },
+        Err(e) => {
+            let _ = conn.query_drop("ROLLBACK");
+            Err(e)
+        }
+    };
+    // @mpedb_origin survives COMMIT and ROLLBACK. A reused connection must not
+    // tag a later statement as this mirror's echo.
+    let cleared = conn.query_drop("SET @mpedb_origin = NULL");
+    match outcome {
         Ok(flags) => {
-            conn.query_drop("COMMIT")
-                .map_err(|e| Error::Config(format!("mysql push commit: {e}")))?;
+            cleared.map_err(|e| Error::Config(format!("mysql push origin clear: {e}")))?;
             Ok(flags)
         }
         Err(e) => {
-            let _ = conn.query_drop("ROLLBACK");
+            let _ = cleared;
             Err(e)
         }
     }
@@ -381,17 +410,13 @@ fn push_in_txn(
     cursor: Option<&MysqlCursor>,
     ops: &[NetOp],
 ) -> Result<Vec<bool>> {
-    let mut premax = BTreeMap::new();
-    for (&tid, src) in metas {
-        let seq: Option<i64> = conn
-            .exec_first(format!("SELECT COALESCE(MAX(seq), 0) FROM {}", q(&log_table(&src.name))), ())
-            .map_err(|e| Error::Config(format!("mysql log head `{}`: {e}", src.name)))?;
-        premax.insert(tid, seq.unwrap_or(0));
-    }
     let mut results = Vec::with_capacity(ops.len());
     for op in ops {
         let src = &metas[&op.table_id];
         if let Some(cursor) = cursor {
+            // Lock first. The changelog read is then a current read of a row
+            // no other transaction can still be updating.
+            lock_source_row(conn, src, &op.pk)?;
             if source_changed(conn, src, &op.pk, cursor.seq(op.table_id))? {
                 results.push(false);
                 continue;
@@ -399,17 +424,21 @@ fn push_in_txn(
         }
         results.push(apply_op(conn, src, op)?);
     }
-    for (&tid, src) in metas {
-        conn.exec_drop(
-            format!(
-                "UPDATE {} SET origin = '{SELF_ORIGIN}' WHERE seq > ?",
-                q(&log_table(&src.name))
-            ),
-            (premax[&tid],),
-        )
-        .map_err(|e| Error::Config(format!("mysql echo tag `{}`: {e}", src.name)))?;
-    }
     Ok(results)
+}
+
+fn lock_source_row(conn: &mut mysql::Conn, src: &SourceTable, pk: &[Value]) -> Result<()> {
+    let pred = src
+        .pk
+        .iter()
+        .map(|&i| format!("{} = ?", q(&src.columns[i].name)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!("SELECT 1 FROM {} WHERE {pred} FOR UPDATE", q(&src.name));
+    let params: Vec<mysql::Value> = pk.iter().map(to_mysql).collect::<Result<_>>()?;
+    conn.exec_drop(sql, params)
+        .map_err(|e| Error::Config(format!("mysql row lock `{}`: {e}", src.name)))?;
+    Ok(())
 }
 
 fn source_changed(conn: &mut mysql::Conn, src: &SourceTable, pk: &[Value], from_seq: u64) -> Result<bool> {

@@ -2,8 +2,10 @@
 //!
 //! The shape matches the sqlite tracker: one `_mpedb_log_<table>` per mirrored
 //! table, PK columns only, `op` 1 = upsert and 2 = tombstone, and an `origin`
-//! tag so a later pull can drop this mirror's own push. The pull re-reads the
-//! row image; the log never stores it.
+//! tag so a later pull can drop this mirror's own push. The trigger copies the
+//! connection-local `@mpedb_origin`, which is NULL unless that session set it.
+//! Nothing stamps origin by sequence: that would tag another session's commit.
+//! The pull re-reads the row image; the log never stores it.
 
 use std::collections::BTreeMap;
 
@@ -80,7 +82,7 @@ pub(crate) fn install_triggers(conn: &mut mysql::Conn, src: &SourceTable) -> Res
     let trig_ai = format!(
         "CREATE TRIGGER {} AFTER INSERT ON {} FOR EACH ROW \
          BEGIN \
-           INSERT INTO {} (op, origin, {cols_list}) VALUES ({OP_UPSERT}, NULL, {new_refs}); \
+           INSERT INTO {} (op, origin, {cols_list}) VALUES ({OP_UPSERT}, @mpedb_origin, {new_refs}); \
          END",
         q(&ai),
         q(&src.name),
@@ -93,9 +95,9 @@ pub(crate) fn install_triggers(conn: &mut mysql::Conn, src: &SourceTable) -> Res
         "CREATE TRIGGER {} AFTER UPDATE ON {} FOR EACH ROW \
          BEGIN \
            IF NOT ({unchanged}) THEN \
-             INSERT INTO {} (op, origin, {cols_list}) VALUES ({OP_TOMBSTONE}, NULL, {old_refs}); \
+             INSERT INTO {} (op, origin, {cols_list}) VALUES ({OP_TOMBSTONE}, @mpedb_origin, {old_refs}); \
            END IF; \
-           INSERT INTO {} (op, origin, {cols_list}) VALUES ({OP_UPSERT}, NULL, {new_refs}); \
+           INSERT INTO {} (op, origin, {cols_list}) VALUES ({OP_UPSERT}, @mpedb_origin, {new_refs}); \
          END",
         q(&au),
         q(&src.name),
@@ -105,7 +107,7 @@ pub(crate) fn install_triggers(conn: &mut mysql::Conn, src: &SourceTable) -> Res
     let trig_ad = format!(
         "CREATE TRIGGER {} AFTER DELETE ON {} FOR EACH ROW \
          BEGIN \
-           INSERT INTO {} (op, origin, {cols_list}) VALUES ({OP_TOMBSTONE}, NULL, {old_refs}); \
+           INSERT INTO {} (op, origin, {cols_list}) VALUES ({OP_TOMBSTONE}, @mpedb_origin, {old_refs}); \
          END",
         q(&ad),
         q(&src.name),
