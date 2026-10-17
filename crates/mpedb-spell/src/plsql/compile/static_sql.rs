@@ -5,7 +5,7 @@
 //! routine.variable qualification. Ambiguous bare locals are refused.
 use super::*;
 use crate::emit::CallKind;
-enum StaticInput {
+pub(super) enum StaticInput {
     Local(Local),
     Number(String),
 }
@@ -157,7 +157,7 @@ impl Parser<'_> {
         }
         self.emit_sql_call(sql, kind, count, &into, source_start)
     }
-    fn bind_static_inputs(&self, source: &str) -> Result<(String, Vec<StaticInput>)> {
+    pub(super) fn bind_static_inputs(&self, source: &str) -> Result<(String, Vec<StaticInput>)> {
         let tokens = lex::lex(source)?;
         // Bare integer ordinals have clause-specific SQL semantics. Replacing
         // them with decimal expressions would silently change ORDER/GROUP BY.

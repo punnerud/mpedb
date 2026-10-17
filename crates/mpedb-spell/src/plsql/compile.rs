@@ -9,6 +9,7 @@ mod number;
 mod static_sql;
 mod cursor;
 mod forall;
+mod bulk_collect;
 
 use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
@@ -54,6 +55,15 @@ struct RecordDecl {
     fields: Vec<(String, u16)>,
 }
 
+/// A `TYPE name IS TABLE OF` element type, stored as one local. NULL means
+/// the table is uninitialized. An empty list is a completed `BULK COLLECT`
+/// that returned no rows.
+#[derive(Clone, Copy)]
+struct NestedVar {
+    slot: u16,
+    elem: Type,
+}
+
 struct Parser<'a> {
     source: &'a str,
     routine_name: String,
@@ -73,9 +83,14 @@ struct Parser<'a> {
     exceptions: HashMap<String, exception::ExceptionRef>,
     cursors: HashMap<String, cursor::CursorDecl>,
     records: HashMap<String, RecordDecl>,
+    nested_types: HashMap<String, Type>,
+    nested_vars: HashMap<String, NestedVar>,
     /// Set only while the single `FORALL` statement is compiled. The index
     /// is not an expression; every use is a named refusal.
     forall_index: Option<String>,
+    /// How many nested-table subscripts are being compiled. A `FORALL`
+    /// index is legal only there.
+    forall_subscripts: u16,
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
@@ -128,7 +143,10 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         exceptions: HashMap::new(),
         cursors: HashMap::new(),
         records: HashMap::new(),
+        nested_types: HashMap::new(),
+        nested_vars: HashMap::new(),
         forall_index: None,
+        forall_subscripts: 0,
     };
     if p.is_word("DECLARE") || p.is_word("BEGIN") {
         if scalar_only {
@@ -305,6 +323,10 @@ impl Parser<'_> {
                 self.declare_cursor()?;
                 continue;
             }
+            if self.looks_like_nested_type() {
+                self.declare_nested_type()?;
+                continue;
+            }
             let position = self.tokens.get(self.at).map_or(self.source.len(), |t| t.span.start);
             let name = self.identifier()?;
             if self.word("EXCEPTION") {
@@ -314,6 +336,9 @@ impl Parser<'_> {
             }
             let constant = self.word("CONSTANT");
             if self.declare_rowtype(&name, constant)? {
+                continue;
+            }
+            if self.declare_nested_var(&name, constant)? {
                 continue;
             }
             let ty = self.data_type(true)?;
@@ -514,6 +539,7 @@ impl Parser<'_> {
         // A scalar hides an outer record of the same name for this scope.
         // The caller's saved map puts the record back when the scope ends.
         self.records.remove(&name);
+        self.nested_vars.remove(&name);
         let slot = self.builder.alloc_local()?;
         self.locals.insert(name, Local { slot, ty, writable, not_null: false });
         Ok(slot)
@@ -691,6 +717,9 @@ impl Parser<'_> {
         Ok(())
     }
     fn statement(&mut self) -> Result<()> {
+        if self.is_word("SELECT") && self.looks_like_bulk_collect() {
+            return self.bulk_collect();
+        }
         if self.is_word("SELECT") || self.is_word("INSERT") || self.is_word("UPDATE") || self.is_word("DELETE") {
             return self.static_sql();
         }
@@ -703,6 +732,8 @@ impl Parser<'_> {
             let outer_exceptions = self.exceptions.clone();
             let outer_cursors = self.cursors.clone();
             let outer_records = self.records.clone();
+            let outer_nested_types = self.nested_types.clone();
+            let outer_nested_vars = self.nested_vars.clone();
             let outer_declared = std::mem::take(&mut self.declared_here);
             let outer_pending = std::mem::take(&mut self.pending_declarations);
             if declarations {
@@ -716,6 +747,8 @@ impl Parser<'_> {
             self.exceptions = outer_exceptions;
             self.cursors = outer_cursors;
             self.records = outer_records;
+            self.nested_types = outer_nested_types;
+            self.nested_vars = outer_nested_vars;
             self.declared_here = outer_declared;
             self.pending_declarations = outer_pending;
             return Ok(());
@@ -805,6 +838,9 @@ impl Parser<'_> {
             if let Some(record) = self.records.get(&name).cloned() {
                 return self.assign_record(record);
             }
+            if let Some(nested) = self.nested_vars.get(&name).copied() {
+                return self.assign_nested(nested);
+            }
         }
         let local = *self.locals.get(&name).ok_or_else(|| {
             self.error(&format!(
@@ -830,6 +866,8 @@ impl Parser<'_> {
         let reverse = self.word("REVERSE");
         let outer_locals = self.locals.clone();
         let outer_records = self.records.clone();
+        let outer_nested_types = self.nested_types.clone();
+        let outer_nested_vars = self.nested_vars.clone();
         let outer_declared = std::mem::take(&mut self.declared_here);
         let outer_pending = std::mem::take(&mut self.pending_declarations);
         // Oracle's index hides outer names even while the bounds are being
@@ -880,6 +918,8 @@ impl Parser<'_> {
         self.builder.pop_loop();
         self.locals = outer_locals;
         self.records = outer_records;
+        self.nested_types = outer_nested_types;
+        self.nested_vars = outer_nested_vars;
         self.declared_here = outer_declared;
         self.pending_declarations = outer_pending;
         Ok(())
@@ -1166,7 +1206,7 @@ impl Parser<'_> {
         if self.symbol("%") {
             return self.cursor_attribute(&name);
         }
-        if self.forall_index.as_deref() == Some(name.as_str()) {
+        if self.forall_subscripts == 0 && self.forall_index.as_deref() == Some(name.as_str()) {
             return Err(self.error("a FORALL index can only subscript a collection"));
         }
         if self.pending_declarations.contains(&name) {
@@ -1178,6 +1218,9 @@ impl Parser<'_> {
         }
         if let Some(record) = self.records.get(&name).cloned() {
             return self.record_expr(record);
+        }
+        if let Some(nested) = self.nested_vars.get(&name).copied() {
+            return self.nested_expr(nested);
         }
         Err(self.error(&format!(
             "unknown variable or unsupported expression {name}"

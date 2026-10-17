@@ -269,6 +269,14 @@ pub enum Op {
     /// `SQL_BULK_BEGIN`, `SQL_BULK_RECORD`, `SQL_BULK_FINISH`, or
     /// `SQL_BULK_LOAD`. A missing subscript pushes NULL.
     SqlBulk(u8),
+    /// Pop a query row list and push one nested table of its first column.
+    /// Zero rows is an empty table. Sets implicit `SQL%ROWCOUNT` to the
+    /// fetched count.
+    BulkCollect,
+    /// Pop a nested table and a 1-based index. NULL table raises
+    /// `COLLECTION_IS_NULL`. A NULL index raises `VALUE_ERROR`. A missing
+    /// element raises `SUBSCRIPT_BEYOND_COUNT`. A stored NULL stays NULL.
+    NestedIndex,
     /// Pop a cursor handle, push its current row as a tuple.
     CursorRow,
     /// Pop the return value and finish the procedure.
@@ -387,6 +395,9 @@ const OP_DB_RETURNING: u8 = 99;
 const OP_SQL_ATTR: u8 = 100;
 // `SQL%BULK_ROWCOUNT`. Additive: `SqlAttr` still pushes one scalar attribute.
 const OP_SQL_BULK: u8 = 101;
+// Nested-table `BULK COLLECT`. Additive: `SqlBulk` keeps its mode byte.
+const OP_BULK_COLLECT: u8 = 102;
+const OP_NESTED_INDEX: u8 = 103;
 
 /// `Op::CursorAttr` selector. Any other byte fails validation.
 pub const CURSOR_ATTR_ISOPEN: u8 = 0;
@@ -739,6 +750,8 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
             b.push(OP_SQL_BULK);
             b.push(mode);
         }
+        Op::BulkCollect => b.push(OP_BULK_COLLECT),
+        Op::NestedIndex => b.push(OP_NESTED_INDEX),
         Op::CursorRow => b.push(OP_CURSOR_ROW),
         Op::Return => b.push(OP_RETURN),
     }
@@ -891,6 +904,8 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
             *pos += 1;
             Op::SqlBulk(mode)
         }
+        OP_BULK_COLLECT => Op::BulkCollect,
+        OP_NESTED_INDEX => Op::NestedIndex,
         OP_CURSOR_ROW => Op::CursorRow,
         OP_RETURN => Op::Return,
         other => return Err(Error::Corrupt(format!("proc: invalid opcode {other}"))),
@@ -909,6 +924,8 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::SqlBulk(SQL_BULK_RECORD) => (1, 0),
         Op::SqlBulk(SQL_BULK_LOAD) => (1, 1),
         Op::SqlBulk(_) => (0, 0),
+        Op::BulkCollect => (1, 1),
+        Op::NestedIndex => (2, 1),
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
@@ -1510,6 +1527,27 @@ mod tests {
         assert_eq!(
             Proc::decode(&bulk_proc.encode()).unwrap().instrs,
             bulk_proc.instrs
+        );
+        let mut collect = Vec::new();
+        encode_op(&mut collect, Op::BulkCollect);
+        assert_eq!(collect, vec![102]);
+        encode_op(&mut collect, Op::NestedIndex);
+        assert_eq!(collect, vec![102, 103]);
+        let collect_proc = mk(
+            vec![
+                Op::LoadConst(0),
+                Op::BulkCollect,
+                Op::LoadConst(0),
+                Op::NestedIndex,
+                Op::Return,
+            ],
+            vec![Value::Null],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            Proc::decode(&collect_proc.encode()).unwrap().instrs,
+            collect_proc.instrs
         );
         let fetched = mk(
             vec![

@@ -985,6 +985,15 @@ pub fn run(
             Op::SqlBulk(mode) => {
                 bulk.step(mode, &mut stack, &mut implicit_sql)?;
             }
+            Op::BulkCollect => {
+                let rows = stack.pop().expect("validated");
+                stack.push(bulk_collect_column(&mut implicit_sql, rows)?);
+            }
+            Op::NestedIndex => {
+                let collection = stack.pop().expect("validated");
+                let index = stack.pop().expect("validated");
+                stack.push(nested_index(collection, index)?);
+            }
             Op::CursorRow => {
                 let slot = pop_cursor(&mut stack, &cursors)?;
                 match &cursors[slot].row {
@@ -1114,6 +1123,58 @@ fn bulk_index(value: PValue) -> Result<i64> {
         // A NULL subscript is Oracle 6502, not a missing FORALL entry.
         _ => Err(oracle_exception::named(6502)),
     }
+}
+
+/// First column of a query row list. An empty result is an empty nested
+/// table, not NULL, and `SQL%ROWCOUNT` is the fetched count.
+fn bulk_collect_column(implicit_sql: &mut Option<(bool, i64)>, rows: PValue) -> Result<PValue> {
+    let PValue::List(rows) = rows else {
+        return Err(type_err("BULK COLLECT requires a query row set"));
+    };
+    let mut elems = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let PValue::Tuple(cols) = row else {
+            return Err(type_err("BULK COLLECT requires a query row tuple"));
+        };
+        if cols.len() != 1 {
+            return Err(type_err("BULK COLLECT requires one select item"));
+        }
+        elems.push(cols[0].clone());
+    }
+    let count = i64::try_from(elems.len()).map_err(|_| rt_err("BULK COLLECT row count exceeds i64"))?;
+    *implicit_sql = Some((count > 0, count));
+    Ok(PValue::List(Rc::new(elems)))
+}
+
+/// 1-based nested-table subscript. A NULL element already stored is returned
+/// unchanged. The table itself being NULL is a different error.
+fn nested_index(collection: PValue, index: PValue) -> Result<PValue> {
+    let list = match collection {
+        PValue::Scalar(Value::Null) => {
+            return Err(Error::Oracle {
+                code: 6531,
+                message: "Reference to uninitialized collection".into(),
+            })
+        }
+        PValue::List(list) => list,
+        other => {
+            return Err(type_err(format!(
+                "expected a nested table, got {}",
+                tyname(&other)
+            )))
+        }
+    };
+    let index = match index {
+        PValue::Scalar(Value::Int(index)) => index,
+        _ => return Err(oracle_exception::named(6502)),
+    };
+    if index < 1 || index as usize > list.len() {
+        return Err(Error::Oracle {
+            code: 6533,
+            message: "Subscript beyond count".into(),
+        });
+    }
+    Ok(list[(index as usize) - 1].clone())
 }
 
 /// Implicit `SQL%` attribute. `ISOPEN` is always false. The other three
