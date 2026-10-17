@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/mpedb-types",
+    "crates/mpedb-host",
     "crates/mpedb-core",
     "crates/mpedb-sql",
     "crates/mpedb",
@@ -47,6 +48,7 @@ license = "LicenseRef-mpedb-1.0"
 
 [workspace.dependencies]
 mpedb-types = { path = "crates/mpedb-types" }
+mpedb-host = { path = "crates/mpedb-host" }
 mpedb-core = { path = "crates/mpedb-core" }
 mpedb-sql = { path = "crates/mpedb-sql" }
 mpedb = { path = "crates/mpedb" }

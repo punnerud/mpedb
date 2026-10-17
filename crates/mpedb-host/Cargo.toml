@@ -1,0 +1,23 @@
+[package]
+name = "mpedb-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Database-independent host services with an environment ceiling and mutable inner ACLs"
+
+[features]
+default = []
+http = ["dep:reqwest", "dep:serde_json", "dep:url"]
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+cap-std = "4"
+getrandom = "0.4"
+libc = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+serde_json = { version = "1", optional = true }
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

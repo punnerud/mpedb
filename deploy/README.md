@@ -74,3 +74,12 @@ pgrep -a mpedb-pg            # no output again
 
 If the last `pgrep` prints something, the connection was not closed — that is a
 client holding it open, not a daemon.
+
+## Optional outbound host services
+
+The separate [mpedb-host library](../crates/mpedb-host/README.md) supports direct
+Rust file/HTTP operations or an authenticated dispatch service behind a gateway.
+Its immutable outer environment limits are always intersected with mutable
+inner database/routine grants. This is distinct from the PostgreSQL ingress
+Nginx stream configuration above. The library has native and gateway client
+implementations; it does not yet ship a listening daemon or Oracle UTL_* bindings.

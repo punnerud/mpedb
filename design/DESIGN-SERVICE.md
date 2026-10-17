@@ -6,6 +6,25 @@ writer-lock + MVCC, WAL, workspaces. The service is a *coordination convenience 
 embedded model, never a gatekeeper: other processes still attach the `.mpedb` directly (CLAUDE.md's
 no-server contract is preserved). Pairs with [DESIGN-SYNC-TIERING.md](DESIGN-SYNC-TIERING.md).**
 
+## Current host-service boundary (2026-10-17)
+
+The database-independent [mpedb-host library](../crates/mpedb-host/README.md) now
+provides native file/HTTP operations and an interchangeable authenticated-gateway
+client contract. The deployment environment supplies an **outer** immutable
+permission/resource ceiling outside the database. Database/user/routine grants
+form an **inner** mutable ACL; authorized routines may administer/extend those
+grants, but effective access always intersects the outer environment. The older
+file-resident callout settings below therefore travel as inner preferences, not
+as authority to enlarge the host's ceiling. ACL persistence, Oracle package
+bindings and a listening service remain work to integrate.
+
+An optional persistent Rust worker/service may embed the library and attach the
+same MPEdb shared mapping as other local processes. The default per-file writer
+is still coordinated/serial; reader/I/O parallelism and independent database
+partitions are distinct scaling dimensions. Native/gateway selection does not
+change those engine guarantees. TB/Mac hardware validation is deferred; the
+library README records the intended measurements without claiming tested scale.
+
 ## 0. The thesis
 
 A queue and a cron schedule are just *tables*. What makes a DB-backed task runner hard is
