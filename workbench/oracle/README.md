@@ -244,7 +244,8 @@ writes count as changes too, so callers must pull/reconcile before a new request
 This coarse table fence is a transport correctness baseline, not fine-grained
 continuous mirroring. Native tests cover foreign commits, compound-key moves,
 whole-batch rejection, busy writers, budgets, cursor realms and old-epoch
-receipt recovery. Production outbox/echo/controller wiring remains unfinished.
+receipt recovery. Production push/rejection-receipt and authority-controller
+wiring remain unfinished.
 
 Oracle writes re-read every requested target after the entire DML batch,
 before publishing data and receipts. A later trigger that changes an earlier
@@ -274,8 +275,8 @@ postimages, changed chunks during RPC and concurrent ACK/new-request races.
 The native Oracle receipt fixture also loses a committed reply, cold-reopens,
 changes the local row again and verifies that retry recovers the OLD request
 before sending the new generation; its Unicode payload spans metadata chunks.
-Oracle production push remains gated until provenance/echo filtering and the
-controller are connected. The outbox retains the full coalesced dirty set in
+Oracle production push remains gated until rejection receipts, prepared-request
+recovery and the authority controller are connected. The outbox retains the full coalesced dirty set in
 one source transaction; its current 64 MiB/100000-op limit refuses oversized
 requests before RPC rather than splitting key moves or silently truncating.
 
@@ -287,8 +288,35 @@ Unmatched expirations mark a key incomplete; consumers must treat it as unknown.
 All XIDs affecting a key are retained, so a shared commit SCN alone cannot prove
 ownership. Native historical/key-move capture, index-organized logical ROWIDs and
 partition row movement pass, along with deterministic tests for unrelated rows,
-table isolation and mixed/unknown evidence. This evidence
-still needs a source-side request ledger before it can attest mirror origins.
+table isolation and mixed/unknown evidence.
+
+`prepare_origin_ledger` installs the explicitly owned `MPEDB_WRITE_ORIGINS` V1
+ledger. An optional `OracleWriteRequest.origin` binds a FILE incarnation and the
+pinned origin-ledger identity into the receipt payload domain. Data, explicit
+key/object footprints, origin row and write receipt commit together. Replay and
+read-only receipt recovery verify that the matching origin still exists with
+its exact original footprint. Ledger recreation/truncation/DDL changes and
+incompatible application name collisions are refused. Enabled triggers on
+tracking/receipt ledgers are refused; all application postimages are checked
+again after tracking writes and before commit.
+
+`read_write_origins` uses public Flashback Versions to obtain each immutable
+origin INSERT's actual commit SCN/XID and bounded checksummed BLOB footprint.
+Updates, deletions/expirations, corrupt records, unavailable undo and budgets
+fail without advancing a mirror. `attest_write_origins` combines these events
+with complete per-key transaction evidence. Every affecting transaction/request
+must cover that explicit key and FILE; the same XID on an unrequested trigger
+side effect never proves ownership.
+
+Imports verify/exclude the owned ledger and optionally pin its identity in the
+backward-compatible V3 bootstrap manifest. Prepare the ledger before importing
+when this capability is needed; older manifests remain read-only. OracleAdapter
+and the bounded CLI pull use provenance-aware capture/apply. The whole interval
+before a cursor advance is checked, including origin-only commits and empty
+application watermarks. Budgets bisect windows without splitting a source SCN.
+Legacy pull refuses to discard an own-key proof and requires the provenance API.
+Production write-back still stays refused until its remaining protocol gates
+are implemented.
 
 The shared apply boundary also accepts optional source-attested per-key write
 provenance (`pull_provenanced` / `apply_provenanced_batch`). An ACK persists the
@@ -305,8 +333,24 @@ Fifteen protocol tests cover the outbox and provenance rules, including cold
 reopen, restore, pending receipt recovery, rejected requests and multiple own
 requests coalesced onto one key. ACK footprints currently have no garbage
 collection; a future retention policy must explicitly preserve recovery from
-supported backups. Native Oracle capture does not yet supply this provenance,
-so this shared foundation does not enable production Oracle write-back.
+supported backups. Native Oracle tests now exercise pending and ACKed echoes
+through the real adapter/apply path, including lost replies, cold reopen, newer
+dirty intent and equal-value foreign writes. Another native test verifies that
+an own-FILE event without local ACK/pending knowledge is applied normally.
+Ledger mutations cannot be skipped by empty watermarks or recycled into an old
+request identity in a later foreign transaction. These are protocol foundations;
+production Oracle write-back is still gated.
+
+The source-origin pass ran all 20 native tests across the 16 source targets,
+then the new origin-only mutation/reinsertion regression and bounded CLI test.
+The mutation regression first failed against the old cursor-window behavior and
+passed after the fix. All 14 external functional library tests also passed,
+including the real Oracle/MPEdb/rRETL/PostgreSQL roundtrip with source-origin
+metadata enabled, and the 100-round switch drill. Shared tests passed 89 ordinary
+library tests, 15 outbox/provenance tests and 6 postimage tests; the 14 external
+library tests are explicitly run separately rather than skipped. Feature clippy
+and the default CLI build passed. These results do not establish full Oracle
+SQL/PLSQL or framework compatibility.
 
 Tokens must include a durable local FILE incarnation and dirty generation;
 a path/transaction number or payload hash alone can collide after reimport.
@@ -428,7 +472,8 @@ Parameter lists follow Oracle's grammar: omit parentheses for zero parameters.
 Nested blocks provide lexical scope, shadow outer names, and initialize local
 variables on every entry. Self/forward references in initializers are rejected,
 including references that would otherwise resolve to an outer variable.
-Block labels, qualified local names, and exception handlers are not yet supported.
+Block labels remain unsupported. Routine-qualified locals and block exception
+handlers have since been added; their current limits are described below.
 
 VARCHAR2 follows the measured Oracle 26ai reference profile: AL32UTF8, binary
 comparison, and BYTE default length semantics. Local declarations accept
@@ -788,3 +833,15 @@ References:
 * [Django Oracle test privileges](https://docs.djangoproject.com/en/5.2/ref/databases/#oracle-notes)
 * [SQLAlchemy upstream test instructions](https://github.com/sqlalchemy/sqlalchemy/blob/rel_2_0_44/README.unittests.rst)
 * [Python-oracledb initialization](https://python-oracledb.readthedocs.io/en/latest/user_guide/initialization.html)
+
+
+## Environment-controlled external services
+
+The separate [mpedb-host Rust library](../../crates/mpedb-host/README.md) provides
+bounded native file/HTTP operations and an interchangeable gateway client.
+Mutable inner database/routine ACLs can be administered by authorized callers;
+they always intersect an immutable environment ceiling outside the database.
+Oracle UTL_HTTP/UTL_FILE, directory-object, role and DBMS_NETWORK_ACL_ADMIN bindings
+remain integration work. The generic library currently has no database dependency
+and does not install a listening service. Optional worker/service deployment,
+shared-memory concurrency and deferred Mac/TB load testing are documented there.

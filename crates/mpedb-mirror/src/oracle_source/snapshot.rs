@@ -21,7 +21,7 @@ impl OracleSource {
     /// Read all selected tables at ONE SCN while fencing source DDL. A failed
     /// bootstrap publishes no cursor; callers may retry the entire bootstrap.
     pub fn snapshot(&mut self, tables: &[OracleTable]) -> Result<OracleSnapshot> {
-        self.snapshot_inner(tables, None, None, None)
+        self.snapshot_inner(tables, None, None, None, None)
     }
     /// Bootstrap a mirror after its authority row was initialized. Its epoch
     /// is read at the same SCN as the application rows, never from current data.
@@ -30,7 +30,7 @@ impl OracleSource {
         tables: &[OracleTable],
         mirror_id: &str,
     ) -> Result<OracleSnapshot> {
-        self.snapshot_inner(tables, Some(mirror_id), None, None)
+        self.snapshot_inner(tables, Some(mirror_id), None, None, None)
     }
     /// Returns the snapshot header with empty `rows`; values go to the sink.
     pub(crate) fn stream_mirror_snapshot(
@@ -38,15 +38,17 @@ impl OracleSource {
         tables: &[OracleTable],
         mirror_id: &str,
         ledger: Option<&OracleLedgerIdentity>,
+        origins: Option<&OracleOriginLedgerIdentity>,
         sink: &mut dyn FnMut(u32, Vec<Value>) -> Result<()>,
     ) -> Result<OracleSnapshot> {
-        self.snapshot_inner(tables, Some(mirror_id), ledger, Some(sink))
+        self.snapshot_inner(tables, Some(mirror_id), ledger, origins, Some(sink))
     }
     fn snapshot_inner(
         &mut self,
         tables: &[OracleTable],
         mirror_id: Option<&str>,
         ledger: Option<&OracleLedgerIdentity>,
+        origins: Option<&OracleOriginLedgerIdentity>,
         mut sink: Option<&mut dyn FnMut(u32, Vec<Value>) -> Result<()>>,
     ) -> Result<OracleSnapshot> {
         let result = (|| {
@@ -57,6 +59,9 @@ impl OracleSource {
             }
             if let Some(ledger) = ledger {
                 self.lock_write_ledger(ledger)?;
+            }
+            if let Some(origins) = origins {
+                self.lock_origin_ledger(origins)?;
             }
             for table in &tables {
                 self.lock_schema(table)?;

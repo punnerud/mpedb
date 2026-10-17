@@ -27,6 +27,7 @@ pub struct OracleWriteRequest<'a> {
     pub epoch: u64,
     pub authority: &'a str,
     pub state_identity: &'a OracleStateIdentity,
+    pub origin: Option<OracleWriteOrigin<'a>>,
     pub ledger_identity: &'a OracleLedgerIdentity,
 }
 impl OracleSource {
@@ -72,7 +73,7 @@ impl OracleSource {
                 "Oracle receipt ledger changed; reconcile before retrying".into(),
             ));
         }
-        Ok(())
+        self.check_tracking_triggers(TABLE)
     }
     /// Prepare tracking BEFORE storing a bootstrap boundary. An existing table
     /// must have the exact owned shape; application name collisions are refused.
@@ -141,7 +142,9 @@ impl OracleSource {
                     "Oracle receipt ledger ownership marker is missing".into(),
                 ));
             }
-            self.ledger_identity()
+            let identity = self.ledger_identity()?;
+            self.lock_write_ledger(&identity)?;
+            Ok(identity)
         })();
         self.connection
             .rollback()
@@ -255,6 +258,15 @@ impl OracleSource {
         domain.extend_from_slice(&request.ledger_identity.object_id.to_be_bytes());
         domain.extend_from_slice(&request.ledger_identity.data_object_id.to_be_bytes());
         domain.extend_from_slice(&request.state_identity.incarnation);
+        if let Some(origin) = request.origin {
+            domain.extend_from_slice(b"MPEdb Oracle origin v1\0");
+            domain.extend_from_slice(&origin.file_incarnation);
+            domain.extend_from_slice(&origin.ledger_identity.object_id.to_be_bytes());
+            domain.extend_from_slice(&origin.ledger_identity.data_object_id.to_be_bytes());
+            domain.extend_from_slice(
+                blake3::hash(origin.ledger_identity.schema_ddl.as_bytes()).as_bytes(),
+            );
+        }
         super::receipt_codec::payload(tables, ops, &domain)
     }
     /// Recover an uncertain commit WITHOUT executing application DML. The
@@ -273,12 +285,22 @@ impl OracleSource {
         let result = (|| {
             self.lock_write_incarnation(request)?;
             self.lock_write_ledger(request.ledger_identity)?;
+            self.lock_request_origin(request)?;
             self.lock_write_tables(tables, ops)?;
             let payload = self.receipt_payload(tables, ops, request)?;
+            let origin = self.request_origin_footprint(tables, ops, request)?;
             let images = self
                 .receipt_bytes(request, &payload)?
                 .map(|bytes| super::receipt_codec::decode(tables, ops, &bytes))
                 .transpose()?;
+            if let Some(bytes) = origin {
+                let present = self.read_request_origin(request, &payload, &bytes)?;
+                if present != images.is_some() {
+                    return Err(Error::Corrupt(
+                        "Oracle receipt/origin atomicity mismatch".into(),
+                    ));
+                }
+            }
             if self.source_state_identity(request.mirror_id)? != *request.state_identity {
                 return Err(Error::Unsupported(
                     "Oracle receipt recovery incarnation changed".into(),
@@ -330,6 +352,7 @@ impl OracleSource {
         let result = (|| {
             self.lock_write_authority(request)?;
             self.lock_write_ledger(request.ledger_identity)?;
+            self.lock_request_origin(request)?;
             // Replays must also reject stale application schema metadata.
             let locked = self.lock_write_tables(tables, ops)?;
             if let Some((from, budget)) = checked {
@@ -343,13 +366,31 @@ impl OracleSource {
                 }
             }
             let payload = self.receipt_payload(tables, ops, request)?;
+            let origin = self.request_origin_footprint(tables, ops, request)?;
             if let Some(bytes) = self.receipt_bytes(request, &payload)? {
+                if let Some(footprint) = &origin {
+                    if !self.read_request_origin(request, &payload, footprint)? {
+                        return Err(Error::Corrupt(
+                            "Oracle receipt is missing its committed origin".into(),
+                        ));
+                    }
+                }
                 return super::receipt_codec::decode(tables, ops, &bytes);
+            }
+            if let Some(footprint) = &origin {
+                if self.read_request_origin(request, &payload, footprint)? {
+                    return Err(Error::Corrupt(
+                        "Oracle origin exists without its committed receipt".into(),
+                    ));
+                }
             }
             if let Some((from, budget)) = checked {
                 self.check_write_conflicts(tables, ops, from.scn(), budget)?;
             }
             let images = self.write_locked(&locked, ops)?;
+            if let Some(footprint) = &origin {
+                self.insert_request_origin(request, &payload, footprint)?;
+            }
             let bytes = super::receipt_codec::encode(tables, ops, &images)?;
             let hash = blake3::hash(&bytes).as_bytes().to_vec();
             let mut blob =
@@ -374,6 +415,24 @@ impl OracleSource {
                 return Err(Error::Corrupt(
                     "Oracle did not retain its write receipt; transaction rolled back".into(),
                 ));
+            }
+            // Tracking writes must not invalidate the application postimages
+            // that the receipt is about to publish. Keep the application row
+            // locks until this final verification and commit.
+            self.check_tracking_triggers(TABLE)?;
+            if request.origin.is_some() {
+                self.check_tracking_triggers("MPEDB_WRITE_ORIGINS")?;
+            }
+            for (op, expected) in ops.iter().zip(&images) {
+                let actual = self.read_key(locked[op.table_id as usize], &op.pk, None)?;
+                let same = match (expected, &actual) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => crate::adapter::same_carrier_rows(a, b),
+                    _ => false,
+                };
+                if !same {
+                    return Err(Error::Unsupported("Oracle tracking writes changed an application postimage; transaction rolled back".into()));
+                }
             }
             self.verify_write_authority(request)?;
             Ok(images)

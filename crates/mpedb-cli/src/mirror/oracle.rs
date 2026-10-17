@@ -39,10 +39,10 @@ pub(super) fn pull(db_path: &str, p: &args::Parsed) -> Result<Option<u64>, Failu
         let from = db
             .sys_record_get(state::MIR_NS, state::KEY_CUR)?
             .ok_or_else(|| Failure::Runtime("Oracle cursor is missing".into()))?;
-        let Some(batch) = adapter.pull_through(&from, &through, 100_000)? else {
+        let Some(batch) = adapter.pull_through_provenanced(&from, &through, 100_000)? else {
             break;
         };
-        let stats = mpedb_mirror::apply_batch(&db, &from, &batch)?;
+        let stats = mpedb_mirror::apply_provenanced_batch(&db, &from, &batch)?;
         applied += stats.upserts + stats.deletes;
     }
     Ok(Some(applied))

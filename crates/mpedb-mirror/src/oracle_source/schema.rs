@@ -2,6 +2,19 @@
 use super::*;
 
 impl OracleSource {
+    pub(super) fn check_tracking_triggers(&self, table: &str) -> Result<()> {
+        let count: u64 = self.connection.query_row_as(
+            "SELECT COUNT(*) FROM all_triggers WHERE table_owner=:1 AND table_name=:2 AND status='ENABLED'",
+            &[&self.owner, &table],
+        ).map_err(|e| err("tracking ledger triggers", e))?;
+        if count != 0 {
+            return Err(Error::Unsupported(
+                "Oracle tracking ledger has enabled triggers".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn lock_schema(&self, table: &OracleTable) -> Result<()> {
         if table.owner != self.owner {
             return Err(Error::Unsupported(

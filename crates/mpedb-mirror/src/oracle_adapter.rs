@@ -2,11 +2,13 @@
 //! enter MPEdb through the shared atomic apply protocol. Write-back is refused
 //! until its durable echo ledger and conflict protocol are connected.
 use crate::{
-    adapter::{Cursor, NetOp, PullBatch, SourceAdapter},
+    adapter::{Cursor, NetOp, ProvenancedPullBatch, PullBatch, SourceAdapter},
     oracle::{carrier_tables, OracleTable},
     oracle_cursor::{OracleIdentity, OraclePosition},
-    oracle_import::load_bootstrap,
-    oracle_source::{OracleSource, OracleStateIdentity},
+    oracle_import::{load_bootstrap, load_file_incarnation},
+    oracle_source::{
+        attest_write_origins, OracleOriginLedgerIdentity, OracleSource, OracleStateIdentity,
+    },
 };
 use mpedb::Database;
 use mpedb_types::{Error, Result, Value};
@@ -19,6 +21,8 @@ pub struct OracleAdapter {
     initial: Cursor,
     mirror_id: String,
     max_events: usize,
+    origin_ledger: Option<OracleOriginLedgerIdentity>,
+    file_incarnation: Option<[u8; 16]>,
 }
 impl OracleAdapter {
     /// Reconnect using metadata stored in the imported MPEdb file. The source
@@ -37,6 +41,12 @@ impl OracleAdapter {
             initial: metadata.cursor,
             mirror_id: metadata.mirror_id,
             max_events: 100_000,
+            file_incarnation: metadata
+                .origin_ledger
+                .as_ref()
+                .map(|_| load_file_incarnation(db))
+                .transpose()?,
+            origin_ledger: metadata.origin_ledger,
         };
         adapter.check_identity()?;
         if adapter
@@ -70,14 +80,30 @@ impl OracleAdapter {
         through: &Cursor,
         max_ops: usize,
     ) -> Result<Option<PullBatch>> {
+        Self::legacy(self.pull_window(from, Some(through), max_ops)?)
+    }
+    pub fn pull_through_provenanced(
+        &mut self,
+        from: &Cursor,
+        through: &Cursor,
+        max_ops: usize,
+    ) -> Result<Option<ProvenancedPullBatch>> {
         self.pull_window(from, Some(through), max_ops)
+    }
+    fn legacy(batch: Option<ProvenancedPullBatch>) -> Result<Option<PullBatch>> {
+        batch.map(|incoming| {
+            if incoming.origins.as_ref().is_some_and(|origins|origins.iter().any(Option::is_some)) {
+                return Err(Error::Unsupported("Oracle own writes require pull_provenanced and atomic provenance-aware apply".into()));
+            }
+            Ok(incoming.batch)
+        }).transpose()
     }
     fn pull_window(
         &mut self,
         from: &Cursor,
         through: Option<&Cursor>,
         max_ops: usize,
-    ) -> Result<Option<PullBatch>> {
+    ) -> Result<Option<ProvenancedPullBatch>> {
         if max_ops == 0 {
             return Err(Error::Config("Oracle pull max_ops must be positive".into()));
         }
@@ -103,14 +129,36 @@ impl OracleAdapter {
             return Ok(None);
         }
         let mut end = head;
-        let batches = loop {
-            match self
-                .source
-                .read_changes(&self.tables, from_scn, end, self.max_events)
-            {
-                Ok(batches) => break batches,
+        let (first, events) = loop {
+            let window = (|| {
+                let batches =
+                    self.source
+                        .read_changes(&self.tables, from_scn, end, self.max_events)?;
+                let first = batches.into_iter().next();
+                let through = first.as_ref().map_or(end, |batch| batch.scn);
+                let events = if let Some(ledger) = &self.origin_ledger {
+                    // Check EVERY origin change before advancing, including
+                    // origin-only commits and empty app-data watermarks. An
+                    // earlier DELETE followed by reinsertion of an old request
+                    // must never become a fresh ownership assertion.
+                    self.source.read_write_origins(
+                        &self.mirror_id,
+                        ledger,
+                        from_scn,
+                        through,
+                        self.max_events,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                Ok((first, events))
+            })();
+            match window {
+                Ok(value) => break value,
                 Err(Error::Unsupported(ref message))
-                    if message.starts_with("Oracle capture event budget exceeded;")
+                    if (message.starts_with("Oracle capture event budget exceeded;")
+                        || message.starts_with("Oracle origin capture event budget exceeded;")
+                        || message.starts_with("Oracle origin capture byte budget exceeded;"))
                         && end - from_scn > 1 =>
                 {
                     end = from_scn + (end - from_scn) / 2;
@@ -118,14 +166,18 @@ impl OracleAdapter {
                 Err(e) => return Err(e),
             }
         };
-        let (ops, scn) = match batches.into_iter().next() {
+        let (ops, scn, origins) = match first {
             Some(batch) => {
                 if batch.ops.len() > max_ops {
                     return Err(Error::Unsupported("Oracle commit exceeds max_ops; increase the limit without advancing the cursor".into()));
                 }
-                (batch.ops, batch.scn)
+                let origins = self
+                    .file_incarnation
+                    .map(|file| attest_write_origins(&self.tables, &batch, &events, file))
+                    .transpose()?;
+                (batch.ops, batch.scn, origins)
             }
-            None => (Vec::new(), end),
+            None => (Vec::new(), end, None),
         };
         let epoch = self
             .source
@@ -135,10 +187,13 @@ impl OracleAdapter {
             })?
             .0;
         self.check_identity()?;
-        Ok(Some(PullBatch {
-            ops,
-            end_cursor: self.cursor(scn)?,
-            source_epoch: Some(epoch),
+        Ok(Some(ProvenancedPullBatch {
+            batch: PullBatch {
+                ops,
+                end_cursor: self.cursor(scn)?,
+                source_epoch: Some(epoch),
+            },
+            origins,
         }))
     }
     fn check_identity(&self) -> Result<()> {
@@ -180,6 +235,13 @@ impl OracleAdapter {
 }
 impl SourceAdapter for OracleAdapter {
     fn pull(&mut self, from: &Cursor, max_ops: usize) -> Result<Option<PullBatch>> {
+        Self::legacy(self.pull_window(from, None, max_ops)?)
+    }
+    fn pull_provenanced(
+        &mut self,
+        from: &Cursor,
+        max_ops: usize,
+    ) -> Result<Option<ProvenancedPullBatch>> {
         self.pull_window(from, None, max_ops)
     }
     fn head(&mut self) -> Result<Cursor> {

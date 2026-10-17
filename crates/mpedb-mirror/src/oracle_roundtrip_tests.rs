@@ -55,10 +55,10 @@ fn drain_oracle(db: &Database, adapter: &mut OracleAdapter) {
             .sys_record_get(state::MIR_NS, state::KEY_CUR)
             .unwrap()
             .unwrap();
-        let Some(batch) = adapter.pull_through(&from, &through, 64).unwrap() else {
+        let Some(batch) = adapter.pull_through_provenanced(&from, &through, 64).unwrap() else {
             return;
         };
-        apply_batch(db, &from, &batch).unwrap();
+        crate::apply_provenanced_batch(db, &from, &batch).unwrap();
     }
     panic!("Oracle source did not reach its captured boundary");
 }
@@ -77,7 +77,7 @@ fn oracle_postgres_roundtrip_uses_mpedb_rretl_for_both_directions() {
     };
     assert_eq!(username, "MPEDB_ORACLE_FENCE");
     let oracle = oracle_client::Connection::connect(username, password, connect_string).unwrap();
-    let owned = [TABLE, "MPEDB_WRITE_RECEIPTS", "MPEDB_MIRROR_STATE"];
+    let owned = [TABLE, "MPEDB_WRITE_ORIGINS", "MPEDB_WRITE_RECEIPTS", "MPEDB_MIRROR_STATE"];
     for table in owned {
         oracle.execute(&format!("BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table} PURGE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"), &[]).unwrap();
     }
@@ -105,6 +105,7 @@ fn oracle_postgres_roundtrip_uses_mpedb_rretl_for_both_directions() {
     };
     let mut source = OracleSource::connect(&spec).unwrap();
     let ledger = source.prepare_write_ledger().unwrap();
+    let origins = source.prepare_origin_ledger().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let (raw, _) = loop {
         match import_oracle(&mut source, &raw_path, &options) {
@@ -166,6 +167,10 @@ fn oracle_postgres_roundtrip_uses_mpedb_rretl_for_both_directions() {
     let token =
         *blake3::hash(&crate::oracle_import::load_file_incarnation(&raw).unwrap()).as_bytes();
     let request = OracleWriteRequest {
+        origin: Some(crate::oracle_source::OracleWriteOrigin {
+            file_incarnation:crate::oracle_import::load_file_incarnation(&raw).unwrap(),
+            ledger_identity:&origins,
+        }),
         mirror_id: &metadata.mirror_id,
         token,
         epoch: 1,

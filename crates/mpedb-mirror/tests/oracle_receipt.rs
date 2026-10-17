@@ -52,11 +52,27 @@ impl mpedb_mirror::SourceAdapter for PostimageTransport<'_> {
         ops: &[NetOp],
         context: &mpedb_mirror::PushContext,
     ) -> mpedb_types::Result<mpedb_mirror::PushReply> {
-        assert_eq!(from, Some(&self.metadata.cursor));
+        let actual = mpedb_mirror::oracle_cursor::OraclePosition::decode(
+            from.unwrap(),
+            &self.metadata.identity,
+            self.tables,
+        )?;
+        let initial = mpedb_mirror::oracle_cursor::OraclePosition::decode(
+            &self.metadata.cursor,
+            &self.metadata.identity,
+            self.tables,
+        )?;
+        assert!(actual.scn() >= initial.scn());
         assert_eq!(context.generations.len(), ops.len());
         let epoch = context.epoch.unwrap();
         assert_eq!(epoch.authority, mpedb_mirror::Authority::Source);
         let request = OracleWriteRequest {
+            origin: self.metadata.origin_ledger.as_ref().map(|ledger| {
+                mpedb_mirror::oracle_source::OracleWriteOrigin {
+                    file_incarnation: self.file_incarnation,
+                    ledger_identity: ledger,
+                }
+            }),
             mirror_id: &self.metadata.mirror_id,
             token: context
                 .request_id
@@ -99,6 +115,7 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
     let c = oracle_client::Connection::connect(username, password, connect_string).unwrap();
     for table in [
         "MPEDB_RECEIPT_CASE",
+        "MPEDB_WRITE_ORIGINS",
         "MPEDB_WRITE_RECEIPTS",
         "MPEDB_MIRROR_STATE",
     ] {
@@ -149,6 +166,7 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
         kind: NetOpKind::Upsert(row),
     };
     let request = OracleWriteRequest {
+        origin: None,
         mirror_id,
         token: [7; 32],
         epoch: 1,
@@ -311,6 +329,7 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
                 scope.spawn(|| {
                     let mut connection = OracleSource::connect(&spec).unwrap();
                     let request = OracleWriteRequest {
+                        origin: None,
                         mirror_id,
                         token: [10; 32],
                         epoch: 2,
@@ -349,6 +368,7 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
         size_bytes: 64 * 1024 * 1024,
         ..Default::default()
     };
+    source.prepare_origin_ledger().unwrap();
     let (db, report) = mpedb_mirror::import_oracle(&mut source, &dest, &options).unwrap();
     assert_eq!(report.tables.len(), 1);
     assert_eq!(report.tables[0].name, "MPEDB_RECEIPT_CASE");
@@ -400,6 +420,22 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
         &[Value::Numeric("6.6".into()), Value::Numeric("3".into())],
     )
     .unwrap();
+    // Capture/apply may run before the uncertain old commit is ACKed. Its
+    // pending explicit footprint must preserve the newer dirty generation.
+    {
+        use mpedb_mirror::SourceAdapter;
+        let mut adapter =
+            mpedb_mirror::OracleAdapter::from_database(OracleSource::connect(&spec).unwrap(), &db)
+                .unwrap();
+        let from = db
+            .sys_record_get(mpedb_mirror::state::MIR_NS, mpedb_mirror::state::KEY_CUR)
+            .unwrap()
+            .unwrap();
+        let incoming = adapter.pull_provenanced(&from, 100_000).unwrap().unwrap();
+        let stats = mpedb_mirror::apply_provenanced_batch(&db, &from, &incoming).unwrap();
+        assert_eq!(stats.echoes, 1);
+        assert_eq!(stats.conflicts, 0);
+    }
     {
         let mut transport = PostimageTransport {
             source: &mut source,
@@ -433,6 +469,72 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
         .unwrap()
         .iter()
         .any(|(k, _)| k.starts_with(b"d/")));
+    assert!(metadata.origin_ledger.is_some());
+    db.query(
+        "UPDATE MPEDB_RECEIPT_CASE SET AMOUNT=$1 WHERE ID=$2",
+        &[Value::Numeric("8.8".into()), Value::Numeric("3".into())],
+    )
+    .unwrap();
+    {
+        use mpedb_mirror::SourceAdapter;
+        let mut adapter =
+            mpedb_mirror::OracleAdapter::from_database(OracleSource::connect(&spec).unwrap(), &db)
+                .unwrap();
+        let from = db
+            .sys_record_get(mpedb_mirror::state::MIR_NS, mpedb_mirror::state::KEY_CUR)
+            .unwrap()
+            .unwrap();
+        assert!(adapter
+            .pull(&from, 100_000)
+            .unwrap_err()
+            .to_string()
+            .contains("pull_provenanced"));
+        let through = adapter.head().unwrap();
+        let mut echoes = 0;
+        loop {
+            let from = db
+                .sys_record_get(mpedb_mirror::state::MIR_NS, mpedb_mirror::state::KEY_CUR)
+                .unwrap()
+                .unwrap();
+            let Some(incoming) = adapter
+                .pull_through_provenanced(&from, &through, 100_000)
+                .unwrap()
+            else {
+                break;
+            };
+            let stats = mpedb_mirror::apply_provenanced_batch(&db, &from, &incoming).unwrap();
+            echoes += stats.echoes;
+            assert_eq!(stats.conflicts, 0);
+        }
+        assert_eq!(echoes, 1);
+        assert!(
+            matches!(db.query("SELECT AMOUNT FROM MPEDB_RECEIPT_CASE WHERE ID=3",&[]).unwrap(),mpedb::ExecResult::Rows {rows,..} if rows==vec![vec![Value::Numeric("8.8".into())]])
+        );
+        assert_eq!(
+            db.sys_record_scan("cdc")
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| key.starts_with(b"d/"))
+                .count(),
+            1
+        );
+        // An equal-value foreign UPDATE is not our echo and resolves the
+        // dirty conflict normally, even though values match an earlier ACK.
+        c.execute("UPDATE MPEDB_RECEIPT_CASE SET amount=6.6 WHERE id=3", &[])
+            .unwrap();
+        c.commit().unwrap();
+        let from = db
+            .sys_record_get(mpedb_mirror::state::MIR_NS, mpedb_mirror::state::KEY_CUR)
+            .unwrap()
+            .unwrap();
+        let incoming = adapter.pull_provenanced(&from, 100_000).unwrap().unwrap();
+        let stats = mpedb_mirror::apply_provenanced_batch(&db, &from, &incoming).unwrap();
+        assert_eq!(stats.echoes, 0);
+        assert_eq!(stats.conflicts, 1);
+        assert!(
+            matches!(db.query("SELECT AMOUNT FROM MPEDB_RECEIPT_CASE WHERE ID=3",&[]).unwrap(),mpedb::ExecResult::Rows {rows,..} if rows==vec![vec![Value::Numeric("6.6".into())]])
+        );
+    }
     drop(db);
     std::fs::remove_file(&dest).unwrap();
     assert!(source
@@ -495,6 +597,7 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
         .contains("fenced by authority incarnation"));
     for table in [
         "MPEDB_RECEIPT_CASE",
+        "MPEDB_WRITE_ORIGINS",
         "MPEDB_WRITE_RECEIPTS",
         "MPEDB_MIRROR_STATE",
     ] {

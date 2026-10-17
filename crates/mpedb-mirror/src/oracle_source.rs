@@ -16,6 +16,11 @@ pub use snapshot::OracleSnapshot;
 pub use state::OracleStateIdentity;
 mod checked_write;
 mod receipt;
+mod origin;
+pub use origin::{
+    attest_write_origins, OracleOriginEvent, OracleOriginLedgerIdentity,
+    OracleOriginTouch, OracleWriteOrigin,
+};
 mod receipt_codec;
 mod temporal;
 mod write;

@@ -143,6 +143,7 @@ fn native_oracle_binary_floats_roundtrip_specials_and_reject_signed_zero_loss() 
     let state = source.source_state_identity(receipt_id).unwrap();
     let ledger = source.prepare_write_ledger().unwrap();
     let request = mpedb_mirror::oracle_source::OracleWriteRequest {
+        origin: None,
         mirror_id: receipt_id,
         token: [42; 32],
         epoch: 1,

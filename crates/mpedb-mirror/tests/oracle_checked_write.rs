@@ -58,6 +58,7 @@ fn native_oracle_checked_writes_preserve_foreign_commits_and_fence_concurrent_dm
     let identity = source.identity().unwrap();
     let from = OraclePosition::new(&identity, &tables, scn).unwrap();
     let request = OracleWriteRequest {
+        origin: None,
         mirror_id: id,
         token: [1; 32],
         epoch: 1,

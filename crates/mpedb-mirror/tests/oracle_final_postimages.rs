@@ -83,6 +83,7 @@ fn native_later_triggers_cannot_invalidate_earlier_postimages_or_create_false_re
     source.ensure_source_state(id, 1, "source").unwrap();
     let state = source.source_state_identity(id).unwrap();
     let request = OracleWriteRequest {
+        origin: None,
         mirror_id: id,
         token: [21; 32],
         epoch: 1,

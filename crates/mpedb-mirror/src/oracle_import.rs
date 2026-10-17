@@ -26,6 +26,8 @@ pub struct OracleBootstrap {
     pub mirror_id: String,
     pub epoch: u64,
     pub state_identity: OracleStateIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_ledger: Option<crate::oracle_source::OracleOriginLedgerIdentity>,
 }
 impl OracleBootstrap {
     fn validate(&self) -> Result<()> {
@@ -38,6 +40,13 @@ impl OracleBootstrap {
             || self.mirror_id.len() != 32
         {
             return Err(Error::Corrupt("invalid Oracle bootstrap manifest".into()));
+        }
+        if self.origin_ledger.as_ref().is_some_and(|ledger| {
+            ledger.object_id == 0 || ledger.data_object_id == 0 || ledger.schema_ddl.is_empty()
+        }) {
+            return Err(Error::Corrupt(
+                "invalid Oracle bootstrap origin ledger".into(),
+            ));
         }
         OraclePosition::decode(&self.cursor, &self.identity, &self.tables)?;
         Ok(())
@@ -177,7 +186,15 @@ pub fn import_oracle(
     if ledger.is_some() {
         exclude.push("MPEDB_WRITE_RECEIPTS".into());
     }
+    let mut origins = source.existing_origin_ledger()?;
+    if origins.is_some() {
+        exclude.push("MPEDB_WRITE_ORIGINS".into());
+    }
     let mut tables = source.introspect(opts.include.as_deref(), &exclude)?;
+    if tables.iter().any(|t| t.name == "MPEDB_WRITE_ORIGINS") {
+        origins = Some(source.prepare_origin_ledger()?);
+        tables.retain(|t| t.name != "MPEDB_WRITE_ORIGINS");
+    }
     if tables.iter().any(|t| t.name == "MPEDB_WRITE_RECEIPTS") {
         // A concurrent controller may have installed tracking after the first
         // lookup. Verify ownership before removing it from application scope.
@@ -223,8 +240,12 @@ pub fn import_oracle(
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     let mut current = None;
-    let snapshot =
-        source.stream_mirror_snapshot(&tables, &mirror_id, ledger.as_ref(), &mut |id, row| {
+    let snapshot = source.stream_mirror_snapshot(
+        &tables,
+        &mirror_id,
+        ledger.as_ref(),
+        origins.as_ref(),
+        &mut |id, row| {
             if current != Some(id) {
                 if let Some(previous) = current {
                     if !batch.is_empty() {
@@ -251,7 +272,8 @@ pub fn import_oracle(
             batch.push(row);
             report.tables[id as usize].rows += 1;
             Ok(())
-        })?;
+        },
+    )?;
     if let Some(id) = current {
         if !batch.is_empty() {
             import::flush_batch(&db, id, &tables[id as usize].pk, &mut batch)?;
@@ -264,6 +286,7 @@ pub fn import_oracle(
     }
     let metadata = OracleBootstrap {
         version: 3,
+        origin_ledger: origins,
         cursor: snapshot.position()?.encode(),
         identity: snapshot.identity,
         tables: snapshot.tables,
