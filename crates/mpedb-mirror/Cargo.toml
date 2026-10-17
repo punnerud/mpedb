@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Bidirectional sqlite3/PostgreSQL <-> mpedb mirror (design/DESIGN-MIRROR.md)"
 
+[features]
+oracle-source = ["dep:oracle-client"]
+
 [dependencies]
 mpedb = { workspace = true }
 mpedb-core = { workspace = true }
@@ -15,6 +18,8 @@ xxhash-rust = { workspace = true }
 # PostgreSQL via the sync postgres client.
 rusqlite = { version = "0.31", features = ["bundled"] }
 postgres = "0.19"
+# Public OCI client API only; Oracle engine remains a black-box dependency.
+oracle-client = { package = "oracle", version = "0.6.3", optional = true }
 # §12 credential channel: 0600 TOML source-config + geteuid ownership check.
 toml = { workspace = true }
 libc = { workspace = true }

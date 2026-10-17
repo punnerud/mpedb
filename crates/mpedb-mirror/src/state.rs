@@ -166,6 +166,7 @@ pub fn sys_subkey(key: &[u8]) -> Vec<u8> {
 pub enum SourceKind {
     Sqlite = 1,
     Postgres = 2,
+    Oracle = 3,
 }
 
 impl SourceKind {
@@ -177,6 +178,7 @@ impl SourceKind {
         match t {
             1 => Ok(SourceKind::Sqlite),
             2 => Ok(SourceKind::Postgres),
+            3 => Ok(SourceKind::Oracle),
             other => Err(Error::Corrupt(format!("bad mirror source_kind {other}"))),
         }
     }

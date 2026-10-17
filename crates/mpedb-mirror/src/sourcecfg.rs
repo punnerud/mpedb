@@ -27,8 +27,17 @@ use crate::state::SourceKind;
 /// Where a mirror's source lives, including any secret needed to reach it.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SourceSpec {
-    Sqlite { path: String },
-    Postgres { dsn: String },
+    Sqlite {
+        path: String,
+    },
+    Postgres {
+        dsn: String,
+    },
+    Oracle {
+        connect_string: String,
+        username: String,
+        password: String,
+    },
 }
 
 impl SourceSpec {
@@ -36,6 +45,7 @@ impl SourceSpec {
         match self {
             SourceSpec::Sqlite { .. } => SourceKind::Sqlite,
             SourceSpec::Postgres { .. } => SourceKind::Postgres,
+            SourceSpec::Oracle { .. } => SourceKind::Oracle,
         }
     }
 
@@ -45,6 +55,8 @@ impl SourceSpec {
         match self {
             SourceSpec::Sqlite { path } => format!("sqlite:{path}"),
             SourceSpec::Postgres { dsn } => format!("postgres:{}", redact_dsn(dsn)),
+            // Oracle connect descriptors can themselves contain secrets.
+            SourceSpec::Oracle { .. } => "oracle:<redacted>".into(),
         }
     }
 }
@@ -123,27 +135,41 @@ fn check_perms(_path: &Path) -> Result<()> {
 /// Parse the config text. Split out from [`load`] so the codec is testable
 /// without a filesystem.
 pub fn parse(text: &str) -> Result<SourceSpec> {
-    let val: toml::Value =
-        toml::from_str(text).map_err(|e| Error::Config(format!("source-config: {e}")))?;
+    // TOML's formatted error includes the offending source line, which can
+    // contain a password. Report position without echoing any input text.
+    let val: toml::Value = toml::from_str(text).map_err(|e: toml::de::Error| {
+        Error::Config(format!(
+            "source-config: invalid TOML at byte {}",
+            e.span().map_or(0, |s| s.start)
+        ))
+    })?;
     let t = val
         .as_table()
         .ok_or_else(|| Error::Config("source-config: expected a TOML table".into()))?;
-    let kind = t
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Config("source-config: `kind` must be \"sqlite\" or \"postgres\"".into()))?;
+    let kind = t.get("kind").and_then(|v| v.as_str()).ok_or_else(|| {
+        Error::Config("source-config: `kind` must be \"sqlite\", \"postgres\" or \"oracle\"".into())
+    })?;
     let get = |k: &str| -> Result<String> {
         t.get(k)
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| Error::Config(format!("source-config: `{k}` (string) is required for kind=\"{kind}\"")))
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "source-config: `{k}` (string) is required for kind=\"{kind}\""
+                ))
+            })
     };
     match kind {
         "sqlite" => Ok(SourceSpec::Sqlite { path: get("path")? }),
         "postgres" | "postgresql" | "pg" => Ok(SourceSpec::Postgres { dsn: get("dsn")? }),
-        other => Err(Error::Config(format!(
-            "source-config: unknown kind `{other}` (want \"sqlite\" or \"postgres\")"
-        ))),
+        "oracle" => Ok(SourceSpec::Oracle {
+            connect_string: get("connect_string")?,
+            username: get("username")?,
+            password: get("password")?,
+        }),
+        _ => Err(Error::Config(
+            "source-config: unknown kind (want sqlite, postgres or oracle)".into(),
+        )),
     }
 }
 
@@ -168,6 +194,16 @@ pub fn write_new(path: &Path, spec: &SourceSpec) -> Result<()> {
     let body = match spec {
         SourceSpec::Sqlite { path } => format!("kind = \"sqlite\"\npath = {}\n", toml_str(path)),
         SourceSpec::Postgres { dsn } => format!("kind = \"postgres\"\ndsn = {}\n", toml_str(dsn)),
+        SourceSpec::Oracle {
+            connect_string,
+            username,
+            password,
+        } => format!(
+            "kind = \"oracle\"\nconnect_string = {}\nusername = {}\npassword = {}\n",
+            toml_str(connect_string),
+            toml_str(username),
+            toml_str(password)
+        ),
     };
     f.write_all(body.as_bytes())
         .map_err(|e| Error::Config(format!("write source-config: {e}")))?;
@@ -181,6 +217,19 @@ fn toml_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oracle_credentials_round_trip_without_diagnostic_leaks() {
+        let spec = SourceSpec::Oracle { connect_string: "(PASSWORD=descriptor-secret)".into(), username: "app".into(), password: "login-secret".into() };
+        assert_eq!(spec.kind(), SourceKind::Oracle);
+        let shown=format!("{spec:?} {}",spec.redacted());
+        assert!(!shown.contains("descriptor-secret"));assert!(!shown.contains("login-secret"));
+        let dir=mpedb_testkit::scratch_base().join(format!("oracle-source-cfg-{}",std::process::id()));std::fs::create_dir_all(&dir).unwrap();let file=dir.join("source.toml");let _=std::fs::remove_file(&file);
+        write_new(&file,&spec).unwrap();assert_eq!(load(&file).unwrap(),spec);std::fs::remove_file(file).unwrap();
+        for text in ["kind='oracle'\npassword=\"login-secret", "kind='login-secret'"] {
+            let message=parse(text).unwrap_err().to_string();assert!(!message.contains("login-secret"));
+        }
+    }
 
     #[test]
     fn parses_both_kinds() {

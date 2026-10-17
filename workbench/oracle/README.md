@@ -21,17 +21,19 @@ an older version than their version-based expectations. A private stock
 [CPython 3.12.15](https://www.python.org/downloads/release/python-31215/) was built
 on the extra disk. All three affected test methods now pass with the corrected
 settings and complete dependency environment, without changing assertions.
-A fresh full Django run is in progress with that interpreter.
-No Oracle-backend failure occurred in that full run, but it is not reported as
-fully green. See `reference/framework-baseline.json` for the measured counts.
+The private interpreter ran 17,587 tests successfully; the missing 606 cache
+cases also passed separately. Their combined coverage is 18,193 tests,
+1512 skips and 6 expected failures. The harness now starts in upstream's
+`tests` directory: a cache directory created in the source root had shadowed
+`cache.tests` during discovery. A fresh single full run is in progress with
+that correction. See `reference/framework-baseline.json` for measured counts.
 
-The first broad SQLAlchemy 2.0.44 reference run stopped at the upstream
-maxfail=250 default: 777 passed, 34 failed, 217 setup/teardown errors, 9 skipped.
-Some ORM fixtures omit Oracle sequences for generated primary keys and are not
-backend agnostic. The harness now disables early failure stopping, records the
-Python interpreter/platform, and reruns from clean disposable schemas. A
-completed process is not proof that every upstream test was reached if it
-aborted early. These reference failures do not describe MPEdb's implementation.
+The full broad SQLAlchemy 2.0.44 reference run completed with early failure
+stopping disabled: **22,260 passed, 259 failed, 497 setup/teardown errors,
+814 skipped**, in 2092.55 seconds. Some ORM fixtures omit Oracle sequences for
+generated primary keys; cleanup errors also cascade. These failures still need
+classification. Upstream assertions and requirement flags remain unchanged.
+These reference results do not describe MPEdb's implementation.
 
 ## Migration architecture
 
@@ -63,6 +65,25 @@ and database/session transaction behavior. Python/Rust procedure semantics must
 not substitute for Oracle's NULL logic or Oracle transaction semantics. The
 upstream Oracle suites are initial reference coverage, not the completion gate
 for full Oracle support.
+
+## Oracle source boundary
+
+The optional `mpedb-mirror/oracle-source` feature uses the public OCI client to
+read application-owned tables and routine definitions. It retains original DDL,
+NUMBER precision/scale, character units, generated/identity flags and compound
+primary keys. Snapshot rows use an explicit SCN shared by the caller across
+tables; snapshot failure never falls back to current data. Exact NUMBER strings,
+LOBs and nanosecond/timezone temporal text enter MPEdb losslessly. Unsupported
+object types and unvalidated identities are refused.
+
+A live native Oracle test reads a compound-key snapshot, loads its carrier into
+MPEdb, compiles a function extracted from that application's `ALL_SOURCE`, and
+verifies rRETL apply, lineage and revert. In-place rRETL now uses every primary
+key component while retaining single-key residual compatibility. Incremental
+maps still require single-key identities. Oracle change capture, transactional
+write-back, CLI import and the complete two-database topology remain unfinished.
+Metadata inspection currently precedes snapshot capture; a production import
+must also fence concurrent source DDL.
 
 ## Native implementation progress
 

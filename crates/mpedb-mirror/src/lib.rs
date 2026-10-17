@@ -14,6 +14,9 @@ pub mod apply;
 pub mod conflicts;
 pub mod export;
 pub mod import;
+pub mod oracle;
+#[cfg(feature = "oracle-source")]
+pub mod oracle_source;
 pub mod pg;
 pub mod preflight;
 pub mod pg_adapter;

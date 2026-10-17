@@ -111,6 +111,7 @@ fn open_source(
             a.install_triggers()?;
             Box::new(a)
         }
+        SourceSpec::Oracle { .. } => return Err(Failure::Runtime("Oracle live capture is not linked yet".into())),
     };
     match recover(&db, adapter.as_mut())? {
         Recovered::Steady => {}
@@ -459,6 +460,7 @@ fn cmd_import(argv: &[String]) -> CliResult {
             let mut client = PgAdapter::connect(dsn, opts.include.as_deref(), &opts.exclude)?;
             import_pg(client.client(), &dest, &opts)?
         }
+        SourceSpec::Oracle { .. } => return Err(Failure::Runtime("Oracle import is not linked yet; the oracle-source library feature provides snapshot introspection".into())),
     };
 
     // Record WHERE the credentials live (never the DSN itself — §12), so every

@@ -74,6 +74,7 @@ def main():
         "python_version": sys.version,
         "python_executable": sys.executable,
         "platform": platform.platform(),
+        "working_directory": str(source / "tests" if args.suite == "django" else source),
         "status": "prepared",
         "versions": {
             name: importlib.metadata.version(name) for name in ("oracledb", args.suite)
@@ -155,7 +156,9 @@ raise SystemExit(pytest.main(['--maxfail=0', '--dburi', url.render_as_string(hid
     with (output / "suite.log").open("w") as log:
         process = subprocess.Popen(
             command,
-            cwd=source,
+            # A generated source-root cache/ directory can shadow Django's
+            # cache test module and silently remove hundreds of tests.
+            cwd=source / "tests" if args.suite == "django" else source,
             env=env,
             stdout=log,
             stderr=subprocess.STDOUT,

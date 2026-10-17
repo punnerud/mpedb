@@ -331,6 +331,9 @@ pub fn preflight(db: &Database) -> Result<PreflightReport> {
         }
     };
 
+    if src_kind == SourceKind::Oracle {
+        return Err(Error::Unsupported("Oracle write-back preflight is not linked yet; PostgreSQL rules cannot validate Oracle constraints".into()));
+    }
     for (tid, tdef) in schema.tables.iter().enumerate() {
         let Some(raw) = db.sys_record_get(state::MIR_NS, &state::map_key(tid as u32))? else {
             // No provenance: an .mpedb created before this record existed, or a
