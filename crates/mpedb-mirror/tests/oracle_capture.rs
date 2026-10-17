@@ -1,7 +1,6 @@
 #![cfg(feature = "oracle-source")]
 use mpedb_mirror::{adapter::NetOpKind, oracle_source::OracleSource, sourcecfg, SourceSpec};
 use mpedb_types::Value;
-mod oracle_support;
 
 #[test]
 #[ignore = "requires MPEDB_ORACLE_SOURCE_CONFIG and Oracle client libraries"]
@@ -48,7 +47,35 @@ fn native_oracle_capture_keeps_commits_historical_images_and_compound_key_change
         .unwrap();
     assert_eq!(tables[0].name, "MPEDB_CAPTURE_A");
     assert_eq!(tables[1].name, "MPEDB_CAPTURE_B");
-    let (from, _) = oracle_support::initial_snapshot(&source, &tables);
+    let mirror_id = format!("snapshot-{}", std::process::id());
+    source.ensure_source_state(&mirror_id, 1, "source").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let bootstrap = loop {
+        match source.snapshot_for_mirror(&tables, &mirror_id) {
+            Ok(snapshot) => break snapshot,
+            Err(e)
+                if e.to_string().contains("ORA-01466") && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(250))
+            }
+            Err(e) => panic!("mirror bootstrap failed: {e}"),
+        }
+    };
+    let from = bootstrap.scn;
+    assert_eq!(bootstrap.source_state, Some((1, "source".into())));
+    assert_eq!(
+        bootstrap.rows.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+    assert_eq!(bootstrap.position().unwrap().scn(), from);
+    let identity = source.identity().unwrap();
+    assert_eq!(identity.owner, source.owner());
+    assert_eq!(identity.session_user, source.owner());
+    assert!(identity.database_id > 0);
+    let position =
+        mpedb_mirror::oracle_cursor::OraclePosition::new(&identity, &tables, from).unwrap();
+    let reconnect = OracleSource::connect(&spec).unwrap();
+    assert_eq!(reconnect.identity().unwrap(), identity);
     c.execute("UPDATE MPEDB_CAPTURE_A SET payload='first' WHERE id=1", &[])
         .unwrap();
     c.execute("INSERT INTO MPEDB_CAPTURE_A VALUES(3,'new','created')", &[])
@@ -114,6 +141,32 @@ fn native_oracle_capture_keeps_commits_historical_images_and_compound_key_change
         && matches!(op.kind, NetOpKind::Delete)));
     assert!(all[3].ops.iter().any(|op| op.table_id == 0
         && matches!(&op.kind,NetOpKind::Upsert(row) if row[2]==Value::Text("pending".into()))));
+    let mut reversed = tables.clone();
+    reversed.reverse();
+    assert_eq!(
+        mpedb_mirror::oracle_cursor::OraclePosition::decode(
+            &position.encode(),
+            &identity,
+            &reversed
+        )
+        .unwrap()
+        .scn(),
+        from
+    );
+    let mut changed_scope = tables.clone();
+    changed_scope[0].ddl_source.push_str(" -- schema change");
+    assert!(mpedb_mirror::oracle_cursor::OraclePosition::decode(
+        &position.encode(),
+        &identity,
+        &changed_scope
+    )
+    .is_err());
+    let reordered = source.read_changes(&reversed, from, to, 100).unwrap();
+    assert_eq!(
+        reordered.iter().map(|b| &b.ops).collect::<Vec<_>>(),
+        all.iter().map(|b| &b.ops).collect::<Vec<_>>(),
+        "table ids must follow the carrier schema, not metadata slice order"
+    );
     let resumed = source.read_changes(&tables, all[0].scn, to, 100).unwrap();
     assert_eq!(resumed.len(), 3);
     assert_eq!(resumed[0].scn, all[1].scn);
@@ -132,6 +185,34 @@ fn native_oracle_capture_keeps_commits_historical_images_and_compound_key_change
         .unwrap()
         .is_empty());
     assert!(source.read_changes(&tables, to, from, 100).is_err());
+    source
+        .write_batch(
+            &reversed,
+            &[mpedb_mirror::adapter::NetOp {
+                table_id: 1,
+                pk: vec![Value::Numeric("1".into())],
+                kind: NetOpKind::Upsert(vec![
+                    Value::Numeric("1".into()),
+                    Value::Numeric("999".into()),
+                ]),
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        c.query_row_as::<String>(
+            "SELECT TO_CHAR(amount,'TM9') FROM MPEDB_CAPTURE_B WHERE id=1",
+            &[]
+        )
+        .unwrap(),
+        "999"
+    );
+    let mirror_key = mirror_id.as_bytes().to_vec();
+    c.execute(
+        "DELETE FROM MPEDB_MIRROR_STATE WHERE mirror_id=:1",
+        &[&mirror_key],
+    )
+    .unwrap();
+    c.commit().unwrap();
     for name in ["MPEDB_CAPTURE_A", "MPEDB_CAPTURE_B"] {
         c.execute(&format!("DROP TABLE {name} PURGE"), &[]).unwrap();
     }

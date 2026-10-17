@@ -73,6 +73,25 @@ pub fn build_schema(tables: &[OracleTable]) -> mpedb_types::Result<mpedb_types::
     Schema::new(output)
 }
 
+/// Resolve source metadata in the carrier schema's canonical table-id order.
+/// Caller slice order is not an identity: Schema::new sorts table names.
+pub(crate) fn carrier_tables(tables: &[OracleTable]) -> mpedb_types::Result<Vec<&OracleTable>> {
+    let schema = build_schema(tables)?;
+    let by_name = tables
+        .iter()
+        .map(|table| (table.name.as_str(), table))
+        .collect::<std::collections::HashMap<_, _>>();
+    schema
+        .tables
+        .iter()
+        .map(|table| {
+            by_name.get(table.name.as_str()).copied().ok_or_else(|| {
+                mpedb_types::Error::Corrupt("Oracle carrier table metadata is missing".into())
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OracleColumn {
     pub name: String,

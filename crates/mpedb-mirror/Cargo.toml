@@ -14,6 +14,7 @@ mpedb-core = { workspace = true }
 mpedb-types = { workspace = true }
 # xxh3 for the CDC dirty-key hash, matching mpedb-core.
 xxhash-rust = { workspace = true }
+blake3 = { workspace = true }
 # Source adapters: sqlite via rusqlite (bundled 3.45, proven in mpedb-bench),
 # PostgreSQL via the sync postgres client.
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -46,8 +46,8 @@ impl OracleSource {
             ));
         }
         let result = (|| {
-            crate::oracle::build_schema(tables)?;
-            for table in tables {
+            let tables = crate::oracle::carrier_tables(tables)?;
+            for table in &tables {
                 self.lock_schema(table)?;
             }
             let mut changes = BTreeMap::<u64, Changes>::new();
@@ -146,7 +146,7 @@ impl OracleSource {
                     // the same PK. The final image at the commit determines
                     // the net op, never the arbitrary order of version rows.
                     let kind = self
-                        .read_key(&tables[table_id as usize], &pk, Some(scn))?
+                        .read_key(tables[table_id as usize], &pk, Some(scn))?
                         .map_or(NetOpKind::Delete, NetOpKind::Upsert);
                     ops.push(NetOp { table_id, pk, kind });
                 }

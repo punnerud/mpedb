@@ -26,7 +26,7 @@ impl Bind {
 
 impl OracleSource {
     /// Apply a batch in one Oracle transaction and return its actual postimages.
-    /// Table ids are indices into `tables` (the carrier schema's table order).
+    /// Table ids come from the carrier schema, independent of slice order.
     /// Any error, including source rounding/truncation or trigger substitution,
     /// rolls the WHOLE batch back. Generated columns are read back rather than
     /// written. This low-level API does not advance a synchronization cursor.
@@ -36,6 +36,7 @@ impl OracleSource {
         ops: &[NetOp],
     ) -> Result<Vec<Option<Vec<Value>>>> {
         let result = (|| {
+            let tables = crate::oracle::carrier_tables(tables)?;
             // Fence source DDL for the entire batch. A recreated/altered table
             // requires a new carrier import; never use stale type metadata.
             let used = ops

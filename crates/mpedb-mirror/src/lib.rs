@@ -15,6 +15,7 @@ pub mod conflicts;
 pub mod export;
 pub mod import;
 pub mod oracle;
+pub mod oracle_cursor;
 #[cfg(feature = "oracle-source")]
 pub mod oracle_source;
 pub mod pg;

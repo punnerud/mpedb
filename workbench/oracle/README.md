@@ -121,6 +121,35 @@ See [Oracle Flashback documentation](https://docs.oracle.com/en/database/oracle/
 Metadata inspection currently precedes snapshot capture; a production import
 must also fence concurrent source DDL.
 
+## Oracle bootstrap and authority foundations
+
+`OracleSource::snapshot` fences table DDL and reads the complete selected table
+set at one SCN, checking database identity before and after the read. The mirror
+variant also reads its initialized authority row at that same SCN. Snapshot
+failure releases the fences and publishes no cursor. Table ids follow MPEdb's
+canonical schema order even when the caller supplies reordered Oracle metadata;
+native tests verify capture and write-back with reversed metadata order.
+
+Version-1 Oracle positions bind the SCN to CDB DBID/resetlogs, container GUID,
+PDB incarnation, application owner, session account and original schema scope.
+The fixed 41-byte codec rejects unknown versions, truncation, appended bytes,
+zero SCNs and another resume domain. Password changes do not change identity;
+connection secrets are never part of the record. Identity reads require:
+
+```sql
+GRANT SELECT ON SYS.V_$DATABASE TO application_user;
+GRANT SELECT ON SYS.V_$PDB_INCARNATION TO application_user;
+```
+
+The source authority table has a validated shape, version marker and primary
+key. Mirror ids use RAW so session collation cannot merge different identities.
+Initialization is idempotent; CAS advances exactly one epoch, verifies its
+actual result and commits atomically. Native tests cover competing connections
+(one winner), stale CAS, old-SCN reads and refusing a disabled ownership marker.
+These APIs are foundations for the adapter; a complete SourceAdapter, durable
+Oracle import, own-write echo suppression and the two-database controller are
+still unfinished.
+
 ## Native implementation progress
 
 `mpedb-spell` now has an Oracle lexical frontend (`plsql::lex`) that preserves

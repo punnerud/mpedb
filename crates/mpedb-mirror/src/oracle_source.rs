@@ -1,10 +1,14 @@
 //! Native public OCI client boundary. Reads application dictionary metadata
 //! and rows at one explicit SCN. No Oracle engine implementation is inspected.
-//! Capture/push and CLI import are separate unfinished stages; this module does
-//! not implement SourceAdapter or publish a fake live-sync cursor.
+//! Bounded capture, atomic writes and verified bootstrap positions are exposed
+//! as low-level APIs. Full SourceAdapter and CLI import remain unfinished.
 mod capture;
+mod identity;
 mod codec;
 mod schema;
+mod state;
+mod snapshot;
+pub use snapshot::OracleSnapshot;
 pub use capture::OracleChangeBatch;
 mod write;
 use codec::{decode_row, read_expr};
