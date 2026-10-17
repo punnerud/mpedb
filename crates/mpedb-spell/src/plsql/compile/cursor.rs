@@ -1,6 +1,9 @@
 //! Explicit PL/SQL cursors: `CURSOR c IS SELECT ...; OPEN; FETCH INTO; CLOSE`
 //! and `%FOUND`, `%NOTFOUND`, `%ISOPEN`, `%ROWCOUNT`.
-//! Packages and parameters in the cursor query stay refused.
+//! Cursor parameters are IN only. In the query they are written
+//! `cursor.parameter` and become positional binds. A bare parameter is
+//! refused: Oracle prefers a same-named column, and this compiler has no
+//! schema that could tell the two apart. Packages stay refused.
 //! A fetch that finds no row leaves its targets unchanged and leaves the
 //! cursor open. A NULL column assigns NULL. CLOSE releases the stream
 //! without fetching the remaining rows. `SELECT *` is refused: the select
@@ -11,11 +14,18 @@
 use super::*;
 use crate::emit::{line_col, CallKind, SqlCall};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct CursorDecl {
     slot: u16,
     call: u16,
     width: u16,
+    /// Formal types in declaration order. Empty means `OPEN name;`.
+    formals: Vec<Type>,
+    /// One entry per placeholder, in occurrence order, indexing `formals`.
+    /// `SqlCall.argc` is this length, not the formal count.
+    uses: Vec<u16>,
+    /// Temps filled once per OPEN, then loaded in `uses` order.
+    arg_slots: Vec<u16>,
 }
 
 impl Parser<'_> {
@@ -25,6 +35,7 @@ impl Parser<'_> {
         if !self.declared_here.insert(name.clone()) {
             return Err(self.error("duplicate parameter or variable name"));
         }
+        let formals = self.cursor_formals()?;
         self.want_word("IS")?;
         if !self.is_word("SELECT") {
             return Err(self.error("a cursor declaration requires SELECT"));
@@ -55,8 +66,6 @@ impl Parser<'_> {
             end += 1;
         }
         let source_start = self.tokens[start].span.start;
-        let source_end = self.tokens[end].span.start;
-        let source = self.source[source_start..source_end].to_string();
         let width = match select_width(&self.tokens[start..end]) {
             Ok(width) => width,
             Err(WidthError::Star { at }) => {
@@ -72,30 +81,197 @@ impl Parser<'_> {
             }
         };
         self.at = end + 1;
-        let (sql, count) = super::sql::normalize_sql(&source, CallKind::Query)
+        let (rewritten, uses) = self.bind_cursor_query(start, end, &name, &formals)?;
+        let (sql, count) = super::sql::normalize_sql(&rewritten, CallKind::Query)
             .map_err(|e| self.error(&e.to_string()))?;
-        if count != 0 {
-            return Err(self.error("cursor SELECT parameters are not implemented"));
+        if count != uses.len() {
+            return Err(self.error("cursor parameter bind count mismatch"));
         }
+        let argc = u8::try_from(count).map_err(|_| self.error("too many cursor parameter uses"))?;
         let (line, col) = line_col(self.source, source_start);
         let call = self.builder.add_call(SqlCall {
             sql,
             kind: CallKind::Rows,
-            argc: 0,
+            argc,
             expected_columns: Some(width),
             line,
             col,
         })?;
+        let mut arg_slots = Vec::with_capacity(formals.len());
+        for _ in &formals {
+            arg_slots.push(self.builder.alloc_local()?);
+        }
         self.constant(Value::Null)?;
         let slot = self.builder.alloc_local()?;
         self.builder.emit(Op::StoreLocal(slot))?;
-        self.cursors.insert(name, CursorDecl { slot, call, width });
+        self.cursors.insert(
+            name,
+            CursorDecl {
+                slot,
+                call,
+                width,
+                formals: formals.into_iter().map(|(_, ty)| ty).collect(),
+                uses,
+                arg_slots,
+            },
+        );
         Ok(())
+    }
+
+    /// `(name [IN] type, ...)`. Empty parentheses are refused. The names stay
+    /// out of the routine's locals: a cursor parameter is not a body variable.
+    fn cursor_formals(&mut self) -> Result<Vec<(String, Type)>> {
+        if !self.symbol("(") {
+            return Ok(Vec::new());
+        }
+        if matches!(self.peek(), Some(Token::Symbol(")"))) {
+            return Err(self.error("omit the parentheses for a cursor with no parameters"));
+        }
+        let mut formals = Vec::new();
+        loop {
+            let name = self.identifier()?;
+            if formals.iter().any(|(existing, _)| existing == &name) {
+                return Err(self.error("duplicate cursor parameter name"));
+            }
+            // IN is optional. OUT and IN OUT are not cursor modes.
+            self.word("IN");
+            if self.is_word("OUT") {
+                return Err(self.error("cursor parameters are IN only"));
+            }
+            if self.word("NOCOPY") {
+                return Err(self.error("NOCOPY is only valid for OUT or IN OUT parameters"));
+            }
+            let ty = self.data_type(false)?;
+            if self.word("NOCOPY") {
+                return Err(self.error("NOCOPY is only valid for OUT or IN OUT parameters"));
+            }
+            if self.symbol(":=") || self.word("DEFAULT") {
+                return Err(self.error("cursor parameter defaults are not implemented"));
+            }
+            formals.push((name, ty));
+            if !self.symbol(",") {
+                self.want_symbol(")")?;
+                break;
+            }
+        }
+        Ok(formals)
+    }
+
+    /// Rewrite `cursor.formal` to a bind marker, in occurrence order.
+    /// `start..end` are the SELECT tokens in the routine, not a substring.
+    fn bind_cursor_query(
+        &self,
+        start: usize,
+        end: usize,
+        cursor_name: &str,
+        formals: &[(String, Type)],
+    ) -> Result<(String, Vec<u16>)> {
+        let tokens = &self.tokens[start..end];
+        let mut output = String::new();
+        let mut uses = Vec::new();
+        let mut index = 0;
+        let mut copied = tokens
+            .first()
+            .map(|token| token.span.start)
+            .unwrap_or(0);
+        while let Some(token) = tokens.get(index) {
+            output.push_str(&self.source[copied..token.span.start]);
+            if let Token::Identifier { name, quoted: false } = &token.token {
+                if name == cursor_name {
+                    if !matches!(
+                        tokens.get(index + 1).map(|token| &token.token),
+                        Some(Token::Symbol("."))
+                    ) {
+                        return Err(self.located(
+                            start + index,
+                            "cursor name in the query requires .parameter",
+                        ));
+                    }
+                    let Some(Token::Identifier {
+                        name: formal,
+                        quoted: false,
+                    }) = tokens.get(index + 2).map(|token| &token.token)
+                    else {
+                        return Err(self.located(
+                            start + index + 2,
+                            "expected a cursor parameter after the cursor name",
+                        ));
+                    };
+                    if matches!(
+                        tokens.get(index + 3).map(|token| &token.token),
+                        Some(Token::Symbol("."))
+                    ) {
+                        return Err(self.located(
+                            start + index + 2,
+                            "cursor parameter cannot have further qualification",
+                        ));
+                    }
+                    let Some(pos) = formals.iter().position(|(formal_name, _)| formal_name == formal)
+                    else {
+                        return Err(self.located(
+                            start + index + 2,
+                            &format!("unknown cursor parameter {formal}"),
+                        ));
+                    };
+                    let pos = u16::try_from(pos).map_err(|_| {
+                        self.located(start + index + 2, "too many cursor parameters")
+                    })?;
+                    uses.push(pos);
+                    output.push_str(":mpedb_cursor_bind");
+                    copied = tokens[index + 2].span.end;
+                    index += 3;
+                    continue;
+                }
+                let qualified = matches!(
+                    index
+                        .checked_sub(1)
+                        .and_then(|i| tokens.get(i))
+                        .map(|token| &token.token),
+                    Some(Token::Symbol("."))
+                ) || matches!(
+                    tokens.get(index + 1).map(|token| &token.token),
+                    Some(Token::Symbol("."))
+                );
+                if !qualified && formals.iter().any(|(formal_name, _)| formal_name == name) {
+                    return Err(self.located(
+                        start + index,
+                        "bare cursor parameter in the query requires qualification with the cursor name",
+                    ));
+                }
+            }
+            if matches!(token.token, Token::Bind(_)) {
+                return Err(self.located(
+                    start + index,
+                    "cursor query takes cursor-qualified parameters, not bind placeholders",
+                ));
+            }
+            output.push_str(&self.source[token.span.clone()]);
+            copied = token.span.end;
+            index += 1;
+        }
+        let semi = self.tokens.get(end).map_or(self.source.len(), |token| token.span.start);
+        output.push_str(&self.source[copied..semi]);
+        Ok((output, uses))
+    }
+
+    fn located(&self, at: usize, message: &str) -> mpedb_types::Error {
+        super::super::lex::error(
+            self.source,
+            self.tokens.get(at).map_or(self.source.len(), |token| token.span.start),
+            message,
+        )
     }
 
     pub(super) fn cursor_statement(&mut self) -> Result<bool> {
         if self.word("OPEN") {
             let cursor = self.cursor_name()?;
+            if cursor.formals.is_empty() {
+                if self.symbol("(") {
+                    return Err(self.error("this cursor has no parameters"));
+                }
+            } else {
+                self.open_arguments(&cursor)?;
+            }
             self.want_symbol(";")?;
             self.builder.emit(Op::CursorOpen(cursor.call))?;
             self.builder.emit(Op::StoreLocal(cursor.slot))?;
@@ -155,16 +331,48 @@ impl Parser<'_> {
         Ok(false)
     }
 
+    /// Evaluate each formal once, then push the placeholders in query order.
+    /// NULL stays a bound NULL. The SQL text keeps `= $n` rather than `IS NULL`.
+    fn open_arguments(&mut self, cursor: &CursorDecl) -> Result<()> {
+        self.want_symbol("(")?;
+        if matches!(self.peek(), Some(Token::Symbol(")"))) {
+            return Err(self.error("OPEN argument count does not match the cursor parameters"));
+        }
+        let mut got = 0usize;
+        loop {
+            if got == cursor.formals.len() {
+                return Err(self.error("OPEN argument count does not match the cursor parameters"));
+            }
+            let actual = self.expression()?;
+            let ty = cursor.formals[got];
+            self.compatible(ty, actual)?;
+            self.builder.emit(ty.check())?;
+            self.builder.emit(Op::StoreLocal(cursor.arg_slots[got]))?;
+            got += 1;
+            if !self.symbol(",") {
+                break;
+            }
+        }
+        if got != cursor.formals.len() {
+            return Err(self.error("OPEN argument count does not match the cursor parameters"));
+        }
+        self.want_symbol(")")?;
+        for &formal in &cursor.uses {
+            self.builder.emit(Op::LoadLocal(cursor.arg_slots[formal as usize]))?;
+        }
+        Ok(())
+    }
+
     fn cursor_name(&mut self) -> Result<CursorDecl> {
         let name = self.identifier()?;
         self.cursors
             .get(&name)
-            .copied()
+            .cloned()
             .ok_or_else(|| self.error("unknown explicit cursor"))
     }
 
     pub(super) fn cursor_attribute(&mut self, name: &str) -> Result<Option<Type>> {
-        let cursor = self.cursors.get(name).copied().ok_or_else(|| {
+        let cursor = self.cursors.get(name).cloned().ok_or_else(|| {
             self.error("cursor attributes require an explicit cursor")
         })?;
         let attr = self.identifier()?;
@@ -524,6 +732,163 @@ mod tests {
                     || err.contains("cursor attributes require an explicit cursor"),
                 "{err}"
             );
+        }
+    }
+
+    #[test]
+    fn cursor_query_parameters_bind_null_and_values() {
+        let query = "SELECT id FROM t WHERE t.part = c.part AND t.amount = c.amount AND t.again = c.part";
+        let body = format!(
+            "CURSOR c (part IN VARCHAR2, amount NUMBER, unused BOOLEAN) IS {query}; BEGIN OPEN c(NULL, 4, TRUE); CLOSE c; RETURN 1; END;"
+        );
+        let skel = compile(&format!("CREATE FUNCTION f RETURN NUMBER IS {body}")).unwrap();
+        assert_eq!(
+            skel.calls[0].sql,
+            "SELECT id FROM t WHERE t.part = $1 AND t.amount = $2 AND t.again = $3"
+        );
+        assert!(!skel.calls[0].sql.contains("c.part"));
+        assert!(!skel.calls[0].sql.contains("IS NULL"));
+        assert_eq!(skel.calls[0].argc, 3);
+        assert_eq!(skel.calls[0].expected_columns, Some(1));
+        let (_value, bridge, proc) = execute("NUMBER", vec![], &body);
+        assert_eq!(
+            bridge.cursor_params,
+            vec![vec![Value::Null, Value::Numeric("4".into()), Value::Null]]
+        );
+        let open_at = proc
+            .instrs
+            .iter()
+            .position(|op| matches!(op, Op::CursorOpen(_)))
+            .unwrap();
+        let before = &proc.instrs[..open_at];
+        let loads = before.iter().filter(|op| matches!(op, Op::LoadLocal(_))).count();
+        let stores = before.iter().filter(|op| matches!(op, Op::StoreLocal(_))).count();
+        assert_eq!(loads, 3, "a repeated formal is loaded twice and evaluated once");
+        assert_eq!(stores, 4, "the handle plus one store per formal, including the unused one");
+
+        let one = "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part; v NUMBER := 7;";
+        let (missing, bridge) = run(
+            vec![],
+            &format!("{one} BEGIN OPEN c(NULL); FETCH c INTO v; CLOSE c; RETURN v; END;"),
+        );
+        assert_eq!(missing, Value::Numeric("7".into()));
+        assert_eq!(bridge.cursor_params, vec![vec![Value::Null]]);
+        assert_eq!(bridge.advances, 1);
+        assert_eq!(bridge.closes, 1);
+        let (found, bridge) = run(
+            vec![vec![Value::Numeric("4".into())]],
+            &format!("{one} BEGIN OPEN c(NULL); FETCH c INTO v; CLOSE c; RETURN v; END;"),
+        );
+        assert_eq!(found, Value::Numeric("4".into()));
+        assert_eq!(bridge.cursor_params, vec![vec![Value::Null]]);
+        let (kept, bridge, _) = execute(
+            "VARCHAR2",
+            vec![],
+            "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part; part VARCHAR2 := 'keep'; BEGIN OPEN c('wheel'); CLOSE c; RETURN part; END;",
+        );
+        assert_eq!(kept, Value::Text("keep".into()));
+        assert_eq!(bridge.cursor_params, vec![vec![Value::Text("wheel".into())]]);
+        let text_sql = compile(
+            "CREATE FUNCTION f RETURN VARCHAR2 IS CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part; part VARCHAR2 := 'keep'; BEGIN OPEN c('wheel'); CLOSE c; RETURN part; END;",
+        )
+        .unwrap();
+        assert_eq!(text_sql.calls[0].sql, "SELECT id FROM t WHERE t.part = $1");
+        assert_eq!(text_sql.calls[0].argc, 1);
+        let (unused, bridge, _) = execute(
+            "NUMBER",
+            vec![],
+            "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.x = 1; BEGIN OPEN c(NULL); CLOSE c; RETURN 1; END;",
+        );
+        assert_eq!(unused, Value::Numeric("1".into()));
+        assert_eq!(bridge.cursor_params, vec![vec![]]);
+        assert_eq!(bridge.cursor_opens, 1);
+        let unused_sql = compile(
+            "CREATE FUNCTION f RETURN NUMBER IS CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.x = 1; BEGIN OPEN c(NULL); CLOSE c; RETURN 1; END;",
+        )
+        .unwrap();
+        assert_eq!(unused_sql.calls[0].sql, "SELECT id FROM t WHERE t.x = 1");
+        assert_eq!(unused_sql.calls[0].argc, 0);
+
+        let bare = compile("CREATE FUNCTION f RETURN NUMBER IS CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE part = c.part; BEGIN RETURN 1; END;")
+            .unwrap_err()
+            .to_string();
+        assert!(bare.contains("PL/SQL at "), "{bare}");
+        assert!(bare.contains("bare cursor parameter"), "{bare}");
+        for (body, needle) in [
+            (
+                "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.part = :part; BEGIN RETURN 1; END;",
+                "not bind placeholders",
+            ),
+            (
+                "CURSOR c () IS SELECT id FROM t; BEGIN RETURN 1; END;",
+                "omit the parentheses",
+            ),
+            (
+                "CURSOR c IS SELECT id FROM t; BEGIN OPEN c(1); RETURN 1; END;",
+                "this cursor has no parameters",
+            ),
+            (
+                "CURSOR c (part VARCHAR2, amount NUMBER) IS SELECT id FROM t WHERE t.part = c.part AND t.amount = c.amount; BEGIN OPEN c(NULL); RETURN 1; END;",
+                "OPEN argument count does not match",
+            ),
+            (
+                "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part; BEGIN OPEN c(NULL, 4); RETURN 1; END;",
+                "OPEN argument count does not match",
+            ),
+            (
+                "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part; BEGIN OPEN c; RETURN 1; END;",
+                "expected (",
+            ),
+            (
+                "CURSOR c (part OUT VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part; BEGIN RETURN 1; END;",
+                "cursor parameters are IN only",
+            ),
+            (
+                "CURSOR c (part IN OUT VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part; BEGIN RETURN 1; END;",
+                "cursor parameters are IN only",
+            ),
+            (
+                "CURSOR c (part VARCHAR2 DEFAULT 'x') IS SELECT id FROM t WHERE t.part = c.part; BEGIN RETURN 1; END;",
+                "cursor parameter defaults are not implemented",
+            ),
+            (
+                "CURSOR c (part VARCHAR2 := 'x') IS SELECT id FROM t WHERE t.part = c.part; BEGIN RETURN 1; END;",
+                "cursor parameter defaults are not implemented",
+            ),
+            (
+                "CURSOR c (part IN NOCOPY VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part; BEGIN RETURN 1; END;",
+                "NOCOPY is only valid for OUT or IN OUT parameters",
+            ),
+            (
+                "CURSOR c (part VARCHAR2, part NUMBER) IS SELECT id FROM t WHERE t.part = c.part; BEGIN RETURN 1; END;",
+                "duplicate cursor parameter name",
+            ),
+            (
+                "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.part = c.missing; BEGIN RETURN 1; END;",
+                "unknown cursor parameter",
+            ),
+            (
+                "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part.extra; BEGIN RETURN 1; END;",
+                "cannot have further qualification",
+            ),
+            (
+                "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE c = 1; BEGIN RETURN 1; END;",
+                "cursor name in the query requires .parameter",
+            ),
+            (
+                "CURSOR c (part VARCHAR2) IS SELECT id FROM t WHERE t.part = c.part; BEGIN RETURN part; END;",
+                "unknown variable",
+            ),
+            (
+                "part VARCHAR2 := 'keep'; CURSOR c (p VARCHAR2) IS SELECT id FROM t WHERE t.part = c.p; BEGIN OPEN c(part => 'wheel'); RETURN 1; END;",
+                "expected )",
+            ),
+        ] {
+            let err = compile(&format!("CREATE FUNCTION f RETURN NUMBER IS {body}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("PL/SQL at "), "{needle}: {err}");
+            assert!(err.contains(needle), "{needle}: {err}");
         }
     }
 }

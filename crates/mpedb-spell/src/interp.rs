@@ -1047,6 +1047,8 @@ pub mod testutil {
         pub queries: usize,
         pub execs: usize,
         pub cursor_opens: usize,
+        /// Parameters each `cursor_open` actually received, in call order.
+        pub cursor_params: Vec<Vec<Value>>,
         /// Rows `cursor_advance` actually pulled, including a not-found pull.
         pub advances: usize,
         /// Streams `cursor_close` released.
@@ -1063,6 +1065,7 @@ pub mod testutil {
                 queries: 0,
                 execs: 0,
                 cursor_opens: 0,
+                cursor_params: Vec::new(),
                 advances: 0,
                 closes: 0,
                 streams: Vec::new(),
@@ -1085,8 +1088,9 @@ pub mod testutil {
             self.execs += 1;
             Ok(self.affected)
         }
-        fn cursor_open(&mut self, _plan: &PlanRef, _params: &[Value]) -> Result<u32> {
+        fn cursor_open(&mut self, _plan: &PlanRef, params: &[Value]) -> Result<u32> {
             self.cursor_opens += 1;
+            self.cursor_params.push(params.to_vec());
             self.streams.push(Some(self.rows.clone().into()));
             Ok((self.streams.len() - 1) as u32)
         }
