@@ -11,11 +11,11 @@ mod state;
 pub use capture::OracleChangeBatch;
 pub use snapshot::OracleSnapshot;
 pub use state::OracleStateIdentity;
-mod write;
 mod receipt;
 mod receipt_codec;
-pub use receipt::{OracleLedgerIdentity, OracleWriteRequest};
+mod write;
 use codec::{decode_row, read_expr};
+pub use receipt::{OracleLedgerIdentity, OracleWriteRequest};
 
 use crate::oracle::{quote, OracleColumn, OracleRoutine, OracleTable};
 use crate::sourcecfg::SourceSpec;
@@ -204,6 +204,21 @@ impl OracleSource {
     /// a snapshot. Flashback/DDL/history errors propagate; never silently fall
     /// back to current rows. Temporal text retains nanoseconds and time zones.
     pub fn read_snapshot(&self, table: &OracleTable, scn: u64) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::new();
+        self.stream_snapshot(table, scn, |row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+    /// Stream one fixed-SCN table; individual carrier values remain owned.
+    /// Callback failure aborts the read without substituting a newer SCN.
+    pub fn stream_snapshot(
+        &self,
+        table: &OracleTable,
+        scn: u64,
+        mut sink: impl FnMut(Vec<Value>) -> Result<()>,
+    ) -> Result<u64> {
         if table.owner != self.owner
             || table.temporary
             || table.nested
@@ -241,11 +256,13 @@ impl OracleSource {
             .build()
             .map_err(|e| err("snapshot prepare", e))?;
         let rows = statement.query(&[&scn]).map_err(|e| err("snapshot", e))?;
-        rows.map(|row| {
+        let mut count = 0;
+        for row in rows {
             let row = row.map_err(|e| err("snapshot row", e))?;
-            decode_row(&row, &table.columns, 0)
-        })
-        .collect()
+            sink(decode_row(&row, &table.columns, 0)?)?;
+            count += 1;
+        }
+        Ok(count)
     }
 }
 

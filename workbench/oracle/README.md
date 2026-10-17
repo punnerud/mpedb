@@ -104,15 +104,25 @@ reads the selected tables at one bootstrap SCN, and imports carriers into a new
 MPEdb file. Source identity, full original/logical DDL, column metadata and the
 initial cursor persist in checksummed 64 KiB JSON chunks (64 MiB metadata limit).
 The start cursor, mirror config, provenance and CDC flags publish in ONE final
-commit; failed bootstrap reads publish none of them. Partial row imports can
-leave an unpublished file, which is refused as an existing destination.
+commit; failed bootstrap reads publish none of them. Import streams rows at the
+same SCN into a private staging directory on the destination filesystem. Batches
+are bounded by both `batch_rows` and 8 MiB of encoded rows (one larger row may
+exceed that byte budget). After closing the completed database, an atomic
+no-replace hard link publishes the destination; failures clean up the owned
+stage and never overwrite a destination created concurrently. A durable random
+file incarnation survives reopen/move and changes on every fresh import, even
+when the destination path is reused. This distinguishes outbound generations
+across independent imports.
 `load_oracle_bootstrap` verifies metadata and the pinned carrier-table scope
 without contacting Oracle. Extra rRETL lineage/maps and local tables are allowed;
 the original scope ids and full carrier definitions must still match. Native
 tests apply/revert an Oracle PL/SQL Boolean lens, cold-reopen the adapter after
 lineage creation, and still reject an added column on a mirrored table. Native tests cover cold reopen, multiple metadata chunks, data values,
-existing-destination rejection, altered content and truncated chunks. Snapshot
-rows are still materialized in memory; CLI import and full live adapter wiring
+existing-destination rejection, altered content and truncated chunks. A native
+6000-row fixture exceeds the byte budget, includes an empty table, and verifies
+that capacity failure leaves no published destination or staging directory.
+Individual row/LOB carrier values are still materialized in memory; the import
+no longer retains the entire snapshot. CLI import and full live adapter wiring
 remain unfinished. SQL execution uses MPEdb's strict grouping mode, which does
 not imply full Oracle SQL-dialect compatibility.
 

@@ -11,6 +11,7 @@ use mpedb::Database;
 use mpedb_types::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+mod staging;
 const META: &[u8] = b"ora/bootstrap";
 const CHUNK: usize = 65536;
 const LIMIT: usize = 64 * 1024 * 1024;
@@ -122,6 +123,24 @@ pub fn load_bootstrap(db: &Database) -> Result<OracleBootstrap> {
     }
     Ok(metadata)
 }
+/// Durable per-FILE identity for outbound request generations. Unlike a path
+/// or transaction counter, this changes on every fresh import and survives move.
+pub fn load_file_incarnation(db: &Database) -> Result<[u8; 16]> {
+    let bytes = db
+        .sys_record_get(state::MIR_NS, b"ora/file-incarnation")?
+        .ok_or_else(|| {
+            Error::Unsupported(
+                "Oracle mirror has no file incarnation; reimport before enabling write-back".into(),
+            )
+        })?;
+    let id: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| Error::Corrupt("invalid Oracle file incarnation length".into()))?;
+    if id == [0; 16] {
+        return Err(Error::Corrupt("zero Oracle file incarnation".into()));
+    }
+    Ok(id)
+}
 fn mirror_name(id: [u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -134,10 +153,14 @@ pub fn import_oracle(
     dest: &Path,
     opts: &ImportOptions,
 ) -> Result<(Database, ImportReport)> {
-    if dest.exists() {
-        return Err(Error::Config(
-            "Oracle import destination already exists".into(),
-        ));
+    match dest.symlink_metadata() {
+        Ok(_) => {
+            return Err(Error::Config(
+                "Oracle import destination already exists".into(),
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     if opts.batch_rows == 0 || opts.adapt.is_some() {
         return Err(Error::Config(
@@ -166,7 +189,74 @@ pub fn import_oracle(
             "no mirrorable Oracle tables in source".into(),
         ));
     }
-    let snapshot = source.snapshot_for_mirror_with_ledger(&tables, &mirror_id, ledger.as_ref())?;
+    let tables = oracle::carrier_tables(&tables)?
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let schema = oracle::build_schema(&tables)?;
+    let nonce = source.import_incarnation()?;
+    let stage = staging::Staging::new(dest, nonce)?;
+    let db = import::create_mirror_db(
+        &stage.path(),
+        schema.clone(),
+        opts.size_bytes,
+        opts.durability,
+        mpedb_types::Dialect::Postgres,
+    )?;
+    let mut report = ImportReport {
+        tables: tables
+            .iter()
+            .enumerate()
+            .map(|(id, t)| TableImportStat {
+                name: t.name.clone(),
+                table_id: id as u32,
+                rows: 0,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let types = schema
+        .tables
+        .iter()
+        .map(|t| t.columns.iter().map(|c| c.ty).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+    let mut current = None;
+    let snapshot =
+        source.stream_mirror_snapshot(&tables, &mirror_id, ledger.as_ref(), &mut |id, row| {
+            if current != Some(id) {
+                if let Some(previous) = current {
+                    if !batch.is_empty() {
+                        import::flush_batch(
+                            &db,
+                            previous,
+                            &tables[previous as usize].pk,
+                            &mut batch,
+                        )?;
+                    }
+                }
+                current = Some(id);
+                batch_bytes = 0;
+            }
+            let size = mpedb_core::row::encoded_len(&row, &types[id as usize]);
+            if !batch.is_empty()
+                && (batch.len() >= opts.batch_rows
+                    || batch_bytes.saturating_add(size) > 8 * 1024 * 1024)
+            {
+                import::flush_batch(&db, id, &tables[id as usize].pk, &mut batch)?;
+                batch_bytes = 0;
+            }
+            batch_bytes = batch_bytes.saturating_add(size);
+            batch.push(row);
+            report.tables[id as usize].rows += 1;
+            Ok(())
+        })?;
+    if let Some(id) = current {
+        if !batch.is_empty() {
+            import::flush_batch(&db, id, &tables[id as usize].pk, &mut batch)?;
+        }
+    }
     if snapshot.source_state != Some((1, "source".into())) {
         return Err(Error::Config(
             "Oracle import requires an initial source-authoritative epoch".into(),
@@ -191,7 +281,6 @@ pub fn import_oracle(
             "Oracle bootstrap metadata exceeds 64 MiB".into(),
         ));
     }
-    let schema = oracle::build_schema(&metadata.tables)?;
     let maps = metadata
         .tables
         .iter()
@@ -226,32 +315,6 @@ pub fn import_oracle(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let db = import::create_mirror_db(
-        dest,
-        schema.clone(),
-        opts.size_bytes,
-        opts.durability,
-        mpedb_types::Dialect::Postgres,
-    )?;
-    let mut report = ImportReport::default();
-    for (id, rows) in snapshot.rows.into_iter().enumerate() {
-        let count = rows.len() as u64;
-        let mut batch = Vec::new();
-        for row in rows {
-            batch.push(row);
-            if batch.len() >= opts.batch_rows {
-                import::flush_batch(&db, id as u32, &metadata.tables[id].pk, &mut batch)?;
-            }
-        }
-        if !batch.is_empty() {
-            import::flush_batch(&db, id as u32, &metadata.tables[id].pk, &mut batch)?;
-        }
-        report.tables.push(TableImportStat {
-            name: metadata.tables[id].name.clone(),
-            table_id: id as u32,
-            rows: count,
-        });
-    }
     import::publish_mirror_state_with(&db, &schema, state::SourceKind::Oracle, &maps, |s| {
         let mut header = vec![1];
         header.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
@@ -260,7 +323,19 @@ pub fn import_oracle(
             s.sys_record_put(state::MIR_NS, &chunk_key(n), chunk)?;
         }
         s.sys_record_put(state::MIR_NS, META, &header)?;
+        s.sys_record_put(state::MIR_NS, b"ora/file-incarnation", &nonce)?;
+        let cfg = s
+            .sys_record_get(state::MIR_NS, state::KEY_CFG)?
+            .ok_or_else(|| Error::Corrupt("Oracle import config publication is missing".into()))?;
+        let mut cfg = state::MirrorConfig::decode(&cfg)?;
+        cfg.mirror_id = import::mirror_id_for(dest);
+        s.sys_record_put(state::MIR_NS, state::KEY_CFG, &cfg.encode())?;
         s.sys_record_put(state::MIR_NS, state::KEY_CUR, &metadata.cursor)
     })?;
+    drop(db);
+    stage.publish()?;
+    let db = Database::open_from_file(dest)?;
+    // The trusted applier exemption is per connection, not persisted tuning.
+    db.set_fk_enforced(false);
     Ok((db, report))
 }

@@ -318,13 +318,7 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
         1
     );
     let metadata = mpedb_mirror::load_oracle_bootstrap(&db).unwrap();
-    let nonce: Vec<u8> = c.query_row_as("SELECT SYS_GUID() FROM dual", &[]).unwrap();
-    let nonce: [u8; 16] = nonce.try_into().unwrap();
-    let mut s = db.begin().unwrap();
-    s.set_capture(false);
-    s.sys_record_put("mir", b"fixture/file-incarnation", &nonce)
-        .unwrap();
-    s.commit().unwrap();
+    let nonce = mpedb_mirror::oracle_import::load_file_incarnation(&db).unwrap();
     db.query(
         "UPDATE \"MPEDB_RECEIPT_CASE\" SET \"GENERATED_VALUE\"=$1 WHERE \"ID\"=$2",
         &[Value::Numeric("0".into()), Value::Numeric("3".into())],

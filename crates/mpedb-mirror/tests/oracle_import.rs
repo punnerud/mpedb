@@ -69,6 +69,7 @@ fn native_oracle_import_reopens_with_verified_chunked_provenance_and_cursor() {
     };
     assert_eq!(report.total_rows(), 1);
     let original = load_bootstrap(&db).unwrap();
+    let file_incarnation = mpedb_mirror::oracle_import::load_file_incarnation(&db).unwrap();
     assert_eq!(
         original.tables[0].columns[2]
             .default_source
@@ -110,6 +111,10 @@ fn native_oracle_import_reopens_with_verified_chunked_provenance_and_cursor() {
 
     drop(db);
     let db = mpedb::Database::open_from_file(&path).unwrap();
+    assert_eq!(
+        mpedb_mirror::oracle_import::load_file_incarnation(&db).unwrap(),
+        file_incarnation
+    );
     assert_eq!(load_bootstrap(&db).unwrap(), original);
     let mut adapter =
         mpedb_mirror::OracleAdapter::from_database(OracleSource::connect(&spec).unwrap(), &db)
@@ -152,6 +157,18 @@ fn native_oracle_import_reopens_with_verified_chunked_provenance_and_cursor() {
     s.commit().unwrap();
     assert!(load_bootstrap(&db).is_err());
     drop(db);
+    std::fs::remove_file(&path).unwrap();
+    // Reusing a destination path must never reuse outbound request identity.
+    let (fresh, _) = import_oracle(&mut source, &path, &opts).unwrap();
+    assert_ne!(
+        mpedb_mirror::oracle_import::load_file_incarnation(&fresh).unwrap(),
+        file_incarnation
+    );
+    assert_eq!(
+        load_bootstrap(&fresh).unwrap().mirror_id,
+        original.mirror_id
+    );
+    drop(fresh);
     std::fs::remove_file(&path).unwrap();
     c.execute(
         "DELETE FROM MPEDB_MIRROR_STATE WHERE mirror_id=:1",

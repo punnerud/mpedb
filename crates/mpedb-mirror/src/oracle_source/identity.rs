@@ -2,6 +2,20 @@
 use super::*;
 use crate::oracle_cursor::OracleIdentity;
 impl OracleSource {
+    pub(crate) fn import_incarnation(&self) -> Result<[u8; 16]> {
+        let bytes: Vec<u8> = self
+            .connection
+            .query_row_as("SELECT SYS_GUID() FROM dual", &[])
+            .map_err(|e| err("import incarnation", e))?;
+        let id: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| Error::Corrupt("Oracle returned an invalid import GUID".into()))?;
+        if id == [0; 16] {
+            return Err(Error::Corrupt("Oracle returned a zero import GUID".into()));
+        }
+        Ok(id)
+    }
+
     /// Requires SELECT on SYS.V_$DATABASE and SYS.V_$PDB_INCARNATION.
     /// Refuses unavailable identity; database names or DSNs are not substitutes.
     pub fn identity(&self) -> Result<OracleIdentity> {
