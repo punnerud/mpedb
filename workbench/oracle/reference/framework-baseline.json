@@ -19,7 +19,15 @@
       "result": "passed"
     },
     "scope_complete": true,
-    "green": false
+    "green": false,
+    "python31215_recheck": {
+      "python": "3.12.15",
+      "tests_ran": 3,
+      "failure_entries": 0,
+      "result": "passed",
+      "assertions_modified": false
+    },
+    "follow_up": "Fresh full run in progress using private CPython 3.12.15 and the same pinned dependency versions."
   },
   "sqlalchemy_initial_broad_run": {
     "revision": "29e4255f413b9791e117b40ab12c76c9df6313d8",

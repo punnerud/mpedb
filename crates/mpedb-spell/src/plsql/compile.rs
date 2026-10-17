@@ -761,7 +761,7 @@ impl Parser<'_> {
             let op = if self.symbol("*") {
                 Op::OracleMul
             } else if self.symbol("/") {
-                Op::OracleDiv
+                Op::OraclePlSqlDiv
             } else {
                 break;
             };

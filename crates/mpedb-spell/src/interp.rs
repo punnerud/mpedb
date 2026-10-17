@@ -537,7 +537,7 @@ pub fn run(
                 let value = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(oracle_number::negate(value)?));
             }
-            Op::OracleAdd | Op::OracleSub | Op::OracleMul | Op::OracleDiv => {
+            Op::OracleAdd | Op::OracleSub | Op::OracleMul | Op::OracleDiv | Op::OraclePlSqlDiv => {
                 let b = stack.pop().expect("validated");
                 let a = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(oracle_number::binary(op, a, b)?));

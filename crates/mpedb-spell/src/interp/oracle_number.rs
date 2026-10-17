@@ -195,7 +195,7 @@ pub(super) fn binary(op: Op, a: PValue, b: PValue) -> Result<Value> {
             value(if op == Op::OracleAdd { a + b } else { a - b }, scale)
         }
         Op::OracleMul => value(a.coefficient * b.coefficient, a.scale + b.scale),
-        Op::OracleDiv => {
+        Op::OracleDiv | Op::OraclePlSqlDiv => {
             if b.coefficient.is_zero() {
                 return Err(Error::DivisionByZero);
             }
@@ -223,9 +223,13 @@ pub(super) fn binary(op: Op, a: PValue, b: PValue) -> Result<Value> {
                 exponent -= 1;
             }
             if exponent < -130 {
-                // Unlike literal conversion/multiplication, Oracle division
-                // of nonzero operands raises ORA-01426 on underflow.
-                return Err(Error::ArithmeticOverflow);
+                // Oracle SQL raises ORA-01426; native PL/SQL returns zero.
+                // Separate opcodes preserve already stored procedure hashes.
+                return if op == Op::OraclePlSqlDiv {
+                    Ok(Value::Numeric("0".into()))
+                } else {
+                    Err(Error::ArithmeticOverflow)
+                };
             }
             if exponent >= 126 {
                 return Err(Error::ArithmeticOverflow);

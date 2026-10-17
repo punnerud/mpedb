@@ -65,3 +65,40 @@ fn legacy_division_retains_its_error_and_new_division_has_distinct_encoding() {
         ))
     );
 }
+
+#[test]
+fn plsql_underflow_instruction_does_not_change_stored_sql_style_division() {
+    let program = |op| {
+        Proc::new(
+            "underflow".into(),
+            0,
+            0,
+            vec![],
+            vec![
+                Value::Numeric("1e-100".into()),
+                Value::Numeric("1e100".into()),
+            ],
+            vec![Op::LoadConst(0), Op::LoadConst(1), op, Op::Return],
+        )
+        .unwrap()
+    };
+    let old = program(Op::OracleDiv);
+    let new = program(Op::OraclePlSqlDiv);
+    assert_ne!(old.hash(), new.hash());
+    let execute = |p: Proc| {
+        run(
+            &Proc::decode(&p.encode()).unwrap(),
+            &[],
+            &mut MockBridge::new(),
+            Budget::default(),
+        )
+    };
+    assert!(matches!(
+        execute(old),
+        Err(mpedb_types::Error::ArithmeticOverflow)
+    ));
+    assert_eq!(
+        execute(new).unwrap(),
+        ProcValue::Scalar(Value::Numeric("0".into()))
+    );
+}

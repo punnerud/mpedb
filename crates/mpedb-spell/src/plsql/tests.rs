@@ -330,14 +330,15 @@ fn rounded_arithmetic_matches_measured_oracle_values() {
 }
 
 #[test]
-fn division_underflow_raises_while_literal_and_multiplication_underflow_zero() {
-    assert!(matches!(
+fn plsql_division_literal_and_multiplication_underflow_become_zero() {
+    assert_eq!(
         call(
             &function("", "NUMBER", "BEGIN RETURN 1e-100 / 1e100; END;"),
             &[]
-        ),
-        Err(mpedb_types::Error::ArithmeticOverflow)
-    ));
+        )
+        .unwrap(),
+        Value::Numeric("0".into())
+    );
     assert_eq!(
         call(
             &function("", "NUMBER", "BEGIN RETURN 1e-100 * 1e-100; END;"),

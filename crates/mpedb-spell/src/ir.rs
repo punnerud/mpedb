@@ -143,6 +143,8 @@ pub enum Op {
     OracleSub,
     OracleMul,
     OracleDiv,
+    /// PL/SQL division returns zero on underflow; legacy SQL-style op stays unchanged.
+    OraclePlSqlDiv,
     OracleNeg,
     /// VARCHAR2 normalization. Low 15 bits: length (0 = unconstrained);
     /// high bit: CHAR semantics rather than BYTE. Absolute maximum 32767 bytes.
@@ -284,6 +286,7 @@ const OP_ORACLE_INT_ADD: u8 = 69;
 const OP_ORACLE_INT_SUB: u8 = 70;
 const OP_ORACLE_INT_MUL: u8 = 71;
 const OP_ORACLE_INT_NEG: u8 = 72;
+const OP_ORACLE_PLSQL_DIV: u8 = 73;
 
 
 
@@ -530,6 +533,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleSub => b.push(OP_ORACLE_SUB),
         Op::OracleMul => b.push(OP_ORACLE_MUL),
         Op::OracleDiv => b.push(OP_ORACLE_DIV),
+        Op::OraclePlSqlDiv => b.push(OP_ORACLE_PLSQL_DIV),
         Op::OracleNeg => b.push(OP_ORACLE_NEG),
         Op::OracleVarchar(limit) => u16arg(OP_ORACLE_VARCHAR, limit),
         Op::OracleLoopBound => b.push(OP_ORACLE_LOOP_BOUND),
@@ -625,6 +629,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_SUB => Op::OracleSub,
         OP_ORACLE_MUL => Op::OracleMul,
         OP_ORACLE_DIV => Op::OracleDiv,
+        OP_ORACLE_PLSQL_DIV => Op::OraclePlSqlDiv,
         OP_ORACLE_NEG => Op::OracleNeg,
         OP_ORACLE_VARCHAR => Op::OracleVarchar(u16arg()?),
         OP_ORACLE_LOOP_BOUND => Op::OracleLoopBound,
@@ -711,6 +716,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         | Op::OracleSub
         | Op::OracleMul
         | Op::OracleDiv
+        | Op::OraclePlSqlDiv
         | Op::SqlAnd
         | Op::SqlOr
         | Op::SqlEq

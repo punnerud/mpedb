@@ -18,8 +18,10 @@ and 6 failure entries. Four failures came from the harness's test-only
 SECRET_KEY; the two affected test methods pass after using upstream's expected
 key. Two HTML tests reflect Ubuntu's security-backported Python 3.12.3 reporting
 an older version than their version-based expectations. A private stock
-[CPython 3.12.15](https://www.python.org/downloads/release/python-31215/) is being
-built on the extra disk to recheck those tests without changing assertions.
+[CPython 3.12.15](https://www.python.org/downloads/release/python-31215/) was built
+on the extra disk. All three affected test methods now pass with the corrected
+settings and complete dependency environment, without changing assertions.
+A fresh full Django run is in progress with that interpreter.
 No Oracle-backend failure occurred in that full run, but it is not reported as
 fully green. See `reference/framework-baseline.json` for the measured counts.
 
@@ -158,10 +160,12 @@ parameter boundaries. Finite arithmetic uses twenty base-100 groups (39/40
 decimal digits according to exponent parity), measured against Oracle 23.26.3.
 Arithmetic uses bounded arbitrary-width integer intermediates, SQL NULL
 propagation, and proper precedence. Recurring division works: `1 / 3` retains
-forty fractional digits. The current NUMBER opcodes implement SQL-style range
-checks: overflow raises, literal/multiplication underflow becomes zero, and
-nonzero division underflow raises. **The last rule differs from Oracle PL/SQL,
-which returns zero. PL/SQL overflow also needs separate special-value support.**
+forty fractional digits. The original NUMBER opcodes retain SQL-style range
+checks. New PL/SQL routines use a distinct division instruction that returns
+zero on underflow, matching the real procedural reference; already stored
+SQL-style division still raises. Literal/multiplication underflow also becomes
+zero. **PL/SQL overflow still needs separate special-value support; native
+execution currently raises rather than returning those special values.**
 
 These NUMBER and integer instructions have distinct IR opcodes. Previously
 stored routines retain their original semantics and hashes; redefining source
@@ -181,8 +185,8 @@ python workbench/oracle/number_differential.py \
   --output /path/to/artifacts/number-report.json
 ```
 
-**The corrected 2016-case NUMBER test currently has 155 mismatches:** 44 division
-underflows, 110 overflow results where Oracle produces special NUMBER values
+**The corrected 2016-case NUMBER test now has 111 mismatches**, reduced from 155
+after fixing all 44 division underflows: 110 overflow results where Oracle produces special NUMBER values
 (displayed as `#######` by TO_CHAR), and one out-of-range source literal with a
 different compilation error. There were no differing returned finite values.
 Measured special representations include `DUMP` bytes `ff,65` and `0`; a driver
