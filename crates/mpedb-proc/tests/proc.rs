@@ -1822,3 +1822,74 @@ fn plsql_nested_table_first_of_null() {
         ProcValue::Scalar(Value::Int(2))
     );
 }
+
+#[test]
+fn plsql_nested_table_prior_of_null() {
+    let (cfg, _guard) = test_config("plsql-nested-prior");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query(
+        "CREATE TABLE marks (id INTEGER PRIMARY KEY, score INTEGER)",
+        &[],
+    )
+    .unwrap();
+    db.query("INSERT INTO marks (id, score) VALUES (1, 4)", &[])
+        .unwrap();
+    db.query("INSERT INTO marks (id, score) VALUES (2, NULL)", &[])
+        .unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "CREATE FUNCTION see_null RETURN PLS_INTEGER IS \
+             TYPE nums IS TABLE OF NUMBER; \
+             n nums; \
+             BEGIN \
+               RETURN n.PRIOR(1); \
+             EXCEPTION \
+               WHEN COLLECTION_IS_NULL THEN \
+                 RETURN NULL; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_NULL", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_empty RETURN PLS_INTEGER IS \
+             TYPE nums IS TABLE OF NUMBER; \
+             n nums; \
+             BEGIN \
+               SELECT score BULK COLLECT INTO n FROM marks WHERE id < 0; \
+               IF n.NEXT(1) IS NULL AND n.PRIOR(1) IS NULL THEN RETURN NULL; END IF; \
+               RETURN 1; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_EMPTY", &[]).unwrap(),
+        ProcValue::Scalar(Value::Null)
+    );
+    engine
+        .define(
+            "CREATE FUNCTION see_step RETURN PLS_INTEGER IS \
+             TYPE nums IS TABLE OF NUMBER; \
+             n nums; \
+             BEGIN \
+               SELECT score BULK COLLECT INTO n FROM marks; \
+               IF n.NEXT(1) = 2 AND n.PRIOR(2) = 1 AND n(2) IS NULL \
+                  AND n.NEXT(2) IS NULL THEN \
+                 RETURN n.NEXT(1); \
+               END IF; \
+               RETURN NULL; \
+             END;",
+            Lang::PlSql,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("SEE_STEP", &[]).unwrap(),
+        ProcValue::Scalar(Value::Int(2))
+    );
+}

@@ -1021,6 +1021,15 @@ pub fn run_with_package(
                 let collection = stack.pop().expect("validated");
                 stack.push(nested_bound(collection, matches!(op, Op::NestedLast))?);
             }
+            Op::NestedPrior | Op::NestedNext => {
+                let collection = stack.pop().expect("validated");
+                let index = stack.pop().expect("validated");
+                stack.push(nested_neighbor(
+                    collection,
+                    index,
+                    matches!(op, Op::NestedNext),
+                )?);
+            }
             Op::PkgGet(index) => {
                 let key = package_key(&proc.consts, index)?;
                 let value = package.get(key).cloned().unwrap_or(Value::Null);
@@ -1291,6 +1300,56 @@ fn nested_bound(collection: PValue, last: bool) -> Result<PValue> {
     let index = if last { list.len() } else { 1 };
     let index = i64::try_from(index).map_err(|_| rt_err("nested table bound exceeds i64"))?;
     Ok(PValue::Scalar(Value::Int(index)))
+}
+
+/// `PRIOR` and `NEXT` on a dense nested table. A NULL collection raises.
+/// A NULL index pushes NULL. Deleted gaps are not representable yet, so the
+/// neighbor is the adjacent index in `1..=len`, or NULL at either end.
+/// A stored NULL element is still a step.
+fn nested_neighbor(collection: PValue, index: PValue, next: bool) -> Result<PValue> {
+    let list = match collection {
+        PValue::Scalar(Value::Null) => {
+            return Err(Error::Oracle {
+                code: 6531,
+                message: "Reference to uninitialized collection".into(),
+            })
+        }
+        PValue::List(list) => list,
+        other => {
+            return Err(type_err(format!(
+                "expected a nested table, got {}",
+                tyname(&other)
+            )))
+        }
+    };
+    let index = match index {
+        PValue::Scalar(Value::Null) => return Ok(PValue::Scalar(Value::Null)),
+        PValue::Scalar(Value::Int(index)) => index,
+        _ => return Err(oracle_exception::named(6502)),
+    };
+    if list.is_empty() {
+        return Ok(PValue::Scalar(Value::Null));
+    }
+    let len = i64::try_from(list.len()).map_err(|_| rt_err("nested table bound exceeds i64"))?;
+    let neighbor = if next {
+        if index < 1 {
+            Some(1)
+        } else if index >= len {
+            None
+        } else {
+            index.checked_add(1)
+        }
+    } else if index > len {
+        Some(len)
+    } else if index <= 1 {
+        None
+    } else {
+        index.checked_sub(1)
+    };
+    Ok(PValue::Scalar(match neighbor {
+        Some(neighbor) => Value::Int(neighbor),
+        None => Value::Null,
+    }))
 }
 
 /// Implicit `SQL%` attribute. `ISOPEN` is always false. The other three

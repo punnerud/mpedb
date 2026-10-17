@@ -6,7 +6,9 @@
 //! table's `COUNT` is 0, and a NULL element still counts and still exists.
 //! `FIRST` and `LAST` of an uninitialized table raise the same error. An
 //! empty table's `FIRST` and `LAST` are NULL, and a NULL element does not
-//! move either bound. `INDEX BY` and `VARRAY` stay refused.
+//! move either bound. `PRIOR` and `NEXT` of an uninitialized table raise
+//! the same error. A NULL index, an empty table, or a missing neighbor is
+//! NULL, and a NULL element is still a step. `INDEX BY` and `VARRAY` stay refused.
 
 use super::*;
 use crate::emit::{CallKind, SqlCall};
@@ -131,6 +133,23 @@ impl Parser<'_> {
                 }
                 self.builder.emit(Op::LoadLocal(nested.slot))?;
                 self.builder.emit(if last { Op::NestedLast } else { Op::NestedFirst })?;
+                return Ok(Some(Type::PlsInteger));
+            }
+            let neighbor = if self.word("PRIOR") {
+                Some(false)
+            } else if self.word("NEXT") {
+                Some(true)
+            } else {
+                None
+            };
+            if let Some(next) = neighbor {
+                self.want_symbol("(")?;
+                let actual = self.expression()?;
+                self.compatible(Type::PlsInteger, actual)?;
+                self.builder.emit(Op::OraclePlSqlInteger)?;
+                self.want_symbol(")")?;
+                self.builder.emit(Op::LoadLocal(nested.slot))?;
+                self.builder.emit(if next { Op::NestedNext } else { Op::NestedPrior })?;
                 return Ok(Some(Type::PlsInteger));
             }
             return Err(self.error("nested table methods are not implemented"));
@@ -713,6 +732,84 @@ mod tests {
         let uninit = fail(
             "PLS_INTEGER",
             &format!("{decl} BEGIN RETURN n.LAST; END;"),
+            vec![],
+        );
+        assert!(uninit.contains("ORA-06531"), "{uninit}");
+    }
+
+    #[test]
+    fn nested_table_prior_and_next_of_null() {
+        let decl = "TYPE nums IS TABLE OF NUMBER; n nums;";
+        let (caught, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} BEGIN RETURN n.PRIOR(1); \
+                 EXCEPTION WHEN COLLECTION_IS_NULL THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(caught, Value::Null);
+        let (assigned, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} BEGIN n := NULL; RETURN n.NEXT(1); \
+                 EXCEPTION WHEN COLLECTION_IS_NULL THEN RETURN NULL; END;"
+            ),
+            vec![],
+        );
+        assert_eq!(assigned, Value::Null);
+
+        let collect = format!("{decl} BEGIN SELECT amount BULK COLLECT INTO n FROM t;");
+        let (empty_next, _, _) = scene(
+            "PLS_INTEGER",
+            &format!("{collect} RETURN n.NEXT(1); END;"),
+            vec![],
+        );
+        assert_eq!(empty_next, Value::Null);
+        let (empty_prior, _, _) = scene(
+            "PLS_INTEGER",
+            &format!("{collect} RETURN n.PRIOR(1); END;"),
+            vec![],
+        );
+        assert_eq!(empty_prior, Value::Null);
+
+        let rows = vec![vec![Value::Numeric("4".into())], vec![Value::Null]];
+        let (step, _, _) = scene(
+            "PLS_INTEGER",
+            &format!("{collect} RETURN n.NEXT(1); END;"),
+            rows.clone(),
+        );
+        assert_eq!(step, Value::Int(2));
+        let (back, _, _) = scene(
+            "PLS_INTEGER",
+            &format!("{collect} RETURN n.PRIOR(2); END;"),
+            rows.clone(),
+        );
+        assert_eq!(back, Value::Int(1));
+        let (end, _, _) = scene(
+            "PLS_INTEGER",
+            &format!("{collect} RETURN n.NEXT(2); END;"),
+            rows.clone(),
+        );
+        assert_eq!(end, Value::Null);
+        let (start, _, _) = scene(
+            "PLS_INTEGER",
+            &format!("{collect} RETURN n.PRIOR(1); END;"),
+            rows,
+        );
+        assert_eq!(start, Value::Null);
+        let (null_index, _, _) = scene(
+            "PLS_INTEGER",
+            &format!(
+                "{decl} v NUMBER; BEGIN SELECT amount BULK COLLECT INTO n FROM t; RETURN n.NEXT(v); END;"
+            ),
+            vec![vec![Value::Numeric("4".into())]],
+        );
+        assert_eq!(null_index, Value::Null);
+
+        let uninit = fail(
+            "PLS_INTEGER",
+            &format!("{decl} BEGIN RETURN n.NEXT(1); END;"),
             vec![],
         );
         assert!(uninit.contains("ORA-06531"), "{uninit}");

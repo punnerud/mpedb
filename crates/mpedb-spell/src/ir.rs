@@ -289,6 +289,12 @@ pub enum Op {
     NestedFirst,
     /// Pop a nested table and push `LAST`. Same NULL rules as `FIRST`.
     NestedLast,
+    /// Pop a nested table and an index and push `PRIOR`. NULL raises
+    /// `COLLECTION_IS_NULL`. A NULL index, an empty table, or no predecessor
+    /// pushes NULL. A stored NULL element is still a step.
+    NestedPrior,
+    /// Pop a nested table and an index and push `NEXT`. Same NULL rules as `PRIOR`.
+    NestedNext,
     /// Push the session value of package variable `consts[i]` (a text key).
     /// A variable that has never been stored is NULL.
     PkgGet(u16),
@@ -426,6 +432,9 @@ const OP_NESTED_EXISTS: u8 = 107;
 // Nested-table FIRST and LAST. Additive: `NestedExists` stays 107.
 const OP_NESTED_FIRST: u8 = 108;
 const OP_NESTED_LAST: u8 = 109;
+// Nested-table PRIOR and NEXT. Additive: `NestedFirst`/`NestedLast` stay 108/109.
+const OP_NESTED_PRIOR: u8 = 110;
+const OP_NESTED_NEXT: u8 = 111;
 
 /// `Op::CursorAttr` selector. Any other byte fails validation.
 pub const CURSOR_ATTR_ISOPEN: u8 = 0;
@@ -806,6 +815,8 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::NestedExists => b.push(OP_NESTED_EXISTS),
         Op::NestedFirst => b.push(OP_NESTED_FIRST),
         Op::NestedLast => b.push(OP_NESTED_LAST),
+        Op::NestedPrior => b.push(OP_NESTED_PRIOR),
+        Op::NestedNext => b.push(OP_NESTED_NEXT),
         Op::PkgGet(x) => u16arg(OP_PKG_GET, x),
         Op::PkgSet(x) => u16arg(OP_PKG_SET, x),
         Op::CursorRow => b.push(OP_CURSOR_ROW),
@@ -966,6 +977,8 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_NESTED_EXISTS => Op::NestedExists,
         OP_NESTED_FIRST => Op::NestedFirst,
         OP_NESTED_LAST => Op::NestedLast,
+        OP_NESTED_PRIOR => Op::NestedPrior,
+        OP_NESTED_NEXT => Op::NestedNext,
         OP_PKG_GET => Op::PkgGet(u16arg()?),
         OP_PKG_SET => Op::PkgSet(u16arg()?),
         OP_CURSOR_ROW => Op::CursorRow,
@@ -991,6 +1004,7 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::NestedCount => (1, 1),
         Op::NestedExists => (2, 1),
         Op::NestedFirst | Op::NestedLast => (1, 1),
+        Op::NestedPrior | Op::NestedNext => (2, 1),
         Op::PkgGet(_) => (0, 1),
         Op::PkgSet(_) => (1, 0),
         Op::Tuple(n) => (n as usize, 1),
@@ -1614,7 +1628,9 @@ mod tests {
         assert_eq!(collect, vec![102, 103, 106, 107]);
         encode_op(&mut collect, Op::NestedFirst);
         encode_op(&mut collect, Op::NestedLast);
-        assert_eq!(collect, vec![102, 103, 106, 107, 108, 109]);
+        encode_op(&mut collect, Op::NestedPrior);
+        encode_op(&mut collect, Op::NestedNext);
+        assert_eq!(collect, vec![102, 103, 106, 107, 108, 109, 110, 111]);
         let collect_proc = mk(
             vec![
                 Op::LoadConst(0),
