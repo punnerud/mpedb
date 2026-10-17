@@ -96,6 +96,7 @@ pub mod colseg;
 mod derived;
 mod fk;
 mod trigger;
+mod trigger_oracle;
 mod workspace;
 
 pub use backtest::TriggerBacktest;

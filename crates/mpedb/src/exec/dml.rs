@@ -945,6 +945,30 @@ pub(crate) fn fire_row_triggers(
                     crate::trigger::TRIGGER_BUDGET,
                 )?;
             }
+            // PL/SQL body. Both images are arguments, in table order, `:NEW`
+            // then `:OLD`. The side this event does not have is NULL, as is a
+            // NULL column. The body only reads those values.
+            crate::trigger::TriggerBody::Oracle(body) => {
+                let args = crate::trigger_oracle::image_args(
+                    body.proc.argc as usize,
+                    new,
+                    old,
+                )?;
+                let mut bridge = CtxBridge {
+                    ctx,
+                    schema,
+                    plans: &body.plans,
+                    triggers,
+                    depth,
+                    streams: Vec::new(),
+                };
+                mpedb_spell::interp::run(
+                    &body.proc,
+                    &args,
+                    &mut bridge,
+                    crate::trigger::TRIGGER_BUDGET,
+                )?;
+            }
         }
     }
     Ok(crate::trigger::FireOutcome::Proceed)

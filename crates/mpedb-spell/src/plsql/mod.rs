@@ -9,7 +9,7 @@
 
 pub mod lex;
 mod compile;
-pub use compile::{compile, compile_function};
+pub use compile::{compile, compile_function, compile_trigger, TriggerImage, TriggerImageType};
 
 #[cfg(test)]
 mod tests;

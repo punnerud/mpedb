@@ -1461,8 +1461,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // Body: `BEGIN <stmt>; … END` (SQL) or `EXECUTE PROCEDURE p(args…)`
-        // (PySpell, DESIGN-TRIGGERS stage 5).
+        // Body: `BEGIN <stmt>; … END` (SQL), `DECLARE … END` / `:NEW`/`:OLD`
+        // (PL/SQL), or `EXECUTE PROCEDURE p(args…)` (PySpell).
         let body = if self.eat_word("EXECUTE") {
             self.expect_word("PROCEDURE")?;
             let proc_name = self.ident("procedure name")?;
@@ -1471,12 +1471,16 @@ impl<'a> Parser<'a> {
                 name: proc_name,
                 arg_srcs,
             }
+        } else if self.peek_word_at(0, "DECLARE")
+            || (matches!(self.peek(), Some(Tok::Kw(Kw::Begin))) && self.rest_has_correlation())
+        {
+            TriggerBodySpec::Oracle(self.capture_plsql_block()?)
         } else if self.eat_kw(Kw::Begin) {
             TriggerBodySpec::Sql(self.capture_begin_end_source()?)
         } else {
-            return Err(
-                self.err_here("expected BEGIN … END (or EXECUTE PROCEDURE) for the trigger body")
-            );
+            return Err(self.err_here(
+                "expected BEGIN … END, DECLARE … END, or EXECUTE PROCEDURE for the trigger body",
+            ));
         };
         Ok(DdlStmt::CreateTrigger(CreateTriggerSpec {
             name,

@@ -46,6 +46,8 @@ const BODY_TAG_SQL: u8 = 0;
 /// stage 0. Uses the same TRIGGER_FORMAT — a stage-3 reader meets tag 1 as
 /// `Corrupt`, which the no-backward-compat standing rule accepts.
 const BODY_TAG_PROC: u8 = 1;
+/// A PL/SQL row body. Same format: an older reader reports `Corrupt`.
+const BODY_TAG_ORACLE: u8 = 2;
 
 /// Per-fire budget for a PySpell trigger body (DESIGN-TRIGGERS §5.2). Applies
 /// to EACH fired row: the interpreter's instruction/db-call/row meters are the
@@ -88,6 +90,9 @@ pub(crate) enum StoredBody {
         hash: [u8; 32],
         arg_srcs: Vec<String>,
     },
+    /// PL/SQL source, recompiled from this text at catalog load. `:NEW` and
+    /// `:OLD` are both in scope; the event's absent image is NULL.
+    Oracle(String),
 }
 
 /// A decoded `trigger/<name>` catalog record.
@@ -147,6 +152,10 @@ impl StoredTrigger {
                     put_str(&mut b, a);
                 }
             }
+            StoredBody::Oracle(sql) => {
+                b.push(BODY_TAG_ORACLE);
+                put_str(&mut b, sql);
+            }
         }
         b
     }
@@ -199,6 +208,7 @@ impl StoredTrigger {
                 }
                 StoredBody::Proc { name: pname, hash, arg_srcs }
             }
+            BODY_TAG_ORACLE => StoredBody::Oracle(take_str(bytes, &mut p)?),
             t => return Err(Error::Corrupt(format!("trigger record: unknown body tag {t}"))),
         };
         if p != bytes.len() {
@@ -269,6 +279,8 @@ pub(crate) enum TriggerBody {
     /// a `RAISE` veto statement.
     Sql(Vec<mpedb_sql::TriggerStmt>),
     Spell(SpellTriggerBody),
+    /// PL/SQL body. Both images are arguments; the absent one is NULL.
+    Oracle(crate::trigger_oracle::OracleBody),
 }
 
 /// What a fired trigger set decided about the current row (DESIGN-TRIGGERS
@@ -404,6 +416,10 @@ fn build_stored_body(
                 hash: *blake3::hash(&blob).as_bytes(),
                 arg_srcs: arg_srcs.clone(),
             })
+        }
+        mpedb_sql::TriggerBodySpec::Oracle(src) => {
+            let _ = crate::trigger_oracle::compile_body(src, table, schema)?;
+            Ok(StoredBody::Oracle(src.clone()))
         }
     }
 }
@@ -551,6 +567,9 @@ impl Database {
                     args,
                     ready: self.resolve_spell_body(name, hash),
                 })
+            }
+            StoredBody::Oracle(src) => {
+                TriggerBody::Oracle(crate::trigger_oracle::compile_body(src, table, schema)?)
             }
         };
         let when = match &st.when_src {
@@ -965,6 +984,10 @@ fn reconstruct_create_trigger(st: &StoredTrigger, table: &str, col_names: &[Stri
             st.name,
             arg_srcs.join(", ")
         ),
+        StoredBody::Oracle(src) => format!(
+            "CREATE TRIGGER \"{}\" {timing} {event} ON \"{table}\"{when} {src}",
+            st.name
+        ),
     }
 }
 
@@ -1041,11 +1064,27 @@ mod tests {
             ..sample_proc()
         };
         assert_eq!(StoredTrigger::decode(&t4.encode()).unwrap(), t4);
+        let t5 = StoredTrigger {
+            name: "see_null".into(),
+            body: StoredBody::Oracle(
+                "DECLARE n VARCHAR2(40); BEGIN n := :NEW.note; END;".into(),
+            ),
+            ..sample()
+        };
+        assert_eq!(StoredTrigger::decode(&t5.encode()).unwrap(), t5);
     }
 
     #[test]
     fn decode_is_corrupt_never_panic_at_every_truncation() {
-        for bytes in [sample().encode(), sample_proc().encode()] {
+        for bytes in [
+            sample().encode(),
+            sample_proc().encode(),
+            StoredTrigger {
+                body: StoredBody::Oracle("BEGIN NULL; END;".into()),
+                ..sample()
+            }
+            .encode(),
+        ] {
             for n in 0..bytes.len() {
                 // Every prefix shorter than the whole must be Corrupt, not a panic.
                 assert!(

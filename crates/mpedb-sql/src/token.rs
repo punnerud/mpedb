@@ -54,10 +54,12 @@ pub(crate) enum Tok {
     ArrowText,
     /// `:sym:` — a USER-DEFINED operator (stage M3, SQL-EXTENSIONS.md),
     /// self-delimited by colons so it lexes in one scan with no maximal-munch
-    /// interaction with anything (`:` begins nothing else in this grammar —
-    /// mpedb's parameters are `$n`/`?`, never `:name`). Carries the symbol
-    /// between the colons; the PARSER decides what it means from the operator
-    /// catalog, and an undefined one refuses by name there.
+    /// interaction with anything else that uses `:`. mpedb's parameters are
+    /// `$n`/`?`. A bare `:NEW` / `:OLD` (no closing colon) and PL/SQL `:=`
+    /// are trigger-body spellings that used to be lex errors; the trigger
+    /// parser reads the original bytes. Carries the symbol between the
+    /// colons; the PARSER decides what it means from the operator catalog,
+    /// and an undefined one refuses by name there.
     CustomOp(String),
     Star,
     Slash,
@@ -248,6 +250,25 @@ fn pg_json_operator(rest: &str) -> Option<&'static str> {
         .find(|op| rest.starts_with(op))
 }
 
+/// Byte offset just past a bare `:NEW` or `:OLD`. `:NEW:` stays a custom
+/// operator, and `:NEWEST` is not a correlation name.
+pub(crate) fn bare_correlation_end(b: &[u8], colon: usize) -> Option<usize> {
+    let start = colon.checked_add(1)?;
+    let rest = b.get(start..)?;
+    // NEW and OLD are the same length. A longer tail (`:NEWEST`, `:NEW:`)
+    // is rejected below, so this only names the two correlation words.
+    let is_side = rest.len() >= 3
+        && (rest[..3].eq_ignore_ascii_case(b"new") || rest[..3].eq_ignore_ascii_case(b"old"));
+    if !is_side {
+        return None;
+    }
+    let end = start + 3;
+    if b.get(end).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b':') {
+        return None;
+    }
+    Some(end)
+}
+
 fn perr(pos: usize, msg: impl Into<String>) -> Error {
     Error::Parse {
         pos,
@@ -338,6 +359,17 @@ pub(crate) fn tokenize_dialect(sql: &str, dialect: Dialect) -> Result<Vec<SpTok>
             // before `->`, or `a ->> '$.x'` lexes as `a -> (> '$.x')` and the
             // SQL-text form silently becomes the JSON-text one.
             b':' => {
+                // PL/SQL assignment. The trigger body is captured from the
+                // original bytes; this token only lets `CREATE TRIGGER` lex.
+                if b.get(i + 1) == Some(&b'=') {
+                    i += 2;
+                    Tok::Eq
+                } else if let Some(end) = bare_correlation_end(b, i) {
+                    // `:NEW` / `:OLD`, not `:NEW:`. Same reason as `:=`.
+                    let word = sql[i + 1..end].to_ascii_uppercase();
+                    i = end;
+                    Tok::CustomOp(word)
+                } else {
                 // `:sym:` — scan to the closing colon. Bounded and strict:
                 // an unterminated or empty or whitespace-carrying symbol is a
                 // lex error naming the doc, never a silent reinterpretation.
@@ -362,6 +394,7 @@ pub(crate) fn tokenize_dialect(sql: &str, dialect: Dialect) -> Result<Vec<SpTok>
                     .to_string();
                 i = j + 1;
                 Tok::CustomOp(sym)
+                }
             }
             b'-' => match (b.get(i + 1), b.get(i + 2)) {
                 // `-- …` is a line comment ANYWHERE in the statement, not only

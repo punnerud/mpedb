@@ -11,6 +11,8 @@ mod cursor;
 mod forall;
 mod bulk_collect;
 mod package;
+mod trigger_body;
+pub use trigger_body::{TriggerImage, TriggerImageType};
 
 use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
@@ -106,6 +108,9 @@ struct Parser<'a> {
     /// `PACKAGE.ROUTINE`; `routine_name` stays the unqualified name.
     package_name: Option<String>,
     package_var: Option<PackageVar>,
+    /// Set only while an Oracle row trigger is compiled. Slots are the
+    /// call arguments (`:NEW` columns, then `:OLD` columns), not locals.
+    trigger_images: Option<trigger_body::TriggerImages>,
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
@@ -116,6 +121,25 @@ pub fn compile(source: &str) -> Result<Skeleton> {
 /// to the procedure calling convention and must never enter a scalar catalog.
 pub fn compile_function(source: &str) -> Result<Skeleton> {
     compile_on_stack(source, true)
+}
+
+/// Compile one Oracle row-trigger body. `columns` is the target table in
+/// order. Arguments are `:NEW` then `:OLD`; a column the event does not have
+/// is passed as NULL by the caller. `:NEW.col :=` is refused.
+pub fn compile_trigger(source: &str, columns: &[trigger_body::TriggerImage]) -> Result<Skeleton> {
+    let owned = columns.to_vec();
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("mpedb-plsql-compile".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn_scoped(scope, || trigger_body::compile_trigger_inner(source, &owned))
+            .map_err(|_| mpedb_types::Error::OutOfMemory {
+                what: "PL/SQL compiler worker",
+            })?;
+        worker.join().map_err(|_| {
+            mpedb_types::Error::Unsupported("PL/SQL compiler worker panicked".into())
+        })?
+    })
 }
 
 fn compile_on_stack(source: &str, scalar_only: bool) -> Result<Skeleton> {
@@ -164,6 +188,7 @@ fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
         forall_subscripts: 0,
         package_name: None,
         package_var: None,
+        trigger_images: None,
     };
     if p.is_word("DECLARE") || p.is_word("BEGIN") {
         if scalar_only {
@@ -885,6 +910,7 @@ impl Parser<'_> {
         if self.cursor_statement()? {
             return Ok(());
         }
+        self.refuse_correlation_statement()?;
         let name = self.identifier()?;
         if self.cursors.contains_key(&name) {
             return Err(self.error("cannot assign to a cursor"));
@@ -1261,6 +1287,9 @@ impl Parser<'_> {
             self.constant(Value::Numeric(value))?;
             self.builder.emit(Op::OracleNumber)?;
             return Ok(Some(Type::Number));
+        }
+        if self.trigger_images.is_some() && matches!(self.peek(), Some(Token::Bind(_))) {
+            return self.correlation_expr();
         }
         let name = self.identifier()?;
         if self.symbol("%") {

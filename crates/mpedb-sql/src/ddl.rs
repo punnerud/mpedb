@@ -216,6 +216,10 @@ pub enum TriggerBodySpec {
     /// procedure. Each argument is captured as source (an expression over
     /// `NEW.<col>` / `OLD.<col>` / constants), compiled at apply time.
     Proc { name: String, arg_srcs: Vec<String> },
+    /// A PL/SQL row-trigger body (`DECLARE … BEGIN … END` or a `BEGIN` block
+    /// that reads `:NEW` / `:OLD`). The absent image is NULL. Assignment to
+    /// either correlation name is refused.
+    Oracle(String),
 }
 
 /// `CREATE TRIGGER [IF NOT EXISTS] <name> {BEFORE|AFTER}

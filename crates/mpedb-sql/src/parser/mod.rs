@@ -19,6 +19,7 @@ use mpedb_types::{Dialect, Error, Result};
 
 mod ddl;
 mod dml;
+mod trigger_oracle;
 mod expr;
 mod select;
 pub(crate) use ddl::{parse_ddl_dialect, parse_ddl_with_enums};
