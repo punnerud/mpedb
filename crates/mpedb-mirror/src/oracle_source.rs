@@ -15,7 +15,7 @@ mod receipt;
 mod receipt_codec;
 mod write;
 use codec::{decode_row, read_expr};
-pub use receipt::{OracleLedgerIdentity, OracleWriteRequest};
+pub use receipt::{OracleLedgerIdentity, OracleWriteImages, OracleWriteRequest};
 
 use crate::oracle::{quote, OracleColumn, OracleRoutine, OracleTable};
 use crate::sourcecfg::SourceSpec;

@@ -19,6 +19,8 @@ pub struct OracleLedgerIdentity {
 /// values: A -> B -> A are different requests. Reusing a committed token with
 /// another payload is refused. Keep the ledger until local durable recovery no
 /// longer needs that token; this API never deletes receipts.
+pub type OracleWriteImages = Vec<Option<Vec<Value>>>;
+
 pub struct OracleWriteRequest<'a> {
     pub mirror_id: &'a str,
     pub token: [u8; 32],
@@ -146,7 +148,7 @@ impl OracleSource {
             .map_err(|e| err("receipt ledger prepare release", e))?;
         result
     }
-    fn lock_write_authority(&self, request: &OracleWriteRequest<'_>) -> Result<()> {
+    fn lock_write_incarnation(&self, request: &OracleWriteRequest<'_>) -> Result<()> {
         if request.mirror_id.is_empty()
             || request.mirror_id.len() > 128
             || request.token == [0; 32]
@@ -169,6 +171,20 @@ impl OracleSource {
                 &[&key],
             )
             .map_err(|e| err("receipted write authority lock", e))?;
+        if self.source_state_identity(request.mirror_id)? != *request.state_identity {
+            return Err(Error::Unsupported(
+                "Oracle receipted write was fenced by authority incarnation".into(),
+            ));
+        }
+        if self.state_row(request.mirror_id, None)?.is_none() {
+            return Err(Error::Corrupt(
+                "Oracle write authority row is missing".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn lock_write_authority(&self, request: &OracleWriteRequest<'_>) -> Result<()> {
+        self.lock_write_incarnation(request)?;
         self.verify_write_authority(request)
     }
     fn verify_write_authority(&self, request: &OracleWriteRequest<'_>) -> Result<()> {
@@ -221,6 +237,60 @@ impl OracleSource {
         }
         Ok(Some(bytes))
     }
+    fn receipt_payload(
+        &self,
+        tables: &[OracleTable],
+        ops: &[NetOp],
+        request: &OracleWriteRequest<'_>,
+    ) -> Result<[u8; 32]> {
+        let realm =
+            crate::oracle_cursor::OraclePosition::new(&self.identity()?, tables, 1)?.encode();
+        let mut domain = realm;
+        domain.extend_from_slice(&(request.mirror_id.len() as u64).to_be_bytes());
+        domain.extend_from_slice(request.mirror_id.as_bytes());
+        domain.extend_from_slice(&request.epoch.to_be_bytes());
+        domain.push(u8::from(request.authority == "mpedb"));
+        domain.extend_from_slice(&request.state_identity.object_id.to_be_bytes());
+        domain.extend_from_slice(&request.state_identity.data_object_id.to_be_bytes());
+        domain.extend_from_slice(&request.ledger_identity.object_id.to_be_bytes());
+        domain.extend_from_slice(&request.ledger_identity.data_object_id.to_be_bytes());
+        domain.extend_from_slice(&request.state_identity.incarnation);
+        super::receipt_codec::payload(tables, ops, &domain)
+    }
+    /// Recover an uncertain commit WITHOUT executing application DML. The
+    /// original request's epoch/role may have advanced, but its database,
+    /// control-row incarnation, ledger and application schema must still match.
+    /// The authority row lock serializes this lookup with writes and cutover.
+    /// `None` means no matching receipt now; it NEVER authorizes resending an
+    /// old request or acknowledging local data. Recheck current authority before
+    /// creating any new request. A positive result contains ORIGINAL postimages.
+    pub fn recover_write_receipt(
+        &mut self,
+        tables: &[OracleTable],
+        ops: &[NetOp],
+        request: &OracleWriteRequest<'_>,
+    ) -> Result<Option<OracleWriteImages>> {
+        let result = (|| {
+            self.lock_write_incarnation(request)?;
+            self.lock_write_ledger(request.ledger_identity)?;
+            self.lock_write_tables(tables, ops)?;
+            let payload = self.receipt_payload(tables, ops, request)?;
+            let images = self
+                .receipt_bytes(request, &payload)?
+                .map(|bytes| super::receipt_codec::decode(tables, ops, &bytes))
+                .transpose()?;
+            if self.source_state_identity(request.mirror_id)? != *request.state_identity {
+                return Err(Error::Unsupported(
+                    "Oracle receipt recovery incarnation changed".into(),
+                ));
+            }
+            Ok(images)
+        })();
+        self.connection
+            .rollback()
+            .map_err(|e| err("receipt recovery release", e))?;
+        result
+    }
     /// Commit verified source writes and their receipt together. A retry of an
     /// already committed token returns its ORIGINAL postimages without running
     /// DML again. No conflict policy, per-row rejection or echo filtering is
@@ -236,19 +306,7 @@ impl OracleSource {
             self.lock_write_ledger(request.ledger_identity)?;
             // Replays must also reject stale application schema metadata.
             let locked = self.lock_write_tables(tables, ops)?;
-            let realm =
-                crate::oracle_cursor::OraclePosition::new(&self.identity()?, tables, 1)?.encode();
-            let mut domain = realm;
-            domain.extend_from_slice(&(request.mirror_id.len() as u64).to_be_bytes());
-            domain.extend_from_slice(request.mirror_id.as_bytes());
-            domain.extend_from_slice(&request.epoch.to_be_bytes());
-            domain.push(u8::from(request.authority == "mpedb"));
-            domain.extend_from_slice(&request.state_identity.object_id.to_be_bytes());
-            domain.extend_from_slice(&request.state_identity.data_object_id.to_be_bytes());
-            domain.extend_from_slice(&request.ledger_identity.object_id.to_be_bytes());
-            domain.extend_from_slice(&request.ledger_identity.data_object_id.to_be_bytes());
-            domain.extend_from_slice(&request.state_identity.incarnation);
-            let payload = super::receipt_codec::payload(tables, ops, &domain)?;
+            let payload = self.receipt_payload(tables, ops, request)?;
             if let Some(bytes) = self.receipt_bytes(request, &payload)? {
                 return super::receipt_codec::decode(tables, ops, &bytes);
             }

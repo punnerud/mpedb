@@ -234,16 +234,58 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
     );
     second[1] = Value::Numeric("4.4".into());
     let result = source
-        .write_batch_receipted(&tables, &[op(changed.clone()), op(second)], &request2)
+        .write_batch_receipted(
+            &tables,
+            &[op(changed.clone()), op(second.clone())],
+            &request2,
+        )
         .unwrap();
     assert_eq!(result[1].as_ref().unwrap()[4], Value::Numeric("3".into()));
     assert!(source
         .cas_source_state_fenced(mirror_id, 1, 2, "source", &state)
         .unwrap());
+    // A lost commit response remains recoverable after the epoch changes.
+    // Recovery never rewrites data or weakens the normal stale-write guard.
+    assert_eq!(
+        source
+            .recover_write_receipt(
+                &tables,
+                &[op(changed.clone()), op(second.clone())],
+                &request2
+            )
+            .unwrap(),
+        Some(result.clone())
+    );
+    assert!(source
+        .write_batch_receipted(
+            &tables,
+            &[op(changed.clone()), op(second.clone())],
+            &request2
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("fenced by authority"));
+    assert!(
+        source
+            .recover_write_receipt(&tables, &[op(image.clone())], &request)
+            .is_err(),
+        "corrupt historical receipts remain errors during recovery"
+    );
     let request3 = OracleWriteRequest {
         token: [9; 32],
         ..request2
     };
+    assert!(source
+        .recover_write_receipt(&tables, &[op(changed.clone())], &request3)
+        .unwrap()
+        .is_none());
+    let mut wrong_payload = changed.clone();
+    wrong_payload[1] = Value::Numeric("6.6".into());
+    assert!(source
+        .recover_write_receipt(&tables, &[op(wrong_payload), op(second)], &request2)
+        .unwrap_err()
+        .to_string()
+        .contains("another payload"));
     assert!(source
         .write_batch_receipted(&tables, &[op(changed.clone())], &request3)
         .unwrap_err()
@@ -347,6 +389,23 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
         .any(|(k, _)| k.starts_with(b"d/")));
     drop(db);
     std::fs::remove_file(&dest).unwrap();
+    assert!(source
+        .cas_source_state_fenced(mirror_id, 2, 3, "mpedb", &state)
+        .unwrap());
+    assert!(source
+        .recover_write_receipt(&tables, &[op(changed.clone())], &request3)
+        .unwrap()
+        .is_some());
+    assert!(source
+        .write_batch_receipted(&tables, &[op(changed.clone())], &request3)
+        .is_err());
+    assert!(source
+        .cas_source_state_fenced(mirror_id, 3, 4, "source", &state)
+        .unwrap());
+    let request3 = OracleWriteRequest {
+        epoch: 4,
+        ..request3
+    };
     c.execute(
         "ALTER TABLE MPEDB_RECEIPT_CASE MODIFY amount NUMBER(5,1)",
         &[],
@@ -354,6 +413,11 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
     .unwrap();
     assert!(source
         .write_batch_receipted(&tables, &[op(changed.clone())], &request3)
+        .unwrap_err()
+        .to_string()
+        .contains("source schema changed"));
+    assert!(source
+        .recover_write_receipt(&tables, &[op(changed.clone())], &request3)
         .unwrap_err()
         .to_string()
         .contains("source schema changed"));
@@ -366,6 +430,23 @@ fn native_oracle_receipts_retry_without_reapplying_and_rollback_failed_batches()
         .unwrap_err()
         .to_string()
         .contains("ledger changed"));
+    assert!(source
+        .recover_write_receipt(&tables, &[], &request3)
+        .unwrap_err()
+        .to_string()
+        .contains("ledger changed"));
+    c.execute(
+        "DELETE FROM MPEDB_MIRROR_STATE WHERE mirror_id=:1",
+        &[&mirror_id.as_bytes()],
+    )
+    .unwrap();
+    c.commit().unwrap();
+    source.ensure_source_state(mirror_id, 4, "source").unwrap();
+    assert!(source
+        .recover_write_receipt(&tables, &[], &request3)
+        .unwrap_err()
+        .to_string()
+        .contains("fenced by authority incarnation"));
     for table in [
         "MPEDB_RECEIPT_CASE",
         "MPEDB_WRITE_RECEIPTS",

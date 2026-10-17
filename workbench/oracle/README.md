@@ -178,6 +178,14 @@ generated postimages, large Unicode/BLOB images, forged frame lengths, business
 name collisions, tracking-table exclusion during default import and ledger
 recreation. The import verifies tracking ownership before excluding receipts,
 and holds its DDL fence while taking the application snapshot.
+`recover_write_receipt` separately resolves an uncertain earlier commit without
+executing DML, even when the original epoch/authority has changed. It serializes
+with writes/cutover on the authority row and still validates the database realm,
+control-row incarnation, ledger, application schema, payload and image hashes.
+A missing receipt does not authorize retry or local acknowledgement. Native
+tests cover old-epoch recovery, role changes, absent/corrupt/mismatched receipts,
+and recreation/DDL fences. Durable local outbox/controller recovery remains to
+be connected to this primitive.
 The shared push protocol now supplies `PushContext` from the SAME local
 snapshot as rows, dirty generations, cursor and authority. `PushReply` can return
 actual postimages. Matching generations update those rows and clear dirty/park
