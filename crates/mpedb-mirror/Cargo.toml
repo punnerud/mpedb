@@ -26,3 +26,4 @@ libc = { workspace = true }
 
 [dev-dependencies]
 mpedb-testkit = { path = "../mpedb-testkit" }
+mpedb-proc = { path = "../mpedb-proc" }

@@ -266,9 +266,23 @@ See `reference/plsql-number-gaps.json`, `reference/plsql-number-specials.json`,
 and [Oracle NUMBER precision](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Data-Types.html).
 
 Floating-point/text-to-NUMBER conversions and NLS settings remain unimplemented.
-**Parameter defaults, NUMBER precision/scale constraints, SQL statements, calls to other routines, packages,
-exceptions, cursors, and dynamic SQL remain unimplemented**; measured arithmetic
-agreement is not full PL/SQL compatibility.
+Literal `EXECUTE IMMEDIATE` DML now compiles to MPEdb's shared SQL plans:
+INSERT, UPDATE and DELETE with input `USING` expressions. Repeated placeholder
+names bind by occurrence, q-quoted literals retain their values, and empty SQL
+strings become NULL. A real Oracle application procedure is extracted from
+`ALL_SOURCE` and executes unchanged inside MPEdb with exact NUMBER binds.
+Procedure errors roll back already-executed DML; stored procedures and their
+plans survive reopen. Scalar SQL functions continue to reject database work.
+
+This is a limited native dynamic-DML frontend, not complete dynamic SQL.
+Runtime-generated SQL strings, SELECT INTO, RETURNING/OUT binds, implicit SQL
+cursor attributes, DDL and anonymous dynamic blocks remain unsupported. The
+embedded statement also must be supported by MPEdb's SQL engine. See
+[Oracle's binding rules](https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/native-dynamic-sql.html).
+
+**Parameter defaults, NUMBER precision/scale constraints, static SQL statements,
+calls to other routines, packages, exceptions and cursors remain unimplemented**;
+measured arithmetic agreement is not full PL/SQL compatibility.
 
 The native `ProcEngine` calling convention supplies one argument slot for every
 formal parameter, including OUT placeholders. OUT values start NULL; IN OUT

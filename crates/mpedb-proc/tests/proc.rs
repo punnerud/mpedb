@@ -711,3 +711,47 @@ fn plsql_arithmetic_updates_in_out_values_without_binary_float_rounding() {
         ProcValue::Scalar(Value::Numeric("4503599627370496.2".into())),
     ]));
 }
+
+#[test]
+fn plsql_literal_dynamic_dml_is_positional_persistent_and_atomic() {
+    let (cfg, _guard) = test_config("plsql-dynamic-dml");
+    let db=Database::open_with_config(cfg.clone()).unwrap();
+    db.query("CREATE TABLE native_ledger (id NUMERIC PRIMARY KEY, amount NUMERIC, note TEXT)",&[]).unwrap();
+    let source="CREATE PROCEDURE store_row(p_id NUMBER, p_amount NUMBER, p_note VARCHAR2) IS BEGIN EXECUTE IMMEDIATE q'[INSERT INTO native_ledger VALUES(:x,:x,:x)]' USING IN p_id,p_amount,p_note; END;";
+    let engine=ProcEngine::new(&db);
+    let hash=engine.define(source,Lang::PlSql).unwrap();
+    assert!(engine.info(&hash.to_string()).unwrap().writes);
+    engine.call("STORE_ROW",&[Value::Int(1),Value::Numeric("9007199254740992.125".into()),Value::Text("ø".into())]).unwrap();
+    let expected=vec![vec![Value::Numeric("1".into()),Value::Numeric("9007199254740992.125".into()),Value::Text("ø".into())]];
+    assert!(matches!(db.query("SELECT * FROM native_ledger",&[]).unwrap(),ExecResult::Rows{rows,..} if rows==expected));
+    engine.define("CREATE PROCEDURE break_after_write IS n NUMBER; BEGIN EXECUTE IMMEDIATE 'UPDATE native_ledger SET amount=0'; n:=1/0; END;",Lang::PlSql).unwrap();
+    assert!(engine.call("BREAK_AFTER_WRITE",&[]).is_err());
+    assert!(matches!(db.query("SELECT * FROM native_ledger",&[]).unwrap(),ExecResult::Rows{rows,..} if rows==expected),"failure must roll back the already executed DML");
+    assert!(db.create_function(mpedb::spellfn::SpellLang::PlSql,"CREATE FUNCTION bad_scalar RETURN NUMBER IS BEGIN EXECUTE IMMEDIATE 'DELETE FROM native_ledger'; RETURN 1; END;").unwrap_err().to_string().contains("cannot run SQL"));
+    drop(engine);drop(db);
+    let db=Database::open_with_config(cfg).unwrap();
+    ProcEngine::new(&db).call(&hash.to_string(),&[Value::Int(2),Value::Null,Value::Null]).unwrap();
+    assert!(matches!(db.query("SELECT amount,note FROM native_ledger WHERE id=$1",&[Value::Numeric("2".into())]).unwrap(),ExecResult::Rows{rows,..} if rows==vec![vec![Value::Null,Value::Null]]));
+}
+
+#[test]
+fn plsql_dynamic_dml_rejects_unimplemented_forms_before_publication() {
+    let (cfg, _guard)=test_config("plsql-dynamic-refusals");
+    let db=Database::open_with_config(cfg).unwrap();
+    let engine=ProcEngine::new(&db);
+    for body in [
+        "EXECUTE IMMEDIATE 'UPDATE accounts SET balance=:x' USING NULL;",
+        "EXECUTE IMMEDIATE 'UPDATE accounts SET balance=:x' USING OUT n;",
+        "EXECUTE IMMEDIATE 'UPDATE accounts SET balance=:x' USING IN OUT n;",
+        "EXECUTE IMMEDIATE 'UPDATE accounts SET balance=:x';",
+        "EXECUTE IMMEDIATE 'UPDATE accounts SET balance=1' USING n;",
+        "EXECUTE IMMEDIATE sql_text;",
+        "EXECUTE IMMEDIATE 'SELECT balance FROM accounts' INTO n;",
+        "EXECUTE IMMEDIATE 'CREATE TABLE x(id NUMBER)';",
+        "EXECUTE IMMEDIATE 'UPDATE accounts SET balance=1; DELETE FROM accounts';",
+    ] {
+        let source=format!("CREATE PROCEDURE refused IS n NUMBER; sql_text VARCHAR2(100); BEGIN {body} END;");
+        assert!(engine.define(&source,Lang::PlSql).is_err(),"{body}");
+        assert!(engine.info("REFUSED").is_err(),"a rejected routine must not publish");
+    }
+}

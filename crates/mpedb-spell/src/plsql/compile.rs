@@ -1,5 +1,7 @@
 //! Native Oracle routine compilation; no translation into Python or PL/pgSQL.
 
+mod sql;
+
 use super::lex::{self, Lexed, Token};
 use crate::emit::{FuncBuilder, Skeleton};
 use crate::ir::Op;
@@ -434,6 +436,7 @@ impl Parser<'_> {
         Ok(())
     }
     fn statement(&mut self) -> Result<()> {
+        if self.word("EXECUTE") { return self.execute_immediate(); }
         let declarations = self.word("DECLARE");
         if declarations || self.is_word("BEGIN") {
             let outer_locals = self.locals.clone();
