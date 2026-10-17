@@ -192,7 +192,11 @@ fn native_oracle_cli_push_requires_pinned_ledgers_and_refuses_cutover() {
     };
     assert_eq!(username, "MPEDB_ORACLE_FENCE");
     let c = oracle_client::Connection::connect(username, password, connect_string).unwrap();
-    c.execute("BEGIN EXECUTE IMMEDIATE 'DROP TABLE MPEDB_CLI_PUSH PURGE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;",&[]).unwrap();
+    // A previous pinned import leaves the shared ledgers behind. This case
+    // needs them absent, or an import without --pin-ledgers adopts them.
+    for table in ["MPEDB_CLI_PUSH", "MPEDB_WRITE_ORIGINS", "MPEDB_WRITE_RECEIPTS"] {
+        c.execute(&format!("BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table} PURGE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"), &[]).unwrap();
+    }
     c.execute(
         "CREATE TABLE MPEDB_CLI_PUSH(id NUMBER PRIMARY KEY, amount NUMBER(4,1))",
         &[],
@@ -238,6 +242,13 @@ fn native_oracle_cli_push_requires_pinned_ledgers_and_refuses_cutover() {
     drop(db);
     let (out, safe) = invoke(
         &["mirror", "push", "--db", plain_s],
+        password,
+        connect_string,
+    );
+    assert!(!out.status.success(), "{safe}");
+    assert!(safe.contains("--pin-ledgers"), "{safe}");
+    let (out, safe) = invoke(
+        &["mirror", "sync", "--db", plain_s],
         password,
         connect_string,
     );
@@ -314,17 +325,22 @@ fn native_oracle_cli_push_requires_pinned_ledgers_and_refuses_cutover() {
     );
     assert!(out.status.success(), "{safe}");
     assert!(safe.contains("pushed 0 row change"), "{safe}");
-    for cmd in [
-        &["mirror", "sync", "--db", pinned_s][..],
-        &["mirror", "switch", "--db", pinned_s, "--to", "mpedb"][..],
-    ] {
-        let (out, safe) = invoke(cmd, password, connect_string);
-        assert!(!out.status.success(), "{cmd:?}: {safe}");
-        assert!(
-            safe.contains("cutover remain unavailable"),
-            "{cmd:?}: {safe}"
-        );
-    }
+    let (out, safe) = invoke(
+        &["mirror", "sync", "--db", pinned_s],
+        password,
+        connect_string,
+    );
+    assert!(out.status.success(), "{safe}");
+    assert!(safe.contains("pushed 0,"), "{safe}");
+    let (out, safe) = invoke(
+        &[
+            "mirror", "switch", "--db", pinned_s, "--to", "mpedb",
+        ],
+        password,
+        connect_string,
+    );
+    assert!(!out.status.success(), "{safe}");
+    assert!(safe.contains("cutover remain unavailable"), "{safe}");
     let db = mpedb::Database::open_from_file(&pinned).unwrap();
     db.query(
         "UPDATE MPEDB_CLI_PUSH SET AMOUNT=$1 WHERE ID=$2",
@@ -377,4 +393,161 @@ fn native_oracle_cli_push_requires_pinned_ledgers_and_refuses_cutover() {
     }
     c.commit().unwrap();
     c.execute("DROP TABLE MPEDB_CLI_PUSH PURGE", &[]).unwrap();
+}
+fn row_amount(path: &Path) -> Value {
+    let db = mpedb::Database::open_from_file(path).unwrap();
+    match db
+        .query(
+            "SELECT AMOUNT FROM MPEDB_CLI_SYNC WHERE ID=$1",
+            &[number(1)],
+        )
+        .unwrap()
+    {
+        mpedb::ExecResult::Rows { rows, .. } => rows.into_iter().next().unwrap().into_iter().next().unwrap(),
+        other => panic!("amount query returned {other:?}"),
+    }
+}
+#[test]
+#[ignore = "requires isolated native MPEDB_ORACLE_FENCE_SOURCE_CONFIG"]
+fn native_oracle_cli_sync_pulls_then_pushes_and_refuses_cutover() {
+    let config = std::env::var("MPEDB_ORACLE_FENCE_SOURCE_CONFIG").unwrap();
+    let spec = sourcecfg::load(Path::new(&config)).unwrap();
+    let SourceSpec::Oracle {
+        connect_string,
+        username,
+        password,
+    } = &spec
+    else {
+        panic!("Oracle required")
+    };
+    assert_eq!(username, "MPEDB_ORACLE_FENCE");
+    let c = oracle_client::Connection::connect(username, password, connect_string).unwrap();
+    c.execute("BEGIN EXECUTE IMMEDIATE 'DROP TABLE MPEDB_CLI_SYNC PURGE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;",&[]).unwrap();
+    c.execute(
+        "CREATE TABLE MPEDB_CLI_SYNC(id NUMBER PRIMARY KEY, amount NUMBER(4,1))",
+        &[],
+    )
+    .unwrap();
+    c.execute("INSERT INTO MPEDB_CLI_SYNC(id,amount) VALUES(1,1)", &[])
+        .unwrap();
+    c.commit().unwrap();
+    let dir = mpedb_testkit::scratch_base().join(format!("oracle-cli-sync-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sync.mpedb");
+    let path_s = path.to_str().unwrap();
+    import_retry(
+        &[
+            "mirror",
+            "import",
+            "--source-config",
+            &config,
+            "--dest",
+            path_s,
+            "--include",
+            "MPEDB_CLI_SYNC",
+            "--size_mb",
+            "64",
+            "--durability",
+            "commit",
+            "--pin-ledgers",
+        ],
+        password,
+        connect_string,
+        &path,
+    );
+    let db = mpedb::Database::open_from_file(&path).unwrap();
+    let meta = mpedb_mirror::load_oracle_bootstrap(&db).unwrap();
+    assert!(meta.receipt_ledger.is_some());
+    assert!(meta.origin_ledger.is_some());
+    let epoch = mpedb_mirror::switch::read_epoch(&db).unwrap();
+    assert_eq!(epoch.authority, state::Authority::Source);
+    assert_eq!(epoch.epoch, 1);
+    db.query(
+        "UPDATE MPEDB_CLI_SYNC SET AMOUNT=$1 WHERE ID=$2",
+        &[number(2), number(1)],
+    )
+    .unwrap();
+    drop(db);
+    let (out, safe) = invoke(&["mirror", "sync", "--db", path_s], password, connect_string);
+    assert!(out.status.success(), "{safe}");
+    assert!(safe.contains("pulled 0,"), "{safe}");
+    assert!(safe.contains("pushed 1,"), "{safe}");
+    assert!(safe.contains("authority: Source"), "{safe}");
+    assert_eq!(
+        c.query_row_as::<i64>("SELECT amount FROM MPEDB_CLI_SYNC WHERE id=1", &[])
+            .unwrap(),
+        2
+    );
+    c.execute("UPDATE MPEDB_CLI_SYNC SET amount=4 WHERE id=1", &[])
+        .unwrap();
+    c.commit().unwrap();
+    let (out, safe) = invoke(&["mirror", "sync", "--db", path_s], password, connect_string);
+    assert!(out.status.success(), "{safe}");
+    assert!(safe.contains("pulled 1,"), "{safe}");
+    assert_eq!(row_amount(&path), number(4), "{safe}");
+    assert_eq!(
+        c.query_row_as::<i64>("SELECT amount FROM MPEDB_CLI_SYNC WHERE id=1", &[])
+            .unwrap(),
+        4
+    );
+    let (out, safe) = invoke(&["mirror", "sync", "--db", path_s], password, connect_string);
+    assert!(out.status.success(), "{safe}");
+    assert!(safe.contains("pulled 0,"), "{safe}");
+    assert!(safe.contains("pushed 0,"), "{safe}");
+    let db = mpedb::Database::open_from_file(&path).unwrap();
+    db.query(
+        "UPDATE MPEDB_CLI_SYNC SET AMOUNT=$1 WHERE ID=$2",
+        &[number(9), number(1)],
+    )
+    .unwrap();
+    let before = db.sys_record_get(state::MIR_NS, state::KEY_CUR).unwrap();
+    drop(db);
+    let mut source = OracleSource::connect(&spec).unwrap();
+    assert!(source
+        .cas_source_state_fenced(&meta.mirror_id, 1, 2, "source", &meta.state_identity)
+        .unwrap());
+    let (out, safe) = invoke(&["mirror", "sync", "--db", path_s], password, connect_string);
+    assert!(!out.status.success(), "{safe}");
+    assert!(safe.contains("matching source authority"), "{safe}");
+    assert_eq!(
+        c.query_row_as::<i64>("SELECT amount FROM MPEDB_CLI_SYNC WHERE id=1", &[])
+            .unwrap(),
+        4,
+        "a refused sync must not write the newer local value"
+    );
+    let db = mpedb::Database::open_from_file(&path).unwrap();
+    assert_eq!(
+        db.sys_record_get(state::MIR_NS, state::KEY_CUR).unwrap(),
+        before
+    );
+    assert!(matches!(
+        db.query("SELECT AMOUNT FROM MPEDB_CLI_SYNC WHERE ID=$1", &[number(1)])
+            .unwrap(),
+        mpedb::ExecResult::Rows { rows, .. } if rows == vec![vec![number(9)]]
+    ));
+    let epoch = mpedb_mirror::switch::read_epoch(&db).unwrap();
+    assert_eq!(epoch.authority, state::Authority::Source);
+    assert_eq!(epoch.epoch, 1);
+    drop(db);
+    let (out, safe) = invoke(
+        &["mirror", "switch", "--db", path_s, "--to", "mpedb"],
+        password,
+        connect_string,
+    );
+    assert!(!out.status.success(), "{safe}");
+    assert!(safe.contains("cutover remain unavailable"), "{safe}");
+    let db = mpedb::Database::open_from_file(&path).unwrap();
+    let epoch = mpedb_mirror::switch::read_epoch(&db).unwrap();
+    assert_eq!(epoch.authority, state::Authority::Source);
+    assert_eq!(epoch.epoch, 1);
+    db.verify().unwrap();
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    c.execute(
+        "DELETE FROM MPEDB_MIRROR_STATE WHERE mirror_id=:1",
+        &[&meta.mirror_id.as_bytes()],
+    )
+    .unwrap();
+    c.commit().unwrap();
+    c.execute("DROP TABLE MPEDB_CLI_SYNC PURGE", &[]).unwrap();
 }

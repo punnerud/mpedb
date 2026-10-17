@@ -139,6 +139,7 @@ target/debug/mpedb mirror import --source-config oracle.toml --dest app.mpedb
 target/debug/mpedb mirror import --source-config oracle.toml --dest app.mpedb --pin-ledgers
 target/debug/mpedb mirror pull --db app.mpedb
 target/debug/mpedb mirror push --db app.mpedb
+target/debug/mpedb mirror sync --db app.mpedb
 target/debug/mpedb mirror status --db app.mpedb
 ```
 
@@ -149,11 +150,14 @@ matching source authority, and refuses epoch mismatches instead of attempting
 an unsupported automatic Oracle cutover recovery. `--pin-ledgers` prepares the
 receipt and origin ledgers before that snapshot. `mirror push` then sends one
 durable request per round and refuses a file that did not pin them. It uses
-the same authority check as pull and does not run cutover recovery. Native
-subprocess tests cover import, key moves, empty drains, status, secret
-redaction, epoch rejection, unpinned-push refusal, a pinned push, and sync
-or switch refusal. The default CLI still builds without Oracle/OCI. Sync,
-switch, verify, reconcile and conflict resolution stay explicitly unavailable.
+the same authority check as pull and does not run cutover recovery. `mirror sync`
+is that pull followed by that push: one captured head, then durable whole-request
+receipts. It refuses a frozen file, an authority or epoch mismatch, and a file
+whose ledgers were not pinned, and it does so before either side is written.
+Native subprocess tests cover import, key moves, empty drains, status, secret
+redaction, epoch rejection, unpinned-push refusal, a pinned push, source-authoritative
+sync, and switch refusal. The default CLI still builds without Oracle/OCI.
+Switch, verify, reconcile and conflict resolution stay explicitly unavailable.
 
 A native component test now runs both real engines: Oracle import → MPEdb
 PL/SQL Boolean lens/rRETL → PostgreSQL, then PostgreSQL changes → a second
@@ -204,8 +208,10 @@ first inserts into empty tables, stale cursors, epoch mismatches, cold resume an
 DDL fences. The shared apply path now enforces source epochs when provided;
 legacy adapters that supply None retain their existing behavior.
 Oracle mirror push is available through `push_batch` and `mpedb mirror push`
-when both tracking ledgers were pinned at import (`--pin-ledgers`). MPEdb
-authority cutover remains gated; `mirror sync` and `mirror switch` stay refused.
+when both tracking ledgers were pinned at import (`--pin-ledgers`). `mirror sync`
+uses that same fence: matching source authority, both ledgers, a bounded pull,
+then the durable push. MPEdb authority cutover remains gated; `mirror switch`
+stays refused.
 
 `OracleSource::prepare_write_ledger` and `write_batch_receipted` now provide the
 low-level durable write primitive. Application writes and a BLAKE3-checked BLOB

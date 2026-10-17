@@ -117,7 +117,7 @@ fn open_source(
         SourceSpec::Oracle { .. } => {
             return Err(Failure::Runtime(
                 "This Oracle command is not enabled. oracle-source builds support import, \
-                 bounded pull, and push after --pin-ledgers. Sync and cutover remain unavailable"
+                 bounded pull, push, and sync after --pin-ledgers. Authority cutover remain unavailable"
                     .into(),
             ));
         }
@@ -137,9 +137,9 @@ mpedb mirror <subcommand>
           [--adapt exact|lossy] [--pin-ledgers]
       Import sqlite, PostgreSQL, or Oracle (feature oracle-source) into a NEW mirror.
       --pin-ledgers is Oracle-only. It creates the receipt and origin ledgers
-      before the snapshot so later `mirror push` can write those tables back.
-      Without it an Oracle import stays read-only. Sync and authority switch
-      stay unavailable either way.
+      before the snapshot so later `mirror push` and `mirror sync` can write
+      those tables back. Without it an Oracle import stays read-only.
+      Authority switch stays unavailable either way.
       sqlite's declared types are affinities, not constraints, so a column may
       hold off-type values. By DEFAULT one of those fails the import (loudly,
       while you are watching). --adapt exact coerces only what parses WHOLLY and
@@ -203,6 +203,9 @@ SOURCE SELECTION
 
   sync    --db <mpedb-file> [--source <sqlite-file> | --source-config <file>]
       Pull then push (respecting which side is authoritative).
+      Oracle sync stays source-authoritative. It checks the epoch and the
+      pinned ledgers before it pulls through one captured head and pushes.
+      It does not switch authority or finish a half-done cutover.
 
   verify  --source <sqlite-file> --db <mpedb-file>
       Report whether mpedb and the source are byte-identical.
@@ -366,6 +369,17 @@ fn cmd_push(argv: &[String]) -> CliResult {
 
 fn cmd_sync(argv: &[String]) -> CliResult {
     let p = args::parse(argv, &["source", "db", "source-config"], &[])?;
+    #[cfg(feature = "oracle-source")]
+    if let Some(done) = oracle_cli::sync(p.require("db")?, &p)? {
+        println!(
+            "sync: pulled {}, pushed {}, parked {} (authority: {:?})",
+            done.pulled,
+            done.push.upserts + done.push.deletes,
+            done.push.conflicts,
+            done.authority
+        );
+        return Ok(());
+    }
     let (db, mut a) = open_source(p.require("db")?, &p)?;
     let auth = read_epoch(&db)?.authority;
     let pulled = if auth == Authority::Source {
