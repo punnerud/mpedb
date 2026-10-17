@@ -907,3 +907,23 @@ fn constrained_number_declarations_reject_invalid_or_formal_constraints() {
     assert!(compile(&function("p NUMBER(4,2)", "NUMBER", "BEGIN RETURN p; END;")).is_err());
     assert!(compile(&function("", "NUMBER(4,2)", "BEGIN RETURN 1; END;")).is_err());
 }
+
+#[test]
+fn oracle_integer_and_decimal_aliases_apply_local_constraints_only() {
+    for ty in ["INTEGER", "INT", "SMALLINT", "DEC", "DECIMAL", "NUMERIC"] {
+        let local = function("p NUMBER", "NUMBER", &format!("n {ty}; BEGIN n:=p; RETURN n; EXCEPTION WHEN VALUE_ERROR THEN RETURN -6502; END;"));
+        for (input, expected) in [("1.5","2"),("-1.5","-2"),("100000000000000000000","100000000000000000000"),("1e39","-6502")] {
+            assert_eq!(call(&local,&[Value::Numeric(mpedb_types::value::parse_numeric(input).unwrap())]).unwrap(),Value::Numeric(expected.into()),"{ty}: {input}");
+        }
+        let formal = function(&format!("p {ty}"),ty,"BEGIN RETURN p; END;");
+        for input in ["1.5","-1.5","1e39"] {
+            let value = Value::Numeric(mpedb_types::value::parse_numeric(input).unwrap());
+            assert_eq!(call(&formal,std::slice::from_ref(&value)).unwrap(),value,"formal {ty}");
+        }
+    }
+    let source = function("", "NUMBER", "n DECIMAL(4,2):=1.235; BEGIN RETURN n; END;");
+    assert_eq!(call(&source,&[]).unwrap(),Value::Numeric("1.24".into()));
+    for ty in ["INTEGER(3)","SMALLINT(2)","DECIMAL(39)","NUMERIC(4,-85)"] {
+        assert!(compile(&function("","NUMBER",&format!("n {ty}; BEGIN RETURN n; END;"))).is_err());
+    }
+}

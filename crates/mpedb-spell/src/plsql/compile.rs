@@ -367,6 +367,15 @@ impl Parser<'_> {
             Ok(Type::Boolean)
         } else if self.word("NUMBER") {
             self.number_type(local)
+        } else if self.word("INTEGER") || self.word("INT") || self.word("SMALLINT") {
+            if matches!(self.peek(), Some(Token::Symbol("("))) {
+                return Err(self.error("INTEGER/INT/SMALLINT do not take explicit precision or scale"));
+            }
+            Ok(if local { Type::ConstrainedNumber { precision: 38, scale: 0 } } else { Type::Number })
+        } else if self.word("DEC") || self.word("DECIMAL") || self.word("NUMERIC") {
+            let explicit = matches!(self.peek(), Some(Token::Symbol("(")));
+            let ty = self.number_type(local)?;
+            Ok(if local && !explicit { Type::ConstrainedNumber { precision: 38, scale: 0 } } else { ty })
         } else if self.word("PLS_INTEGER") || self.word("BINARY_INTEGER") {
             Ok(Type::PlsInteger)
         } else if self.word("VARCHAR2") {
@@ -397,7 +406,7 @@ impl Parser<'_> {
             }
             Ok(Type::Varchar(constraint))
         } else {
-            Err(self.error("this PL/SQL compiler currently supports BOOLEAN, unconstrained NUMBER, PLS_INTEGER/BINARY_INTEGER and VARCHAR2; other types require typed runtime support"))
+            Err(self.error("this PL/SQL compiler currently supports BOOLEAN, NUMBER and its integer/decimal aliases, PLS_INTEGER/BINARY_INTEGER and VARCHAR2; other types require typed runtime support"))
         }
     }
     fn add_local(&mut self, name: String, ty: Type, writable: bool) -> Result<u16> {

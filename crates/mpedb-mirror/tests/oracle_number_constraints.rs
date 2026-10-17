@@ -52,6 +52,15 @@ fn native_oracle_number_constraints_match_native_mpedb_plsql() {
         "NUMBER(38)",
         "NUMBER(38,-84)",
         "NUMBER(1,127)",
+        "INTEGER",
+        "INT",
+        "SMALLINT",
+        "DEC",
+        "DECIMAL",
+        "NUMERIC",
+        "DEC(4,2)",
+        "DECIMAL(3,-2)",
+        "NUMERIC(4,5)",
     ] {
         let source = format!("CREATE OR REPLACE FUNCTION MPEDB_NUM_CONSTRAINT(p NUMBER) RETURN NUMBER IS n {ty}; BEGIN n:=p; RETURN n; EXCEPTION WHEN VALUE_ERROR THEN RETURN -6502; END;");
         c.execute(&source, &[]).unwrap();
@@ -70,6 +79,21 @@ fn native_oracle_number_constraints_match_native_mpedb_plsql() {
                 actual,
                 mpedb_proc::ProcValue::Scalar(expected),
                 "{ty}, {input:?}"
+            );
+        }
+    }
+    for ty in ["INTEGER", "INT", "SMALLINT", "DEC", "DECIMAL", "NUMERIC"] {
+        let source = format!("CREATE OR REPLACE FUNCTION MPEDB_NUM_CONSTRAINT(p {ty}) RETURN {ty} IS BEGIN RETURN p; END;");
+        c.execute(&source, &[]).unwrap();
+        engine.define(&source, mpedb_proc::Lang::PlSql).unwrap();
+        for input in ["1.5", "-1.5", "1e39"] {
+            let native: String = c.query_row_as("SELECT TO_CHAR(MPEDB_NUM_CONSTRAINT(CAST(:1 AS NUMBER)),'TM9','NLS_NUMERIC_CHARACTERS=''.,''') FROM dual", &[&input]).unwrap();
+            let expected = Value::Numeric(mpedb_types::value::parse_numeric(&native).unwrap());
+            let input = Value::Numeric(mpedb_types::value::parse_numeric(input).unwrap());
+            assert_eq!(
+                engine.call("MPEDB_NUM_CONSTRAINT", &[input]).unwrap(),
+                mpedb_proc::ProcValue::Scalar(expected),
+                "formal/return {ty}"
             );
         }
     }

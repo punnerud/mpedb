@@ -353,7 +353,11 @@ Intermediate expressions remain unconstrained. Overflow raises VALUE_ERROR in
 handlers; formal parameter/return constraints and invalid bounds are rejected.
 A new additive IR opcode (90) validates its bounds and stack on decode. Unit
 checks cover ties, overflow after rounding, NULL, constants and arithmetic;
-128 differential calls match the same application functions on native Oracle.
+290 differential calls match the same application functions on native Oracle,
+including INTEGER/INT/SMALLINT and DEC/DECIMAL/NUMERIC aliases. Local aliases
+use NUMBER(38,0) defaults (SMALLINT is not a 16-bit PL/SQL value); decimal
+aliases accept explicit precision/scale. Formal parameters and return values
+retain Oracle's unconstrained NUMBER behavior, verified separately.
 See Oracle's [NUMBER type rules](https://docs.oracle.com/en/database/oracle/oracle-database/26/sqlrf/Data-Types.html).
 
 `VARCHAR2(n BYTE)` or `VARCHAR2(n CHAR)` with n from 1 to 32767; unconstrained
