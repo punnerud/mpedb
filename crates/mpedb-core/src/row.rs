@@ -124,7 +124,7 @@ pub fn encoded_len(values: &[Value], types: &[ColumnType]) -> usize {
     let var_total: usize = values
         .iter()
         .map(|v| match v {
-            Value::Text(s) => s.len(),
+            Value::Text(s) | Value::Numeric(s) => s.len(),
             Value::Blob(b) => b.len(),
             _ => 0,
         })
