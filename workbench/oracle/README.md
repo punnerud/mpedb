@@ -246,6 +246,15 @@ continuous mirroring. Native tests cover foreign commits, compound-key moves,
 whole-batch rejection, busy writers, budgets, cursor realms and old-epoch
 receipt recovery. Production outbox/echo/controller wiring remains unfinished.
 
+Oracle writes re-read every requested target after the entire DML batch,
+before publishing data and receipts. A later trigger that changes an earlier
+writable value or resurrects an earlier delete rejects and rolls back the whole
+transaction; generated postimages are refreshed from the final state. The native
+`oracle_final_postimages` regression demonstrates both trigger cases and retries
+the same token after removing the offending trigger. Its dedicated application
+test account requires CREATE TRIGGER. All 18 native tests in the 15 source test
+targets passed together after this fix, with no ignored tests in that run.
+
 The shared push path now has an opt-in durable local outbox for receipt-capable
 adapters (`push_outbox_identity`). It captures typed rows, dirty generations,
 source cursor, epoch/config and scoped table hashes in the SAME local writer

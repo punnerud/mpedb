@@ -249,6 +249,27 @@ impl OracleSource {
                 }
             }
         }
+        // A later operation's trigger can mutate an earlier target. Per-op
+        // checks alone would commit data that contradicts the returned receipt.
+        // Re-read EVERY final target while the transaction still owns its locks.
+        for (index, op) in ops.iter().enumerate() {
+            let table = tables
+                .get(op.table_id as usize)
+                .ok_or_else(|| Error::Corrupt("unknown Oracle final-postimage table".into()))?;
+            let final_image = self.read_key(table, &op.pk, None)?;
+            match (&op.kind, &final_image) {
+                (NetOpKind::Delete, None) => {},
+                (NetOpKind::Delete, Some(_)) => return Err(Error::Unsupported("Oracle delete did not remove the requested identity at final batch verification; transaction rolled back".into())),
+                (NetOpKind::Upsert(_), None) => return Err(Error::Unsupported("Oracle upsert disappeared at final batch verification; transaction rolled back".into())),
+                (NetOpKind::Upsert(values), Some(image)) => {
+                    if let Some((_, column)) = table.columns.iter().enumerate().find(|(i, column)|
+                        !column.generated && !crate::adapter::same_carrier_value(&image[*i], &values[*i])) {
+                        return Err(Error::Unsupported(format!("Oracle changed a submitted carrier value in {} at operation {index} during final batch verification; transaction rolled back", column.name)));
+                    }
+                }
+            }
+            images[index] = final_image;
+        }
         Ok(images)
     }
 
