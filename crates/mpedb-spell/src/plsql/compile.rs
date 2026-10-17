@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 enum Type {
     Boolean,
     Number,
+    PlsInteger,
     Varchar(u16),
     CharLiteral,
 }
@@ -19,6 +20,7 @@ impl Type {
         match self {
             Self::Boolean => Op::SqlBool,
             Self::Number => Op::OracleNumber,
+            Self::PlsInteger => Op::OracleInteger,
             Self::Varchar(limit) => Op::OracleVarchar(limit),
             Self::CharLiteral => Op::OracleVarchar(0),
         }
@@ -47,13 +49,31 @@ struct Parser<'a> {
 }
 
 pub fn compile(source: &str) -> Result<Skeleton> {
-    compile_inner(source, false)
+    compile_on_stack(source, false)
 }
 
 /// Compile only a scalar SQL function; procedures and OUT signatures belong
 /// to the procedure calling convention and must never enter a scalar catalog.
 pub fn compile_function(source: &str) -> Result<Skeleton> {
-    compile_inner(source, true)
+    compile_on_stack(source, true)
+}
+
+fn compile_on_stack(source: &str, scalar_only: bool) -> Result<Skeleton> {
+    // Host-side parsing must not depend on the embedding application's worker
+    // stack size. Keep the documented nesting bound while giving the recursive
+    // parser a known stack; execution still uses the bounded, validated IR.
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("mpedb-plsql-compile".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn_scoped(scope, || compile_inner(source, scalar_only))
+            .map_err(|_| mpedb_types::Error::OutOfMemory {
+                what: "PL/SQL compiler worker",
+            })?;
+        worker.join().map_err(|_| {
+            mpedb_types::Error::Unsupported("PL/SQL compiler worker panicked".into())
+        })?
+    })
 }
 
 fn compile_inner(source: &str, scalar_only: bool) -> Result<Skeleton> {
@@ -298,6 +318,9 @@ impl Parser<'_> {
                     | "ELSIF"
                     | "LOOP"
                     | "WHILE"
+                    | "FOR"
+                    | "IN"
+                    | "REVERSE"
                     | "RETURN"
                     | "NULL"
                     | "TRUE"
@@ -325,6 +348,8 @@ impl Parser<'_> {
             Ok(Type::Boolean)
         } else if self.word("NUMBER") {
             Ok(Type::Number)
+        } else if self.word("PLS_INTEGER") || self.word("BINARY_INTEGER") {
+            Ok(Type::PlsInteger)
         } else if self.word("VARCHAR2") {
             let mut constraint = 0;
             if self.symbol("(") {
@@ -353,7 +378,7 @@ impl Parser<'_> {
             }
             Ok(Type::Varchar(constraint))
         } else {
-            Err(self.error("this PL/SQL compiler currently supports BOOLEAN, unconstrained NUMBER and VARCHAR2; other types require typed runtime support"))
+            Err(self.error("this PL/SQL compiler currently supports BOOLEAN, unconstrained NUMBER, PLS_INTEGER/BINARY_INTEGER and VARCHAR2; other types require typed runtime support"))
         }
     }
     fn add_local(&mut self, name: String, ty: Type, writable: bool) -> Result<u16> {
@@ -377,6 +402,9 @@ impl Parser<'_> {
                     (
                         Type::Varchar(_) | Type::CharLiteral,
                         Type::Varchar(_) | Type::CharLiteral
+                    ) | (
+                        Type::Number | Type::PlsInteger,
+                        Type::Number | Type::PlsInteger
                     )
                 )
         }) {
@@ -444,6 +472,9 @@ impl Parser<'_> {
         if self.word("IF") {
             return self.if_statement();
         }
+        if self.word("FOR") {
+            return self.for_statement();
+        }
         if self.word("WHILE") {
             let top = self.builder.here();
             self.condition()?;
@@ -498,7 +529,7 @@ impl Parser<'_> {
             ))
         })?;
         if !local.writable {
-            return Err(self.error("cannot assign to an IN parameter or CONSTANT"));
+            return Err(self.error("cannot assign to an IN parameter, CONSTANT or FOR index"));
         }
         self.want_symbol(":=")?;
         let actual = self.expression()?;
@@ -507,6 +538,65 @@ impl Parser<'_> {
         self.builder.emit(Op::StoreLocal(local.slot))?;
         self.want_symbol(";")
     }
+    fn for_statement(&mut self) -> Result<()> {
+        let name = self.identifier()?;
+        self.want_word("IN")?;
+        let reverse = self.word("REVERSE");
+        let outer_locals = self.locals.clone();
+        let outer_declared = std::mem::take(&mut self.declared_here);
+        let outer_pending = std::mem::take(&mut self.pending_declarations);
+        // Oracle's index hides outer names even while the bounds are being
+        // evaluated; referring to the index in a bound sees its initial NULL.
+        let index = self.add_local(name, Type::PlsInteger, false)?;
+        self.constant(Value::Null)?;
+        self.builder.emit(Op::StoreLocal(index))?;
+        let lower = self.builder.alloc_local()?;
+        let upper = self.builder.alloc_local()?;
+        let ty = self.expression()?;
+        self.compatible(Type::Number, ty)?;
+        self.builder.emit(Op::OracleLoopBound)?;
+        self.builder.emit(Op::StoreLocal(lower))?;
+        self.want_symbol("..")?;
+        let ty = self.expression()?;
+        self.compatible(Type::Number, ty)?;
+        self.builder.emit(Op::OracleLoopBound)?;
+        self.builder.emit(Op::StoreLocal(upper))?;
+        self.want_word("LOOP")?;
+        let limit = if reverse { lower } else { upper };
+        self.builder
+            .emit(Op::LoadLocal(if reverse { upper } else { lower }))?;
+        self.builder.emit(Op::StoreLocal(index))?;
+        let first = self.builder.emit_jump(Op::Jump(u32::MAX))?;
+        let advance = self.builder.here();
+        self.builder.emit(Op::LoadLocal(index))?;
+        self.builder.emit(Op::LoadLocal(limit))?;
+        self.builder.emit(Op::SqlEq)?;
+        let finished = self.builder.emit_jump(Op::JumpIfTrue(u32::MAX))?;
+        self.builder.emit(Op::LoadLocal(index))?;
+        self.constant(Value::Int(1))?;
+        self.builder.emit(if reverse { Op::Sub } else { Op::Add })?;
+        self.builder.emit(Op::StoreLocal(index))?;
+        self.builder.patch_to_here(first);
+        self.builder.emit(Op::LoadLocal(index))?;
+        self.builder.emit(Op::LoadLocal(limit))?;
+        self.builder
+            .emit(if reverse { Op::SqlGe } else { Op::SqlLe })?;
+        let out = self.builder.emit_jump(Op::JumpIfFalse(u32::MAX))?;
+        self.builder.push_loop(advance);
+        self.statements()?;
+        self.want_word("END")?;
+        self.want_word("LOOP")?;
+        self.want_symbol(";")?;
+        self.builder.emit(Op::Jump(advance))?;
+        self.builder.patch_to_here(out);
+        self.builder.patch_to_here(finished);
+        self.builder.pop_loop();
+        self.locals = outer_locals;
+        self.declared_here = outer_declared;
+        self.pending_declarations = outer_pending;
+        Ok(())
+    }
+
     fn if_statement(&mut self) -> Result<()> {
         let mut ends = Vec::new();
         loop {
@@ -598,9 +688,15 @@ impl Parser<'_> {
             };
             if let Some(op) = op {
                 self.at += 1;
+                if ty == Some(Type::PlsInteger) {
+                    self.builder.emit(Op::OracleNumber)?;
+                }
                 let right = self.additive()?;
                 if let Some(ty) = ty {
                     self.compatible(ty, right)?;
+                }
+                if right == Some(Type::PlsInteger) {
+                    self.builder.emit(Op::OracleNumber)?;
                 }
                 let op = if ty == Some(Type::CharLiteral) && right == Some(Type::CharLiteral) {
                     match op {
@@ -642,8 +738,20 @@ impl Parser<'_> {
             self.compatible(expected, ty)?;
             let right = self.multiplicative()?;
             self.compatible(expected, right)?;
+            let integer = op != Op::OracleConcat
+                && matches!(ty, None | Some(Type::PlsInteger))
+                && matches!(right, None | Some(Type::PlsInteger));
+            let op = if integer {
+                if op == Op::OracleAdd {
+                    Op::OracleIntAdd
+                } else {
+                    Op::OracleIntSub
+                }
+            } else {
+                op
+            };
             self.builder.emit(op)?;
-            ty = Some(expected);
+            ty = Some(if integer { Type::PlsInteger } else { expected });
         }
         Ok(ty)
     }
@@ -660,17 +768,25 @@ impl Parser<'_> {
             self.compatible(Type::Number, ty)?;
             let right = self.unary()?;
             self.compatible(Type::Number, right)?;
-            self.builder.emit(op)?;
-            ty = Some(Type::Number);
+            let integer = op == Op::OracleMul
+                && matches!(ty, None | Some(Type::PlsInteger))
+                && matches!(right, None | Some(Type::PlsInteger));
+            self.builder
+                .emit(if integer { Op::OracleIntMul } else { op })?;
+            ty = Some(if integer {
+                Type::PlsInteger
+            } else {
+                Type::Number
+            });
         }
         Ok(ty)
     }
     fn unary(&mut self) -> Result<Option<Type>> {
-        let mut negate = false;
+        let mut negations = 0;
         let mut signed = false;
         loop {
             if self.symbol("-") {
-                negate = !negate;
+                negations += 1;
                 signed = true;
             } else if self.symbol("+") {
                 signed = true;
@@ -682,10 +798,18 @@ impl Parser<'_> {
         if signed {
             self.compatible(Type::Number, ty)?;
         }
-        if negate {
-            self.builder.emit(Op::OracleNeg)?;
+        for _ in 0..negations {
+            self.builder.emit(if ty == Some(Type::PlsInteger) {
+                Op::OracleIntNeg
+            } else {
+                Op::OracleNeg
+            })?;
         }
-        Ok(if signed { Some(Type::Number) } else { ty })
+        Ok(if signed && ty.is_none() {
+            Some(Type::Number)
+        } else {
+            ty
+        })
     }
     fn atom(&mut self) -> Result<Option<Type>> {
         if self.word("NULL") {
@@ -720,7 +844,15 @@ impl Parser<'_> {
         if let Some(Token::Number(text)) = self.peek() {
             let value = mpedb_types::value::parse_numeric(text)
                 .ok_or_else(|| self.error("unsupported NUMBER literal"))?;
+            let integer = text
+                .parse::<i32>()
+                .ok()
+                .filter(|_| text.bytes().all(|c| c.is_ascii_digit()));
             self.at += 1;
+            if let Some(integer) = integer {
+                self.constant(Value::Int(integer as i64))?;
+                return Ok(Some(Type::PlsInteger));
+            }
             self.constant(Value::Numeric(value))?;
             self.builder.emit(Op::OracleNumber)?;
             return Ok(Some(Type::Number));

@@ -10,6 +10,111 @@ fn tuple(values: Vec<Value>) -> ProcValue {
 }
 
 #[test]
+fn numeric_for_loops_are_inclusive_reverse_and_round_bounds_once() {
+    for (bounds, expected) in [
+        ("1..3", "123"),
+        ("REVERSE 1..3", "321"),
+        ("3..1", "0"),
+        ("REVERSE 3..1", "0"),
+        ("0.5..2.5", "123"),
+    ] {
+        let source = function("", "NUMBER", &format!("n NUMBER := 0; BEGIN FOR i IN {bounds} LOOP n := n * 10 + i; END LOOP; RETURN n; END;"));
+        assert_eq!(
+            call(&source, &[]).unwrap(),
+            Value::Numeric(expected.into()),
+            "{bounds}"
+        );
+    }
+    let source = function("", "NUMBER", "lo NUMBER := 1; hi NUMBER := 3; n NUMBER := 0; BEGIN FOR i IN lo..hi LOOP lo := 10; hi := 0; n := n * 10 + i; END LOOP; RETURN n; END;");
+    assert_eq!(call(&source, &[]).unwrap(), Value::Numeric("123".into()));
+}
+
+#[test]
+fn numeric_for_continue_exit_nesting_and_endpoint_overflow_are_correct() {
+    let source = function("", "NUMBER", "n NUMBER := 0; BEGIN FOR i IN 1..5 LOOP CONTINUE WHEN i = 2; FOR j IN REVERSE 1..2 LOOP EXIT WHEN j = 1; n := n + i; END LOOP; EXIT WHEN i = 3; END LOOP; RETURN n; END;");
+    assert_eq!(call(&source, &[]).unwrap(), Value::Numeric("4".into()));
+    for (reverse, bound) in [("", "2147483647"), ("REVERSE ", "-2147483648")] {
+        let source = function("", "NUMBER", &format!("n NUMBER := 0; BEGIN FOR i IN {reverse}{bound}..{bound} LOOP n := i; CONTINUE; END LOOP; RETURN n; END;"));
+        assert_eq!(call(&source, &[]).unwrap(), Value::Numeric(bound.into()));
+    }
+}
+
+#[test]
+fn for_index_hides_outer_names_in_bounds_and_restores_outer_scope() {
+    let source = function("", "NUMBER", "i NUMBER := 7; n NUMBER := 0; BEGIN FOR i IN 1..3 LOOP n := n + i; END LOOP; RETURN n + i; END;");
+    assert_eq!(call(&source, &[]).unwrap(), Value::Numeric("13".into()));
+    let source = function(
+        "",
+        "NUMBER",
+        "i NUMBER := 3; BEGIN FOR i IN i..i+2 LOOP NULL; END LOOP; RETURN i; END;",
+    );
+    assert!(call(&source, &[])
+        .unwrap_err()
+        .to_string()
+        .contains("cannot be NULL"));
+    for body in [
+        "BEGIN FOR i IN 1..3 LOOP i := 2; END LOOP; RETURN 1; END;",
+        "BEGIN FOR i IN 1..3 LOOP NULL; END LOOP; RETURN i; END;",
+        "BEGIN FOR i IN TRUE..3 LOOP NULL; END LOOP; RETURN 1; END;",
+    ] {
+        assert!(compile(&function("", "NUMBER", body)).is_err(), "{body}");
+    }
+}
+
+#[test]
+fn pls_integer_rounds_inputs_preserves_null_and_checks_expression_overflow() {
+    let source = function(
+        "p PLS_INTEGER",
+        "PLS_INTEGER",
+        "v BINARY_INTEGER := p; BEGIN RETURN v; END;",
+    );
+    for (input, expected) in [
+        (Value::Null, Value::Null),
+        (Value::Numeric("1.5".into()), Value::Int(2)),
+        (Value::Numeric("-1.5".into()), Value::Int(-2)),
+        (Value::Int(i32::MIN as i64), Value::Int(i32::MIN as i64)),
+        (Value::Int(i32::MAX as i64), Value::Int(i32::MAX as i64)),
+    ] {
+        assert_eq!(call(&source, &[input]).unwrap(), expected);
+    }
+    assert!(matches!(
+        call(&source, &[Value::Int(i32::MAX as i64 + 1)]),
+        Err(mpedb_types::Error::ArithmeticOverflow)
+    ));
+    for body in [
+        "BEGIN RETURN 50000 * 50000; END;",
+        "BEGIN FOR i IN 50000..50000 LOOP RETURN i * i; END LOOP; END;",
+        "BEGIN FOR i IN 2147483647..2147483647 LOOP RETURN i + 1; END LOOP; END;",
+        "BEGIN FOR i IN -2147483648..-2147483648 LOOP RETURN -i; END LOOP; END;",
+        "v PLS_INTEGER := -2147483648; BEGIN RETURN - -v; END;",
+        "BEGIN FOR i IN 2147483648..1 LOOP NULL; END LOOP; RETURN 0; END;",
+    ] {
+        assert!(
+            matches!(
+                call(&function("", "NUMBER", body), &[]),
+                Err(mpedb_types::Error::ArithmeticOverflow)
+            ),
+            "{body}"
+        );
+    }
+    let source = function(
+        "",
+        "NUMBER",
+        "BEGIN FOR i IN 2147483647..2147483647 LOOP RETURN i + 1.0; END LOOP; END;",
+    );
+    assert_eq!(
+        call(&source, &[]).unwrap(),
+        Value::Numeric("2147483648".into())
+    );
+    let source = function(
+        "",
+        "NUMBER",
+        "BEGIN FOR i IN 3..3 LOOP RETURN i / 2; END LOOP; END;",
+    );
+    assert_eq!(call(&source, &[]).unwrap(), Value::Numeric("1.5".into()));
+}
+
+#[test]
 fn varchar_normalizes_empty_text_and_concatenates_null_without_losing_spaces() {
     let source = function(
         "p VARCHAR2",
@@ -599,6 +704,29 @@ fn number_overflow_and_nonfinite_inputs_raise() {
         assert!(call(&source, &[Value::Numeric(text.into())]).is_err());
     }
     assert!(call(&source, &[Value::Float(0.1)]).is_err());
+}
+
+#[test]
+fn native_compilation_is_safe_on_small_embedding_thread_stacks() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(|| {
+            for (nesting, valid) in [(100, true), (200, false)] {
+                let source = function(
+                    "",
+                    "BOOLEAN",
+                    &format!(
+                        "BEGIN RETURN {}TRUE{}; END;",
+                        "(".repeat(nesting),
+                        ")".repeat(nesting)
+                    ),
+                );
+                assert_eq!(compile(&source).is_ok(), valid);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]

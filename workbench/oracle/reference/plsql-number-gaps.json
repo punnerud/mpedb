@@ -1,0 +1,65 @@
+{
+  "oracle_version": "23.26.3.0.0",
+  "sql_vs_plsql": {
+    "1e-100/1e100 literal": {
+      "value": "0"
+    },
+    "1e-100/1e100 variable": {
+      "value": "0"
+    },
+    "1e125*1e125 literal": {
+      "value": "#######"
+    },
+    "1e125*1e125 variable": {
+      "value": "#######"
+    },
+    "1e125+1e125 literal": {
+      "value": "2E+125"
+    },
+    "1e125+1e125 variable": {
+      "value": "2E+125"
+    },
+    "-1e125*1e125 literal": {
+      "value": "#######"
+    },
+    "-1e125*1e125 variable": {
+      "value": "#######"
+    },
+    "1e125/0 literal": {
+      "error": "ORA-01476: divisor is equal to zero\nORA-06512: at line 1\nHelp: https://docs.oracle.com/error-help/db/ora-01476/"
+    },
+    "1e125/0 variable": {
+      "error": "ORA-01476: divisor is equal to zero\nORA-06512: at line 1\nHelp: https://docs.oracle.com/error-help/db/ora-01476/"
+    },
+    "1e125/1e-125 literal": {
+      "value": "#######"
+    },
+    "1e125/1e-125 variable": {
+      "value": "#######"
+    }
+  },
+  "bound_values": {
+    "1e125*1e125": {
+      "dump": "Typ=2 Len=2: ff,65",
+      "text": "#######",
+      "driver": "1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "-1e125*1e125": {
+      "dump": "Typ=2 Len=1: 0",
+      "text": "#######",
+      "driver": "-1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "1e-100/1e100": {
+      "dump": "Typ=2 Len=1: 80",
+      "text": "0",
+      "driver": "0"
+    }
+  },
+  "differential_summary": {
+    "cases": 2016,
+    "mismatches": 155,
+    "division_underflow": 44,
+    "special_overflow": 110,
+    "literal_error_code": 1
+  }
+}

@@ -62,9 +62,11 @@ contract; Oracle CREATE-versus-OR-REPLACE catalog behavior is not implemented
 by this host API.
 
 The first compiler supports IN/OUT/IN OUT parameters, local variables and
-initialized CONSTANT declarations of BOOLEAN, unconstrained NUMBER, and VARCHAR2,
+initialized CONSTANT declarations of BOOLEAN, unconstrained NUMBER, PLS_INTEGER /
+BINARY_INTEGER, and VARCHAR2,
 exact numeric literals and comparisons, IS [NOT] NULL,
-assignment, nested DECLARE/BEGIN blocks, IF/ELSIF/ELSE, WHILE/LOOP,
+assignment, nested DECLARE/BEGIN blocks, IF/ELSIF/ELSE, WHILE/LOOP, numeric FOR /
+FOR REVERSE,
 EXIT/CONTINUE [WHEN], and RETURN. Static
 type checks cover even skipped short-circuit branches; IN parameters cannot
 be assigned. Constants accept `:=` or `DEFAULT` initializers (including NULL),
@@ -105,38 +107,70 @@ empty text and NULL share an Oracle representation. rRETL verification still
 requires an appropriate domain or retained provenance; this normalization does
 not authorize an unchecked bidirectional mirror.
 
-NUMBER values remain exact decimals; integers are normalized at parameter
-boundaries. New routines use Oracle's twenty base-100 groups (39/40 decimal
-digits according to exponent parity), with rounding measured against Oracle
-23.26.3. Arithmetic `+`, `-`, `*`, `/` and unary signs use bounded arbitrary-width
-integer intermediates, SQL NULL propagation, and proper operator precedence.
-Recurring division now works: `1 / 3` retains forty fractional digits. Numeric
-overflow raises; literal conversion and multiplication underflow become zero,
-whereas division underflow on nonzero operands raises as Oracle does.
+PLS_INTEGER and its BINARY_INTEGER alias use signed 32-bit values, round decimal
+inputs half away from zero, preserve NULL, and raise on overflow. Integer
+literals in range retain this type. Integer `+`, `-`, `*`, and unary minus check
+32-bit overflow even when assigned to NUMBER; a decimal/exponent literal or
+NUMBER operand promotes the operation to NUMBER. Division returns NUMBER.
+Numeric FOR evaluates rounded bounds once, includes both endpoints, supports
+REVERSE, EXIT and CONTINUE, and guards increment at the integer endpoints.
+The index is read-only and scoped to the loop. It shadows outer names even
+while evaluating bounds; referencing it in a bound encounters NULL and raises.
+An inverted range executes zero iterations. Labels and extended iteration
+controls are not yet supported.
 
-The new NUMBER behavior has **distinct IR opcodes**. Previously stored numeric
-routines retain their original limited semantics and hashes; redefining source
-emits the new instructions and produces a new hash. Older builds reject unknown
-opcodes. Existing Python/Rust semantics and stored blobs are unchanged.
+The reproducible FOR/PLS_INTEGER differential test measured 1760 cases against
+real anonymous PL/SQL blocks with no mismatches:
 
-The reproducible differential tool compares native compiled/serialized PL/SQL
-with real Oracle SELECT results:
+```bash
+python workbench/oracle/for_differential.py \
+  --probe /path/to/target/debug/examples/plsql_number_probe \
+  --native-root /path/to/private-oracle-root \
+  --output /path/to/artifacts/for-differential.json
+```
 
-```sh
-# Build with CARGO_TARGET_DIR on the extra disk as for other Rust tests.
+Host compilation uses a dedicated 8 MiB stack so the supported nesting bound
+of 128 does not depend on an embedding application's thread stack. Tests also
+compile valid nested source and reject excessive nesting from a 64 KiB caller.
+Runtime execution remains governed by the validated IR and instruction budgets.
+
+NUMBER values remain exact decimals; integer arguments are normalized at NUMBER
+parameter boundaries. Finite arithmetic uses twenty base-100 groups (39/40
+decimal digits according to exponent parity), measured against Oracle 23.26.3.
+Arithmetic uses bounded arbitrary-width integer intermediates, SQL NULL
+propagation, and proper precedence. Recurring division works: `1 / 3` retains
+forty fractional digits. The current NUMBER opcodes implement SQL-style range
+checks: overflow raises, literal/multiplication underflow becomes zero, and
+nonzero division underflow raises. **The last rule differs from Oracle PL/SQL,
+which returns zero. PL/SQL overflow also needs separate special-value support.**
+
+These NUMBER and integer instructions have distinct IR opcodes. Previously
+stored routines retain their original semantics and hashes; redefining source
+emits the new instructions. Older builds reject unknown instructions. Existing
+Python/Rust semantics and stored blobs are unchanged.
+
+The original NUMBER differential run matched Oracle SELECT results in 2016
+cases. That was SQL reference evidence, not proof of matching PL/SQL boundaries.
+The tool now compares the native PL/SQL compiler with real anonymous PL/SQL
+functions in the same context:
+
+```bash
 cargo build -p mpedb-spell --example plsql_number_probe
 python workbench/oracle/number_differential.py \
   --probe /path/to/target/debug/examples/plsql_number_probe \
-  --native-root /mnt/HC_Volume_106406886/mpedb-oracle \
-  --output /mnt/HC_Volume_106406886/mpedb-oracle/number-report.json
+  --native-root /path/to/private-oracle-root \
+  --output /path/to/artifacts/number-report.json
 ```
 
-The measured seed **20261017** covers **2,016 cases with zero mismatches** for
-arithmetic over valid finite literals plus the boundary corpus. An exploratory
-run that also generated invalid/out-of-range source literals had 96 parsing
-error-code differences: both implementations rejected those expressions, but
-Oracle SQL reported ORA-00923 where the native PL/SQL host path reported numeric
-overflow. Exact Oracle SQL parsing/error compatibility remains unfinished.
+**The corrected 2016-case NUMBER test currently has 155 mismatches:** 44 division
+underflows, 110 overflow results where Oracle produces special NUMBER values
+(displayed as `#######` by TO_CHAR), and one out-of-range source literal with a
+different compilation error. There were no differing returned finite values.
+Measured special representations include `DUMP` bytes `ff,65` and `0`; a driver
+may expose these as a finite sentinel, so they need explicit representation and
+provenance rather than silent numeric conversion. These remaining gaps are
+recorded, not counted as passing tests. New PL/SQL-specific range semantics must
+also preserve the meaning of already stored bytecode.
 See [Oracle NUMBER precision](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Data-Types.html).
 
 Floating-point/text-to-NUMBER conversions and NLS settings remain unimplemented.

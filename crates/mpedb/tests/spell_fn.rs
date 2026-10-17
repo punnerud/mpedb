@@ -194,6 +194,19 @@ fn plsql_varchar_functions_run_from_shared_sql_plans_with_oracle_null_rules() {
 }
 
 #[test]
+fn plsql_integer_for_routines_survive_shared_plan_linking_and_overflow_checks() {
+    let (d, path) = db("plsql-for");
+    d.create_function(SpellLang::PlSql, "CREATE FUNCTION oracle_square(p PLS_INTEGER) RETURN NUMBER IS BEGIN FOR i IN p..p LOOP RETURN i * i; END LOOP; END;").unwrap();
+    let hash = d.prepare("SELECT oracle_square($1)").unwrap();
+    let attached = Database::open_from_file(std::path::Path::new(&path)).unwrap();
+    assert_eq!(rows(attached.execute(&hash, &[Value::Int(7)]).unwrap()), vec![vec![Value::Numeric("49".into())]]);
+    assert_eq!(rows(attached.execute(&hash, &[Value::Numeric("3.5".into())]).unwrap()), vec![vec![Value::Numeric("16".into())]]);
+    assert!(attached.execute(&hash, &[Value::Int(50000)]).is_err());
+    assert!(attached.execute(&hash, &[Value::Null]).is_err());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn procedure_and_out_signatures_cannot_be_registered_as_scalar_sql_functions() {
     let (d, path) = db("plsql-signature");
     for source in [

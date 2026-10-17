@@ -515,6 +515,20 @@ pub fn run(
                 let a = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(oracle_text::binary(op, a, b)?));
             }
+            Op::OracleInteger | Op::OracleIntNeg => {
+                let value = stack.pop().expect("validated");
+                let value = if op == Op::OracleIntNeg { oracle_number::integer_negate(value)? } else { oracle_number::integer(value)? };
+                stack.push(PValue::Scalar(value));
+            }
+            Op::OracleIntAdd | Op::OracleIntSub | Op::OracleIntMul => {
+                let b = stack.pop().expect("validated");
+                let a = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(oracle_number::integer_binary(op, a, b)?));
+            }
+            Op::OracleLoopBound => {
+                let value = stack.pop().expect("validated");
+                stack.push(PValue::Scalar(oracle_number::loop_bound(value)?));
+            }
             Op::OracleNumber => {
                 let value = stack.pop().expect("validated");
                 stack.push(PValue::Scalar(oracle_number::number(value)?));

@@ -147,6 +147,13 @@ pub enum Op {
     /// VARCHAR2 normalization. Low 15 bits: length (0 = unconstrained);
     /// high bit: CHAR semantics rather than BYTE. Absolute maximum 32767 bytes.
     OracleVarchar(u16),
+    /// Numeric FOR bound: rounded signed 32-bit integer; NULL is an error.
+    OracleLoopBound,
+    OracleInteger,
+    OracleIntAdd,
+    OracleIntSub,
+    OracleIntMul,
+    OracleIntNeg,
     OracleConcat,
     /// Blank-padded comparisons when both operands are character literals.
     OracleCharEq,
@@ -271,6 +278,12 @@ const OP_ORACLE_CHAR_LT: u8 = 63;
 const OP_ORACLE_CHAR_LE: u8 = 64;
 const OP_ORACLE_CHAR_GT: u8 = 65;
 const OP_ORACLE_CHAR_GE: u8 = 66;
+const OP_ORACLE_LOOP_BOUND: u8 = 67;
+const OP_ORACLE_INTEGER: u8 = 68;
+const OP_ORACLE_INT_ADD: u8 = 69;
+const OP_ORACLE_INT_SUB: u8 = 70;
+const OP_ORACLE_INT_MUL: u8 = 71;
+const OP_ORACLE_INT_NEG: u8 = 72;
 
 
 
@@ -519,6 +532,12 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::OracleDiv => b.push(OP_ORACLE_DIV),
         Op::OracleNeg => b.push(OP_ORACLE_NEG),
         Op::OracleVarchar(limit) => u16arg(OP_ORACLE_VARCHAR, limit),
+        Op::OracleLoopBound => b.push(OP_ORACLE_LOOP_BOUND),
+        Op::OracleInteger => b.push(OP_ORACLE_INTEGER),
+        Op::OracleIntAdd => b.push(OP_ORACLE_INT_ADD),
+        Op::OracleIntSub => b.push(OP_ORACLE_INT_SUB),
+        Op::OracleIntMul => b.push(OP_ORACLE_INT_MUL),
+        Op::OracleIntNeg => b.push(OP_ORACLE_INT_NEG),
         Op::OracleConcat => b.push(OP_ORACLE_CONCAT),
         Op::OracleCharEq => b.push(OP_ORACLE_CHAR_EQ),
         Op::OracleCharNe => b.push(OP_ORACLE_CHAR_NE),
@@ -608,6 +627,12 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_ORACLE_DIV => Op::OracleDiv,
         OP_ORACLE_NEG => Op::OracleNeg,
         OP_ORACLE_VARCHAR => Op::OracleVarchar(u16arg()?),
+        OP_ORACLE_LOOP_BOUND => Op::OracleLoopBound,
+        OP_ORACLE_INTEGER => Op::OracleInteger,
+        OP_ORACLE_INT_ADD => Op::OracleIntAdd,
+        OP_ORACLE_INT_SUB => Op::OracleIntSub,
+        OP_ORACLE_INT_MUL => Op::OracleIntMul,
+        OP_ORACLE_INT_NEG => Op::OracleIntNeg,
         OP_ORACLE_CONCAT => Op::OracleConcat,
         OP_ORACLE_CHAR_EQ => Op::OracleCharEq,
         OP_ORACLE_CHAR_NE => Op::OracleCharNe,
@@ -655,8 +680,9 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
         Op::Tuple(n) => (n as usize, 1),
         Op::StoreLocal(_) | Op::Pop => (1, 0),
         Op::Dup => (1, 2),
-        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) => (1, 1),
-        Op::OracleConcat
+        Op::Neg | Op::Not | Op::Len | Op::SqlNot | Op::SqlBool | Op::SqlNumber | Op::SqlNeg | Op::OracleNumber | Op::OracleNeg | Op::OracleVarchar(_) | Op::OracleLoopBound | Op::OracleInteger | Op::OracleIntNeg => (1, 1),
+        Op::OracleIntAdd | Op::OracleIntSub | Op::OracleIntMul
+        | Op::OracleConcat
         | Op::OracleCharEq
         | Op::OracleCharNe
         | Op::OracleCharLt

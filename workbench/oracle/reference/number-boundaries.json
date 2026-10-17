@@ -65,5 +65,6 @@
       "expression": "1e-100 * 1e-100",
       "value": "0"
     }
-  ]
+  ],
+  "context": "Oracle SQL expressions (initial NUMBER boundary measurements)"
 }

@@ -72,16 +72,25 @@ def main():
     native = process.stdout.splitlines()
     if len(native) != len(expressions):
         raise RuntimeError("native probe returned an unexpected result count")
-    oracledb.defaults.fetch_decimals = True
     mismatches = []
     with oracledb.connect(
         user=user, password=password, dsn=dsn, tcp_connect_timeout=10
     ) as connection:
         with connection.cursor() as cursor:
+            output = cursor.var(oracledb.DB_TYPE_VARCHAR, size=32767)
             for expression, actual in zip(expressions, native):
                 try:
-                    cursor.execute("SELECT " + expression + " FROM dual")
-                    value = cursor.fetchone()[0]
+                    # Compare the same PL/SQL context as the native compiler:
+                    # integer-literal arithmetic can overflow in PL/SQL even
+                    # when the corresponding Oracle SQL expression succeeds.
+                    cursor.execute(
+                        "DECLARE FUNCTION f RETURN NUMBER IS BEGIN RETURN "
+                        + expression
+                        + "; END; BEGIN :out := TO_CHAR(f, 'TM9', "
+                        "'NLS_NUMERIC_CHARACTERS=''.,'''); END;",
+                        out=output,
+                    )
+                    value = output.getvalue()
                     expected = "NULL" if value is None else "OK\t" + str(value)
                 except oracledb.Error as error:
                     expected = "ERR\t" + error.args[0].full_code
@@ -103,6 +112,7 @@ def main():
             "pairs": args.pairs,
             "cases": len(expressions),
             "scope": "arithmetic with valid finite literals plus measured boundary corpus",
+            "context": "anonymous PL/SQL functions returning NUMBER",
             "mismatches": mismatches,
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -19,6 +19,58 @@ pub(super) fn number(value: PValue) -> Result<Value> {
     }
 }
 
+pub(super) fn integer(value: PValue) -> Result<Value> {
+    let Value::Numeric(text) = number(value)? else {
+        return Ok(Value::Null);
+    };
+    let negative = text.starts_with('-');
+    let unsigned = text.trim_start_matches('-');
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let mut magnitude: i64 = whole.parse().map_err(|_| Error::ArithmeticOverflow)?;
+    if fraction.as_bytes().first().is_some_and(|&c| c >= b'5') {
+        magnitude = magnitude.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+    }
+    let rounded = if negative { -magnitude } else { magnitude };
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&rounded) {
+        return Err(Error::ArithmeticOverflow);
+    }
+    Ok(Value::Int(rounded))
+}
+
+pub(super) fn loop_bound(value: PValue) -> Result<Value> {
+    match integer(value)? {
+        Value::Null => Err(type_err("PL/SQL numeric FOR bounds cannot be NULL")),
+        value => Ok(value),
+    }
+}
+
+fn integer_result(n: i64) -> Result<Value> {
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&n) {
+        return Err(Error::ArithmeticOverflow);
+    }
+    Ok(Value::Int(n))
+}
+
+pub(super) fn integer_negate(value: PValue) -> Result<Value> {
+    match integer(value)? {
+        Value::Null => Ok(Value::Null),
+        Value::Int(n) => integer_result(-n),
+        _ => unreachable!("PLS_INTEGER normalization"),
+    }
+}
+
+pub(super) fn integer_binary(op: Op, a: PValue, b: PValue) -> Result<Value> {
+    let (Value::Int(a), Value::Int(b)) = (integer(a)?, integer(b)?) else {
+        return Ok(Value::Null);
+    };
+    integer_result(match op {
+        Op::OracleIntAdd => a + b,
+        Op::OracleIntSub => a - b,
+        Op::OracleIntMul => a * b,
+        _ => unreachable!("PLS_INTEGER arithmetic dispatch"),
+    })
+}
+
 struct Decimal {
     coefficient: BigInt,
     scale: u32,
