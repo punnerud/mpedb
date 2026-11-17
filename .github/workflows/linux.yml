@@ -150,10 +150,14 @@ jobs:
       # The tests use a private datadir and `--skip-networking`; the
       # package's own service is unused.
       #
-      # The package also confines `usr.sbin.mariadbd` to `/var/lib/mysql`.
-      # A private datadir then fails in `mariadb-install-db`: Aria cannot
-      # lock `aria_log_control` (error 11) and InnoDB cannot lock `ibdata1`
-      # (error 13). The runners are throwaway, so unload that profile.
+      # Ubuntu 26.04 ships the profile as /etc/apparmor.d/mariadbd.
+      # Older images used usr.sbin.mariadbd. Either file confines the
+      # binary to the packaged datadir, and a private one then fails in
+      # mariadb-install-db: Aria cannot lock aria_log_control (error 11)
+      # and InnoDB cannot lock ibdata1 (error 13). Looking only at the
+      # old path left the new profile enforced. The runners are
+      # throwaway, so unload whichever file is present and stop if
+      # aa-status still lists it in enforce mode.
       - name: mariadb for the mysql mirror tests
         run: |
           sudo apt-get update -qq
@@ -161,8 +165,33 @@ jobs:
           test -x /usr/bin/mariadb-install-db
           test -x /usr/sbin/mariadbd
           sudo systemctl stop mariadb || true
-          if [ -f /etc/apparmor.d/usr.sbin.mariadbd ]; then
-            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.mariadbd || true
+          unloaded=0
+          for p in /etc/apparmor.d/mariadbd /etc/apparmor.d/usr.sbin.mariadbd; do
+            if [ -f "$p" ]; then
+              echo "unloading $p"
+              sudo apparmor_parser -R "$p"
+              unloaded=1
+            fi
+          done
+          echo "profile files unloaded: $unloaded"
+          if [ -d /etc/apparmor.d ]; then
+            echo "apparmor.d mariadb entries:"
+            ls /etc/apparmor.d | grep -E -i 'maria|mysql' || echo "(none)"
+          fi
+          if sudo aa-status >/tmp/aa-status.txt 2>&1; then
+            cat /tmp/aa-status.txt
+            if awk '
+              /in enforce mode/ {e=1}
+              /in complain mode/ {e=0}
+              e && /mariadbd|mysqld/ {found=1}
+              END {exit found ? 0 : 1}
+            ' /tmp/aa-status.txt; then
+              echo "a mariadb/mysql profile is still enforced"
+              exit 1
+            fi
+          else
+            echo "aa-status did not run"
+            cat /tmp/aa-status.txt || true
           fi
       - name: test
         run: cargo test --workspace

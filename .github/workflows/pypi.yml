@@ -132,10 +132,10 @@ jobs:
         with:
           cache-on-failure: true
       - uses: mozilla-actions/sccache-action@v0.0.9
-      # Same server the linux job installs, including unloading the
-      # AppArmor profile that confines `mariadbd` to `/var/lib/mysql`.
-      # `mysql_tests` boots a private datadir; under that profile
-      # `mariadb-install-db` cannot lock its files.
+      # Same server the linux job installs. Ubuntu 26.04's profile is
+      # /etc/apparmor.d/mariadbd; older images used usr.sbin.mariadbd.
+      # Either one confines a private datadir, and mariadb-install-db
+      # then cannot lock its files. Unload whichever is present.
       - name: mariadb for the mysql mirror tests
         run: |
           sudo apt-get update -qq
@@ -143,8 +143,33 @@ jobs:
           test -x /usr/bin/mariadb-install-db
           test -x /usr/sbin/mariadbd
           sudo systemctl stop mariadb || true
-          if [ -f /etc/apparmor.d/usr.sbin.mariadbd ]; then
-            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.mariadbd || true
+          unloaded=0
+          for p in /etc/apparmor.d/mariadbd /etc/apparmor.d/usr.sbin.mariadbd; do
+            if [ -f "$p" ]; then
+              echo "unloading $p"
+              sudo apparmor_parser -R "$p"
+              unloaded=1
+            fi
+          done
+          echo "profile files unloaded: $unloaded"
+          if [ -d /etc/apparmor.d ]; then
+            echo "apparmor.d mariadb entries:"
+            ls /etc/apparmor.d | grep -E -i 'maria|mysql' || echo "(none)"
+          fi
+          if sudo aa-status >/tmp/aa-status.txt 2>&1; then
+            cat /tmp/aa-status.txt
+            if awk '
+              /in enforce mode/ {e=1}
+              /in complain mode/ {e=0}
+              e && /mariadbd|mysqld/ {found=1}
+              END {exit found ? 0 : 1}
+            ' /tmp/aa-status.txt; then
+              echo "a mariadb/mysql profile is still enforced"
+              exit 1
+            fi
+          else
+            echo "aa-status did not run"
+            cat /tmp/aa-status.txt || true
           fi
       - name: workspace tests
         run: cargo test --workspace
