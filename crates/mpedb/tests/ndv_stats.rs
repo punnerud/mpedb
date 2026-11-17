@@ -93,10 +93,27 @@ fn analyze_flips_the_star_and_moves_no_rows() {
         )
         .unwrap();
     }
+    // A NULL join key is not in the index. The broadcast scan walks every
+    // row, so this is the one that would leak if the hash treated NULL as a
+    // key. It must stay out of every result below.
+    s.query(
+        "INSERT INTO fact (id, product_id, amount) VALUES ($1, $2, $3)",
+        &[Value::Int(2000), Value::Null, Value::Int(1)],
+    )
+    .unwrap();
     s.commit().unwrap();
 
     let sql = "SELECT f.amount FROM fact f, product p \
                WHERE f.product_id = p.id AND p.category = 'cat3'";
+    // Residual ON (the equality is pushed; `amount > 50` stays). And the
+    // aggregate shape the star bench times. Both have to survive analyze,
+    // which is when the executor may scan the fact table instead of probing.
+    let sql_residual = "SELECT f.amount FROM fact f, product p \
+                        WHERE f.product_id = p.id AND p.category = 'cat3' \
+                        AND f.amount > 50";
+    let sql_agg = "SELECT p.category, sum(f.amount) FROM fact f, product p \
+                   WHERE f.product_id = p.id AND p.category = 'cat3' \
+                   GROUP BY p.category";
 
     // Unanalyzed: the pre-stage-A plan, and the reference answer.
     let before = explain(&d, sql);
@@ -106,6 +123,9 @@ fn analyze_flips_the_star_and_moves_no_rows() {
     );
     let reference = rows_sorted(d.query(sql, &[]).unwrap());
     assert_eq!(reference.len(), 400, "10 matching products × 40 facts each");
+    let reference_residual = rows_sorted(d.query(sql_residual, &[]).unwrap());
+    assert!(!reference_residual.is_empty() && reference_residual.len() < 400);
+    let reference_agg = rows_sorted(d.query(sql_agg, &[]).unwrap());
 
     // Analyze: both single-column indexes measured, exactly.
     let stats = d.analyze().unwrap();
@@ -126,6 +146,8 @@ fn analyze_flips_the_star_and_moves_no_rows() {
         "analyzed, the dimension must drive; got:\n{after}"
     );
     assert_eq!(rows_sorted(d.query(sql, &[]).unwrap()), reference);
+    assert_eq!(rows_sorted(d.query(sql_residual, &[]).unwrap()), reference_residual);
+    assert_eq!(rows_sorted(d.query(sql_agg, &[]).unwrap()), reference_agg);
 
     // Determinism: a second pass measures the same values (same snapshot
     // content ⇒ same records ⇒ same plans — the stability law).

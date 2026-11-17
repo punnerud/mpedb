@@ -1028,6 +1028,21 @@ pub(crate) fn ndv_bucket_from(
     table_id: u32,
     index_no: u32,
 ) -> Option<u32> {
+    stored_ndv(r, schema, table_id, index_no).map(stats::bucket)
+}
+
+/// The exact distinct-key count `analyze()` stored for this index, or `None`
+/// when the index was never analyzed or the record no longer matches it.
+///
+/// Same lookup as [`ndv_bucket_from`] (identity fingerprint, advisory on every
+/// failure) without the planner's magnitude bucket. The join executor uses the
+/// exact count to price a non-unique probe's fan-out.
+pub(crate) fn stored_ndv(
+    r: &mpedb_core::engine::ReadTxn<'_>,
+    schema: &Schema,
+    table_id: u32,
+    index_no: u32,
+) -> Option<u64> {
     // The record is pinned to the index's IDENTITY (names), not the schema
     // generation — see stats.rs's module doc for the bug the difference fixed.
     let t = schema.tables.iter().find(|t| t.id == table_id && !t.dead)?;
@@ -1041,7 +1056,7 @@ pub(crate) fn ndv_bucket_from(
     let subkey = sys_record_subkey(stats::NS, &stats::record_key(table_id, index_no)).ok()?;
     let bytes = r.sys_get(&subkey).ok().flatten()?;
     let ndv = stats::decode_record(&bytes, &fp)?;
-    (ndv > 0).then(|| stats::bucket(ndv))
+    (ndv > 0).then_some(ndv)
 }
 
 pub(crate) fn sys_record_subkey(ns: &str, key: &[u8]) -> Result<Vec<u8>> {

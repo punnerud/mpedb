@@ -968,6 +968,9 @@ pub(super) fn gather_joined_arena(
         // what `x = y` means when either side is NULL. Bucket contents keep
         // held order, so the surviving rows come out in the same order the
         // linear scan produced them.
+        // Read before `prebuilt_hash` moves into `hash_probe`. The broadcast
+        // is the case that switch declined: inner still probed per outer row.
+        let try_broadcast = held.is_none() && prebuilt_hash.is_none();
         let hash_probe: Option<HashProbe> = match (&held, prebuilt_hash) {
             (_, Some(h)) => Some(h),
             (Some(rows), None) if rows.len() >= HASH_JOIN_MIN_HELD => {
@@ -989,15 +992,44 @@ pub(super) fn gather_joined_arena(
         // here.
         let probe_keep: Option<Vec<u16>> =
             prune.and_then(|p| probe_cols(p.inner(ji), join.policy.as_ref(), inner_width));
+        // BROADCAST (hash the small outer, scan the inner once). The switch
+        // above hashes the INNER side, which is the right trade when that side
+        // is the small one. A star join is the opposite: the outer is the
+        // filtered dimension and the inner is the fact table, so the switch
+        // refuses (`inner > 2 × outer`) and the plan probes the fact index
+        // once per dimension row. Each probe returns the key's whole fan-out,
+        // and each match is a random PK fetch. Hashing the outer rows — they
+        // are already in `acc` — and walking the fact table once answers the
+        // same equality, in one sequential pass, and keeps outer-then-PK
+        // order because a non-unique index is `(value ‖ pk)`.
+        let broadcast = if try_broadcast {
+            let built = broadcast_matches(
+                ctx, schema, join, &acc, acc_width, inner_width, next_width, &cells,
+            )?;
+            if let Some(b) = &built {
+                // Charged for the whole stage, released with the other inputs
+                // below. `broadcast_matches` has already declined when this
+                // would not fit, so the charge does not trip.
+                cells.charge(b.cells, || {
+                    format!("broadcast join with \"{}\"", table_name(schema, join_tbl))
+                })?;
+            }
+            built
+        } else {
+            None
+        };
         for ai in 0..acc.len() {
             let a = acc.row(ai);
             let fetched;
-            let candidates: &[Vec<Value>] = match &held {
-                Some(rows) => rows,
-                None => {
-                    fetched = fetch_inner(ctx, join, plan, params, a, probe_keep.as_deref())?;
-                    &fetched
-                }
+            let candidates: &[Vec<Value>] = match broadcast.as_ref() {
+                Some(b) => &b.buckets[ai],
+                None => match &held {
+                    Some(rows) => rows,
+                    None => {
+                        fetched = fetch_inner(ctx, join, plan, params, a, probe_keep.as_deref())?;
+                        &fetched
+                    }
+                },
             };
             // With a hash, only this outer row's bucket is considered.
             let bucket: Option<&[usize]> = match &hash_probe {
@@ -1016,6 +1048,16 @@ pub(super) fn gather_joined_arena(
             for k in 0..n_cand {
                 let ci = bucket.map_or(k, |b| b[k]);
                 let i = &candidates[ci];
+                // The broadcast scan has not applied the inner RLS policy yet
+                // (it ran inside the snapshot borrow). Same order as
+                // `fetch_inner`: policy over the inner row alone, before ON.
+                if broadcast.is_some() {
+                    if let Some(p) = &join.policy {
+                        if !p.eval_filter_host(&mut stack, i, params, ctx.host_fns())? {
+                            continue;
+                        }
+                    }
+                }
                 // #74: one work-row per inner candidate considered. This is the
                 // O(n·m) cost of a cross join — a held inner side is read once
                 // (charged m by the scan layer) but paired against every outer
@@ -1082,7 +1124,11 @@ pub(super) fn gather_joined_arena(
         }
         // This stage's inputs are dropped here: `acc` is superseded by `next`
         // and `held` goes out of scope. Return their cells so `live` keeps
-        // tracking what the join actually holds.
+        // tracking what the join actually holds. The broadcast buckets are
+        // the same kind of input: held for the stage, gone with it.
+        if let Some(b) = &broadcast {
+            cells.release(b.cells);
+        }
         let dropped = (acc.len() * acc_width) as u64
             + held.as_ref().map_or(0, |h| (h.len() * inner_width) as u64);
         acc_width += inner_width;
@@ -1826,6 +1872,136 @@ fn equi_join_cols(on: &ExprProgram, acc_width: usize) -> Option<(u16, u16)> {
     } else {
         None
     }
+}
+
+/// One outer row's matches, gathered by a single scan of the inner table.
+struct Broadcast {
+    buckets: Vec<Vec<Vec<Value>>>,
+    /// Cells charged for `buckets` (logical inner width × matched rows).
+    cells: u64,
+}
+
+/// Hash the outer rows and scan the inner table once.
+///
+/// `Ok(None)` means "this shape stays an index nested loop": no snapshot, no
+/// NDV, the probe is selective, or the matched rows would not fit beside the
+/// output. A decline is the old plan, so it cannot turn a query that worked
+/// into a budget error.
+///
+/// The scan charges one work-row per inner row it touches. A skew past the
+/// reserved fan-out drops the buckets and returns `None`, so the nested loop
+/// still answers; the rows already scanned stay on the work meter.
+#[allow(clippy::too_many_arguments)]
+fn broadcast_matches(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    join: &Join,
+    acc: &RowArena,
+    acc_width: usize,
+    inner_width: usize,
+    next_width: usize,
+    cells: &JoinCells,
+) -> Result<Option<Broadcast>> {
+    // Paired with `MPEDB_NO_HASH_SWITCH`: one binary arm, so a bench can time
+    // the nested loop this replaces without a second build.
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("MPEDB_NO_BROADCAST_HASH").is_ok_and(|v| v == "1")
+    });
+    if *OFF || join.kind != JoinKind::Inner || acc.len() == 0 {
+        return Ok(None);
+    }
+    let Some((ocol, icol)) = join_hash_key(schema, join, &join.on, acc_width) else {
+        return Ok(None);
+    };
+    let index_no = match &join.access {
+        AccessPath::IndexPoint { index_no, .. } => *index_no,
+        _ => return Ok(None),
+    };
+    // The outer key has to still be in the accumulated row. Pruning keeps it
+    // (it is an `OuterCol` of this access); a mask that dropped it is a shape
+    // this must not guess at.
+    if acc.row(0).len() <= ocol as usize {
+        return Ok(None);
+    }
+    let Some(inner_rows) = ctx.row_count(join.table)? else { return Ok(None) };
+    if inner_rows == 0 {
+        return Ok(None);
+    }
+    let Some(txn) = ctx.snapshot_txn() else { return Ok(None) };
+    let Some(ndv) = crate::stored_ndv(txn, schema, join.table, index_no) else {
+        return Ok(None);
+    };
+    // Uniform fan-out: `analyze` counted distinct keys, the probe returns
+    // about `rows / ndv` of them. A non-unique star key is hundreds; a unique
+    // key is one, and the test below then keeps the nested loop.
+    let fanout = inner_rows.div_ceil(ndv).max(1);
+    let fetched = (acc.len() as u64).saturating_mul(fanout);
+    // Measured (2M-row fact, 2-core Linux): an index match is a PK descent
+    // and a decode, ~1.24 µs, against ~0.11 µs for a scanned row — the two
+    // meet near 11 scanned rows per fetch. `hash_switch_wins` prices a probe
+    // as ONE row. That is right for a unique key and wrong here, where the
+    // probe returns `fanout` rows and every one of them is its own descent.
+    // The range scan's divisor of 8 is the wrong constant for this choice:
+    // it keeps the nested loop until the probes are already the more
+    // expensive plan, which on a fact table that does not fit in RAM is
+    // hundreds of thousands of random PK fetches.
+    const FETCH_PER_SCAN: u64 = 11;
+    if fetched.saturating_mul(FETCH_PER_SCAN) < inner_rows {
+        return Ok(None); // the probes touch less than a scan would
+    }
+    // Buckets and the joined output are both live together. Two times the
+    // uniform estimate absorbs a moderate skew; past that the scan is
+    // abandoned below rather than charged into a budget error.
+    let reserve = fetched.saturating_mul(2).saturating_mul((inner_width + next_width) as u64);
+    if !cells.fits(reserve) {
+        return Ok(None);
+    }
+    let budget = txn.work_budget();
+    if budget != 0 && txn.work_used().saturating_add(inner_rows) > budget {
+        return Ok(None); // the scan itself would trip the work-row budget
+    }
+
+    let mut map: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    let mut key = Vec::with_capacity(16);
+    for ai in 0..acc.len() {
+        let Some(v) = acc.row(ai).get(ocol as usize) else { continue };
+        if v.is_null() {
+            continue;
+        }
+        key.clear();
+        keycode::encode_group_value(&mut key, v, Collation::Binary);
+        map.entry(key.clone()).or_default().push(ai);
+    }
+    if map.is_empty() {
+        return Ok(Some(Broadcast { buckets: vec![Vec::new(); acc.len()], cells: 0 }));
+    }
+
+    let mut buckets: Vec<Vec<Vec<Value>>> = vec![Vec::new(); acc.len()];
+    let mut matched: u64 = 0;
+    let mut cur = txn.scan(join.table, None, None)?;
+    while let Some(row) = cur.next()? {
+        let Some(v) = row.get(icol as usize) else { continue };
+        if v.is_null() {
+            continue;
+        }
+        key.clear();
+        keycode::encode_group_value(&mut key, v, Collation::Binary);
+        let Some(outers) = map.get(&key) else { continue };
+        matched = matched.saturating_add(outers.len() as u64);
+        // Skew past the reservation: drop the buckets and let the nested
+        // loop answer. Nothing has been charged to the cell budget.
+        if matched > fetched.saturating_mul(2) {
+            return Ok(None);
+        }
+        for &ai in outers {
+            buckets[ai].push(row.clone());
+        }
+    }
+    let hold = matched.saturating_mul(inner_width as u64);
+    if !cells.fits(hold) {
+        return Ok(None);
+    }
+    Ok(Some(Broadcast { buckets, cells: hold }))
 }
 
 /// Is the outer side big enough that reading the inner ONCE and hashing it
