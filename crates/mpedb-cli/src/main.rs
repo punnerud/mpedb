@@ -244,6 +244,12 @@ parameters parse as: null | true | false | integer | float | 0xHEX (blob) |
   naive = UTC) | text";
 
 fn main() {
+    // Rust ignores SIGPIPE and turns the EPIPE from a print into a panic.
+    // `mpedb dump | head` should die with the signal, the way a Unix filter does.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let code = match dispatch(&argv) {
         Ok(()) => 0,

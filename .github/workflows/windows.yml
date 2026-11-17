@@ -165,9 +165,14 @@ jobs:
           # second line, so it would pass on a dump full of tombstones.
           test "$("$B" "$f" "SELECT count(*) FROM t" | tail -1 | tr -d '\r')" = 2
           "$B" prepare "$f" "SELECT s FROM t WHERE id = ?"
-          "$B" dump "$f" | grep -q 'name = "t"'
+          # Save the dump, then grep the file. `grep -q` on the live pipe
+          # exits at the first hit, and the writer's SIGPIPE fails the step
+          # under the pipefail shell.
+          "$B" dump "$f" > "$d/schema.txt"
+          grep -q 'name = "t"' "$d/schema.txt"
           "$B" "$f" "DROP TABLE t"
-          ! "$B" dump "$f" | grep -q 'name = ""'
+          "$B" dump "$f" > "$d/schema.txt"
+          ! grep -q 'name = ""' "$d/schema.txt"
           rm -rf "$d"
       - name: clippy the engine
         run: cargo clippy -p mpedb-core --lib -- -D warnings
