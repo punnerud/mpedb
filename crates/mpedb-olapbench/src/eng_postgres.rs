@@ -234,12 +234,18 @@ impl Postgres {
     }
 
     /// A prepared, parameterised loop: `sql` uses `?`, rewritten to `$1`.
-    pub fn prepared_ms(&self, sql: &str, iters: i64, facts: i64) -> Result<f64, Box<dyn std::error::Error>> {
+    pub fn prepared_ms(
+        &self,
+        sql: &str,
+        start: i64,
+        end: i64,
+        facts: i64,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
         let pgsql = sql.replace('?', "$1");
         let mut c = self.client.borrow_mut();
         let st = c.prepare(&pgsql)?;
         let t0 = Instant::now();
-        for i in 0..iters {
+        for i in start..end {
             let _ = c.query(&st, &[&((i % facts) as i32)])?;
         }
         Ok(t0.elapsed().as_secs_f64() * 1000.0)

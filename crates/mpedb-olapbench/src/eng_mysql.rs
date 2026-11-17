@@ -243,11 +243,17 @@ impl Mysql {
         Ok(out.join("\n"))
     }
 
-    pub fn prepared_ms(&self, sql: &str, iters: i64, facts: i64) -> Result<f64, Box<dyn std::error::Error>> {
+    pub fn prepared_ms(
+        &self,
+        sql: &str,
+        start: i64,
+        end: i64,
+        facts: i64,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
         let mut c = self.conn.borrow_mut();
         let st = c.prep(sql)?;
         let t0 = Instant::now();
-        for i in 0..iters {
+        for i in start..end {
             let _: Vec<mysql::Row> = c.exec(&st, (i % facts,))?;
         }
         Ok(t0.elapsed().as_secs_f64() * 1000.0)

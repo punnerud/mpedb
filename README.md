@@ -313,12 +313,12 @@ by many processes at once, versioned, branched, and thrown away. Lock-free
 readers, snapshot isolation, and single-file databases are a better fit for that
 than either ancestor. It is not there yet; see Status.
 
-> ⚠️ **Status: personal research project.** Crash-safe on Linux (x86-64 and
-> 32/64-bit ARM), macOS/Apple Silicon and Windows x86-64 — see
-> [Platforms](#platforms). The
-> design has been through multiple adversarial review rounds (see the
-> `DESIGN*.md` docs), but this is not production-hardened software. Treat it as a
-> serious experiment.
+> **Status: in production.** More than 26,000 devices, on both iPhone and
+> Android, run it through Morten Punnerud-Engelstad's iPhone, Mac, and Android
+> apps. Crash-safe on Linux (x86-64 and 32/64-bit ARM), macOS/Apple Silicon and
+> Windows x86-64 — see [Platforms](#platforms). The design has been through
+> multiple adversarial review rounds (see the `DESIGN*.md` docs). It is still
+> version 0.1.x, with one author.
 
 ### "It's a one-person 0.1.x — if it breaks, I'm alone with it"
 
@@ -326,9 +326,10 @@ That is the right objection, and it is worth separating into the part that is
 true and the part that is an assumption.
 
 **The true part.** This is version 0.1.x with one author. There is no
-community, no track record in production, and no second pair of eyes that has
-not been asked for. Anything below is about how *fixable* a defect is, never
-about how many there are.
+community, and no second pair of eyes that has not been asked for. The
+production track record is the author's own apps: more than 26,000 devices,
+on both iPhone and Android. Anything below is about how *fixable* a defect is,
+never about how many there are.
 
 **The assumption.** "Small project" is usually shorthand for "no specification"
 — when something misbehaves, you argue about what it was supposed to do, and
@@ -737,6 +738,44 @@ reused — capping lifetime creates at 64 (`regenerate` resets it). See
 head-to-head, DuckDB (OLAP), Qdrant (vector), Neo4j (graph), PostgreSQL
 LISTEN/NOTIFY, and the shared method the whole set follows. Start at
 [`benchmarks/README.md`](benchmarks/README.md).
+
+### OLAP — DuckDB, and the other SQL engines
+
+Analytics is not what mpedb is for. The star-schema cell is
+[`benchmarks/olap.md`](benchmarks/olap.md): the same SQL on every engine, and a
+row is timed only after the results agree. Two Linux devboxes are tabled
+separately there. Absolute milliseconds do not cross them.
+
+On the Milan box (2 cores, 7.6 GiB, 2 million fact rows, `durability = "none"`,
+2026-07-24) DuckDB wins every heavy scan, group and join, by 20–110×. That is
+a vectorised column store on the workload it is built for. mpedb wins where
+the answer is already an index probe:
+
+| query | mpedb | DuckDB |
+|---|---:|---:|
+| `min`/`max` on the amount index | 0.032 ms | 12.6 ms |
+| filtered count | 0.292 ms | 1.8 ms |
+| 20 000 point lookups, total | 40 ms | 6 520 ms |
+| 20 000 range sums on one customer, total | 2 458 ms | 36 522 ms |
+
+`sum(amount)` over the whole fact table is 30.9 ms against DuckDB's 1.6 ms,
+and ahead of SQLite, PostgreSQL and MySQL on that same cell.
+
+The Genoa box (2 cores, 3.7 GiB, 2026-11-17, `768504f2`, engines rotated
+across five rounds) has the same split. `min`/`max` is 0.070 ms against
+DuckDB's 15.3, the filtered count 1.2 against 3.2, and 20 000 point lookups
+58 ms against 6 413. Scans stay 22–33× behind DuckDB. The two group-bys in
+that rotated run were 383 ms and 813 ms; folding them as a dense histogram on
+the same file, one execution each, brings the warm times to 90 ms and 120 ms
+(DuckDB's medians were 7.8 ms and 22 ms). The star
+joins in that rotated run took minutes: the plan was already the selective
+dimension first, and each of ~249 000 matches was a random primary-key fetch
+against a 2.4 GB file. Hashing those few hundred dimension rows and scanning
+`fact` once, on the same file, brings `join-star-2` to 3.8 s cold and 2.5 s
+warm (DuckDB's median in that run was 271 ms) and `join-star-4` to 0.79 s
+with the fact pages already resident (DuckDB 299 ms). Those three timings are
+single executions, not a new five-round median, and `join-bad-order` was not
+re-run. Load cost, noise ranges and the other engines are in the linked note.
 
 Head-to-head against SQLite and PostgreSQL through one shared Rust measurement
 loop (each engine on its own fast path — mpedb's `execute(hash, …)`, prepared

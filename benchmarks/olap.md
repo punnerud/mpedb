@@ -28,10 +28,12 @@ set (the DESIGN-COLUMNAR extent store); DuckDB is told to build no indexes (its
 authors advise against them for analytics); SQLite/PostgreSQL/MySQL get the same
 indexes as mpedb, built after the load.
 
-Two machines, tabled separately because absolute times do not cross hardware
-(the *shape* does): a **Linux devbox** (AMD EPYC-Milan, 2 cores, 7.6 GiB) with
-all five engines, and an earlier **Apple M3 Pro** (11 cores) three-engine run
-kept below for reference.
+Three machines, tabled separately because absolute times do not cross hardware
+(the *shape* does): two **Linux devboxes** with all five engines — AMD
+EPYC-Milan (2 cores, 7.6 GiB, 2026-07-24) and AMD EPYC-Genoa (2 cores, 3.7 GiB,
+2026-11-17) — and an earlier **Apple M3 Pro** (11 cores) three-engine run kept
+below for reference. Read a ratio inside one table. A millisecond from Genoa
+is not a regression or a speedup against the same cell on Milan.
 
 ## The dataset
 
@@ -138,6 +140,152 @@ precomputed and point-shaped work — often by one to two orders of magnitude ov
 the servers — competitive-to-winning against SQLite/MySQL on single-pass scans
 and grouping, and behind PostgreSQL on joins. Against the DuckDB specialist it
 loses the heavy analytical scans, by design and by a closing margin.
+
+## Linux devbox, five engines (2026-11-17, mpedb `768504f2`)
+
+AMD EPYC-Genoa, 2 cores, 3.7 GiB RAM, 2.0 GiB swap, Linux 6.8. mpedb on the
+data volume with `durability = "none"`, column segments on, file 2.4 GB (2359
+MiB reserved). The fact file does not fit beside the other engines, and swap
+was in use, so several mpedb medians are wide; the ranges are under the table.
+The run was `nice -n 10`, one compiler. 2M-row `fact`. Every row `agree: yes`.
+
+This run rotates who starts each round: one untimed warm-up per engine, then
+five timed rounds in which every engine runs once. The Milan table above is an
+earlier harness and a different machine. Do not subtract the two.
+
+`analyze` is inside the mpedb load (72.26 s of the 96.3 s) and so is
+`sync-columnar` (one fact table, 3.40 s). DuckDB stays in memory with no
+indexes.
+
+### Load
+
+| engine | load | note |
+|---|---:|---|
+| duckdb | 1.2 s | in memory, Appender, no indexes |
+| sqlite | 4.9 s | in memory, same indexes as mpedb, built after the rows |
+| postgres | 6.0 s | private throwaway cluster, COPY, same indexes, then ANALYZE |
+| mysql | 20.3 s | private throwaway MariaDB, batched INSERT, same indexes, then ANALYZE |
+| mpedb | 96.3 s | five `fact` indexes maintained row by row, then `analyze`, then column segments |
+
+### Queries
+
+Milliseconds, median of 5.
+
+| query | probes | mpedb | duckdb | sqlite | postgres | mysql |
+|---|---|---:|---:|---:|---:|---:|
+| `scan-sum` | scan | 54.8 | 2.5 | 57.6 | 83.5 | 163.1 |
+| `scan-filter-sum` | scan | 143.8 | 4.3 | 84.5 | 100.7 | 194.0 |
+| `scan-range-sum` | scan | 3929.9 | 168.7 | 463.5 | 154.4 | 214.0 |
+| `scan-multi-agg` | scan | 2974.4 | 137.3 | 186.2 | 184.8 | 313.5 |
+| `count-star` | precompute | 6.0 | 0.969 | 0.898 | 56.5 | 153.5 |
+| `min-max-indexed` | precompute | **0.070** | 15.3 | 109.4 | 0.753 | 0.415 |
+| `count-filtered` | precompute | **1.2** | 3.2 | 0.084 | 0.418 | 0.295 |
+| `group-small` | group by | 383.3 | 7.8 | 1331.5 | 167.3 | 2588.9 |
+| `group-large` | group by | 813.3 | 22.4 | 1515.2 | 214.4 | 2994.2 |
+| `join-star-2` | join order | 418326.8 | 271.4 | 238.7 | 174.1 | 396.4 |
+| `join-star-4` | join order | 458886.1 | 298.8 | 319.7 | 208.7 | 790.5 |
+| `join-bad-order` | join order | 9720.7 | 243.7 | 192.8 | 188.6 | 548.5 |
+
+Prepared, 20,000 executions, total milliseconds. The iterations are split
+across the five rounds.
+
+| query | mpedb | duckdb | sqlite | postgres | mysql |
+|---|---:|---:|---:|---:|---:|
+| `prepared-point` — `WHERE id = ?` | **58** | 6413 | 7 | 775 | 1126 |
+| `prepared-range` — `sum(amount) WHERE customer_id = ?` | 10187 | 29139 | 1557 | 3684 | 5285 |
+
+mpedb cells whose coefficient of variation exceeded 15 %: `scan-sum` 30.5–59.3
+ms, `scan-range-sum` 3566–5091 ms, `count-star` 4.1–8.0 ms, `min-max-indexed`
+0.0–0.1 ms, `join-star-2` 350–571 s, `join-star-4` 55–584 s, `join-bad-order`
+4.9–16.5 s. Read those medians as ranges. The `min`/`max` range is still under
+a tenth of a millisecond.
+
+### Same file, after hashing the small side
+
+The two star medians above are one nested loop: `category = 'tools'` is 623
+products, each probe returns about 400 fact rows, and the `product_id` index
+does not cover `amount`, so each of the ~249 000 matches was its own
+primary-key fetch. On a 2.4 GB file in 3.7 GiB of RAM that is minutes of
+random reads (one timed-out confirmation read 33 GB in 104 s). The plan order
+was already the selective dimension first. The existing hash join only builds
+on the inner side, and it refuses to hash two million fact rows.
+
+The build that hashes those 623 products and scans `fact` once was timed on
+the same file, release, `nice -n 10`, one execution each. DuckDB was not run
+again beside it; the DuckDB column is the median from the table above.
+`join-bad-order` was not re-run. These three numbers are not a rotated
+five-round median.
+
+| query | mpedb | duckdb median from the run above |
+|---|---:|---:|
+| `join-star-2`, cold | 3810 | 271.4 |
+| `join-star-2`, warm | 2540 | 271.4 |
+| `join-star-4`, fact pages already resident | 790 | 298.8 |
+
+The sum is the one the five engines had already agreed on:
+`tools`, `124549090.13000062`. Star-4 returned 60 groups. The prepare-time
+warning (`~10000000000` work-rows) still prints; it is the planner's
+worst-case nested loop, not the rows the new path visits. `MPEDB_NO_BROADCAST_HASH=1`
+keeps the nested loop.
+
+### Same file, after the dense group histogram
+
+`group-small` and `group-large` in the table above already read column
+segments, then decoded every value into a `Value` and hashed it. A null-free
+`GROUP BY` of one `INT64` column with `count(*)` and `sum` of one `FLOAT64`
+column now accumulates into a dense histogram, in primary-key order, so the
+float bits stay the ones the row scan produced. Timed on the same file,
+release, `nice -n 10`, one execution each. Not a rotated five-round median.
+DuckDB was not run again.
+
+| query | mpedb cold | mpedb warm | duckdb median from the run above |
+|---|---:|---:|---:|
+| `group-small` (200 groups) | 240 | 90 | 7.8 |
+| `group-large` (15 000 groups present) | 170 | 120 | 22.4 |
+
+The cold `group-small` is the first call and pays for opening the file. Warm,
+both are ahead of this run's PostgreSQL medians (167 ms and 214 ms) and still
+behind DuckDB, by about 12× and 5×. `min`/`max`, `avg`, a second key, and any
+NULL in the key or the sum still take the per-row feed.
+
+### Reading this box
+
+**Against DuckDB the split is the same shape as Milan, except the star joins
+and these two group-bys moved.** DuckDB still wins every heavy scan, by 22–33×:
+`scan-sum` 55 vs 2.5 ms, `scan-filter-sum` 144 vs 4.3, `scan-range-sum` 3.9 s
+vs 169 ms, `scan-multi-agg` 3.0 s vs 137 ms. The group medians in the table
+(383/813 vs 7.8/22 ms) are the per-row feed; the histogram follow-up is above.
+`count-star` is 6.0 vs 0.97 ms. That is the column engine against a row scan,
+on a machine where the row file does not stay resident. DuckDB's own
+`scan-range-sum` is 169 ms here and 3.4 ms on the Milan table; the ratio inside
+this run is the comparison.
+
+**mpedb wins the index probes, including against DuckDB:**
+
+- `min-max-indexed` — 0.070 ms, fastest of the five (DuckDB 15.3, PostgreSQL
+  0.753, MySQL 0.415, SQLite 109). About 220× ahead of DuckDB.
+- `count-filtered` — 1.2 ms vs DuckDB 3.2 (2.7×). SQLite, PostgreSQL and MySQL
+  are all faster on this cell (0.084, 0.418, 0.295).
+- `prepared-point` — 58 ms for 20 000 lookups vs DuckDB 6413 (110×), PostgreSQL
+  775 and MySQL 1126. SQLite is 7 ms.
+- `prepared-range` — 10.2 s vs DuckDB 29.1 s (2.9×). SQLite, PostgreSQL and
+  MySQL all finish it sooner (1.6 s, 3.7 s, 5.3 s).
+
+**Against the other general-purpose engines** the scan cells match the Milan
+reading. `scan-sum` is ahead of SQLite, PostgreSQL and MySQL. The group-bys in
+the rotated table beat SQLite and MySQL and lose to PostgreSQL; the histogram
+follow-up, warm, is ahead of PostgreSQL too. `count-star` crushes the servers
+and trails SQLite on a sub-millisecond absolute.
+
+**Joins stay a loss, and they are no longer a different species of result.**
+Cold `join-star-2` is 3.8 s against DuckDB's 271 ms and SQLite's 239 ms from
+the interleaved run (about 14× and 16×). Warm it is 2.5 s, about 9× behind
+that DuckDB median. Warm `join-star-4` is 0.79 s against DuckDB 299 ms,
+SQLite 320 ms and PostgreSQL 209 ms — same order of magnitude as MySQL's
+791 ms median, and the warm end of the measurement. The residual is one scan
+of two million fact rows against an in-memory hash or column join, which is
+the known OLAP gap. `join-bad-order` is still the interleaved median, 9.7 s
+against DuckDB's 244 ms, and was not remeasured.
 
 ## Apple M3 Pro, three engines (reference)
 
