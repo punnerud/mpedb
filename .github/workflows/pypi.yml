@@ -132,14 +132,20 @@ jobs:
         with:
           cache-on-failure: true
       - uses: mozilla-actions/sccache-action@v0.0.9
-      # Same server the linux job installs: this gate re-runs
-      # `cargo test --workspace`, and `mysql_tests` needs `mariadbd`.
+      # Same server the linux job installs, including unloading the
+      # AppArmor profile that confines `mariadbd` to `/var/lib/mysql`.
+      # `mysql_tests` boots a private datadir; under that profile
+      # `mariadb-install-db` cannot lock its files.
       - name: mariadb for the mysql mirror tests
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mariadb-server
           test -x /usr/bin/mariadb-install-db
           test -x /usr/sbin/mariadbd
+          sudo systemctl stop mariadb || true
+          if [ -f /etc/apparmor.d/usr.sbin.mariadbd ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.mariadbd || true
+          fi
       - name: workspace tests
         run: cargo test --workspace
       - name: capi tests (own workspace)

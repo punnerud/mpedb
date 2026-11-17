@@ -149,12 +149,21 @@ jobs:
       # (the PostgreSQL harness is). Ubuntu images do not ship the server.
       # The tests use a private datadir and `--skip-networking`; the
       # package's own service is unused.
+      #
+      # The package also confines `usr.sbin.mariadbd` to `/var/lib/mysql`.
+      # A private datadir then fails in `mariadb-install-db`: Aria cannot
+      # lock `aria_log_control` (error 11) and InnoDB cannot lock `ibdata1`
+      # (error 13). The runners are throwaway, so unload that profile.
       - name: mariadb for the mysql mirror tests
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mariadb-server
           test -x /usr/bin/mariadb-install-db
           test -x /usr/sbin/mariadbd
+          sudo systemctl stop mariadb || true
+          if [ -f /etc/apparmor.d/usr.sbin.mariadbd ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.mariadbd || true
+          fi
       - name: test
         run: cargo test --workspace
       - name: clippy
