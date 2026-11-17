@@ -669,7 +669,7 @@ impl crate::Database {
                         ))
                     })
             };
-            Ok((find(forward)?, rex.map(&find).transpose()?, find(inverse)?))
+            Ok((find(forward)?, rex.map(find).transpose()?, find(inverse)?))
         })();
         let (fwd_fn, rex_fn, inv_fn) = match resolved {
             Ok(v) => v,

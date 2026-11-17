@@ -195,7 +195,7 @@ fn frontier_dedup(rc: &RecursiveCtePlan) -> Option<u16> {
             _ => {}
         }
     }
-    if t.joined_filter.as_ref().is_some_and(&reads) {
+    if t.joined_filter.as_ref().is_some_and(reads) {
         return None;
     }
     for j in &t.joins {
@@ -209,7 +209,7 @@ fn frontier_dedup(rc: &RecursiveCtePlan) -> Option<u16> {
     if o.table != CTE_TABLE
         || !o.joins.is_empty()
         || o.joined_filter.is_some()
-        || o.filter.as_ref().is_some_and(&reads)
+        || o.filter.as_ref().is_some_and(reads)
     {
         return None;
     }

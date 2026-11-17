@@ -37,7 +37,7 @@ type = "text"
 name = "binary_value"
 type = "blob"
 "#,
-            path.display()
+            mpedb_testkit::toml_path(&path)
         ))
         .unwrap();
         let db = Database::open_with_config(config.clone()).unwrap();

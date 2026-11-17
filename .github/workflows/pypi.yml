@@ -132,6 +132,14 @@ jobs:
         with:
           cache-on-failure: true
       - uses: mozilla-actions/sccache-action@v0.0.9
+      # Same server the linux job installs: this gate re-runs
+      # `cargo test --workspace`, and `mysql_tests` needs `mariadbd`.
+      - name: mariadb for the mysql mirror tests
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mariadb-server
+          test -x /usr/bin/mariadb-install-db
+          test -x /usr/sbin/mariadbd
       - name: workspace tests
         run: cargo test --workspace
       - name: capi tests (own workspace)

@@ -58,6 +58,15 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: toolchain
         run: rustc --version && cargo --version && cargo clippy --version && sqlite3 --version
+      # Same gap as linux.yml: `mysql_tests` boots a private `mariadbd` and
+      # is not ignored. Neither image ships it. Homebrew's prefix differs
+      # (`/opt/homebrew` on Apple Silicon, `/usr/local` on Intel); the tests
+      # look in both. Do not `brew services start` — the tests own the server.
+      - name: mariadb for the mysql mirror tests
+        run: |
+          brew install mariadb
+          command -v mariadb-install-db
+          command -v mariadbd
       # mpedb-py is excluded here only: its PyO3 cdylib needs
       # `-undefined dynamic_lookup` at link time, build-config debt unrelated to
       # the engine (TODO.md's macOS test-path items). Linux builds it, so the
