@@ -171,6 +171,144 @@ pub(crate) fn sum_f64_whole_table(
     Ok(Some((total, count)))
 }
 
+/// Largest key span a dense histogram will hold. Wider than this (a unique
+/// key, a timestamp) declines to the per-row fold: the vector would be the
+/// table, and the per-row path already builds one group per distinct key.
+const HIST_MAX_SPAN: i128 = 1 << 20;
+
+/// `GROUP BY` one null-free `INT64` column, optionally with `sum` of one
+/// null-free `FLOAT64` column, straight out of the packed segments.
+///
+/// Each returned triple is `(key, row_count, float_sum)`. The sum is the
+/// group's running total in PK order, and the first value is stored as itself
+/// rather than added to `0.0`, so the bits match `Accum::push` (a leading
+/// `-0.0` would not survive `0.0 + x`). `Ok(None)` declines — a NULL, a tail
+/// above the watermark, a codec this loop cannot read, or a key span past
+/// [`HIST_MAX_SPAN`] — and the caller feeds synthetic rows instead.
+///
+/// `sum_col == None` is the count-only shape; the float slot is then `0.0`.
+pub(crate) fn group_count_sum_f64(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    key_col: u16,
+    sum_col: Option<u16>,
+) -> Result<Option<Vec<(i64, u64, f64)>>> {
+    let (Ok(want_gen), Ok(want_rows)) = (snap.mod_gen(table), snap.row_count(table)) else {
+        return Ok(None);
+    };
+    if want_rows == 0 {
+        return Ok(None);
+    }
+    let Some(key_recs) = load_column(snap, table, key_col, ColumnType::Int64, want_gen, want_rows)?
+    else {
+        return Ok(None);
+    };
+    let amt_recs = match sum_col {
+        Some(col) => Some(
+            match load_column(snap, table, col, ColumnType::Float64, want_gen, want_rows)? {
+                Some(r) => r,
+                None => return Ok(None),
+            },
+        ),
+        None => None,
+    };
+    if amt_recs.as_ref().is_some_and(|r| r.len() != key_recs.len()) {
+        return Err(Error::Corrupt(
+            "group column segments disagree on block count".into(),
+        ));
+    }
+
+    let mut key_blocks = Vec::with_capacity(key_recs.len());
+    let mut gmin = i64::MAX;
+    let mut gmax = i64::MIN;
+    for rec in &key_recs {
+        let Some(b) = decode_block(rec, want_gen, ColumnType::Int64)? else {
+            return Ok(None);
+        };
+        let Some((lo, hi)) = b.hist_i64_bounds() else {
+            return Ok(None);
+        };
+        gmin = gmin.min(lo);
+        gmax = gmax.max(hi);
+        key_blocks.push(b);
+    }
+    let span = (gmax as i128) - (gmin as i128) + 1;
+    if span <= 0 || span > HIST_MAX_SPAN {
+        return Ok(None);
+    }
+
+    let mut amt_blocks = Vec::new();
+    if let Some(recs) = &amt_recs {
+        for (rec, key_b) in recs.iter().zip(&key_blocks) {
+            let Some(b) = decode_block(rec, want_gen, ColumnType::Float64)? else {
+                return Ok(None);
+            };
+            if !b.hist_f64_ok() || b.n_rows != key_b.n_rows {
+                if b.n_rows != key_b.n_rows {
+                    return Err(Error::Corrupt(
+                        "group column segments disagree on block size".into(),
+                    ));
+                }
+                return Ok(None);
+            }
+            amt_blocks.push(b);
+        }
+    }
+
+    let span = span as usize;
+    // `0` count means the bin has not been seeded. The first float is stored,
+    // later floats are added, matching `Accum`'s `None → Float(x)` then `a + x`.
+    let mut bins = vec![(0u64, 0.0f64); span];
+    let mut keys = Vec::new();
+    let mut amts = Vec::new();
+    for (bi, key_b) in key_blocks.iter().enumerate() {
+        if key_b.fill_i64(&mut keys).is_none() {
+            return Ok(None);
+        }
+        let have_amt = if sum_col.is_some() {
+            if amt_blocks[bi].fill_f64(&mut amts).is_none() || amts.len() != keys.len() {
+                return Ok(None);
+            }
+            true
+        } else {
+            false
+        };
+        for (i, k) in keys.iter().enumerate() {
+            let idx = match (*k as i128).checked_sub(gmin as i128) {
+                Some(d) if d >= 0 && (d as usize) < span => d as usize,
+                _ => {
+                    return Err(Error::Corrupt(
+                        "group key outside its own zone map".into(),
+                    ))
+                }
+            };
+            let bin = &mut bins[idx];
+            if have_amt {
+                let a = amts[i];
+                if bin.0 == 0 {
+                    bin.1 = a;
+                    bin.0 = 1;
+                } else {
+                    bin.1 += a;
+                    bin.0 += 1;
+                }
+            } else {
+                bin.0 += 1;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (i, (n, total)) in bins.into_iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        let key = gmin + i as i64;
+        out.push((key, n, total));
+    }
+    Ok(Some(out))
+}
+
 
 /// Feed a GROUP BY aggregate from column segments (DESIGN-COLUMNAR stage 3):
 /// stream ONLY the group-key and aggregate-argument columns as synthetic rows

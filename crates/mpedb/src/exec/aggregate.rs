@@ -623,6 +623,57 @@ impl<'a> Folder<'a> {
             .ok_or_else(|| internal("the ungrouped fold lost its group"))
     }
 
+    /// Install groups a dense segment histogram already folded.
+    ///
+    /// The histogram proved the shape: one binary `INT64` key, and every
+    /// aggregate is `count(*)` or `sum` of the same null-free `FLOAT64`
+    /// column. `parts` is `(key, row_count, float_sum)` with the sum in PK
+    /// order, so [`Accum::from_float_sum`] leaves the bits `push` would have.
+    /// Cell charge matches the per-row path (one key plus one accumulator per
+    /// aggregate) and happens before the group is inserted.
+    pub(super) fn adopt_i64_count_sum(
+        &mut self,
+        parts: &[(i64, u64, f64)],
+        params: &[Value],
+    ) -> Result<()> {
+        let (schema, table) = (self.schema, self.table);
+        for &(key, n, total) in parts {
+            if n == 0 {
+                continue;
+            }
+            let key_vals = vec![Value::Int(key)];
+            let mut key_buf = Vec::with_capacity(16);
+            keycode::encode_group_value(&mut key_buf, &key_vals[0], Collation::Binary);
+            let accs = self
+                .agg
+                .aggs
+                .iter()
+                .map(|c| match c.func.native() {
+                    Some(mpedb_types::AggFn::Count) => {
+                        let mut a = Accum::new(mpedb_types::AggFn::Count);
+                        a.add_rows(n);
+                        Ok(Acc::Native(a))
+                    }
+                    Some(mpedb_types::AggFn::Sum) => {
+                        Ok(Acc::Native(Accum::from_float_sum(total, n)))
+                    }
+                    _ => Err(internal(
+                        "group histogram adopted an aggregate it did not prove",
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.cells.charge((key_vals.len() + accs.len()) as u64, || {
+                format!(
+                    "the group map of an aggregate over \"{}\"",
+                    super::table_name(schema, table)
+                )
+            })?;
+            self.groups
+                .insert(key_buf, (key_vals, accs, None, Some(params.to_vec())));
+        }
+        Ok(())
+    }
+
     /// Surrender the single UNGROUPED group's accumulators, or `None` when no
     /// row was ever folded (an empty morsel, which merges as the identity).
     /// Panic-free on a grouped folder: it simply takes the first group, and
@@ -1459,6 +1510,58 @@ fn segment_group_columns(t: &TableDef, agg: &Aggregation) -> Option<Vec<(u16, mp
     Some(out)
 }
 
+/// The one grouped shape a dense histogram can fold without `Folder::push`:
+/// a single `INT64` column key, and aggregates that are only `count(*)` or
+/// `sum` of one `FLOAT64` column (several sums of that same column are one
+/// total). Anything else — a second key, `min`/`max`, `avg`, `DISTINCT`, a
+/// filter, a computed key — is `None`, and the synthetic-row feed runs.
+fn group_hist_shape(t: &TableDef, agg: &Aggregation) -> Option<(u16, Option<u16>)> {
+    if agg.group_by.len() != 1 || agg.aggs.is_empty() {
+        return None;
+    }
+    let mpedb_sql::GroupKey::Col(key) = agg.group_by[0] else {
+        return None;
+    };
+    let key_col = t.columns.get(key as usize)?;
+    if key_col.ty != mpedb_types::ColumnType::Int64 {
+        return None;
+    }
+    let mut sum: Option<u16> = None;
+    for call in &agg.aggs {
+        if call.distinct
+            || call.filter.is_some()
+            || !call.order_by.is_empty()
+            || !call.extra_args.is_empty()
+        {
+            return None;
+        }
+        match call.func.native() {
+            Some(mpedb_types::AggFn::Count) if call.arg.is_none() => {}
+            Some(mpedb_types::AggFn::Sum) => {
+                let Some(mpedb_types::Instr::PushCol(i)) =
+                    call.arg.as_ref().and_then(|p| p.instrs.first().copied())
+                else {
+                    return None;
+                };
+                if call.arg.as_ref().is_none_or(|p| p.instrs.len() != 1) {
+                    return None;
+                }
+                let scol = t.columns.get(i as usize)?;
+                if scol.ty != mpedb_types::ColumnType::Float64 {
+                    return None;
+                }
+                match sum {
+                    None => sum = Some(i),
+                    Some(prev) if prev == i => {}
+                    Some(_) => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some((key, sum))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn exec_aggregate(
     ctx: &mut dyn TxnCtx,
@@ -1528,7 +1631,8 @@ pub(super) fn exec_aggregate(
     // row's other columns), a per-aggregate FILTER (it evaluates over the base
     // row), a residual filter, or any group key / argument that is not a plain
     // segmentable column.
-    let segment_grouped = if !agg.group_by.is_empty()
+    let mut segment_grouped = false;
+    if !agg.group_by.is_empty()
         && filter.is_none()
         && joins.is_empty()
         && correlated.is_empty()
@@ -1536,27 +1640,43 @@ pub(super) fn exec_aggregate(
         && agg.over_index.is_none()
         && agg.bare_cols.is_empty()
     {
-        match (ctx.snapshot_txn().is_some(), segment_group_columns(t, agg)) {
-            (true, Some(needed)) => {
-                // The snapshot borrow and the folder's push both borrow `ctx`
-                // SHARED (`snapshot_txn(&self)` / `folder.push(&dyn TxnCtx)`),
-                // which coexist; `folder` is a separate binding, mutated in the
-                // closure. Errors propagate — a host-aggregate mint can fail,
-                // and the guards above do not exclude one.
-                let snap = ctx.snapshot_txn().expect("checked");
-                crate::colseg::feed_group_from_segments(
-                    snap,
-                    table,
-                    width,
-                    &needed,
-                    &mut |row: &[Value]| folder.push(&*ctx, row, params),
-                )?
+        // Dense histogram for the one shape whose per-row `Value` was the
+        // whole cost: one integer key, `count(*)`, `sum` of one float. Same
+        // groups, same float bits. A decline leaves the folder empty, and the
+        // synthetic-row feed below is then exactly the path that ran before.
+        if let Some((key_col, sum_col)) = group_hist_shape(t, agg) {
+            if folder.group_collations.first().copied() == Some(Collation::Binary) {
+                if let Some(snap) = ctx.snapshot_txn() {
+                    if let Some(parts) =
+                        crate::colseg::group_count_sum_f64(snap, table, key_col, sum_col)?
+                    {
+                        folder.adopt_i64_count_sum(&parts, params)?;
+                        segment_grouped = true;
+                    }
+                }
             }
-            _ => false,
         }
-    } else {
-        false
-    };
+        if !segment_grouped {
+            segment_grouped = match (ctx.snapshot_txn().is_some(), segment_group_columns(t, agg)) {
+                (true, Some(needed)) => {
+                    // The snapshot borrow and the folder's push both borrow `ctx`
+                    // SHARED (`snapshot_txn(&self)` / `folder.push(&dyn TxnCtx)`),
+                    // which coexist; `folder` is a separate binding, mutated in the
+                    // closure. Errors propagate — a host-aggregate mint can fail,
+                    // and the guards above do not exclude one.
+                    let snap = ctx.snapshot_txn().expect("checked");
+                    crate::colseg::feed_group_from_segments(
+                        snap,
+                        table,
+                        width,
+                        &needed,
+                        &mut |row: &[Value]| folder.push(&*ctx, row, params),
+                    )?
+                }
+                _ => false,
+            };
+        }
+    }
     if segment_grouped {
         // The folder was fed from segments; a partial feed is impossible
         // (`feed_group_from_segments` pushes nothing unless every column

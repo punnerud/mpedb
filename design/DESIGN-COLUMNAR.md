@@ -409,7 +409,12 @@ and `scan-filter`). Composes with the filtered fold.
 (text/blob segmentable, low-cardinality numerics shrunk), run-of-default sparse,
 a null-free flag, and `GROUP BY` served from segments — integer keys (3a) and
 text keys via the dictionary (3b). Measured: category 0.76 B/row, sparse
-discount 0.50 B/row; text group 512 → 417 ms.
+discount 0.50 B/row; text group 512 → 417 ms. One shape no longer builds a
+`Value` per row: a null-free `GROUP BY` of a single `INT64` column whose
+aggregates are only `count(*)` and `sum` of one null-free `FLOAT64` column
+accumulates into a dense histogram (key span at most 2^20) in PK order, so
+the float bits match the row scan. A NULL, a second key, any other aggregate,
+or a span past that cap declines to the synthetic-row feed.
 
 **Stage 4 — model-driven build.** SHIPPED as `Database::sync_columnar` /
 `mpedb model sync-columnar` (§7): the model's roles decide which tables get

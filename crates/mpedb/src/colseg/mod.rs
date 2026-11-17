@@ -34,7 +34,7 @@ mod zone;
 pub use zone::{zone_predicate, zone_verdict, Cmp, Verdict, ZonePred};
 pub(crate) use scan::{
     feed_filtered_from_segments, feed_from_segments, feed_group_from_segments,
-    sum_f64_whole_table,
+    group_count_sum_f64, sum_f64_whole_table,
 };
 
 /// Namespace in the sys-record keyspace.
@@ -282,6 +282,116 @@ impl Block<'_> {
             _ => return None,
         }
         Some(n as u64)
+    }
+
+    /// Integer bounds of a null-free `Int64` block whose codec can be read by
+    /// [`Self::fill_i64`]. `None` means the histogram must not touch it.
+    pub fn hist_i64_bounds(&self) -> Option<(i64, i64)> {
+        if !self.null_free() || self.ty != ColumnType::Int64 || self.n_rows == 0 {
+            return None;
+        }
+        match &self.codec {
+            Codec::Raw64(_) | Codec::For { .. } | Codec::RunDefault { .. } | Codec::DictNum { .. } => {
+                self.int_bounds()
+            }
+            _ => None,
+        }
+    }
+
+    /// A null-free `Float64` block the histogram can read by [`Self::fill_f64`].
+    pub fn hist_f64_ok(&self) -> bool {
+        self.ty == ColumnType::Float64
+            && self.null_free()
+            && self.n_rows > 0
+            && matches!(
+                self.codec,
+                Codec::Raw64(_) | Codec::DictNum { .. } | Codec::RunDefault { .. }
+            )
+    }
+
+    /// Decode a null-free integer block into `out`, in row order. `None` when
+    /// [`Self::hist_i64_bounds`] would have declined.
+    pub fn fill_i64(&self, out: &mut Vec<i64>) -> Option<()> {
+        let (lo, hi) = self.hist_i64_bounds()?;
+        let n = self.n_rows as usize;
+        out.clear();
+        out.reserve(n);
+        match &self.codec {
+            Codec::Raw64(p) => {
+                let bytes = p.get(..n * 8)?;
+                for chunk in bytes.as_chunks::<8>().0 {
+                    out.push(i64::from_le_bytes(*chunk));
+                }
+            }
+            Codec::For { lo, width, packed } => {
+                for k in 0..n {
+                    out.push(lo.wrapping_add(packed_at(packed, k, *width) as i64));
+                }
+            }
+            Codec::RunDefault { default, exc } => {
+                let d = *default as i64;
+                let mut ei = 0usize;
+                for k in 0..n {
+                    if ei < exc.len() && exc[ei].0 as usize == k {
+                        out.push(exc[ei].1 as i64);
+                        ei += 1;
+                    } else {
+                        out.push(d);
+                    }
+                }
+            }
+            Codec::DictNum { dict, width, codes } => {
+                for k in 0..n {
+                    let c = packed_at(codes, k, *width) as usize;
+                    out.push(*dict.get(c)? as i64);
+                }
+            }
+            _ => return None,
+        }
+        if out.len() != n || out.iter().any(|v| *v < lo || *v > hi) {
+            return None;
+        }
+        Some(())
+    }
+
+    /// Decode a null-free float block into `out`, in the same order
+    /// [`Self::add_f64_into`] adds. `None` when [`Self::hist_f64_ok`] is false.
+    pub fn fill_f64(&self, out: &mut Vec<f64>) -> Option<()> {
+        if !self.hist_f64_ok() {
+            return None;
+        }
+        let n = self.n_rows as usize;
+        out.clear();
+        out.reserve(n);
+        match &self.codec {
+            Codec::Raw64(p) => {
+                let bytes = p.get(..n * 8)?;
+                for chunk in bytes.as_chunks::<8>().0 {
+                    out.push(f64::from_le_bytes(*chunk));
+                }
+            }
+            Codec::DictNum { dict, width, codes } => {
+                let vals: Vec<f64> = dict.iter().map(|&b| f64::from_bits(b)).collect();
+                for k in 0..n {
+                    let c = packed_at(codes, k, *width) as usize;
+                    out.push(*vals.get(c)?);
+                }
+            }
+            Codec::RunDefault { default, exc } => {
+                let d = f64::from_bits(*default);
+                let mut ei = 0usize;
+                for k in 0..n {
+                    if ei < exc.len() && exc[ei].0 as usize == k {
+                        out.push(f64::from_bits(exc[ei].1));
+                        ei += 1;
+                    } else {
+                        out.push(d);
+                    }
+                }
+            }
+            _ => return None,
+        }
+        (out.len() == n).then_some(())
     }
 
     /// Materialize — tests and the reference path only.

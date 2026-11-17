@@ -363,3 +363,70 @@ fn text_group_and_aggregates_run_from_segments() {
         assert_rows_same(&all_rows(&db, q), want, q);
     }
 }
+
+/// Null-free `GROUP BY` of one integer plus `count(*)` / `sum(float)` folds
+/// through the dense histogram. The bits have to match the row scan, including
+/// a group whose first amount is `-0.0` (adding that to `0.0` would flip the
+/// sign bit) and a key span that crosses a block boundary.
+#[test]
+fn null_free_group_histogram_matches_the_row_scan() {
+    let dir = mpedb_testkit::scratch_base();
+    let path = dir.join(format!(
+        "mpedb-colseg-hist-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 64
+max_readers = 16
+
+[[table]]
+name = "fact"
+primary_key = ["id"]
+  [[table.column]]
+  name = "id"
+  type = "int64"
+  [[table.column]]
+  name = "store"
+  type = "int64"
+  nullable = false
+  [[table.column]]
+  name = "amount"
+  type = "float64"
+  nullable = false
+"#,
+        path.display()
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    let _g = Guard(path);
+    let h = db
+        .prepare("INSERT INTO fact (id, store, amount) VALUES ($1, $2, $3)")
+        .unwrap();
+    let mut s = db.begin().unwrap();
+    for i in 0..70_000i64 {
+        let store = (i % 17) - 3;
+        let amount = if i % 17 == 0 {
+            Value::Float(-0.0)
+        } else {
+            Value::Float(i as f64 * 0.1)
+        };
+        s.execute(&h, &[Value::Int(i), Value::Int(store), amount]).unwrap();
+    }
+    s.commit().unwrap();
+
+    let qs = [
+        "SELECT store, count(*), sum(amount) FROM fact GROUP BY store ORDER BY store",
+        "SELECT store, count(*) FROM fact GROUP BY store ORDER BY store",
+        "SELECT store, sum(amount), sum(amount) FROM fact GROUP BY store ORDER BY store",
+        "SELECT store, sum(amount) FROM fact GROUP BY store HAVING sum(amount) > 0 ORDER BY store",
+    ];
+    let before: Vec<Vec<Vec<Value>>> = qs.iter().map(|q| all_rows(&db, q)).collect();
+    db.compact_columns().unwrap();
+    for (q, want) in qs.iter().zip(&before) {
+        assert_rows_same(&all_rows(&db, q), want, q);
+    }
+}
