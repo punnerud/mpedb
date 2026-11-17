@@ -159,7 +159,7 @@ impl<B: Backend> Runtime<B> {
         };
         // Release ACL lock before I/O. Revocation applies to subsequent calls.
         self.in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.environment.max_in_flight_per_runtime).then_some(n + 1)
             })
             .map_err(|_| Error::Limit("host in-flight budget exhausted"))?;
