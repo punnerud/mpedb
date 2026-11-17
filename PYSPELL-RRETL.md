@@ -584,3 +584,57 @@ corpus verification as *proof* (it is statistical evidence over edge values;
 the per-run verification over your actual rows is the strong check); and
 nothing about data edited into shapes the pair cannot carry back — those are
 refused, loudly, which is the guarantee.
+
+## 8. Lineage and the EU AI Act
+
+Regulation (EU) 2024/1689 does not apply to a database. It applies to AI
+systems, and the duties below sit on the provider of a high-risk system.
+rRETL does not discharge them. What it does supply is a checked record of
+every preparation step that went through it, which is the part of Articles 10
+and 12 that is about the data rather than about the model.
+
+**Article 10(2) is data governance for training, validation and testing
+sets.** The clauses that match a column transform are the preparation
+operations — cleaning, updating, enrichment, aggregation — and the record of
+which operation ran. One `rretl_apply` writes one `rretl_lineage` row:
+
+| column | what it fixes |
+|---|---|
+| `lens`, `forward_hash`, `rex_hash`, `inverse_hash` | which pair ran, by the content hash of each function, not by a name that can be redefined underneath |
+| `tbl`, `col` | which column was rewritten |
+| `source_hash`, `output_hash`, `residual_hash` | the bytes before, the bytes after, and the residual set that makes the reverse determined |
+| `rows`, `verified`, `outcome`, `error` | how many rows, that apply verified all of them (`verified = 2`), and whether the run applied, was put back, was reverted, or failed |
+
+The commit that destroys the source does not happen unless `inverse(y, r)`
+reproduced the source for every row. A later SQL edit is not a silent hole:
+`revert` refuses a changed column, and `putback` keeps the edit only when
+`forward` and `rex` still agree with the residual. Failed runs stay in the
+table, so the log is not only the successes. Stacked runs on one column
+unwind in order, so the chain is the order the operations actually committed.
+
+Article 10 also asks for the origin of the data and, where the data are
+personal, the original purpose of collection. rRETL does not record either.
+Rows have to already be in a table. Ingest can say which call brought a key
+in; it does not record a legal basis.
+
+**Article 12 is the system's own event log**, automatic over its lifetime, so
+a provider can see a risk, run post-market monitoring, and let a deployer
+watch operation. rRETL's log is automatic for the transforms it performs. It
+is not a log of inferences, of who looked at a result, or of the session
+times Article 12(3) requires for remote biometric identification. Those stay
+the AI system's logs. Article 19's six-month floor, and Article 18's ten-year
+documentation hold, are retention duties on the provider. The lineage rows
+remain until something deletes them; the engine does not enforce either clock.
+
+**A sensor column, end to end.** The reading lands as a row — an insert, or
+an ingest receipt. rRETL starts at the next step. Calibration, a unit change,
+a packing that drops bits: each one is a lens, and each one is an apply.
+Query `rretl_lineage` and the column's history is the sequence of those rows:
+which functions, which hashes, which outcome. Someone corrects a calibrated
+value with ordinary SQL. `putback` rebuilds the source quantity with that
+correction still in it, and checks the pair on the way. A deleted reading
+stays deleted. `revert` is the other door, and it stays shut once the column
+has been touched. The same pattern is what a later training extract can point
+at: not "the pipeline hoped this was invertible", but the run id whose
+residual hash still matches the residual rows. What a model then did with the
+value is outside this table.
