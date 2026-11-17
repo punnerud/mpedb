@@ -1,0 +1,30 @@
+{
+  "challenge_module": "KernelChallenge",
+  "solution_module": "KernelSolution",
+  "theorem_names": [
+    "wellBehaved_iff_mutual_inverse",
+    "mutual_inverse_bijective",
+    "wellBehaved_bijective",
+    "getPut_injective",
+    "wrongInv_forward_bijective",
+    "wrongInv_not_wellBehaved",
+    "ofInverse_wellBehaved",
+    "drift_getPut",
+    "drift_not_putRes",
+    "collapse_putRes",
+    "collapse_not_getPut",
+    "identity_canon_is_strict",
+    "vcounter_getPut",
+    "vcounter_putGet",
+    "vcounter_not_putPut",
+    "comp_wellBehaved",
+    "comp_assoc_view",
+    "comp_assoc_complement",
+    "celsius_not_getPut",
+    "collision_not_both_roundtrip",
+    "roundTrip_first_hides_collision",
+    "collision_first_names_it",
+    "lossy_in_place_refused"
+  ],
+  "permitted_axioms": ["propext", "Quot.sound", "Classical.choice"]
+}

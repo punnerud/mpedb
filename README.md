@@ -509,7 +509,15 @@ against "dump everything" and against uniform polling is
 **[PYSPELL-RRETL.md](PYSPELL-RRETL.md)** — reversible transforms once the
 data is in: lens pairs verified against a probe corpus, in-place column
 transforms that can be reverted or put back onto edits, and table-set maps
-that keep two shapes in sync both ways.
+that keep two shapes in sync both ways. The core of that design — the lens,
+the two round-trip laws, and the refusal of an in-place lossy run
+(DESIGN-RRETL §§2–4) — is checked in Lean. [lean/rretl/README.md](lean/rretl/README.md)
+records the green `lake comparator --config kernel.json` run: 23 theorems
+about `Kernel.lean` alone. That is a proof of the model, not of
+`crates/mpedb/src/rretl.rs`. The stage model (framing, putback, the named
+sync-table rows, the parameter, the identity preimage) is a separate, larger
+check in the same directory. Two maps sharing one source is a Rust test, not
+a Lean theorem.
 
 **[design/DESIGN-MPEDBFS.md](design/DESIGN-MPEDBFS.md)** — `mpedbfs` mounts
 what the database already holds as ordinary paths, read-only, for the

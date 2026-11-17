@@ -1004,6 +1004,101 @@ fn the_journal_carries_deletes_from_both_sides() {
     assert_eq!(ints(&d, "SELECT id FROM customers ORDER BY id"), vec![1]);
 }
 
+/// Two maps, one source, two targets. Each sync sees only its own pair.
+/// A source edit fans out through two syncs; a target edit comes home and
+/// then out the other map; edits on both targets conflict on the second
+/// sync, which writes nothing. Shared target, reverse map, and a chain are
+/// refused by name.
+#[test]
+fn two_maps_share_a_source_and_fan_out() {
+    let (d, _s) = db("star");
+    d.query("CREATE TABLE canon (id INTEGER PRIMARY KEY, n ANY)", &[])
+        .unwrap();
+    d.query("INSERT INTO canon (id, n) VALUES (1, 10)", &[]).unwrap();
+    define_pairs(&d);
+    let arm = |name: &str, target: &str, pair: &str| {
+        format!(
+            "[map]\nname = \"{name}\"\n[[map.table]]\nsource = \"canon\"\n\
+             target = \"{target}\"\n  [[map.table.column]]\n  source = \"n\"\n  \
+             target = \"n\"\n{pair}"
+        )
+    };
+    d.rretl_map_define(&arm("left", "left_n", "  pair = \"neg\"\n")).unwrap();
+    d.rretl_map_define(&arm("right", "right_n", "")).unwrap();
+
+    let r = d.rretl_map_sync("left").unwrap();
+    assert_eq!(r.created_b, 1, "{r:?}");
+    assert_eq!(ints(&d, "SELECT n FROM left_n"), vec![-10]);
+    let r = d.rretl_map_sync("right").unwrap();
+    assert_eq!(r.created_b, 1, "{r:?}");
+    assert_eq!(ints(&d, "SELECT n FROM right_n"), vec![10]);
+    assert_eq!(d.rretl_map_sync("left").unwrap().changed_total(), 0);
+    assert_eq!(d.rretl_map_sync("right").unwrap().changed_total(), 0);
+
+    // A source edit reaches both targets, each through its own pair.
+    d.query("UPDATE canon SET n = 4 WHERE id = 1", &[]).unwrap();
+    assert_eq!(d.rretl_map_sync("left").unwrap().a_to_b, 1);
+    assert_eq!(ints(&d, "SELECT n FROM left_n"), vec![-4]);
+    assert_eq!(d.rretl_map_sync("right").unwrap().a_to_b, 1);
+    assert_eq!(ints(&d, "SELECT n FROM right_n"), vec![4]);
+    assert_eq!(d.rretl_map_sync("left").unwrap().changed_total(), 0);
+    assert_eq!(d.rretl_map_sync("right").unwrap().changed_total(), 0);
+
+    // A right-side edit comes home, then out through the other map.
+    d.query("UPDATE right_n SET n = 7 WHERE id = 1", &[]).unwrap();
+    assert_eq!(d.rretl_map_sync("right").unwrap().b_to_a, 1);
+    assert_eq!(ints(&d, "SELECT n FROM canon"), vec![7]);
+    assert_eq!(d.rretl_map_sync("left").unwrap().a_to_b, 1);
+    assert_eq!(ints(&d, "SELECT n FROM left_n"), vec![-7]);
+    assert_eq!(d.rretl_map_sync("left").unwrap().changed_total(), 0);
+    assert_eq!(d.rretl_map_sync("right").unwrap().changed_total(), 0);
+
+    // Both targets move. The first sync writes the source. The second
+    // sees that write plus its own edit, conflicts, and leaves every
+    // table as the first sync left it.
+    d.query("UPDATE left_n SET n = -1 WHERE id = 1", &[]).unwrap();
+    d.query("UPDATE right_n SET n = 99 WHERE id = 1", &[]).unwrap();
+    assert_eq!(d.rretl_map_sync("left").unwrap().b_to_a, 1);
+    assert_eq!(ints(&d, "SELECT n FROM canon"), vec![1]);
+    let e = d.rretl_map_sync("right").unwrap_err().to_string();
+    assert!(
+        e.contains("CONFLICT") && e.contains("right_n") && e.contains("both sides changed"),
+        "{e}"
+    );
+    assert_eq!(ints(&d, "SELECT n FROM canon"), vec![1]);
+    assert_eq!(ints(&d, "SELECT n FROM left_n"), vec![-1]);
+    assert_eq!(ints(&d, "SELECT n FROM right_n"), vec![99]);
+    assert_eq!(d.rretl_map_sync("left").unwrap().changed_total(), 0);
+    // The rolled-back sync did not adopt 99. Restoring the last synced
+    // right value leaves only the source move, which then fans out.
+    d.query("UPDATE right_n SET n = 7 WHERE id = 1", &[]).unwrap();
+    assert_eq!(d.rretl_map_sync("right").unwrap().a_to_b, 1);
+    assert_eq!(ints(&d, "SELECT n FROM canon"), vec![1]);
+    assert_eq!(ints(&d, "SELECT n FROM right_n"), vec![1]);
+
+    let maps = d.rretl_maps().unwrap();
+    let bad = |toml: &str, needle: &str| {
+        let e = d.rretl_map_define(toml).unwrap_err().to_string();
+        assert!(e.contains(needle), "wanted `{needle}` in: {e}");
+        assert!(e.contains("loop safety is per map"), "{e}");
+    };
+    bad(
+        &arm("share", "left_n", ""),
+        "`left_n` is its target, but map `left` already uses that table as its target",
+    );
+    bad(
+        "[map]\nname = \"rev\"\n[[map.table]]\nsource = \"left_n\"\n\
+         target = \"canon\"\n  [[map.table.column]]\n  source = \"n\"\n  target = \"n\"\n",
+        "`canon` is its target, but map `left` already uses that table as its source",
+    );
+    bad(
+        "[map]\nname = \"chain\"\n[[map.table]]\nsource = \"left_n\"\n\
+         target = \"far\"\n  [[map.table.column]]\n  source = \"n\"\n  target = \"n\"\n",
+        "`left_n` is its source, but map `left` already uses that table as its target",
+    );
+    assert_eq!(d.rretl_maps().unwrap(), maps);
+}
+
 /// The chunk override must be visible to THIS thread and no other.
 ///
 /// `cargo test` runs a file's tests as threads in one process, so the old
