@@ -145,10 +145,11 @@ fn ingest_spec_toml(spec: &Bound<'_, PyAny>) -> PyResult<String> {
             })?;
             only_keys(bd, &["profile", "window_secs", "calls", "bytes"], "budget")?;
             out.push_str("\n[[source.budget]]\n");
-            for k in ["profile"] {
-                if let Some(v) = bd.get_item(k)?.and_then(|v| v.extract::<String>().ok()) {
-                    out.push_str(&format!("{k} = \"{v}\"\n"));
-                }
+            if let Some(v) = bd
+                .get_item("profile")?
+                .and_then(|v| v.extract::<String>().ok())
+            {
+                out.push_str(&format!("profile = \"{v}\"\n"));
             }
             for k in ["window_secs", "calls", "bytes"] {
                 if let Some(v) = bd.get_item(k)?.and_then(|v| v.extract::<i64>().ok()) {
