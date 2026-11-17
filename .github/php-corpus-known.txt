@@ -1,9 +1,12 @@
 # PHP's own sqlite corpus: the tests that fail under the shim and PASS under
 # stock sqlite. CI measures this on every run against the php-src tag matching
-# the runner's interpreter — php-8.3.6 as of writing: 133 tests from
-# ext/pdo_sqlite and ext/sqlite3, plus the shared PDO suite that
-# pdo_sqlite/tests/common.phpt redirects into, 217 executed in all. Stock
-# sqlite fails zero of them.
+# the runner's interpreter. ubuntu-latest's php-cli is 8.5.4 as of the run
+# that added the PHP 8.5 groups below: 153 top-level sqlite tests collected,
+# 297 executed once subclasses and the shared PDO suite are counted. Stock
+# sqlite fails zero of them. The groups before "PHP 8.5 explain mode" were
+# first measured on php-8.3.6 and still fail on 8.5, except
+# pdo_fetch_func_001.phpt, which passes on both engines under 8.5 and is
+# not listed.
 #
 # A test reached through that redirect is reported under the directory that
 # redirected to it, so the four bug_* entries below name ext/pdo_sqlite/tests
@@ -46,7 +49,6 @@ ext/pdo_sqlite/tests/bug38334.phpt
 ext/pdo_sqlite/tests/bug_34630.phpt
 ext/pdo_sqlite/tests/bug_36798.phpt
 ext/pdo_sqlite/tests/common.phpt
-ext/pdo_sqlite/tests/pdo_fetch_func_001.phpt
 ext/pdo_sqlite/tests/pdo_sqlite_filename_uri.phpt
 ext/pdo_sqlite/tests/pdo_sqlite_transaction.phpt
 #
@@ -62,3 +64,33 @@ ext/pdo_sqlite/tests/pdo_sqlite_transaction.phpt
 #   no VDBE listing, and its plan text is its own. Both pass on stock sqlite.
 ext/sqlite3/tests/sqlite3_explain.phpt
 ext/pdo_sqlite/tests/subclasses/pdo_sqlite_getsetattr_explain.phpt
+#
+#   PHP 8.5 column names. sqlite keeps the source text of the expression
+#   (`strtoupper("test")`, `S(a)`). mpedb renders its own (`strtoupper('test')`,
+#   `s(a)`). The values under those names match: TEST, and the two aggregates
+#   1,3,6,10,14 and -1,-3,-6,-10,-14.
+ext/pdo_sqlite/tests/subclasses/pdo_sqlite_createafunction_trampoline.phpt
+ext/pdo_sqlite/tests/subclasses/pdo_sqlite_createaggregate_trampoline.phpt
+#
+#   Collation callback count. ORDER BY s COLLATE NAT on a1/a10/a2 calls the
+#   collation once more than sqlite does. The first row is still a1.
+ext/pdo_sqlite/tests/subclasses/pdo_sqlite_createcollation_trampoline.phpt
+#
+#   One writer lock. A deferred transaction already locks the database, so a
+#   second connection's BEGIN IMMEDIATE is "database is locked" (code 5) where
+#   sqlite still says it is not. Immediate and exclusive contention is the
+#   same code 5; sqlite reports code 6 and distinguishes "database table is
+#   locked" from "database schema is locked: main".
+ext/pdo_sqlite/tests/subclasses/pdo_sqlite_transaction_mode.phpt
+#
+#   Authorizer arguments, not a wrong row. SQLITE_SELECT is reported with
+#   database name "main" where sqlite passes none (`,,,`). A second READ of
+#   the same column is not raised. DROP TABLE is one DROP_TABLE action;
+#   sqlite also walks sqlite_master (DELETE, READ of tbl_name and type,
+#   UPDATE of rootpage). Those catalog steps are sqlite's, and the shim does
+#   not invent them.
+ext/pdo_sqlite/tests/subclasses/pdosqlite_setauthorizer.phpt
+#
+#   Invalid UTF-8 SQL. gh13952 quotes byte 0x80 and selects the literal back.
+#   mpedb refuses the statement: "SQL is not valid UTF-8". Loud, before any row.
+ext/pdo_sqlite/tests/gh13952.phpt
