@@ -286,7 +286,10 @@ jobs:
           # directory that redirected — ext/pdo_sqlite/tests/bug_34630.phpt —
           # while the file itself lives in ext/pdo/tests. List it under the name
           # it is reported by, or four real known failures read as brand new.
-          (cd corpus && ls ext/pdo_sqlite/tests/*.phpt ext/sqlite3/tests/*.phpt \
+          # Recursive: PHP 8.5 keeps explain-mode tests under tests/subclasses,
+          # and run-tests.php walks that directory. A top-level glob would
+          # leave a real failure out of `known.txt`'s comparison.
+          (cd corpus && find ext/pdo_sqlite/tests ext/sqlite3/tests -name '*.phpt' \
              && ls ext/pdo/tests/*.phpt | sed 's|^ext/pdo/|ext/pdo_sqlite/|') | sort > present.txt
           comm -12 known-all.txt present.txt > known.txt
           ABSENT=$(comm -23 known-all.txt present.txt | wc -l)

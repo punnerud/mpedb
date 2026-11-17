@@ -358,6 +358,11 @@ pub struct Stmt {
     /// the statement owns for its whole life, so it cannot be a temporary.
     /// Built once on first ask.
     sql_c: Option<Vec<u8>>,
+    /// sqlite's explain setting (`sqlite3_stmt_isexplain`): `0` ordinary,
+    /// `1` EXPLAIN, `2` EXPLAIN QUERY PLAN. Seeded from the prepared text
+    /// and changed by `sqlite3_stmt_explain` without rewriting `sql`, which
+    /// is what `sqlite3_sql` keeps handing back.
+    explain_mode: i32,
     rows: Vec<Vec<Value>>,
     /// Index of the NEXT row to yield; the current row is `pos - 1`.
     pos: usize,

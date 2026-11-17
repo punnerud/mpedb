@@ -124,6 +124,8 @@ Coverage note: the busy budget bounds every `Database` facade write entry; the s
 | `sqlite3_db_handle` | ✅ | The `sqlite3*` that prepared a statement |
 | `sqlite3_stmt_readonly` | ✅ | 1 for SELECT / transaction-control / blank, else 0 |
 | `sqlite3_stmt_busy` | ✅ | 1 while a statement is mid-iteration |
+| `sqlite3_stmt_isexplain` | ✅ | 0 ordinary, 1 `EXPLAIN`, 2 `EXPLAIN QUERY PLAN`, including a mode set after prepare. NULL statement → 0 |
+| `sqlite3_stmt_explain` | 🚧 | Switches that mode and reprepares the next step without rewriting `sqlite3_sql`. Mode 2 is the existing four-column plan. Mode 1 is mpedb's plan text in one column, not sqlite's VDBE opcode listing. Refused while the statement is mid-iteration. Bindings are kept |
 | `sqlite3_expanded_sql` | ✅ | Substitutes each bound parameter as a SQL literal (quote/comment aware — a `$K` inside a string or comment is untouched; text `'`-escaped, blobs `X'…'`, NULL/int/float/timestamp rendered); `sqlite3_free`-able |
 | `sqlite3_interrupt` | 🚧 | Sets an atomic flag (safe to call from another thread) polled at step entry and during the busy-retry wait → the interrupted statement returns `SQLITE_INTERRUPT` and clears the flag. mpedb materializes a result synchronously, so there is no mid-scan yield point; a runaway scan is bounded instead by the per-statement runtime budget (#74) |
 

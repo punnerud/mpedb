@@ -160,3 +160,59 @@ fn authorizer_sees_writes_and_ddl_and_denies_with_sqlites_two_messages() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// `sqlite3_stmt_explain` switches what the next step runs and leaves
+/// `sqlite3_sql` alone. Mode 1 must not apply the write. Mode 2 is the
+/// four-column plan. A mode change while a row is waiting is refused.
+#[test]
+fn stmt_explain_switches_mode_without_writing_or_rewriting_sql() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (a TEXT)"), SQLITE_OK);
+
+        let sql = cs("INSERT INTO t VALUES ('first')");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_stmt_isexplain(st), 0);
+        assert_eq!(sqlite3_stmt_explain(st, 1), SQLITE_OK);
+        assert_eq!(sqlite3_stmt_isexplain(st), 1);
+        let kept = CStr::from_ptr(sqlite3_sql(st)).to_string_lossy();
+        assert!(kept.to_ascii_lowercase().starts_with("insert"), "{kept}");
+        // Plan text, one column. The INSERT itself must not run.
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_count(st), 1);
+        while sqlite3_step(st) == SQLITE_ROW {}
+        sqlite3_finalize(st);
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t"), 0);
+
+        let sql = cs("SELECT * FROM t");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_stmt_explain(st, 2), SQLITE_OK);
+        assert_eq!(sqlite3_stmt_isexplain(st), 2);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_count(st), 4);
+        assert_eq!(col_name(st, 0), "id");
+        assert_eq!(col_name(st, 1), "parent");
+        assert_eq!(col_name(st, 2), "notused");
+        assert_eq!(col_name(st, 3), "detail");
+        assert_eq!(sqlite3_stmt_explain(st, 0), SQLITE_ERROR);
+        while sqlite3_step(st) == SQLITE_ROW {}
+        assert_eq!(sqlite3_stmt_explain(st, 0), SQLITE_OK);
+        assert_eq!(sqlite3_stmt_isexplain(st), 0);
+        assert_eq!(sqlite3_step(st), SQLITE_DONE);
+        let kept = CStr::from_ptr(sqlite3_sql(st)).to_string_lossy();
+        assert!(kept.to_ascii_lowercase().starts_with("select"), "{kept}");
+        sqlite3_finalize(st);
+
+        let sql = cs("EXPLAIN QUERY PLAN SELECT * FROM t");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_stmt_isexplain(st), 2);
+        sqlite3_finalize(st);
+
+        assert_eq!(sqlite3_stmt_isexplain(ptr::null_mut()), 0);
+        assert_eq!(sqlite3_stmt_explain(ptr::null_mut(), 0), SQLITE_MISUSE);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}

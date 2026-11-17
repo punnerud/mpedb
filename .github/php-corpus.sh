@@ -63,13 +63,13 @@ fi
 # baseline reporting "Tests failed: 0" produced two failing test names, both of
 # them tests that are SUPPOSED to fail.
 sed -n '/^FAILED TEST SUMMARY/,/^====/p' "$LOG" \
-  | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_.-]+\.phpt' | sort -u > "$FAILS" || true
+  | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_./-]+\.phpt' | sort -u > "$FAILS" || true
 
 # A test whose SKIPIF block bails leaves the comparison without a verdict, and
 # a skip reads as silence, not as a difference. Record them so the caller can
 # see whether the two runs judged the same set of tests.
 grep '^SKIP ' "$LOG" \
-  | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_.-]+\.phpt' | sort -u > "${FAILS%.txt}-skipped.txt" || true
+  | grep -oE 'ext/[a-z0-9_]+/tests/[A-Za-z0-9_./-]+\.phpt' | sort -u > "${FAILS%.txt}-skipped.txt" || true
 
 # Check every list we derived against the count run-tests printed itself. A
 # pattern that matches nothing yields an empty file, and an empty file is

@@ -54,3 +54,11 @@ ext/pdo_sqlite/tests/pdo_sqlite_transaction.phpt
 #   was a no-op, so sqlite3_errcode() gave 19 where sqlite gives 1555. Fixed;
 #   both tests pass. Left as a note because "coarser, never wrong" is the kind
 #   of gap that stays put until someone writes down what it costs.)
+#
+#   PHP 8.5 explain mode. The shim switches it (`sqlite3_stmt_explain`):
+#   EXPLAIN QUERY PLAN is the four-column plan, and a bare EXPLAIN is
+#   mpedb's plan text. These tests assert sqlite's VDBE opcode names
+#   (Init, String8, Insert, …) and the detail string "SCAN t". mpedb has
+#   no VDBE listing, and its plan text is its own. Both pass on stock sqlite.
+ext/sqlite3/tests/sqlite3_explain.phpt
+ext/pdo_sqlite/tests/subclasses/pdo_sqlite_getsetattr_explain.phpt

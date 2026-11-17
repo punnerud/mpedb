@@ -202,6 +202,64 @@ pub fn explain_query_plan_body(sql: &str) -> Option<&str> {
     Some(rest)
 }
 
+/// Body of a bare `EXPLAIN <stmt>`, or `None` when this is not one.
+///
+/// `EXPLAIN QUERY PLAN` is not a bare EXPLAIN — [`explain_query_plan_body`]
+/// owns that spelling. `EXPLAINQUERY` is one identifier, so the keyword has
+/// to be followed by whitespace or by the end of the text.
+pub fn explain_body(sql: &str) -> Option<&str> {
+    if explain_query_plan_body(sql).is_some() {
+        return None;
+    }
+    let mut rest = strip_leading_trivia(sql).trim_start();
+    let n = rest
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_alphabetic())
+        .count();
+    if n == 0 || !rest[..n].eq_ignore_ascii_case("explain") {
+        return None;
+    }
+    rest = &rest[n..];
+    if !rest.is_empty() && !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+/// The statement with a leading `EXPLAIN` or `EXPLAIN QUERY PLAN` removed.
+pub fn without_explain(sql: &str) -> &str {
+    if let Some(body) = explain_query_plan_body(sql) {
+        return body;
+    }
+    if let Some(body) = explain_body(sql) {
+        return body;
+    }
+    sql
+}
+
+/// sqlite's explain setting applied to `sql`: `0` runs the statement, `1`
+/// prefixes `EXPLAIN`, `2` prefixes `EXPLAIN QUERY PLAN`. A prefix already
+/// on `sql` is replaced, not stacked.
+pub fn with_explain_mode(sql: &str, mode: i32) -> String {
+    let body = without_explain(sql);
+    match mode {
+        1 => format!("EXPLAIN {body}"),
+        2 => format!("EXPLAIN QUERY PLAN {body}"),
+        _ => body.to_string(),
+    }
+}
+
+/// `2` for `EXPLAIN QUERY PLAN`, `1` for a bare `EXPLAIN`, otherwise `0`.
+pub fn explain_mode_of(sql: &str) -> i32 {
+    if explain_query_plan_body(sql).is_some() {
+        2
+    } else if explain_body(sql).is_some() {
+        1
+    } else {
+        0
+    }
+}
+
 /// Per-constraint `… ON CONFLICT ROLLBACK` on a CREATE TABLE clause.
 ///
 /// Same ownership story as [`rewrite_insert_or_rollback`]: mpedb's schema

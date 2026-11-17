@@ -1289,7 +1289,12 @@ pub(super) fn run_stmt(s: &mut Stmt) -> c_int {
     let Some(c) = (unsafe { conn(s.db) }) else {
         return SQLITE_MISUSE;
     };
-    let is_dml = matches!(sql::classify(&s.sql), sql::Kind::Dml { .. });
+    // `sqlite3_stmt_explain` changes what runs without rewriting `s.sql`.
+    // Mode 0 is the statement itself (an `EXPLAIN` prefix already on the
+    // text is stripped); 1 and 2 put that prefix back on.
+    let run_sql = sql::with_explain_mode(&s.exec_sql, s.explain_mode);
+    let is_dml =
+        s.explain_mode == 0 && matches!(sql::classify(&run_sql), sql::Kind::Dml { .. });
     let params = s.binds.clone();
     // An interrupt requested before we start aborts this step and is consumed
     // (sqlite clears the flag when the interrupted statement finishes).
@@ -1300,7 +1305,10 @@ pub(super) fn run_stmt(s: &mut Stmt) -> c_int {
     // A read-only connection (`file:…?mode=ro`) refuses every statement that
     // could write. Transaction control is allowed (as sqlite does): the write
     // inside it is what gets refused.
-    if c.readonly && matches!(sql::classify(&s.sql), sql::Kind::Dml { .. } | sql::Kind::Ddl) {
+    if c.readonly
+        && s.explain_mode == 0
+        && matches!(sql::classify(&run_sql), sql::Kind::Dml { .. } | sql::Kind::Ddl)
+    {
         c.set_error(SQLITE_READONLY, SQLITE_READONLY, "attempt to write a readonly database");
         return SQLITE_READONLY;
     }
@@ -1322,7 +1330,7 @@ pub(super) fn run_stmt(s: &mut Stmt) -> c_int {
     // by the rewrite (only placeholders change), so they still use `s.sql`.
     let mut tries = 0u32;
     let outcome = loop {
-        match catch_unwind(AssertUnwindSafe(|| exec_one(c, &s.exec_sql, &params))) {
+        match catch_unwind(AssertUnwindSafe(|| exec_one(c, &run_sql, &params))) {
             Ok(Err(ref e)) if is_busy_err(e) && deadline.is_some_and(|d| Instant::now() < d) => {
                 // sqlite3_interrupt breaks the busy wait instead of sleeping on.
                 if c.interrupted.swap(false, Ordering::SeqCst) {

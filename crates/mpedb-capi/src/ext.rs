@@ -144,6 +144,60 @@ pub unsafe extern "C" fn sqlite3_stmt_readonly(p: *mut Stmt) -> c_int {
     }
 }
 
+/// sqlite's explain setting: 0 ordinary, 1 EXPLAIN, 2 EXPLAIN QUERY PLAN.
+/// A NULL statement is 0, matching sqlite.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_stmt_isexplain(p: *mut Stmt) -> c_int {
+    match stmt(p) {
+        Some(s) => s.explain_mode,
+        None => 0,
+    }
+}
+
+/// Change the explain setting. `sqlite3_sql` keeps the text that was
+/// prepared. Mode 1 runs mpedb's `EXPLAIN` (one column of plan text, not a
+/// VDBE opcode listing). Mode 2 runs the existing `EXPLAIN QUERY PLAN`
+/// reshape (id, parent, notused, detail). The statement must not be
+/// mid-iteration; bindings are kept.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_stmt_explain(p: *mut Stmt, mode: c_int) -> c_int {
+    let Some(s) = stmt(p) else {
+        return SQLITE_MISUSE;
+    };
+    if !(0..=2).contains(&mode) {
+        if let Some(c) = conn(s.db) {
+            c.set_error(SQLITE_MISUSE, SQLITE_MISUSE, "explain mode must be 0, 1, or 2");
+        }
+        return SQLITE_MISUSE;
+    }
+    // Same notion of "active" as `sqlite3_stmt_busy`: a row is waiting, or
+    // a previous step has not yet been consumed to the end.
+    if s.have_row || (s.executed && s.pos < s.rows.len()) {
+        if let Some(c) = conn(s.db) {
+            c.set_error(
+                SQLITE_ERROR,
+                SQLITE_ERROR,
+                "cannot change explain mode while a statement is active",
+            );
+        }
+        return SQLITE_ERROR;
+    }
+    if s.explain_mode == mode {
+        return SQLITE_OK;
+    }
+    s.explain_mode = mode;
+    s.executed = false;
+    s.rows.clear();
+    s.columns.clear();
+    s.col_name_c.clear();
+    s.decltype_c = None;
+    s.table_name_c = None;
+    s.cells.clear();
+    s.pos = 0;
+    s.have_row = false;
+    SQLITE_OK
+}
+
 /// Non-zero while the statement is mid-iteration (stepped, not yet done/reset).
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stmt_busy(p: *mut Stmt) -> c_int {
