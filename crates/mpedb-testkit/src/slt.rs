@@ -191,7 +191,7 @@ pub fn run_slt_file(path: &Path) -> Result<SltStats> {
                         other => (SortMode::No, Some(other.to_string())),
                     },
                 };
-                let (sql, expected) = parser.take_query_body().map_err(&fail)?;
+                let (sql, expected) = parser.take_query_body().map_err(fail)?;
                 if skip {
                     stats.skipped += 1;
                     continue;

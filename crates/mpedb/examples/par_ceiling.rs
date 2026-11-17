@@ -449,14 +449,14 @@ fn verify_snapshots(t: &Tmp, rows: usize, n: usize) {
     });
     let txn_of = |e: &mpedb_core::Engine| e.begin_read().unwrap().txn_id();
 
-    let t0 = sidecar.as_ref().map(&txn_of);
+    let t0 = sidecar.as_ref().map(txn_of);
     let mut streams: Vec<_> = bounds(rows, n)
         .into_iter()
         .map(|(lo, hi)| {
             t.db.stream_query(&hash, &[Value::Int(lo), Value::Int(hi)]).unwrap()
         })
         .collect();
-    let t1 = sidecar.as_ref().map(&txn_of);
+    let t1 = sidecar.as_ref().map(txn_of);
     match (t0, t1) {
         (Some(a), Some(b)) => {
             assert_eq!(a, b, "a commit slipped between the N stream opens");
