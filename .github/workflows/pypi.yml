@@ -144,7 +144,13 @@ jobs:
           test -x /usr/sbin/mariadbd
           sudo systemctl stop mariadb || true
           unloaded=0
-          for p in /etc/apparmor.d/mariadbd /etc/apparmor.d/usr.sbin.mariadbd; do
+          # The image ships MySQL first. Replacing it with MariaDB leaves
+          # /usr/sbin/mysqld enforced, and that profile is what still
+          # confines the server binary. mariadbd is the Ubuntu 26.04 name;
+          # usr.sbin.mariadbd is the older one.
+          for p in /etc/apparmor.d/mariadbd \
+                   /etc/apparmor.d/usr.sbin.mariadbd \
+                   /etc/apparmor.d/usr.sbin.mysqld; do
             if [ -f "$p" ]; then
               echo "unloading $p"
               sudo apparmor_parser -R "$p"
@@ -158,10 +164,13 @@ jobs:
           fi
           if sudo aa-status >/tmp/aa-status.txt 2>&1; then
             cat /tmp/aa-status.txt
+            # Profile entries only. The heading "N processes are in enforce
+            # mode" must not count, and neither must a name that merely
+            # contains the letters.
             if awk '
-              /in enforce mode/ {e=1}
-              /in complain mode/ {e=0}
-              e && /mariadbd|mysqld/ {found=1}
+              /profiles are in enforce mode/ {e=1; next}
+              /profiles are in complain mode/ {e=0}
+              e && $1 ~ /(^|\/)(mariadbd|mysqld)$/ {found=1}
               END {exit found ? 0 : 1}
             ' /tmp/aa-status.txt; then
               echo "a mariadb/mysql profile is still enforced"
