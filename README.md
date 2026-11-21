@@ -932,7 +932,10 @@ blobs, tmpfs) and wins from ~8 KiB; on macOS it currently LOSES below ~1 MiB
 (sparse preallocation makes each payload pwrite allocate APFS blocks), so
 the default differs per platform: **on by default at 16 KiB on Linux, off on
 macOS** — `extent_threshold_kb` in the config overrides either way (`0` =
-off). The 4 KiB cell and the macOS curve share one queued fix: per-commit
+off). Under `durability = "async"` the default is off on every
+platform: the payload is synced before the commit returns, and on a disk
+whose flush costs milliseconds that sync is the whole write (measured
+34 → 5 648 writes/s at 6 KB with it off; tmpfs hides this). The 4 KiB cell and the macOS curve share one queued fix: per-commit
 coalesced `pwritev`. See
 [benchmarks/head-to-head.md](benchmarks/head-to-head.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
 

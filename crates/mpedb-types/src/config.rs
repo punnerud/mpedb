@@ -531,7 +531,9 @@ struct RawDatabase {
     /// off. Absent = the PLATFORM default: 4 on Linux (coalesced
     /// pwrite made the 4 KiB cell win 1.7×), 32 on macOS (crossover ~16 KiB) (the sparse preallocation
     /// makes per-value pwrites lose at every measured size until the B4
-    /// coalescing levers land).
+    /// coalescing levers land). Under `durability = "async"` absent means
+    /// OFF on every platform: the extent path syncs the payload before the
+    /// commit returns, which is the wait `async` exists to avoid.
     #[serde(default)]
     extent_threshold_kb: Option<u64>,
     /// Put extent-sized payloads in `<path>.extents/` as content-named objects
@@ -912,6 +914,18 @@ fn raw_to_config(
                 extent_threshold: match db.extent_threshold_kb {
                     Some(0) => None,
                     Some(kb) => Some(kb as usize * 1024),
+                    // `async` says the client is acknowledged before the
+                    // sync. An extent's payload is msynced before the log
+                    // record that names it (DESIGN-BLOBEXTENT §7), so with
+                    // the platform default every value over the threshold
+                    // waited on the disk anyway. Measured 2026-11-21 on a
+                    // network volume whose flush is ~13 ms, one writer,
+                    // incompressible values, extents on -> off: 6 KB 34 ->
+                    // 5 648 writes/s, 64 KB 37 -> 223, 1 MiB 35 -> 61,
+                    // 4 MiB 9 -> 9. Off is never slower there, so absent
+                    // means off under `async`. An explicit
+                    // `extent_threshold_kb` still turns it on.
+                    None if durability == Durability::Async => None,
                     None => default_extent_threshold(),
                 },
                 external_extents: db.external_extents.unwrap_or(false),
