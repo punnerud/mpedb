@@ -39,7 +39,9 @@ def readFramed (bs : List Bool) : Option (List Bool × List Bool) :=
 
 /- § stage 2 putback. A kept row is inverted with its stored residual and
 admitted only when both PutRes halves hold. A deleted row stays deleted.
-An inserted residual row is the refused creation path. -/
+An inserted residual row is the refused creation path. This is one row.
+The design rolls the whole run back on the first refusal; there is no run
+here. -/
 
 inductive Row (Y C : Type)
   | kept (y : Y) (r : C)
@@ -76,7 +78,10 @@ def putbackBij {X Y : Type} [DecidableEq Y] (L : Lens X Y Unit) :
     if (L.forward x).1 = y then .carry x else .refusePutRes
 
 /- §13.2. One row, two sides. `unspecified` is every combination the
-design does not name; the theorems below cover only the named ones. -/
+design does not name; the theorems cover only the named ones. This is the
+decision table and nothing more: `changed` is an input bit, not a
+comparison against a recorded hash, and there is no push and no state row.
+A row that is absent ignores its own `changed` bit. -/
 
 structure Side where
   was : Bool
@@ -112,7 +117,8 @@ def classify (a b : Side) (bNewAllBijective lossyMovedOnB : Bool) : Sync :=
   else .unspecified
 
 /- §5.1. rRETL equality on the two float edges, not IEEE `==`.
-`±0` stay apart. Every `NaN` payload is one value. -/
+`±0` stay apart. Every `NaN` payload is one value. The table is written by
+hand to say that. It is not derived from 64-bit patterns. -/
 
 inductive Flt
   | negZero
@@ -161,9 +167,12 @@ A one-column key is `valueBits` and nothing else, so it stays the input
 `u64` count, then each `valueBits` with its own little-endian length.
 Blake3 is not in this model: the digest distinguishes two keys only
 because these byte strings differ, at the same trust as every other
-content hash in the engine. Tags `0`–`6` are the scalar `value_bits`
-tags. The debug arm that emits `0xff` for a non-scalar is not a stored
-key and is not in `Scalar`. -/
+content hash in the engine. `Scalar` is tags `0`–`9` of `value_bits`:
+every storable key type, `Date` (7), `Time` (8) and `Numeric` (9)
+included. Payloads are arbitrary byte lists; the fixed eight-byte width
+of the integer-like ones is not modelled and not needed. The one arm left
+out is the `0xff` debug arm, which today is `Value::List` only, a
+parameter value that is never stored and never a key. -/
 
 inductive Scalar
   | null
@@ -173,6 +182,9 @@ inductive Scalar
   | text (s : List UInt8)
   | blob (b : List UInt8)
   | timestamp (le : List UInt8)
+  | date (le : List UInt8)
+  | time (le : List UInt8)
+  | numeric (s : List UInt8)
 
 def valueBits : Scalar → List UInt8
   | .null => [0]
@@ -183,6 +195,9 @@ def valueBits : Scalar → List UInt8
   | .text s => 4 :: s
   | .blob b => 5 :: b
   | .timestamp le => 6 :: le
+  | .date le => 7 :: le
+  | .time le => 8 :: le
+  | .numeric s => 9 :: s
 
 def pow256 : Nat → Nat
   | 0 => 1
@@ -220,6 +235,9 @@ def parseScalar : List UInt8 → Option Scalar
   | 4 :: s => some (.text s)
   | 5 :: b => some (.blob b)
   | 6 :: le => some (.timestamp le)
+  | 7 :: le => some (.date le)
+  | 8 :: le => some (.time le)
+  | 9 :: s => some (.numeric s)
   | _ => none
 
 def decodeN : Nat → List UInt8 → Option (List Scalar)

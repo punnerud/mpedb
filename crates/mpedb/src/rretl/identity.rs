@@ -24,7 +24,8 @@ impl RowKey {
         if self.0.len() == 1 {
             return super::pk_ref(&self.0[0]);
         }
-        // 0xff is not a scalar value_bits tag. Framing prevents either a
+        // 0xff is not the tag of any storable value (`value_bits` gives
+        // every keyable type a tag in 0..=9). Framing prevents either a
         // scalar Blob or differently partitioned compound values colliding.
         let mut hash = blake3::Hasher::new();
         hash.update(&[0xff]);

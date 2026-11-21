@@ -24,7 +24,15 @@
     "collision_not_both_roundtrip",
     "roundTrip_first_hides_collision",
     "collision_first_names_it",
-    "lossy_in_place_refused"
+    "lossy_in_place_refused",
+    "roundTrip_first_never_collision",
+    "collision_first_always_names_it",
+    "collision_forces_roundTrip_failure",
+    "lens_collision_reports_roundTripFailed",
+    "getPut_putRes_on_image",
+    "succLens_getPut",
+    "succLens_not_putRes",
+    "succLens_injective_not_surjective"
   ],
   "permitted_axioms": ["propext", "Quot.sound", "Classical.choice"]
 }

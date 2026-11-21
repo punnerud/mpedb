@@ -99,3 +99,41 @@ theorem collision_first_names_it :
 
 theorem lossy_in_place_refused : admitInPlace .lossy = false := by
   sorry
+
+theorem roundTrip_first_never_collision (c f : Bool)
+    (h : c = true → f = true) :
+    diagnose true c f ≠ Report.collision := by
+  sorry
+
+theorem collision_first_always_names_it (f : Bool) :
+    diagnose false true f = Report.collision := by
+  sorry
+
+theorem collision_forces_roundTrip_failure {X Y C : Type} (L : Lens X Y C)
+    (x x' : X) (hne : x ≠ x') (hfwd : L.forward x = L.forward x') :
+    ¬ (invFun L (toFun L x) = x ∧ invFun L (toFun L x') = x') := by
+  sorry
+
+theorem lens_collision_reports_roundTripFailed {X Y C : Type} [DecidableEq X]
+    (L : Lens X Y C) (x x' : X) (hne : x ≠ x')
+    (hfwd : L.forward x = L.forward x') (c : Bool) :
+    diagnose true c
+        (!(decide (invFun L (toFun L x) = x) &&
+            decide (invFun L (toFun L x') = x'))) =
+      Report.roundTripFailed := by
+  sorry
+
+theorem getPut_putRes_on_image {X Y C : Type} (L : Lens X Y C)
+    (h : getPut L) (x : X) :
+    toFun L (invFun L (toFun L x)) = toFun L x := by
+  sorry
+
+theorem succLens_getPut : getPut succLens := by
+  sorry
+
+theorem succLens_not_putRes : ¬ putRes succLens := by
+  sorry
+
+theorem succLens_injective_not_surjective :
+    Injective (toFun succLens) ∧ ¬ Surjective (toFun succLens) := by
+  sorry

@@ -226,3 +226,105 @@ theorem identity_injective (vs vs' : List Scalar) (h : fits vs) (h' : fits vs')
 theorem compound_not_a_scalar_blob (vs : List Scalar) (h : vs.length ≠ 1) :
     identityPreimage vs ≠ valueBits (.blob (identityPreimage vs)) := by
   sorry
+
+theorem roundTrip_first_never_collision (c f : Bool)
+    (h : c = true → f = true) :
+    diagnose true c f ≠ Report.collision := by
+  sorry
+
+theorem collision_first_always_names_it (f : Bool) :
+    diagnose false true f = Report.collision := by
+  sorry
+
+theorem collision_forces_roundTrip_failure {X Y C : Type} (L : Lens X Y C)
+    (x x' : X) (hne : x ≠ x') (hfwd : L.forward x = L.forward x') :
+    ¬ (invFun L (toFun L x) = x ∧ invFun L (toFun L x') = x') := by
+  sorry
+
+theorem lens_collision_reports_roundTripFailed {X Y C : Type} [DecidableEq X]
+    (L : Lens X Y C) (x x' : X) (hne : x ≠ x')
+    (hfwd : L.forward x = L.forward x') (c : Bool) :
+    diagnose true c
+        (!(decide (invFun L (toFun L x) = x) &&
+            decide (invFun L (toFun L x') = x'))) =
+      Report.roundTripFailed := by
+  sorry
+
+theorem getPut_putRes_on_image {X Y C : Type} (L : Lens X Y C)
+    (h : getPut L) (x : X) :
+    toFun L (invFun L (toFun L x)) = toFun L x := by
+  sorry
+
+theorem succLens_getPut : getPut succLens := by
+  sorry
+
+theorem succLens_not_putRes : ¬ putRes succLens := by
+  sorry
+
+theorem succLens_injective_not_surjective :
+    Injective (toFun succLens) ∧ ¬ Surjective (toFun succLens) := by
+  sorry
+
+theorem putback_carry_pointwise {X Y C : Type} [DecidableEq Y] [DecidableEq C]
+    (L : Lens X Y C) (y : Y) (r : C)
+    (h : toFun L (invFun L (y, r)) = (y, r)) :
+    putbackRow L (.kept y r) = .carry (invFun L (y, r)) := by
+  sorry
+
+theorem putback_carry_iff {X Y C : Type} [DecidableEq Y] [DecidableEq C]
+    (L : Lens X Y C) (y : Y) (r : C) :
+    (∃ x, putbackRow L (.kept y r) = .carry x) ↔
+      toFun L (invFun L (y, r)) = (y, r) := by
+  sorry
+
+theorem changed_a_pushes (nb lm : Bool) :
+    classify ⟨true, true, true⟩ ⟨true, true, false⟩ nb lm = .pushAtoB := by
+  sorry
+
+theorem changed_b_pushes_back (nb : Bool) :
+    classify ⟨true, true, false⟩ ⟨true, true, true⟩ nb false = .pushBtoA := by
+  sorry
+
+theorem new_b_all_bijective_inserts (ca cb lm : Bool) :
+    classify ⟨false, false, ca⟩ ⟨false, true, cb⟩ true lm = .pushBtoA := by
+  sorry
+
+theorem deleted_b_clean_a_deletes (cb nb lm : Bool) :
+    classify ⟨true, true, false⟩ ⟨true, false, cb⟩ nb lm = .deleteA := by
+  sorry
+
+theorem deleted_b_while_a_moved_conflicts (cb nb lm : Bool) :
+    classify ⟨true, true, true⟩ ⟨true, false, cb⟩ nb lm = .conflict := by
+  sorry
+
+theorem echo_guard_all (nb lm : Bool) :
+    classify ⟨true, true, false⟩ ⟨true, true, false⟩ nb lm = .skip := by
+  sorry
+
+theorem both_moved_conflict_all (nb lm : Bool) :
+    classify ⟨true, true, true⟩ ⟨true, true, true⟩ nb lm = .conflict := by
+  sorry
+
+theorem lossy_b_edit_refused_all (nb : Bool) :
+    classify ⟨true, true, false⟩ ⟨true, true, true⟩ nb true = .refuseLossy := by
+  sorry
+
+theorem new_b_creation_refused_all (ca cb lm : Bool) :
+    classify ⟨false, false, ca⟩ ⟨false, true, cb⟩ false lm = .refuseCreation := by
+  sorry
+
+theorem new_a_pushes_all (ca cb nb lm : Bool) :
+    classify ⟨false, true, ca⟩ ⟨false, false, cb⟩ nb lm = .pushAtoB := by
+  sorry
+
+theorem both_deleted_clears_all (ca cb nb lm : Bool) :
+    classify ⟨true, false, ca⟩ ⟨true, false, cb⟩ nb lm = .clear := by
+  sorry
+
+theorem deleted_clean_other_deletes_all (ca nb lm : Bool) :
+    classify ⟨true, false, ca⟩ ⟨true, true, false⟩ nb lm = .deleteB := by
+  sorry
+
+theorem deleted_while_other_moved_conflicts_all (ca nb lm : Bool) :
+    classify ⟨true, false, ca⟩ ⟨true, true, true⟩ nb lm = .conflict := by
+  sorry

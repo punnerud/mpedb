@@ -262,3 +262,73 @@ theorem compound_not_a_scalar_blob (vs : List Scalar) (h : vs.length ≠ 1) :
   rw [hblob] at hhead
   injection hhead with h5
   simp at h5
+
+theorem putback_carry_pointwise {X Y C : Type} [DecidableEq Y] [DecidableEq C]
+    (L : Lens X Y C) (y : Y) (r : C)
+    (h : toFun L (invFun L (y, r)) = (y, r)) :
+    putbackRow L (.kept y r) = .carry (invFun L (y, r)) := by
+  simp [putbackRow, h]
+
+theorem putback_carry_iff {X Y C : Type} [DecidableEq Y] [DecidableEq C]
+    (L : Lens X Y C) (y : Y) (r : C) :
+    (∃ x, putbackRow L (.kept y r) = .carry x) ↔
+      toFun L (invFun L (y, r)) = (y, r) := by
+  constructor
+  · intro ⟨x, hx⟩
+    by_cases h : toFun L (invFun L (y, r)) = (y, r)
+    · exact h
+    · simp [putbackRow, h] at hx
+  · intro h
+    exact ⟨invFun L (y, r), putback_carry_pointwise L y r h⟩
+
+theorem changed_a_pushes (nb lm : Bool) :
+    classify ⟨true, true, true⟩ ⟨true, true, false⟩ nb lm = .pushAtoB := by
+  cases nb <;> cases lm <;> rfl
+
+theorem changed_b_pushes_back (nb : Bool) :
+    classify ⟨true, true, false⟩ ⟨true, true, true⟩ nb false = .pushBtoA := by
+  cases nb <;> rfl
+
+theorem new_b_all_bijective_inserts (ca cb lm : Bool) :
+    classify ⟨false, false, ca⟩ ⟨false, true, cb⟩ true lm = .pushBtoA := by
+  cases ca <;> cases cb <;> cases lm <;> rfl
+
+theorem deleted_b_clean_a_deletes (cb nb lm : Bool) :
+    classify ⟨true, true, false⟩ ⟨true, false, cb⟩ nb lm = .deleteA := by
+  cases cb <;> cases nb <;> cases lm <;> rfl
+
+theorem deleted_b_while_a_moved_conflicts (cb nb lm : Bool) :
+    classify ⟨true, true, true⟩ ⟨true, false, cb⟩ nb lm = .conflict := by
+  cases cb <;> cases nb <;> cases lm <;> rfl
+
+theorem echo_guard_all (nb lm : Bool) :
+    classify ⟨true, true, false⟩ ⟨true, true, false⟩ nb lm = .skip := by
+  cases nb <;> cases lm <;> rfl
+
+theorem both_moved_conflict_all (nb lm : Bool) :
+    classify ⟨true, true, true⟩ ⟨true, true, true⟩ nb lm = .conflict := by
+  cases nb <;> cases lm <;> rfl
+
+theorem lossy_b_edit_refused_all (nb : Bool) :
+    classify ⟨true, true, false⟩ ⟨true, true, true⟩ nb true = .refuseLossy := by
+  cases nb <;> rfl
+
+theorem new_b_creation_refused_all (ca cb lm : Bool) :
+    classify ⟨false, false, ca⟩ ⟨false, true, cb⟩ false lm = .refuseCreation := by
+  cases ca <;> cases cb <;> cases lm <;> rfl
+
+theorem new_a_pushes_all (ca cb nb lm : Bool) :
+    classify ⟨false, true, ca⟩ ⟨false, false, cb⟩ nb lm = .pushAtoB := by
+  cases ca <;> cases cb <;> cases nb <;> cases lm <;> rfl
+
+theorem both_deleted_clears_all (ca cb nb lm : Bool) :
+    classify ⟨true, false, ca⟩ ⟨true, false, cb⟩ nb lm = .clear := by
+  cases ca <;> cases cb <;> cases nb <;> cases lm <;> rfl
+
+theorem deleted_clean_other_deletes_all (ca nb lm : Bool) :
+    classify ⟨true, false, ca⟩ ⟨true, true, false⟩ nb lm = .deleteB := by
+  cases ca <;> cases nb <;> cases lm <;> rfl
+
+theorem deleted_while_other_moved_conflicts_all (ca nb lm : Bool) :
+    classify ⟨true, false, ca⟩ ⟨true, true, true⟩ nb lm = .conflict := by
+  cases ca <;> cases nb <;> cases lm <;> rfl

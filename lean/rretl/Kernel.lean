@@ -68,6 +68,14 @@ def drift : Lens Nat Nat Nat where
   forward x := (x, 0)
   inverse y _ := y
 
+/- §4. An injective forward that is not surjective. GetPut holds, so the
+round trip over any corpus is clean. PutRes fails at `0`, which is outside
+the image: this is the edit putback has to refuse. -/
+
+def succLens : Lens Nat Nat Unit where
+  forward n := (n + 1, ())
+  inverse y _ := y - 1
+
 /- PutRes does not imply GetPut. -/
 
 def collapse : Lens Bool Unit Unit where
@@ -116,7 +124,10 @@ def celsius : Lens Int Int Unit where
 
 /- §4. Two inputs that forward to one value cannot both round-trip, so a
 checker that stops at the first failed round trip never reaches a separate
-collision arm. `diagnose` is that order, as a pure function of the two bits. -/
+collision arm. `diagnose` is that order, as a pure function of the two bits.
+The bits are free here: `roundTrip_first_never_collision` takes "a collision
+implies a failed round trip" as a hypothesis, and
+`lens_collision_reports_roundTripFailed` discharges it from a `Lens`. -/
 
 inductive Report
   | ok

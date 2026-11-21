@@ -239,8 +239,25 @@ pub(crate) fn value_bits(v: &Value) -> Vec<u8> {
             out.push(6);
             out.extend_from_slice(&t.to_le_bytes());
         }
-        // Unreachable for a stored function's scalar result and never in the
-        // probe corpus; kept total rather than panicking.
+        // Date, Time and Numeric are storable and keyable, so they are
+        // scalars with tags of their own. They used to fall into the arm
+        // below, whose 0xff is also the first byte of a compound key's
+        // frame (`RowKey::reference`), and whose payload was derived
+        // `Debug` text that nothing proves injective.
+        Value::Date(d) => {
+            out.push(7);
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Time(t) => {
+            out.push(8);
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Numeric(text) => {
+            out.push(9);
+            out.extend_from_slice(text.as_bytes());
+        }
+        // What is left is `Value::List`, a parameter value that is never
+        // stored and never a key. Kept total rather than panicking.
         other => {
             out.push(0xff);
             out.extend_from_slice(format!("{other:?}").as_bytes());
@@ -1043,6 +1060,19 @@ mod tests {
         // Int(1) and Timestamp(1) share their payload bytes and must not share a key.
         assert_ne!(value_bits(&Value::Int(1)), value_bits(&Value::Timestamp(1)));
         assert_ne!(value_bits(&Value::Text("a".into())), value_bits(&Value::Blob(vec![b'a'])));
+        // Date and Time are an i64 like Int and Timestamp, and Numeric is text.
+        // Each has its own tag, and none of them starts with the compound
+        // frame's 0xff.
+        let one = [Value::Int(1), Value::Timestamp(1), Value::Date(1), Value::Time(1)];
+        for (i, a) in one.iter().enumerate() {
+            for b in &one[i + 1..] {
+                assert_ne!(value_bits(a), value_bits(b));
+            }
+        }
+        assert_ne!(value_bits(&Value::Numeric("1".into())), value_bits(&Value::Text("1".into())));
+        for v in one.iter().chain([&Value::Numeric("1.5".into())]) {
+            assert_ne!(value_bits(v)[0], 0xff);
+        }
     }
 
     #[test]

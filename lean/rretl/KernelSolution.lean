@@ -149,3 +149,59 @@ theorem collision_first_names_it :
     diagnose false true true = Report.collision := rfl
 
 theorem lossy_in_place_refused : admitInPlace .lossy = false := rfl
+
+theorem roundTrip_first_never_collision (c f : Bool)
+    (h : c = true → f = true) :
+    diagnose true c f ≠ Report.collision := by
+  cases c <;> cases f <;> simp [diagnose] at h ⊢
+
+theorem collision_first_always_names_it (f : Bool) :
+    diagnose false true f = Report.collision := by
+  cases f <;> rfl
+
+theorem collision_forces_roundTrip_failure {X Y C : Type} (L : Lens X Y C)
+    (x x' : X) (hne : x ≠ x') (hfwd : L.forward x = L.forward x') :
+    ¬ (invFun L (toFun L x) = x ∧ invFun L (toFun L x') = x') :=
+  fun h => hne (collision_not_both_roundtrip L x x' hfwd h.1 h.2)
+
+theorem lens_collision_reports_roundTripFailed {X Y C : Type} [DecidableEq X]
+    (L : Lens X Y C) (x x' : X) (hne : x ≠ x')
+    (hfwd : L.forward x = L.forward x') (c : Bool) :
+    diagnose true c
+        (!(decide (invFun L (toFun L x) = x) &&
+            decide (invFun L (toFun L x') = x'))) =
+      Report.roundTripFailed := by
+  have h := collision_forces_roundTrip_failure L x x' hne hfwd
+  have hb : (!(decide (invFun L (toFun L x) = x) &&
+      decide (invFun L (toFun L x') = x'))) = true := by
+    cases h1 : decide (invFun L (toFun L x) = x)
+    · rfl
+    · cases h2 : decide (invFun L (toFun L x') = x')
+      · rfl
+      · exact absurd ⟨of_decide_eq_true h1, of_decide_eq_true h2⟩ h
+  rw [hb]
+  rfl
+
+theorem getPut_putRes_on_image {X Y C : Type} (L : Lens X Y C)
+    (h : getPut L) (x : X) :
+    toFun L (invFun L (toFun L x)) = toFun L x :=
+  congrArg (toFun L) (h x)
+
+theorem succLens_getPut : getPut succLens := by
+  intro x
+  simp [toFun, invFun, succLens]
+
+theorem succLens_not_putRes : ¬ putRes succLens := by
+  intro h
+  have := h 0 ()
+  simp [toFun, invFun, succLens] at this
+
+theorem succLens_injective_not_surjective :
+    Injective (toFun succLens) ∧ ¬ Surjective (toFun succLens) := by
+  constructor
+  · intro a b h
+    simp [toFun, succLens] at h
+    exact h
+  · intro h
+    obtain ⟨x, hx⟩ := h (0, ())
+    simp [toFun, succLens] at hx
