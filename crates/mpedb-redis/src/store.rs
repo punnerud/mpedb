@@ -939,10 +939,10 @@ fn shard_config(path: &Path, opts: &StoreOptions) -> Result<Config, StoreError> 
     // Under `wal` the engine's default is 4 KiB, and a batch then pays an
     // msync of the data file on top of the log's fdatasync. Measured
     // 2026-11-21, eight writers, incompressible values, a volume whose flush
-    // is ~5 ms, extents at 4 KiB against off: 7 KB 211 -> 723-845 writes/s,
-    // 64 KB 177-229 -> 311-360, 120 KB 206-221 -> 212-232, 250 KB 163-173 ->
-    // 114-122, 500 KB 86-111 -> 55-61. Small values belong in the log record
-    // and large ones do not, and 64 KiB is below where the two cross.
+    // is ~5 ms, extents at 4 KiB against off: 7 KB 401-427 -> 751-794
+    // writes/s, 64 KB 301-351 -> 310-332, 120 KB 265-269 -> 213-215, 250 KB
+    // 172-194 -> 92-105, 500 KB 80-119 -> 62-67. Small values belong in the
+    // log record and large ones do not, and the two cross near 64 KB.
     let extents = match opts.durability.as_str() {
         "wal" => "extent_threshold_kb = 64\n",
         _ => "",

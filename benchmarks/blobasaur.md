@@ -10,8 +10,9 @@ repetitions of that pair on one machine. The harness is
 [`blobasaur/results-2026-11-21.tsv`](blobasaur/results-2026-11-21.tsv) and the
 flush probe is
 [`blobasaur/fsync-probe-2026-11-21.tsv`](blobasaur/fsync-probe-2026-11-21.tsv).
-An earlier run the same day, before the two changes described under "What
-this page changed in mpedb", is kept beside them as `…-before.tsv`.
+Two earlier runs the same day are kept beside them: `…-run1.tsv` is before
+the last three changes under "What this page changed in mpedb", and
+`…-run2.tsv` is before the last one.
 
 ## What the article published
 
@@ -49,10 +50,10 @@ after each one:
 
 | when | p50 | p99 |
 |---|---|---|
-| before | 4.6 ms | 7.5 ms |
-| after repetition 1 | 4.6 ms | 8.5 ms |
-| after repetition 2 | 4.9 ms | 12.4 ms |
-| after repetition 3 | 4.7 ms | 10.0 ms |
+| before | 4.9 ms | 12.4 ms |
+| after repetition 1 | 4.9 ms | 10.6 ms |
+| after repetition 2 | 4.7 ms | 11.3 ms |
+| after repetition 3 | 5.0 ms | 10.9 ms |
 
 One flush is about 5 ms, so one writer that flushes once per write cannot
 pass about 200 writes a second here. The probe is also the null control: it
@@ -118,12 +119,12 @@ Two commands, because the servers hash different bytes:
 
 | files | Blobasaur `normal` | Blobasaur `normal-b1` | mpedb `async` |
 |---|---|---|---|
-| 1 | 1 445 [1 308–1 490], p50 2.6 ms | 996 [961–1 016], p50 4.0 ms | **3 425** [3 270–3 491], p50 0.8 ms |
-| 2 | 1 429 [1 334–1 447], p50 2.2 ms | 1 062 [1 059–1 148], p50 2.9 ms | **3 247** [2 472–3 474], p50 0.9 ms |
+| 1 | 1 384 [1 312–1 476], p50 2.4 ms | 807 [677–919], p50 4.5 ms | **3 444** [3 197–3 610], p50 0.9 ms |
+| 2 | 1 338 [1 306–1 457], p50 2.2 ms | 1 138 [1 056–1 175], p50 2.8 ms | **3 138** [2 848–3 898], p50 0.9 ms |
 
-mpedb-redis is 2.4× Blobasaur with one file and 2.3× with two. The batch is
-worth about 1.45× to Blobasaur (996 → 1 445). The tails differ more than
-the medians: Blobasaur's p99 is 86–97 ms and mpedb's is 6–16 ms.
+mpedb-redis is 2.5× Blobasaur with one file and 2.3× with two. The batch is
+worth about 1.7× to Blobasaur with one file (807 → 1 384). The tails differ
+more than the medians: Blobasaur's p99 is 89–105 ms and mpedb's is 6–24 ms.
 
 A second file changes nothing for either server. The ranges overlap.
 
@@ -133,20 +134,23 @@ A second file changes nothing for either server. The ranges overlap.
 
 | files | Blobasaur `full` | Blobasaur `full-b1` | mpedb `wal` | mpedb `commit` |
 |---|---|---|---|---|
-| 1 | 443 [440–462], p50 15.6 ms | 145 [144–154], p50 51 ms | **845** [836–870], p50 6.9 ms | 78 [74–85], p50 85 ms |
-| 2 | 461 [442–473], p50 15.7 ms | 215 [212–216], p50 39 ms | **905** [882–912], p50 6.9 ms | 84 [74–89], p50 84 ms |
+| 1 | 453 [433–458], p50 15.6 ms | 148 [138–154], p50 50 ms | **871** [839–909], p50 7.0 ms | 397 [384–417], p50 17.2 ms |
+| 2 | 441 [436–456], p50 16.0 ms | 209 [200–215], p50 40 ms | **896** [792–904], p50 6.7 ms | 319 [308–333], p50 19.2 ms |
 
-mpedb `wal` is 1.9× Blobasaur with one file and 2.0× with two. The two p99s
-are the same, 59–62 ms. Blobasaur is 5.7× and 5.5× ahead of `commit`, which
-flushes twice per batch and whose p99 is over 500 ms.
+mpedb `wal` is 1.9× Blobasaur with one file and 2.0× with two. Its p99 is
+47–79 ms against Blobasaur's 56–65 ms. Blobasaur is 1.14× ahead of `commit`
+with one file and 1.38× with two. `commit` flushes twice per batch, data and
+then meta, and Blobasaur's batch flushes once.
 
 Both sides batch here. Take Blobasaur's batch away (`full-b1`) and it does
-145 writes a second, one fsync per write, so the batch is worth 3× to it.
-mpedb's median request is 6.9 ms against a 4.7 ms flush: a write waits for
+148 writes a second, one fsync per write, so the batch is worth 3× to it.
+mpedb's median request is 7.0 ms against a 4.9 ms flush: a write waits for
 the batch in flight and then rides the next one.
 
-A second file adds 7 % to mpedb `wal` and nothing measurable to Blobasaur's
-batched arm.
+A second file changes nothing for mpedb `wal` or for Blobasaur's batched
+arm: the ranges overlap. It costs `commit` a fifth, 397 to 319, and those
+ranges do not overlap. Two files there are two pairs of flushes on one
+disk.
 
 ## The same pair with a small value
 
@@ -154,10 +158,12 @@ batched arm.
 
 | | Blobasaur `full` | mpedb `wal` | mpedb `commit` |
 |---|---|---|---|
-| writes/s | 558 [548–562], p50 13.5 ms | **1 084** [1 050–1 088], p50 5.9 ms | 122 [117–126], p50 56 ms |
+| writes/s | 541 [522–546], p50 13.8 ms | **1 088** [1 069–1 109], p50 5.8 ms | 406 [404–416], p50 16.9 ms |
 
-mpedb `wal` is 1.9× Blobasaur here too. The ratio is the same at 82 B and
+mpedb `wal` is 2.0× Blobasaur here too. The ratio is the same at 82 B and
 at 7 166 B, which says the value's size is no longer what decides it.
+`commit` does 406 here and 397 on the article value, so the same holds for
+it. Blobasaur is 1.33× ahead of it.
 
 ## Reads
 
@@ -166,16 +172,16 @@ requests per second.
 
 | files | Blobasaur | mpedb-redis |
 |---|---|---|
-| 1 | p50 0.64 ms, 12 169 [10 339–12 444] /s | **p50 0.40 ms**, 19 280 [17 949–19 389] /s |
-| 2 | p50 0.77 ms, 10 030 [9 789–12 097] /s | **p50 0.41 ms**, 18 560 [18 184–19 323] /s |
+| 1 | p50 0.83 ms, 9 176 [9 123–10 695] /s | **p50 0.41 ms**, 18 576 [18 175–19 410] /s |
+| 2 | p50 0.73 ms, 10 514 [10 468–11 909] /s | **p50 0.42 ms**, 18 380 [18 265–19 520] /s |
 
 These are the `normal` and `async` arms. Blobasaur's other arms read between
-p50 0.64 and 0.81 ms and mpedb's all read at 0.40. The small value reads at
-p50 0.40 ms on Blobasaur and 0.18 ms on mpedb-redis. mpedb-redis is 1.6× to
-1.9× on the 64 KiB value, and the Python client is a large share of both
+p50 0.68 and 0.80 ms and mpedb's all read at 0.41. The small value reads at
+p50 0.42 ms on Blobasaur and 0.18 ms on mpedb-redis. mpedb-redis is 1.7× to
+2.0× on the 64 KiB value, and the Python client is a large share of both
 figures.
 
-The earlier run the same day read about half as fast on both servers
+The first run the same day read about half as fast on both servers
 (Blobasaur p50 1.20 ms, mpedb-redis 0.76 ms) with the same ratio. Nothing on
 the read path changed between the two, and the flush probe was the same, so
 that difference is the machine and it is not explained here.
@@ -186,16 +192,16 @@ No sync before the reply. Article value, hash name `prefs`.
 
 | files | Blobasaur `normal` | mpedb `async` |
 |---|---|---|
-| 1 | 964 [823–1 008] | **2 950** [2 535–2 993] |
-| 2 | 1 183 [1 182–1 185] | **2 680** [2 583–3 573] |
+| 1 | 969 [963–984] | **3 369** [3 161–3 389] |
+| 2 | 1 142 [1 042–1 218] | **3 820** [3 327–4 031] |
 
 Blobasaur hashes the field, so two files spread these writes, and it gains
 about 1.2× from the second file. mpedb-redis hashes `prefs`, so they all
-land in one, and it does not move.
+land in one. Its two ranges overlap.
 
 ## What this page changed in mpedb
 
-Three defects, each found by a run of this page and fixed in the tree the
+Four defects, each found by a run of this page and fixed in the tree the
 tables above measured.
 
 **`async` synced once per write.** The first run, a day earlier, had mpedb
@@ -207,7 +213,7 @@ that was 53–79 `SET` a second with the extent path and 3 068–3 996 without.
 The extent default was measured on tmpfs, where that sync is free. It is
 now off under `async` unless `extent_threshold_kb` asks for it.
 
-**Group commit stopped at 824 bytes.** The run before this one had mpedb
+**Group commit stopped at 824 bytes.** The first run that day had mpedb
 `wal` at 94 writes a second [31–173] on the article value, against
 Blobasaur's 450, while the small value was already 2.1× ahead. An intent
 slot holds 824 bytes of parameters, and anything larger took the writer
@@ -229,24 +235,55 @@ off:
 | 250 KB | 173, 163 | 114, 122 |
 | 500 KB | 86, 111 | 55, 61 |
 
-Small values belong in the log record and large ones do not, and the two
-cross near 120 KB on this disk. `mpedb-redis` now sets the threshold to
-64 KiB under `wal`. The engine's default is unchanged. That moved the cell
-from 272 to 845.
+Small values belong in the log record and large ones do not. `mpedb-redis`
+now sets the threshold to 64 KiB under `wal`. The engine's default is
+unchanged. That moved the cell from 272 to 845.
 
-`commit` went from 18 to 78 on the article value through the second change
-alone. It still flushes twice per batch.
+**One changed page was written as a megabyte.** `commit` was at 78 writes a
+second after the second change, with a median request of 85 ms. A trace
+showed each of its two msyncs taking 11–16 ms, the one that covers a single
+4 KiB meta page included, on a disk that flushes in 5 ms. The engine
+pre-writes a new file with zeros so later writes are overwrites, and it did
+so in 1 MiB writes. Linux gives a buffered write a page-cache folio as large
+as the write, a store through the mapping dirties the whole folio, and msync
+writes the whole folio. The mapping also asked for huge pages, which does
+the same on a fault. A probe on this disk, one page stored and msynced, by
+how the file was filled:
+
+| prewrite | one page | three pages |
+|---|---|---|
+| 1 MiB writes | 12.7 ms | 26.5 ms |
+| 64 KiB writes | 2.7 ms | 6.1 ms |
+| 4 KiB writes | 2.1 ms | 3.9 ms |
+| 1 MiB writes, cache dropped, huge-page advice | | 28.4 ms |
+| 1 MiB writes, cache dropped, no advice | 2.2 ms | 4.9 ms |
+
+The prewrite is now one page per write, and the advice is given only to a
+mapping nothing syncs. `commit` went from 78 to 397. The table in the third
+change, measured again on this build, eight writers:
+
+| value | extents at 4 KiB | extents off |
+|---|---|---|
+| 7 KB | 401, 427 | 794, 751 |
+| 64 KB | 301, 351 | 310, 332 |
+| 120 KB | 265, 269 | 215, 213 |
+| 250 KB | 194, 172 | 92, 105 |
+| 500 KB | 80, 119 | 67, 62 |
+
+The extent path is about twice as fast below 120 KB as it was, and the two
+now cross near 64 KB, which is where the threshold already was.
 
 ## Reading it
 
-Where neither server waits for the disk, mpedb-redis writes 2.3× to 2.4×
-and reads 1.6× to 1.9× what Blobasaur does on this machine.
+Where neither server waits for the disk, mpedb-redis writes 2.3× to 2.5×
+and reads 1.7× to 2.0× what Blobasaur does on this machine.
 
 Where both wait for the disk, a write costs about one 5 ms flush and the
 question is how many writes share it. Both servers now share it at this
 value size, and mpedb `wal` is 1.9× to 2.0× ahead, at 82 bytes and at
-7 KiB alike. Above 1 MiB of parameters an mpedb write still syncs alone,
-and that size was not measured here.
+7 KiB alike. mpedb `commit`, which keeps no log and flushes data and then
+meta, is behind Blobasaur by 1.14× to 1.38×. Above 1 MiB of parameters an
+mpedb write still syncs alone, and that size was not measured here.
 
 A second file did not give either server the article's scaling. This box
 has two cores and one disk; the article's had sixteen and tmpfs.
