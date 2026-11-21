@@ -6,6 +6,10 @@ existing mirror ([DESIGN-MIRROR.md](DESIGN-MIRROR.md)). Capture-ahead: the hard 
 different class of problem than everything mpedb has built, and this doc's job is to be honest about
 that and to stage the tractable pieces first.**
 
+`crates/mpedb-redis` is a RESP front with a static slot map and `MOVED`. It
+does not replicate, elect a leader, or fence a writer. Those stay in this
+document.
+
 ## 0. The boundary this crosses — say it plainly
 
 Everything mpedb does today is **single-machine, single-PID-namespace, shared-memory** multi-process

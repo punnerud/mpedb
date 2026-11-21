@@ -23,6 +23,7 @@ feature-by-feature status is [../COMPAT.md](../COMPAT.md).
 | [concurrency.md](concurrency.md) | sqlite3 (WAL, fullfsync), PostgreSQL 16 | "How many concurrent locks before it melts?" — the writer-contention curve, 1 to 1 024 processes, verified at every point: sqlite stays flat, PostgreSQL peaks at 16 connections, mpedb climbs to a 128-process peak at 5× PostgreSQL's best and sags, never melts. Plus the latency half: mpedb's ordered ring holds p99 ≈ 2× p50 through 128 writers while sqlite's lock lottery starves its worst writer for 15+ s from 8 |
 | [minisqlite.md](minisqlite.md) | minisqlite, sqlite3, PostgreSQL | Two SQL engines built the same way, and the number nobody publishes |
 | [turso.md](turso.md) | Turso | Side document for the fourth engine in the head-to-head |
+| [blobasaur.md](blobasaur.md) | Blobasaur (Zerodha's RESP server over N SQLite files) | 64 KiB JSON, zstd ~9×, 1 and 2 files, three repetitions, a flush probe as the null control. No sync before the reply: mpedb-redis 2.4× on writes. A sync before the reply: mpedb-redis `wal` 1.9× on the 7 KiB value and on an 82 B one, after group commit was widened past 824 bytes; Blobasaur 5.7× ahead of `commit`. Point reads: mpedb-redis 1.6–1.9×. Their published 16-core table is the reference, not a row |
 
 Related but deliberately NOT here: [../LANDSCAPE.md](../LANDSCAPE.md) is a
 positioning survey of what other engines do *better*, not a measurement, and

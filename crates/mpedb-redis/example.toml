@@ -1,0 +1,39 @@
+# mpedb-redis serve --config example.toml
+#
+# One process, one data directory. The directory remembers shards and size_mb
+# and refuses a later start that changes them. durability may change.
+# There is no AUTH. Bind an address the operating system can keep private.
+
+listen = "127.0.0.1:6379"
+data_dir = "/var/lib/mpedb-redis"
+
+# One file until one file with durability = "commit" has been measured
+# against N files on the same payload and hardware. More files are more
+# writer locks. The file is the cluster slot modulo this number.
+shards = 1
+
+# async acknowledges before the next fsync. commit and wal wait, and those
+# are the modes where group commit runs. none skips the sync entirely.
+durability = "async"
+
+size_mb = 64
+zstd_level = 3
+max_value_mb = 16
+max_connections = 256
+
+# cleanup_interval_ms = 0 turns the expiry reaper off.
+cleanup_interval_ms = 1000
+cleanup_chunk = 200
+
+# Omit [cluster] on a single node. That node owns slots 0-16383.
+#
+# [cluster]
+# announce = "10.0.0.1:6379"
+#
+# [[cluster.node]]
+# announce = "10.0.0.1:6379"
+# ranges = ["0-8191"]
+#
+# [[cluster.node]]
+# announce = "10.0.0.2:6379"
+# ranges = ["8192-16383"]

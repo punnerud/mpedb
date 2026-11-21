@@ -27,20 +27,22 @@ log-based engine), and the hardware published when the hardware is the answer.
   `cargo test --manifest-path crates/mpedb-capi/Cargo.toml`)
 - One crate: `cargo test -p mpedb-core` (also: mpedb-types, mpedb-sql, mpedb, mpedb-cli)
 - Lint (keep clean): `cargo clippy --workspace --all-targets -- -D warnings`
-  **plus the three satellite workspaces**, which `--workspace` cannot reach —
+  **plus the four satellite workspaces**, which `--workspace` cannot reach —
   a separate workspace is invisible to the parent's `--workspace`, which is how
   a lint once reached main red with the documented command passing locally:
 
-      for m in capi pg fs; do
+      for m in capi pg fs redis; do
         cargo clippy --manifest-path crates/mpedb-$m/Cargo.toml \
           --all-targets -- -D warnings
       done
 
-  CI runs all three now (`capi` and `pg` on Linux and macOS, `fs` on Linux
-  only), so the documented procedure and the enforced one match. The two
+  CI runs all four now (`capi`, `pg` and `redis` on Linux and macOS, `fs` on
+  Linux only), so the documented procedure and the enforced one match. The
   platform limits are measured, not assumed: `mpedb-pg` uses `std::os::fd` and
-  `std::os::unix` so it does not build for Windows, and `fuser`'s build script
-  wants macFUSE through pkg-config so `mpedb-fs` does not build on Apple.
+  `std::os::unix` so it does not build for Windows, `fuser`'s build script
+  wants macFUSE through pkg-config so `mpedb-fs` does not build on Apple, and
+  `mpedb-redis` is left off the Windows job. Its directory lock is a Unix
+  `flock` (a no-op elsewhere), and that runner does not build the crate.
 - Slow/instrumented tests are `#[ignore]`d: `cargo test -p mpedb-core -- --ignored`
 - **Point every test's scratch at a real volume**: `MPEDB_TEST_DIR=/path cargo test …`.
   `mpedb_testkit::scratch_base` (and `mpedb_core::scratch_dir`, which spells the
@@ -211,6 +213,19 @@ log-based engine), and the hardware published when the hardware is the answer.
   mpedb-capi, so a box without /dev/fuse never compiles it: `cargo build --manifest-path
   crates/mpedb-fs/Cargo.toml`; `fuser` with default-features off, so no
   libfuse headers, mounting via `fusermount3`.
+- `crates/mpedb-redis` — `mpedb-redis serve`, a resident RESP server for
+  overwrite-heavy blobs. Its OWN workspace, like `mpedb-pg`: a listener must
+  not be compiled by every `cargo test --workspace`. Two tables per file
+  (`str_blobs`, `hash_blobs`) so a type check is a point probe and a string
+  `SET` is one upsert. zstd runs before the write when the bytes shrink.
+  Expiry is a nullable indexed column, hidden on read, and deleted in chunks
+  by a reaper that shares the single writer. N files (`shard-NNNN.mpedb`,
+  slot modulo N) are N writer locks; the default is one file, and the
+  directory's `META` refuses a later start that changes the count or
+  `size_mb`. A static Redis Cluster slot map answers `MOVED`. There is no
+  replica and no failover — that is `design/DESIGN-DISTRIBUTED.md`. Group
+  commit runs only for durability `commit` and `wal`; the default is `async`.
+  No `AUTH`. `cargo test --manifest-path crates/mpedb-redis/Cargo.toml`.
 - `crates/mpedb-py` — PyO3 module `mpedb` (abi3-py310, GIL released around engine calls);
   build: `cargo build --release -p mpedb-py`, ship `libmpedb_py.so` as `mpedb.so`.
 

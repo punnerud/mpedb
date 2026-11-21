@@ -1,0 +1,39 @@
+[workspace]
+# Its OWN workspace, for the same reason as mpedb-pg.
+#
+# mpedb's contract is that there is NO SERVER: processes mmap a file and attach.
+# A network listener in the parent workspace would be compiled by every
+# `cargo build` and `cargo test --workspace` whether or not anyone asked for
+# it. Being outside the parent's `members` IS the build toggle: the default
+# build contains not one byte of this crate.
+#
+# This program is a resident server on purpose. Group commit across clients
+# and the expiry reaper both need a process that outlives one connection.
+# The engine underneath is still the embedded one; nothing in mpedb-core
+# learns about Redis.
+members = []
+
+[package]
+name = "mpedb-redis"
+version = "0.3.1"
+edition = "2021"
+license = "LicenseRef-mpedb-1.0"
+description = "Redis RESP blob server on mpedb — static hash slots, one writer per file"
+
+[[bin]]
+name = "mpedb-redis"
+path = "src/bin/mpedb_redis.rs"
+
+[dependencies]
+mpedb = { path = "../mpedb" }
+mpedb-core = { path = "../mpedb-core" }
+mpedb-types = { path = "../mpedb-types" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+zstd = "0.13"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+mpedb-testkit = { path = "../mpedb-testkit" }

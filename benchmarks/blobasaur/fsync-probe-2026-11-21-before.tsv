@@ -1,0 +1,5 @@
+when	p50_us	p99_us
+before-r1	4684	13547
+after-r1	4571	10549
+after-r2	4486	10524
+after-r3	5044	9861

@@ -40,6 +40,13 @@ members = [
 # it would put that in front of every `cargo test --workspace` and every CI run,
 # to build a benchmark nobody is running at the time.
 exclude = ["crates/mpedb-capi", "crates/mpedb-olapbench"]
+# mpedb-pg, mpedb-fs and mpedb-redis are not members and not excluded: each
+# Cargo.toml is its own workspace, so `cargo test --workspace` never compiles
+# them. A PostgreSQL wire server, a FUSE build script, and a Redis listener
+# stay out of the default build for that reason.
+#     cargo test --manifest-path crates/mpedb-pg/Cargo.toml
+#     cargo test --manifest-path crates/mpedb-fs/Cargo.toml
+#     cargo test --manifest-path crates/mpedb-redis/Cargo.toml
 
 [workspace.package]
 version = "0.3.1"
