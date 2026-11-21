@@ -41,13 +41,22 @@
 //!  16  affected      AtomicU64
 //!  24  committed_in  AtomicU64  txn stamp (0 = not staged)
 //!  32  plan_hash     [u8; 32]   owner-written
-//!  64  params_len    u16 LE     owner-written
-//!  72  params        [u8; 824]  owner-written
+//!  64  params_len    u16 LE     owner-written; 0xFFFF = spilled
+//!  72  params        [u8; 824]  owner-written; spilled: len u64 ‖ sum u64
 //! 896  err_msg_len   u16 LE     leader-written
 //! 898  err_msg       [u8; 126]  leader-written
 //! ```
+//!
+//! **Spilled parameters.** A blob over [`RING_PARAMS_CAP`] and up to
+//! [`RING_SPILL_CAP`] is written to the slot's region of `<db>-ring` while
+//! the slot is RESERVED, and the slot carries its length and checksum. The
+//! slot protocol does not change: the region is owned exactly as the slot's
+//! own payload bytes are, and a leader reads it under the writer lock from a
+//! READY slot it has not stamped, which its owner cannot release. A leader
+//! that cannot produce the bytes as published marks the intent
+//! [`PendingIntent::spill_lost`] and must hand it back unexecuted.
 
-use crate::shm::{Shm, RING_SLOTS, RING_SLOT_SIZE};
+use crate::shm::{Shm, RING_SLOTS, RING_SLOT_SIZE, RING_SPILL_CAP};
 use mpedb_types::PlanHash;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -63,9 +72,15 @@ const O_PARAMS: usize = 72;
 const O_ERR_MSG_LEN: usize = 896;
 const O_ERR_MSG: usize = 898;
 
-/// Maximum serialized parameter bytes an intent can carry; larger requests
-/// fall back to the direct writer-lock path.
+/// Maximum serialized parameter bytes a slot holds inline. Larger blobs
+/// spill to `<db>-ring` up to [`RING_SPILL_CAP`]; past that a request falls
+/// back to the direct writer-lock path.
 pub const RING_PARAMS_CAP: usize = O_ERR_MSG_LEN - O_PARAMS; // 824
+/// `params_len` value that says the parameters are in the overflow file.
+const SPILLED: u16 = u16::MAX;
+/// Spilled bytes one leader round will hold in memory. Intents past it stay
+/// READY for the next round.
+const SPILL_ROUND_BYTES: usize = 32 << 20;
 pub const RING_ERR_MSG_CAP: usize = RING_SLOT_SIZE - O_ERR_MSG; // 126
 
 const ST_EMPTY: u64 = 0;
@@ -133,6 +148,10 @@ pub struct PendingIntent {
     pub word: u64,
     pub hash: PlanHash,
     pub params: Vec<u8>,
+    /// The parameters were spilled and this process could not read them back
+    /// as published. `params` is empty. The intent must not be executed: the
+    /// leader stages a result that sends its owner to the direct path.
+    pub spill_lost: bool,
 }
 
 /// View over the shared intent-slot region. Enqueuer methods are safe from
@@ -184,7 +203,8 @@ impl<'a> IntentRing<'a> {
     /// the params exceed [`RING_PARAMS_CAP`]) — callers then fall back to the
     /// direct writer-lock path.
     pub fn enqueue(&self, hash: &PlanHash, params: &[u8]) -> Option<(u32, u64)> {
-        if params.len() > RING_PARAMS_CAP {
+        let spill = params.len() > RING_PARAMS_CAP;
+        if spill && (params.len() > RING_SPILL_CAP || !self.shm.ring_spill_ready()) {
             return None;
         }
         let pid = crate::os::process_id();
@@ -211,9 +231,27 @@ impl<'a> IntentRing<'a> {
             self.affected(idx).store(0, Ordering::Relaxed);
             self.committed_in(idx).store(0, Ordering::Relaxed);
             self.payload(idx, O_PLAN_HASH, 32).copy_from_slice(&hash.0);
-            self.payload(idx, O_PARAMS_LEN, 2)
-                .copy_from_slice(&(params.len() as u16).to_le_bytes());
-            self.payload(idx, O_PARAMS, params.len()).copy_from_slice(params);
+            if spill {
+                // Still RESERVED, so the region is ours alone. A failed write
+                // gives the slot back the way a finished intent would.
+                let Some(sum) = self.shm.ring_spill_write(idx, params) else {
+                    let _ = self.header(idx).compare_exchange(
+                        reserved,
+                        pack(0, gen.wrapping_add(2), ST_EMPTY),
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
+                    return None;
+                };
+                self.payload(idx, O_PARAMS_LEN, 2).copy_from_slice(&SPILLED.to_le_bytes());
+                self.payload(idx, O_PARAMS, 8)
+                    .copy_from_slice(&(params.len() as u64).to_le_bytes());
+                self.payload(idx, O_PARAMS + 8, 8).copy_from_slice(&sum.to_le_bytes());
+            } else {
+                self.payload(idx, O_PARAMS_LEN, 2)
+                    .copy_from_slice(&(params.len() as u16).to_le_bytes());
+                self.payload(idx, O_PARAMS, params.len()).copy_from_slice(params);
+            }
             let ready = pack(pid, gen.wrapping_add(1), ST_READY);
             match self.header(idx).compare_exchange(
                 reserved,
@@ -340,6 +378,7 @@ impl<'a> IntentRing<'a> {
     /// *Leader.* All executable intents, in slot order (deterministic).
     pub fn collect_ready(&self) -> Vec<PendingIntent> {
         let mut out = Vec::new();
+        let mut spilled = 0usize;
         for idx in 0..RING_SLOTS {
             let w = self.header(idx).load(Ordering::Acquire);
             let (_, _, state) = unpack(w);
@@ -349,6 +388,26 @@ impl<'a> IntentRing<'a> {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(self.payload(idx, O_PLAN_HASH, 32));
             let raw: [u8; 2] = self.payload(idx, O_PARAMS_LEN, 2)[..].try_into().unwrap();
+            if u16::from_le_bytes(raw) == SPILLED {
+                let field = |at: usize| {
+                    let b: [u8; 8] = self.payload(idx, O_PARAMS + at, 8)[..].try_into().unwrap();
+                    u64::from_le_bytes(b)
+                };
+                let len = field(0).min(usize::MAX as u64) as usize;
+                if spilled > 0 && spilled.saturating_add(len) > SPILL_ROUND_BYTES {
+                    continue; // next round; the slot stays READY
+                }
+                let params = self.shm.ring_spill_read(idx, len, field(8));
+                spilled += params.as_ref().map_or(0, Vec::len);
+                out.push(PendingIntent {
+                    idx,
+                    word: w,
+                    hash: PlanHash(hash),
+                    spill_lost: params.is_none(),
+                    params: params.unwrap_or_default(),
+                });
+                continue;
+            }
             let len = u16::from_le_bytes(raw) as usize;
             if len > RING_PARAMS_CAP {
                 continue; // corrupt publish; leave for dead-owner reclaim
@@ -358,6 +417,7 @@ impl<'a> IntentRing<'a> {
                 word: w,
                 hash: PlanHash(hash),
                 params: self.payload(idx, O_PARAMS, len).to_vec(),
+                spill_lost: false,
             });
         }
         out

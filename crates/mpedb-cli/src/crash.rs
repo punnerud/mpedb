@@ -37,11 +37,10 @@
 //! kill window and starve the small-txn/index code paths this harness also
 //! exists for.
 //!
-//! HONESTY, `--durability commit|wal`: blob parameters exceed the intent
-//! ring's `RING_PARAMS_CAP` (824 B), so blob ops always take the direct
-//! writer-lock fallback. `--blob-kb` exercises overflow chains under SIGKILL
-//! (and WAL replay), NOT "the ring with blobs" — only the small ops still
-//! ride the ring.
+//! `--durability commit|wal`: blob parameters exceed the intent slot's 824
+//! inline bytes and spill to `<db>-ring` up to `RING_SPILL_CAP` (1 MiB), so
+//! `--blob-kb` up to about 1000 kills writers and leaders around spilled
+//! intents too. Above that a blob op takes the direct writer-lock path.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -481,9 +480,8 @@ fn writer_loop(db: &Database, rng: &mut Rng, blob_kb: u64) -> CliResult {
     let upd = db.prepare("UPDATE rows SET a = $1, b = $2 WHERE id = $3")?;
     let ins = db.prepare("INSERT INTO rows (id, a, b, check_sum) VALUES ($1, $2, $3, $4)")?;
     let del = db.prepare("DELETE FROM rows WHERE id = $1")?;
-    // Blob statements (--blob-kb > 0). Their params blow RING_PARAMS_CAP, so
-    // under durability commit|wal these take the direct writer-lock fallback,
-    // never the ring — see the module doc.
+    // Blob statements (--blob-kb > 0). Under durability commit|wal their
+    // params spill to the ring's overflow file — see the module doc.
     let blob_stmts = if blob_kb > 0 {
         Some((
             db.prepare("UPDATE rows SET data = $1, blob_seq = $2 WHERE id = $3")?,

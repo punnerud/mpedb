@@ -434,11 +434,33 @@ impl<'e> WriteTxn<'e> {
                 // and turn each large-value commit into a mini-checkpoint).
                 // In `async` this is the insert-direction half; the reuse
                 // direction is the refill gate on the durable frontier (§6).
-                for &(start, npages) in &self.extent_dirty {
+                //
+                // A group-commit batch can carry one extent per intent, and on
+                // Linux every one of these calls is a device flush. One call
+                // over the span makes the same payload durable; what else it
+                // sweeps in is dirty COW pages, which the kernel was free to
+                // write back at any moment already. Linux only, for the
+                // reason `span_data_barrier` gives: Darwin charges for the
+                // range's width.
+                if cfg!(target_os = "linux") && self.extent_dirty.len() > 1 {
+                    let lo = self.extent_dirty.iter().map(|&(s, _)| s).min().unwrap_or(0);
+                    let hi = self
+                        .extent_dirty
+                        .iter()
+                        .map(|&(s, n)| s + u64::from(n))
+                        .max()
+                        .unwrap_or(0);
                     self.eng.shm.msync_range_nobarrier(
-                        start as usize * PAGE_SIZE,
-                        npages as usize * PAGE_SIZE,
+                        lo as usize * PAGE_SIZE,
+                        (hi - lo) as usize * PAGE_SIZE,
                     )?;
+                } else {
+                    for &(start, npages) in &self.extent_dirty {
+                        self.eng.shm.msync_range_nobarrier(
+                            start as usize * PAGE_SIZE,
+                            npages as usize * PAGE_SIZE,
+                        )?;
+                    }
                 }
                 // Test instrumentation (powerloss sim): the sim's loss model
                 // rolls the main file back to a snapshot — which would erase

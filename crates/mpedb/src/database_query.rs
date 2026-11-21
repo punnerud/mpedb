@@ -1323,27 +1323,33 @@ impl Database {
             return ring_exec::lead_and_execute(self, txn, Some((plan, params)))
                 .map(|r| r.expect("own statement always yields a result"));
         };
+        // `UnknownPlan` through the slot means the leader could not run the
+        // intent and did not: it had no way to load our plan (local-only
+        // seeding), or the parameters were spilled and it could not read
+        // them back. We hold both, so run it directly. That holds whoever
+        // the leader was — leading our own round reads the same overflow
+        // file a foreign leader would have.
+        let settle = |r: mpedb_core::RingResult| {
+            ring.release(idx, owned);
+            match ring_exec::decode_ring_result(r) {
+                Err(Error::UnknownPlan(_)) => {
+                    let txn = self.engine.begin_write()?;
+                    ring_exec::lead_and_execute(self, txn, Some((plan, params)))
+                        .map(|r| r.expect("own statement always yields a result"))
+                }
+                other => other,
+            }
+        };
         loop {
             if let Some(r) = ring.wait_result(idx, std::time::Duration::from_millis(2)) {
-                ring.release(idx, owned);
-                return match ring_exec::decode_ring_result(r) {
-                    // the leader had no way to load our plan (e.g. local-only
-                    // seeding); we DO have it — run it directly instead
-                    Err(Error::UnknownPlan(_)) => {
-                        let txn = self.engine.begin_write()?;
-                        ring_exec::lead_and_execute(self, txn, Some((plan, params)))
-                            .map(|r| r.expect("own statement always yields a result"))
-                    }
-                    other => other,
-                };
+                return settle(r);
             }
             // another leader at work → keep waiting; lock free → we lead,
             // and our own intent is drained like any other
             if let Some(txn) = self.engine.try_begin_write()? {
                 ring_exec::lead_and_execute(self, txn, None)?;
                 if let Some(r) = ring.try_take_result(idx) {
-                    ring.release(idx, owned);
-                    return ring_exec::decode_ring_result(r);
+                    return settle(r);
                 }
                 // not drained (should not happen — we were READY); retry
             }

@@ -207,6 +207,13 @@ struct PreparedIntent {
 /// per-intent errors are byte-identical through the slot.
 fn prepare_intent(db: &Database, intent: PendingIntent) -> PreparedIntent {
     let prepared = (|| {
+        // Spilled parameters this process could not read back. `UnknownPlan`
+        // is the result that already means "the leader could not run this,
+        // its owner can": `run_write_plan` answers it by taking the direct
+        // path with the parameters it still holds.
+        if intent.spill_lost {
+            return Err(Error::UnknownPlan(intent.hash));
+        }
         let plan = db.cached_or_load(&intent.hash)?;
         if plan.footprint.read_only
             || matches!(
@@ -1615,6 +1622,7 @@ mod tests {
             word: 0,
             hash: plan.hash(),
             params: encode_params(&params),
+            spill_lost: false,
         };
         PreparedIntent {
             intent,
@@ -1630,6 +1638,7 @@ mod tests {
                 word: 0,
                 hash,
                 params: Vec::new(),
+                spill_lost: false,
             },
             prepared: Err(Error::UnknownPlan(hash)),
         }

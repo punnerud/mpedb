@@ -643,7 +643,28 @@ sketch, both review/stress-hardened:
   slower media → longer msync → more intents queue → bigger batches. On `none`/`async`
   (µs-cheap commits) the direct lock path wins and the ring is bypassed entirely
   (`MPEDB_NO_RING=1` forces the direct path for A/B measurement in any mode).
-- Params ≤ 824 B ride the ring; larger fall back to the direct path. Interactive
+- **Parameters past the slot spill to `<db>-ring`.** A slot holds 824 B
+  inline. A larger blob, up to 1 MiB (`RING_SPILL_CAP`), is written to that
+  slot's fixed region of the overflow file while the slot is RESERVED, and the
+  slot carries `0xFFFF` as its length, then the real length and an xxh3 of the
+  bytes seeded with the slot index. Nothing in the slot protocol moves: the
+  region has exactly the ownership the slot's own payload bytes have, and a
+  leader reads it under the writer lock from a READY slot it has not yet
+  stamped, which its owner cannot release. The file needs no flush and no
+  recovery, because the ring is process state and a reboot empties it.
+  A leader that cannot produce the bytes as published (no file in its process,
+  a short read, a checksum mismatch) does NOT execute the intent. It stages
+  `UnknownPlan`, the result that already means "the leader could not run this
+  and its owner can", and the owner runs the statement on the direct path with
+  the parameters it still holds. One round holds at most 32 MiB of spilled
+  bytes; intents past that stay READY for the next. Before this, every write
+  over 824 B synced alone, which measured 4.8× behind a batching SQLite server
+  on a 7 KiB value (`benchmarks/blobasaur.md`).
+  Under `wal` a batch of extent-backed values would still have paid one device
+  flush per extent, since each range-msync is one on Linux, so the commit
+  issues ONE msync over the extents' span there. Darwin keeps the per-range
+  loop for the reason §5.4.1 gives for checkpoints: it charges for width.
+- Params over 1 MiB fall back to the direct path. Interactive
   multi-statement sessions take the writer lock directly (⚠ they stall the ring for
   their duration). The Phase-3 optimistic per-writer path was prototyped and
   **measured to lose** on this COW engine — the expensive COW B+tree mutation cannot

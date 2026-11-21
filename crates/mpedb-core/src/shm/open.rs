@@ -111,6 +111,9 @@ impl Shm {
                 if durability.uses_wal() {
                     shm.attach_wal(path)?;
                 }
+                if matches!(durability, Durability::Commit | Durability::Wal) {
+                    shm.attach_ring_spill(path);
+                }
                 shm.post_attach(schema_hash)?;
                 return Ok(shm);
             }
@@ -164,10 +167,23 @@ impl Shm {
         if durability.uses_wal() {
             shm.attach_wal(path)?; // before format: format truncates debris
         }
+        // The intent ring engages for exactly these two (§5.3).
+        if matches!(durability, Durability::Commit | Durability::Wal) {
+            shm.attach_ring_spill(path);
+        }
         let state = shm.init_state().load(Ordering::Acquire);
         if state != INIT_READY {
             // fresh format (state 0) or a dead initializer's debris (state 1)
             shm.format(page_count, max_readers, durability, schema_hash)?;
+            // Parameters are user data, so the overflow file gets the same
+            // mode as the database. Truncated first: a previous file at this
+            // path may have left regions behind.
+            if let Some(f) = shm.spill.as_ref() {
+                if unsafe { libc::ftruncate(f.as_raw_fd(), 0) } != 0 {
+                    return Err(io_err("ftruncate(ring overflow)"));
+                }
+                apply_file_perms(f.as_raw_fd(), perms)?;
+            }
             // We are the formatter and hold the exclusive flock: widen the
             // born-0o600 file (and its `-wal`, an equal isolation asset holding
             // recent page images) to the configured mode/owner exactly once.
@@ -235,6 +251,9 @@ impl Shm {
         shm.data_start = data_start_page(max_readers);
         if durability.uses_wal() {
             shm.attach_wal(path)?;
+        }
+        if matches!(durability, Durability::Commit | Durability::Wal) {
+            shm.attach_ring_spill(path);
         }
         let hash_unused = [0u8; 32];
         shm.post_attach(&hash_unused)?;
@@ -315,6 +334,7 @@ impl Shm {
             })?,
             recovered: false,
             wal: None,
+            spill: None,
             is_private: false,
             priv_pins: std::array::from_fn(|_| AtomicU64::new(PRIV_PIN_FREE)),
             priv_meta_active: AtomicU64::new(0),

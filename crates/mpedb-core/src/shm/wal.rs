@@ -31,6 +31,62 @@ impl Shm {
         Ok(())
     }
 
+    /// Open (creating if absent) `<path>-ring`. A failure is not an attach
+    /// error: the file only widens what may share a flush, and a process
+    /// without it still runs every write on the direct path.
+    pub(super) fn attach_ring_spill(&mut self, db_path: &Path) {
+        self.spill = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(ring_spill_path(db_path))
+            .ok();
+    }
+
+    /// Can this process spill at all? Checked before a slot is reserved.
+    pub(crate) fn ring_spill_ready(&self) -> bool {
+        self.spill.is_some()
+    }
+
+    /// Write an intent's parameters into slot `idx`'s region. The caller owns
+    /// the slot (RESERVED), so nothing else writes this region. Returns the
+    /// checksum the slot must carry, or None when the bytes cannot spill.
+    pub(crate) fn ring_spill_write(&self, idx: u32, bytes: &[u8]) -> Option<u64> {
+        if bytes.len() > RING_SPILL_CAP {
+            return None;
+        }
+        let file = self.spill.as_ref()?;
+        file.write_all_at(bytes, Self::ring_spill_off(idx)).ok()?;
+        Some(Self::ring_spill_sum(idx, bytes))
+    }
+
+    /// Read slot `idx`'s spilled parameters back. None when they are not
+    /// there as published: no file in this process, a short read, or a
+    /// checksum that does not match. The caller must then leave the intent
+    /// to its owner, never execute it.
+    pub(crate) fn ring_spill_read(&self, idx: u32, len: usize, sum: u64) -> Option<Vec<u8>> {
+        if len > RING_SPILL_CAP {
+            return None;
+        }
+        let file = self.spill.as_ref()?;
+        let mut buf = vec![0u8; len];
+        if read_full_at(file, &mut buf, Self::ring_spill_off(idx)).ok()? != len {
+            return None;
+        }
+        (Self::ring_spill_sum(idx, &buf) == sum).then_some(buf)
+    }
+
+    fn ring_spill_off(idx: u32) -> u64 {
+        idx as u64 * RING_SPILL_CAP as u64
+    }
+
+    /// Seeded with the slot so one region's bytes never validate in another.
+    fn ring_spill_sum(idx: u32, bytes: &[u8]) -> u64 {
+        xxhash_rust::xxh3::xxh3_64_with_seed(bytes, idx as u64)
+    }
+
     /// Format-time reset: drop any debris from a previous incarnation. A
     /// fresh database starts with wal_ckpt = wal_len = 0 (the zeroed lock
     /// area), so stale checksum-valid records at low offsets would otherwise

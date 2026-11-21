@@ -701,6 +701,22 @@ pub fn wal_path(db_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// The intent ring's overflow file, `<db-path>-ring` (design/DESIGN.md §5.3).
+/// Parameters too large for a 1 KiB slot are written here, one fixed region
+/// per slot, and the slot carries their length and checksum. Nothing in it
+/// outlives a reboot or needs a flush: the ring itself is process state.
+pub fn ring_spill_path(db_path: &Path) -> PathBuf {
+    let mut os = db_path.as_os_str().to_owned();
+    os.push("-ring");
+    PathBuf::from(os)
+}
+
+/// Largest parameter blob an intent may spill. One region per slot, so the
+/// file is at most `RING_SLOTS` times this, sparse wherever no intent wrote.
+/// Above it a write costs about what a flush costs, and sharing the flush
+/// buys little; those take the writer lock directly, as before.
+pub const RING_SPILL_CAP: usize = 1 << 20;
+
 /// File-absolute byte offsets of the lock-area WAL fields and the boot id,
 /// exported for crash/power-loss tooling that manipulates cold files.
 pub const WAL_LEN_FILE_OFFSET: u64 = LOCK_PAGE * PAGE_SIZE as u64 + LA_WAL_LEN as u64;
@@ -1110,6 +1126,11 @@ pub struct Shm {
     pub recovered: bool,
     /// The append-only log; Some iff durability = wal.
     wal: Option<WalFile>,
+    /// The intent ring's overflow file. None when the ring cannot engage for
+    /// this durability, or when this process could not open the file — it
+    /// then keeps large writes on the direct path and declines to execute
+    /// other processes' spilled intents.
+    spill: Option<File>,
     /// Process-private in-memory DB (`path = ":memory:"`): no multi-process
     /// attach. Reader pins use [`Self::priv_pins`] instead of the mapped
     /// multi-process reader table (cheaper: no CAS claim scan / SeqCst pin
