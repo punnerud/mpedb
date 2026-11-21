@@ -1129,6 +1129,14 @@ across 1000 processes) plus ~1M warm-up minor faults each. For big regions use t
 huge pages (`huge=within_size`) or `MADV_COLLAPSE`; the engine calls
 `madvise(MADV_HUGEPAGE)` opportunistically. Small (≤ 256 MB) regions are a non-issue.
 
+⚠ **A large page-cache folio is a large write.** On Linux a store through the mapping
+dirties the whole folio it lands in, and `msync` writes the whole folio. Two things used
+to hand the data file large folios: the create-time prewrite, done in 1 MiB writes, and
+the huge-page advice above, which makes a fault read in 2 MiB. One changed 4 KiB page
+then cost a 1–2 MiB write at every `commit` msync, 12.7 ms against 2.1 ms on a network
+XFS volume. So the prewrite is one page per write, and the advice is given only where
+nothing waits on writeback: a private mapping, a tmpfs file, or `durability = "none"`.
+
 ## 10. Testing & verification strategy
 
 1. Unit tests per module; model-based B+tree tests vs `BTreeMap` (done).

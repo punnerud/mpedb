@@ -303,8 +303,19 @@ impl Shm {
         if ptr == libc::MAP_FAILED {
             return Err(io_err("mmap"));
         }
-        // opportunistic; harmless where unsupported (macOS: no-op)
-        crate::os::madvise_hugepage(ptr, size as usize);
+        // Opportunistic (§9), and not for a file this process syncs. With
+        // the advice a fault brings in a 2 MiB folio, one stored page dirties
+        // all of it, and the commit's msync writes all of it: measured 28 ms
+        // against 4.9 ms for three pages on a network XFS volume. tmpfs has
+        // no writeback, and `none` never waits for it.
+        #[cfg(target_os = "linux")]
+        let huge =
+            private || durability == Durability::None || crate::os::is_memory_fs(file.as_raw_fd());
+        #[cfg(not(target_os = "linux"))]
+        let huge = true;
+        if huge {
+            crate::os::madvise_hugepage(ptr, size as usize);
+        }
         // macOS/Windows crash-safe writer lock: open (creating if absent)
         // `<db>.wlock`. A private mapping gets the file-less form.
         //

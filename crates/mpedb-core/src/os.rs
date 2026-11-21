@@ -235,10 +235,17 @@ pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
 /// Windows likewise has nothing to convert: the unwritten-extent stall is an
 /// ext4/xfs behaviour and NTFS has no equivalent state for a `SetEndOfFile`
 /// grow, so zeroing the reserve would be pure cost.
+///
+/// One page per write, and the size is load-bearing. A buffered write gets a
+/// page-cache folio as large as the write, and a store through the mapping
+/// dirties the whole folio it lands in, so `msync` of one changed page then
+/// writes the folio. With 1 MiB writes that was 1 MiB per dirty page.
+/// Measured on a network XFS volume, kernel 6.8, one 4 KiB page stored and
+/// msynced, by prewrite size: 1 MiB 12.7 ms, 64 KiB 2.7 ms, 4 KiB 2.1 ms.
 #[cfg(target_os = "linux")]
 pub fn prewrite_zeros(fd: RawFd, len: u64) -> libc::c_int {
-    const CHUNK: usize = 1 << 20; // 1 MiB write buffer
-    let zeros = vec![0u8; CHUNK];
+    const CHUNK: usize = mpedb_types::PAGE_SIZE;
+    let zeros = [0u8; CHUNK];
     let mut off: u64 = 0;
     while off < len {
         let n = CHUNK.min((len - off) as usize);
@@ -345,6 +352,17 @@ pub fn fs_kind(path: &std::path::Path) -> FsKind {
 pub fn fs_kind(path: &std::path::Path) -> FsKind {
     let _ = path;
     FsKind::Unknown
+}
+
+/// Is `fd` on a filesystem with no disk behind it (tmpfs, ramfs, hugetlbfs)?
+/// False when `fstatfs` does not answer.
+#[cfg(target_os = "linux")]
+pub fn is_memory_fs(fd: RawFd) -> bool {
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(fd, &mut st) } != 0 {
+        return false;
+    }
+    matches!(st.f_type as i64, 0x0102_1994 | 0x8584_58f6 | 0x9584_58f6)
 }
 
 /// Advise transparent huge pages over the mapping. Opportunistic; macOS: no-op.
