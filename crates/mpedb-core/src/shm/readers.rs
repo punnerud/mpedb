@@ -138,8 +138,8 @@ impl Shm {
     /// True if any process-local private pin is held.
     #[inline]
     pub fn any_private_pin(&self) -> bool {
-        for i in 0..PRIV_PIN_SLOTS {
-            if self.priv_pins[i].load(Ordering::Acquire) != PRIV_PIN_FREE {
+        for pin in &self.priv_pins {
+            if pin.load(Ordering::Acquire) != PRIV_PIN_FREE {
                 return true;
             }
         }
@@ -372,8 +372,8 @@ impl Shm {
             // Process-private pins: scan the local array. No SeqCst fence —
             // writers and readers share one address space; AcqRel on the pin
             // cells already orders pin stores vs this load.
-            for i in 0..PRIV_PIN_SLOTS {
-                let t = self.priv_pins[i].load(Ordering::Acquire);
+            for pin in &self.priv_pins {
+                let t = pin.load(Ordering::Acquire);
                 if t != PRIV_PIN_FREE {
                     oldest = oldest.min(t);
                 }

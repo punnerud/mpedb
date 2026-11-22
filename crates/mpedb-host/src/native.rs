@@ -48,10 +48,10 @@ impl NativeBackend {
             .roots
             .get(name)
             .ok_or(Error::Denied("directory was not opened by host bootstrap"))?;
-        if !environment
+        if environment
             .directories
             .get(name)
-            .is_some_and(|d| d.root == root.configured)
+            .is_none_or(|d| d.root != root.configured)
         {
             return Err(Error::Denied(
                 "provider directory does not match environment",

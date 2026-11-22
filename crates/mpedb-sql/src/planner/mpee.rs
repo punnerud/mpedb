@@ -430,9 +430,9 @@ impl<'a> Problem<'a> {
     /// Tables adjacent to the placed set and not yet placed.
     fn frontier(&self, placed: Mask) -> Mask {
         let mut f = 0 as Mask;
-        for t in 0..self.n {
+        for (t, node) in self.nodes.iter().enumerate().take(self.n) {
             if placed & (bit(t)) != 0 {
-                f |= self.nodes[t].adj;
+                f |= node.adj;
             }
         }
         f & !placed & full_mask(self.n)

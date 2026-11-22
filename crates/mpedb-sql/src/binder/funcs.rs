@@ -63,8 +63,8 @@ impl<'a> Binder<'a> {
                                 "EXTRACT({field}) is not supported for date"
                             )));
                         }
-                        if !matches!(ty, None | Some(ColumnType::Timestamp | ColumnType::Date))
-                            && !(ty == Some(ColumnType::Time) && time_field)
+                        if !(matches!(ty, None | Some(ColumnType::Timestamp | ColumnType::Date))
+                            || ty == Some(ColumnType::Time) && time_field)
                         {
                             return Err(bind_err(
                                 "EXTRACT requires a date, timestamp, or supported time field",
