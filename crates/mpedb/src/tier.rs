@@ -125,6 +125,7 @@ impl Database {
                 durability,
                 concurrency: Concurrency::Serial,
                 extent_threshold: default_extent_threshold(),
+                wal_checkpoint: None,
                 // A cold tier is a file the drainer made and the drainer reads.
                 // Objects beside it would be one more thing to carry for a
                 // tier whose whole point is to sit still.

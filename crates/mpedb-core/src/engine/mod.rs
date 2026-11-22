@@ -548,6 +548,8 @@ pub struct Engine {
     /// overflow chain (DESIGN-BLOBEXTENT §8). `None` = disabled — today's
     /// behavior byte for byte, and the A/B's control arm.
     extent_threshold: Option<usize>,
+    /// Log bytes between checkpoints; `None` = the default.
+    wal_checkpoint: Option<u64>,
     /// Send extent-sized payloads outside the file as content-named objects
     /// (`vkind=4`) rather than into a run of pages inside it (`vkind=2`).
     /// Per-process, exactly like `extent_threshold`: it decides what NEW
@@ -632,6 +634,7 @@ impl Engine {
             concurrency: config.options.concurrency,
             flusher,
             extent_threshold: None,
+            wal_checkpoint: None,
             external_extents: false,
             work_budget: config.options.max_work_rows,
             max_tables: config.options.max_tables,
@@ -842,6 +845,7 @@ impl Engine {
             concurrency: Concurrency::Serial,
             flusher: None, // read-only tooling handle; async needs a config
             extent_threshold: None,
+            wal_checkpoint: None,
             external_extents: false,
             // Tooling handle (no config): the WORK-ROW budget is unlimited, a
             // `dump`/verify pass legitimately scans whole tables and a row count
@@ -977,6 +981,12 @@ impl Engine {
 
     pub fn set_extent_threshold(&mut self, threshold: Option<usize>) {
         self.extent_threshold = threshold;
+    }
+
+    /// Un-checkpointed log bytes that trigger a checkpoint. `None` keeps the
+    /// default (`MPEDB_WAL_CKPT_BYTES`, else 16 MiB).
+    pub fn set_wal_checkpoint(&mut self, bytes: Option<u64>) {
+        self.wal_checkpoint = bytes;
     }
 
     pub fn leak_counters(&self) -> Result<(u64, u64, u64, u64)> {

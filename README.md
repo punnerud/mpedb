@@ -946,7 +946,10 @@ macOS** — `extent_threshold_kb` in the config overrides either way (`0` =
 off). Under `durability = "async"` the default is off on every
 platform: the payload is synced before the commit returns, and on a disk
 whose flush costs milliseconds that sync is the whole write (measured
-34 → 5 648 writes/s at 6 KB with it off; tmpfs hides this). The 4 KiB cell and the macOS curve share one queued fix: per-commit
+34 → 5 648 writes/s at 6 KB with it off; tmpfs hides this). `wal_checkpoint_mb` (default 16, `wal` and `async`) is how much log
+accumulates before a checkpoint syncs the data file under the writer lock; a
+larger value means fewer of those pauses and more log to replay after a
+crash. The 4 KiB cell and the macOS curve share one queued fix: per-commit
 coalesced `pwritev`. See
 [benchmarks/head-to-head.md](benchmarks/head-to-head.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
 

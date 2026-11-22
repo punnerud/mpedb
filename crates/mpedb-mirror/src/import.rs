@@ -209,6 +209,7 @@ pub(crate) fn create_mirror_db(
             // A mirror file carries no RLS assertions: the mirror applier runs
             // at the engine level, BELOW policies, by design (DESIGN-MIRROR §0).
             extent_threshold: mpedb_types::config::default_extent_threshold(),
+            wal_checkpoint: None,
             // An import creates the mpedb side from a foreign database. Objects
             // beside the file would be a second thing to hand over, and the
             // mirror's contract is one file converged against one source.

@@ -903,6 +903,12 @@ honesty. Implementation note: WAL growth pre-zeroes new chunks — appending int
 measured 958 µs vs 350 µs per append+fdatasync (2.7×) on this host's ext4.
 Checkpoint-threshold sensitivity: 16 MiB vs 64 MiB made no measurable difference
 (9,924 vs 9,890 ops/s), so checkpoint drag is negligible at the default.
+That holds for small rows. With `wal_checkpoint_mb` the threshold is a config
+value, and a workload that logs a page image per row is where it matters:
+measured 2026-11-21 through `mpedb-redis` under `async`, 64-byte values on
+random keys, 16 MiB against 256 MiB was 2,464 against 13,087 writes/s, because
+each checkpoint msyncs the data file while it holds the writer lock. The price
+is the replay: a crash replays up to that much log.
 
 #### 5.4.2 Deferred-fsync WAL (`durability = async`) — the crash-consistent fast class
 

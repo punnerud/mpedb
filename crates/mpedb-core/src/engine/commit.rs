@@ -625,7 +625,10 @@ impl<'e> WriteTxn<'e> {
             // advance, recovery still replays from the old wal_ckpt, and the
             // next commit retries — whereas failing a commit that is already
             // durable and acknowledged would be a lie.
-            let _ = self.eng.shm.wal_maybe_checkpoint();
+            let _ = match self.eng.wal_checkpoint {
+                Some(bytes) => self.eng.shm.wal_checkpoint_if(bytes),
+                None => self.eng.shm.wal_maybe_checkpoint(),
+            };
         }
         // Commit wins: discard undo images (published meta now owns the dirtied pages).
         self.inplace_undo.clear();

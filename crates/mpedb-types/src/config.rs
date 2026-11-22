@@ -239,6 +239,13 @@ pub struct DbOptions {
     /// format self-describes (`vkind=2` cells), so processes with different
     /// thresholds only differ in what NEW writes do.
     pub extent_threshold: Option<usize>,
+    /// Un-checkpointed log bytes that trigger a checkpoint under `wal` and
+    /// `async`; `None` = the engine's default (16 MiB). Per-process: it
+    /// decides when THIS process checkpoints, and any value recovers any
+    /// file. A checkpoint msyncs the data file under the writer lock, so a
+    /// larger value trades a longer log and a longer replay after a crash
+    /// for fewer of those.
+    pub wal_checkpoint: Option<u64>,
     /// Send extent-sized payloads OUTSIDE the database file, as their own
     /// content-named objects in `<path>.extents/`, instead of into a run of
     /// pages inside it (`vkind=4` rather than `vkind=2`).
@@ -536,6 +543,12 @@ struct RawDatabase {
     /// commit returns, which is the wait `async` exists to avoid.
     #[serde(default)]
     extent_threshold_kb: Option<u64>,
+    /// Checkpoint the log once this many MiB of it are un-checkpointed
+    /// (`wal` and `async`). Absent = 16. A checkpoint msyncs the data file
+    /// while it holds the writer lock; the log between two of them is what a
+    /// crash replays.
+    #[serde(default)]
+    wal_checkpoint_mb: Option<u64>,
     /// Put extent-sized payloads in `<path>.extents/` as content-named objects
     /// rather than in this file's page space. Off unless asked for.
     #[serde(default)]
@@ -928,6 +941,15 @@ fn raw_to_config(
                     None if durability == Durability::Async => None,
                     None => default_extent_threshold(),
                 },
+                wal_checkpoint: match db.wal_checkpoint_mb {
+                    Some(0) => {
+                        return Err(Error::Config(
+                            "wal_checkpoint_mb must be at least 1".into(),
+                        ))
+                    }
+                    Some(mb) => Some(mb.saturating_mul(1024 * 1024)),
+                    None => None,
+                },
                 external_extents: db.external_extents.unwrap_or(false),
                 max_work_rows: runtime.max_work_rows,
                 max_join_cells: runtime.max_join_cells,
@@ -1003,6 +1025,7 @@ impl RawMember {
                 owner: self.owner,
                 group: self.group,
                 extent_threshold_kb: None,
+                wal_checkpoint_mb: None,
                 external_extents: None,
             },
             self.tables,
