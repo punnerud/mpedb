@@ -24,6 +24,7 @@ feature-by-feature status is [../COMPAT.md](../COMPAT.md).
 | [minisqlite.md](minisqlite.md) | minisqlite, sqlite3, PostgreSQL | Two SQL engines built the same way, and the number nobody publishes |
 | [turso.md](turso.md) | Turso | Side document for the fourth engine in the head-to-head |
 | [blobasaur.md](blobasaur.md) | Blobasaur (Zerodha's RESP server over N SQLite files) | 64 KiB JSON, zstd ~9×, 1 and 2 files, three repetitions, a flush probe as the null control. No sync before the reply: mpedb-redis 2.3–2.5× on writes. A sync before the reply: mpedb-redis `wal` 1.9–2.0× on the 7 KiB value and on an 82 B one, after group commit was widened past 824 bytes; Blobasaur 1.14–1.38× ahead of `commit`, which was 5.7× before the prewrite stopped handing msync megabyte folios. Point reads: mpedb-redis 1.7–2.0×. Their published 16-core table is the reference, not a row |
+| [redis.md](redis.md) | Redis 7 (memory, and the append-only file at three sync settings) | Paired by what survives, mpedb never the weaker side, a no-cache control arm, three repetitions. Pipelined `GET` of present keys is level (0.94–0.96×); Redis is 6.5–11× ahead on pipelined `SET` without a sync and 1.4× with one; mpedb-redis `wal` is 1.5–2.2× ahead on unpipelined synced writes and holds 3.5–4.4× less memory. `write_behind_ms` reaches 0.67× of Redis without persistence when keys repeat, and is shown only against that |
 
 Related but deliberately NOT here: [../LANDSCAPE.md](../LANDSCAPE.md) is a
 positioning survey of what other engines do *better*, not a measurement, and
