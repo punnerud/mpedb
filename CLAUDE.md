@@ -231,6 +231,12 @@ log-based engine), and the hardware published when the hardware is the answer.
   `size_mb`. A static Redis Cluster slot map answers `MOVED`. There is no
   replica and no failover — that is `design/DESIGN-DISTRIBUTED.md`. Group
   commit runs only for durability `commit` and `wal`; the default is `async`.
+  The listener is `mio` event loops (`threads`, default one), and the `SET`s
+  every connection has ready in one round are one transaction. `cache_mb`
+  holds strings in memory in front of the files and holds nothing the files
+  do not. `write_behind_ms` (default 0, off) answers a plain `SET` from
+  memory and writes it later: a killed process loses that window, which no
+  durability mode allows, so it is paired only with Redis without persistence.
   No `AUTH`. `cargo test --manifest-path crates/mpedb-redis/Cargo.toml`.
 - `crates/mpedb-py` — PyO3 module `mpedb` (abi3-py310, GIL released around engine calls);
   build: `cargo build --release -p mpedb-py`, ship `libmpedb_py.so` as `mpedb.so`.

@@ -32,6 +32,15 @@ impl Resp {
     pub fn pong() -> Self {
         Resp::Simple("PONG".into())
     }
+
+    /// Bytes of bulk payload held, framing not counted.
+    pub fn payload_len(&self) -> usize {
+        match self {
+            Resp::Bulk(Some(bytes)) => bytes.len(),
+            Resp::Array(items) => items.iter().map(Resp::payload_len).sum(),
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug)]

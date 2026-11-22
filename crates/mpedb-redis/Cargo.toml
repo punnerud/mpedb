@@ -31,6 +31,8 @@ mpedb-types = { path = "../mpedb-types" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 zstd = "0.13"
+# Readiness only: epoll, kqueue or IOCP behind one interface. No runtime.
+mio = { version = "1", features = ["os-poll", "net"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -17,8 +17,20 @@ pub struct ServeConfig {
     pub store: StoreOptions,
     pub cluster: Cluster,
     pub max_connections: usize,
+    /// Event-loop threads. One by default: a second one makes pipelined
+    /// reads faster and durable writes slower, because two loops commit
+    /// out of phase and each flush carries half as many writes. Measured
+    /// 2026-11-21 on 2 vCPUs shared with the client, eight connections,
+    /// one thread against two: `GET` pipelined 16 deep 175 737 against
+    /// 249 961 /s, `SET` under `wal` 1 175 against 700 /s, `SET` under
+    /// `async` 22 787 against 20 183 /s.
+    pub threads: usize,
     pub cleanup_interval: Duration,
     pub cleanup_chunk: usize,
+    /// How often held `SET`s are written to the files. Zero, the default,
+    /// holds nothing: a `SET` is answered after its commit. See
+    /// `StoreOptions::write_behind`.
+    pub write_behind: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,8 +48,14 @@ struct FileConfig {
     zstd_level: i32,
     #[serde(default = "default_max_value_mb")]
     max_value_mb: u64,
+    #[serde(default = "default_cache_mb")]
+    cache_mb: u64,
+    #[serde(default)]
+    write_behind_ms: u64,
     #[serde(default = "default_max_connections")]
     max_connections: usize,
+    #[serde(default = "default_threads")]
+    threads: usize,
     #[serde(default = "default_cleanup_ms")]
     cleanup_interval_ms: u64,
     #[serde(default = "default_chunk")]
@@ -80,6 +98,12 @@ fn default_zstd() -> i32 {
 fn default_max_value_mb() -> u64 {
     16
 }
+fn default_cache_mb() -> u64 {
+    64
+}
+fn default_threads() -> usize {
+    1
+}
 fn default_max_connections() -> usize {
     256
 }
@@ -107,6 +131,9 @@ impl ServeConfig {
         if file.cleanup_chunk == 0 {
             return Err("cleanup_chunk must be at least 1".into());
         }
+        if file.threads == 0 {
+            return Err("threads must be at least 1".into());
+        }
         if file.max_connections == 0 {
             return Err("max_connections must be at least 1".into());
         }
@@ -120,11 +147,18 @@ impl ServeConfig {
                 size_mb: file.size_mb,
                 zstd_level: file.zstd_level,
                 max_value_bytes,
+                cache_bytes: file
+                    .cache_mb
+                    .checked_mul(1024 * 1024)
+                    .ok_or("cache_mb is too large")? as usize,
+                write_behind: file.write_behind_ms > 0,
             },
             cluster,
             max_connections: file.max_connections,
+            threads: file.threads,
             cleanup_interval: Duration::from_millis(file.cleanup_interval_ms),
             cleanup_chunk: file.cleanup_chunk,
+            write_behind: Duration::from_millis(file.write_behind_ms),
         })
     }
 
@@ -141,11 +175,15 @@ impl ServeConfig {
                 size_mb: default_size_mb(),
                 zstd_level: default_zstd(),
                 max_value_bytes: default_max_value_mb() as usize * 1024 * 1024,
+                cache_bytes: default_cache_mb() as usize * 1024 * 1024,
+                write_behind: false,
             },
             cluster: Cluster::single(announce),
             max_connections: default_max_connections(),
+            threads: default_threads(),
             cleanup_interval: Duration::from_millis(default_cleanup_ms()),
             cleanup_chunk: default_chunk(),
+            write_behind: Duration::ZERO,
         }
     }
 }

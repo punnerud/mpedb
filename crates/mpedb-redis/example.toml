@@ -20,6 +20,20 @@ size_mb = 64
 zstd_level = 3
 max_value_mb = 16
 max_connections = 256
+# Event loops. One is the default; more helps pipelined reads and costs
+# durable writes (two loops commit out of phase).
+threads = 1
+
+# Memory for strings kept in front of the files, so a GET of one is a hash
+# probe. It holds nothing the files do not. 0 turns it off.
+cache_mb = 64
+
+# 0, the default: a SET is answered after its commit. Above 0, a SET with no
+# NX or XX is answered from memory and written this often, and a key set
+# several times in between is written once. A killed process then loses the
+# writes of that window, which no durability mode allows. SIGTERM and SIGINT
+# write what is held before the process exits.
+write_behind_ms = 0
 
 # cleanup_interval_ms = 0 turns the expiry reaper off.
 cleanup_interval_ms = 1000

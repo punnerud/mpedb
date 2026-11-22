@@ -18,6 +18,7 @@
 //! `DEL` `EXISTS` `EXPIRE` `TTL` `PTTL` `PERSIST` `HGET` `HSET` `HDEL`,
 //! `PING`, `QUIT`, `SELECT 0`, and `CLUSTER SLOTS|NODES|INFO`.
 
+mod cache;
 mod cluster;
 mod cmd;
 mod compress;

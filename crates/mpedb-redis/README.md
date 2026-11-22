@@ -140,6 +140,38 @@ mpedb-redis serve --listen 127.0.0.1:6379 --data-dir DIR \
 `size_mb` defaults to 64. `zstd_level` is `1..=19`, default 3.
 `max_value_mb` defaults to 16. `max_connections` defaults to 256.
 
+`cache_mb` (default 64) is memory for strings held in front of the files. A
+`GET` of a held string is a hash probe. `SET` fills it after its commit, a
+`GET` that read the file fills it, and every other write to a string drops
+the key, so it holds nothing the files do not. `0` turns it off. It relies
+on this process being the only writer of the directory.
+
+`write_behind_ms` (default 0, off) changes what a `SET` reply means. Above
+zero, a `SET` with no `NX` or `XX`, in a store that holds no hash, is kept in
+memory and answered, and written to the file every that many milliseconds. A
+key set several times in between is written once. Every command other than
+`GET` and such a `SET` first writes what is held. A killed process loses the
+writes of the window. No durability mode does that: `none` keeps every
+answered write through a killed process. SIGTERM and SIGINT write what is
+held before the process exits. At most 64 MiB is held, and a `SET` that
+finds more writes it out before it returns, so with keys that never repeat
+the sustained rate is the file's.
+
+Measured 2026-11-22 on 2 vCPUs shared with `redis-benchmark`, eight
+connections, 64-byte values, pipeline 16, 100 000 keys, per second:
+
+| | `GET` | `SET` |
+|---|---|---|
+| `cache_mb = 0`, `none` | 173 415 | 111 247 |
+| `cache_mb = 64`, `none` | 654 450 | 102 093 |
+| `cache_mb = 64`, `write_behind_ms = 100`, `none` | 641 437 | 377 074 |
+| `cache_mb = 64`, `write_behind_ms = 1000`, `async` | 559 128 | 499 251 |
+| Redis 7, no persistence | 666 001 | 579 710 |
+
+With keys that never repeat, `async`, `SET`: one million fit in the 64 MiB
+and ran at 439 947 /s; two million did not and ran at 18 000 /s, against
+13 629 /s with `write_behind_ms = 0`.
+
 A cluster section lists every node and the slot ranges it owns. Ranges are
 `start-end`, inclusive, and must cover `0-16383` with no overlap. This
 process's `cluster.announce` must appear on exactly one node. Addresses are

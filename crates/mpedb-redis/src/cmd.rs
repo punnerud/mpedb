@@ -8,7 +8,7 @@
 
 use crate::cluster::Cluster;
 use crate::resp::Resp;
-use crate::store::{BlobStore, SetCond, SetExpiry, SetWritten, StoreError, Ttl};
+use crate::store::{BlobStore, SetCond, SetExpiry, SetItem, SetWritten, StoreError, Ttl};
 
 pub struct Outcome {
     pub reply: Resp,
@@ -25,6 +25,112 @@ impl Outcome {
 
     fn close(reply: Resp) -> Self {
         Outcome { reply, close: true }
+    }
+}
+
+/// One connection's commands for a round, and the replies to them. A reply
+/// is pushed for every command that ran, in order. Nothing after a command
+/// that closes the connection is run, so `replies` can be shorter than
+/// `cmds`.
+pub struct Pipeline {
+    pub cmds: Vec<Vec<Vec<u8>>>,
+    pub replies: Vec<Outcome>,
+    /// Payload bytes in `replies`. Past [`REPLY_PAUSE`] the rest of `cmds`
+    /// waits for a later round: 64 `GET`s of a 16 MiB value must not be
+    /// held in memory at once for a client that reads slowly.
+    held: usize,
+}
+
+/// See [`Pipeline::held`].
+pub const REPLY_PAUSE: usize = 256 * 1024;
+
+impl Pipeline {
+    pub fn new(cmds: Vec<Vec<Vec<u8>>>) -> Self {
+        Pipeline {
+            cmds,
+            replies: Vec::new(),
+            held: 0,
+        }
+    }
+
+    fn push(&mut self, outcome: Outcome) {
+        self.held += outcome.reply.payload_len();
+        self.replies.push(outcome);
+    }
+
+    fn closed(&self) -> bool {
+        self.replies.last().is_some_and(|o| o.close)
+    }
+
+    /// The next command, unless the connection is closing or done.
+    fn next(&self) -> Option<&Vec<Vec<u8>>> {
+        if self.closed() || self.held >= REPLY_PAUSE {
+            return None;
+        }
+        self.cmds.get(self.replies.len())
+    }
+}
+
+/// Run what several connections sent, keeping each connection's own order.
+///
+/// Every `SET` that is next on its connection goes to the store in one
+/// call, so the `SET`s of all of them commit together. Everything else is
+/// [`dispatch`], one command at a time. The two alternate until every
+/// connection is done.
+pub fn dispatch_round(store: &BlobStore, cluster: &Cluster, pipes: &mut [Pipeline], now: i64) {
+    let is_set = |argv: &Vec<Vec<u8>>| argv.first().is_some_and(|name| upper(name) == "SET");
+    loop {
+        for pipe in pipes.iter_mut() {
+            while let Some(argv) = pipe.next() {
+                if is_set(argv) {
+                    break;
+                }
+                let outcome = dispatch(store, cluster, argv, now);
+                pipe.push(outcome);
+            }
+        }
+        // (connection, reply already known). `None` waits for the store.
+        let mut planned: Vec<(usize, Option<Resp>)> = Vec::new();
+        let mut items = Vec::new();
+        for (i, pipe) in pipes.iter().enumerate() {
+            if pipe.next().is_none() {
+                continue;
+            }
+            for argv in pipe.cmds[pipe.replies.len()..]
+                .iter()
+                .take_while(|a| is_set(a))
+            {
+                match parse_set(argv, now)
+                    .and_then(|item| cluster.check_key(item.key).map(|_| item))
+                {
+                    Ok(item) => {
+                        items.push(item);
+                        planned.push((i, None));
+                    }
+                    Err(reply) => planned.push((i, Some(reply))),
+                }
+            }
+        }
+        if planned.is_empty() {
+            return;
+        }
+        let mut results = store.set_many(&items, now).into_iter();
+        drop(items);
+        for (i, reply) in planned {
+            let reply = reply.unwrap_or_else(|| match results.next() {
+                Some(result) => set_reply(result),
+                None => Resp::err("ERR internal: a SET has no result"),
+            });
+            pipes[i].push(Outcome::reply(reply));
+        }
+    }
+}
+
+fn set_reply(result: Result<SetWritten, StoreError>) -> Resp {
+    match result {
+        Ok(SetWritten::Written) => Resp::ok(),
+        Ok(SetWritten::Skipped) => Resp::Bulk(None),
+        Err(e) => store_err(e),
     }
 }
 
@@ -97,8 +203,17 @@ fn select(argv: &[Vec<u8>]) -> Outcome {
 }
 
 fn set(store: &BlobStore, cluster: &Cluster, argv: &[Vec<u8>], now: i64) -> Outcome {
+    Outcome::reply(
+        match parse_set(argv, now).and_then(|item| cluster.check_key(item.key).map(|_| item)) {
+            Ok(item) => set_reply(store.set(item.key, item.value, item.expiry, item.cond, now)),
+            Err(reply) => reply,
+        },
+    )
+}
+
+fn parse_set(argv: &[Vec<u8>], now: i64) -> Result<SetItem<'_>, Resp> {
     if argv.len() < 3 {
-        return Outcome::reply(arity("set"));
+        return Err(arity("set"));
     }
     let key = &argv[1];
     let value = &argv[2];
@@ -120,57 +235,47 @@ fn set(store: &BlobStore, cluster: &Cluster, argv: &[Vec<u8>], now: i64) -> Outc
                 // One expiry per SET, as Redis has it. Last-wins would make
                 // `EX 10 PX 5` a five-millisecond key.
                 if !matches!(expiry, SetExpiry::None) {
-                    return Outcome::reply(Resp::err("ERR syntax error"));
+                    return Err(Resp::err("ERR syntax error"));
                 }
                 let Some(raw) = argv.get(i + 1) else {
-                    return Outcome::reply(Resp::err("ERR syntax error"));
+                    return Err(Resp::err("ERR syntax error"));
                 };
                 let Ok(n) = parse_i64(raw) else {
-                    return Outcome::reply(Resp::err(
-                        "ERR value is not an integer or out of range",
-                    ));
+                    return Err(Resp::err("ERR value is not an integer or out of range"));
                 };
                 if n <= 0 {
-                    return Outcome::reply(Resp::err("ERR invalid expire time in set"));
+                    return Err(Resp::err("ERR invalid expire time in set"));
                 }
                 let ms = if opt == "EX" {
                     match n.checked_mul(1000) {
                         Some(ms) => ms,
                         None => {
-                            return Outcome::reply(Resp::err(
-                                "ERR value is not an integer or out of range",
-                            ))
+                            return Err(Resp::err("ERR value is not an integer or out of range"))
                         }
                     }
                 } else {
                     n
                 };
                 let Some(deadline) = now.checked_add(ms) else {
-                    return Outcome::reply(Resp::err(
-                        "ERR value is not an integer or out of range",
-                    ));
+                    return Err(Resp::err("ERR value is not an integer or out of range"));
                 };
                 expiry = SetExpiry::At(deadline);
                 i += 2;
             }
-            other => {
-                return Outcome::reply(Resp::err(format!("ERR unsupported SET option '{other}'")))
-            }
+            other => return Err(Resp::err(format!("ERR unsupported SET option '{other}'"))),
         }
     }
     // Only the option tail counts. The key itself may be the bytes `NX`.
     let nx = argv[3..].iter().any(|a| upper(a) == "NX");
     let xx = argv[3..].iter().any(|a| upper(a) == "XX");
     if nx && xx {
-        return Outcome::reply(Resp::err("ERR syntax error"));
+        return Err(Resp::err("ERR syntax error"));
     }
-    Outcome::reply(match cluster.check_key(key) {
-        Ok(_) => match store.set(key, value, expiry, cond, now) {
-            Ok(SetWritten::Written) => Resp::ok(),
-            Ok(SetWritten::Skipped) => Resp::Bulk(None),
-            Err(e) => store_err(e),
-        },
-        Err(reply) => reply,
+    Ok(SetItem {
+        key,
+        value,
+        expiry,
+        cond,
     })
 }
 
@@ -381,12 +486,50 @@ mod tests {
             size_mb: 8,
             zstd_level: 3,
             max_value_bytes: 64,
+            cache_bytes: 1024 * 1024,
+            write_behind: false,
         })
         .unwrap()
     }
 
     fn args(parts: &[&str]) -> Vec<Vec<u8>> {
         parts.iter().map(|p| p.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn a_pipelined_run_of_sets_keeps_each_answer_and_stops_at_quit() {
+        let store = store();
+        let cluster = Cluster::single("127.0.0.1:6379");
+        dispatch(&store, &cluster, &args(&["HSET", "h", "f", "v"]), 1);
+        let cmds = [
+            args(&["SET", "a", "1"]),
+            args(&["SET", "h", "x"]),
+            args(&["SET", "a", "2", "NX"]),
+            args(&["SET", "a", "3", "KEEPTTL"]),
+            args(&["SET", "b", "4"]),
+            args(&["GET", "a"]),
+            args(&["QUIT"]),
+            args(&["SET", "c", "5"]),
+        ];
+        let mut pipes = [
+            Pipeline::new(cmds.to_vec()),
+            Pipeline::new(vec![args(&["SET", "z", "9"]), args(&["GET", "z"])]),
+        ];
+        dispatch_round(&store, &cluster, &mut pipes, 1);
+        assert_eq!(pipes[1].replies[0].reply, Resp::ok());
+        assert_eq!(pipes[1].replies[1].reply, Resp::Bulk(Some(b"9".to_vec())));
+        let out = &pipes[0].replies;
+        let replies: Vec<&Resp> = out.iter().map(|o| &o.reply).collect();
+        assert_eq!(replies.len(), 7, "nothing runs after QUIT");
+        assert_eq!(*replies[0], Resp::ok());
+        assert!(matches!(replies[1], Resp::Error(s) if s.starts_with("WRONGTYPE")));
+        assert_eq!(*replies[2], Resp::Bulk(None), "NX sees the SET before it");
+        assert!(matches!(replies[3], Resp::Error(s) if s.contains("KEEPTTL")));
+        assert_eq!(*replies[4], Resp::ok());
+        assert_eq!(*replies[5], Resp::Bulk(Some(b"1".to_vec())));
+        assert!(out[6].close);
+        assert_eq!(store.get(b"b", 1).unwrap(), Some(b"4".to_vec()));
+        assert_eq!(store.get(b"c", 1).unwrap(), None);
     }
 
     #[test]
