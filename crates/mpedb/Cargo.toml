@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Embedded multi-process shared-memory database with SQL and content-hashed plans"
+# The integration tests are one binary, tests/all.rs, plus the few files
+# that need a process of their own. See the comment at the top of that file.
+autotests = false
 
 [features]
 # forward mpedb-core's #37 leak counters; `examples/leak_probe` dumps them
@@ -45,3 +48,43 @@ toml = { workspace = true }
 # interpret at call — database-free by construction (the crate depends only
 # on mpedb-types).
 mpedb-spell = { workspace = true }
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[[test]]
+name = "agg_correlated_perrow"
+path = "tests/agg_correlated_perrow.rs"
+
+[[test]]
+name = "agg_stream"
+path = "tests/agg_stream.rs"
+
+[[test]]
+name = "busy_timeout"
+path = "tests/busy_timeout.rs"
+
+[[test]]
+name = "correlated_in"
+path = "tests/correlated_in.rs"
+
+[[test]]
+name = "correlated_memo"
+path = "tests/correlated_memo.rs"
+
+[[test]]
+name = "par_fold"
+path = "tests/par_fold.rs"
+
+[[test]]
+name = "ring_locality_nosort"
+path = "tests/ring_locality_nosort.rs"
+
+[[test]]
+name = "agg_stream_mem"
+path = "tests/agg_stream_mem.rs"
+
+[[test]]
+name = "prune_width_mem"
+path = "tests/prune_width_mem.rs"

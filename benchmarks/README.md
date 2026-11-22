@@ -53,9 +53,9 @@ in the table headings for exactly that reason.
 ## Reproducing
 
 ```sh
-cargo build --release -p mpedb-bench
-./target/release/mpedb-bench --help          # the cells and their flags
-./target/release/mpedb-bench --notify --disk /path/on/real/disk
+cargo build --release --manifest-path crates/mpedb-bench/Cargo.toml
+./crates/mpedb-bench/target/release/mpedb-bench --help          # the cells and their flags
+./crates/mpedb-bench/target/release/mpedb-bench --notify --disk /path/on/real/disk
 ```
 
 Run isolated — nothing else on the machine. PostgreSQL cells need PG 16 on

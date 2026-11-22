@@ -1,0 +1,183 @@
+//! Every integration test of this crate that can share a process, as one
+//! binary.
+//!
+//! Each file used to be its own test binary, and each binary links the whole
+//! engine: 173 of them were about 8 GiB on disk and most of the time of a
+//! rebuild after any engine change. A file here is a module, so
+//! `cargo test -p mpedb --test all <file>::` runs what
+//! `cargo test -p mpedb --test <file>` used to.
+//!
+//! A file stays its own binary, listed in Cargo.toml, when it changes
+//! something the whole process shares: it sets an environment variable the
+//! engine reads once, it installs a counting global allocator, or it starts
+//! its own executable again. A new test file
+//! needs a line here, or a `[[test]]` entry there. `autotests` is off, so a
+//! file with neither is not compiled.
+
+// Shared by many of the files below. Each used to compile its own copy.
+mod sqlite_oracle;
+
+mod access_report;
+mod add_column_default;
+mod advisor;
+mod affinity_synthetic_tuple;
+mod agg_collate;
+mod agg_correlated;
+mod agg_extra;
+mod agg_filter;
+mod agg_over_index;
+mod aliases;
+mod alter_table;
+mod analyze_reindex;
+mod any_key;
+mod any_types;
+mod attach_cross_file;
+mod backtest;
+mod backup_roundtrip;
+mod binder_join_scope;
+mod bitwise;
+mod bool_truthiness;
+mod cast_affinity;
+mod change_cursor;
+mod collab;
+mod collab_batch;
+mod collab_mixed_snap;
+mod collate;
+mod collate_column;
+mod colseg;
+mod colseg_model;
+mod colseg_watermark;
+mod columnar_advice;
+mod columnar_cost;
+mod columnar_extent_leak;
+mod columnar_maintain;
+mod columnar_vecsum;
+mod compact_classified;
+mod composite_index;
+mod compound_subquery;
+mod concat_blob;
+mod connect_cost;
+mod cost_layer;
+mod create_index;
+mod create_table;
+mod create_view;
+mod cte;
+mod custom_ops;
+mod datetime_fns;
+mod ddl_in_txn;
+mod derived_materialize;
+mod derived_nested;
+mod derived_table;
+mod div_zero;
+mod django_parse_gaps;
+mod dml_subquery;
+mod dqs;
+mod drop_index;
+mod drop_table;
+mod extent_numeric;
+mod extent_savepoint;
+mod facade;
+mod filesystem_class;
+mod foreign_key;
+mod fts;
+mod full_join_chains;
+mod generated_columns;
+mod glob;
+mod group_by_dialect;
+mod guide;
+mod host_udf_write;
+mod host_window_agg;
+mod hot_stmt_latency;
+mod ident_case;
+mod implicit_rowid;
+mod in_empty;
+mod in_mixed_class;
+mod in_table;
+mod index_pushdown;
+mod ingest;
+mod inplace_fixpoint;
+mod insert_default_values;
+mod insert_file;
+mod insert_or;
+mod insert_select;
+mod is_distinct;
+mod island_range;
+mod join_chains;
+mod join_using;
+mod json_fn;
+mod knn;
+mod lens;
+mod like_bound;
+mod like_dialect;
+mod like_escape;
+mod math_fns;
+mod min_max_scalar;
+mod mixed_arms;
+mod model;
+mod model_derived;
+mod mpee_solver;
+mod multi_row_insert;
+mod natural_join;
+mod ndv_stats;
+mod nested_correlated;
+mod nested_midscope;
+mod nested_subquery;
+mod nonunique_index;
+mod notify_key_range;
+mod numeric_params;
+mod odd_identifiers;
+mod oracle_trigger;
+mod order_by_nulls;
+mod order_elision;
+mod par_adaptive;
+mod param_affinity;
+mod partial_index;
+mod printf_fn;
+mod prune_width;
+mod query_many;
+mod quote_fn;
+mod recursive_cte;
+mod regexp;
+mod ring_locality;
+mod ring_returning;
+mod ring_spill;
+mod ring_stmt_atomicity;
+mod risk_depth_guard;
+mod rls_join_order;
+mod row_value;
+mod rowid_alias;
+mod rretl;
+mod rretl_map;
+mod rretl_store;
+mod runtime_budget;
+mod savepoint;
+mod savepoint_inplace;
+mod savepoint_journal;
+mod scalar_fns;
+mod scalar_fns2;
+mod session_memo_first;
+mod shard_guard;
+mod shard_tenant;
+mod spell_fn;
+mod splice;
+mod sqlite_attach;
+mod sqlite_checkpoint;
+mod sqlite_oracle_contract;
+mod sqlite_overlay;
+mod stream_correctness;
+mod strftime_fn;
+mod sync_link;
+mod table_cap;
+mod three_way_join;
+mod tier;
+mod trigger;
+mod txn_control_dispatch;
+mod typeof_storage_class;
+mod update_dup_set;
+mod values;
+mod view_trigger_txn;
+mod window;
+mod window2;
+mod window3;
+mod window_frames;
+mod window_over_group;

@@ -20,8 +20,7 @@
 use mpedb::{Config, Database, ExecResult};
 use mpedb_types::Value;
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 /// One throwaway database (FROM-less SELECT needs no user tables, but a config
 /// needs at least one, so we declare a trivial one and never touch it).

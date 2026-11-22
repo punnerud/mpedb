@@ -1,7 +1,7 @@
 #![cfg(feature = "oracle-source")]
 use mpedb_mirror::{oracle_source::OracleSource, sourcecfg, NetOp, NetOpKind, SourceSpec};
 use mpedb_types::Value;
-mod oracle_support;
+use crate::oracle_support;
 fn same_rows(a: &[Vec<Value>], b: &[Vec<Value>]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(a, b)| {

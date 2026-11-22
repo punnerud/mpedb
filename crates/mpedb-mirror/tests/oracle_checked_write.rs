@@ -5,7 +5,7 @@ use mpedb_mirror::{
     sourcecfg, NetOp, NetOpKind, SourceSpec,
 };
 use mpedb_types::Value;
-mod oracle_support;
+use crate::oracle_support;
 fn upsert(id: &str, part: &str, amount: &str) -> NetOp {
     let row = vec![
         Value::Numeric(id.into()),

@@ -1,20 +1,34 @@
 [package]
 name = "mpedb-bench"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.3.1"
+edition = "2021"
+license = "LicenseRef-mpedb-1.0"
 publish = false
 description = "Head-to-head benchmark: mpedb vs SQLite vs PostgreSQL on this machine"
 
+# Its OWN workspace, like mpedb-olapbench. It links Turso, a bundled SQLite
+# and a PostgreSQL client, and as a member that was the longest compile in
+# front of every `cargo test --workspace` and every clippy run, for a
+# benchmark nobody was running at the time.
+#     cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml
+[workspace]
+
+# The parent's release profile, repeated because a profile belongs to the
+# workspace root and this crate is now its own. The bench must measure the
+# engine as the shipped binaries build it.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [dependencies]
-mpedb = { workspace = true }
+mpedb = { path = "../mpedb" }
 # For os::fdatasync: the raw baseline must use the SAME durability barrier as the
 # engines (F_FULLFSYNC on Apple), or it would flatter itself by ~10x there.
-mpedb-core = { workspace = true }
+mpedb-core = { path = "../mpedb-core" }
 # For `--expr`: the bench measures `ExprProgram` directly, which is where the
 # residual filter's time is spent. Nothing else here needs the types crate.
-mpedb-types = { workspace = true }
-libc = { workspace = true }
+mpedb-types = { path = "../mpedb-types" }
+libc = "0.2"
 # rusqlite 0.31 bundles SQLite 3.45.0 (libsqlite3-sys 0.28). The system has
 # only libsqlite3.so.0 (no dev symlink, no header): linking -lsqlite3 fails,
 # so the bundled build is required on this machine (verified 2026-07-13).

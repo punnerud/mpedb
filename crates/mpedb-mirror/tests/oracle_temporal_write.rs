@@ -1,7 +1,7 @@
 #![cfg(feature = "oracle-source")]
 use mpedb_mirror::{oracle_source::OracleSource, sourcecfg, NetOp, NetOpKind, SourceSpec};
 use mpedb_types::Value;
-mod oracle_support;
+use crate::oracle_support;
 #[test]
 #[ignore = "requires Oracle application test owner and native client libraries"]
 fn native_oracle_zoned_timestamps_and_intervals_write_back_without_losing_carriers() {

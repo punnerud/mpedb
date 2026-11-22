@@ -10,8 +10,8 @@ Against PostgreSQL doing the same work the natural way there: `SELECT … FOR
 UPDATE` before the think time, so the row is locked across it.
 
 ```sh
-cargo build --release -p mpedb-bench
-./target/release/mpedb-bench --doc-load --disk /path/on/real/disk
+cargo build --release --manifest-path crates/mpedb-bench/Cargo.toml
+./crates/mpedb-bench/target/release/mpedb-bench --doc-load --disk /path/on/real/disk
 # knobs: MPEDB_F_ACTIONS (40), MPEDB_F_DELAY_MS (10)
 ```
 

@@ -168,5 +168,5 @@ engine doesn't.
 Read it with the obvious grain of salt: Turso is beta, 0.7.0, and moving fast;
 these numbers are a snapshot of 2026-07-17, taken to place a promising
 newcomer honestly in the field — not a verdict on where it ends up. The
-snapshot's methodology is reproducible: `cargo run --release -p mpedb-bench`
+snapshot's methodology is reproducible: `cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml`
 with the adapter decisions documented above.

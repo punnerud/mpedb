@@ -7,8 +7,8 @@ page is what that costs and where it stops working.
 Run it isolated (`benchmarks/README.md`), on both machines:
 
 ```
-cargo build --release -p mpedb-bench
-./target/release/mpedb-bench --sync-load --disk /path/on/disk
+cargo build --release --manifest-path crates/mpedb-bench/Cargo.toml
+./crates/mpedb-bench/target/release/mpedb-bench --sync-load --disk /path/on/disk
 ```
 
 ## The shape

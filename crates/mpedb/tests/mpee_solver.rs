@@ -361,8 +361,7 @@ fn join_17_4_answers() {
 // (design/DESIGN-MPEE-SOLVER.md §7). Every case below therefore proves TWO
 // things: that the order actually moved, and that the answer did not.
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 /// The v2 fixture: three tables whose TEXTUAL order is the bad one.
 ///

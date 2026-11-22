@@ -171,7 +171,7 @@ find **both** slots newer than the gate it holds and conclude
 So `newest_meta` re-loads the gate and retries, and gives up only when a *reloaded* gate
 yields the same failure (a gate that did not move admits nothing new, so the failure is
 genuine corruption). The loop is cheap to prove: replace it with a single
-`newest_meta_gated(durable_txn.load(Acquire))` and `cargo run -p mpedb-bench -- --only
+`newest_meta_gated(durable_txn.load(Acquire))` and `cargo run --manifest-path crates/mpedb-bench/Cargo.toml -- --only
 mpedb` reports spurious retries within seconds — measured 2026-07-15, 3 with it disabled
 against 0 as shipped on the same flags. `mpedb-bench`'s `SPURIOUS_CORRUPT_RETRIES`
  counter is the tripwire for that regression.

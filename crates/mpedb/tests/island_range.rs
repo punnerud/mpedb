@@ -17,8 +17,7 @@ use mpedb::{Database, ExecResult, Value};
 use mpedb_sql::AccessPath;
 use mpedb_types::Config;
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 const DDL: &[&str] = &[
     "CREATE TABLE p (id INTEGER PRIMARY KEY, lat REAL NOT NULL, lon REAL NOT NULL)",

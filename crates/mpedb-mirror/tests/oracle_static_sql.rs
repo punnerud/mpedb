@@ -1,7 +1,7 @@
 #![cfg(feature = "oracle-source")]
 use mpedb_mirror::{oracle, oracle_source::OracleSource, sourcecfg, SourceSpec};
 use mpedb_types::Value;
-mod oracle_support;
+use crate::oracle_support;
 #[test]
 #[ignore = "requires Oracle application test owner and native client libraries"]
 fn native_oracle_static_sql_procedures_execute_through_mpedb_shared_plans() {

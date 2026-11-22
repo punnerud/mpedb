@@ -16,7 +16,6 @@ members = [
     "crates/mpedb-cli",
     "crates/mpedb-py",
     "crates/mpedb-testkit",
-    "crates/mpedb-bench",
     "crates/mpedb-sqlitefmt",
     "crates/mpedb-wasm",
 ]
@@ -39,7 +38,10 @@ members = [
 # bundled DuckDB, whose C++ amalgamation is a multi-minute compile. As a member
 # it would put that in front of every `cargo test --workspace` and every CI run,
 # to build a benchmark nobody is running at the time.
-exclude = ["crates/mpedb-capi", "crates/mpedb-olapbench"]
+# mpedb-bench is excluded for the same reason: Turso, a bundled SQLite and a
+# PostgreSQL client were the longest compile in the workspace.
+#     cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml
+exclude = ["crates/mpedb-capi", "crates/mpedb-olapbench", "crates/mpedb-bench"]
 # mpedb-pg, mpedb-fs and mpedb-redis are not members and not excluded: each
 # Cargo.toml is its own workspace, so `cargo test --workspace` never compiles
 # them. A PostgreSQL wire server, a FUSE build script, and a Redis listener

@@ -218,12 +218,12 @@ matters, reproduce it in a second session before believing it.
 Reproduce:
 
 ```sh
-cargo run --release -p mpedb-bench          # full run → RESULTS-<machine>.md
-cargo run --release -p mpedb-bench -- --out RESULTS-mybox.md   # explicit name
-cargo run --release -p mpedb-bench -- --only mpedb   # one engine, least noise
-cargo run --release -p mpedb-bench -- --disk /mnt/ext4/scratch # pick the medium
-cargo run --release -p mpedb-bench -- --h2h 8       # paired durable head-to-head
-cargo run --release -p mpedb-bench -- --extents 800 # append+fdatasync by layout
+cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml          # full run → RESULTS-<machine>.md
+cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml -- --out RESULTS-mybox.md   # explicit name
+cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml -- --only mpedb   # one engine, least noise
+cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml -- --disk /mnt/ext4/scratch # pick the medium
+cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml -- --h2h 8       # paired durable head-to-head
+cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml -- --extents 800 # append+fdatasync by layout
 mpedb bench --auto --durability none|commit|wal|async   # mpedb-only, quick
 ```
 
@@ -755,7 +755,7 @@ in 4 MiB `fallocate` chunks, so every `fdatasync` also journals an extent
 conversion. **The mechanism is real and large. The attribution to mpedb was
 wrong.**
 
-`cargo run --release -p mpedb-bench -- --disk <dir> --extents 800`: five
+`cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml -- --disk <dir> --extents 800`: five
 log-file layouts, same 16 KiB record, all arms **interleaved inside one loop**,
 with the kernel's flush counters read around each append. ext4, three sessions:
 
@@ -1005,7 +1005,7 @@ other two, it is slandering them. All three fixes are committed.
 
 ## Bulk MB/s — and the number that makes it mean something
 
-`cargo run --release -p mpedb-bench -- --io` pushes a **blob payload** (256 MiB
+`cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml -- --io` pushes a **blob payload** (256 MiB
 logical, 4 KiB values, batched 256 rows/commit) through each engine and reports
 MiB/s next to a **raw-Rust baseline**: the same bytes written to a plain file
 with `std::fs` on the same medium under the same durability promise (the baseline

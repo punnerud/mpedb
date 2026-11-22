@@ -26,6 +26,12 @@ log-based engine), and the hardware published when the hardware is the answer.
   feature unification pulls in; test it with
   `cargo test --manifest-path crates/mpedb-capi/Cargo.toml`)
 - One crate: `cargo test -p mpedb-core` (also: mpedb-types, mpedb-sql, mpedb, mpedb-cli)
+- `mpedb` and `mpedb-mirror` link their integration tests into ONE binary
+  each (`tests/all.rs`, `autotests = false`), because 173 test binaries were
+  173 links of the engine. One file of them: `cargo test -p mpedb --test all window::`. A
+  new `tests/x.rs` must be added to `all.rs` or it does not run.
+- `mpedb-bench` is its OWN workspace too (it links Turso, a bundled SQLite and
+  a PostgreSQL client): `cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml`.
 - Lint (keep clean): `cargo clippy --workspace --all-targets -- -D warnings`
   **plus the four satellite workspaces**, which `--workspace` cannot reach —
   a separate workspace is invisible to the parent's `--workspace`, which is how

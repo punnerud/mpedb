@@ -234,7 +234,7 @@ impl Shm {
         //
         // ⚠ This loop is LOAD-BEARING, and it is cheap to prove: replace it with
         // a single `newest_meta_gated(self.durable_txn().load(Acquire))` and
-        // `cargo run -p mpedb-bench -- --only mpedb` reports spurious reader
+        // `cargo run --manifest-path crates/mpedb-bench/Cargo.toml -- --only mpedb` reports spurious reader
         // retries within seconds (measured 2026-07-15: 3 with it disabled, 0 as
         // shipped, same flags both arms). The commit path publishes the meta slot
         // BEFORE it advances the gate — `write_meta_slot`, then `msync_page`

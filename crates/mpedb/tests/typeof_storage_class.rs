@@ -14,8 +14,7 @@
 use mpedb::{params, Config, Database, ExecResult, Value};
 use std::ops::Deref;
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 /// Takes its file with it when it dies (the `/dev/shm` leak discipline).
 struct Tmp {

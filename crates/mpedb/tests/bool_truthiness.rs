@@ -22,8 +22,7 @@
 use mpedb::{Config, Database, ExecResult};
 use mpedb_types::Value;
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 /// Every value the matrix drives through a boolean position. Written so the
 /// literal text is legal in BOTH dialects.

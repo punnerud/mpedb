@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Bidirectional sqlite3/PostgreSQL <-> mpedb mirror (design/DESIGN-MIRROR.md)"
+# The integration tests are one binary, tests/all.rs.
+autotests = false
 
 [features]
 oracle-source = ["dep:oracle-client"]
@@ -35,3 +37,7 @@ libc = { workspace = true }
 [dev-dependencies]
 mpedb-testkit = { path = "../mpedb-testkit" }
 mpedb-proc = { path = "../mpedb-proc" }
+
+[[test]]
+name = "all"
+path = "tests/all.rs"

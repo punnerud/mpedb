@@ -951,8 +951,8 @@ coalesced `pwritev`. See
 [benchmarks/head-to-head.md](benchmarks/head-to-head.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
 
 ```sh
-cargo run --release -p mpedb-bench      # full head-to-head -> RESULTS-<machine>.md
-cargo run --release -p mpedb-bench -- --io   # bulk MiB/s vs a raw-Rust baseline
+cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml      # full head-to-head -> RESULTS-<machine>.md
+cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml -- --io   # bulk MiB/s vs a raw-Rust baseline
 mpedb bench --auto --durability wal     # quick mpedb-only
 ```
 

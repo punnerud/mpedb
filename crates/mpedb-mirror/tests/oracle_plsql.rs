@@ -1,7 +1,7 @@
 #![cfg(feature = "oracle-source")]
 use mpedb_mirror::{oracle, oracle_source::OracleSource, sourcecfg, SourceSpec};
 use mpedb_types::Value;
-mod oracle_support;
+use crate::oracle_support;
 
 #[test]
 #[ignore = "requires MPEDB_ORACLE_SOURCE_CONFIG and Oracle client libraries"]

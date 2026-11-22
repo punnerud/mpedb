@@ -10,8 +10,7 @@
 //! the oracle against the AMBIENT CLI — useful when auditing an upgrade,
 //! version-dependent by design, never part of the default battery.
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 use sqlite_oracle::{script_stdout, script_stdout_lenient, try_script_stdout};
 

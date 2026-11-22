@@ -8,8 +8,7 @@ use mpedb::{Database, ExecResult, Value};
 use mpedb_sql::AccessPath;
 use mpedb_types::Config;
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 /// `/dev/shm` when present (fast tmpfs, mpedb's habitat), else the platform
 /// temp dir — keeps the scratch path portable to macOS, where `/dev/shm` does

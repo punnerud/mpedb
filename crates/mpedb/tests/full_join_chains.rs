@@ -16,8 +16,7 @@
 //! machine and never skips.
 use mpedb::{Config, Database, ExecResult, Value};
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 // ---- schema + data, identical on both engines --------------------------------
 

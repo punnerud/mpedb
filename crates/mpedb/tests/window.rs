@@ -16,8 +16,7 @@ use mpedb::{Config, Database, ExecResult, Value};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 

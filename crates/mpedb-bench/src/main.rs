@@ -1,6 +1,6 @@
 //! mpedb-bench — honest head-to-head: mpedb vs SQLite vs PostgreSQL.
 //!
-//! Run: `cargo run --release -p mpedb-bench`
+//! Run: `cargo run --release --manifest-path crates/mpedb-bench/Cargo.toml`
 //! Flags: `--out FILE` (report destination; default is derived from the
 //! machine, so a second host cannot silently overwrite the first host's
 //! numbers), `--quick` (short cells, report not written),

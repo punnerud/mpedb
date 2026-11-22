@@ -27,8 +27,7 @@
 use mpedb::{Config, Database, ExecResult};
 use mpedb_types::Value;
 
-#[path = "sqlite_oracle/mod.rs"]
-mod sqlite_oracle;
+use crate::sqlite_oracle;
 
 /// The sqlite side of the shared table: same rows mpedb is seeded with.
 /// Row 5 holds the deliberate int/real collision (i=1 vs f=1.0) so DISTINCT

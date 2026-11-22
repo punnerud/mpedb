@@ -2,7 +2,7 @@
 use mpedb_mirror::{oracle, oracle_source::OracleSource, sourcecfg, SourceSpec};
 use mpedb_proc::{Lang, ProcEngine, ProcValue};
 use mpedb_types::Value;
-mod oracle_support;
+use crate::oracle_support;
 fn numeric(engine: &ProcEngine<'_>, name: &str, input: Value) -> Value {
     match engine.call(name, &[input]).unwrap() {
         ProcValue::Scalar(v) => v,
