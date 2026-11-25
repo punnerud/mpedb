@@ -17,23 +17,40 @@
 //! - `db.query("SQL", [args...])` and `db.execute("SQL", [args...])` where
 //!   the SQL is a **string literal** and the optional second argument is a
 //!   **list literal** of expressions;
-//! - `for row in db.rows("SQL", [args...]):` — the ONLY `for` form: a
-//!   streaming cursor pulling one row per iteration (O(1) memory in the
-//!   result size), each row bound as a tuple. Compiles to
-//!   `CursorOpen`/`CursorAdvance`/`CursorRow`; allowed only in read-only
-//!   procedures (the IR's v1 cursor rule). `break`/`continue` work; a
-//!   `break` leaves the cursor open until the call ends (at most
-//!   `interp::MAX_CURSORS` cursors may be open at once).
+//! - `for row in db.rows("SQL", [args...]):` — a streaming cursor pulling
+//!   one row per iteration (O(1) memory in the result size), each row bound
+//!   as a tuple. Compiles to `CursorOpen`/`CursorAdvance`/`CursorRow`;
+//!   allowed only in read-only procedures (the IR's v1 cursor rule).
+//!   `break`/`continue` work; a `break` leaves the cursor open until the
+//!   call ends (at most `interp::MAX_CURSORS` cursors may be open at once).
+//! - `for x in <expr>:` over a materialized list or tuple (a `db.query`
+//!   result, a row), and `for i in range(stop)` / `range(start, stop)` /
+//!   `range(start, stop, step)` where `step` is a non-zero int literal.
+//!   Both are **frontend sugar**: they compile to the same hidden-index
+//!   `while` a user would write by hand (`Len`/`Index`/`Lt`/`Jump`), so the
+//!   IR, its validator and stored blobs are unchanged. The iterable is
+//!   evaluated once. `range` arguments must be ints (not checked).
+//! - chained comparisons (`a < b <= c`, the middle evaluated once),
+//!   conditional expressions (`x if c else y`), and `x in [a, b]` /
+//!   `x not in (a, b)` against a **list or tuple literal** (an `==` chain);
+//! - `sql.NAME(args...)` — one scalar SQL function call, e.g.
+//!   `sql.upper(s)`, `sql.round(x, 2)`, `sql.strftime("%Y-%m-%d", "now")`.
+//!   Sugar for `db.query("SELECT NAME($1, ...)", [args...])[0][0]`: compiled
+//!   at define time like every embedded statement (an unknown function is a
+//!   define error), costs one db call, and has that SQL function's
+//!   semantics — which is why it does not borrow Python's method names.
+//!   A plain string literal argument is written into the statement as a
+//!   SQL literal (so `sql.date("now")` binds like `date('now')`); every
+//!   other argument is a `$n` parameter.
 //!
-//! General `for` loops stay intentionally omitted: `while` with an index
-//! covers iteration over materialized query results, and keeping the
-//! statement set minimal keeps the IR and its validator small.
+//! The `for` target is one plain name (no tuple unpacking), and there is no
+//! `for`/`else`. Containers stay read-only: no list/dict construction.
 //!
 //! Python semantics notes: `/` on two ints yields a float, `//` floors,
 //! `%` takes the divisor's sign, int overflow is an error (no bigints).
-//! Everything else — imports, attribute access (other than `db.query` /
-//! `db.execute` heads), comprehensions, f-strings, classes, lambdas,
-//! chained comparisons, ... — is a compile error with source location.
+//! Everything else — imports, attribute access (other than `db.*` /
+//! `sql.*` call heads), comprehensions, f-strings, classes, lambdas, ...
+//! — is a compile error with source location.
 
 use crate::emit::{cerr, line_col, CallKind, FuncBuilder, Skeleton, SqlCall};
 use mpedb_types::{Error, Result, Value};
@@ -223,7 +240,7 @@ impl Compiler<'_> {
                 self.b.pop_loop();
                 Ok(())
             }
-            ast::Stmt::For(f) => self.for_rows(f),
+            ast::Stmt::For(f) => self.for_stmt(f),
             ast::Stmt::Break(x) => {
                 if !self.b.emit_break()? {
                     return Err(self.err(x, "break outside of a loop"));
@@ -249,8 +266,41 @@ impl Compiler<'_> {
         }
     }
 
-    /// The ONLY `for` form: `for <name> in db.rows("SQL", [args...]):` — a
-    /// streaming cursor. General iteration stays rejected. Compiled shape:
+    /// `for <name> in <iterable>:` — three shapes, chosen by the iterable:
+    /// `db.rows(...)` (a streaming cursor), `range(...)` (a counter), and
+    /// anything else (a materialized list/tuple walked by a hidden index).
+    fn for_stmt(&mut self, f: &ast::StmtFor) -> Result<()> {
+        if !f.orelse.is_empty() {
+            return Err(self.err(f, "for/else is not supported"));
+        }
+        let ast::Expr::Name(target) = &*f.target else {
+            return Err(self.err(
+                f,
+                "the for target must be a plain variable (no tuple unpacking)",
+            ));
+        };
+        let target_slot = self.locals[target.id.as_str()]; // prescan guarantees presence
+        if let ast::Expr::Call(call) = &*f.iter {
+            match &*call.func {
+                ast::Expr::Attribute(a)
+                    if a.attr.as_str() == "rows"
+                        && matches!(&*a.value, ast::Expr::Name(n) if n.id.as_str() == "db") =>
+                {
+                    return self.for_rows(f, call, target_slot);
+                }
+                ast::Expr::Name(n)
+                    if n.id.as_str() == "range" && !self.locals.contains_key("range") =>
+                {
+                    return self.for_range(f, call, target_slot);
+                }
+                _ => {}
+            }
+        }
+        self.for_seq(f, target_slot)
+    }
+
+    /// `for <name> in db.rows("SQL", [args...]):` — a streaming cursor.
+    /// Compiled shape:
     ///
     /// ```text
     ///   <args...>; CursorOpen(p); StoreLocal(cur)     ; cur = hidden temp
@@ -263,48 +313,147 @@ impl Compiler<'_> {
     /// ```
     ///
     /// `continue` jumps to `start` (re-advance); `break` jumps to `end`.
-    fn for_rows(&mut self, f: &ast::StmtFor) -> Result<()> {
-        if !f.orelse.is_empty() {
-            return Err(self.err(f, "for/else is not supported"));
-        }
-        let ast::Expr::Name(target) = &*f.target else {
-            return Err(self.err(
-                f,
-                "the for target must be a plain variable (no tuple unpacking)",
-            ));
-        };
-        let is_db_rows = |call: &ast::ExprCall| -> bool {
-            matches!(&*call.func, ast::Expr::Attribute(a)
-                if a.attr.as_str() == "rows"
-                    && matches!(&*a.value, ast::Expr::Name(n) if n.id.as_str() == "db"))
-        };
-        let ast::Expr::Call(call) = &*f.iter else {
-            return Err(self.err(
-                &*f.iter,
-                "for is only supported over db.rows(\"SQL\", [args...]) — \
-                 general iteration does not exist here",
-            ));
-        };
-        if !is_db_rows(call) {
-            return Err(self.err(
-                &*f.iter,
-                "for is only supported over db.rows(\"SQL\", [args...]) — \
-                 general iteration does not exist here",
-            ));
-        }
+    fn for_rows(&mut self, f: &ast::StmtFor, call: &ast::ExprCall, target_slot: u16) -> Result<()> {
         // <args...>; CursorOpen — via the shared db-call path.
         self.db_call(call, CallKind::Rows)?;
         // Hidden temp holding the cursor handle; anonymous, so it can never
         // collide with a user variable.
         let cur = self.b.alloc_local().map_err(|e| self.werr(f, e))?;
         self.b.emit(Op::StoreLocal(cur))?;
-        let target_slot = self.locals[target.id.as_str()]; // prescan guarantees presence
         let start = self.b.here();
         self.b.emit(Op::LoadLocal(cur))?;
         self.b.emit(Op::CursorAdvance)?;
         let jf = self.b.emit_jump(Op::JumpIfFalse(u32::MAX))?;
         self.b.emit(Op::LoadLocal(cur))?;
         self.b.emit(Op::CursorRow)?;
+        self.b.emit(Op::StoreLocal(target_slot))?;
+        self.b.push_loop(start);
+        self.stmts(&f.body)?;
+        self.b.emit(Op::Jump(start))?; // the backward jump
+        self.b.patch_to_here(jf);
+        self.b.pop_loop();
+        Ok(())
+    }
+
+    /// `for <name> in <expr>:` over a materialized list or tuple. Pure
+    /// sugar for the index loop the subset already had — no new IR:
+    ///
+    /// ```text
+    ///   <expr>; StoreLocal(seq); LoadConst(0); StoreLocal(i)   ; hidden temps
+    ///   Jump(check)
+    /// start:
+    ///   LoadLocal(i); LoadConst(1); Add; StoreLocal(i)
+    /// check:
+    ///   LoadLocal(i); LoadLocal(seq); Len; Lt; JumpIfFalse(end)
+    ///   LoadLocal(seq); LoadLocal(i); Index; StoreLocal(target)
+    ///   <body>
+    ///   Jump(start)
+    /// end:
+    /// ```
+    ///
+    /// The iterable is evaluated once, so rebinding its variable in the body
+    /// does not change the walk (as in Python). A value that is not a list
+    /// or tuple fails at run time in `Len`/`Index`.
+    fn for_seq(&mut self, f: &ast::StmtFor, target_slot: u16) -> Result<()> {
+        self.expr(&f.iter)?;
+        let seq = self.b.alloc_local().map_err(|e| self.werr(f, e))?;
+        self.b.emit(Op::StoreLocal(seq))?;
+        let i = self.b.alloc_local().map_err(|e| self.werr(f, e))?;
+        let zero = self.b.const_idx(Value::Int(0))?;
+        self.b.emit(Op::LoadConst(zero))?;
+        self.b.emit(Op::StoreLocal(i))?;
+        let to_check = self.b.emit_jump(Op::Jump(u32::MAX))?;
+        let start = self.b.here();
+        let one = self.b.const_idx(Value::Int(1))?;
+        self.b.emit(Op::LoadLocal(i))?;
+        self.b.emit(Op::LoadConst(one))?;
+        self.b.emit(Op::Add)?;
+        self.b.emit(Op::StoreLocal(i))?;
+        self.b.patch_to_here(to_check);
+        self.b.emit(Op::LoadLocal(i))?;
+        self.b.emit(Op::LoadLocal(seq))?;
+        self.b.emit(Op::Len)?;
+        self.b.emit(Op::Lt)?;
+        let jf = self.b.emit_jump(Op::JumpIfFalse(u32::MAX))?;
+        self.b.emit(Op::LoadLocal(seq))?;
+        self.b.emit(Op::LoadLocal(i))?;
+        self.b.emit(Op::Index)?;
+        self.b.emit(Op::StoreLocal(target_slot))?;
+        self.b.push_loop(start);
+        self.stmts(&f.body)?;
+        self.b.emit(Op::Jump(start))?; // the backward jump
+        self.b.patch_to_here(jf);
+        self.b.pop_loop();
+        Ok(())
+    }
+
+    /// `for <name> in range(stop | start, stop | start, stop, step):` — a
+    /// hidden counter; the same shape as [`Self::for_seq`] with the bound
+    /// test `i < stop` (`i > stop` for a negative step). `step` must be a
+    /// non-zero int literal so the direction is known at compile time.
+    /// `start` and `stop` are evaluated once, in that order. The target is a
+    /// copy of the counter, so assigning to it does not change the walk.
+    fn for_range(&mut self, f: &ast::StmtFor, call: &ast::ExprCall, target_slot: u16) -> Result<()> {
+        if !call.keywords.is_empty() {
+            return Err(self.err(call, "keyword arguments are not supported"));
+        }
+        let (start_expr, stop_expr, step) = match &call.args[..] {
+            [stop] => (None, stop, 1i64),
+            [start, stop] => (Some(start), stop, 1i64),
+            [start, stop, step] => {
+                let literal = match step {
+                    ast::Expr::Constant(c) => match &c.value {
+                        ast::Constant::Int(big) => i64::try_from(big).ok(),
+                        _ => None,
+                    },
+                    ast::Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::USub) => {
+                        match &*u.operand {
+                            ast::Expr::Constant(c) => match &c.value {
+                                ast::Constant::Int(big) => i64::try_from(&-big.clone()).ok(),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match literal {
+                    Some(v) if v != 0 => (Some(start), stop, v),
+                    _ => {
+                        return Err(self.err(
+                            step,
+                            "the range step must be a non-zero int literal",
+                        ))
+                    }
+                }
+            }
+            _ => return Err(self.err(call, "range() takes 1 to 3 arguments")),
+        };
+        let i = self.b.alloc_local().map_err(|e| self.werr(f, e))?;
+        match start_expr {
+            Some(e) => self.expr(e)?,
+            None => {
+                let zero = self.b.const_idx(Value::Int(0))?;
+                self.b.emit(Op::LoadConst(zero))?;
+            }
+        }
+        self.b.emit(Op::StoreLocal(i))?;
+        self.expr(stop_expr)?;
+        let stop = self.b.alloc_local().map_err(|e| self.werr(f, e))?;
+        self.b.emit(Op::StoreLocal(stop))?;
+        let to_check = self.b.emit_jump(Op::Jump(u32::MAX))?;
+        let start = self.b.here();
+        let step_const = self.b.const_idx(Value::Int(step))?;
+        self.b.emit(Op::LoadLocal(i))?;
+        self.b.emit(Op::LoadConst(step_const))?;
+        self.b.emit(Op::Add)?;
+        self.b.emit(Op::StoreLocal(i))?;
+        self.b.patch_to_here(to_check);
+        self.b.emit(Op::LoadLocal(i))?;
+        self.b.emit(Op::LoadLocal(stop))?;
+        self.b.emit(if step > 0 { Op::Lt } else { Op::Gt })?;
+        let jf = self.b.emit_jump(Op::JumpIfFalse(u32::MAX))?;
+        self.b.emit(Op::LoadLocal(i))?;
         self.b.emit(Op::StoreLocal(target_slot))?;
         self.b.push_loop(start);
         self.stmts(&f.body)?;
@@ -398,44 +547,16 @@ impl Compiler<'_> {
                 }
                 Ok(())
             }
-            ast::Expr::Compare(c) => {
-                let ([op], [right]) = (&c.ops[..], &c.comparators[..]) else {
-                    return Err(self.err(
-                        c,
-                        "chained comparisons are not supported; write `a < b and b < c`",
-                    ));
-                };
-                let is_none =
-                    |e: &ast::Expr| matches!(e, ast::Expr::Constant(k) if k.value.is_none());
-                let ir = match op {
-                    ast::CmpOp::Eq => Op::Eq,
-                    ast::CmpOp::NotEq => Op::Ne,
-                    ast::CmpOp::Lt => Op::Lt,
-                    ast::CmpOp::LtE => Op::Le,
-                    ast::CmpOp::Gt => Op::Gt,
-                    ast::CmpOp::GtE => Op::Ge,
-                    ast::CmpOp::Is | ast::CmpOp::IsNot
-                        if is_none(&c.left) || is_none(right) =>
-                    {
-                        if matches!(op, ast::CmpOp::Is) {
-                            Op::Eq
-                        } else {
-                            Op::Ne
-                        }
-                    }
-                    ast::CmpOp::Is | ast::CmpOp::IsNot => {
-                        return Err(self.err(
-                            c,
-                            "`is` is only supported against None (identity does not exist here)",
-                        ))
-                    }
-                    ast::CmpOp::In | ast::CmpOp::NotIn => {
-                        return Err(self.err(c, "`in` is not supported"))
-                    }
-                };
-                self.expr(&c.left)?;
-                self.expr(right)?;
-                self.b.emit(ir)?;
+            ast::Expr::Compare(c) => self.compare(c),
+            ast::Expr::IfExp(i) => {
+                // body if test else orelse — both arms leave one value.
+                self.expr(&i.test)?;
+                let jf = self.b.emit_jump(Op::JumpIfFalse(u32::MAX))?;
+                self.expr(&i.body)?;
+                let jend = self.b.emit_jump(Op::Jump(u32::MAX))?;
+                self.b.patch_to_here(jf);
+                self.expr(&i.orelse)?;
+                self.b.patch_to_here(jend);
                 Ok(())
             }
             ast::Expr::Call(call) => self.call(call),
@@ -460,6 +581,117 @@ impl Compiler<'_> {
         }
     }
 
+    /// One comparison, a chain (`a < b <= c`: each middle operand is
+    /// evaluated once, into a hidden temp, and the chain short-circuits on
+    /// the first false link), or membership in a list/tuple literal.
+    fn compare(&mut self, c: &ast::ExprCompare) -> Result<()> {
+        if let ([op @ (ast::CmpOp::In | ast::CmpOp::NotIn)], [right]) =
+            (&c.ops[..], &c.comparators[..])
+        {
+            return self.member(c, matches!(op, ast::CmpOp::NotIn), right);
+        }
+        let is_none = |e: &ast::Expr| matches!(e, ast::Expr::Constant(k) if k.value.is_none());
+        let mut ops = Vec::with_capacity(c.ops.len());
+        let mut left = &*c.left;
+        for (op, right) in c.ops.iter().zip(&c.comparators) {
+            ops.push(match op {
+                ast::CmpOp::Eq => Op::Eq,
+                ast::CmpOp::NotEq => Op::Ne,
+                ast::CmpOp::Lt => Op::Lt,
+                ast::CmpOp::LtE => Op::Le,
+                ast::CmpOp::Gt => Op::Gt,
+                ast::CmpOp::GtE => Op::Ge,
+                ast::CmpOp::Is | ast::CmpOp::IsNot if is_none(left) || is_none(right) => {
+                    if matches!(op, ast::CmpOp::Is) {
+                        Op::Eq
+                    } else {
+                        Op::Ne
+                    }
+                }
+                ast::CmpOp::Is | ast::CmpOp::IsNot => {
+                    return Err(self.err(
+                        c,
+                        "`is` is only supported against None (identity does not exist here)",
+                    ))
+                }
+                ast::CmpOp::In | ast::CmpOp::NotIn => {
+                    return Err(self.err(c, "`in` cannot be part of a comparison chain"))
+                }
+            });
+            left = right;
+        }
+        self.expr(&c.left)?;
+        let last = ops.len() - 1;
+        let tmp = if last > 0 {
+            Some(self.b.alloc_local().map_err(|e| self.werr(c, e))?)
+        } else {
+            None
+        };
+        let mut ends = Vec::new();
+        for (k, (ir, right)) in ops.into_iter().zip(&c.comparators).enumerate() {
+            self.expr(right)?;
+            match tmp {
+                Some(t) if k < last => {
+                    self.b.emit(Op::Dup)?;
+                    self.b.emit(Op::StoreLocal(t))?;
+                    self.b.emit(ir)?;
+                    self.b.emit(Op::Dup)?;
+                    ends.push(self.b.emit_jump(Op::JumpIfFalse(u32::MAX))?);
+                    self.b.emit(Op::Pop)?;
+                    self.b.emit(Op::LoadLocal(t))?;
+                }
+                _ => {
+                    self.b.emit(ir)?;
+                }
+            }
+        }
+        for at in ends {
+            self.b.patch_to_here(at);
+        }
+        Ok(())
+    }
+
+    /// `x in [a, b, ...]` / `x not in (a, b, ...)`: an `==` chain against a
+    /// list or tuple **literal**, short-circuiting on the first match. There
+    /// is no general membership test (containers are opaque query results).
+    fn member(&mut self, c: &ast::ExprCompare, negate: bool, right: &ast::Expr) -> Result<()> {
+        let items = match right {
+            ast::Expr::List(l) => &l.elts,
+            ast::Expr::Tuple(t) => &t.elts,
+            _ => {
+                return Err(self.err(
+                    c,
+                    "`in` is only supported against a list or tuple literal: `x in [a, b]`",
+                ))
+            }
+        };
+        self.expr(&c.left)?;
+        let tmp = self.b.alloc_local().map_err(|e| self.werr(c, e))?;
+        self.b.emit(Op::StoreLocal(tmp))?;
+        let mut ends = Vec::new();
+        if items.is_empty() {
+            let f = self.b.const_idx(Value::Bool(false))?;
+            self.b.emit(Op::LoadConst(f))?;
+        }
+        for (k, item) in items.iter().enumerate() {
+            self.b.emit(Op::LoadLocal(tmp))?;
+            self.expr(item)?;
+            self.b.emit(Op::Eq)?;
+            if k + 1 < items.len() {
+                self.b.emit(Op::Dup)?;
+                ends.push(self.b.emit_jump(Op::JumpIfTrue(u32::MAX))?);
+                self.b.emit(Op::Pop)?;
+            }
+        }
+        for at in ends {
+            self.b.patch_to_here(at);
+        }
+        if negate {
+            self.b.emit(Op::Not)?;
+        }
+        Ok(())
+    }
+
     fn constant(&mut self, c: &ast::ExprConstant) -> Result<()> {
         let v = match &c.value {
             ast::Constant::None => Value::Null,
@@ -482,12 +714,17 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// The only three callables: `len(x)`, `db.query(...)`, `db.execute(...)`.
+    /// The only callables: `len(x)`, `db.query(...)`, `db.execute(...)` and
+    /// `sql.NAME(...)`.
     fn call(&mut self, call: &ast::ExprCall) -> Result<()> {
         if !call.keywords.is_empty() {
             return Err(self.err(call, "keyword arguments are not supported"));
         }
         match &*call.func {
+            ast::Expr::Name(n) if n.id.as_str() == "range" => Err(self.err(
+                call,
+                "range(...) may only be used as the iterable of a for loop",
+            )),
             ast::Expr::Name(n) if n.id.as_str() == "len" => {
                 let [arg] = &call.args[..] else {
                     return Err(self.err(call, "len() takes exactly one argument"));
@@ -498,10 +735,23 @@ impl Compiler<'_> {
             }
             ast::Expr::Attribute(a) => {
                 let ast::Expr::Name(recv) = &*a.value else {
-                    return Err(self.err(call, "only db.query(...)/db.execute(...) may be called"));
+                    return Err(self.err(
+                        call,
+                        "methods do not exist here (only db.query(...)/db.execute(...) and \
+                         sql.NAME(...) may be called); for text use a SQL function, \
+                         e.g. sql.upper(s)",
+                    ));
                 };
+                if recv.id.as_str() == "sql" && !self.locals.contains_key("sql") {
+                    return self.sql_function(call, a.attr.as_str());
+                }
                 if recv.id.as_str() != "db" {
-                    return Err(self.err(call, "only db.query(...)/db.execute(...) may be called"));
+                    return Err(self.err(
+                        call,
+                        "methods do not exist here (only db.query(...)/db.execute(...) and \
+                         sql.NAME(...) may be called); for text use a SQL function, \
+                         e.g. sql.upper(s)",
+                    ));
                 }
                 let kind = match a.attr.as_str() {
                     "query" => CallKind::Query,
@@ -527,9 +777,66 @@ impl Compiler<'_> {
             }
             _ => Err(self.err(
                 call,
-                "only len(), db.query(...) and db.execute(...) may be called",
+                "only len(), db.query(...), db.execute(...) and sql.NAME(...) may be called",
             )),
         }
+    }
+
+    /// `sql.NAME(args...)`: one scalar SQL function call, compiled as the
+    /// embedded statement `SELECT NAME($1, ..., $n)` and unwrapped with
+    /// `[0][0]`. No new IR: it is a `DbQuery` like any other, linked at
+    /// define time (so an unknown function fails there), and it costs one
+    /// db call. String literal arguments become SQL literals. `NAME` is a plain ASCII identifier — nothing else can reach
+    /// the SQL text.
+    fn sql_function(&mut self, call: &ast::ExprCall, name: &str) -> Result<()> {
+        let plain = !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !name.as_bytes()[0].is_ascii_digit();
+        if !plain {
+            return Err(self.err(call, "sql.NAME(...): NAME must be a plain ASCII identifier"));
+        }
+        // A plain string literal is written into the statement as a SQL
+        // literal, every other argument is a `$n` parameter. Some SQL
+        // functions read a literal at bind time (`date('now')`), and a
+        // parameter cannot stand in for one. Only plain text is inlined
+        // (no backslash, no control character), with
+        // `'` doubled; anything else stays a parameter.
+        let mut rendered = Vec::with_capacity(call.args.len());
+        let mut argc = 0usize;
+        for arg in &call.args {
+            if let ast::Expr::Constant(k) = arg {
+                if let ast::Constant::Str(text) = &k.value {
+                    if !text.chars().any(|ch| ch == '\\' || ch.is_control()) {
+                        rendered.push(format!("'{}'", text.replace('\'', "''")));
+                        continue;
+                    }
+                }
+            }
+            self.expr(arg)?;
+            argc += 1;
+            rendered.push(format!("${argc}"));
+        }
+        if argc > crate::ir::MAX_DB_ARGS {
+            return Err(self.err(call, "too many SQL parameters"));
+        }
+        let (line, col) = line_col(self.src, call.range().start().to_usize());
+        let plan_idx = self
+            .b
+            .add_call(SqlCall {
+                sql: format!("SELECT {name}({})", rendered.join(", ")),
+                kind: CallKind::Query,
+                argc: argc as u8,
+                line,
+                col,
+            })
+            .map_err(|e| self.werr(call, e))?;
+        self.b.emit(Op::DbQuery(plan_idx))?;
+        let zero = self.b.const_idx(Value::Int(0))?;
+        for _ in 0..2 {
+            self.b.emit(Op::LoadConst(zero))?;
+            self.b.emit(Op::Index)?;
+        }
+        Ok(())
     }
 
     fn db_call(&mut self, call: &ast::ExprCall, kind: CallKind) -> Result<()> {
@@ -617,8 +924,7 @@ fn collect_assigned(body: &[ast::Stmt], out: &mut Vec<String>) {
                 collect_assigned(&w.body, out);
                 collect_assigned(&w.orelse, out);
             }
-            // The for target is an assigned name (only db.rows fors compile,
-            // but pre-scanning rejected forms is harmless).
+            // The for target is an assigned name.
             ast::Stmt::For(f) => {
                 if let ast::Expr::Name(n) = &*f.target {
                     push(n.id.as_str(), out);
@@ -636,8 +942,7 @@ fn stmt_name(s: &ast::Stmt) -> &'static str {
         ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => "import",
         ast::Stmt::ClassDef(_) => "class definition",
         ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => "nested function definition",
-        // Plain `for` is handled in stmt() (db.rows only); only async
-        // reaches this fallback.
+        // Plain `for` is handled in stmt(); only async reaches this fallback.
         ast::Stmt::For(_) | ast::Stmt::AsyncFor(_) => "async for loop",
         ast::Stmt::With(_) | ast::Stmt::AsyncWith(_) => "with statement",
         ast::Stmt::Try(_) | ast::Stmt::TryStar(_) => "try/except",
@@ -654,7 +959,6 @@ fn stmt_name(s: &ast::Stmt) -> &'static str {
 fn expr_name(e: &ast::Expr) -> &'static str {
     match e {
         ast::Expr::Lambda(_) => "lambda",
-        ast::Expr::IfExp(_) => "conditional expression (use an if statement)",
         ast::Expr::Dict(_) => "dict literal",
         ast::Expr::Set(_) => "set literal",
         ast::Expr::ListComp(_) | ast::Expr::SetComp(_) | ast::Expr::DictComp(_) => "comprehension",

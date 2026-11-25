@@ -119,10 +119,18 @@ Accepted (everything else is a compile error with a line number):
   the definition itself; no defaults, no `*args`, no annotations, no decorators
 - literals: int (i64 range), float, str, `True`/`False`/`None`
 - operators: `+ - * / // %`, unary `-`, `not`, `== != < <= > >=`,
-  `is None` / `is not None`, `and`/`or`, augmented assignment (`+=` …)
+  `is None` / `is not None`, `and`/`or`, augmented assignment (`+=` …),
+  chained comparisons (`0 < a <= 10`), `x if c else y`, and `x in [a, b]` /
+  `x not in (a, b)` against a list or tuple literal
 - statements: assignment, `if`/`elif`/`else`, `while`, `break`/`continue`,
-  `return`, `pass`
+  `return`, `pass`, and `for i in range(stop)` / `range(start, stop)` /
+  `range(start, stop, step)` (the step a non-zero int literal)
 - `len(x)` and indexing
+
+Stored **procedures** (which may run SQL) additionally get `for x in <list>`
+over a query result, and `sql.NAME(args...)` — one scalar SQL function call,
+e.g. `sql.upper(s)`, sugar for `db.query("SELECT NAME($1, ...)", [...])[0][0]`.
+A lens function may use neither `db` nor `sql`.
 
 Semantics to know: `/` on ints yields a float, `//` floors, int overflow is an
 **error** (no bigints), division by zero is an **error** — and lens functions
