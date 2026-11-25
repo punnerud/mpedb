@@ -71,6 +71,7 @@ pub fn compile(src: &str) -> Result<Skeleton> {
         consts: c.b.consts,
         instrs: c.b.instrs,
         calls: c.b.calls,
+        proc_calls: c.b.proc_calls,
     })
 }
 

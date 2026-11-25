@@ -32,6 +32,17 @@ pub struct SqlCall {
     pub col: usize,
 }
 
+/// One call to another stored procedure: its name as written, the number
+/// of arguments passed, and the source position (for define-time errors
+/// when no such procedure exists or it takes other arguments).
+#[derive(Debug, Clone)]
+pub struct ProcCall {
+    pub name: String,
+    pub argc: u16,
+    pub line: usize,
+    pub col: usize,
+}
+
 /// Frontend output: everything but the plan hashes (which only exist after
 /// the engine prepares the collected SQL against a live schema).
 #[derive(Debug)]
@@ -43,6 +54,11 @@ pub struct Skeleton {
     pub instrs: Vec<Op>,
     /// `DbQuery(i)`/`DbExec(i)` in `instrs` refers to `calls[i]`.
     pub calls: Vec<SqlCall>,
+    /// `CallProc(i)` in `instrs` refers to `proc_calls[i]`. Only the engine
+    /// can link these (it knows the stored procedures); every other user of
+    /// a skeleton builds a procedure without callees, which the validator
+    /// refuses if a call is present.
+    pub proc_calls: Vec<ProcCall>,
 }
 
 /// Compile error helper: all frontend rejections funnel through here so the
@@ -70,6 +86,7 @@ pub struct FuncBuilder {
     pub instrs: Vec<Op>,
     pub consts: Vec<Value>,
     pub calls: Vec<SqlCall>,
+    pub proc_calls: Vec<ProcCall>,
     nlocals: u16,
     /// Innermost-last loop contexts for break/continue.
     loops: Vec<LoopCtx>,
@@ -89,6 +106,7 @@ impl FuncBuilder {
             instrs: Vec::new(),
             consts: Vec::new(),
             calls: Vec::new(),
+            proc_calls: Vec::new(),
             nlocals: 0,
             loops: Vec::new(),
         }
@@ -183,6 +201,26 @@ impl FuncBuilder {
     }
 
     // ------------------------------------------------------------ loops
+
+    /// Register a call to another procedure; returns the callee-table index
+    /// for the op. One entry per (name, argument count).
+    pub fn add_proc_call(&mut self, call: ProcCall) -> Result<u16> {
+        if let Some(i) = self
+            .proc_calls
+            .iter()
+            .position(|c| c.name == call.name && c.argc == call.argc)
+        {
+            return Ok(i as u16);
+        }
+        if self.proc_calls.len() >= crate::ir::MAX_CALLEES {
+            return Err(Error::Unsupported(format!(
+                "proc: calls too many other procedures (max {})",
+                crate::ir::MAX_CALLEES
+            )));
+        }
+        self.proc_calls.push(call);
+        Ok((self.proc_calls.len() - 1) as u16)
+    }
 
     pub fn push_loop(&mut self, start: u32) {
         self.loops.push(LoopCtx {

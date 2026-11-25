@@ -132,6 +132,32 @@ over a query result, and `sql.NAME(args...)` — one scalar SQL function call,
 e.g. `sql.upper(s)`, sugar for `db.query("SELECT NAME($1, ...)", [...])[0][0]`.
 A lens function may use neither `db` nor `sql`.
 
+**Lists and dicts** are built with displays only: `[a, b, *more]` and
+`{"k": v, **other}` (text keys, insertion order kept, a repeated key takes
+the last value). They are values: nothing changes one in place — no
+`xs.append(v)`, no `d["k"] = v`, both compile errors that name the
+replacement (`xs = [*xs, v]`, `d = {**d, "k": v}`) — so two names never
+alias the same container and the result is the same as CPython's. `xs[i]`,
+`d["k"]` (a missing key is an error), `len(...)`, `==`, and `x in xs` /
+`"k" in d` / `"ab" in text` work on them; `+` does not join lists. A
+procedure may return one, nested at most 8 deep and 1,000,000 elements in
+total; building and comparing them is charged to the instruction budget by
+the elements touched, so a short loop cannot do unbounded work.
+
+A stored **procedure** may **call another stored procedure** by name:
+`total = order_total(order_id)`. The callee must already be defined, and the
+caller is bound to the callee's content hash at that moment — redefining
+the callee does not change the caller until the caller is defined again, as
+with the SQL plans a procedure embeds. Calls therefore form a DAG: no
+recursion, at most 16 deep (checked at define time). The callee runs inside
+the caller's call: same transaction (it sees the caller's uncommitted
+writes; any error rolls everything back), same instruction, database-call
+and cursor-row budgets. A procedure that calls a writer is a writer, and
+the rule that `db.rows()` cursors exist only in read-only procedures spans
+everything a procedure calls. Cursors a callee leaves open are closed when
+it returns. Functions, lenses, operators and trigger bodies cannot call
+procedures.
+
 Semantics to know: `/` on ints yields a float, `//` floors, int overflow is an
 **error** (no bigints), division by zero is an **error** — and lens functions
 may NOT run SQL. Execution has a fixed instruction budget (250 000), so a

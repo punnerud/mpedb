@@ -68,6 +68,100 @@ pub enum PValue {
     List(Rc<Vec<PValue>>),
     Tuple(Rc<Vec<PValue>>),
     Cursor { slot: u16, gen: u32 },
+    /// A list the procedure built itself (`NewList` and friends).
+    Seq(Rc<Built<Vec<PValue>>>),
+    /// A dict the procedure built: text keys in insertion order.
+    Map(Rc<Built<Vec<(String, PValue)>>>),
+}
+
+/// A container built by the procedure, with the two measures that bound it.
+/// `depth` is how deeply containers nest inside it and `cells` how many
+/// values it holds in all, counted as the tree a caller would receive (a
+/// value placed twice counts twice). Both are kept on the container so a
+/// build op checks its limits without walking what it is given.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Built<T> {
+    depth: u8,
+    cells: u32,
+    items: T,
+}
+
+impl<T: Default> Built<T> {
+    fn empty() -> Built<T> {
+        Built {
+            depth: 1,
+            cells: 1,
+            items: T::default(),
+        }
+    }
+}
+
+/// Deepest nesting of built containers. Bounds every recursive walk
+/// (equality, conversion on return, drop).
+pub const MAX_BUILT_DEPTH: u8 = 8;
+/// Most values one built container may hold, nested ones included.
+pub const MAX_BUILT_CELLS: u32 = 1_000_000;
+/// An op whose work grows with a container's length costs one extra
+/// instruction-budget unit per this many elements it touches, so a
+/// procedure cannot buy unbounded work for one unit.
+pub const BUILT_WORK_PER_UNIT: usize = 32;
+
+/// Depth and cell count of a value about to be placed in a container.
+fn measure(v: &PValue) -> Result<(u8, u32)> {
+    Ok(match v {
+        PValue::Scalar(_) => (0, 1),
+        PValue::Tuple(t) => (1, 1u32.saturating_add(t.len() as u32)),
+        PValue::List(l) => {
+            let mut cells = 1u32;
+            for item in l.iter() {
+                cells = cells.saturating_add(match item {
+                    PValue::Tuple(t) | PValue::List(t) => 1u32.saturating_add(t.len() as u32),
+                    _ => 1,
+                });
+            }
+            (2, cells)
+        }
+        PValue::Seq(b) => (b.depth, b.cells),
+        PValue::Map(b) => (b.depth, b.cells),
+        PValue::Cursor { .. } => {
+            return Err(type_err("a cursor cannot be stored in a list or dict"))
+        }
+    })
+}
+
+/// Account for one value added to a built container.
+fn grow<T>(b: &mut Built<T>, (depth, cells): (u8, u32)) -> Result<()> {
+    let depth = depth.saturating_add(1);
+    if depth > MAX_BUILT_DEPTH {
+        return Err(rt_err(format!(
+            "lists and dicts may nest at most {MAX_BUILT_DEPTH} levels deep"
+        )));
+    }
+    let total = b.cells.saturating_add(cells);
+    if total > MAX_BUILT_CELLS {
+        return Err(rt_err(format!(
+            "a list or dict may hold at most {MAX_BUILT_CELLS} values"
+        )));
+    }
+    b.depth = b.depth.max(depth);
+    b.cells = total;
+    Ok(())
+}
+
+/// Set `key` in a built dict: replace in place (the key keeps its position,
+/// as in Python) or append.
+fn dict_set(b: &mut Built<Vec<(String, PValue)>>, key: String, v: PValue) -> Result<()> {
+    let m = measure(&v)?;
+    if let Some(at) = b.items.iter().position(|(k, _)| *k == key) {
+        let (_, old) = measure(&b.items[at].1)?;
+        b.cells = b.cells.saturating_sub(old);
+        grow(b, m)?;
+        b.items[at].1 = v;
+    } else {
+        grow(b, m)?;
+        b.items.push((key, v));
+    }
+    Ok(())
 }
 
 /// What `call` hands back: the scalar, or (for procs that return query
@@ -78,6 +172,8 @@ pub enum ProcValue {
     Scalar(Value),
     List(Vec<ProcValue>),
     Tuple(Vec<ProcValue>),
+    /// A dict the procedure built: text keys in insertion order.
+    Map(Vec<(String, ProcValue)>),
 }
 
 impl std::fmt::Display for ProcValue {
@@ -103,6 +199,16 @@ impl std::fmt::Display for ProcValue {
                 seq(f, items)?;
                 f.write_str(")")
             }
+            ProcValue::Map(items) => {
+                f.write_str("{")?;
+                for (i, (k, v)) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{k:?}: {v}")?;
+                }
+                f.write_str("}")
+            }
         }
     }
 }
@@ -125,6 +231,21 @@ fn to_proc_value(v: PValue) -> Result<ProcValue> {
                 .iter()
                 .cloned()
                 .map(to_proc_value)
+                .collect::<Result<_>>()?,
+        ),
+        // Bounded by MAX_BUILT_DEPTH and MAX_BUILT_CELLS, both enforced when
+        // the container was built.
+        PValue::Seq(b) => ProcValue::List(
+            b.items
+                .iter()
+                .cloned()
+                .map(to_proc_value)
+                .collect::<Result<_>>()?,
+        ),
+        PValue::Map(b) => ProcValue::Map(
+            b.items
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), to_proc_value(v.clone())?)))
                 .collect::<Result<_>>()?,
         ),
         PValue::Cursor { .. } => {
@@ -152,6 +273,19 @@ pub trait DbBridge {
     fn exec(&mut self, plan: &PlanRef, params: &[Value]) -> Result<u64>;
     fn cursor_open(&mut self, plan: &PlanRef, params: &[Value]) -> Result<u32>;
     fn cursor_advance(&mut self, stream: u32) -> Result<Option<Vec<Value>>>;
+    /// `CallProc`: the procedure stored under `hash`. The default refuses,
+    /// so a bridge that was not built to resolve procedures cannot run one
+    /// by accident.
+    fn load_proc(&mut self, _hash: &crate::hash::ProcHash) -> Result<std::sync::Arc<Proc>> {
+        Err(Error::Unsupported(
+            "proc runtime: calling another procedure is not available here".into(),
+        ))
+    }
+    /// Drop a stream before it is exhausted (a called procedure returned
+    /// with its cursor still open). Bridges without streams need nothing.
+    fn cursor_close(&mut self, _stream: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn rt_err(msg: impl Into<String>) -> Error {
@@ -189,6 +323,8 @@ fn tyname(v: &PValue) -> &'static str {
         PValue::List(_) => "list",
         PValue::Tuple(_) => "tuple",
         PValue::Cursor { .. } => "cursor",
+        PValue::Seq(_) => "list",
+        PValue::Map(_) => "dict",
     }
 }
 
@@ -217,6 +353,8 @@ fn truthy(v: &PValue) -> bool {
         PValue::List(v) => !v.is_empty(),
         PValue::Tuple(v) => !v.is_empty(),
         PValue::Cursor { .. } => true,
+        PValue::Seq(b) => !b.items.is_empty(),
+        PValue::Map(b) => !b.items.is_empty(),
     }
 }
 
@@ -237,6 +375,21 @@ fn eq(a: &PValue, b: &PValue) -> bool {
         }
         (Cursor { slot: s1, gen: g1 }, Cursor { slot: s2, gen: g2 }) => {
             s1 == s2 && g1 == g2
+        }
+        // A built list equals a list with equal elements, built or queried.
+        (Seq(x), Seq(y)) => {
+            x.items.len() == y.items.len() && x.items.iter().zip(&y.items).all(|(a, b)| eq(a, b))
+        }
+        (Seq(x), PValue::List(y)) | (PValue::List(y), Seq(x)) => {
+            x.items.len() == y.len() && x.items.iter().zip(y.iter()).all(|(a, b)| eq(a, b))
+        }
+        // Dicts are equal when they hold the same keys with equal values,
+        // in any order (Python).
+        (Map(x), Map(y)) => {
+            x.items.len() == y.items.len()
+                && x.items.iter().all(|(k, a)| {
+                    y.items.iter().any(|(k2, b)| k == k2 && eq(a, b))
+                })
         }
         _ => false,
     }
@@ -407,10 +560,30 @@ fn arith(op: Op, a: PValue, b: PValue) -> Result<PValue> {
 /// row (set by `CursorAdvance`, read by `CursorRow`), and the generation
 /// that must match the handle. Exhaustion frees the slot for reuse and
 /// bumps the generation so stale handles error instead of aliasing.
+const _: () = assert!(MAX_CURSORS <= 32);
+
 struct CurSlot {
     gen: u32,
     stream: Option<u32>,
     row: Option<PValue>,
+}
+
+/// Deepest chain of procedure calls. Calls form a DAG (a callee is fixed by
+/// hash when its caller is defined), so this bounds the native stack, not
+/// termination.
+pub const MAX_CALL_DEPTH: usize = 16;
+
+/// What one top-level call shares across every procedure it runs: the
+/// bridge, the budgets and the cursor table.
+struct State<'a> {
+    bridge: &'a mut dyn DbBridge,
+    budget: Budget,
+    instrs_left: u64,
+    db_left: u64,
+    rows_left: u64,
+    /// Grown on demand, bounded by MAX_CURSORS.
+    cursors: Vec<CurSlot>,
+    depth: usize,
 }
 
 /// Run a validated procedure. `args` were checked against `proc.argc` by
@@ -423,23 +596,72 @@ pub fn run(
     budget: Budget,
 ) -> Result<ProcValue> {
     debug_assert_eq!(args.len(), proc.argc as usize);
+    let mut st = State {
+        bridge,
+        budget,
+        instrs_left: budget.instrs,
+        db_left: budget.db_calls,
+        rows_left: budget.rows,
+        cursors: Vec::new(),
+        depth: 0,
+    };
+    let locals = args.iter().map(|v| Some(PValue::Scalar(v.clone()))).collect();
+    to_proc_value(exec(proc, locals, &mut st)?)
+}
+
+/// One bit per cursor slot that is taken (`MAX_CURSORS` fits a `u32`).
+fn cursors_in_use(cursors: &[CurSlot]) -> u32 {
+    cursors
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.stream.is_some())
+        .fold(0, |bits, (i, _)| bits | (1 << i))
+}
+
+/// Close every cursor taken since `before`: what a called procedure opened
+/// ends with that procedure, whether it returned or failed. Handles to
+/// them go stale, so a cursor cannot be used outside the procedure that
+/// opened it.
+fn close_cursors_since(st: &mut State<'_>, before: u32) -> Result<()> {
+    let now = cursors_in_use(&st.cursors);
+    for i in 0..st.cursors.len() {
+        if now & !before & (1 << i) == 0 {
+            continue;
+        }
+        if let Some(stream) = st.cursors[i].stream {
+            st.bridge.cursor_close(stream)?;
+        }
+        let c = &mut st.cursors[i];
+        c.stream = None;
+        c.row = None;
+        c.gen = c.gen.wrapping_add(1);
+    }
+    Ok(())
+}
+
+/// One activation: `locals` holds the arguments, and the budgets and
+/// cursors in `st` are the top-level call's.
+fn exec(proc: &Proc, mut locals: Vec<Option<PValue>>, st: &mut State<'_>) -> Result<PValue> {
     // Option<PValue>: None = never assigned (UnboundLocalError analogue).
-    let mut locals: Vec<Option<PValue>> = Vec::with_capacity(proc.nlocals as usize);
-    locals.extend(args.iter().map(|v| Some(PValue::Scalar(v.clone()))));
     locals.resize(proc.nlocals as usize, None);
     let mut stack: Vec<PValue> = Vec::with_capacity(proc.max_stack());
     let mut dbargs: Vec<Value> = Vec::new();
-    // Grown on demand, bounded by MAX_CURSORS.
-    let mut cursors: Vec<CurSlot> = Vec::new();
-    let mut instrs_left = budget.instrs;
-    let mut db_left = budget.db_calls;
-    let mut rows_left = budget.rows;
     let mut pc = 0usize;
+    // Charge the extra budget of an op that touches `n` container elements.
+    macro_rules! work {
+        ($n:expr) => {{
+            let extra = ($n / BUILT_WORK_PER_UNIT) as u64;
+            if st.instrs_left < extra {
+                return Err(budget_instr_err(st.budget.instrs));
+            }
+            st.instrs_left -= extra;
+        }};
+    }
     loop {
-        if instrs_left == 0 {
-            return Err(budget_instr_err(budget.instrs));
+        if st.instrs_left == 0 {
+            return Err(budget_instr_err(st.budget.instrs));
         }
-        instrs_left -= 1;
+        st.instrs_left -= 1;
         // pc is always in range: validation proved every reachable
         // successor exists and every terminal path ends in Return.
         let op = proc.instrs[pc];
@@ -493,6 +715,17 @@ pub fn run(
             Op::Eq | Op::Ne => {
                 let b = stack.pop().expect("validated");
                 let a = stack.pop().expect("validated");
+                // Comparing built containers walks them; charge the walk.
+                // Dict equality looks every key up in the other dict.
+                match (&a, &b) {
+                    (PValue::Seq(x), PValue::Seq(y)) => work!(x.cells.min(y.cells) as usize),
+                    (PValue::Map(x), PValue::Map(y)) => {
+                        let n = x.cells.min(y.cells) as usize;
+                        work!(n.saturating_mul(x.items.len().min(y.items.len()).max(1)));
+                    }
+                    (PValue::Seq(x), _) | (_, PValue::Seq(x)) => work!(x.cells as usize),
+                    _ => {}
+                }
                 let e = eq(&a, &b);
                 stack.push(PValue::Scalar(Value::Bool(if op == Op::Eq { e } else { !e })));
             }
@@ -514,6 +747,8 @@ pub fn run(
                 let n = match &v {
                     PValue::List(items) => items.len(),
                     PValue::Tuple(items) => items.len(),
+                    PValue::Seq(b) => b.items.len(),
+                    PValue::Map(b) => b.items.len(),
                     // Python len(str) counts code points, not bytes.
                     PValue::Scalar(Value::Text(s)) => s.chars().count(),
                     PValue::Scalar(Value::Blob(b)) => b.len(),
@@ -524,6 +759,20 @@ pub fn run(
             Op::Index => {
                 let idx = stack.pop().expect("validated");
                 let cont = stack.pop().expect("validated");
+                if let PValue::Map(b) = &cont {
+                    let PValue::Scalar(Value::Text(key)) = &idx else {
+                        return Err(type_err(format!(
+                            "dict keys are text, not {}",
+                            tyname(&idx)
+                        )));
+                    };
+                    work!(b.items.len());
+                    match b.items.iter().find(|(k, _)| k == key) {
+                        Some((_, v)) => stack.push(v.clone()),
+                        None => return Err(rt_err(format!("key {key:?} is not in the dict"))),
+                    }
+                    continue;
+                }
                 let i = match idx {
                     PValue::Scalar(Value::Int(i)) => i,
                     v => {
@@ -533,11 +782,12 @@ pub fn run(
                         )))
                     }
                 };
-                let items = match &cont {
+                let items: &[PValue] = match &cont {
                     PValue::List(items) | PValue::Tuple(items) => items,
+                    PValue::Seq(b) => &b.items,
                     v => {
                         return Err(type_err(format!(
-                            "{} is not indexable (only query results are)",
+                            "{} is not indexable (only lists, rows and dicts are)",
                             tyname(v)
                         )))
                     }
@@ -566,10 +816,10 @@ pub fn run(
                 }
             }
             Op::DbQuery(p) | Op::DbExec(p) | Op::CursorOpen(p) => {
-                if db_left == 0 {
-                    return Err(budget_db_err(budget.db_calls));
+                if st.db_left == 0 {
+                    return Err(budget_db_err(st.budget.db_calls));
                 }
-                db_left -= 1;
+                st.db_left -= 1;
                 let plan = &proc.plans[p as usize];
                 let argc = plan.argc as usize;
                 dbargs.clear();
@@ -589,7 +839,7 @@ pub fn run(
                 }
                 match op {
                     Op::DbQuery(_) => {
-                        let rows = bridge.query(plan, &dbargs)?;
+                        let rows = st.bridge.query(plan, &dbargs)?;
                         let list: Vec<PValue> = rows
                             .into_iter()
                             .map(|row| {
@@ -601,7 +851,7 @@ pub fn run(
                         stack.push(PValue::List(Rc::new(list)));
                     }
                     Op::DbExec(_) => {
-                        let n = bridge.exec(plan, &dbargs)?;
+                        let n = st.bridge.exec(plan, &dbargs)?;
                         let n = i64::try_from(n)
                             .map_err(|_| rt_err("affected-row count exceeds i64"))?;
                         stack.push(PValue::Scalar(Value::Int(n)));
@@ -609,15 +859,15 @@ pub fn run(
                     _ => {
                         // CursorOpen: claim a free slot (bounded), open the
                         // stream, hand out a slot+generation handle.
-                        let slot = match cursors.iter().position(|c| c.stream.is_none()) {
+                        let slot = match st.cursors.iter().position(|c| c.stream.is_none()) {
                             Some(i) => i,
-                            None if cursors.len() < MAX_CURSORS => {
-                                cursors.push(CurSlot {
+                            None if st.cursors.len() < MAX_CURSORS => {
+                                st.cursors.push(CurSlot {
                                     gen: 0,
                                     stream: None,
                                     row: None,
                                 });
-                                cursors.len() - 1
+                                st.cursors.len() - 1
                             }
                             None => {
                                 return Err(rt_err(format!(
@@ -626,8 +876,8 @@ pub fn run(
                                 )))
                             }
                         };
-                        let stream = bridge.cursor_open(plan, &dbargs)?;
-                        let c = &mut cursors[slot];
+                        let stream = st.bridge.cursor_open(plan, &dbargs)?;
+                        let c = &mut st.cursors[slot];
                         c.stream = Some(stream);
                         c.row = None;
                         stack.push(PValue::Cursor {
@@ -638,15 +888,15 @@ pub fn run(
                 }
             }
             Op::CursorAdvance => {
-                let slot = pop_cursor(&mut stack, &cursors)?;
-                if rows_left == 0 {
-                    return Err(budget_rows_err(budget.rows));
+                let slot = pop_cursor(&mut stack, &st.cursors)?;
+                if st.rows_left == 0 {
+                    return Err(budget_rows_err(st.budget.rows));
                 }
-                rows_left -= 1;
-                let stream = cursors[slot].stream.expect("pop_cursor checked");
-                match bridge.cursor_advance(stream)? {
+                st.rows_left -= 1;
+                let stream = st.cursors[slot].stream.expect("pop_cursor checked");
+                match st.bridge.cursor_advance(stream)? {
                     Some(row) => {
-                        cursors[slot].row = Some(PValue::Tuple(Rc::new(
+                        st.cursors[slot].row = Some(PValue::Tuple(Rc::new(
                             row.into_iter().map(PValue::Scalar).collect(),
                         )));
                         stack.push(PValue::Scalar(Value::Bool(true)));
@@ -654,7 +904,7 @@ pub fn run(
                     None => {
                         // Exhausted: the bridge freed the stream; recycle
                         // the slot and invalidate outstanding handles.
-                        let c = &mut cursors[slot];
+                        let c = &mut st.cursors[slot];
                         c.stream = None;
                         c.row = None;
                         c.gen = c.gen.wrapping_add(1);
@@ -663,8 +913,8 @@ pub fn run(
                 }
             }
             Op::CursorRow => {
-                let slot = pop_cursor(&mut stack, &cursors)?;
-                match &cursors[slot].row {
+                let slot = pop_cursor(&mut stack, &st.cursors)?;
+                match &st.cursors[slot].row {
                     Some(row) => stack.push(row.clone()),
                     None => {
                         return Err(rt_err(
@@ -673,9 +923,156 @@ pub fn run(
                     }
                 }
             }
+            Op::CallProc(i) => {
+                let callee = proc.callees[i as usize];
+                if st.depth >= MAX_CALL_DEPTH {
+                    return Err(rt_err(format!(
+                        "procedures call each other more than {MAX_CALL_DEPTH} deep"
+                    )));
+                }
+                let target = st.bridge.load_proc(&callee.hash)?;
+                // The caller's blob promised what the callee is; a callee
+                // that takes other arguments, writes or opens cursors when
+                // the entry says it does not would break the routing the
+                // caller was given.
+                if target.argc != callee.argc
+                    || (target.has_exec() && !callee.writes)
+                    || (target.has_cursor() && !callee.cursors)
+                {
+                    return Err(Error::Corrupt(
+                        "proc: a called procedure does not match its callee entry".into(),
+                    ));
+                }
+                let base = stack.len() - callee.argc as usize; // >= 0: validated
+                let args: Vec<Option<PValue>> = stack.drain(base..).map(Some).collect();
+                let before = cursors_in_use(&st.cursors);
+                st.depth += 1;
+                let result = exec(&target, args, st);
+                st.depth -= 1;
+                close_cursors_since(st, before)?;
+                stack.push(result?);
+            }
+            Op::NewList => stack.push(PValue::Seq(Rc::new(Built::empty()))),
+            Op::NewDict => stack.push(PValue::Map(Rc::new(Built::empty()))),
+            Op::ListAppend => {
+                let v = stack.pop().expect("validated");
+                let PValue::Seq(mut list) = stack.pop().expect("validated") else {
+                    return Err(type_err("only a list built here ([...]) can be added to"));
+                };
+                let m = measure(&v)?;
+                // A list nothing else holds grows in place; a shared one is
+                // copied first, and the copy is charged.
+                if Rc::get_mut(&mut list).is_none() {
+                    work!(list.items.len());
+                }
+                let b = Rc::make_mut(&mut list);
+                grow(b, m)?;
+                b.items.push(v);
+                stack.push(PValue::Seq(list));
+            }
+            Op::ListExtend => {
+                let other = stack.pop().expect("validated");
+                let PValue::Seq(mut list) = stack.pop().expect("validated") else {
+                    return Err(type_err("only a list built here ([...]) can be added to"));
+                };
+                let more: &[PValue] = match &other {
+                    PValue::List(items) | PValue::Tuple(items) => items,
+                    PValue::Seq(b) => &b.items,
+                    v => {
+                        return Err(type_err(format!(
+                            "* in a list needs a list or a row, not {}",
+                            tyname(v)
+                        )))
+                    }
+                };
+                work!(more.len());
+                if Rc::get_mut(&mut list).is_none() {
+                    work!(list.items.len());
+                }
+                let b = Rc::make_mut(&mut list);
+                for v in more {
+                    grow(b, measure(v)?)?;
+                    b.items.push(v.clone());
+                }
+                stack.push(PValue::Seq(list));
+            }
+            Op::DictSet => {
+                let v = stack.pop().expect("validated");
+                let key = stack.pop().expect("validated");
+                let PValue::Map(mut map) = stack.pop().expect("validated") else {
+                    return Err(type_err("only a dict built here ({...}) can be added to"));
+                };
+                let PValue::Scalar(Value::Text(key)) = key else {
+                    return Err(type_err(format!(
+                        "dict keys must be text, not {}",
+                        tyname(&key)
+                    )));
+                };
+                work!(map.items.len());
+                dict_set(Rc::make_mut(&mut map), key, v)?;
+                stack.push(PValue::Map(map));
+            }
+            Op::DictMerge => {
+                let other = stack.pop().expect("validated");
+                let PValue::Map(mut map) = stack.pop().expect("validated") else {
+                    return Err(type_err("only a dict built here ({...}) can be added to"));
+                };
+                let PValue::Map(more) = other else {
+                    return Err(type_err(format!(
+                        "** in a dict needs a dict, not {}",
+                        tyname(&other)
+                    )));
+                };
+                // Every entry is looked up in a dict that may grow to both.
+                let n = more.items.len();
+                work!(n.saturating_mul(map.items.len() + n));
+                let b = Rc::make_mut(&mut map);
+                for (k, v) in &more.items {
+                    dict_set(b, k.clone(), v.clone())?;
+                }
+                stack.push(PValue::Map(map));
+            }
+            Op::Contains => {
+                let cont = stack.pop().expect("validated");
+                let item = stack.pop().expect("validated");
+                let found = match &cont {
+                    PValue::List(items) | PValue::Tuple(items) => {
+                        work!(items.len());
+                        items.iter().any(|v| eq(v, &item))
+                    }
+                    PValue::Seq(b) => {
+                        work!(b.cells as usize);
+                        b.items.iter().any(|v| eq(v, &item))
+                    }
+                    PValue::Map(b) => {
+                        work!(b.items.len());
+                        match &item {
+                            PValue::Scalar(Value::Text(key)) => b.items.iter().any(|(k, _)| k == key),
+                            _ => false,
+                        }
+                    }
+                    PValue::Scalar(Value::Text(hay)) => {
+                        let PValue::Scalar(Value::Text(needle)) = &item else {
+                            return Err(type_err(format!(
+                                "`in` on text needs text on the left, not {}",
+                                tyname(&item)
+                            )));
+                        };
+                        work!(hay.len());
+                        hay.contains(needle.as_str())
+                    }
+                    v => {
+                        return Err(type_err(format!(
+                            "`in` needs a list, a row, a dict or text on the right, not {}",
+                            tyname(v)
+                        )))
+                    }
+                };
+                stack.push(PValue::Scalar(Value::Bool(found)));
+            }
             Op::Return => {
                 let v = stack.pop().expect("validated");
-                return to_proc_value(v);
+                return Ok(v);
             }
         }
     }
