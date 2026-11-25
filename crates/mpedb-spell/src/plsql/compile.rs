@@ -336,6 +336,7 @@ impl Parser<'_> {
             None => name,
         };
         Ok(Skeleton {
+            proc_calls: Vec::new(),
             name: stored,
             argc,
             nlocals: self.builder.nlocals(),
@@ -389,6 +390,7 @@ impl Parser<'_> {
         self.emit_procedure_result()?;
         self.builder.emit(Op::Return)?;
         Ok(Skeleton {
+            proc_calls: Vec::new(),
             name: "ANON".into(),
             argc: 0,
             nlocals: self.builder.nlocals(),

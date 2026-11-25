@@ -70,9 +70,18 @@ fn python_rejects_out_of_subset_constructs() {
     reject_py("def f():\n    return [x for x in range(3)]", "comprehension");
     reject_py("def f():\n    return f'{1}'", "f-string");
     reject_py("def f():\n    return lambda: 1", "lambda");
-    reject_py("def f():\n    return {'a': 1}", "dict");
+    reject_py("def f():\n    return {1, 2}", "set literal");
     reject_py("def f():\n    return (1, 2)", "tuple");
-    reject_py("def f():\n    return [1, 2]", "list literals are only allowed");
+    // Calls to other procedures compile only for the procedure engine.
+    reject_py("def f(x):\n    return other(x)", "may be called");
+    reject_py("def f(x):\n    return str(x)", "may be called");
+    assert_eq!(py::compile_procedure("def f(x):\n    return other(x, 1) + other(2, x) + third()").unwrap().proc_calls.len(), 2);
+    assert!(py::compile_procedure("def f(other):\n    return other(1)").is_err()); // a local is not a procedure
+    reject_py("def f(xs):\n    xs.append(1)", "cannot be changed in place");
+    reject_py("def f(d):\n    d['k'] = 1", "cannot be changed in place");
+    reject_py("def f(xs):\n    xs[0] = 1", "cannot be changed in place");
+    reject_py("def f(d):\n    return {k: 1 for k in d}", "comprehension");
+    reject_py("def f(a):\n    return (*a, 1)", "tuple");
     // General `for` is sugar over lists, tuples and range(); these stay out.
     reject_py("def f(n):\n    for i in range(0, n, n):\n        pass", "non-zero int literal");
     reject_py("def f(n):\n    for i in range(0, n, 0):\n        pass", "non-zero int literal");
@@ -88,7 +97,6 @@ fn python_rejects_out_of_subset_constructs() {
     reject_py("def f():\n    assert True", "assert");
     reject_py("def f():\n    raise ValueError()", "raise");
     reject_py("def f():\n    x: int = 1\n    return x", "annotated");
-    reject_py("def f(a, rows):\n    return a in rows", "list or tuple literal");
     reject_py("def f(a):\n    return 0 < a in [1]", "comparison chain");
     reject_py("def f(a):\n    return 0 < a is 5", "only supported against None");
     reject_py("def f(a):\n    return sql.upper", "attribute access");

@@ -783,3 +783,175 @@ fn sql_function_calls_are_one_embedded_select() {
     assert!(py::compile("def f(range):\n    for r in range:\n        pass").is_ok());
     assert!(py::compile("def f(range):\n    for r in range(3):\n        pass").is_err());
 }
+
+// ------------------------------------------------ built lists and dicts
+
+fn int(i: i64) -> ProcValue {
+    scalar(Value::Int(i))
+}
+
+fn text(s: &str) -> ProcValue {
+    scalar(Value::Text(s.into()))
+}
+
+/// Every expectation is what CPython 3 gives for the same source (a dict
+/// is shown as its items in insertion order).
+#[test]
+fn python_list_and_dict_displays_match_cpython() {
+    let got = run_py("def f(a, b):\n    return [a, b, [a + b], []]", &[Value::Int(1), Value::Int(2)]).unwrap();
+    assert_eq!(got, ProcValue::List(vec![int(1), int(2), ProcValue::List(vec![int(3)]), ProcValue::List(vec![])]));
+
+    let got = run_py("def f(a):\n    xs = [1, 2]\n    return [0, *xs, *xs, a, *[]]", &[Value::Int(9)]).unwrap();
+    assert_eq!(got, ProcValue::List(vec![int(0), int(1), int(2), int(1), int(2), int(9)]));
+
+    // A repeated key keeps its first position and takes the last value;
+    // ** merges in order, and later entries win.
+    let got = run_py(
+        "def f():\n    d = {'a': 1, 'b': 2, 'a': 3}\n    return {'z': 0, **d, 'b': 20, **{'c': 5, 'z': 9}}",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        ProcValue::Map(vec![("z".into(), int(9)), ("a".into(), int(3)), ("b".into(), int(20)), ("c".into(), int(5))])
+    );
+    assert_eq!(got.to_string(), r#"{"z": 9, "a": 3, "b": 20, "c": 5}"#);
+
+    expect_py("def f():\n    d = {'a': 1, 'b': [10, 20]}\n    return d['a'] + d['b'][1] + len(d) + len(d['b'])", &[], Value::Int(25));
+    expect_py("def f(k):\n    return {'x' + k: 1}['xy']", &[Value::Text("y".into())], Value::Int(1));
+    expect_py("def f():\n    return len([]) + len({})", &[], Value::Int(0));
+    // Empty containers are falsey, non-empty truthy.
+    expect_py("def f():\n    return 1 if [] or {} else 2", &[], Value::Int(2));
+    expect_py("def f():\n    return 1 if [0] and {'a': None} else 2", &[], Value::Int(1));
+}
+
+#[test]
+fn python_membership_matches_cpython() {
+    let src = "def f(x):\n    xs = [1, 'a', None, [2]]\n    return x in xs";
+    expect_py(src, &[Value::Int(1)], Value::Bool(true));
+    expect_py(src, &[Value::Text("a".into())], Value::Bool(true));
+    expect_py(src, &[Value::Null], Value::Bool(true));
+    expect_py(src, &[Value::Int(2)], Value::Bool(false));
+    expect_py("def f():\n    return [2] in [1, [2]]", &[], Value::Bool(true));
+    let src = "def f(k):\n    d = {'a': 1, 'b': None}\n    return k in d";
+    expect_py(src, &[Value::Text("b".into())], Value::Bool(true));
+    expect_py(src, &[Value::Text("c".into())], Value::Bool(false));
+    expect_py(src, &[Value::Int(1)], Value::Bool(false)); // values are not keys
+    expect_py("def f(k):\n    return k not in {'a': 1}", &[Value::Text("z".into())], Value::Bool(true));
+    expect_py("def f(a, b):\n    return a in b", &[Value::Text("bc".into()), Value::Text("abcd".into())], Value::Bool(true));
+    expect_py("def f(a, b):\n    return a in b", &[Value::Text("".into()), Value::Text("abcd".into())], Value::Bool(true));
+    expect_py("def f(a, b):\n    return a not in b", &[Value::Text("x".into()), Value::Text("abcd".into())], Value::Bool(true));
+    expect_py("def f(x, xs):\n    return x in [*[1, 2], 3]", &[Value::Int(3), Value::Null], Value::Bool(true));
+    // CPython: TypeError for both.
+    assert!(matches!(run_py("def f(a, b):\n    return a in b", &[Value::Int(1), Value::Text("a1".into())]).unwrap_err(), Error::TypeMismatch(_)));
+    assert!(matches!(run_py("def f(a, b):\n    return a in b", &[Value::Int(1), Value::Int(2)]).unwrap_err(), Error::TypeMismatch(_)));
+
+    // Rows and query results are containers too.
+    let mut bridge = MockBridge::new();
+    bridge.rows = vec![vec![Value::Int(1), Value::Text("x".into())], vec![Value::Int(2), Value::Text("y".into())]];
+    let src = "def f(a):\n    rows = db.query('SELECT a, b FROM t')\n    return [a in rows[0], rows[1] in rows, [a] in rows]";
+    let got = run_lang(py::compile, src, &[Value::Text("x".into())], &mut bridge, Budget::default()).unwrap();
+    assert_eq!(got, ProcValue::List(vec![scalar(Value::Bool(true)), scalar(Value::Bool(true)), scalar(Value::Bool(false))]));
+}
+
+#[test]
+fn python_container_equality_matches_cpython() {
+    expect_py("def f():\n    return [1, [2, 'a']] == [1, [2, 'a']]", &[], Value::Bool(true));
+    expect_py("def f():\n    return [1, 2] == [2, 1]", &[], Value::Bool(false));
+    expect_py("def f():\n    return [1] == [1.0]", &[], Value::Bool(true));
+    expect_py("def f():\n    return [1] != [1, 2]", &[], Value::Bool(true));
+    expect_py("def f():\n    return {'a': 1, 'b': [2]} == {'b': [2], 'a': 1}", &[], Value::Bool(true));
+    expect_py("def f():\n    return {'a': 1} == {'a': 2}", &[], Value::Bool(false));
+    expect_py("def f():\n    return {'a': 1} == {'a': 1, 'b': 2}", &[], Value::Bool(false));
+    expect_py("def f():\n    return [] == {}", &[], Value::Bool(false));
+    expect_py("def f():\n    return [] == None", &[], Value::Bool(false));
+}
+
+/// Lists and dicts are values. A variable holding one can never change
+/// because of what happens to another — which is what CPython shows for
+/// these sources too, since each rebinds instead of mutating.
+#[test]
+fn built_containers_are_values() {
+    expect_py(
+        "def f():\n    xs = [1]\n    ys = xs\n    xs = [*xs, 2]\n    zs = [ys, xs]\n    xs = [*xs, 3]\n    return len(ys) * 100 + len(zs[1]) * 10 + len(xs)",
+        &[],
+        Value::Int(123),
+    );
+    expect_py(
+        "def f():\n    d = {'a': 1}\n    e = d\n    d = {**d, 'b': 2}\n    return len(e) * 10 + len(d)",
+        &[],
+        Value::Int(12),
+    );
+    // Collecting in a loop: the usual way to build a result.
+    let mut bridge = MockBridge::new();
+    bridge.rows = vec![vec![Value::Int(1), Value::Text("x".into())], vec![Value::Int(2), Value::Text("y".into())]];
+    let src = "
+def f():
+    out = []
+    for r in db.query('SELECT a, b FROM t'):
+        out = [*out, {'id': r[0], 'name': r[1], 'row': r}]
+    return {'count': len(out), 'items': out}
+";
+    let got = run_lang(py::compile, src, &[], &mut bridge, Budget::default()).unwrap();
+    let item = |id: i64, name: &str| {
+        ProcValue::Map(vec![
+            ("id".into(), int(id)),
+            ("name".into(), text(name)),
+            ("row".into(), ProcValue::Tuple(vec![int(id), text(name)])),
+        ])
+    };
+    assert_eq!(
+        got,
+        ProcValue::Map(vec![("count".into(), int(2)), ("items".into(), ProcValue::List(vec![item(1, "x"), item(2, "y")]))])
+    );
+}
+
+#[test]
+fn built_container_errors_are_loud() {
+    let rt = |src: &str, args: &[Value], needle: &str| {
+        let e = run_py(src, args).unwrap_err();
+        assert!(e.to_string().contains(needle), "{src}: {e}");
+    };
+    rt("def f():\n    return {'a': 1}['b']", &[], "is not in the dict"); // KeyError
+    rt("def f():\n    return {'a': 1}[0]", &[], "dict keys are text");
+    rt("def f(k):\n    return {k: 1}", &[Value::Int(1)], "dict keys must be text");
+    rt("def f():\n    return [1, 2][5]", &[], "out of range"); // IndexError
+    rt("def f(a):\n    return [*a]", &[Value::Int(1)], "needs a list or a row");
+    rt("def f(a):\n    return {**a}", &[Value::Int(1)], "needs a dict");
+    rt("def f():\n    return [1] + [2]", &[], "arithmetic not supported"); // `+` does not join lists
+    rt("def f():\n    for k in {'a': 1}:\n        pass", &[], "dict keys are text");
+    rt("def f():\n    return db.query('SELECT 1', [[1]])", &[], "only scalar values");
+}
+
+/// Depth, size and work are bounded, so one instruction never buys
+/// unbounded work and no value can outgrow what a caller can receive.
+#[test]
+fn built_containers_stay_inside_their_bounds() {
+    use crate::interp::{MAX_BUILT_CELLS, MAX_BUILT_DEPTH};
+    let nest = "def f(n):\n    x = []\n    for i in range(n):\n        x = [x]\n    return x";
+    assert!(run_py(nest, &[Value::Int(MAX_BUILT_DEPTH as i64 - 1)]).is_ok());
+    let e = run_py(nest, &[Value::Int(MAX_BUILT_DEPTH as i64)]).unwrap_err();
+    assert!(e.to_string().contains("levels deep"), "{e}");
+
+    // Doubling reaches the size bound long before memory matters, even
+    // though every level shares the one below it.
+    let double = "def f(n):\n    x = [1]\n    for i in range(n):\n        x = [*x, *x]\n    return len(x)";
+    expect_py(double, &[Value::Int(10)], Value::Int(1024));
+    let big = Budget { instrs: u64::MAX, db_calls: 10, rows: 10 };
+    let e = run_lang(py::compile, double, &[Value::Int(30)], &mut MockBridge::new(), big).unwrap_err();
+    assert!(e.to_string().contains(&MAX_BUILT_CELLS.to_string()), "{e}");
+    let wide = "def f(n):\n    x = [1, 2, 3]\n    y = {'a': x}\n    for i in range(n):\n        y = {'a': y, 'b': y, 'c': y, 'd': y, 'e': y, 'f': y, 'g': y, 'h': y, 'i': y, 'j': y}\n    return 1";
+    let e = run_lang(py::compile, wide, &[Value::Int(7)], &mut MockBridge::new(), big).unwrap_err();
+    assert!(e.to_string().contains("may hold at most"), "{e}");
+
+    // Appending one at a time copies the list each time; the copies are
+    // charged, so the default budget ends it instead of the clock.
+    let grow = "def f(n):\n    x = []\n    for i in range(n):\n        x = [*x, i]\n    return len(x)";
+    expect_py(grow, &[Value::Int(2000)], Value::Int(2000));
+    let e = run_py(grow, &[Value::Int(100_000)]).unwrap_err();
+    assert!(e.to_string().contains("instruction budget"), "{e}");
+    // The same for membership tests over a long list.
+    let scan = "def f(n):\n    x = []\n    for i in range(2000):\n        x = [*x, i]\n    c = 0\n    for i in range(n):\n        if -1 in x:\n            c += 1\n    return c";
+    let e = run_py(scan, &[Value::Int(100_000)]).unwrap_err();
+    assert!(e.to_string().contains("instruction budget"), "{e}");
+}
