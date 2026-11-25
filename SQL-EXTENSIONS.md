@@ -23,7 +23,7 @@ mpedb exec app.toml 'SELECT double(amount) FROM orders'
 ```
 
 - Name and arity come from the `def` itself. Full procedure subset: `while`,
-  `for`, locals, `if`/`else`. **No SQL inside** (that is what stored
+  `for` over `range(...)`, locals, `if`/`else`. **No SQL inside** (that is what stored
   procedures, `mpedb proc`, are for) and no I/O — a function sees its
   arguments and nothing else.
 - Stored content-addressed; plans calling it carry the definition's **hash**,
