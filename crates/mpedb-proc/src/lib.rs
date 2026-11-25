@@ -91,7 +91,7 @@
 mod engine;
 
 pub use engine::{Lang, ProcEngine, ProcInfo, NS_PROC, NS_PROC_HASH};
-pub use mpedb_spell::{Budget, ProcHash, ProcValue};
+pub use mpedb_spell::{Budget, ProcHash, ProcValue, Usage};
 
 // Re-exported for callers that match on errors / build params.
 pub use mpedb::{Error, Result, Value};

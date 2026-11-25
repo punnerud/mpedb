@@ -158,6 +158,12 @@ everything a procedure calls. Cursors a callee leaves open are closed when
 it returns. Functions, lenses, operators and trigger bodies cannot call
 procedures.
 
+`ProcEngine::call_metered` is `call` plus a `Usage`: the instructions,
+database calls and cursor rows the call spent, summed over the procedures it
+called, and filled in also when the call failed and was rolled back. The
+counts are deterministic — the same call on the same data costs the same —
+so a host can bill or ration by them instead of by wall-clock time.
+
 Semantics to know: `/` on ints yields a float, `//` floors, int overflow is an
 **error** (no bigints), division by zero is an **error** — and lens functions
 may NOT run SQL. Execution has a fixed instruction budget (250 000), so a

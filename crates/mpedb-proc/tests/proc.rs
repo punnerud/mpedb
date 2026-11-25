@@ -2155,3 +2155,57 @@ fn python_procedures_call_each_other() {
     let e = engine.call("spin_many", &[Value::Int(100_000)]).unwrap_err();
     assert!(e.to_string().contains("instruction budget"), "{e}");
 }
+
+/// A call reports what it spent, summed over the procedures it called, and
+/// also when it failed.
+#[test]
+fn a_call_reports_what_it_spent() {
+    let (cfg, _guard) = test_config("pyusage");
+    let db = Database::open_with_config(cfg).unwrap();
+    seed_accounts(&db, &[(1, 100), (2, 10), (3, 5)]);
+    let engine = ProcEngine::new(&db);
+    let def = |src: &str| engine.define(src, Lang::Python).unwrap();
+    let spent = |name: &str, args: &[Value]| {
+        let mut used = mpedb_proc::Usage { instrs: 99, db_calls: 99, rows: 99 };
+        let result = engine.call_metered(name, args, &mut used);
+        (result.is_ok(), used)
+    };
+
+    def("def nothing():\n    return 1");
+    let (ok, used) = spent("nothing", &[]);
+    assert!(ok && used.instrs > 0 && used.instrs < 10 && used.db_calls == 0 && used.rows == 0, "{used:?}");
+
+    def("def two(id):\n    a = db.query('SELECT balance FROM accounts WHERE id = $1', [id])\n    b = db.query('SELECT balance FROM accounts WHERE id = $1', [id])\n    return len(a) + len(b)");
+    let (_, plain) = spent("two", &[Value::Int(1)]);
+    assert_eq!((plain.db_calls, plain.rows), (2, 0));
+
+    // What a called procedure spends is the caller's.
+    def("def outer(id):\n    return two(id) + two(id)");
+    let (_, nested) = spent("outer", &[Value::Int(1)]);
+    assert_eq!(nested.db_calls, 4);
+    assert!(nested.instrs > 2 * plain.instrs, "{nested:?} vs {plain:?}");
+
+    // Cursor rows are their own count (one more pull finds the end).
+    def("def scan():\n    n = 0\n    for r in db.rows('SELECT id FROM accounts'):\n        n += 1\n    return n");
+    let (_, scan) = spent("scan", &[]);
+    assert_eq!((scan.db_calls, scan.rows), (1, 4));
+
+    // More work, more instructions; the same call always costs the same.
+    def("def spin(n):\n    i = 0\n    while i < n:\n        i += 1\n    return i");
+    let (_, ten) = spent("spin", &[Value::Int(10)]);
+    let (_, thousand) = spent("spin", &[Value::Int(1000)]);
+    assert!(thousand.instrs > 50 * ten.instrs);
+    assert_eq!(spent("spin", &[Value::Int(1000)]).1, thousand);
+
+    // A failed call still says what it spent before it failed.
+    def("def fail(id):\n    db.execute('UPDATE accounts SET balance = 0 WHERE id = $1', [id])\n    return 1 // 0");
+    let (ok, failed) = spent("fail", &[Value::Int(1)]);
+    assert!(!ok && failed.db_calls == 1 && failed.instrs > 0);
+    assert_eq!(balance(&db, 1), 100);
+    let (ok, over) = spent("spin", &[Value::Int(10_000_000)]);
+    assert!(!ok && over.instrs == 1_000_000, "{over:?}");
+
+    // A call that never started spent nothing.
+    assert_eq!(spent("missing", &[]), (false, mpedb_proc::Usage::default()));
+    assert_eq!(spent("spin", &[]), (false, mpedb_proc::Usage::default()));
+}

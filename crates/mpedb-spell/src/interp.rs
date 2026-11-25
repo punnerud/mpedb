@@ -90,6 +90,16 @@ use std::rc::Rc;
 /// scan, while leaving them uncharged would let `SELECT`-all cursors bypass
 /// row accounting entirely. A fetch that already found no row, and
 /// `CursorClose`, cost no further row unit.
+/// What one top-level call spent of its [`Budget`], in the same three
+/// units, summed over every procedure it called. Filled in whether the
+/// call returned or failed, so a caller can bill work that was rolled back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub instrs: u64,
+    pub db_calls: u64,
+    pub rows: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
     pub instrs: u64,
@@ -674,6 +684,18 @@ pub fn run(
     run_with_package(proc, args, bridge, budget, &mut package)
 }
 
+/// Like [`run`], and reports in `used` what the call spent.
+pub fn run_metered(
+    proc: &Proc,
+    args: &[Value],
+    bridge: &mut dyn DbBridge,
+    budget: Budget,
+    used: &mut Usage,
+) -> Result<ProcValue> {
+    let mut package = HashMap::new();
+    run_with_package_metered(proc, args, bridge, budget, &mut package, used)
+}
+
 /// Like [`run`], but package variables live in `package` across calls.
 /// A missing key is NULL. `PkgSet` writes immediately, including NULL, and
 /// a later error does not remove that write.
@@ -683,6 +705,18 @@ pub fn run_with_package(
     bridge: &mut dyn DbBridge,
     budget: Budget,
     package: &mut HashMap<String, Value>,
+) -> Result<ProcValue> {
+    run_with_package_metered(proc, args, bridge, budget, package, &mut Usage::default())
+}
+
+/// Like [`run_with_package`], and reports in `used` what the call spent.
+pub fn run_with_package_metered(
+    proc: &Proc,
+    args: &[Value],
+    bridge: &mut dyn DbBridge,
+    budget: Budget,
+    package: &mut HashMap<String, Value>,
+    used: &mut Usage,
 ) -> Result<ProcValue> {
     debug_assert_eq!(args.len(), proc.argc as usize);
     let mut st = State {
@@ -696,7 +730,13 @@ pub fn run_with_package(
         depth: 0,
     };
     let locals = args.iter().map(|v| Some(PValue::Scalar(v.clone()))).collect();
-    to_proc_value(exec(proc, locals, &mut st)?)
+    let result = exec(proc, locals, &mut st);
+    *used = Usage {
+        instrs: budget.instrs - st.instrs_left,
+        db_calls: budget.db_calls - st.db_left,
+        rows: budget.rows - st.rows_left,
+    };
+    to_proc_value(result?)
 }
 
 /// One bit per cursor slot that is taken (`MAX_CURSORS` fits a `u32`).
