@@ -623,3 +623,163 @@ fn index_errors_are_clean() {
     let e = run_py("def f(a): return a[0]", &[Value::Int(3)]).unwrap_err();
     assert!(matches!(e, Error::TypeMismatch(_)), "{e}");
 }
+
+// ------------------------------------------- general for, range, chains (sugar)
+
+/// Every expectation below is what CPython 3 prints for the same source.
+#[test]
+fn python_range_loops_match_cpython() {
+    let sum = |head: &str| format!("def f(n):\n    t = 0\n    for i in {head}:\n        t += i\n    return t");
+    expect_py(&sum("range(n)"), &[Value::Int(5)], Value::Int(10));
+    expect_py(&sum("range(n)"), &[Value::Int(0)], Value::Int(0));
+    expect_py(&sum("range(n)"), &[Value::Int(-3)], Value::Int(0));
+    expect_py(&sum("range(2, n)"), &[Value::Int(7)], Value::Int(20));
+    expect_py(&sum("range(n, 0, -3)"), &[Value::Int(10)], Value::Int(22)); // 10 7 4 1
+    expect_py(&sum("range(0, n, 4)"), &[Value::Int(9)], Value::Int(12)); // 0 4 8
+    expect_py(&sum("range(n, 0)"), &[Value::Int(5)], Value::Int(0));
+    // `continue` must still advance the counter; `break` leaves the loop.
+    expect_py(
+        "def f(n):\n    t = 0\n    for i in range(n):\n        if i % 2 == 0:\n            continue\n        if i > 6:\n            break\n        t += i\n    return t",
+        &[Value::Int(100)],
+        Value::Int(9), // 1 + 3 + 5
+    );
+    // The bound is evaluated once and the target is a copy of the counter.
+    expect_py(
+        "def f(n):\n    c = 0\n    for i in range(n):\n        n = 0\n        i = 100\n        c += 1\n    return c",
+        &[Value::Int(4)],
+        Value::Int(4),
+    );
+    // Nested loops keep separate hidden counters; the target survives the loop.
+    expect_py(
+        "def f(n):\n    t = 0\n    for i in range(n):\n        for j in range(i):\n            t += j\n    return t * 100 + i",
+        &[Value::Int(4)],
+        Value::Int(403), // (0) + (0+1) + (0+1+2) = 4, last i = 3
+    );
+}
+
+#[test]
+fn python_for_walks_materialized_rows() {
+    let src = "
+def f(skip):
+    rows = db.query('SELECT a, b FROM t')
+    total = 0
+    for r in rows:
+        if r[0] == skip:
+            continue
+        rows = None
+        total += r[0] * r[1]
+    return total
+";
+    let mut bridge = MockBridge::new();
+    bridge.rows = vec![
+        vec![Value::Int(1), Value::Int(10)],
+        vec![Value::Int(2), Value::Int(20)],
+        vec![Value::Int(3), Value::Int(30)],
+    ];
+    let got = run_lang(py::compile, src, &[Value::Int(2)], &mut bridge, Budget::default()).unwrap();
+    assert_eq!(got, scalar(Value::Int(100))); // 1*10 + 3*30; rebinding `rows` changes nothing
+    assert_eq!(bridge.queries, 1);
+
+    // Directly over the call, and over one row (a tuple).
+    let src = "
+def f():
+    n = 0
+    for r in db.query('SELECT a, b FROM t'):
+        for cell in r:
+            n += cell
+    return n
+";
+    let got = run_lang(py::compile, src, &[], &mut bridge, Budget::default()).unwrap();
+    assert_eq!(got, scalar(Value::Int(66)));
+
+    // An empty result runs the body zero times.
+    bridge.rows = vec![];
+    let got = run_lang(py::compile, src, &[], &mut bridge, Budget::default()).unwrap();
+    assert_eq!(got, scalar(Value::Int(0)));
+
+    // A scalar is not iterable: a loud run-time error, never a silent skip.
+    let e = run_py("def f(a):\n    for x in a:\n        pass\n    return 1", &[Value::Int(5)]).unwrap_err();
+    assert!(matches!(e, Error::TypeMismatch(_)), "{e}");
+}
+
+#[test]
+fn for_loops_stay_inside_the_instruction_budget() {
+    let e = run_lang(
+        py::compile,
+        "def f():\n    for i in range(1000000000000):\n        pass",
+        &[],
+        &mut MockBridge::new(),
+        Budget { instrs: 10_000, db_calls: 10, rows: 100 },
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("instruction budget"), "{e}");
+}
+
+#[test]
+fn python_chains_conditionals_and_membership_match_cpython() {
+    let chain = "def f(a): return 0 < a <= 10";
+    expect_py(chain, &[Value::Int(5)], Value::Bool(true));
+    expect_py(chain, &[Value::Int(10)], Value::Bool(true));
+    expect_py(chain, &[Value::Int(0)], Value::Bool(false));
+    expect_py(chain, &[Value::Int(11)], Value::Bool(false));
+    expect_py("def f(a, b, c): return a < b < c < 10", &[Value::Int(1), Value::Int(2), Value::Int(3)], Value::Bool(true));
+    expect_py("def f(a, b, c): return a < b < c < 10", &[Value::Int(1), Value::Int(2), Value::Int(2)], Value::Bool(false));
+    expect_py("def f(a, b): return a == b != 3", &[Value::Int(4), Value::Int(4)], Value::Bool(true));
+    // The middle operand is evaluated exactly once, and a false first link
+    // short-circuits the rest.
+    let mut bridge = MockBridge::new();
+    bridge.rows = vec![vec![Value::Int(1)], vec![Value::Int(2)]];
+    let src = "def f(a):\n    return a < len(db.query('SELECT a FROM t')) < len(db.query('SELECT a FROM t')) + 1";
+    let got = run_lang(py::compile, src, &[Value::Int(0)], &mut bridge, Budget::default()).unwrap();
+    assert_eq!((got, bridge.queries), (scalar(Value::Bool(true)), 2));
+    let mut bridge = MockBridge::new();
+    let got = run_lang(py::compile, src, &[Value::Int(9)], &mut bridge, Budget::default()).unwrap();
+    assert_eq!((got, bridge.queries), (scalar(Value::Bool(false)), 1));
+
+    expect_py("def f(a): return 'small' if a < 10 else 'big'", &[Value::Int(3)], Value::Text("small".into()));
+    expect_py("def f(a): return 'small' if a < 10 else 'big'", &[Value::Int(30)], Value::Text("big".into()));
+    expect_py("def f(a): return 1 if a else 2 if a is None else 3", &[Value::Null], Value::Int(2));
+    expect_py("def f(a): return 1 if a else 2 if a is None else 3", &[Value::Int(0)], Value::Int(3));
+
+    let member = "def f(a): return a in ['x', 'y', 3]";
+    expect_py(member, &[Value::Text("y".into())], Value::Bool(true));
+    expect_py(member, &[Value::Int(3)], Value::Bool(true));
+    expect_py(member, &[Value::Text("z".into())], Value::Bool(false));
+    expect_py("def f(a): return a not in (1, 2)", &[Value::Int(2)], Value::Bool(false));
+    expect_py("def f(a): return a not in (1, 2)", &[Value::Int(5)], Value::Bool(true));
+    expect_py("def f(a): return a in []", &[Value::Int(5)], Value::Bool(false));
+    expect_py("def f(a): return a not in ()", &[Value::Int(5)], Value::Bool(true));
+    expect_py("def f(a, b): return a in [b, None]", &[Value::Null, Value::Int(1)], Value::Bool(true));
+}
+
+/// `sql.NAME(args)` is exactly `db.query("SELECT NAME($1, ...)", [args])[0][0]`.
+#[test]
+fn sql_function_calls_are_one_embedded_select() {
+    let skel = py::compile("def f(a, b):\n    return sql.round(a, b) + sql.round(a, b) + sql.pi()").unwrap();
+    let texts: Vec<&str> = skel.calls.iter().map(|c| c.sql.as_str()).collect();
+    assert_eq!(texts, ["SELECT round($1, $2)", "SELECT pi()"]); // identical calls share a plan
+    assert!(skel.calls.iter().all(|c| c.kind == CallKind::Query));
+    assert_eq!(skel.calls.iter().map(|c| c.argc).collect::<Vec<_>>(), [2, 0]);
+
+    // Plain string literals are SQL literals; everything else is a parameter.
+    let skel = py::compile(
+        "def f(a):\n    return sql.strftime('%Y', 'now') + sql.replace(a, \"it's\", 'x') + sql.instr(a, 'a\\\\b') + sql.instr(a, 'a\\nb')",
+    )
+    .unwrap();
+    let texts: Vec<&str> = skel.calls.iter().map(|c| c.sql.as_str()).collect();
+    assert_eq!(
+        texts,
+        ["SELECT strftime('%Y', 'now')", "SELECT replace($1, 'it''s', 'x')", "SELECT instr($1, $2)"]
+    );
+    assert_eq!(skel.calls.iter().map(|c| c.argc).collect::<Vec<_>>(), [0, 1, 2]);
+
+    let mut bridge = MockBridge::new();
+    bridge.rows = vec![vec![Value::Text("ABC".into())]];
+    let got = run_lang(py::compile, "def f(s):\n    return sql.upper(s)", &[Value::Text("abc".into())], &mut bridge, Budget::default()).unwrap();
+    assert_eq!((got, bridge.queries), (scalar(Value::Text("ABC".into())), 1));
+
+    // A local named `sql` or `range` is just a variable.
+    assert!(py::compile("def f(sql):\n    return sql.upper(1)").is_err());
+    assert!(py::compile("def f(range):\n    for r in range:\n        pass").is_ok());
+    assert!(py::compile("def f(range):\n    for r in range(3):\n        pass").is_err());
+}

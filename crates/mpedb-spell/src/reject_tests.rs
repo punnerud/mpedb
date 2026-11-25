@@ -73,13 +73,14 @@ fn python_rejects_out_of_subset_constructs() {
     reject_py("def f():\n    return {'a': 1}", "dict");
     reject_py("def f():\n    return (1, 2)", "tuple");
     reject_py("def f():\n    return [1, 2]", "list literals are only allowed");
-    // `for` exists ONLY over db.rows(...); everything else stays rejected.
-    reject_py("def f():\n    for i in [1]:\n        pass", "only supported over db.rows");
-    reject_py("def f(n):\n    for i in range(n):\n        pass", "only supported over db.rows");
-    reject_py(
-        "def f():\n    for r in db.query('SELECT pk FROM t'):\n        pass",
-        "only supported over db.rows",
-    );
+    // General `for` is sugar over lists, tuples and range(); these stay out.
+    reject_py("def f(n):\n    for i in range(0, n, n):\n        pass", "non-zero int literal");
+    reject_py("def f(n):\n    for i in range(0, n, 0):\n        pass", "non-zero int literal");
+    reject_py("def f(n):\n    for i in range():\n        pass", "1 to 3 arguments");
+    reject_py("def f(n):\n    return range(n)", "iterable of a for loop");
+    reject_py("def f(n):\n    return len(range(n))", "iterable of a for loop");
+    reject_py("def f(rows):\n    for a, b in rows:\n        pass", "plain variable");
+    reject_py("def f(rows):\n    for r in rows:\n        pass\n    else:\n        pass", "for/else");
     reject_py("def f():\n    class C:\n        pass", "class");
     reject_py("def f():\n    try:\n        pass\n    except:\n        pass", "try");
     reject_py("def f():\n    with open('x') as g:\n        pass", "with");
@@ -87,9 +88,14 @@ fn python_rejects_out_of_subset_constructs() {
     reject_py("def f():\n    assert True", "assert");
     reject_py("def f():\n    raise ValueError()", "raise");
     reject_py("def f():\n    x: int = 1\n    return x", "annotated");
-    reject_py("def f():\n    return 1 if True else 2", "conditional expression");
-    reject_py("def f(a):\n    return 0 < a < 10", "chained comparison");
-    reject_py("def f(a):\n    return a in [1]", "`in` is not supported");
+    reject_py("def f(a, rows):\n    return a in rows", "list or tuple literal");
+    reject_py("def f(a):\n    return 0 < a in [1]", "comparison chain");
+    reject_py("def f(a):\n    return 0 < a is 5", "only supported against None");
+    reject_py("def f(a):\n    return sql.upper", "attribute access");
+    reject_py("def f(s):\n    return s.upper()", "e.g. sql.upper(s)");
+    reject_py("def f(a):\n    return sql.upper(a, sep=1)", "keyword arguments");
+    reject_py("def f(a):\n    return sql.\u{e6}(a)", "plain ASCII identifier");
+    reject_py("def f(a):\n    return sql", "undefined variable");
     reject_py("def f(a):\n    return a is 5", "only supported against None");
     reject_py("def f(a):\n    return a ** 2", "not supported");
     reject_py("def f(a):\n    return a & 1", "not supported");

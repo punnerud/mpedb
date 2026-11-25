@@ -1946,3 +1946,70 @@ fn plsql_nested_table_limit_of_null() {
         ProcValue::Scalar(Value::Null)
     );
 }
+
+/// The Python frontend's sugar against a real database: a general `for`
+/// over a materialized result inside a WRITE procedure (where the streaming
+/// `db.rows` cursor is not allowed), `range`, and `sql.NAME(...)` linked at
+/// define time like any embedded statement.
+#[test]
+fn python_general_for_and_sql_functions_run_against_a_real_database() {
+    let (cfg, _guard) = test_config("pysugar");
+    let db = Database::open_with_config(cfg).unwrap();
+    seed_accounts(&db, &[(1, 100), (2, 250), (3, 40)]);
+    let engine = ProcEngine::new(&db);
+
+    engine
+        .define(
+            "
+def add_interest(percent):
+    changed = 0
+    for row in db.query('SELECT id, balance FROM accounts ORDER BY id'):
+        if row[1] < 50:
+            continue
+        db.execute('UPDATE accounts SET balance = $1 WHERE id = $2', [row[1] + row[1] * percent // 100, row[0]])
+        changed += 1
+    return changed
+",
+            Lang::Python,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("add_interest", &[Value::Int(10)]).unwrap(),
+        ProcValue::Scalar(Value::Int(2))
+    );
+    assert_eq!((balance(&db, 1), balance(&db, 2), balance(&db, 3)), (110, 275, 40));
+
+    engine
+        .define(
+            "
+def label(id):
+    rows = db.query('SELECT balance FROM accounts WHERE id = $1', [id])
+    size = 'none' if len(rows) == 0 else 'small' if rows[0][0] < 100 else 'large'
+    stars = ''
+    for i in range(3):
+        stars = stars + '*'
+    return sql.upper(size) + stars + sql.substr('abcdef', 2, 3)
+",
+            Lang::Python,
+        )
+        .unwrap();
+    let text = |id: i64| engine.call("label", &[Value::Int(id)]).unwrap();
+    assert_eq!(text(2), ProcValue::Scalar(Value::Text("LARGE***bcd".into())));
+    assert_eq!(text(3), ProcValue::Scalar(Value::Text("SMALL***bcd".into())));
+    assert_eq!(text(9), ProcValue::Scalar(Value::Text("NONE***bcd".into())));
+
+    // A string literal reaches SQL as a literal, which `'now'` requires.
+    engine
+        .define("def today_len():\n    return sql.length(sql.date('now'))", Lang::Python)
+        .unwrap();
+    assert_eq!(
+        engine.call("today_len", &[]).unwrap(),
+        ProcValue::Scalar(Value::Int(10))
+    );
+
+    // An unknown SQL function is refused when the procedure is defined.
+    let e = engine
+        .define("def bad(a):\n    return sql.no_such_function(a)", Lang::Python)
+        .unwrap_err();
+    assert!(e.to_string().contains("no_such_function"), "{e}");
+}
