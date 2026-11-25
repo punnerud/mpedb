@@ -102,6 +102,7 @@ pub(super) fn compile_trigger_inner(source: &str, columns: &[TriggerImage]) -> R
     parser.emit_procedure_result()?;
     parser.builder.emit(crate::ir::Op::Return)?;
     Ok(Skeleton {
+        proc_calls: Vec::new(),
         name: "TRG".into(),
         argc,
         nlocals: parser.builder.nlocals(),

@@ -33,6 +33,32 @@
 //! budget — each pull costs one unit of the separate, generous row budget
 //! (default 10M rows). `CursorClose` reads nothing and costs no row unit.
 //!
+//! # Built containers
+//!
+//! `NewList`/`ListAppend`/`ListExtend` and `NewDict`/`DictSet`/`DictMerge`
+//! build lists and text-keyed dicts. They are **values**: every op pushes a
+//! container and none changes one another variable can see, so there is no
+//! aliasing and no cycle. Three bounds keep the instruction budget honest
+//! (see `interp`): nesting depth, the total number of values a container
+//! holds, and an extra budget charge for every op whose work grows with a
+//! container's length. `Contains` is the `in` test. The seven opcodes are an
+//! additive extension of format 1, like the cursor opcodes.
+//!
+//! # Calls
+//!
+//! `CallProc(i)` runs `callees[i]`, another stored procedure, with the
+//! arguments on the stack and pushes what it returns. A callee is named by
+//! its **content hash**, fixed when the caller is defined, exactly as a
+//! plan is. Two things follow. A procedure can only name one that already
+//! exists, so calls form a DAG and there is no recursion; and redefining a
+//! callee does not change its callers until they are defined again. Each
+//! entry also records whether the callee (with everything it calls) writes
+//! or opens cursors, so a caller's routing and the cursor rule are decided
+//! from its own blob. The runtime checks a loaded callee against its entry
+//! and refuses one that does more than the entry says. A procedure with a
+//! callee table is format 2; one without is format 1, byte for byte as
+//! before.
+//!
 //! # Cursors
 //!
 //! `CursorOpen(p)` opens a streaming scan over `plans[p]` (which must be
@@ -73,6 +99,24 @@ pub const MAX_INSTRS: usize = 1 << 20;
 pub const MAX_STACK: usize = 256;
 /// Most parameters one embedded SQL statement may take.
 pub const MAX_DB_ARGS: usize = 64;
+/// Most other procedures one procedure may call.
+pub const MAX_CALLEES: usize = 64;
+/// Most arguments of a call to another procedure.
+pub const MAX_CALL_ARGS: usize = 64;
+/// Format of a procedure that calls others (see "Calls").
+pub const PROC_FORMAT_CALLS: u16 = 2;
+
+/// One entry of a procedure's callee table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalleeRef {
+    pub hash: ProcHash,
+    /// Number of arguments the callee takes.
+    pub argc: u16,
+    /// The callee, or something it calls, runs DML.
+    pub writes: bool,
+    /// The callee, or something it calls, opens a cursor.
+    pub cursors: bool,
+}
 
 /// How an embedded plan is used. `Query` plans must be read-only SELECTs;
 /// `Exec` plans must be DML. Enforced at define time against the recomputed
@@ -315,6 +359,26 @@ pub enum Op {
     PkgSet(u16),
     /// Pop a cursor handle, push its current row as a tuple.
     CursorRow,
+    /// Pop `callees[i].argc` arguments, run that procedure, push its result.
+    CallProc(u16),
+    /// Push a new empty list built by the procedure (module docs:
+    /// "Built containers").
+    NewList,
+    /// Pop a value and a built list; push the list with the value added.
+    ListAppend,
+    /// Pop a list (built, query result or row) and a built list; push the
+    /// built list with every element of the other added.
+    ListExtend,
+    /// Push a new empty dict.
+    NewDict,
+    /// Pop a value, a text key and a dict; push the dict with the key set.
+    /// An existing key keeps its position.
+    DictSet,
+    /// Pop two dicts; push the first with every entry of the second set.
+    DictMerge,
+    /// Pop a container and an item; push whether the item is in it: an
+    /// equal element of a list or row, a key of a dict, a substring of text.
+    Contains,
     /// Pop the return value and finish the procedure.
     Return,
 }
@@ -354,6 +418,16 @@ const OP_RETURN: u8 = 29;
 const OP_CURSOR_OPEN: u8 = 30;
 const OP_CURSOR_ADVANCE: u8 = 31;
 const OP_CURSOR_ROW: u8 = 32;
+// Built containers: an additive extension of format 1, numbered away from
+// the other opcodes so every branch of the engine gives them the same bytes.
+const OP_NEW_LIST: u8 = 120;
+const OP_LIST_APPEND: u8 = 121;
+const OP_LIST_EXTEND: u8 = 122;
+const OP_NEW_DICT: u8 = 123;
+const OP_DICT_SET: u8 = 124;
+const OP_DICT_MERGE: u8 = 125;
+const OP_CONTAINS: u8 = 126;
+const OP_CALL_PROC: u8 = 127;
 // Additive format-1 extension, like cursors: legacy blobs retain their exact
 // semantics and older readers reject unknown instructions rather than guessing.
 const OP_SQL_NOT: u8 = 33;
@@ -480,11 +554,15 @@ pub struct Proc {
     pub plans: Vec<PlanRef>,
     pub consts: Vec<Value>,
     pub instrs: Vec<Op>,
+    /// Other procedures this one calls; `CallProc(i)` refers to `callees[i]`.
+    pub callees: Vec<CalleeRef>,
     /// Proven maximum operand-stack depth (validation artifact).
     max_stack: usize,
-    /// Whether any instruction is `DbExec` or `DbReturning` — decides
-    /// transactional routing. Recomputed from the instructions, never stored.
+    /// Whether any instruction is `DbExec`, or any callee writes — decides
+    /// transactional routing. Recomputed, never stored.
     has_exec: bool,
+    /// Whether any instruction is `CursorOpen`, or any callee opens one.
+    has_cursor: bool,
 }
 
 impl Proc {
@@ -496,7 +574,23 @@ impl Proc {
         consts: Vec<Value>,
         instrs: Vec<Op>,
     ) -> Result<Proc> {
+        Proc::with_callees(name, argc, nlocals, plans, consts, instrs, Vec::new())
+    }
+
+    /// [`Proc::new`] for a procedure that calls others.
+    pub fn with_callees(
+        name: String,
+        argc: u16,
+        nlocals: u16,
+        plans: Vec<PlanRef>,
+        consts: Vec<Value>,
+        instrs: Vec<Op>,
+        callees: Vec<CalleeRef>,
+    ) -> Result<Proc> {
         check_name(&name)?;
+        if callees.len() > MAX_CALLEES || callees.iter().any(|c| c.argc as usize > MAX_CALL_ARGS) {
+            return Err(Error::Corrupt("proc: callee table too large".into()));
+        }
         if (argc as usize) > nlocals as usize || nlocals as usize > MAX_LOCALS {
             return Err(Error::Corrupt("proc: bad local count".into()));
         }
@@ -508,10 +602,13 @@ impl Proc {
                 return Err(Error::Corrupt("proc: plan takes too many parameters".into()));
             }
         }
-        let max_stack = validate(&instrs, nlocals, &consts, &plans)?;
+        let max_stack = validate(&instrs, nlocals, &consts, &plans, &callees)?;
         let has_exec = instrs
             .iter()
-            .any(|op| matches!(op, Op::DbExec(_) | Op::DbReturning(_)));
+            .any(|op| matches!(op, Op::DbExec(_) | Op::DbReturning(_)))
+            || callees.iter().any(|c| c.writes);
+        let has_cursor = instrs.iter().any(|op| matches!(op, Op::CursorOpen(_)))
+            || callees.iter().any(|c| c.cursors);
         Ok(Proc {
             name,
             argc,
@@ -519,9 +616,16 @@ impl Proc {
             plans,
             consts,
             instrs,
+            callees,
             max_stack,
             has_exec,
+            has_cursor,
         })
+    }
+
+    /// True if the proc, or anything it calls, opens a cursor.
+    pub fn has_cursor(&self) -> bool {
+        self.has_cursor
     }
 
     pub fn max_stack(&self) -> usize {
@@ -548,6 +652,8 @@ impl Proc {
                 )
             })
             || !self.plans.is_empty()
+            // A callee may do anything; a function must not have one.
+            || !self.callees.is_empty()
     }
 
     /// Canonical serialization; the blob stored in the database and the
@@ -555,7 +661,12 @@ impl Proc {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(64 + self.instrs.len() * 3);
         b.extend_from_slice(MAGIC);
-        b.extend_from_slice(&PROC_FORMAT.to_le_bytes());
+        let version = if self.callees.is_empty() {
+            PROC_FORMAT
+        } else {
+            PROC_FORMAT_CALLS
+        };
+        b.extend_from_slice(&version.to_le_bytes());
         b.push(self.name.len() as u8);
         b.extend_from_slice(self.name.as_bytes());
         b.extend_from_slice(&self.argc.to_le_bytes());
@@ -576,6 +687,14 @@ impl Proc {
         b.extend_from_slice(&(self.instrs.len() as u32).to_le_bytes());
         for &op in &self.instrs {
             encode_op(&mut b, op);
+        }
+        if !self.callees.is_empty() {
+            b.extend_from_slice(&(self.callees.len() as u16).to_le_bytes());
+            for c in &self.callees {
+                b.extend_from_slice(&c.hash.0);
+                b.extend_from_slice(&c.argc.to_le_bytes());
+                b.push(u8::from(c.writes) | (u8::from(c.cursors) << 1));
+            }
         }
         b
     }
@@ -607,9 +726,10 @@ impl Proc {
             return Err(Error::Corrupt("proc: bad magic".into()));
         }
         let version = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap());
-        if version != PROC_FORMAT {
+        if version != PROC_FORMAT && version != PROC_FORMAT_CALLS {
             return Err(Error::Corrupt(format!(
-                "proc: format version {version} (this build understands {PROC_FORMAT})"
+                "proc: format version {version} (this build understands \
+                 {PROC_FORMAT} and {PROC_FORMAT_CALLS})"
             )));
         }
         let name_len = take(&mut pos, 1)?[0] as usize;
@@ -652,11 +772,33 @@ impl Proc {
         for _ in 0..ninstrs {
             instrs.push(decode_op(buf, &mut pos)?);
         }
+        let mut callees = Vec::new();
+        if version == PROC_FORMAT_CALLS {
+            let n = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap()) as usize;
+            // One encoding per procedure: format 2 always has a callee.
+            if n == 0 || n > MAX_CALLEES {
+                return Err(Error::Corrupt("proc: bad callee count".into()));
+            }
+            for _ in 0..n {
+                let hash = ProcHash(take(&mut pos, 32)?.try_into().unwrap());
+                let argc = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap());
+                let flags = take(&mut pos, 1)?[0];
+                if flags > 3 {
+                    return Err(Error::Corrupt("proc: invalid callee flags".into()));
+                }
+                callees.push(CalleeRef {
+                    hash,
+                    argc,
+                    writes: flags & 1 != 0,
+                    cursors: flags & 2 != 0,
+                });
+            }
+        }
         if pos != buf.len() {
             return Err(Error::Corrupt("proc: trailing bytes after program".into()));
         }
         // Full revalidation: identical to the compile-time path.
-        Proc::new(name, argc, nlocals, plans, consts, instrs)
+        Proc::with_callees(name, argc, nlocals, plans, consts, instrs, callees)
     }
 }
 
@@ -712,6 +854,7 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::DbExec(x) => u16arg(OP_DB_EXEC, x),
         Op::DbReturning(x) => u16arg(OP_DB_RETURNING, x),
         Op::CursorOpen(x) => u16arg(OP_CURSOR_OPEN, x),
+        Op::CallProc(x) => u16arg(OP_CALL_PROC, x),
         Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::JumpIfSqlFalse(t) | Op::JumpIfSqlTrue(t) => {
             b.push(match op {
                 Op::Jump(_) => OP_JUMP,
@@ -841,6 +984,13 @@ fn encode_op(b: &mut Vec<u8>, op: Op) {
         Op::PkgGet(x) => u16arg(OP_PKG_GET, x),
         Op::PkgSet(x) => u16arg(OP_PKG_SET, x),
         Op::CursorRow => b.push(OP_CURSOR_ROW),
+        Op::NewList => b.push(OP_NEW_LIST),
+        Op::ListAppend => b.push(OP_LIST_APPEND),
+        Op::ListExtend => b.push(OP_LIST_EXTEND),
+        Op::NewDict => b.push(OP_NEW_DICT),
+        Op::DictSet => b.push(OP_DICT_SET),
+        Op::DictMerge => b.push(OP_DICT_MERGE),
+        Op::Contains => b.push(OP_CONTAINS),
         Op::Return => b.push(OP_RETURN),
     }
 }
@@ -863,6 +1013,7 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_DB_EXEC => Op::DbExec(u16arg()?),
         OP_DB_RETURNING => Op::DbReturning(u16arg()?),
         OP_CURSOR_OPEN => Op::CursorOpen(u16arg()?),
+        OP_CALL_PROC => Op::CallProc(u16arg()?),
         OP_JUMP | OP_JUMP_IF_FALSE | OP_JUMP_IF_TRUE | OP_JUMP_IF_SQL_FALSE | OP_JUMP_IF_SQL_TRUE => {
             let raw = buf.get(*pos..*pos + 4).ok_or_else(err)?;
             *pos += 4;
@@ -1006,6 +1157,13 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
         OP_PKG_GET => Op::PkgGet(u16arg()?),
         OP_PKG_SET => Op::PkgSet(u16arg()?),
         OP_CURSOR_ROW => Op::CursorRow,
+        OP_NEW_LIST => Op::NewList,
+        OP_LIST_APPEND => Op::ListAppend,
+        OP_LIST_EXTEND => Op::ListExtend,
+        OP_NEW_DICT => Op::NewDict,
+        OP_DICT_SET => Op::DictSet,
+        OP_DICT_MERGE => Op::DictMerge,
+        OP_CONTAINS => Op::Contains,
         OP_RETURN => Op::Return,
         other => return Err(Error::Corrupt(format!("proc: invalid opcode {other}"))),
     })
@@ -1013,8 +1171,9 @@ fn decode_op(buf: &[u8], pos: &mut usize) -> Result<Op> {
 
 /// Stack effect (pops, pushes) of an instruction; db ops consult the plan
 /// table (operand bounds are checked before this is called).
-fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
+fn stack_effect(op: Op, plans: &[PlanRef], callees: &[CalleeRef]) -> (usize, usize) {
     match op {
+        Op::CallProc(i) => (callees[i as usize].argc as usize, 1),
         Op::OracleTry { .. } | Op::OracleReraise | Op::OracleRaise(_) | Op::OracleRaiseUser(_) | Op::OracleRaiseBound(_) => (0, 0),
         Op::OracleExceptionCode | Op::OracleSqlCode | Op::OracleSqlErrm | Op::OracleMatchUser(_) => (0, 1),
         Op::OracleRaiseApplication => (2, 0),
@@ -1087,6 +1246,9 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
             (plans[p as usize].argc as usize, 1)
         }
         Op::CursorAdvance | Op::CursorFetch | Op::CursorRow | Op::CursorAttr(_) => (1, 1),
+        Op::NewList | Op::NewDict => (0, 1),
+        Op::ListAppend | Op::ListExtend | Op::DictMerge | Op::Contains => (2, 1),
+        Op::DictSet => (3, 1),
         Op::CursorClose | Op::Return => (1, 0),
     }
 }
@@ -1103,17 +1265,29 @@ fn stack_effect(op: Op, plans: &[PlanRef]) -> (usize, usize) {
 ///
 /// Returns the proven maximum stack depth so the interpreter can
 /// preallocate and skip per-instruction underflow checks.
-fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) -> Result<usize> {
+fn validate(
+    instrs: &[Op],
+    nlocals: u16,
+    consts: &[Value],
+    plans: &[PlanRef],
+    callees: &[CalleeRef],
+) -> Result<usize> {
     let nconsts = consts.len();
     if instrs.is_empty() {
         return Err(Error::Corrupt("proc: empty program".into()));
     }
     let n = instrs.len();
     // Pass 1: operand bounds, including unreachable code.
-    let mut any_cursor = false;
-    let mut any_exec = false;
+    // A callee's cursors and writes count as the caller's own (v1 rule).
+    let mut any_cursor = callees.iter().any(|c| c.cursors);
+    let mut any_exec = callees.iter().any(|c| c.writes);
     for (pc, &op) in instrs.iter().enumerate() {
         match op {
+            Op::CallProc(i) if i as usize >= callees.len() => {
+                return Err(Error::Corrupt(
+                    "proc: call to a procedure that was never linked".into(),
+                ));
+            }
             Op::OracleTry { handler, end, handler_end } => {
                 if end as usize <= pc || handler < end || handler_end <= handler || handler_end as usize > n {
                     return Err(Error::Corrupt("proc: invalid Oracle exception scope".into()));
@@ -1235,7 +1409,7 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
     entry[0] = Some(0);
     while let Some((pc, depth)) = work.pop() {
         let op = instrs[pc];
-        let (pops, pushes) = stack_effect(op, plans);
+        let (pops, pushes) = stack_effect(op, plans, callees);
         if depth < pops {
             return Err(Error::Corrupt("proc: stack underflow".into()));
         }
@@ -1265,6 +1439,74 @@ fn validate(instrs: &[Op], nlocals: u16, consts: &[Value], plans: &[PlanRef]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A procedure with callees is format 2 and roundtrips; one without is
+    /// format 1 as before; a call needs its callee entry; callee cursors
+    /// and writes count as the caller's own.
+    #[test]
+    fn callee_table_roundtrips_and_is_validated() {
+        let callee = |writes, cursors| CalleeRef { hash: ProcHash([7; 32]), argc: 2, writes, cursors };
+        let body = vec![Op::LoadConst(0), Op::LoadConst(0), Op::CallProc(0), Op::Return];
+        let build = |callees: Vec<CalleeRef>| {
+            Proc::with_callees("f".into(), 0, 0, vec![], vec![Value::Null], body.clone(), callees)
+        };
+        let p = build(vec![callee(true, false)]).unwrap();
+        assert!(p.has_exec() && !p.has_cursor() && p.has_db_ops());
+        let blob = p.encode();
+        assert_eq!(u16::from_le_bytes([blob[4], blob[5]]), PROC_FORMAT_CALLS);
+        assert_eq!(Proc::decode(&blob).unwrap(), p);
+        for cut in 0..blob.len() {
+            assert!(Proc::decode(&blob[..cut]).is_err());
+        }
+        let plain = Proc::new("f".into(), 0, 0, vec![], vec![Value::Null], vec![Op::LoadConst(0), Op::Return]).unwrap();
+        assert_eq!(u16::from_le_bytes([plain.encode()[4], plain.encode()[5]]), PROC_FORMAT);
+        assert!(!plain.has_db_ops());
+
+        assert!(matches!(build(vec![]), Err(Error::Corrupt(_)))); // CallProc(0) with no entry
+        assert!(matches!(build(vec![callee(true, true)]), Err(Error::Corrupt(_)))); // cursor + write
+        let mut wrong_flags = blob.clone();
+        *wrong_flags.last_mut().unwrap() = 4;
+        assert!(Proc::decode(&wrong_flags).is_err());
+        // Too few arguments on the stack for the callee.
+        assert!(matches!(
+            Proc::with_callees("f".into(), 0, 0, vec![], vec![Value::Null], vec![Op::LoadConst(0), Op::CallProc(0), Op::Return], vec![callee(false, false)]),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    /// The container opcodes roundtrip, and a blob that underflows the
+    /// stack with one, or leaves it unbalanced, is refused like any other.
+    #[test]
+    fn container_ops_roundtrip_and_are_validated() {
+        let build = |instrs: Vec<Op>| Proc::new("f".into(), 0, 0, vec![], vec![Value::Text("k".into())], instrs);
+        let ok = build(vec![
+            Op::NewDict,
+            Op::LoadConst(0),
+            Op::NewList,
+            Op::LoadConst(0),
+            Op::ListAppend,
+            Op::NewList,
+            Op::ListExtend,
+            Op::DictSet,
+            Op::NewDict,
+            Op::DictMerge,
+            Op::LoadConst(0),
+            Op::Contains,
+            Op::Return,
+        ])
+        .unwrap();
+        assert_eq!(ok.max_stack(), 4);
+        assert_eq!(Proc::decode(&ok.encode()).unwrap(), ok);
+        for bad in [
+            vec![Op::ListAppend, Op::Return],
+            vec![Op::NewList, Op::ListExtend, Op::Return],
+            vec![Op::NewDict, Op::LoadConst(0), Op::DictSet, Op::Return],
+            vec![Op::NewDict, Op::DictMerge, Op::Return],
+            vec![Op::LoadConst(0), Op::Contains, Op::Return],
+        ] {
+            assert!(matches!(build(bad), Err(Error::Corrupt(_))));
+        }
+    }
 
     fn plan(kind: PlanKind, argc: u8) -> PlanRef {
         PlanRef {

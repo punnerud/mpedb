@@ -43,8 +43,29 @@
 //!   SQL literal (so `sql.date("now")` binds like `date('now')`); every
 //!   other argument is a `$n` parameter.
 //!
+//! - list displays `[a, b, *more]` and dict displays `{"k": v, **more}`
+//!   (text keys), `d["k"]`, `len(d)`, and `x in c` for a list, a row, a
+//!   dict (its keys) or text (a substring). Lists and dicts are **values**,
+//!   as tuples are in Python: there is no in-place change (`xs.append(v)`,
+//!   `d["k"] = v` and `xs[i] = v` are compile errors), so a container can
+//!   never change behind another variable. Grow one with a new display:
+//!   `xs = [*xs, v]`, `d = {**d, "k": v}`. The one place this differs from
+//!   CPython is `xs += [v]` after `ys = xs`: here `ys` keeps its value,
+//!   which is why `+` does not join lists at all. Compiles to the IR's
+//!   built-container ops; depth, size and work are bounded there.
+//!
+//! - `other(a, b)` — a call to another stored procedure, by name, with
+//!   positional arguments (lists and dicts included). The name is resolved
+//!   when THIS procedure is defined and fixed to that definition's content
+//!   hash: the callee must already exist, a procedure cannot call itself,
+//!   and redefining the callee changes nothing here until this procedure is
+//!   defined again. The callee runs inside the caller's transaction and
+//!   budgets. Not available in stored functions and lenses (which may not
+//!   touch the database), nor in a trigger body.
+//!
 //! The `for` target is one plain name (no tuple unpacking), and there is no
-//! `for`/`else`. Containers stay read-only: no list/dict construction.
+//! `for`/`else`. A `for` over a dict is a run-time error (no key order to
+//! borrow from an index).
 //!
 //! Python semantics notes: `/` on two ints yields a float, `//` floors,
 //! `%` takes the divisor's sign, int overflow is an error (no bigints).
@@ -52,7 +73,7 @@
 //! `sql.*` call heads), comprehensions, f-strings, classes, lambdas, ...
 //! — is a compile error with source location.
 
-use crate::emit::{cerr, line_col, CallKind, FuncBuilder, Skeleton, SqlCall};
+use crate::emit::{cerr, line_col, CallKind, FuncBuilder, ProcCall, Skeleton, SqlCall};
 use mpedb_types::{Error, Result, Value};
 use rustpython_parser::ast::{self, Ranged};
 use rustpython_parser::{parse, Mode};
@@ -60,7 +81,20 @@ use std::collections::HashMap;
 
 const LANG: &str = "py";
 
+/// Compile a function, lens, operator or trigger body: everything in the
+/// subset except calls to other stored procedures.
 pub fn compile(src: &str) -> Result<Skeleton> {
+    compile_with(src, false)
+}
+
+/// Compile a stored procedure, which may also call other stored procedures
+/// by name. Only the procedure engine can link those calls, so only it uses
+/// this entry point.
+pub fn compile_procedure(src: &str) -> Result<Skeleton> {
+    compile_with(src, true)
+}
+
+fn compile_with(src: &str, allow_calls: bool) -> Result<Skeleton> {
     let module = parse(src, Mode::Module, "<proc>").map_err(|e| {
         let (l, c) = line_col(src, e.offset.to_usize());
         cerr(LANG, l, c, format!("syntax error: {}", e.error))
@@ -81,6 +115,8 @@ pub fn compile(src: &str) -> Result<Skeleton> {
         src,
         b: FuncBuilder::new(),
         locals: HashMap::new(),
+        name: f.name.to_string(),
+        allow_calls,
     };
     c.compile_function(f)?;
     let argc = f.args.args.len() as u16;
@@ -91,6 +127,7 @@ pub fn compile(src: &str) -> Result<Skeleton> {
         consts: c.b.consts,
         instrs: c.b.instrs,
         calls: c.b.calls,
+        proc_calls: c.b.proc_calls,
     })
 }
 
@@ -98,6 +135,10 @@ struct Compiler<'a> {
     src: &'a str,
     b: FuncBuilder,
     locals: HashMap<String, u16>,
+    /// The procedure being compiled (a call to it is refused).
+    name: String,
+    /// Whether calls to other stored procedures may be compiled.
+    allow_calls: bool,
 }
 
 use crate::ir::Op;
@@ -190,6 +231,13 @@ impl Compiler<'_> {
                 let [target] = &a.targets[..] else {
                     return Err(self.err(a, "chained assignment (a = b = ...) is not supported"));
                 };
+                if matches!(target, ast::Expr::Subscript(_)) {
+                    return Err(self.err(
+                        a,
+                        "lists and dicts are values and cannot be changed in place; build a \
+                         new one: `d = {**d, \"k\": v}` or `xs = [*xs, v]`",
+                    ));
+                }
                 let ast::Expr::Name(n) = target else {
                     return Err(self.err(
                         a,
@@ -573,10 +621,39 @@ impl Compiler<'_> {
                 a,
                 "attribute access is not allowed (db.query/db.execute are the only dotted forms)",
             )),
-            ast::Expr::List(l) => Err(self.err(
-                l,
-                "list literals are only allowed as the argument list of db.query/db.execute",
-            )),
+            ast::Expr::List(l) => {
+                // [a, *b, c]: start empty, then add one element or one
+                // whole list at a time (operand stack depth stays at 2).
+                self.b.emit(Op::NewList)?;
+                for item in &l.elts {
+                    if let ast::Expr::Starred(star) = item {
+                        self.expr(&star.value)?;
+                        self.b.emit(Op::ListExtend)?;
+                    } else {
+                        self.expr(item)?;
+                        self.b.emit(Op::ListAppend)?;
+                    }
+                }
+                Ok(())
+            }
+            ast::Expr::Dict(d) => {
+                // {"k": v, **more}: later entries win, as in Python.
+                self.b.emit(Op::NewDict)?;
+                for (key, value) in d.keys.iter().zip(&d.values) {
+                    match key {
+                        Some(key) => {
+                            self.expr(key)?;
+                            self.expr(value)?;
+                            self.b.emit(Op::DictSet)?;
+                        }
+                        None => {
+                            self.expr(value)?;
+                            self.b.emit(Op::DictMerge)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
             other => Err(self.err(other, format!("{} is not supported", expr_name(other)))),
         }
     }
@@ -651,18 +728,23 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// `x in [a, b, ...]` / `x not in (a, b, ...)`: an `==` chain against a
-    /// list or tuple **literal**, short-circuiting on the first match. There
-    /// is no general membership test (containers are opaque query results).
+    /// `x in [a, b, ...]` / `x not in (a, b, ...)` against a list or tuple
+    /// **literal** is an `==` chain, short-circuiting on the first match
+    /// (a starred element makes it a real list). Against anything else it
+    /// is the `Contains` op, decided by the container at run time.
     fn member(&mut self, c: &ast::ExprCompare, negate: bool, right: &ast::Expr) -> Result<()> {
+        let plain = |elts: &[ast::Expr]| !elts.iter().any(|e| matches!(e, ast::Expr::Starred(_)));
         let items = match right {
-            ast::Expr::List(l) => &l.elts,
-            ast::Expr::Tuple(t) => &t.elts,
+            ast::Expr::List(l) if plain(&l.elts) => &l.elts,
+            ast::Expr::Tuple(t) if plain(&t.elts) => &t.elts,
             _ => {
-                return Err(self.err(
-                    c,
-                    "`in` is only supported against a list or tuple literal: `x in [a, b]`",
-                ))
+                self.expr(&c.left)?;
+                self.expr(right)?;
+                self.b.emit(Op::Contains)?;
+                if negate {
+                    self.b.emit(Op::Not)?;
+                }
+                return Ok(());
             }
         };
         self.expr(&c.left)?;
@@ -714,8 +796,8 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// The only callables: `len(x)`, `db.query(...)`, `db.execute(...)` and
-    /// `sql.NAME(...)`.
+    /// The callables: `len(x)`, `db.query(...)`, `db.execute(...)`,
+    /// `sql.NAME(...)` and other stored procedures by name.
     fn call(&mut self, call: &ast::ExprCall) -> Result<()> {
         if !call.keywords.is_empty() {
             return Err(self.err(call, "keyword arguments are not supported"));
@@ -742,6 +824,15 @@ impl Compiler<'_> {
                          e.g. sql.upper(s)",
                     ));
                 };
+                if matches!(a.attr.as_str(), "append" | "extend" | "update" | "pop" | "insert")
+                    && !matches!(recv.id.as_str(), "db" | "sql")
+                {
+                    return Err(self.err(
+                        call,
+                        "lists and dicts are values and cannot be changed in place; build a \
+                         new one: `xs = [*xs, v]` or `d = {**d, \"k\": v}`",
+                    ));
+                }
                 if recv.id.as_str() == "sql" && !self.locals.contains_key("sql") {
                     return self.sql_function(call, a.attr.as_str());
                 }
@@ -775,9 +866,44 @@ impl Compiler<'_> {
                 };
                 self.db_call(call, kind)
             }
+            // Any other plain name is another stored procedure.
+            ast::Expr::Name(n)
+                if self.allow_calls && !self.locals.contains_key(n.id.as_str()) =>
+            {
+                if n.id.as_str() == self.name {
+                    return Err(self.err(
+                        call,
+                        "a procedure cannot call itself (recursion does not exist here; \
+                         use a loop)",
+                    ));
+                }
+                let argc = call.args.len();
+                if argc > crate::ir::MAX_CALL_ARGS {
+                    return Err(self.err(call, "too many arguments"));
+                }
+                for arg in &call.args {
+                    if matches!(arg, ast::Expr::Starred(_)) {
+                        return Err(self.err(arg, "starred arguments are not supported"));
+                    }
+                    self.expr(arg)?;
+                }
+                let (line, col) = line_col(self.src, call.range().start().to_usize());
+                let idx = self
+                    .b
+                    .add_proc_call(ProcCall {
+                        name: n.id.to_string(),
+                        argc: argc as u16,
+                        line,
+                        col,
+                    })
+                    .map_err(|e| self.werr(call, e))?;
+                self.b.emit(Op::CallProc(idx))?;
+                Ok(())
+            }
             _ => Err(self.err(
                 call,
-                "only len(), db.query(...), db.execute(...) and sql.NAME(...) may be called",
+                "only len(), db.query(...), db.execute(...), sql.NAME(...) and other \
+                 stored procedures may be called",
             )),
         }
     }
@@ -961,7 +1087,6 @@ fn stmt_name(s: &ast::Stmt) -> &'static str {
 fn expr_name(e: &ast::Expr) -> &'static str {
     match e {
         ast::Expr::Lambda(_) => "lambda",
-        ast::Expr::Dict(_) => "dict literal",
         ast::Expr::Set(_) => "set literal",
         ast::Expr::ListComp(_) | ast::Expr::SetComp(_) | ast::Expr::DictComp(_) => "comprehension",
         ast::Expr::GeneratorExp(_) => "generator expression",

@@ -2013,3 +2013,199 @@ def label(id):
         .unwrap_err();
     assert!(e.to_string().contains("no_such_function"), "{e}");
 }
+
+/// Built lists and dicts against a real database: a write procedure
+/// collects what it changed and returns it as named fields.
+#[test]
+fn python_lists_and_dicts_run_against_a_real_database() {
+    let (cfg, _guard) = test_config("pycontainers");
+    let db = Database::open_with_config(cfg).unwrap();
+    seed_accounts(&db, &[(1, 100), (2, 250), (3, 40)]);
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            "
+def raise_small(limit, by):
+    changed = []
+    skipped = {}
+    for row in db.query('SELECT id, balance FROM accounts ORDER BY id'):
+        if row[1] >= limit:
+            skipped = {**skipped, sql.format('id%d', row[0]): row[1]}
+            continue
+        db.execute('UPDATE accounts SET balance = $1 WHERE id = $2', [row[1] + by, row[0]])
+        changed = [*changed, {'id': row[0], 'before': row[1], 'after': row[1] + by}]
+    return {'changed': changed, 'skipped': skipped, 'any': len(changed) > 0 and 'id2' in skipped}
+",
+            Lang::Python,
+        )
+        .unwrap();
+    let scalar = |i: i64| ProcValue::Scalar(Value::Int(i));
+    let row = |id: i64, before: i64, after: i64| {
+        ProcValue::Map(vec![
+            ("id".into(), scalar(id)),
+            ("before".into(), scalar(before)),
+            ("after".into(), scalar(after)),
+        ])
+    };
+    assert_eq!(
+        engine.call("raise_small", &[Value::Int(200), Value::Int(5)]).unwrap(),
+        ProcValue::Map(vec![
+            ("changed".into(), ProcValue::List(vec![row(1, 100, 105), row(3, 40, 45)])),
+            ("skipped".into(), ProcValue::Map(vec![("id2".into(), scalar(250))])),
+            ("any".into(), ProcValue::Scalar(Value::Bool(true))),
+        ])
+    );
+    assert_eq!((balance(&db, 1), balance(&db, 2), balance(&db, 3)), (105, 250, 45));
+}
+
+/// Procedures calling procedures: bound by content hash when the caller is
+/// defined, run inside the caller's transaction and budgets.
+#[test]
+fn python_procedures_call_each_other() {
+    let (cfg, _guard) = test_config("pycalls");
+    let db = Database::open_with_config(cfg).unwrap();
+    seed_accounts(&db, &[(1, 100), (2, 10)]);
+    let engine = ProcEngine::new(&db);
+    let def = |src: &str| engine.define(src, Lang::Python);
+    let int = |i: i64| ProcValue::Scalar(Value::Int(i));
+
+    def("def bal(id):\n    rows = db.query('SELECT balance FROM accounts WHERE id = $1', [id])\n    return rows[0][0] if len(rows) == 1 else None").unwrap();
+    def("def move(a, b, amount):\n    if bal(a) is None or bal(b) is None or bal(a) < amount:\n        return 1 // 0\n    db.execute('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [amount, a])\n    db.execute('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [amount, b])\n    return {'from': bal(a), 'to': bal(b)}").unwrap();
+    def("def twice(a, b, amount):\n    first = move(a, b, amount)\n    second = move(a, b, amount)\n    return [first, second, describe({'n': 2, 'last': second})]").unwrap_err(); // describe is not defined yet
+    def("def describe(d):\n    return sql.format('%d moves, %d left', d['n'], d['last']['from'])").unwrap();
+    def("def twice(a, b, amount):\n    first = move(a, b, amount)\n    second = move(a, b, amount)\n    return [first, second, describe({'n': 2, 'last': second})]").unwrap();
+
+    // A caller of a writer is itself a writer; a reader stays a reader.
+    assert!(engine.info("twice").unwrap().writes);
+    assert!(engine.info("move").unwrap().writes);
+    assert!(!engine.info("describe").unwrap().writes);
+
+    let pair = |from: i64, to: i64| ProcValue::Map(vec![("from".into(), int(from)), ("to".into(), int(to))]);
+    assert_eq!(
+        engine.call("twice", &[Value::Int(1), Value::Int(2), Value::Int(30)]).unwrap(),
+        ProcValue::List(vec![
+            pair(70, 40), // the callee saw the caller's uncommitted writes
+            pair(40, 70),
+            ProcValue::Scalar(Value::Text("2 moves, 40 left".into())),
+        ])
+    );
+    assert_eq!((balance(&db, 1), balance(&db, 2)), (40, 70));
+
+    // An error in a callee rolls back what the whole call did.
+    assert!(engine.call("twice", &[Value::Int(1), Value::Int(2), Value::Int(25)]).is_err());
+    assert_eq!((balance(&db, 1), balance(&db, 2)), (40, 70));
+
+    // Redefining a callee does not change a caller until it is defined again.
+    def("def describe(d):\n    return 'changed'").unwrap();
+    let last = |v: ProcValue| match v {
+        ProcValue::List(mut items) => items.pop().unwrap(),
+        other => other,
+    };
+    assert_eq!(
+        last(engine.call("twice", &[Value::Int(2), Value::Int(1), Value::Int(1)]).unwrap()),
+        ProcValue::Scalar(Value::Text("2 moves, 68 left".into()))
+    );
+    def("def twice(a, b, amount):\n    first = move(a, b, amount)\n    second = move(a, b, amount)\n    return [first, second, describe({'n': 2, 'last': second})]").unwrap();
+    assert_eq!(
+        last(engine.call("twice", &[Value::Int(2), Value::Int(1), Value::Int(1)]).unwrap()),
+        ProcValue::Scalar(Value::Text("changed".into()))
+    );
+
+    // What is refused when a procedure is defined.
+    let refused = |src: &str, needle: &str| {
+        let e = def(src).unwrap_err();
+        assert!(e.to_string().contains(needle), "{src}: {e}");
+    };
+    refused("def a(x):\n    return missing(x)", "is not a defined procedure");
+    refused("def a(x):\n    return bal(x, 1)", "takes 1 argument(s) but 2 were passed");
+    refused("def a(x):\n    return a(x)", "cannot call itself");
+    refused("def a(x):\n    return bal(id=x)", "keyword arguments");
+    def("def scan():\n    n = 0\n    for r in db.rows('SELECT id FROM accounts'):\n        n += 1\n    return n").unwrap();
+    refused("def a(x):\n    db.execute('DELETE FROM accounts WHERE id = $1', [x])\n    return scan()", "cursors are allowed only when nothing in the call writes");
+    refused("def a(x):\n    return [scan(), move(1, 2, x)]", "cursors are allowed only when nothing in the call writes");
+    // A reader may call the cursor procedure.
+    def("def count_twice():\n    return scan() + scan()").unwrap();
+    assert_eq!(engine.call("count_twice", &[]).unwrap(), int(4));
+
+    // Cursors a called procedure opened do not pile up across calls, also
+    // when it returns from inside its loop.
+    def("def first_id():\n    for r in db.rows('SELECT id FROM accounts ORDER BY id'):\n        return r[0]\n    return None").unwrap();
+    def("def many():\n    t = 0\n    for i in range(500):\n        t += scan() + first_id()\n    return t").unwrap();
+    assert_eq!(engine.call("many", &[]).unwrap(), int(1500));
+    // A cursor cannot leave the procedure that opened it.
+    refused("def leak():\n    return db.rows('SELECT id FROM accounts')", "may only be used as the iterable");
+
+    // The chain of calls has a depth limit, checked when defining.
+    def("def d0(x):\n    return x + 1").unwrap();
+    let max = mpedb_spell::interp::MAX_CALL_DEPTH;
+    for level in 1..=max + 1 {
+        let src = format!("def d{level}(x):\n    return d{}(x) + 1", level - 1);
+        if level <= max {
+            def(&src).unwrap();
+        } else {
+            refused(&src, "deep");
+        }
+    }
+    assert_eq!(engine.call(&format!("d{max}"), &[Value::Int(0)]).unwrap(), int(max as i64 + 1));
+
+    // The instruction budget is one budget for the whole call.
+    def("def spin(n):\n    i = 0\n    while i < n:\n        i += 1\n    return i").unwrap();
+    def("def spin_many(n):\n    t = 0\n    for i in range(100):\n        t += spin(n)\n    return t").unwrap();
+    assert_eq!(engine.call("spin_many", &[Value::Int(10)]).unwrap(), int(1000));
+    let e = engine.call("spin_many", &[Value::Int(100_000)]).unwrap_err();
+    assert!(e.to_string().contains("instruction budget"), "{e}");
+}
+
+/// A call reports what it spent, summed over the procedures it called, and
+/// also when it failed.
+#[test]
+fn a_call_reports_what_it_spent() {
+    let (cfg, _guard) = test_config("pyusage");
+    let db = Database::open_with_config(cfg).unwrap();
+    seed_accounts(&db, &[(1, 100), (2, 10), (3, 5)]);
+    let engine = ProcEngine::new(&db);
+    let def = |src: &str| engine.define(src, Lang::Python).unwrap();
+    let spent = |name: &str, args: &[Value]| {
+        let mut used = mpedb_proc::Usage { instrs: 99, db_calls: 99, rows: 99 };
+        let result = engine.call_metered(name, args, &mut used);
+        (result.is_ok(), used)
+    };
+
+    def("def nothing():\n    return 1");
+    let (ok, used) = spent("nothing", &[]);
+    assert!(ok && used.instrs > 0 && used.instrs < 10 && used.db_calls == 0 && used.rows == 0, "{used:?}");
+
+    def("def two(id):\n    a = db.query('SELECT balance FROM accounts WHERE id = $1', [id])\n    b = db.query('SELECT balance FROM accounts WHERE id = $1', [id])\n    return len(a) + len(b)");
+    let (_, plain) = spent("two", &[Value::Int(1)]);
+    assert_eq!((plain.db_calls, plain.rows), (2, 0));
+
+    // What a called procedure spends is the caller's.
+    def("def outer(id):\n    return two(id) + two(id)");
+    let (_, nested) = spent("outer", &[Value::Int(1)]);
+    assert_eq!(nested.db_calls, 4);
+    assert!(nested.instrs > 2 * plain.instrs, "{nested:?} vs {plain:?}");
+
+    // Cursor rows are their own count (one more pull finds the end).
+    def("def scan():\n    n = 0\n    for r in db.rows('SELECT id FROM accounts'):\n        n += 1\n    return n");
+    let (_, scan) = spent("scan", &[]);
+    assert_eq!((scan.db_calls, scan.rows), (1, 4));
+
+    // More work, more instructions; the same call always costs the same.
+    def("def spin(n):\n    i = 0\n    while i < n:\n        i += 1\n    return i");
+    let (_, ten) = spent("spin", &[Value::Int(10)]);
+    let (_, thousand) = spent("spin", &[Value::Int(1000)]);
+    assert!(thousand.instrs > 50 * ten.instrs);
+    assert_eq!(spent("spin", &[Value::Int(1000)]).1, thousand);
+
+    // A failed call still says what it spent before it failed.
+    def("def fail(id):\n    db.execute('UPDATE accounts SET balance = 0 WHERE id = $1', [id])\n    return 1 // 0");
+    let (ok, failed) = spent("fail", &[Value::Int(1)]);
+    assert!(!ok && failed.db_calls == 1 && failed.instrs > 0);
+    assert_eq!(balance(&db, 1), 100);
+    let (ok, over) = spent("spin", &[Value::Int(10_000_000)]);
+    assert!(!ok && over.instrs == 1_000_000, "{over:?}");
+
+    // A call that never started spent nothing.
+    assert_eq!(spent("missing", &[]), (false, mpedb_proc::Usage::default()));
+    assert_eq!(spent("spin", &[]), (false, mpedb_proc::Usage::default()));
+}

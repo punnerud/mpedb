@@ -79,6 +79,7 @@ pub fn compile(src: &str) -> Result<Skeleton> {
         consts: fb.consts,
         instrs: fb.instrs,
         calls: fb.calls,
+        proc_calls: fb.proc_calls,
     })
 }
 

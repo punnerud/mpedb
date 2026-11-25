@@ -49,8 +49,8 @@
 
 use mpedb_spell::emit::{cerr, CallKind, Skeleton};
 use mpedb_spell::hash::ProcHash;
-use mpedb_spell::interp::{self, Budget, DbBridge, ProcValue};
-use mpedb_spell::ir::{PlanKind, PlanRef, Proc};
+use mpedb_spell::interp::{self, Budget, DbBridge, ProcValue, Usage};
+use mpedb_spell::ir::{CalleeRef, PlanKind, PlanRef, Proc};
 use mpedb_spell::{py, rs};
 use mpedb::{Database, Error, ExecResult, Result, Value, WriteSession};
 use mpedb_sql::PlanStmt;
@@ -144,7 +144,7 @@ impl<'db> ProcEngine<'db> {
     /// open on this thread (it prepares plans and writes records).
     pub fn define(&self, source: &str, lang: Lang) -> Result<ProcHash> {
         let skel = match lang {
-            Lang::Python => py::compile(source)?,
+            Lang::Python => py::compile_procedure(source)?,
             Lang::Rust => rs::compile(source)?,
             Lang::PlSql => {
                 let schema = self.db.schema();
@@ -266,14 +266,110 @@ impl<'db> ProcEngine<'db> {
                 argc: call.argc,
             });
         }
-        Proc::new(
+        // Calls to other procedures: each name is bound, now, to the
+        // content hash of the definition it has at this moment.
+        let mut callees = Vec::with_capacity(skel.proc_calls.len());
+        for call in &skel.proc_calls {
+            let at = |msg: String| cerr(lang_tag, call.line, call.col, msg);
+            let target = match self.db.sys_record_get(NS_PROC, call.name.as_bytes())? {
+                Some(blob) => {
+                    let h = ProcHash(*blake3::hash(&blob).as_bytes());
+                    self.load_hashed(&h, &blob)?
+                }
+                None => {
+                    return Err(at(format!(
+                        "`{}` is not a defined procedure; define it before the \
+                         procedures that call it",
+                        call.name
+                    )))
+                }
+            };
+            if target.argc != call.argc {
+                return Err(at(format!(
+                    "`{}` takes {} argument(s) but {} were passed",
+                    call.name, target.argc, call.argc
+                )));
+            }
+            if self.call_depth(&target)? + 1 > interp::MAX_CALL_DEPTH {
+                return Err(at(format!(
+                    "`{}` would make procedures call each other more than {} deep",
+                    call.name,
+                    interp::MAX_CALL_DEPTH
+                )));
+            }
+            callees.push(CalleeRef {
+                hash: target.hash(),
+                argc: target.argc,
+                writes: target.has_exec(),
+                cursors: target.has_cursor(),
+            });
+        }
+        // The cursor rule spans everything a procedure calls.
+        let own_rows = skel.calls.iter().any(|c| c.kind == CallKind::Rows);
+        let own_exec = skel.calls.iter().any(|c| c.kind == CallKind::Exec);
+        for (call, callee) in skel.proc_calls.iter().zip(&callees) {
+            if (callee.cursors && (own_exec || callees.iter().any(|c| c.writes)))
+                || (callee.writes && (own_rows || callees.iter().any(|c| c.cursors)))
+            {
+                return Err(cerr(
+                    lang_tag,
+                    call.line,
+                    call.col,
+                    format!(
+                        "db.rows() cursors are allowed only when nothing in the call writes; \
+                         `{}` and this procedure (with what it calls) do both",
+                        call.name
+                    ),
+                ));
+            }
+        }
+        Proc::with_callees(
             skel.name.clone(),
             skel.argc,
             skel.nlocals,
             plans,
             skel.consts.clone(),
             skel.instrs.clone(),
+            callees,
         )
+    }
+
+    /// Longest chain of calls below `proc` (0 when it calls nothing).
+    fn call_depth(&self, proc: &Proc) -> Result<usize> {
+        let mut deepest = 0;
+        for callee in &proc.callees {
+            let target = self.by_hash(&callee.hash)?;
+            deepest = deepest.max(1 + self.call_depth(&target)?);
+        }
+        Ok(deepest)
+    }
+
+    /// A stored procedure by content hash (cache first).
+    fn by_hash(&self, h: &ProcHash) -> Result<Arc<Proc>> {
+        if let Some(p) = self.cache.read().expect(POISON).get(h) {
+            return Ok(p.clone());
+        }
+        match self.db.sys_record_get(NS_PROC_HASH, &h.0)? {
+            Some(blob) => self.load_hashed(h, &blob),
+            None => Err(Error::Corrupt(
+                "proc: a called procedure is missing from the database".into(),
+            )),
+        }
+    }
+
+    /// Every procedure a call can reach, loaded before it starts, so the
+    /// run itself never reads procedure records (a write session is open by
+    /// then).
+    fn reachable(&self, proc: &Proc, into: &mut HashMap<ProcHash, Arc<Proc>>) -> Result<()> {
+        for callee in &proc.callees {
+            if into.contains_key(&callee.hash) {
+                continue;
+            }
+            let target = self.by_hash(&callee.hash)?;
+            into.insert(callee.hash, target.clone());
+            self.reachable(&target, into)?;
+        }
+        Ok(())
     }
 
     /// Execute a stored procedure by name or 64-hex content hash.
@@ -281,6 +377,19 @@ impl<'db> ProcEngine<'db> {
     /// Errors roll back everything: a proc that writes runs inside a single
     /// write transaction which only commits on a successful `return`.
     pub fn call(&self, name_or_hash: &str, args: &[Value]) -> Result<ProcValue> {
+        self.call_metered(name_or_hash, args, &mut Usage::default())
+    }
+
+    /// Like [`ProcEngine::call`], and reports in `used` the instructions,
+    /// database calls and cursor rows the call spent — also when it failed
+    /// and was rolled back. A call refused before it started spent nothing.
+    pub fn call_metered(
+        &self,
+        name_or_hash: &str,
+        args: &[Value],
+        used: &mut Usage,
+    ) -> Result<ProcValue> {
+        *used = Usage::default();
         let proc = self.resolve(name_or_hash)?;
         if args.len() != proc.argc as usize {
             return Err(Error::WrongParamCount {
@@ -288,19 +397,26 @@ impl<'db> ProcEngine<'db> {
                 got: args.len(),
             });
         }
+        let mut procs = HashMap::new();
+        self.reachable(&proc, &mut procs)?;
         if proc.has_exec() {
             let mut session = self.db.begin()?;
             let res = {
                 let mut bridge = SessionBridge {
                     session: &mut session,
-                    statement_atomic: proc.instrs.iter().any(|op| matches!(op, mpedb_spell::ir::Op::OracleTry { .. })),
+                    // A called procedure with handlers needs the same.
+                    statement_atomic: std::iter::once(&proc).chain(procs.values()).any(|p| {
+                        p.instrs.iter().any(|op| matches!(op, mpedb_spell::ir::Op::OracleTry { .. }))
+                    }),
+                    procs: &procs,
                 };
-                interp::run_with_package(
+                interp::run_with_package_metered(
                     &proc,
                     args,
                     &mut bridge,
                     self.budget,
                     &mut self.package.lock().expect(POISON),
+                    used,
                 )
             };
             match res {
@@ -320,13 +436,15 @@ impl<'db> ProcEngine<'db> {
             let mut bridge = SnapshotBridge {
                 db: self.db,
                 streams: Vec::new(),
+                procs: &procs,
             };
-            interp::run_with_package(
+            interp::run_with_package_metered(
                 &proc,
                 args,
                 &mut bridge,
                 self.budget,
                 &mut self.package.lock().expect(POISON),
+                used,
             )
         }
     }
@@ -522,9 +640,21 @@ struct SnapshotBridge<'a> {
     /// streams are dropped (releasing their snapshot) but their slot is
     /// never reused within one call — ids stay unambiguous.
     streams: Vec<Option<mpedb::RowStream<'a>>>,
+    /// Every procedure this call can reach, by content hash.
+    procs: &'a HashMap<ProcHash, Arc<Proc>>,
+}
+
+fn loaded(procs: &HashMap<ProcHash, Arc<Proc>>, hash: &ProcHash) -> Result<Arc<Proc>> {
+    procs.get(hash).cloned().ok_or_else(|| {
+        Error::Corrupt("proc: a called procedure was not loaded with its caller".into())
+    })
 }
 
 impl DbBridge for SnapshotBridge<'_> {
+    fn load_proc(&mut self, hash: &ProcHash) -> Result<Arc<Proc>> {
+        loaded(self.procs, hash)
+    }
+
     fn query(&mut self, plan: &PlanRef, params: &[Value]) -> Result<Vec<Vec<Value>>> {
         match self.db.execute(&plan.hash, params)? {
             ExecResult::Rows { rows, .. } => Ok(rows),
@@ -574,6 +704,8 @@ impl DbBridge for SnapshotBridge<'_> {
 struct SessionBridge<'a, 'db> {
     session: &'a mut WriteSession<'db>,
     statement_atomic: bool,
+    /// Every procedure this call can reach, by content hash.
+    procs: &'a HashMap<ProcHash, Arc<Proc>>,
 }
 
 impl SessionBridge<'_, '_> {
@@ -584,6 +716,10 @@ impl SessionBridge<'_, '_> {
 }
 
 impl DbBridge for SessionBridge<'_, '_> {
+    fn load_proc(&mut self, hash: &ProcHash) -> Result<Arc<Proc>> {
+        loaded(self.procs, hash)
+    }
+
     fn query(&mut self, plan: &PlanRef, params: &[Value]) -> Result<Vec<Vec<Value>>> {
         match self.execute(plan, params)? {
             ExecResult::Rows { rows, .. } => Ok(rows),
