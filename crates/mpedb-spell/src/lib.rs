@@ -21,7 +21,7 @@ pub mod py;
 pub mod rs;
 
 pub use hash::ProcHash;
-pub use interp::{Budget, DbBridge, ProcValue};
+pub use interp::{Budget, DbBridge, ProcValue, Usage};
 pub use ir::Proc;
 
 #[cfg(test)]

@@ -49,7 +49,7 @@
 
 use mpedb_spell::emit::{cerr, CallKind, Skeleton};
 use mpedb_spell::hash::ProcHash;
-use mpedb_spell::interp::{self, Budget, DbBridge, ProcValue};
+use mpedb_spell::interp::{self, Budget, DbBridge, ProcValue, Usage};
 use mpedb_spell::ir::{CalleeRef, PlanKind, PlanRef, Proc};
 use mpedb_spell::{py, rs};
 use mpedb::{Database, Error, ExecResult, Result, Value, WriteSession};
@@ -341,6 +341,19 @@ impl<'db> ProcEngine<'db> {
     /// Errors roll back everything: a proc that writes runs inside a single
     /// write transaction which only commits on a successful `return`.
     pub fn call(&self, name_or_hash: &str, args: &[Value]) -> Result<ProcValue> {
+        self.call_metered(name_or_hash, args, &mut Usage::default())
+    }
+
+    /// Like [`ProcEngine::call`], and reports in `used` the instructions,
+    /// database calls and cursor rows the call spent — also when it failed
+    /// and was rolled back. A call refused before it started spent nothing.
+    pub fn call_metered(
+        &self,
+        name_or_hash: &str,
+        args: &[Value],
+        used: &mut Usage,
+    ) -> Result<ProcValue> {
+        *used = Usage::default();
         let proc = self.resolve(name_or_hash)?;
         if args.len() != proc.argc as usize {
             return Err(Error::WrongParamCount {
@@ -357,7 +370,7 @@ impl<'db> ProcEngine<'db> {
                     session: &mut session,
                     procs: &procs,
                 };
-                interp::run(&proc, args, &mut bridge, self.budget)
+                interp::run_metered(&proc, args, &mut bridge, self.budget, used)
             };
             match res {
                 Ok(v) => {
@@ -378,7 +391,7 @@ impl<'db> ProcEngine<'db> {
                 streams: Vec::new(),
                 procs: &procs,
             };
-            interp::run(&proc, args, &mut bridge, self.budget)
+            interp::run_metered(&proc, args, &mut bridge, self.budget, used)
         }
     }
 
